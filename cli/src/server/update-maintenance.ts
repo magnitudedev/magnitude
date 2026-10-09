@@ -5,7 +5,7 @@ import { release } from "node:os"
 import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@magnitudedev/sdk/desktop-host"
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { acquireApplicationMaintenance, acquireUpdateInstallationLease, applicationNativeHostPath, nativeHostLayer, resolveInstalledApplicationRuntime,
-  PreparedUpdateStore, UpdatePreferences, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory } from "@magnitudedev/daemon-management/desktop-native"
+  PreparedUpdateStore, UpdatePreferences, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
 import { runWindowsInstalledUpdate } from "./windows-startup-update"
 import { CLI_VERSION } from "../version"
@@ -43,7 +43,7 @@ export const runLocalUpdateMaintenance = (options: {
         if (platform === "darwin") return yield* startMacForegroundInstallation({ resources: runtime.resourcesDirectory,
           stateDirectory: options.stateDirectory, dataDirectory: options.dataDirectory, version: CLI_VERSION, architecture,
           operation: "Install", continuation: { _tag: "None" } })
-        yield* completeLinuxForegroundUpdate(options.dataDirectory, Boolean(process.stdin.isTTY && process.stderr.isTTY))
+        yield* completeLinuxForegroundUpdate(options.dataDirectory, Boolean(process.stdin.isTTY && process.stderr.isTTY)).pipe(Effect.provide(nodeTerminalCommand))
         return yield* readPreparedUpdateState
       }
       if (options.action === "discard") return yield* discardPreparedUpdate

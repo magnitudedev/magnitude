@@ -299,7 +299,10 @@ take effect.
 person, and only its root step runs through sudo, as a hidden command of the installed CLI invoked
 by full path. That command accepts exactly the invoking user's name (sudo's own, never another
 account), or no arguments for a root login, or removal; it refuses unless running as root from the
-installed path, and writes only Magnitude's fixed files.
+installed path, and writes only Magnitude's fixed files. Interactive sudo, here and for a foreground
+`magnitude update install`, runs in the caller's own terminal session, so it reuses that terminal's
+ticket (the installer's earlier authorization) or asks there once; a child in a new session could do
+neither.
 
 On Linux the service is the package's inert `magnitude.service` unit, running as the `magnitude`
 system account. Setup creates that account and group with home and data directory

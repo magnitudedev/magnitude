@@ -5,7 +5,7 @@ import { open } from "node:fs/promises"
 import { join } from "node:path"
 import { userInfo } from "node:os"
 import { MagnitudeClient } from "@magnitudedev/sdk"
-import { applicationStateDirectory, installedServerCli, requestApplication } from "@magnitudedev/daemon-management/desktop-native"
+import { applicationStateDirectory, installedServerCli, requestApplication, TerminalCommand, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { isServerSetUp } from "./serve-owner"
 import { desktopDataDirectory, desktopServiceOrigin } from "./application"
 import { ServerSetupFailed, ServerSetupHost, type ServerAccess } from "./server-setup"
@@ -54,6 +54,7 @@ const enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed> = Effe
 export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const executor = yield* CommandExecutor.CommandExecutor
+  const terminal = yield* TerminalCommand
   const platform = process.platform
   return ServerSetupHost.of({
     platform,
@@ -74,11 +75,12 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
         return yield* failed("Server mode needs the installed Magnitude app. Install it from https://magnitude.dev/download.")
       }
       const root = process.getuid?.() === 0
-      const code = yield* executor.exitCode(Command.make(root ? cli.value : "/usr/bin/sudo", ...(root ? args : ["--", cli.value, ...args])).pipe(
-        Command.stdin("inherit"), Command.stdout("inherit"), Command.stderr("inherit"))).pipe(Effect.orElseSucceed(() => -1))
+      // In this terminal's session, so sudo reuses its ticket (the installer's Yes) or asks here once.
+      const code = yield* terminal.run(root ? cli.value : "/usr/bin/sudo", root ? args : ["--", cli.value, ...args], { stdin: "inherit" }).pipe(
+        Effect.orElseSucceed(() => -1))
       if (code !== 0) return yield* failed("The root step did not finish; nothing else was changed.")
     }),
     enableNetworkAccess,
     write: text => Effect.sync(() => { process.stdout.write(text) }),
   })
-})).pipe(Layer.provide(BunContext.layer))
+})).pipe(Layer.provide([BunContext.layer, nodeTerminalCommand]))

@@ -5,7 +5,7 @@ import { dirname, join } from "node:path"
 import { release } from "node:os"
 import type { UpdateOwner } from "@magnitudedev/release/hosted-update"
 import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, UpdatePreferences, makeUnixProcessContinuation, acquireUpdateInstallationLease,
-  acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory } from "@magnitudedev/daemon-management/desktop-native"
+  acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
   reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup,
   startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
@@ -132,7 +132,7 @@ export const idleInstallationSystem = (options: {
     yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.groupAccess)
     const continuation = yield* makeUnixProcessContinuation(options.addon)
     yield* acquireUpdateInstallationLease(options.stateDirectory)
-    const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, false).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store))
+    const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, false).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store), Effect.provide(nodeTerminalCommand))
     yield* options.notify(`Installed Magnitude ${version}. Restarting.`)
     return yield* continuation.replace(process.execPath, process.argv.slice(2), process.env)
   }))
