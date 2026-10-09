@@ -99,7 +99,7 @@ describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package asse
       expect(mtree).toMatch(/^\.\/etc\/sudoers\.d\/magnitude .*mode=440/m)
       expect(mtree).toMatch(/^\.\/etc\/sudoers\.d .*mode=750/m)
       expect(read("etc/sudoers.d/magnitude").toString()).toContain("magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update *")
-      expect(read("usr/lib/systemd/system/magnitude.service").toString()).toContain("ExecStart=/usr/bin/magnitude serve")
+      expect(read("usr/lib/systemd/system/magnitude.service").toString()).toContain("ExecStart=/usr/bin/env /usr/lib/magnitude-desktop/resources/magnitude serve")
       expect(read("usr/share/polkit-1/actions/dev.magnitude.update.policy").toString()).toContain("<allow_active>yes</allow_active>")
     } finally { rmSync(root, { recursive: true, force: true }) }
   })

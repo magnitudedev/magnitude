@@ -9,7 +9,9 @@ Wants=network-online.target
 Type=simple
 User=magnitude
 Group=magnitude
-ExecStart=/usr/bin/magnitude serve
+# Started through a bin_t program so SELinux (Fedora) runs it as unconfined_service_t; the CLI
+# itself is labeled lib_t, and the init_t domain it would otherwise keep cannot reach its engine.
+ExecStart=/usr/bin/env /usr/lib/magnitude-desktop/resources/magnitude serve
 Restart=always
 RestartSec=3
 KillMode=control-group
