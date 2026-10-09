@@ -1,6 +1,6 @@
 export * from "./index"
 export { makeMacCliRegistration } from "./mac-cli-registration"
-export { adoptLinuxInstallationLease, acquireLinuxInstallationLease } from "./linux-installation-lease"
+export { adoptLinuxInstallationLease, acquireLinuxInstallationLease, linuxInstallationLockHeldByOthers } from "./linux-installation-lease"
 export { WindowsInstallerVerifier, nativeWindowsInstallerVerifier } from "./windows-update-signature"
 export { MacBundleVerifier, MacBundleVerificationFailed, MacBundleExpectation, nativeMacBundleVerifier } from "./mac-update-validation"
 export { PrivateFilePermissions, unixPrivateFilePermissions, windowsPrivateFilePermissions } from "./private-files"

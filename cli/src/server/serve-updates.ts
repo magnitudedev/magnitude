@@ -5,7 +5,7 @@ import { dirname, join } from "node:path"
 import { release } from "node:os"
 import type { UpdateOwner } from "@magnitudedev/release/hosted-update"
 import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, UpdatePreferences, makeUnixProcessContinuation, acquireUpdateInstallationLease,
-  acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
+  acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand, linuxInstallationLockHeldByOthers } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
   reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup,
   startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
@@ -170,9 +170,11 @@ export const idleInstallationSystem = (options: {
       : fs.access(dirname(dirname(dirname(options.runtime.resourcesDirectory))), { writable: true }).pipe(Effect.as(true), Effect.orElseSucceed(() => false)),
     isIdle: isIdle(options.profile.endpoint),
     // macOS exclusion is the installation lease the installer itself acquires.
+    // This process holds its own shared lease on the lock for as long as it serves, so ask whether
+    // anyone else holds or awaits it.
     installationLockFree: process.platform !== "linux" ? Effect.succeed(true)
-      : executor.exitCode(Command.make("/usr/bin/flock", "--exclusive", "--nonblock", linuxInstallationLock, "/usr/bin/true")).pipe(
-        Effect.map(code => code === 0), Effect.orElseSucceed(() => false)),
+      : linuxInstallationLockHeldByOthers(linuxInstallationLock).pipe(Effect.map(held => !held), Effect.provideService(FileSystem.FileSystem, fs),
+        Effect.orElseSucceed(() => false)),
     store,
     installPrepared: Effect.gen(function* () {
       if (process.platform === "darwin") return yield* installMac

@@ -44,7 +44,8 @@ install`, recording no outcome. To install it ends its owner scope, which releas
 the platform installer, and on success replaces its own process with the new version (same PID);
 on failure it serves the current version again and, keeping the `failed` outcome, drops the failed
 download, so the next check can fetch a newer release (or retry this one unless it was withdrawn). It checks the installation lock before stopping
-anything: if another Magnitude holds it, it keeps serving, records `deferred`, reports it with an
+anything: if another process holds or awaits it (the service's own shared lease does not count,
+so this reads the kernel's lock table rather than trying the lock), it keeps serving, records `deferred`, reports it with an
 immediate update check, and tries again at an idle point 15 minutes later. (A started service
 refuses to run while the lock is held, so stopping first would leave it down until the lock frees.) Update checks start only once the
 service is ready, so a new version reports `applied` only after it starts; one that fails before
