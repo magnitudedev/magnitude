@@ -123,7 +123,7 @@ export const removeLinuxServer = Effect.gen(function* () {
   }
   yield* fs.remove(SERVER_MARKER_PATH, { force: true })
   const markerDirectory = dirname(SERVER_MARKER_PATH)
-  if ((yield* fs.exists(markerDirectory)) && (yield* fs.readDirectory(markerDirectory)).length === 0) yield* fs.remove(markerDirectory)
+  if ((yield* fs.exists(markerDirectory)) && (yield* fs.readDirectory(markerDirectory)).length === 0) yield* fs.remove(markerDirectory, { recursive: true })
   if (yield* succeeds("/usr/bin/getent", "passwd", SERVER_USER)) yield* run("remove the magnitude user", "/usr/sbin/userdel", SERVER_USER)
   if (yield* succeeds("/usr/bin/getent", "group", SERVER_USER)) yield* run("remove the magnitude group", "/usr/sbin/groupdel", SERVER_USER)
 }).pipe(Effect.mapError(error => error instanceof ServerInstallationFailed ? error : failed("Server removal could not finish.")))

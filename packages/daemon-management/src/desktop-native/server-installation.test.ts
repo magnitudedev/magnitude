@@ -1,4 +1,5 @@
 import { CommandExecutor, FileSystem } from "@effect/platform"
+import { SystemError } from "@effect/platform/Error"
 import { Effect, Either, Option } from "effect"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { installLinuxServer, macServerPlist, parseServerInstallation, removeLinuxServer, requireInstalledRoot } from "./server-installation"
@@ -70,7 +71,8 @@ describe("Linux root step", () => {
     const commands: string[] = []
     const files = new Map<string, { type: "File" | "Directory"; uid: number }>([
       ["/run/systemd/system", { type: "Directory", uid: 0 }],
-      ...(options.existing ? [["/var/lib/magnitude", { type: "Directory", uid: options.dataUid }] as const] : []),
+      ...(options.existing ? [["/var/lib/magnitude", { type: "Directory", uid: options.dataUid }] as const,
+        ["/etc/magnitude", { type: "Directory", uid: 0 }] as const, ["/etc/magnitude/server", { type: "File", uid: 0 }] as const] : []),
     ])
     const written: string[] = []
     const fs = FileSystem.makeNoop({
@@ -81,8 +83,11 @@ describe("Linux root step", () => {
       chmod: (path, mode) => Effect.sync(() => { written.push(`chmod ${mode.toString(8)} ${path}`) }),
       writeFileString: path => Effect.sync(() => { written.push(`write ${path.replace(/\.[^/]*\.tmp$/, "<tmp>")}`) }),
       rename: (_, to) => Effect.sync(() => { written.push(`rename ${to}`) }),
-      remove: path => Effect.sync(() => { files.delete(path); written.push(`remove ${path}`) }),
-      readDirectory: () => Effect.succeed([]),
+      // Like Node's fs.rm, a directory needs `recursive`.
+      remove: (path, removeOptions) => files.get(path)?.type === "Directory" && !removeOptions?.recursive
+        ? Effect.fail(new SystemError({ reason: "Unknown", module: "FileSystem", method: "remove", pathOrDescriptor: path, description: "EISDIR" }))
+        : Effect.sync(() => { files.delete(path); written.push(`remove ${path}`) }),
+      readDirectory: path => Effect.succeed([...files.keys()].filter(file => file.startsWith(`${path}/`)).map(file => file.slice(path.length + 1))),
     })
     const accounts = new Set(options.existing ? ["group", "passwd"] : [])
     const executor = CommandExecutor.makeExecutor(() => Effect.die("unexpected start"))
@@ -146,6 +151,7 @@ describe("Linux root step", () => {
     ])
     expect(m.written).not.toContain("remove /var/lib/magnitude")
     expect(m.written).toContain("remove /etc/magnitude/server")
+    expect(m.written).toContain("remove /etc/magnitude")
   })
 })
 
