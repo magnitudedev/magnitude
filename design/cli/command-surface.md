@@ -3,6 +3,8 @@ applies_to:
   - cli/src/commands/**
   - cli/src/index.ts
   - cli/src/server/application.ts
+  - cli/src/server/server-setup*.ts
+  - cli/src/server/local-harness-connections.ts
   - cli/src/agent-docs/**
   - packages/harness-connections/**
   - packages/sdk/**
@@ -15,8 +17,8 @@ applies_to:
 The non-interactive CLI is a human-readable, agent-usable projection of Magnitude product state.
 It does not expose transport documents or internal state graphs. Bare `magnitude` prints help and
 exits. Help, version, and documentation do not start the desktop or service. There is no terminal
-onboarding, chat harness, setup command, or hidden hosted-setup mode. All onboarding lives in the
-desktop application.
+onboarding, chat harness, or hidden hosted-setup mode. All onboarding lives in the desktop
+application. `server setup` registers Magnitude as a system service; it is not onboarding.
 
 The public command vocabulary is:
 
@@ -24,12 +26,13 @@ The public command vocabulary is:
 update [check | status | download | install | discard]
 app open
 serve
+server setup | remove
 status
 hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
 catalog pull <model-id> | cancel <model-id> | remove <model-id>
 models status [model-id] | load <model-id> | stop
-connections list | add <harness> [--set-model <model-id>] [--install-skill]
+connections list | connect <harness> [--set-model <model-id>] [--install-skill]
 connections sync [harness] | remove <harness>
 docs [topic-id]
 ```
@@ -41,12 +44,16 @@ plugins call the SDK over RPC instead.
 ## Domain ownership
 
 - `serve` owns the foreground application and service tree until shutdown or cooperative Desktop handoff.
+- `server setup` and `server remove` register and remove the system service on Linux (systemd) and
+  macOS (launchd), running as the person and asking for authorization only for their one root step.
+  On Windows they explain that server mode isn't available and change nothing.
 - `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance and exits successfully without starting anything.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
 - `catalog` reports catalog assessment progress, reviewed model choices,
   machine-specific assessment evidence, recommendations, and download operations.
 - `models` reports models present or undergoing local operations and controls runtime residency.
-- `connections` reports harness installation and observed configuration integrity.
+- `connections` reports harness installation and observed configuration integrity, and writes
+  harness configuration for the person running the command, from the CLI process.
 
 Catalog output never includes acquisition or residency state. Model-status output never includes
 catalog ranking or provenance. The focused `models status <model-id>` view is the observation point
@@ -75,7 +82,8 @@ compact token counts; generation speed uses `tok/s`. Rounded values are presenta
 
 The CLI provides human-oriented commands. Plugins use the private bundled Effect SDK and the
 existing RPC endpoint for model observation and control. Both connect to an already-running
-Desktop or Headless owner without launching an application. With no owner, service-backed CLI
+Desktop or Headless owner without launching an application. `connections connect` and `sync` need
+the running service's models, which they read over loopback, and write configuration themselves. With no owner, service-backed CLI
 commands fail with “No Magnitude service is running. Open the Magnitude desktop app or run
 `magnitude serve`.” Passive `status` reports absence successfully. There is no model-control JSON
 CLI protocol, CLI service starter, or separately published integration-contract package.
@@ -127,7 +135,8 @@ residency slot, so stop remains unaddressed.
 Connection observation reports executable installation and configuration integrity separately;
 a missing executable cannot hide intact or unreadable configuration.
 `Connected` comes from actual configuration and required artifacts, not the durable receipt or executable detection. Connection
-mutations delegate directly to the shared connector service. Success reports configuration and
+mutations delegate directly to the shared connector service, run in the CLI process for the person
+running the command; the service never writes them for the CLI. Success reports configuration and
 artifact installation. There is no launch-plan or handoff output and no Magnitude harness destination.
 Users launch their external harness themselves.
 

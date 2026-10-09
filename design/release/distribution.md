@@ -7,6 +7,7 @@ applies_to:
   - packages/release/native/**
   - packages/release/resources/windows/desktop.nsi
   - packages/release/resources/install.*
+  - packages/release/resources/linux/**
   - packages/release/scripts/apple/desktop.ts
   - packages/launcher/package.json
   - packages/daemon-management/src/desktop-native/mac-cli-*.ts
@@ -96,7 +97,16 @@ package reinstallation to restore dependencies and clear the gate.
 `/usr/bin/magnitude-desktop` is the graphical launch entry; `/usr/bin/magnitude` resolves the
 bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
-automatically open a window. Native DEB/RPM/pacman consumption and upgrade acceptance precede
+automatically open a window.
+Every Linux package also ships, root-owned, the `magnitude.service` system unit, the
+`/etc/sudoers.d/magnitude` rule (mode 0440) and the `dev.magnitude.update` Polkit action. The unit
+and sudoers rule are inert until `magnitude server setup` creates the `magnitude` system account
+(home and data in `/var/lib/magnitude`) and enables the unit; a desktop that never opts in has no
+such account or service. The sudoers rule lets only that account run the installed update helper
+without a password. The Polkit action admits the same helper, matched on its exact first argument,
+without a password for the active local session and with admin authentication for inactive and
+remote sessions; it authorizes no other CLI entry. On macOS `server setup` writes the root-owned
+`dev.magnitude.server` LaunchDaemon instead; no package ships it. Native DEB/RPM/pacman consumption and upgrade acceptance precede
 inclusion in the published artifact graph.
 
 Windows installer candidates use the desktop's existing application lease and never start or adopt
@@ -142,11 +152,18 @@ The concrete host dependency contracts are defined in
 [CLI updates](./client-updates.md), and remote publication is defined in
 [Publication](./publication.md).
 
-Installer distribution preparation consumes authenticated publisher records and emits both scripts
-and per-channel target offers into a fresh static hosting directory. It verifies the complete input
-batch before writing and rejects duplicate targets or mixed release versions. Preparing these files
-does not deploy them or promote a channel. Linux bootstrap requires curl, Python 3 and OpenSSL with
-Ed25519 support; Windows bootstrap uses the publisher-signed CLI from the selected release.
+Installer distribution preparation renders the two installation scripts, with the release origin
+and publisher identities, into a fresh static hosting directory; preparing them does not deploy
+them. The scripts take no options and install the stable channel. Each fetches the publisher-signed
+offer for its target from the landing server's `/api/installer`, which counts the request like a
+website download, and verifies it before downloading. On Linux the script first asks, from the
+terminal and with a 60-second timeout, whether to run Magnitude as a server (no answer or no
+terminal means No), then obtains sudo before any download and keeps it fresh, so nothing asks for
+input afterwards; Yes runs `magnitude server setup` with that sudo session. Re-running it on a set-up
+server upgrades the package around a stopped service without asking again. macOS and Windows
+install the desktop app without a question. Linux bootstrap requires curl, coreutils `timeout`,
+Python 3 and OpenSSL with Ed25519 support; Windows bootstrap uses the publisher-signed CLI from the
+selected release.
 
 ## Desktop-owned command registration
 

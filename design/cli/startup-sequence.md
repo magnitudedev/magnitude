@@ -52,12 +52,16 @@ exit before application admission and is not treated as failure. This short-live
 never supervises or terminates the desktop process.
 
 The CLI does not install or download ACN, elect a daemon owner, kill a predecessor, or register an
-independent OS daemon. Missing installation and missing graphical session produce actionable errors.
+independent OS daemon. The one exception is `server setup`, which at the person's explicit request
+registers the system service that runs the foreground serving host at boot; `server remove` undoes it.
+Missing installation and missing graphical session produce actionable errors.
 Windows cold launch checks the native assigned desktop; a noninteractive caller may control an
 existing desktop owner but cannot create an invisible owner in its own session.
 Development uses its isolated desktop, service endpoint, data, and harness configuration.
 An explicitly isolated profile also applies to packaged CLI runs: application control, service
-requests, and harness configuration use that profile together. Choosing a private profile does
+requests, and harness configuration use that profile together. Where the Linux server profile is set
+up, application control and update maintenance address the service's profile instead of the
+person's; harness configuration always stays in the person's own home. Choosing a private profile does
 not change whether startup launches a source checkout or an installed application.
 
 ## Passive status
@@ -65,8 +69,11 @@ not change whether startup launches a source checkout or an installed applicatio
 `status` observes application lifecycle without starting it. Absence is a successful Stopped result.
 The owner is Desktop or Headless when present; tray and login-startup observations appear only for
 Desktop. Model observations are separate from service readiness, and unavailable model evidence must
-not be presented as no loaded model. Login configuration and application Quit belong to Desktop;
-there is no public CLI service administration namespace.
+not be presented as no loaded model. A ready service also shows how to reach it: this computer's
+address, each address other devices can use when network access is on, or how to turn it on with
+the profile's real configuration path. Status never shows the network access key. Login
+configuration and application Quit belong to Desktop; `server setup` and `server remove` are the
+only service administration.
 
 ## Recovery and updates
 
@@ -87,9 +94,11 @@ application semantics.
 ## Acceptance
 
 - Finite commands terminate without terminal UI or prompts; serve remains until owner shutdown.
+  `server setup` and `server remove` ask for authorization at most once, and `server remove` for
+  confirmation, only with a terminal; without one they fail at once.
 - Passive commands neither create a desktop process nor alter login registration.
 - Background cold and concurrent launches preserve window visibility and focus.
 - Service readiness uses the exact application's compatible service, independent of model loading.
 - Cancelling startup leaves an already admitted desktop alive.
 - Quit stops the application and its owned tree; established clients cannot resurrect it.
-- Installation and login startup never register a standalone daemon.
+- Installation and login startup never register a standalone daemon; only `server setup` registers the system service.

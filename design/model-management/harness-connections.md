@@ -6,6 +6,7 @@ applies_to:
   - packages/acn-protocol/src/boundary/connections.ts
   - cli/src/commands/connections.ts
   - cli/src/commands/connections-runtime.ts
+  - cli/src/server/local-harness-connections.ts
   - integrations/pi/**
   - scripts/dev-pi.ts
   - package.json
@@ -16,9 +17,14 @@ applies_to:
 `HarnessConnection` configures an external agent harness to use Magnitude. `Connections` is the
 public CLI noun and the ACN RPC group; there is no separate connection-manager domain.
 
-ACN owns harness connections for the machine it runs on. The desktop app and the CLI inspect,
-connect, synchronize, and disconnect through the `Connections` RPCs, so configuration is written
-where Magnitude runs. No client runs its own copy of the connection service.
+A harness connection is written on the machine, and as the user, where the harness runs. One-click
+connection exists only in the desktop app, which inspects, connects, synchronizes, and disconnects
+through the `Connections` RPCs of the service it owns, running as the same person. The CLI runs the
+connection service in its own process for the person running the command: it writes into their
+home and points at the service on `localhost`, so `magnitude connections connect` works the same
+whether the service runs as that person or as the Linux server's `magnitude` account. That server
+account has no harnesses of its own, so its service refuses connect, synchronize, and disconnect;
+inspection and copyable setup remain available.
 
 A browser never connects harnesses in place, because it can't know which computer its viewer's
 harnesses run on. `DescribeHarnessSetup` renders, for a harness, the default model, the viewer's

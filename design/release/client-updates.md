@@ -32,7 +32,21 @@ must be resolved explicitly; uninstall removes only registration owned by that i
 `magnitude update download` explicitly admits a download of the selected offer. It acknowledges
 admission and directs the caller to status; download completion belongs to the owner.
 `magnitude update install` requires a prepared update. Desktop may stop its model and service to
-install and restart; a running Headless owner refuses installation without stopping.
+install and restart; a running Headless owner refuses an explicit install, because it installs by
+itself when idle.
+
+No owner installs at startup: Desktop launch and `serve` start normally with a prepared update
+retained, and Desktop offers Restart. A running Headless owner installs a downloaded update at an
+idle point, when the service reports no working session and no inference request in flight. It
+first checks that it may install unattended (the Linux server's sudoers rule, or a writable macOS
+application folder); otherwise it keeps serving and prints one line naming `magnitude update
+install`, recording no outcome. To install it ends its owner scope, which releases its leases, runs
+the platform installer, and on success replaces its own process with the new version (same PID);
+on failure it serves the current version again. If another Magnitude holds the installation lock,
+it records `deferred` and tries again at a later idle point. Update checks start only once the
+service is ready, so a new version reports `applied` only after it starts; one that fails before
+Ready reports `failed`/`startup` and exits non-zero for the service manager to retry. There is no
+rollback; withdrawing the release stops it being offered.
 
 Update commands never launch Desktop. With no owner, status observes persisted preparation without
 creating state; finite check, download and discard retain maintenance ownership. A finite download
@@ -70,4 +84,5 @@ installation.
 - Invalid or failed checks never report up to date.
 - Download admission is distinct from successful native staging.
 - Install requires Ready and acknowledges before service/application shutdown.
+- No owner installs at startup; Headless installs only at an idle point, and never blocks Ready.
 - Packaged CLI and service versions match the application version.

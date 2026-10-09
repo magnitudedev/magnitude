@@ -12,6 +12,7 @@ applies_to:
   - packages/daemon-management/scripts/build-native.ts
   - packages/daemon-management/scripts/*windows*.ps1
   - .github/workflows/desktop-native.yml
+  - desktop/src/server-conflict*.ts
 ---
 
 # Native application ownership
@@ -285,6 +286,43 @@ reach it, including a browser on another device:
   same handlers it uses for its native controls and the CLI's application-control socket; ACN
   never performs owner work itself.
 
-Desktop supports every request. Headless supports updates and quit; it refuses installing while
-serving with its existing guidance, and reports launch at login and application restart as
-unsupported, so clients hide those controls.
+Desktop supports every request. Headless supports updates, restart and quit. It refuses an
+explicit install while serving, because it installs downloaded updates by itself at idle points,
+and reports launch at login as unsupported, so clients hide that control. Restart replies first,
+then ends the owner's scope, releasing the service tree, control endpoint, leases and ownership; the
+serving command admits a new owner with the same invocation, so settings read at service start
+take effect.
+
+## Server mode
+
+`magnitude server setup` registers the foreground serving host as a system service. It runs as the
+person, and only its root step runs through sudo, as a hidden command of the installed CLI invoked
+by full path. That command accepts exactly the invoking user's name (sudo's own, never another
+account), or no arguments for a root login, or removal; it refuses unless running as root from the
+installed path, and writes only Magnitude's fixed files.
+
+On Linux the service is the package's inert `magnitude.service` unit, running as the `magnitude`
+system account. Setup creates that account and group with home and data directory
+`/var/lib/magnitude`, adds the person to the group, writes a root-owned marker, and enables the
+unit. The marker selects the server profile for the service and for every CLI command: a marker
+that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
+The desktop app always uses the person's own profile. The server profile's ownership directory is
+group-traversable (0710) and its control socket is group-accessible (0660), so group members reach
+owner control while the lock, data and keys stay private to the service account. Anyone else running
+`serve` while the profile is active is refused, since the service already serves.
+
+On macOS the service is the root-owned `dev.magnitude.server` LaunchDaemon in the system domain,
+running the app's CLI as the person who set it up (`UserName`), loaded at boot and kept alive, and
+associated with the app's bundle identifier for Login Items. It uses the person's own profile, so
+no server profile exists, and it replaces the app bundle through the person's own update
+transaction. Its label is distinct from the retired `dev.magnitude.acn` agent, and the Linux system
+unit is distinct from the per-user unit that previous-installation retirement inspects.
+
+`server remove` stops and unregisters the service and removes the Linux account and marker; the
+data directory is kept. Desktop launch first checks for a running server (the active Linux unit
+under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
+it runs, the whole window is one screen offering to keep the server, which opens it in the browser
+and quits, or to stop it with administrator authorization and continue. A background launch leaves
+a running server alone, and a server that stops lets the app continue. Windows has no server
+mode; its command launcher ignores logoff, which Windows sends only to services, so a third-party
+service wrapper keeps serving.

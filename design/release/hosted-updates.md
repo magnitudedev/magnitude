@@ -31,8 +31,9 @@ can begin. A retained prepared update survives owner exit; a recorded failed att
 until explicit retry or discard. Observation never initiates a check or transfer.
 
 A running Headless owner accepts status, check, download and discard through application control.
-It reports prepared releases with stop-and-start guidance. Install requests fail without stopping
-the service or admitting an installer; preparation and its timer end with the owner's scope.
+Explicit install requests fail without stopping the service or admitting an installer; the owner
+installs prepared releases itself at idle points, as [client updates](./client-updates.md)
+describes. Preparation and its timer end with the owner's scope.
 
 Without a running owner, update observation reads persisted preparation and preferences without
 creating an identity, owner or update worker. An explicitly admitted finite preparation command holds
@@ -66,7 +67,13 @@ counted. A failure records its reason where it is classified, never by parsing i
 installer or package-manager failure, `authorization` when sudo or Polkit refuses, `startup` when
 the installed version does not reach Ready, and `incomplete` for an attempt with no recorded result.
 The privileged Linux helper reports its class through a distinct exit status, separate from the
-statuses sudo and pkexec use for authorization. The outcome is sent once with the next check.
+statuses sudo and pkexec use for authorization. `deferred` records an idle installation postponed
+because another Magnitude held the installation lock. The outcome is sent once with the next check.
+
+Every request names its `owner`: `desktop`, `headless` (`serve` run by hand, or a finite CLI
+command), or `service` (the system service). Requests from older clients have no owner. The
+privileged Linux helper accepts exactly its request path and an optional `--parent-stdin`, since
+sudo and Polkit admit any arguments after its name; anything else is refused before work starts.
 
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before

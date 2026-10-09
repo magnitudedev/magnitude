@@ -16,7 +16,9 @@ applies_to:
 Desktop and the foreground serving host are the two application owner forms. Only their privileged
 composition roots launch ACN while retaining application ownership; ACN privately owns ICN and
 workers. Ordinary clients never independently download, adopt, elect, replace, or retain an ACN
-process. Login startup belongs exclusively to Desktop.
+process. Login startup belongs exclusively to Desktop. The system service that `magnitude server
+setup` registers runs the foreground serving host at boot; it is the same Headless owner form,
+not an independently elected daemon.
 The web development host uses the same application launcher with an isolated development profile
 and proxies that profile's service endpoint. Closing the web host or cancelling its startup response
 does not quit an already admitted desktop owner.
@@ -31,7 +33,8 @@ The SDK remains portable and receives a starter capability rather than OS proces
 Application bootstrap selects one installed resource directory or one development checkout and
 constructs the service command from that selection. Profile selection, native adapter location,
 previous-installation retirement and per-attempt port preflight are shared host composition in
-daemon-management. Installed service and adapter paths always come from the same resource directory.
+daemon-management, including the Linux server profile, which the serving command selects only for
+the service account. Installed service and adapter paths always come from the same resource directory.
 Bundled CLI resource selection resolves the executing payload through filesystem symlinks and
 requires the installed layout; it never substitutes a different installation found through PATH.
 Development runtime and engine overrides remain explicit. Selection itself never creates state,
