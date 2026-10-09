@@ -1,5 +1,7 @@
 //! Emptiness questions over terminal languages, answered with derivre within
-//! a per-compilation work budget. Planning and certification ask them.
+//! a per-compilation work budget. Planning and certification ask them, and
+//! both treat a positive answer as the safe one, so a question may be asked
+//! about a superset of the languages it names.
 use crate::terminal::{has_byte, Bytes, Term, TermId, Terms};
 use llguidance::derivre::{raw::RelevanceCache, ExprRef, RegexAst, RegexBuilder};
 
@@ -8,6 +10,10 @@ const FUEL: u64 = 200_000;
 /// Derivative work allowed per compilation. A question left unanswered
 /// counts as positive, which only makes the rendering finer.
 const TOTAL_FUEL: u64 = 20_000_000;
+/// Repetition bounds beyond this are asked about as unbounded. Derivative
+/// work grows with a counted bound, and a superset can only turn an answer
+/// positive, which is as safe as a question left unanswered.
+const COUNTED: u32 = 256;
 
 /// derivre expressions for terminals and batched emptiness questions.
 pub(crate) struct Regexes {
@@ -75,8 +81,8 @@ impl Regexes {
                 }
                 Term::Repeat(part, min, max) => RegexAst::Repeat(
                     Box::new(child(*part, &self.exprs)),
-                    *min,
-                    max.unwrap_or(u32::MAX),
+                    (*min).min(COUNTED),
+                    max.filter(|&max| max <= COUNTED).unwrap_or(u32::MAX),
                 ),
                 Term::NonEmpty(part) => {
                     RegexAst::And(vec![child(*part, &self.exprs), Self::any_bytes(1)])
