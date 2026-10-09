@@ -1,0 +1,30 @@
+name: Server install test cleanup
+
+# Deletes the server-install test builds (prereleases and tags under
+# desktop-update-acceptance/<commit>/) for the commits listed in the cleanup file. Nothing else.
+on:
+  push:
+    branches: [server-install]
+    paths: ['.github/server-install-test-cleanup.json']
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete the listed test prereleases and their tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for commit in $(jq -r '.commits[]' .github/server-install-test-cleanup.json); do
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "bad commit $commit"; exit 1; }
+            for tag in $(git ls-remote --tags origin "refs/tags/desktop-update-acceptance/$commit/*" | awk '{print $2}' | sed 's|^refs/tags/||'); do
+              echo "Deleting $tag"
+              gh release delete "$tag" --cleanup-tag --yes || git push origin --delete "refs/tags/$tag"
+            done
+          done
+          echo "Remaining tags for these commits:"
+          for commit in $(jq -r '.commits[]' .github/server-install-test-cleanup.json); do git ls-remote --tags origin "refs/tags/desktop-update-acceptance/$commit/*"; done
