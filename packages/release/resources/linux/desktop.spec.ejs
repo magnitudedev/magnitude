@@ -22,6 +22,7 @@ cp -a usr/. %{buildroot}/usr/
 find %{buildroot}/usr/lib/<%= name %> -type d -exec chmod 0755 {} +
 find %{buildroot}/usr/lib/<%= name %> -type f -exec chmod go-w {} +
 ln -s ../lib/<%= name %>/resources/magnitude %{buildroot}/usr/bin/magnitude
+@MAGNITUDE_SYSTEM_INSTALL@
 
 %files
 %defattr(-,root,root)
@@ -31,6 +32,7 @@ ln -s ../lib/<%= name %>/resources/magnitude %{buildroot}/usr/bin/magnitude
 /usr/share/applications/<%= name %>.desktop
 /usr/share/doc/<%= name %>/
 /usr/share/icons/hicolor/256x256/apps/<%= name %>.png
+@MAGNITUDE_SYSTEM_FILES@
 
 %pre
 set -eu

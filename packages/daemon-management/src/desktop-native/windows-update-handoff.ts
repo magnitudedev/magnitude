@@ -65,7 +65,7 @@ export const completeWindowsUpdateHandoff = (request: WindowsUpdateHandoffReques
   const error = result._tag === "Left" ? Option.some("The application update installer could not be started.")
     : result.right === 0 ? Option.none<string>()
     : Option.some("The application update installer could not finish. Check for updates to retry.")
-  if (Option.isSome(error)) yield* recordPreparedUpdateFailure(request.dataDirectory, request.release, error.value)
+  if (Option.isSome(error)) yield* recordPreparedUpdateFailure(request.dataDirectory, request.release, "install", error.value)
 }).pipe(Effect.mapError(failed))
 
 /** Called only after the helper releases its native installation lease. */

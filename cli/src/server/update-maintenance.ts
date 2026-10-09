@@ -28,7 +28,7 @@ export const runLocalUpdateMaintenance = (options: {
     ? (yield* Command.make("/usr/bin/sw_vers", "-productVersion").pipe(Command.string, Effect.timeout("5 seconds"))).trim()
     : release()
   return yield* Effect.gen(function* () {
-    if (options.action === "install" && platform === "win32") yield* runWindowsInstalledUpdate(runtime, options, options.stateDirectory, false)
+    if (options.action === "install" && platform === "win32") yield* runWindowsInstalledUpdate(runtime, options, options.stateDirectory)
     else if (options.action !== "status") {
       yield* acquireApplicationMaintenance(options.stateDirectory)
       if (platform === "win32") yield* recoverWindowsUpdateDirectory(addon, options.dataDirectory)

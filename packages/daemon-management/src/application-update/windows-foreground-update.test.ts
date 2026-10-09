@@ -20,7 +20,7 @@ const release = await Effect.runPromise(signUpdateRelease({ version: "0.1.6", by
   sha256: createHash("sha256").update("x").digest("hex") }, { os: "windows", arch: "x64", package: "windows-exe" }, keys.privateKey))
 beforeEach(() => { events.length = 0; vi.spyOn(process, "chdir").mockImplementation(() => {}) })
 afterEach(() => vi.restoreAllMocks())
-const run = async (options: { attempted?: boolean; automatic?: boolean; protocol?: string; installerCode?: number; version?: string } = {}) => {
+const run = async (options: { attempted?: boolean; installerCode?: number; version?: string } = {}) => {
   const root = await mkdtemp(join(tmpdir(), "magnitude-windows-foreground-"))
   const locks = new Set<string>()
   const host = nativeHostLayerFromLoader(() => ({
@@ -39,11 +39,11 @@ const run = async (options: { attempted?: boolean; automatic?: boolean; protocol
   const store = PreparedUpdateStore.of({
     read: Effect.succeed(Option.some({ release, installation: options.attempted ? { _tag: "Attempted" } : { _tag: "Unattempted" } })),
     verify: () => step("verify").pipe(Effect.as("installer.exe")), recordAttempt: () => step("attempt"),
-    recordFailure: () => step("failure"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
+    recordFailure: () => step("failure"), complete: () => step("complete"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
     prepare: () => Effect.die("Unexpected download"),
   })
   return Effect.runPromise(completeWindowsForegroundUpdate({ resources: fileURLToPath(new URL("../../dist/native/win32-x64", import.meta.url)), dataDirectory: root,
-    stateDirectory: join(root, "state"), version: "0.1.5", automatic: options.automatic ?? true, launcherProtocol: options.protocol ?? "1" }).pipe(
+    stateDirectory: join(root, "state"), version: "0.1.5" }).pipe(
     Effect.provideService(PreparedUpdateStore, store), Effect.provideService(WindowsInstallerVerifier, { verify: () => step("publisher") }),
     Effect.provideService(CommandExecutor.CommandExecutor, {
       ...CommandExecutor.makeExecutor(() => Effect.die("Unexpected start")),
@@ -61,12 +61,8 @@ test("releases application ownership while retaining installation admission thro
   expect(await run()).toMatchObject({ _tag: "Right", right: true })
   expect(events).toEqual(["owner acquired", "installation acquired", "installation released", "installation acquired", "verify", "publisher", "attempt", "owner released", "installer", "version", "discard", "installation released"])
 })
-test.each([{ attempted: true }, { protocol: "unsupported" }])("defers startup without an eligible preparation and launcher: %j", async options => {
-  expect(await run(options)).toMatchObject({ _tag: "Right", right: false })
-  expect(events).toEqual(["owner acquired", "installation acquired", "installation released", "owner released"])
-})
-test("permits an explicit finite retry without a foreground launcher", async () => {
-  expect(await run({ automatic: false, attempted: true, protocol: "unsupported" })).toMatchObject({ _tag: "Right", right: true })
+test("permits an explicit retry of an attempted preparation", async () => {
+  expect(await run({ attempted: true })).toMatchObject({ _tag: "Right", right: true })
 })
 test.each([{ installerCode: 1 }, { version: "0.1.5" }])("retains failed preparation instead of continuing: %j", async options => {
   expect(await run(options)).toMatchObject({ _tag: "Left" })

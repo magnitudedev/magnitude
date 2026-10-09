@@ -1,0 +1,3 @@
+# Lets the Magnitude server service install verified Magnitude updates. Inert until
+# `magnitude server setup` creates the magnitude user.
+magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update *

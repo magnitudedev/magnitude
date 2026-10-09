@@ -1,6 +1,6 @@
 import * as Command from "@effect/platform/Command"
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { DesktopBuildFailed } from "./desktop"
@@ -10,6 +10,7 @@ import { sha256File } from "../../src/macos-app"
 import { LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
 import { linuxDesktopInstaller } from "../../src/targets"
 import { renderLinuxMaintainerScripts, renderPacmanInstallScript } from "./linux-maintainer-scripts"
+import { linuxSudoersPath, linuxSystemFiles } from "./linux-system-files"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
 const PackageFields = {
@@ -42,6 +43,19 @@ const pacmanDepends = ["alsa-lib", "at-spi2-core", "cairo", "dbus", "expat", "gl
   "libgcc", "libnotify", "libsecret", "libx11", "libxcb", "libxcomposite", "libxdamage", "libxext", "libxfixes", "libxkbcommon",
   "libxrandr", "mesa", "nspr", "nss", "pango", "polkit", "systemd-libs", "util-linux", "xdg-utils"]
 
+/** Directory modes are explicit so the builder's umask never reaches the package. */
+const installLinuxSystemFiles = (tree: string) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  for (const file of linuxSystemFiles) {
+    yield* fs.makeDirectory(dirname(join(tree, file.path)), { recursive: true })
+    for (let directory = dirname(file.path); directory !== "."; directory = dirname(directory)) {
+      yield* fs.chmod(join(tree, directory), directory === "etc/sudoers.d" ? 0o750 : 0o755)
+    }
+    yield* fs.copyFile(file.source, join(tree, file.path))
+    yield* fs.chmod(join(tree, file.path), file.mode)
+  }
+})
+
 export const validateLinuxPayloadPermissions = (format: LinuxPackageFormat, listing: string) => Effect.gen(function* () {
   const prefix = `/usr/lib/${LINUX_DESKTOP_PACKAGE_NAME}`
   const rows = listing.split("\n").filter(line => format === "deb" ? line.includes(` .${prefix}/`)
@@ -61,6 +75,21 @@ export const validateLinuxPayloadPermissions = (format: LinuxPackageFormat, list
     return owner !== "root" || group !== "root" || !Number.isFinite(mode)
       || ((mode & 0o170000) !== 0o120000 && (mode & 0o022) !== 0)
   })) return yield* new DesktopBuildFailed({ message: "Linux application payload must be root-owned without group or other write access" })
+})
+
+const symbolicMode = (mode: string) => mode.length !== 10 ? -1 : [...mode.slice(1)].reduce((bits, flag, index) =>
+  bits | (flag === "-" ? 0 : 1 << (8 - index)), 0)
+
+/** Every package ships the same system files; the sudoers rule must be exactly root-owned 0440. */
+export const validateLinuxSystemFiles = (entry: (path: string) => Option.Option<{ readonly mode: number; readonly owner: string }>) => Effect.gen(function* () {
+  for (const file of linuxSystemFiles) {
+    const found = entry(file.path)
+    if (Option.isNone(found) || found.value.owner !== "root/root" || found.value.mode !== file.mode) {
+      return yield* new DesktopBuildFailed({ message: file.path === linuxSudoersPath
+        ? "Linux installer must contain the root-owned mode-0440 sudoers rule"
+        : `Linux installer must contain root-owned /${file.path}` })
+    }
+  }
 })
 
 export const validateLinuxDesktopInstaller = (options: {
@@ -91,6 +120,10 @@ export const validateLinuxDesktopInstaller = (options: {
     if (![".PKGINFO", ".MTREE", ".INSTALL", pacmanHookPath, pacmanBeginScriptPath].every(path => entries.has(path))) {
       return yield* new DesktopBuildFailed({ message: "Pacman installer is missing its metadata or installation admission hook" })
     }
+    yield* validateLinuxSystemFiles(path => Option.fromNullable(entries.get(path)).pipe(Option.map(row => {
+      const [mode, owner, group] = row.split(" ")
+      return { mode: symbolicMode(mode ?? ""), owner: `${owner}/${group}` }
+    })))
     return
   }
   if (options.format === "deb") {
@@ -100,12 +133,21 @@ export const validateLinuxDesktopInstaller = (options: {
     if (sandbox === undefined || !/^-rwsr-xr-x\s+root\/root\s/.test(sandbox)) {
       return yield* new DesktopBuildFailed({ message: "Debian installer must contain a root-owned mode-04755 Chromium sandbox helper" })
     }
+    yield* validateLinuxSystemFiles(path => Option.fromNullable(listing.split("\n").find(line => line.endsWith(` ./${path}`))).pipe(Option.map(line => {
+      const [mode, owner] = line.trim().split(/\s+/)
+      return { mode: symbolicMode(mode ?? ""), owner: owner ?? "" }
+    })))
   } else {
     const listing = yield* Command.make("rpm", "-qp", "--qf", "[%{FILENAMES} %{FILEMODES:octal} %{FILEUSERNAME} %{FILEGROUPNAME}\n]", options.file).pipe(Command.string)
     yield* validateLinuxPayloadPermissions("rpm", listing)
     if (!listing.split("\n").includes(`/usr/lib/${LINUX_DESKTOP_PACKAGE_NAME}/chrome-sandbox 104755 root root`)) {
       return yield* new DesktopBuildFailed({ message: "RPM installer must contain a root-owned mode-04755 Chromium sandbox helper" })
     }
+    const systemListing = yield* Command.make("rpm", "-qp", "--qf", "[%{FILENAMES} %{FILEMODES:octal} %{FILEUSERNAME} %{FILEGROUPNAME}\n]", options.file).pipe(Command.string)
+    yield* validateLinuxSystemFiles(path => Option.fromNullable(systemListing.split("\n").find(line => line.startsWith(`/${path} `))).pipe(Option.map(line => {
+      const [, mode, owner, group] = line.split(" ")
+      return { mode: Number.parseInt(mode ?? "", 8) & 0o7777, owner: `${owner}/${group}` }
+    })))
   }
 })
 
@@ -130,7 +172,9 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
   }
   const specTemplate = join(stage, "desktop.spec.ejs")
   const spec = yield* fs.readFileString(join(root, "packages/release/resources/linux/desktop.spec.ejs"))
-  yield* fs.writeFileString(specTemplate, spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end))
+  yield* fs.writeFileString(specTemplate, spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end)
+    .replaceAll("@MAGNITUDE_SYSTEM_INSTALL@", linuxSystemFiles.map(file => `install -D -m ${file.mode.toString(8).padStart(4, "0")} '${file.source}' '%{buildroot}/${file.path}'`).join("\n"))
+    .replaceAll("@MAGNITUDE_SYSTEM_FILES@", linuxSystemFiles.map(file => `%attr(${file.mode.toString(8).padStart(4, "0")},root,root) /${file.path}`).join("\n")))
   const desktopTemplate = join(stage, "magnitude.desktop.ejs")
   yield* fs.writeFileString(desktopTemplate, desktopEntry)
   const metadata = {
@@ -170,6 +214,7 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
     const extracted = yield* Command.make("dpkg-deb", "--raw-extract", candidate, contents).pipe(Command.exitCode)
     if (extracted !== 0) return yield* new DesktopBuildFailed({ message: "Could not prepare the bundled CLI package entry" })
     yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/resources/magnitude`, join(contents, "usr/bin/magnitude"))
+    yield* installLinuxSystemFiles(contents)
     // Copied Electron directories can retain the builder's group-writable mode.
     // Normalize the final package tree, including directories created by the installer.
     const application = join(contents, "usr/lib", LINUX_DESKTOP_PACKAGE_NAME)
@@ -215,23 +260,24 @@ const buildPacmanPackage = (options: LinuxInstallerOptions, stage: string, paylo
   yield* run("Could not protect the pacman package tree", "find", "usr", "-type", "d", "-exec", "chmod", "0755", "{}", "+")
   yield* run("Could not protect the pacman package tree", "find", "usr", "-type", "f", "-exec", "chmod", "go-w", "{}", "+")
   yield* fs.chmod(join(tree, pacmanBeginScriptPath), 0o755)
+  yield* installLinuxSystemFiles(tree)
   yield* fs.chmod(join(tree, "usr/lib", LINUX_DESKTOP_PACKAGE_NAME, "chrome-sandbox"), 0o4755)
-  const size = yield* Command.make("du", "-sb", "usr").pipe(Command.workingDirectory(tree), Command.string)
+  const size = yield* Command.make("du", "-sbc", "etc", "usr").pipe(Command.workingDirectory(tree), Command.string)
   const info = [
     "# Generated by Magnitude release packaging",
     `pkgname = ${LINUX_DESKTOP_PACKAGE_NAME}`, `pkgbase = ${LINUX_DESKTOP_PACKAGE_NAME}`, "xdata = pkgtype=pkg",
     `pkgver = ${pkgver}`, `pkgdesc = ${packageDescription}`, `url = ${packageHomepage}`,
     `builddate = ${Math.floor(Date.now() / 1000)}`, `packager = ${packageMaintainer}`,
-    `size = ${Number.parseInt(size, 10)}`, `arch = ${linuxPackageArchitecture("pacman", options.arch)}`, "license = Apache-2.0",
+    `size = ${Number.parseInt(size.trim().split("\n").at(-1) ?? "", 10)}`, `arch = ${linuxPackageArchitecture("pacman", options.arch)}`, "license = Apache-2.0",
     ...pacmanDepends.map(name => `depend = ${name}`),
   ]
   yield* fs.writeFileString(join(tree, ".PKGINFO"), `${info.join("\n")}\n`)
   const owner = ["--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"] as const
   yield* run("Could not record the pacman package file manifest", "bsdtar", "-czf", ".MTREE", "--format=mtree",
-    "--options=!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link", ...owner, ".PKGINFO", ".INSTALL", "usr")
+    "--options=!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link", ...owner, ".PKGINFO", ".INSTALL", "etc", "usr")
   const candidate = join(stage, linuxDesktopInstaller(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", "pacman", options.version, options.revision))
   yield* run("Could not create the pacman package", "bsdtar", "-cf", candidate, "--zstd", "--options=zstd:compression-level=19",
-    ...owner, ".MTREE", ".PKGINFO", ".INSTALL", "usr")
+    ...owner, ".MTREE", ".PKGINFO", ".INSTALL", "etc", "usr")
   return candidate
 })
 

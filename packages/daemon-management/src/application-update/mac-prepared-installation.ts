@@ -12,8 +12,8 @@ const reconcilePreparation = (workspace: Option.Option.Value<Effect.Effect.Succe
   const recovered = yield* workspace.recover
   if (recovered._tag !== "NoTransaction") {
     if (Option.isSome(pending)) {
-      if (recovered._tag === "Installed" && recovered.version === pending.value.release.version) yield* store.discard
-      else if (recovered._tag === "Preserved") yield* store.recordFailure(pending.value.release, "The previous installation attempt was interrupted. Retry installation explicitly.")
+      if (recovered._tag === "Installed" && recovered.version === pending.value.release.version) yield* store.complete(pending.value.release)
+      else if (recovered._tag === "Preserved") yield* store.recordFailure(pending.value.release, "install", "The previous installation attempt was interrupted. Retry installation explicitly.")
     }
     yield* workspace.retire
   }
@@ -45,16 +45,17 @@ export const completeMacPreparedInstallation = (options: {
   const pending = yield* store.read
   if (Option.isNone(pending)) return yield* new ApplicationUpdateFailed({ message: "There is no prepared application update to install." })
   const release = pending.value.release
-  const archive = yield* store.verify(release)
+  const archive = yield* store.verify(release).pipe(Effect.tapError(error => store.recordFailure(release, "verify", error.message)))
   yield* store.recordAttempt(release)
+  yield* workspace.clearUnpublishedStaging.pipe(Effect.tapError(error => store.recordFailure(release, "install", error.message)))
+  // Staging authenticates and extracts the signed archive.
+  const stager = yield* MacUpdateArchiveStager
+  yield* stager.stage(archive, workspace.staging, release).pipe(Effect.tapError(error => store.recordFailure(release, "verify", error.message)))
   return yield* Effect.gen(function* () {
-    yield* workspace.clearUnpublishedStaging
-    const stager = yield* MacUpdateArchiveStager
-    yield* stager.stage(archive, workspace.staging, release)
     const installed = yield* workspace.exchange({ previous: options.version, replacement: release.version, architecture: options.architecture })
-    if (installed._tag === "Installed") yield* store.discard
-    else yield* store.recordFailure(release, "The installation did not complete. Retry installation explicitly.")
+    if (installed._tag === "Installed") yield* store.complete(release)
+    else yield* store.recordFailure(release, "install", "The installation did not complete. Retry installation explicitly.")
     yield* cleanup
     return installed
-  }).pipe(Effect.tapError(error => store.recordFailure(release, error.message)))
+  }).pipe(Effect.tapError(error => store.recordFailure(release, "install", error.message)))
 }))

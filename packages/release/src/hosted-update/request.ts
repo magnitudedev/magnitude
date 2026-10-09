@@ -7,9 +7,16 @@ export const Version = Schema.String.pipe(Schema.maxLength(96), Schema.filter(is
 const PlatformVersion = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(96), Schema.pattern(/^[a-zA-Z0-9 ._+()-]+$/))
 export const UpdateCheckReason = Schema.Literal("launch", "scheduled", "manual")
 export type UpdateCheckReason = typeof UpdateCheckReason.Type
-export const UpdateOutcomeReason = Schema.Literal("verify", "install", "authorization", "incomplete")
+/** Why a recorded installation attempt failed, as classified where the failure happened. */
+export const UpdateFailureReason = Schema.Literal("verify", "install", "authorization", "startup")
+export type UpdateFailureReason = typeof UpdateFailureReason.Type
+export const UpdateOutcomeReason = Schema.Union(UpdateFailureReason, Schema.Literal("incomplete"))
+export const UpdateOutcomeKind = Schema.Literal("applied", "failed", "deferred")
+/** Which application owner made the request: the desktop app, `serve` run by hand, or the system service. */
+export const UpdateOwner = Schema.Literal("desktop", "headless", "service")
+export type UpdateOwner = typeof UpdateOwner.Type
 export const UpdateOutcome = Schema.Struct({
-  outcome: Schema.Literal("applied", "failed"),
+  outcome: UpdateOutcomeKind,
   version: Version,
   reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
 }).pipe(Schema.filter(outcome => (outcome.outcome === "failed") === Option.isSome(outcome.reason)))
@@ -27,8 +34,9 @@ export const UpdateRequestFields = Schema.Struct({
   nonce: RequestNonce,
   distro: Schema.optionalWith(PlatformVersion, { as: "Option", exact: true }),
   distro_version: Schema.optionalWith(PlatformVersion, { as: "Option", exact: true }),
+  owner: Schema.optionalWith(UpdateOwner, { as: "Option", exact: true }),
   reason: Schema.optionalWith(UpdateCheckReason, { as: "Option", exact: true }),
-  outcome: Schema.optionalWith(Schema.Literal("applied", "failed"), { as: "Option", exact: true }),
+  outcome: Schema.optionalWith(UpdateOutcomeKind, { as: "Option", exact: true }),
   outcome_version: Schema.optionalWith(Version, { as: "Option", exact: true }),
   outcome_reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
 })

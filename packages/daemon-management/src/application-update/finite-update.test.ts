@@ -22,6 +22,7 @@ const fixture = Effect.gen(function* () {
     outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
     verify: () => Effect.die("Preparation cannot install"), recordAttempt: () => Effect.die("Preparation cannot attempt installation"),
     recordFailure: () => Effect.die("Preparation cannot record installation failure"),
+    complete: () => Effect.die("Preparation cannot complete an installation"),
   })
   const source = ApplicationUpdateSource.of({
     check: () => event("check").pipe(Effect.as(Option.some(release))),
@@ -72,7 +73,7 @@ describe("finite application update preparation", () => {
   })))
   it.each(["Unattempted", "Attempted", "Failed"] as const)("preserves an existing %s installer without redownloading", tag => run(Effect.gen(function* () {
     const { pending, events, provide } = yield* fixture
-    yield* Ref.set(pending, Option.some({ release, installation: tag === "Failed" ? { _tag: tag, reason: "Install failed" } : { _tag: tag } }))
+    yield* Ref.set(pending, Option.some({ release, installation: tag === "Failed" ? { _tag: tag, kind: "install", reason: "Install failed" } : { _tag: tag } }))
     expect((yield* provide(runFiniteUpdatePreparation("download"))).transfer._tag).toBe(tag === "Unattempted" ? "Ready" : "InstallationFailed")
     expect(events).toEqual(["read"])
   })))

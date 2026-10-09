@@ -34,8 +34,9 @@ const fixture = Effect.gen(function* () {
     read: Ref.get(prepared),
     verify: () => step("verify").pipe(Effect.as("archive")),
     recordAttempt: () => step("attempt").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Attempted" } })))),
-    recordFailure: (_, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Failed", reason } })))),
-    discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
+    recordFailure: (_, kind, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Failed", kind, reason } })))),
+    discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))),
+    complete: () => step("complete").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
     prepare: () => Effect.die("Unexpected download"),
   })
   const stager = MacUpdateArchiveStager.of({ stage: (_, staging) => Effect.gen(function* () {
@@ -83,19 +84,19 @@ describe.skipIf(process.platform !== "darwin")("prepared macOS installation", ()
     const f = yield* fixture
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(MacUpdateArchiveStager, f.stager)))
       .toEqual({ _tag: "Installed", version: "0.1.6" })
-    expect(f.events).toEqual(["verify", "attempt", "stage", "discard"])
+    expect(f.events).toEqual(["verify", "attempt", "stage", "complete"])
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.6")
     expect(yield* f.fs.exists(join(f.root, ".Magnitude.app.update"))).toBe(false)
   })))
   it("retains a committed transaction if preparation retirement fails and reconciles without staging again", () => run(Effect.gen(function* () {
     const f = yield* fixture
-    const failing = { ...f.store, discard: Effect.fail(new PreparedUpdateFailed({ message: "Retirement failed" })) }
+    const failing = { ...f.store, complete: () => Effect.fail(new PreparedUpdateFailed({ message: "Retirement failed" })) }
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, failing), Effect.provideService(MacUpdateArchiveStager, f.stager), Effect.isFailure)).toBe(true)
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.6")
     expect(yield* f.recover.pipe(Effect.provideService(PreparedUpdateStore, f.store)))
       .toEqual({ _tag: "Installed", version: "0.1.6" })
     expect(f.events.filter(event => event === "stage")).toHaveLength(1)
-    expect(f.events).toEqual(["verify", "attempt", "stage", "failure", "discard"])
+    expect(f.events).toEqual(["verify", "attempt", "stage", "failure", "complete"])
     expect(yield* f.store.read).toEqual(Option.none())
   })))
   it("retains the old installation after partial extraction and cleans staging on explicit retry", () => run(Effect.gen(function* () {

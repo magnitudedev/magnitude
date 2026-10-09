@@ -8,7 +8,6 @@ import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { isDevelopmentBuild } from "../runtime/environment"
-import { runWindowsInstalledUpdate } from "../server/windows-startup-update"
 import { initializeServeUpdates, prepareServeStartup } from "../server/serve-updates"
 
 export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
@@ -24,12 +23,8 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const profile = resolveApplicationProfile({ runtime, home: homedir(), platform: process.platform, acceptance: false, environment: process.env })
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
-  if (yield* runWindowsInstalledUpdate(runtime, profile, stateDirectory, true)) {
-    yield* Effect.sync(() => { process.exitCode = 75 })
-    return
-  }
   yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
-    prepareStartup: prepareServeStartup(runtime, profile, addon, stateDirectory).pipe(
+    prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
     initializeUpdates: initializeServeUpdates(runtime, profile, addon),
     updateReady: version => Effect.sync(() => { process.stderr.write(`Magnitude ${version} is ready to install. Stop the server, then run: magnitude serve\n`) }),

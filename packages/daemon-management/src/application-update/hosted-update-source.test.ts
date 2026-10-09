@@ -31,7 +31,7 @@ vi.mock("@magnitudedev/release/hosted-update", async importOriginal => {
 const store = (outcome: Option.Option<UpdateOutcome>, reported: Ref.Ref<number>): PreparedUpdateStore => ({
   outcome: Effect.succeed(outcome), markOutcomeReported: Ref.update(reported, n => n + 1), recordOutcome: () => Effect.void,
   read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("unused"), recordAttempt: () => Effect.void,
-  recordFailure: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void,
+  recordFailure: () => Effect.void, complete: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void,
 })
 const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.0", os: "windows", os_version: "11", arch: "x64", package: "windows-exe" })
 const options = { origin: "https://example.com", metadata, dataDirectory: "/unused", userAgent: "fixture", sign: () => Effect.succeed("unused"), trustedPublishers: new Map() }

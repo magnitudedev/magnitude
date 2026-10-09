@@ -4,16 +4,24 @@ import { createHash, type KeyObject } from "node:crypto"
 import { join } from "node:path"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "@magnitudedev/release/executables"
 import { linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity, type LinuxPackageFormat } from "@magnitudedev/release/linux-package"
-import { acceptsUpdateRelease, UpdateRelease, verifyUpdateRelease } from "@magnitudedev/release/hosted-update"
+import { acceptsUpdateRelease, UpdateRelease, verifyUpdateRelease, type UpdateFailureReason } from "@magnitudedev/release/hosted-update"
 import { GuardedCommand } from "@magnitudedev/utils/guarded-command"
 
 export const LinuxPackageUpdate = Schema.Struct({
   release: UpdateRelease,
   packagePath: Schema.NonEmptyString,
 })
+/** Failures the privileged installer classifies itself; authorization failures belong to sudo or Polkit. */
+export const LinuxPackageFailureReason = Schema.Literal("verify", "install")
 export class LinuxPackageUpdateFailed extends Schema.TaggedError<LinuxPackageUpdateFailed>()("LinuxPackageUpdateFailed", {
+  reason: LinuxPackageFailureReason,
   message: Schema.String,
 }) {}
+/** Exit statuses of `_install-application-update`, distinct from sudo (1) and pkexec (126, 127). */
+export const linuxPackageUpdateExitCode = { verify: 3, install: 4 } as const
+export const linuxUpdateFailureReason = (code: number): Exclude<UpdateFailureReason, "startup"> =>
+  code === linuxPackageUpdateExitCode.verify ? "verify" : code === linuxPackageUpdateExitCode.install ? "install"
+  : code === 1 || code === 126 || code === 127 ? "authorization" : "install"
 export interface LinuxPackageInstaller {
   readonly install: (request: typeof LinuxPackageUpdate.Type) => Effect.Effect<void, LinuxPackageUpdateFailed>
 }
@@ -31,19 +39,19 @@ export const makeLinuxPackageInstaller = (options: {
   const guarded = yield* GuardedCommand
   return LinuxPackageInstaller.of({ install: request => Effect.scoped(Effect.gen(function* () {
     if (process.platform !== "linux" || process.getuid?.() !== 0 || !Number.isSafeInteger(options.callerUid) || options.callerUid <= 0) {
-      return yield* new LinuxPackageUpdateFailed({ message: "Package installation requires system authorization from your desktop session." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "install", message: "Package installation requires system authorization from your desktop session." })
     }
     if (process.arch !== "arm64" && process.arch !== "x64") {
-      return yield* new LinuxPackageUpdateFailed({ message: "Unsupported package architecture." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "Unsupported package architecture." })
     }
     const target = { os: "linux" as const, arch: process.arch, package: options.package }
     const release = yield* verifyUpdateRelease(request.release, target, options.trustedPublishers)
     if (!acceptsUpdateRelease(release, options.currentVersion)) {
-      return yield* new LinuxPackageUpdateFailed({ message: "This package is not a newer Magnitude release for this machine." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "This package is not a newer Magnitude release for this machine." })
     }
     const source = yield* fs.stat(request.packagePath)
     if (source.type !== "File" || Number(source.size) !== release.bytes || Option.getOrUndefined(source.uid) !== options.callerUid) {
-      return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update is missing or has changed." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The downloaded update is missing or has changed." })
     }
     // Copy before verification so an unprivileged writer cannot change the bytes installed as root.
     const directory = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-package-update-" })
@@ -53,15 +61,15 @@ export const makeLinuxPackageInstaller = (options: {
     const digest = createHash("sha256")
     yield* fs.stream(request.packagePath).pipe(Stream.tap(bytes => Effect.gen(function* () {
       copied += bytes.length
-      if (copied > release.bytes) return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update grew during preparation." })
+      if (copied > release.bytes) return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The downloaded update grew during preparation." })
       digest.update(bytes)
     })), Stream.run(fs.sink(archive, { flag: "wx", mode: 0o600 })))
     yield* fs.chmod(archive, 0o400)
     if (Number((yield* fs.stat(archive)).size) !== release.bytes) {
-      return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update size changed during preparation." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The downloaded update size changed during preparation." })
     }
     if (digest.digest("hex") !== release.sha256) {
-      return yield* new LinuxPackageUpdateFailed({ message: "The downloaded update failed publisher verification." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The downloaded update failed publisher verification." })
     }
     const query = target.package === "deb"
       ? Command.make("/usr/bin/dpkg-deb", "--show", "--showformat=${Package}\t${Version}\t${Architecture}", archive)
@@ -73,7 +81,7 @@ export const makeLinuxPackageInstaller = (options: {
     const versionPrefix = `${linuxPackageVersion(target.package, release.version)}-`
     if (identity.length !== 3 || identity[0] !== LINUX_DESKTOP_PACKAGE_NAME || identity[2] !== arch
       || !identity[1]!.startsWith(versionPrefix) || !/^[1-9][0-9]*$/.test(identity[1]!.slice(versionPrefix.length))) {
-      return yield* new LinuxPackageUpdateFailed({ message: "The package identity does not match the signed Magnitude release." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The package identity does not match the signed Magnitude release." })
     }
     const environment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
     const result = yield* (target.package === "deb"
@@ -81,7 +89,7 @@ export const makeLinuxPackageInstaller = (options: {
       : target.package === "rpm" ? guarded.run("/usr/bin/dnf", ["--assumeyes", "install", archive], environment)
       : guarded.run("/usr/bin/pacman", ["--upgrade", "--noconfirm", "--", archive], environment))
     yield* Effect.sync(() => { process.stdout.write(result.stdout); process.stderr.write(result.stderr) })
-    if (result.code !== 0) return yield* new LinuxPackageUpdateFailed({ message: "The system package manager could not install Magnitude. Check its installation details before retrying." })
+    if (result.code !== 0) return yield* new LinuxPackageUpdateFailed({ reason: "install", message: "The system package manager could not install Magnitude. Check its installation details before retrying." })
   })).pipe(Effect.mapError(error => error instanceof LinuxPackageUpdateFailed ? error
-    : new LinuxPackageUpdateFailed({ message: "The signed application package could not be verified or installed." }))) })
+    : new LinuxPackageUpdateFailed({ reason: "verify", message: "The signed application package could not be verified or installed." }))) })
 })

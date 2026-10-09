@@ -1,0 +1,19 @@
+# Inert until `magnitude server setup` creates the magnitude user and enables this unit.
+[Unit]
+Description=Magnitude server
+Documentation=https://docs.magnitude.dev/remote-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=magnitude
+Group=magnitude
+ExecStart=/usr/bin/magnitude serve
+Restart=always
+RestartSec=3
+KillMode=control-group
+UMask=0007
+
+[Install]
+WantedBy=multi-user.target

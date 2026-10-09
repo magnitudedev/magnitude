@@ -49,11 +49,24 @@ the authorizing user's identity and installed publisher trust. Success requires 
 package installation and the replacement CLI reporting the prepared version before retained state
 is removed. Cancellation retires privileged installation descendants, cannot report success or clear
 an attempted installation, and preserves package-manager repair state when replacement was interrupted.
-Linux Headless startup considers only unattempted preparation before acquiring shared installation
-admission or starting a service. It checks authorization for the exact installed helper without a
-prompt; unavailable authorization retains preparation and permits ordinary startup. An admitted
-installation must complete and verify replacement before the foreground process executes the new
-CLI with the same invocation. Failed or interrupted attempts are never automatically retried.
+No owner installs a prepared update at startup. Desktop launch and Headless `serve` start
+normally with the update retained; Desktop offers Restart and a terminal owner prints the install
+command. Startup only completes an interrupted macOS transaction from its receipt. Failed or
+interrupted attempts are never automatically retried.
+
+The person at a Linux desktop installs without a password: the package's Polkit action admits the
+installed helper's exact update entry for active local sessions and requires admin authentication
+for inactive and remote sessions. The action matches the helper's first argument, so it authorizes
+no other CLI entry. Restart remains the explicit installation step.
+
+Every installation path records its outcome with the prepared release. Success records `applied`
+before retiring the preparation, so a terminal installation that executes the new version is still
+counted. A failure records its reason where it is classified, never by parsing its message:
+`verify` for signature, digest, version, architecture or package-identity refusal, `install` for an
+installer or package-manager failure, `authorization` when sudo or Polkit refuses, `startup` when
+the installed version does not reach Ready, and `incomplete` for an attempt with no recorded result.
+The privileged Linux helper reports its class through a distinct exit status, separate from the
+statuses sudo and pkexec use for authorization. The outcome is sent once with the next check.
 
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before

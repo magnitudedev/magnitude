@@ -71,7 +71,6 @@ let canPresentErrors = process.platform !== "win32"
 let systemShutdownRequested = false
 let earlyQuitRequested = false
 let restartPreparedUpdate: ((intent: UpdateInstallationIntent) => Effect.Effect<"Started" | "Deferred", ApplicationUpdateFailed>) | undefined
-let startupUpdateStarted = false
 let startupMacUpdate = false
 let macUpdateOperation: "Install" | "Recover" = "Install"
 let startupUpdateDeferred = false
@@ -169,7 +168,7 @@ const program = Effect.scoped(Effect.gen(function* () {
         else return unavailableApplicationUpdate("An application update is being installed.")
       }
       if (process.platform === "darwin" && !earlyQuitRequested) {
-        const operation = yield* macStartupUpdateOperation(dirname(dirname(process.resourcesPath)), app.getVersion()).pipe(
+        const operation = yield* macStartupUpdateOperation(dirname(dirname(process.resourcesPath))).pipe(
           Effect.provideService(PreparedUpdateStore, store), Effect.provide(NodeContext.layer))
         if (Option.isSome(operation)) {
           startupMacUpdate = true
@@ -178,12 +177,8 @@ const program = Effect.scoped(Effect.gen(function* () {
           return unavailableApplicationUpdate("Completing the prepared application update.")
         }
       }
-      let pending = yield* reconcilePreparedUpdate(app.getVersion()).pipe(Effect.provideService(PreparedUpdateStore, store))
-      if (Option.isSome(pending) && pending.value.installation._tag === "Unattempted" && !earlyQuitRequested) {
-        const attempted = yield* restartPreparedUpdate!({ continuation: { _tag: "Desktop", showWindow: !background }, allowAuthorizationPrompt: !background }).pipe(Effect.either)
-        startupUpdateStarted = attempted._tag === "Right" && attempted.right === "Started"
-        pending = yield* store.read
-      }
+      // A downloaded update waits for Restart; launch never installs it.
+      const pending = yield* reconcilePreparedUpdate(app.getVersion()).pipe(Effect.provideService(PreparedUpdateStore, store))
       return yield* makeApplicationUpdate(pending).pipe(
         Effect.provideService(ApplicationUpdateSource, platform.source), Effect.provideService(PreparedUpdateStore, store), Effect.provideService(UpdatePreferences, preferences))
     }).pipe(
@@ -192,7 +187,6 @@ const program = Effect.scoped(Effect.gen(function* () {
     )
   if (startupUpdateDeferred) return "Quit" as const
   if (startupMacUpdate) return "InstallMacUpdate" as const
-  if (startupUpdateStarted) return "RestartUpdate" as const
   const updateSchedule = yield* makeUpdateSchedule(updates.check)
   const resumeUpdates = () => run(updateSchedule.resume)
   powerMonitor.on("resume", resumeUpdates)

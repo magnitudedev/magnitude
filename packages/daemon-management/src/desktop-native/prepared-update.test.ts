@@ -77,8 +77,8 @@ describe("one durable prepared update", () => {
       const store = yield* make
       yield* store.prepare(archive, release)
       yield* store.recordAttempt(release)
-      yield* store.recordFailure(release, "Authorization was cancelled")
-      expect(Option.getOrThrow(yield* store.read).installation).toEqual({ _tag: "Failed", reason: "Authorization was cancelled" })
+      yield* store.recordFailure(release, "authorization", "Authorization was cancelled")
+      expect(Option.getOrThrow(yield* store.read).installation).toEqual({ _tag: "Failed", kind: "authorization", reason: "Authorization was cancelled" })
       yield* store.verify(release)
       yield* store.recordAttempt(release)
       expect(Option.getOrThrow(yield* store.read).installation).toEqual({ _tag: "Attempted" })
@@ -107,7 +107,7 @@ describe("one durable prepared update", () => {
     await run(Effect.gen(function* () {
       const store = yield* make
       yield* store.prepare(archive, release)
-      expect((yield* store.recordFailure(next, "stale helper").pipe(Effect.either))._tag).toBe("Left")
+      expect((yield* store.recordFailure(next, "install", "stale helper").pipe(Effect.either))._tag).toBe("Left")
       expect(Option.getOrThrow(yield* store.read).installation._tag).toBe("Unattempted")
       expect((yield* store.prepare(archive, release).pipe(Effect.either))._tag).toBe("Left")
     }))
@@ -127,8 +127,23 @@ describe("one durable prepared update", () => {
     expect(await readFile(join(root, "identity.pem"), "utf8")).toBe("private identity")
     expect(await readFile(join(root, "config.json"), "utf8")).toBe("{}")
   })
+  it("records applied before removing a completed preparation", async () => {
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      yield* store.prepare(archive, release)
+      yield* store.recordAttempt(release)
+      yield* store.complete(release)
+      expect(Option.isNone(yield* store.read)).toBe(true)
+      expect(yield* store.outcome).toEqual(Option.some({ outcome: "applied", version: release.version, reason: Option.none() }))
+    }))
+    expect(await readdir(join(root, "updates"))).toEqual(["outcome.json"])
+  })
+  it("reads a failure recorded before failures were classified as an install failure", () => {
+    const decoded = Schema.decodeUnknownSync(PreparedUpdate)({ release, installation: { _tag: "Failed", reason: "Old failure" } }, { onExcessProperty: "error" })
+    expect(decoded.installation).toEqual({ _tag: "Failed", kind: "install", reason: "Old failure" })
+  })
   it("rejects duplicate state fields, unsupported modes and unbounded failure messages", () => {
-    for (const installation of [{ _tag: "Downloading" }, { _tag: "Failed", reason: "x".repeat(501) }, { _tag: "Attempted", version: "2.0.0" }]) {
+    for (const installation of [{ _tag: "Downloading" }, { _tag: "Failed", reason: "x".repeat(501) }, { _tag: "Failed", kind: "other", reason: "x" }, { _tag: "Attempted", version: "2.0.0" }]) {
       expect(Schema.decodeUnknownEither(PreparedUpdate)({ release, installation }, { onExcessProperty: "error" })._tag).toBe("Left")
     }
   })

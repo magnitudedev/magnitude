@@ -16,14 +16,14 @@ export const guardLinuxInstallerParent = Effect.try({
     const native = createRequire(import.meta.url)("/usr/lib/magnitude-desktop/resources/desktop-host.node") as { guardInstallerParent(descriptor: number): void }
     native.guardInstallerParent(0)
   },
-  catch: () => new LinuxPackageUpdateFailed({ message: "The installer could not retain the foreground command's lifetime." }),
+  catch: () => new LinuxPackageUpdateFailed({ reason: "install", message: "The installer could not retain the foreground command's lifetime." }),
 })
 
 export const linuxUpdateCallerUid = (environment: Readonly<Record<string, string | undefined>>) => Effect.gen(function* () {
   const value = environment.PKEXEC_UID ?? environment.SUDO_UID
   if (value === undefined || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))
     || (environment.PKEXEC_UID !== undefined && environment.SUDO_UID !== undefined && environment.PKEXEC_UID !== environment.SUDO_UID)) {
-    return yield* new LinuxPackageUpdateFailed({ message: "System authorization did not identify the requesting user." })
+    return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "System authorization did not identify the requesting user." })
   }
   return Number(value)
 })
@@ -32,14 +32,14 @@ export const linuxUpdateCallerUid = (environment: Readonly<Record<string, string
 export const installLinuxApplicationUpdate = (requestPath: string, currentVersion: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   if (process.platform !== "linux" || process.getuid?.() !== 0 || (yield* fs.realPath(process.execPath)) !== installedCli) {
-    return yield* new LinuxPackageUpdateFailed({ message: "Run application updates through the installed Magnitude desktop." })
+    return yield* new LinuxPackageUpdateFailed({ reason: "install", message: "Run application updates through the installed Magnitude desktop." })
   }
   const callerUid = yield* linuxUpdateCallerUid(process.env)
   const trustPath = join(dirname(installedCli), "update-trust.json")
   for (let path = trustPath; ; path = dirname(path)) {
     const info = yield* fs.stat(path)
     if (Option.getOrUndefined(info.uid) !== 0 || (info.mode & 0o022) !== 0 || (yield* fs.realPath(path)) !== path) {
-      return yield* new LinuxPackageUpdateFailed({ message: "The installed publisher trust is not protected by the system." })
+      return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The installed publisher trust is not protected by the system." })
     }
     if (path === parse(path).root) break
   }
@@ -53,18 +53,18 @@ export const installLinuxApplicationUpdate = (requestPath: string, currentVersio
     || basename(requestPath) !== "update.json" || basename(dirname(requestPath)) !== "updates"
     || (yield* fs.realPath(requestPath)) !== requestPath
     || Option.getOrUndefined(requestInfo.uid) !== callerUid) {
-    return yield* new LinuxPackageUpdateFailed({ message: "The application update request is invalid." })
+    return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The application update request is invalid." })
   }
   const trust = yield* fs.readFileString(trustPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Trust))))
   const key = yield* decodePublisherPublicKey(trust.publicKey)
   const format = yield* fs.readFileString(formatPath).pipe(Effect.flatMap(Schema.decodeUnknown(Schema.parseJson(Schema.Struct({ format: LinuxPackageFormat })))))
   const request = yield* fs.stream(requestPath, { bytesToRead: 4097 }).pipe(Stream.runFold(Buffer.alloc(0), (all, bytes) => Buffer.concat([all, bytes])),
     Effect.flatMap(bytes => Effect.gen(function* () {
-      if (bytes.length > 4096) return yield* new LinuxPackageUpdateFailed({ message: "The update request exceeded its size limit." })
+      if (bytes.length > 4096) return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "The update request exceeded its size limit." })
       return yield* Schema.decodeUnknown(Schema.parseJson(PreparedUpdate))(bytes.toString("utf8"), { onExcessProperty: "error" })
     })))
   const installer = yield* makeLinuxPackageInstaller({ currentVersion, package: format.format, callerUid, trustedPublishers: new Map([[trust.keyId, key]]) })
-  if (request.installation._tag !== "Attempted") return yield* new LinuxPackageUpdateFailed({ message: "This update has not been authorized for installation." })
+  if (request.installation._tag !== "Attempted") return yield* new LinuxPackageUpdateFailed({ reason: "verify", message: "This update has not been authorized for installation." })
   yield* installer.install({ release: request.release, packagePath: join(dirname(requestPath), updateInstallerFilename({ os: "linux", arch: process.arch === "arm64" ? "arm64" : "x64", package: format.format })) })
 }).pipe(Effect.mapError(error => error instanceof LinuxPackageUpdateFailed ? error
-  : new LinuxPackageUpdateFailed({ message: "Could not verify the installed publisher trust or update request." })))
+  : new LinuxPackageUpdateFailed({ reason: "verify", message: "Could not verify the installed publisher trust or update request." })))

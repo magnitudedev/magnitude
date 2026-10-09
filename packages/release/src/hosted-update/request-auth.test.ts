@@ -43,6 +43,23 @@ describe("Ollama-compatible update authentication", () => {
       expect(Either.isLeft(await Effect.runPromise(Effect.either(decodeUpdateRequest(withFields(fields), 1000000))))).toBe(true)
     }
   })
+  it("admits the owner, deferred outcomes and startup failures", async () => {
+    const withFields = (fields: Record<string, string>) => { const changed = url(); for (const [key, value] of Object.entries(fields)) changed.searchParams.set(key, value); return changed }
+    const decode = (fields: Record<string, string>) => Effect.runPromise(Effect.either(decodeUpdateRequest(withFields(fields), 1000000)))
+    for (const owner of ["desktop", "headless", "service"]) {
+      const decoded = await decode({ owner })
+      expect(Either.isRight(decoded) && Option.getOrNull(decoded.right.owner)).toBe(owner)
+    }
+    const old = await decode({})
+    expect(Either.isRight(old) && Option.isNone(old.right.owner)).toBe(true)
+    const deferred = await decode({ owner: "service", outcome: "deferred", outcome_version: "1.2.4" })
+    expect(Either.isRight(deferred) && Option.getOrNull(deferred.right.outcome)).toBe("deferred")
+    const startup = await decode({ outcome: "failed", outcome_version: "1.2.4", outcome_reason: "startup" })
+    expect(Either.isRight(startup) && Option.getOrNull(startup.right.outcome_reason)).toBe("startup")
+    for (const fields of [{ owner: "server" }, { owner: "" }, { outcome: "deferred", outcome_version: "1.2.4", outcome_reason: "install" }, { outcome: "deferred" }] as Record<string, string>[]) {
+      expect(Either.isLeft(await decode(fields))).toBe(true)
+    }
+  })
   it("rejects malformed, noncanonical and oversized authorization", async () => {
     const signed = await Effect.runPromise(signUpdateRequest(pair.privateKey, url()))
     for (const value of ["", "x:y", signed + ":x", signed.replace(":", " :"), "a".repeat(1000)]) {

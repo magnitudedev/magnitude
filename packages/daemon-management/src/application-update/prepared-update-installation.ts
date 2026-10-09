@@ -31,11 +31,7 @@ const outcomeOf = (record: PreparedUpdate, applied: boolean): Option.Option<Upda
   switch (record.installation._tag) {
     case "Unattempted": return Option.none()
     case "Attempted": return Option.some({ outcome: "failed", version, reason: Option.some("incomplete") })
-    case "Failed": {
-      const text = record.installation.reason.toLowerCase()
-      return Option.some({ outcome: "failed", version, reason: Option.some(text.includes("verif") || text.includes("changed") ? "verify"
-        : text.includes("authoriz") ? "authorization" : "install") })
-    }
+    case "Failed": return Option.some({ outcome: "failed", version, reason: Option.some(record.installation.kind) })
   }
 }
 
@@ -64,13 +60,13 @@ export const installPreparedUpdate = (intent: UpdateInstallationIntent) => Effec
   if (Option.isNone(pending)) return yield* new ApplicationUpdateFailed({ message: "Download the application update before restarting." })
   const release = pending.value.release
   const archive = yield* store.verify(release).pipe(
-    Effect.tapError(error => store.recordFailure(release, error.message)),
+    Effect.tapError(error => store.recordFailure(release, "verify", error.message)),
   )
   // No native invocation is possible if this write fails, including an uncertain fsync result.
   yield* store.recordAttempt(release)
   yield* installer.install(archive, release, intent.continuation).pipe(
     Effect.catchAllDefect(() => new ApplicationUpdateFailed({ message: "The update installer could not be started." })),
-    Effect.tapError(error => store.recordFailure(release, error.message)),
+    Effect.tapError(error => store.recordFailure(release, "install", error.message)),
   )
   return "Started" as const
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))

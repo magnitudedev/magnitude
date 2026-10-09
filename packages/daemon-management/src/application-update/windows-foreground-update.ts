@@ -16,8 +16,6 @@ export const completeWindowsForegroundUpdate = (options: {
   readonly resources: string
   readonly dataDirectory: string
   readonly version: string
-  readonly automatic: boolean
-  readonly launcherProtocol: string | undefined
 }) => Effect.scoped(Effect.gen(function* () {
   const scope = yield* Effect.scope
   const store = yield* PreparedUpdateStore
@@ -25,15 +23,7 @@ export const completeWindowsForegroundUpdate = (options: {
     yield* acquireApplicationMaintenance(options.stateDirectory)
     yield* recoverWindowsUpdateDirectory(join(options.resources, "desktop-host.node"), options.dataDirectory)
     const pending = yield* reconcilePreparedUpdate(options.version)
-    if (Option.isNone(pending)) {
-      if (!options.automatic) return yield* new ApplicationUpdateFailed({ message: "There is no prepared application update to install." })
-      return Option.none()
-    }
-    if (options.automatic && pending.value.installation._tag !== "Unattempted") return Option.none()
-    if (options.automatic && options.launcherProtocol !== "1") {
-      yield* Effect.sync(() => { process.stderr.write("Use the installed magnitude command on PATH to install the prepared update before serving.\n") })
-      return Option.none()
-    }
+    if (Option.isNone(pending)) return yield* new ApplicationUpdateFailed({ message: "There is no prepared application update to install." })
     yield* acquireUpdateInstallationLease(options.stateDirectory).pipe(Scope.extend(scope))
     const release = pending.value.release
     const archive = yield* Effect.gen(function* () {
@@ -41,7 +31,7 @@ export const completeWindowsForegroundUpdate = (options: {
       const verifier = yield* WindowsInstallerVerifier
       yield* verifier.verify(archive)
       return archive
-    }).pipe(Effect.tapError(error => store.recordFailure(release, error.message)))
+    }).pipe(Effect.tapError(error => store.recordFailure(release, "verify", error.message)))
     yield* store.recordAttempt(release)
     return Option.some({ archive, release })
   }))
@@ -55,8 +45,8 @@ export const completeWindowsForegroundUpdate = (options: {
     if (code !== 0) return yield* new ApplicationUpdateFailed({ message: "The Windows installer could not finish. Retry with `magnitude update install`." })
     const version = (yield* Command.make(join(options.resources, "magnitude.exe"), "--version").pipe(Command.string, Effect.timeout("10 seconds"))).trim()
     if (version !== release.version) return yield* new ApplicationUpdateFailed({ message: "The installed application does not report the prepared update version. Retry the installation." })
-    yield* store.discard
+    yield* store.complete(release)
     return true
   }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })),
-    Effect.tapError(error => store.recordFailure(release, error.message)))
+    Effect.tapError(error => store.recordFailure(release, "install", error.message)))
 })).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))

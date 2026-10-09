@@ -2,13 +2,17 @@ import { FileSystem } from "@effect/platform"
 import { Context, Effect, Option, Schema, Stream } from "effect"
 import { createHash, randomUUID, type KeyObject } from "node:crypto"
 import { join, dirname, basename } from "node:path"
-import { UpdateOutcome, UpdateRelease, verifyUpdateRelease, updateInstallerFilename, type ReleaseTarget } from "@magnitudedev/release/hosted-update"
+import { UpdateFailureReason, UpdateOutcome, UpdateRelease, verifyUpdateRelease, updateInstallerFilename, type ReleaseTarget } from "@magnitudedev/release/hosted-update"
 import { PrivateFilePermissions } from "./private-files"
 
 export const UpdateInstallation = Schema.Union(
   Schema.TaggedStruct("Unattempted", {}),
   Schema.TaggedStruct("Attempted", {}),
-  Schema.TaggedStruct("Failed", { reason: Schema.NonEmptyString.pipe(Schema.maxLength(500)) }),
+  Schema.TaggedStruct("Failed", {
+    reason: Schema.NonEmptyString.pipe(Schema.maxLength(500)),
+    // Records written before failures were classified carry only their message.
+    kind: Schema.optionalWith(UpdateFailureReason, { default: () => "install", exact: true }),
+  }),
 )
 export const PreparedUpdate = Schema.Struct({ release: UpdateRelease, installation: UpdateInstallation })
 export type PreparedUpdate = typeof PreparedUpdate.Type
@@ -24,7 +28,9 @@ export interface PreparedUpdateStore {
   readonly prepare: (archive: string, release: UpdateRelease) => Effect.Effect<void, PreparedUpdateFailed>
   readonly verify: (release: UpdateRelease) => Effect.Effect<string, PreparedUpdateFailed>
   readonly recordAttempt: (release: UpdateRelease) => Effect.Effect<void, PreparedUpdateFailed>
-  readonly recordFailure: (release: UpdateRelease, reason: string) => Effect.Effect<void, PreparedUpdateFailed>
+  readonly recordFailure: (release: UpdateRelease, kind: UpdateFailureReason, reason: string) => Effect.Effect<void, PreparedUpdateFailed>
+  /** The release is installed: records `applied` for the next check, then removes the preparation. */
+  readonly complete: (release: UpdateRelease) => Effect.Effect<void, PreparedUpdateFailed>
   readonly discard: Effect.Effect<void, PreparedUpdateFailed>
   readonly removeAbandonedTransfers: Effect.Effect<void, PreparedUpdateFailed>
   readonly outcome: Effect.Effect<Option.Option<UpdateOutcome>, PreparedUpdateFailed>
@@ -34,7 +40,8 @@ export interface PreparedUpdateStore {
 export const PreparedUpdateStore = Context.GenericTag<PreparedUpdateStore>("daemon-management/PreparedUpdateStore")
 
 const failed = (message: string) => new PreparedUpdateFailed({ message })
-const failureState = (reason: string): PreparedUpdate["installation"] => ({ _tag: "Failed", reason: reason.trim().slice(0, 500) || "The update did not complete." })
+const failureState = (kind: UpdateFailureReason, reason: string): PreparedUpdate["installation"] =>
+  ({ _tag: "Failed", kind, reason: reason.trim().slice(0, 500) || "The update did not complete." })
 
 const makePreparedUpdateRecord = (dataDirectory: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -103,8 +110,8 @@ const makePreparedUpdateRecord = (dataDirectory: string) => Effect.gen(function*
 })
 
 /** The helper records only its exact attempt, while retaining the native installation lease. */
-export const recordPreparedUpdateFailure = (dataDirectory: string, release: UpdateRelease, reason: string) =>
-  makePreparedUpdateRecord(dataDirectory).pipe(Effect.flatMap(record => record.change(release, failureState(reason))))
+export const recordPreparedUpdateFailure = (dataDirectory: string, release: UpdateRelease, kind: UpdateFailureReason, reason: string) =>
+  makePreparedUpdateRecord(dataDirectory).pipe(Effect.flatMap(record => record.change(release, failureState(kind, reason))))
 
 /** Call only under application ownership or the native installer handoff lease. No file acts as a lock. */
 export const makePreparedUpdateStore = (options: {
@@ -133,11 +140,19 @@ export const makePreparedUpdateStore = (options: {
     return path
   }).pipe(Effect.mapError(() => failed("The downloaded update could not be verified. Download it again before installing.")))
 
+  const discard = Effect.gen(function* () {
+    // Metadata is last: an interrupted cleanup remains recognizable on the next launch.
+    yield* fs.remove(installer, { force: true })
+    yield* fs.remove(metadata, { force: true })
+    if (yield* fs.exists(directory)) yield* syncDirectory
+  }).pipe(Effect.uninterruptible, Effect.mapError(() => failed("The prepared update could not be removed.")))
+
   return PreparedUpdateStore.of({
     read, outcome, recordOutcome, markOutcomeReported,
     verify: release => verifyFile(installer, release),
     recordAttempt: release => change(release, { _tag: "Attempted" }),
-    recordFailure: (release, reason) => change(release, failureState(reason)),
+    recordFailure: (release, kind, reason) => change(release, failureState(kind, reason)),
+    complete: release => recordOutcome({ outcome: "applied", version: release.version, reason: Option.none() }).pipe(Effect.zipRight(discard)),
     prepare: (archive, release) => Effect.gen(function* () {
       yield* verifyUpdateRelease(release, options.target, options.trustedPublishers)
       if (Option.isSome(yield* read)) return yield* failed("An update is already prepared.")
@@ -154,12 +169,7 @@ export const makePreparedUpdateStore = (options: {
         }).pipe(Effect.uninterruptible)
       }), () => fs.remove(temporary, { force: true }).pipe(Effect.ignore))
     }).pipe(Effect.mapError(error => error instanceof PreparedUpdateFailed ? error : failed("The downloaded update could not be saved."))),
-    discard: Effect.gen(function* () {
-      // Metadata is last: an interrupted cleanup remains recognizable on the next launch.
-      yield* fs.remove(installer, { force: true })
-      yield* fs.remove(metadata, { force: true })
-      if (yield* fs.exists(directory)) yield* syncDirectory
-    }).pipe(Effect.uninterruptible, Effect.mapError(() => failed("The prepared update could not be removed."))),
+    discard,
     removeAbandonedTransfers: Effect.gen(function* () {
       const transfers = join(options.dataDirectory, "update-downloads")
       if (yield* fs.exists(transfers)) {

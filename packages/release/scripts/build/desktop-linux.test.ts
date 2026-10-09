@@ -1,12 +1,13 @@
 import { BunContext } from "@effect/platform-bun"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { spawnSync } from "node:child_process"
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
-import { buildLinuxDesktopInstaller, validateLinuxPayloadPermissions } from "./desktop-linux"
+import { buildLinuxDesktopInstaller, validateLinuxPayloadPermissions, validateLinuxSystemFiles } from "./desktop-linux"
+import { linuxSystemFiles } from "./linux-system-files"
 import { linuxDesktopInstaller } from "../../src/targets"
 
 describe("Linux prerelease asset names", () => {
@@ -46,6 +47,31 @@ describe("Linux package publisher-trust protection", () => {
   })
 })
 
+describe("Linux system files", () => {
+  const listing = new Map<string, { mode: number; owner: string }>(linuxSystemFiles.map(file => [file.path, { mode: file.mode, owner: "root/root" }]))
+  const validate = (entries: Map<string, { mode: number; owner: string }>) =>
+    Effect.runPromise(validateLinuxSystemFiles(path => Option.fromNullable(entries.get(path))))
+  it("accepts the root-owned unit, Polkit action and 0440 sudoers rule", async () => {
+    await expect(validate(listing)).resolves.toBeUndefined()
+  })
+  it.each([
+    ["a group-readable sudoers rule", "etc/sudoers.d/magnitude", { mode: 0o640, owner: "root/root" }],
+    ["a writable sudoers rule", "etc/sudoers.d/magnitude", { mode: 0o644, owner: "root/root" }],
+    ["a foreign-owned sudoers rule", "etc/sudoers.d/magnitude", { mode: 0o440, owner: "builder/root" }],
+    ["a group-writable unit", "usr/lib/systemd/system/magnitude.service", { mode: 0o664, owner: "root/root" }],
+  ] as const)("rejects %s", async (_, path, entry) => {
+    await expect(validate(new Map([...listing, [path, entry]]))).rejects.toThrow("root-owned")
+  })
+  it("rejects a missing Polkit action", async () => {
+    await expect(validate(new Map([...listing].filter(([path]) => !path.includes("polkit"))))).rejects.toThrow("root-owned")
+  })
+  it("passes visudo", () => {
+    const visudo = ["/usr/sbin/visudo", "/usr/bin/visudo"].find(path => spawnSync(path, ["-V"]).status === 0)
+    if (!visudo) return
+    expect(spawnSync(visudo, ["-cf", linuxSystemFiles.find(file => file.path.startsWith("etc/"))!.source]).status).toBe(0)
+  })
+})
+
 const hasBsdtar = spawnSync("/bin/sh", ["-c", "command -v bsdtar"]).status === 0
 describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package assembly", () => {
   it("produces a root-owned package with admission hook, scriptlets and setuid sandbox", async () => {
@@ -70,6 +96,11 @@ describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package asse
       expect(mtree).toMatch(/uid=0 gid=0/)
       expect(mtree).not.toMatch(/uid=[1-9]/)
       expect(mtree).toMatch(/^\.\/usr\/lib\/magnitude-desktop\/chrome-sandbox .*mode=4755/m)
+      expect(mtree).toMatch(/^\.\/etc\/sudoers\.d\/magnitude .*mode=440/m)
+      expect(mtree).toMatch(/^\.\/etc\/sudoers\.d .*mode=750/m)
+      expect(read("etc/sudoers.d/magnitude").toString()).toContain("magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update *")
+      expect(read("usr/lib/systemd/system/magnitude.service").toString()).toContain("ExecStart=/usr/bin/magnitude serve")
+      expect(read("usr/share/polkit-1/actions/dev.magnitude.update.policy").toString()).toContain("<allow_active>yes</allow_active>")
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
 })

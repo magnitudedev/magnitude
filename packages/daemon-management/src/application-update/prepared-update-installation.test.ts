@@ -17,7 +17,8 @@ const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattem
     prepare: () => Effect.die("No download belongs in restart recovery"),
     verify: () => Effect.sync(() => { events.push("verify"); return "retained-installer" }),
     recordAttempt: () => Effect.sync(() => { events.push("attempt"); pending = Option.some({ release, installation: { _tag: "Attempted" } }) }),
-    recordFailure: (_, reason) => Effect.sync(() => { events.push("failure"); pending = Option.some({ release, installation: { _tag: "Failed", reason } }) }),
+    recordFailure: (_, kind, reason) => Effect.sync(() => { events.push(`failure:${kind}`); pending = Option.some({ release, installation: { _tag: "Failed", kind, reason } }) }),
+    complete: () => Effect.sync(() => { events.push("complete"); pending = Option.none() }),
     discard: Effect.sync(() => { events.push("discard"); pending = Option.none() }),
     removeAbandonedTransfers: Effect.sync(() => { events.push("cleanup"); }),
   }
@@ -44,7 +45,7 @@ describe("prepared update installation", () => {
     expect(h.events).toEqual(["verify", "attempt", "install"])
   })
   it.each(["Unattempted", "Attempted", "Failed"] as const)("cleans a completed %s update based on installed version", async tag => {
-    const h = harness(tag === "Failed" ? { _tag: tag, reason: "previous failure" } : { _tag: tag })
+    const h = harness(tag === "Failed" ? { _tag: tag, kind: "install", reason: "previous failure" } : { _tag: tag })
     expect(Option.isNone(await h.run(reconcilePreparedUpdate("3.0.0")))).toBe(true)
     expect(h.events).toEqual(["cleanup", "discard"])
   })
@@ -55,9 +56,12 @@ describe("prepared update installation", () => {
   })
   it.each([
     [{ _tag: "Attempted" }, "incomplete"],
-    [{ _tag: "Failed", reason: "The downloaded update could not be verified. Download it again before installing." }, "verify"],
-    [{ _tag: "Failed", reason: "System authorization was cancelled" }, "authorization"],
-    [{ _tag: "Failed", reason: "The update installer could not be started." }, "install"],
+    [{ _tag: "Failed", kind: "verify", reason: "The downloaded update could not be verified. Download it again before installing." }, "verify"],
+    [{ _tag: "Failed", kind: "authorization", reason: "System authorization was cancelled" }, "authorization"],
+    [{ _tag: "Failed", kind: "install", reason: "The update installer could not be started." }, "install"],
+    // The recorded kind decides, never the wording of the message.
+    [{ _tag: "Failed", kind: "install", reason: "System authorization or package installation failed." }, "install"],
+    [{ _tag: "Failed", kind: "startup", reason: "The new version did not start." }, "startup"],
   ] as const)("records a still-pending %o as a failed outcome classified %s", async (installation, reason) => {
     const h = harness(installation)
     expect(Option.isSome(await h.run(reconcilePreparedUpdate("1.0.0")))).toBe(true)
@@ -78,7 +82,7 @@ describe("prepared update installation", () => {
     expect(h.events).toEqual(["cleanup"])
   })
   it.each(["Unattempted", "Attempted", "Failed"] as const)("uses the same retained bytes and attempt barrier for explicit %s installation", async tag => {
-    const h = harness(tag === "Failed" ? { _tag: tag, reason: "cancelled" } : { _tag: tag })
+    const h = harness(tag === "Failed" ? { _tag: tag, kind: "authorization", reason: "cancelled" } : { _tag: tag })
     expect(await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }))).toBe("Started")
     expect(h.events).toEqual(["verify", "attempt", "install"])
     expect(Option.getOrThrow(h.pending()).installation).toEqual({ _tag: "Attempted" })
@@ -106,14 +110,14 @@ describe("prepared update installation", () => {
       const h = harness()
       expect((await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }).pipe(Effect.either), { [operation]: () => new PreparedUpdateFailed({ message: "injected failure" }) }))._tag).toBe("Left")
       expect(h.events).not.toContain("install")
-      if (operation === "verify") expect(h.events).toContain("failure")
-      else expect(h.events).not.toContain("failure")
+      if (operation === "verify") expect(h.events).toContain("failure:verify")
+      else expect(h.events.some(event => event.startsWith("failure"))).toBe(false)
     }
   })
   it("persists a known invocation failure against the same release", async () => {
     const h = harness()
     expect((await h.run(installPreparedUpdate({ continuation: { _tag: "Desktop", showWindow: true }, allowAuthorizationPrompt: true }).pipe(Effect.either), {}, { install: () => new ApplicationUpdateFailed({ message: "System authorization was cancelled" }) }))._tag).toBe("Left")
-    expect(h.events).toEqual(["verify", "attempt", "failure"])
-    expect(Option.getOrThrow(h.pending()).installation).toEqual({ _tag: "Failed", reason: "System authorization was cancelled" })
+    expect(h.events).toEqual(["verify", "attempt", "failure:install"])
+    expect(Option.getOrThrow(h.pending()).installation).toEqual({ _tag: "Failed", kind: "install", reason: "System authorization was cancelled" })
   })
 })

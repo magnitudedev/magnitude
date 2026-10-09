@@ -29,28 +29,10 @@ export const initializeServeUpdates = (runtime: ApplicationRuntime, profile: App
   }).pipe(Effect.provide(privateFiles))
 }).pipe(Effect.provide(BunContext.layer), Effect.catchAll(() => Effect.succeed(unavailableApplicationUpdate("Application update setup could not be read."))))
 
-/** Startup installation precedes the shared package lease and every service process. */
-export const prepareServeStartup = (runtime: ApplicationRuntime, profile: ApplicationProfile, addon: string, stateDirectory: string) => Effect.gen(function* () {
-  if (runtime._tag !== "Installed" || (process.platform !== "linux" && process.platform !== "darwin")) return
+/** Startup only completes an interrupted macOS transaction; downloaded updates install at an idle point. */
+export const prepareServeStartup = (runtime: ApplicationRuntime, profile: ApplicationProfile, stateDirectory: string) => Effect.gen(function* () {
+  if (runtime._tag !== "Installed" || process.platform !== "darwin") return
   const architecture = yield* Schema.decodeUnknown(Schema.Literal("arm64", "x64"))(process.arch)
-  const preparation = yield* makeInstalledUpdatePreparation({ resources: runtime.resourcesDirectory, addonPath: addon,
-    dataDirectory: profile.dataDirectory, version: CLI_VERSION, osVersion: release(), platform: process.platform, architecture, isolated: profile.isolated }).pipe(Effect.option)
-  if (Option.isNone(preparation)) return
-  const store = preparation.value.store
-  if (process.platform === "darwin") return yield* prepareMacForegroundStartup({ resources: runtime.resourcesDirectory,
-    stateDirectory, dataDirectory: profile.dataDirectory, version: CLI_VERSION, architecture, arguments: process.argv.slice(2) }).pipe(
-      Effect.provideService(PreparedUpdateStore, store))
-  const pending = yield* reconcilePreparedUpdate(CLI_VERSION).pipe(Effect.provideService(PreparedUpdateStore, store))
-  if (Option.isNone(pending) || pending.value.installation._tag !== "Unattempted") return
-  const authorized = yield* Command.make("/usr/bin/sudo", "-n", "-l", "--", "/usr/lib/magnitude-desktop/resources/magnitude",
-    "_install-application-update", join(profile.dataDirectory, "updates", "update.json"), "--parent-stdin").pipe(Command.exitCode,
-      Effect.map(code => code === 0), Effect.catchAll(() => Effect.succeed(false)))
-  if (!authorized) {
-    yield* Effect.sync(() => { process.stderr.write("Automatic update installation requires system authorization. Stop the server and run `magnitude update install` from a terminal to authorize it.\n") })
-    return
-  }
-  const continuation = yield* makeUnixProcessContinuation(addon)
-  yield* acquireUpdateInstallationLease(stateDirectory)
-  yield* completeLinuxForegroundUpdate(profile.dataDirectory, false).pipe(Effect.provideService(PreparedUpdateStore, store))
-  return yield* continuation.replace(process.execPath, process.argv.slice(2), process.env)
+  return yield* prepareMacForegroundStartup({ resources: runtime.resourcesDirectory,
+    stateDirectory, dataDirectory: profile.dataDirectory, version: CLI_VERSION, architecture, arguments: process.argv.slice(2) })
 }).pipe(Effect.provide([unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))]))
