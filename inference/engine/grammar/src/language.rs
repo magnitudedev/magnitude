@@ -11,9 +11,11 @@ const FUEL: u64 = 200_000;
 /// counts as positive, which only makes the rendering finer.
 const TOTAL_FUEL: u64 = 20_000_000;
 /// Repetition bounds beyond this are asked about as unbounded. Derivative
-/// work grows with a counted bound, and a superset can only turn an answer
-/// positive, which is as safe as a question left unanswered.
-const COUNTED: u32 = 256;
+/// work grows with a counted bound and multiplies across the bounds one
+/// question combines (two strings of at most 200 characters exhaust it), and
+/// a superset can only turn an answer positive, which is as safe as a
+/// question left unanswered.
+const COUNTED: u32 = 16;
 
 /// derivre expressions for terminals and batched emptiness questions.
 pub(crate) struct Regexes {
