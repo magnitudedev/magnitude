@@ -85,3 +85,27 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
 })
+
+describe.skipIf(process.platform === "win32")("macOS installation shell with the server set up", () => {
+  it("refuses before downloading and says how to reinstall", () => {
+    const root = mkdtempSync(join(tmpdir(), "magnitude-shell-mac-server-"))
+    try {
+      const bin = join(root, "bin"), plist = join(root, "dev.magnitude.server.plist")
+      mkdirSync(bin)
+      writeFileSync(plist, "")
+      const executable = (name: string, contents: string) => writeFileSync(join(bin, name), contents, { mode: 0o700 })
+      executable("uname", '#!/bin/sh\ncase "$1" in -m) echo arm64;; *) echo Darwin;; esac\n')
+      executable("curl", `#!/bin/sh\ntouch ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
+      for (const tool of ["mktemp", "rm"]) {
+        const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
+        if (found) symlinkSync(found, join(bin, tool))
+      }
+      const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
+        .replace("mac_server=/Library/LaunchDaemons/dev.magnitude.server.plist", `mac_server=${plist}`)
+      const result = spawnSync("/bin/sh", ["-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
+      expect(result.status).not.toBe(0)
+      expect(result.stderr).toContain("magnitude server remove")
+      expect(existsSync(join(root, "downloaded"))).toBe(false)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+})

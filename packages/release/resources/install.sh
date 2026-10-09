@@ -8,6 +8,7 @@ publisher_key='@MAGNITUDE_PUBLISHER_KEY@'
 channel=stable
 destination=/Applications/Magnitude.app
 server_marker=/etc/magnitude/server
+mac_server=/Library/LaunchDaemons/dev.magnitude.server.plist
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 [ "$#" -eq 0 ] || fail 'install.sh takes no options. Run: curl -fsSL https://magnitude.dev/install.sh | sh'
 case "$origin" in https://*) ;; *) fail 'The installation script has no release origin.' ;; esac
@@ -31,6 +32,8 @@ has_terminal() { (: </dev/tty) 2>/dev/null; }
 
 case "$(uname -s)" in
   Darwin)
+    # The server's LaunchDaemon holds the app and installs its own updates when idle.
+    [ ! -e "$mac_server" ] || fail 'Magnitude runs as a server on this Mac and installs its own updates when idle. To reinstall it now, run `magnitude server remove`, then this installer, then `magnitude server setup`.'
     case "$apple_team" in *[!A-Z0-9]*|'') fail 'The installation script has no Apple publisher identity.' ;; esac
     [ "${#apple_team}" -eq 10 ] || fail 'Invalid Apple publisher identity.'
     offer darwin mac-zip
