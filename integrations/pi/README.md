@@ -49,7 +49,7 @@ free its memory.
 Connect your installed models to Pi:
 
 ```sh
-magnitude connections add pi
+magnitude connections connect pi
 ```
 
 Then restart Pi or run `/reload`.

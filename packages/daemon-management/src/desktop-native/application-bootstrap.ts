@@ -84,6 +84,8 @@ export const applicationServiceCommand = (options: {
     arguments: [...(runtime._tag === "Installed" ? [] : [path.join(runtime.repository, "packages/acn/src/binary.ts")]),
       "serve", "--data-dir", profile.dataDirectory, "--port", String(profile.port)],
     environment: { ...environment, MAGNITUDE_NATIVE_HOST: applicationNativeHostPath(runtime, platform, architecture),
+      // The server's service account has no harnesses; each person connects theirs from the CLI.
+      ...(profile.groupAccess ? { MAGNITUDE_SERVER_SERVICE: "1" } : {}),
       ...(runtime._tag === "Installed" || environment.MAGNITUDE_ICN_PATH ? {} : {
         MAGNITUDE_ICN_PATH: path.join(runtime.repository, "inference/target/development/installation.json"),
       }) },

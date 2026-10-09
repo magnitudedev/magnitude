@@ -19,7 +19,9 @@
     "commander": "^14.0.1",
     "effect": "^3.21.2",
     "string-width": "^8.1.1",
-    "@magnitudedev/daemon-management": "workspace:*"
+    "@magnitudedev/daemon-management": "workspace:*",
+    "@magnitudedev/harness-connections": "workspace:*",
+    "@magnitudedev/storage": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.8.3"

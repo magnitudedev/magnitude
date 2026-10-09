@@ -59,7 +59,7 @@ describe("headless CLI entrypoint", () => {
     ["catalog", "cancel", "test:gguf:q4"], ["catalog", "remove", "test:gguf:q4"],
     ["models", "status"], ["models", "status", "test:gguf:q4"],
     ["models", "load", "test:gguf:q4"], ["models", "stop"],
-    ["connections", "add", "pi"], ["connections", "sync", "pi"],
+    ["connections", "connect", "pi"], ["connections", "sync", "pi"],
   ])("%j requires an existing owner without creating a profile", async (...args) => {
     const root = await mkdtemp(join(tmpdir(), "mag-connect-only-"))
     const profile = join(root, "absent")

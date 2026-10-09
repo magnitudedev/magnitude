@@ -17,7 +17,7 @@ magnitude models status [model-id]
 magnitude models load <model-id>
 magnitude models stop
 magnitude connections list
-magnitude connections add <harness> [--set-model <model-id>] [--install-skill]
+magnitude connections connect <harness> [--set-model <model-id>] [--install-skill]
 magnitude connections sync [harness]
 magnitude connections remove <harness>
 magnitude docs [topic-id]
@@ -47,5 +47,5 @@ Discovery scans existing local Hugging Face caches for usable GGUF models withou
 contacting the Hub. Assessment evaluates catalog and discovered models for the current hardware,
 including compatibility, memory fit, serving configuration, acceleration, and expected speed.
 
-`connections add --install-skill` installs or refreshes the bundled Magnitude skill in the selected
+`connections connect --install-skill` installs or refreshes the bundled Magnitude skill in the selected
 harness's supported user-wide location before applying the connection.

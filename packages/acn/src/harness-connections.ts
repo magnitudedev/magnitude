@@ -17,7 +17,7 @@ import {
   makeHarnessConnectionService,
   resolveHarnessConnectionPaths,
   resolveHarnessEnvironment,
-  type HarnessConnectionError,
+  HarnessConnectionError,
 } from "@magnitudedev/harness-connections"
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
@@ -65,6 +65,13 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     }).pipe(Effect.provideService(CommandExecutor.CommandExecutor, executor))
   }).pipe(Effect.provide(Layer.mergeAll(Layer.succeedContext(context), BunSqliteDriverLayer))))
   const changed = PubSub.publish(changes, undefined).pipe(Effect.asVoid)
+  // Running as the Linux server's service account, configuration written here would land in its
+  // home, where no one's harnesses read it. People connect harnesses from their own terminal.
+  const serverService = process.env.MAGNITUDE_SERVER_SERVICE === "1"
+  const refuseOnServer = (operation: "connect" | "sync" | "disconnect", harness: Option.Option<HarnessId>) => serverService
+    ? Effect.fail(new HarnessConnectionError({ operation, harness: Option.getOrUndefined(harness), message:
+      "This Magnitude runs as a server. Connect a harness on this machine from your own terminal with `magnitude connections connect <harness>`, or copy its setup to another computer." }))
+    : Effect.void
 
   const inspect = service.pipe(
     Effect.flatMap(connections => connections.inspect),
@@ -75,7 +82,7 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     watch: Stream.concat(Stream.succeed(undefined), Stream.merge(Stream.fromPubSub(changes), Stream.fromSchedule(Schedule.spaced("2 seconds")))).pipe(
       Stream.mapEffect(() => inspect),
     ),
-    connect: request => service.pipe(
+    connect: request => refuseOnServer("connect", Option.some(request.harness)).pipe(Effect.zipRight(service),
       Effect.flatMap(connections => connections.connect(request.harness, { model: request.model, installSkill: request.installSkill, launchOnStartup: false })),
       Effect.mapError(failed),
       Effect.map((result): HarnessConnectOutcome => ({
@@ -90,13 +97,13 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
       })),
       Effect.ensuring(changed),
     ),
-    sync: harness => service.pipe(
+    sync: harness => refuseOnServer("sync", harness).pipe(Effect.zipRight(service),
       Effect.flatMap(connections => connections.sync(Option.getOrUndefined(harness))),
       Effect.mapError(failed),
       Effect.asVoid,
       Effect.ensuring(changed),
     ),
-    disconnect: harness => service.pipe(
+    disconnect: harness => refuseOnServer("disconnect", Option.some(harness)).pipe(Effect.zipRight(service),
       Effect.flatMap(connections => connections.disconnect(harness)),
       Effect.mapError(failed),
       Effect.ensuring(changed),

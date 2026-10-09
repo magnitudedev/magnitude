@@ -50,11 +50,11 @@ Prefix each command with `magnitude`. Recommendation preferences are `fastest`, 
 | Command | Purpose |
 | --- | --- |
 | `magnitude connections list` | Inspect installed agents and connection state. |
-| `magnitude connections add <harness>` | Configure an agent. |
+| `magnitude connections connect <harness>` | Configure an agent on this computer, for you. |
 | `magnitude connections sync [harness]` | Refresh one or all configured integrations. |
 | `magnitude connections remove <harness>` | Disconnect an agent. |
 
-`connections add` accepts `--set-model <model-id>` to select a model and `--install-skill` to install or refresh its Magnitude skill. Skill installation is automatic for Pi.
+`connections connect` accepts `--set-model <model-id>` to select a model and `--install-skill` to install or refresh its Magnitude skill. Skill installation is automatic for Pi.
 
 Harness IDs: `pi`, `opencode`, `hermes`, `openclaw`, `codex`, `claude-code`, `oh-my-pi`, and `cline`. See [Integrations](/integrations/overview) for agent-specific instructions.
 

@@ -10,13 +10,13 @@ export const registerConnectionsCommand = (program: Command): void => {
     .description("List supported harnesses and their Magnitude status")
     .action(() => loadRuntime().then(({ listConnections }) => listConnections()))
 
-  connections.command("add")
-    .description("Connect installed Magnitude models to a harness")
+  connections.command("connect")
+    .description("Connect a harness on this computer, for you, to Magnitude's models")
     .argument("<harness>", "Harness ID")
     .option("--set-model <model-id>", "Also select this Magnitude model in the harness")
     .option("--install-skill", "Install or refresh the Magnitude skill (automatic for Pi)")
-    .action((harness, options) => loadRuntime().then(({ addConnection }) =>
-      addConnection(harness, options.setModel, options.installSkill === true)))
+    .action((harness, options) => loadRuntime().then(({ connectConnection }) =>
+      connectConnection(harness, options.setModel, options.installSkill === true)))
 
   connections.command("sync")
     .description("Refresh configured harnesses with installed Magnitude models")

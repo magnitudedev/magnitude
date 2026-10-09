@@ -62,6 +62,15 @@ describe("application bootstrap selection", () => {
     expect(environment).not.toHaveProperty("MAGNITUDE_NATIVE_HOST")
   })
 
+  it("marks the server profile's service so it never writes harness configuration", () => {
+    const runtime: ApplicationRuntime = { _tag: "Installed", resourcesDirectory: "/usr/lib/magnitude-desktop/resources" }
+    const command = (server: boolean) => applicationServiceCommand({ output: "Foreground", runtime, platform: "linux", architecture: "x64", environment: {},
+      profile: resolveApplicationProfile({ runtime, home: "/home/ada", platform: "linux", acceptance: false, environment: {}, server }) })
+    expect(command(true).environment.MAGNITUDE_SERVER_SERVICE).toBe("1")
+    expect(command(true).arguments).toEqual(["serve", "--data-dir", "/var/lib/magnitude", "--port", "10100"])
+    expect(command(false).environment).not.toHaveProperty("MAGNITUDE_SERVER_SERVICE")
+  })
+
   it("runs development source with the chosen runtime and preserves explicit engine selection", () => {
     const profile = resolveApplicationProfile({ runtime: development, home: "/home/user", platform: "darwin", acceptance: false, environment: {}, server: false })
     const options = { output: "DiagnosticTail" as const, runtime: development, profile, platform: "darwin", architecture: "arm64" }

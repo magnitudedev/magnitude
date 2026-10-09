@@ -4,10 +4,9 @@ import {
   type HarnessConnectOutcome,
   type HarnessConnectionStatus,
   type HarnessId,
-  type MagnitudeClient,
 } from "@magnitudedev/sdk"
-import { Data, Effect, Option, Schema, Stream } from "effect"
-import { existingAcnConnection } from "../server/acn-connection"
+import { Data, Effect, Option, Schema } from "effect"
+import { localHarnessConnections, requireLocalService } from "../server/local-harness-connections"
 import { renderFields, renderTable, runCommand } from "./output"
 
 class ConnectionsCommandError extends Data.TaggedError("ConnectionsCommandError")<{
@@ -25,21 +24,9 @@ const parseModel = (input: string | undefined) => input === undefined
       Effect.mapError(() => new ConnectionsCommandError({ message: `Invalid model ID: ${input}` })),
     )
 
-/** Harness connections belong to the running service, which configures harnesses on its own machine. */
-const withClient = <A>(use: (client: Pick<MagnitudeClient, "connections">) => Effect.Effect<A, unknown>) =>
-  Effect.scoped(Effect.gen(function* () {
-    const connection = yield* existingAcnConnection
-    yield* connection.startup.awaitReady
-    return yield* use(connection.client)
-  }))
-
-const readConnections = (client: Pick<MagnitudeClient, "connections">) => client.connections.watchHarnessConnections({}).pipe(
-  Stream.runHead,
-  Effect.flatMap(Option.match({
-    onNone: () => Effect.fail(new ConnectionsCommandError({ message: "Magnitude did not report harness connections." })),
-    onSome: snapshot => snapshot._tag === "Ready" ? Effect.succeed(snapshot.connections) : Effect.fail(new ConnectionsCommandError({ message: snapshot.message })),
-  })),
-)
+/** Harness connections belong to the person running the command; this process writes them into their home. */
+const withConnections = <A>(use: (connections: Effect.Effect.Success<typeof localHarnessConnections>) => Effect.Effect<A, unknown>) =>
+  localHarnessConnections.pipe(Effect.flatMap(use))
 
 export const renderConnections = (rows: readonly HarnessConnectionStatus[]): string => {
   if (rows.length === 0) return "No supported harnesses are available.\n"
@@ -53,7 +40,7 @@ export const renderConnections = (rows: readonly HarnessConnectionStatus[]): str
 }
 
 export const listConnections = () => runCommand({
-  effect: withClient(readConnections),
+  effect: withConnections(connections => connections.inspect),
   render: renderConnections,
 })
 
@@ -90,7 +77,7 @@ export const renderAddedConnection = ({
   ].join("\n")
 }
 
-export const addConnection = (
+export const connectConnection = (
   harnessInput: string,
   modelInput: string | undefined,
   installSkill: boolean,
@@ -98,7 +85,13 @@ export const addConnection = (
   effect: Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
     const model = yield* parseModel(modelInput)
-    const connection = yield* withClient(client => client.connections.connectHarness({ harness, model, installSkill }))
+    yield* requireLocalService
+    const result = yield* withConnections(connections => connections.connect(harness, { model, installSkill, launchOnStartup: false }))
+    const connection: HarnessConnectOutcome = {
+      companion: Option.map(result.companion, companion => ({ name: companion.name, source: companion.source,
+        securityNotice: companion.securityNotice, status: companion.status, activationInstructions: companion.activationInstructions })),
+      skillInstalled: result.skillInstalled,
+    }
     return { harness, model, connection }
   }),
   render: renderAddedConnection,
@@ -107,7 +100,8 @@ export const addConnection = (
 export const syncConnections = (harnessInput: string | undefined) => runCommand({
   effect: Effect.gen(function* () {
     const harness: Option.Option<HarnessId> = harnessInput === undefined ? Option.none() : Option.some(yield* parseHarness(harnessInput))
-    return yield* withClient(client => client.connections.syncHarnessConnections({ harness }).pipe(Effect.zipRight(readConnections(client))))
+    yield* requireLocalService
+    return yield* withConnections(connections => connections.sync(Option.getOrUndefined(harness)).pipe(Effect.zipRight(connections.inspect)))
   }),
   render: renderConnections,
 })
@@ -115,7 +109,7 @@ export const syncConnections = (harnessInput: string | undefined) => runCommand(
 export const removeConnection = (harnessInput: string) => runCommand({
   effect: Effect.gen(function* () {
     const harness = yield* parseHarness(harnessInput)
-    yield* withClient(client => client.connections.disconnectHarness({ harness }))
+    yield* withConnections(connections => connections.disconnect(harness))
     return harness
   }),
   render: (harness) => `Disconnected ${harness} from Magnitude.\n`,

@@ -3,20 +3,20 @@ import { HarnessIdSchema, ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import { registerConnectionsCommand } from "./connections"
-import { addConnection, syncConnections, renderAddedConnection, renderConnections } from "./connections-runtime"
+import { connectConnection, syncConnections, renderAddedConnection, renderConnections } from "./connections-runtime"
 
-const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected service startup") }))
-vi.mock("../server/acn-connection", async () => {
+const startupProbe = vi.hoisted(() => vi.fn(() => { throw new Error("Unexpected harness configuration") }))
+vi.mock("../server/local-harness-connections", async () => {
   const { Effect } = await import("effect")
-  return { existingAcnConnection: Effect.sync(startupProbe) }
+  return { localHarnessConnections: Effect.sync(startupProbe), requireLocalService: Effect.sync(startupProbe) }
 })
 
 describe("connections command contract", () => {
   it.each([
-    [() => addConnection("magnitude", undefined, false), "Unsupported harness: magnitude"],
+    [() => connectConnection("magnitude", undefined, false), "Unsupported harness: magnitude"],
     [() => syncConnections("magnitude"), "Unsupported harness: magnitude"],
-    [() => addConnection("pi", "", false), "Invalid model ID: "],
-  ])("rejects invalid arguments before service startup", async (command, message) => {
+    [() => connectConnection("pi", "", false), "Invalid model ID: "],
+  ])("rejects invalid arguments before touching harness configuration", async (command, message) => {
     const exitCode = process.exitCode
     const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true)
     startupProbe.mockClear()
@@ -35,12 +35,12 @@ describe("connections command contract", () => {
     const program = new Command()
     registerConnectionsCommand(program)
     const connections = program.commands.find((command) => command.name() === "connections")
-    const add = connections?.commands.find((command) => command.name() === "add")
-    expect(add?.registeredArguments.map((argument) => argument.name())).toEqual(["harness"])
-    expect(add?.options.map(({ long }) => long)).toContain("--set-model")
-    expect(add?.options.map(({ long }) => long)).not.toContain("--set-current")
-    expect(add?.options.map(({ long }) => long)).toContain("--install-skill")
-    expect(add?.description()).toBe("Connect installed Magnitude models to a harness")
+    const connect = connections?.commands.find((command) => command.name() === "connect")
+    expect(connections?.commands.map((command) => command.name())).not.toContain("add")
+    expect(connect?.registeredArguments.map((argument) => argument.name())).toEqual(["harness"])
+    expect(connect?.options.map(({ long }) => long)).toContain("--set-model")
+    expect(connect?.options.map(({ long }) => long)).not.toContain("--set-current")
+    expect(connect?.options.map(({ long }) => long)).toContain("--install-skill")
   })
 
   it("distinguishes configuration integrity from installation", () => {
