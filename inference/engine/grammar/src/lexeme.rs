@@ -599,9 +599,9 @@ impl Plan {
                 Key::Repeat(id) => repeats[&id],
                 Key::Twin(_) => unreachable!("twins are added by certification"),
             };
-            // A loop head that splits text from the delimiter its part leads
-            // with is peeled and the rule planned again, while the allowance
-            // pays for the copy.
+            // A loop head that splits text from what its part leads with is
+            // peeled and the rule planned again, while the allowance pays for
+            // the copy.
             let mut peeled = BTreeSet::new();
             let (boundaries, edges, hubs) = loop {
                 let mut discovered = BTreeMap::new();
@@ -841,36 +841,45 @@ fn regions(
     (count, edges, heads, eliminated.kept.len())
 }
 
-/// Repetitions whose loop head ends a lexeme that continues over the text
-/// the part leads with, yet never contains it: a scanner cut from the
-/// delimiter that ends it, which greedy lexing cannot scan exactly apart.
+/// Repetitions whose loop head ends a lexeme that a lexeme starting with it
+/// continues over the text the part leads with. Greedy lexing follows the
+/// longer text and cannot return to the head: a scanner cut from the
+/// delimiter that ends it, or an optional continuation competing with the
+/// loop's first iteration (an open object's next listed property against an
+/// additional one). Building the first iteration before the head decides
+/// between them inside one lexeme.
 fn delimiting(
     edges: &[Edge],
     heads: &BTreeMap<u32, Head>,
     terms: &Terms,
     regexes: &mut Regexes,
 ) -> BTreeSet<RepeatId> {
+    let mut starting: BTreeMap<u32, Vec<TermId>> = BTreeMap::new();
+    for edge in edges {
+        if let EdgeKind::Lexeme { lexeme, .. } = edge.kind {
+            starting.entry(edge.from).or_default().push(lexeme);
+        }
+    }
     let ended = edges
         .iter()
         .filter_map(|edge| match edge.kind {
-            EdgeKind::Lexeme { lexeme, .. } => heads.get(&edge.to).map(|head| (lexeme, *head)),
+            EdgeKind::Lexeme { lexeme, .. } => heads
+                .get(&edge.to)
+                .map(|head| (lexeme, &starting[&edge.from], *head)),
             _ => None,
         })
         .collect::<Vec<_>>();
     let questions = ended
         .iter()
-        .flat_map(|&(text, head)| {
-            [
-                regexes.overrun(terms, text, terms.first(head.leading), &[text]),
-                regexes.contains(terms, text, head.leading),
-            ]
+        .map(|&(text, siblings, head)| {
+            regexes.overrun(terms, text, terms.first(head.leading), siblings)
         })
         .collect::<Vec<_>>();
     let answers = regexes.nonempty(&questions);
     ended
         .iter()
-        .zip(answers.chunks(2))
-        .filter(|(_, answers)| answers == &[true, false])
-        .map(|((_, head), _)| head.repeat)
+        .zip(answers)
+        .filter(|(_, overrun)| *overrun)
+        .map(|((_, _, head), _)| head.repeat)
         .collect()
 }

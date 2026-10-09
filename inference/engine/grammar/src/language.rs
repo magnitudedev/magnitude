@@ -125,18 +125,6 @@ impl Regexes {
         ]);
         self.builder.mk(&ast).expect("overrun of terminals")
     }
-    /// Some text of `text` contains text of `delimiter`.
-    pub(crate) fn contains(&mut self, terms: &Terms, text: TermId, delimiter: TermId) -> ExprRef {
-        let ast = RegexAst::And(vec![
-            RegexAst::ExprRef(self.expr(terms, text)),
-            RegexAst::Concat(vec![
-                Self::any_bytes(0),
-                RegexAst::ExprRef(self.expr(terms, delimiter)),
-                Self::any_bytes(0),
-            ]),
-        ]);
-        self.builder.mk(&ast).expect("containment of terminals")
-    }
     /// Non-emptiness of each expression; unanswerable questions count as
     /// non-empty.
     pub(crate) fn nonempty(&mut self, questions: &[ExprRef]) -> Vec<bool> {
