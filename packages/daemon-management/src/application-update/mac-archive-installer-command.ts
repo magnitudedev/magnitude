@@ -12,7 +12,7 @@ import { nativeMacUpdateAdmission } from "../desktop-native/mac-update-lease"
 import { nativeMacUpdateFilesystem } from "../desktop-native/mac-update-filesystem"
 import { MacBundleVerifier, nativeMacBundleVerifier } from "../desktop-native/mac-update-validation"
 import { NativeMacApplicationInstallation } from "../desktop-native/mac-update-installation"
-import { guardedCommandLayer } from "../desktop-native/guarded-command"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MacUpdateArchiveStager, makeMacUpdateArchiveStager } from "../desktop-native/mac-update-staging"
 import { makeMacCliRegistration } from "../desktop-native/mac-cli-registration"
 

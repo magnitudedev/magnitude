@@ -5,7 +5,7 @@ applies_to:
   - packages/acn-protocol/src/schemas/serving-usage.ts
   - packages/acn-protocol/src/boundary/models.ts
   - packages/client-common/src/operations/models.ts
-  - desktop/src/serving-usage*
+  - web/src/components/serving-usage*
 ---
 
 # Local serving usage

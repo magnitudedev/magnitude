@@ -6,7 +6,6 @@
 @import "shadcn/tailwind.css";
 
 @source "../";
-@source "../../../desktop/src/";
 
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 @custom-variant mac (&:where([data-desktop-platform="darwin"], [data-desktop-platform="darwin"] *));
@@ -319,4 +318,9 @@
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+@keyframes slide-in-left {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
 }

@@ -8,7 +8,7 @@ applies_to:
   - packages/daemon-management/src/application-update/**
   - packages/daemon-management/native/mac-update-*
   - cli/src/startup/*update*
-  - packages/client-common/src/desktop/update.ts
+  - packages/client-common/src/application/update.ts
   - packages/sdk/src/desktop-update.ts
 ---
 

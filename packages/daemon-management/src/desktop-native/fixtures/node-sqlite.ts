@@ -2,7 +2,7 @@ import { strict as assert } from "node:assert"
 import { existsSync, mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { Effect, Either } from "effect"
-import { NodeSqliteDriver } from "../../node-sqlite-driver"
+import { NodeSqliteDriver } from "@magnitudedev/storage/sqlite/node"
 
 const root = mkdtempSync(`${tmpdir()}/magnitude-node-sqlite-`)
 const path = `${root}/database ?# ü.sqlite`

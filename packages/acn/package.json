@@ -16,12 +16,14 @@
     "@effect/platform": "^0.96.0",
     "@effect/platform-bun": "^0.90.0",
     "@effect/rpc": "0.75.1",
+    "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/agent": "workspace:*",
     "@magnitudedev/generate-id": "workspace:*",
+    "@magnitudedev/harness-connections": "workspace:*",
     "@magnitudedev/icn": "workspace:*",
     "@magnitudedev/icn-protocol": "workspace:*",
+    "@magnitudedev/providers": "workspace:*",
     "@magnitudedev/release": "workspace:*",
-    "@magnitudedev/acn-protocol": "workspace:*",
     "@magnitudedev/ripgrep": "workspace:*",
     "@magnitudedev/roles": "workspace:*",
     "@magnitudedev/skills": "workspace:*",
@@ -29,9 +31,8 @@
     "@magnitudedev/utils": "workspace:*",
     "@magnitudedev/version": "workspace:*",
     "effect": "^3.21.2",
+    "eventsource-parser": "^3.1.1",
     "fast-json-patch": "^3.1.1",
-    "jsonc-parser": "^3.3.1",
-    "@magnitudedev/providers": "workspace:*",
-    "eventsource-parser": "^3.1.1"
+    "jsonc-parser": "^3.3.1"
   }
 }

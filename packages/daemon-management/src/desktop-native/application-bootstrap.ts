@@ -5,7 +5,7 @@ import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { makeUnixOwnedChildSpawner, OwnedChildSpawner, OwnedChildSpawnFailed, type OwnedChildCommand } from "./owned-child"
 import { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
-import { makeOwnedService } from "./owned-service"
+import { makeOwnedService, type OwnerAgent } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
 import { checkServicePort, requireServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
@@ -88,6 +88,7 @@ export const makeApplicationService = (options: {
   readonly stateDirectory: string; readonly home: string; readonly environment: Environment
   readonly output: ChildOutputMode
   readonly admission: "Immediate" | "Supervised"
+  readonly owner: OwnerAgent
 }) => Effect.gen(function* () {
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
@@ -108,6 +109,6 @@ export const makeApplicationService = (options: {
     Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
     Effect.zipRight(checked.spawn(command)),
   ) })
-  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION)
+  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION, options.owner)
     .pipe(Effect.provideService(OwnedChildSpawner, admitted))
 })

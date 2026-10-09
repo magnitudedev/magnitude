@@ -1,5 +1,5 @@
 import { harnessEndpoints } from "./shared"
-import type { HarnessId } from "@magnitudedev/client-common"
+import type { HarnessId } from "@magnitudedev/sdk"
 import type { HarnessCompanionPackage, HarnessConnector } from "./contract"
 import { makeClaudeCodeConnector } from "./connectors/claude-code"
 import { makeClineConnector } from "./connectors/cline"

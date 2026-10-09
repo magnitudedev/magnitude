@@ -1,10 +1,10 @@
 import { Effect, Schema } from "effect"
-import { ApplicationUpdateAction, type DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateAction, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { updateApplication } from "../server/application"
 import { runCommand } from "./output"
 
-export const renderApplicationUpdate = (state: DesktopUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop"): string => {
+export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop"): string => {
   if (state.check._tag === "Checking" && (state.transfer._tag === "Idle" || state.transfer._tag === "Failed")) {
     return "Checking for application updates.\n"
   }

@@ -1,8 +1,8 @@
-import { BunSqliteDriverLayer } from "@magnitudedev/daemon-management/bun"
+import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { FetchHttpClient } from "@effect/platform"
 import * as FileSystem from "@effect/platform/FileSystem"
 import { BunContext } from "@effect/platform-bun"
-import { HARNESS_PRIORITY, HarnessIdSchema, UnavailableHarnessConnection } from "@magnitudedev/client-common"
+import { HARNESS_PRIORITY, HarnessIdSchema } from "@magnitudedev/sdk"
 import { ProviderModelIdSchema, ReasoningEffortSchema } from "@magnitudedev/sdk"
 import { Brand, Effect, Option, Schema } from "effect"
 import { parse } from "jsonc-parser"
@@ -246,18 +246,8 @@ describe("HarnessModel persistence", () => {
 })
 
 describe("HarnessConnector contract and registry", () => {
-  it("rejects the removed Magnitude destination and never offers a built-in fallback", async () => {
+  it("rejects the removed Magnitude destination", () => {
     expect(Schema.is(HarnessIdSchema)("magnitude")).toBe(false)
-    expect(await Effect.runPromise(UnavailableHarnessConnection.list)).toEqual([])
-    const harness = HarnessIdSchema.make("pi")
-    for (const action of [
-      UnavailableHarnessConnection.connect(harness, { model: Option.none() }),
-      UnavailableHarnessConnection.sync(harness),
-      UnavailableHarnessConnection.disconnect(harness),
-    ]) {
-      expect((await Effect.runPromise(Effect.either(action)))._tag).toBe("Left")
-    }
-    expect(UnavailableHarnessConnection).not.toHaveProperty("launch")
   })
 
   it("composes one complete connector module per harness in canonical order", () => {

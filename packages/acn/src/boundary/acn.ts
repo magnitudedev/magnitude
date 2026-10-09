@@ -35,6 +35,9 @@ import { ProjectInspector } from "../project-inspector";
 import { ProjectManager } from "../project-manager";
 import { ProjectStore } from "../project-store";
 import { SessionInspector } from "../session-inspector";
+import { ServerSettings } from "../server-settings";
+import { AcnHarnessConnections } from "../harness-connections";
+import { AcnOwner, requestOwner, watchApplicationOwner } from "../application-owner";
 
 const MAX_BASH_OUTPUT_LENGTH = 50_000;
 
@@ -67,6 +70,10 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const modelCatalog = yield* ModelCatalog;
     const modelCommands = yield* ModelCommands;
     const localInferenceHardware = yield* LocalInferenceHardware;
+    const serverSettings = yield* ServerSettings;
+    const harnessConnections = yield* AcnHarnessConnections;
+    const owner = yield* AcnOwner;
+    const ownerRequest = (name: string, request: Parameters<typeof requestOwner>[0]) => observeRpcDefects(name, requestOwner(request).pipe(Effect.provideService(AcnOwner, owner)));
     const displayViewIntrospector = yield* Effect.serviceOption(
       AcnDisplayViewIntrospector
     );
@@ -313,6 +320,30 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
         observeRpcDefects("GetModelCatalog", modelCatalog.state),
 
       GetServingUsage: request => servingUsage.read(request),
+
+      GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),
+      SetModelStorage: ({ path }) => observeRpcDefects("SetModelStorage", serverSettings.setModelStorage(path).pipe(Effect.as({}))),
+      BrowseDirectories: ({ path }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path)),
+      GetNetworkAccess: () => observeRpcDefects("GetNetworkAccess", serverSettings.networkAccess),
+      SetNetworkAccess: change => observeRpcDefects("SetNetworkAccess", serverSettings.setNetworkAccess(change).pipe(Effect.as({}))),
+      RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
+      GetServerMachine: () => observeRpcDefects("GetServerMachine", serverSettings.machine),
+
+      WatchHarnessConnections: () => observeRpcStreamDefects("WatchHarnessConnections", harnessConnections.watch),
+      ConnectHarness: request => observeRpcDefects("ConnectHarness", harnessConnections.connect(request)),
+      SyncHarnessConnections: ({ harness }) => observeRpcDefects("SyncHarnessConnections", harnessConnections.sync(harness).pipe(Effect.as({}))),
+      DisconnectHarness: ({ harness }) => observeRpcDefects("DisconnectHarness", harnessConnections.disconnect(harness).pipe(Effect.as({}))),
+      DescribeHarnessSetup: request => observeRpcDefects("DescribeHarnessSetup", harnessConnections.describe(request)),
+
+      WatchApplicationOwner: () => observeRpcStreamDefects("WatchApplicationOwner", watchApplicationOwner.pipe(Stream.provideService(AcnOwner, owner))),
+      CheckApplicationUpdate: () => ownerRequest("CheckApplicationUpdate", { _tag: "CheckUpdate" }),
+      DownloadApplicationUpdate: () => ownerRequest("DownloadApplicationUpdate", { _tag: "DownloadUpdate" }),
+      DiscardApplicationUpdate: () => ownerRequest("DiscardApplicationUpdate", { _tag: "DiscardUpdate" }),
+      InstallApplicationUpdate: () => ownerRequest("InstallApplicationUpdate", { _tag: "InstallUpdate" }),
+      SetApplicationAutoDownload: ({ enabled }) => ownerRequest("SetApplicationAutoDownload", { _tag: "SetAutoDownload", enabled }),
+      SetLaunchAtLogin: ({ enabled }) => ownerRequest("SetLaunchAtLogin", { _tag: "SetLoginStartup", enabled }),
+      RestartApplication: () => ownerRequest("RestartApplication", { _tag: "RestartService" }),
+      QuitApplication: () => ownerRequest("QuitApplication", { _tag: "Quit" }),
       GetLocalInferenceEnvironment: () =>
         observeRpcDefects("GetLocalInferenceEnvironment", localInferenceHardware.state),
 

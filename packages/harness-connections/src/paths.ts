@@ -1,4 +1,4 @@
-import { HarnessConnectionError } from "@magnitudedev/client-common"
+import { HarnessConnectionError } from "./types"
 import { FileSystem } from "@effect/platform"
 import { Effect } from "effect"
 import { homedir } from "node:os"

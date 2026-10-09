@@ -9,6 +9,10 @@ applies_to:
   - cli/src/commands/status-runtime.ts
   - cli/src/server/application.ts
   - packages/acn-protocol/src/schemas/acn-health.ts
+  - packages/acn/src/remote-access.ts
+  - packages/acn/src/remote-access.test.ts
+  - packages/acn-protocol/src/schemas/remote-access.ts
+  - packages/sdk/src/remote-access.ts
 ---
 
 # ACN service lifecycle
@@ -61,13 +65,32 @@ may supply another explicit port. Health is available during startup. RPC dispat
 at Ready and fenced by the selected instance ID. Inference paths remain unchanged. The inherited
 control channel carries startup health and shutdown; there is no discoverable coordination listener.
 
+ACN serves the browser app at `/`, even while it starts, so a browser can show that state. Release
+executables embed the app's files; a service run from source serves the `web` build directory and
+otherwise answers `/` with build instructions. Hashed assets are cached indefinitely and `index.html`
+never; a path without a file extension is an app page and receives `index.html`; paths under the
+service's own routes are never answered with the app; nothing outside the app's files is served.
+HTML carries a same-origin Content-Security-Policy. The plain-text summary of the inference API is
+served at `/inference`.
+
 Network access is off by default and read once from `network` in `config.json` when ACN starts.
 When enabled, ACN also listens on all interfaces, or on one configured address beside loopback, so
-local clients are never displaced. Reachability from another address never widens what a remote
-caller may do: `/rpc` is refused by socket peer address, never by header, so application control
-stays on this machine; `/health` reports only readiness to remote callers; inference routes require
-the generated API key as a Bearer token or `x-api-key` from remote callers unless the key
-requirement is switched off, and never from loopback callers. The Host header is accepted only for
+local clients are never displaced. Loopback is decided by socket peer address, never by header, and
+loopback callers never sign in. A remote caller gains application control only by signing in from a
+browser: `POST /auth/session` with the Network access key, compared in constant time, sets an
+`HttpOnly`, `SameSite=Strict` session cookie (`Secure` over HTTPS), and `GET /auth/session` reports
+whether the caller is local, signed in, or must sign in, and whether a key exists to sign in with.
+`/rpc` admits loopback callers and signed-in callers whose `Origin` matches their `Host`; anonymous
+remote callers get 401. `/health` returns the instance identity only to loopback and signed-in
+callers, so the SDK's admission works unchanged in a signed-in browser; anyone else learns readiness
+only. Sessions live in ACN memory, expire after 30 days unused, and end with `POST /auth/session/end`
+or when ACN restarts. Because every network change, including a regenerated key or disabling
+network access, applies only when ACN restarts, that restart is also what signs every browser out.
+Failed sign-ins are throttled per remote address: after five, each attempt waits twice as long as
+the last, up to one minute; a success clears the count. With no key configured, nobody can sign in.
+Inference routes require the generated API key as a Bearer token or `x-api-key` from remote callers
+unless the key requirement is switched off, and never from loopback callers; the session cookie
+never authorizes inference, and `requireApiKey` never affects sign-in. The Host header is accepted only for
 local names, and with network access on also for IP literals, `host.docker.internal`, `.ts.net`
 names, and names listed under `network.allowedHosts`; no wildcard is ever accepted. CORS stays
 loopback-only. Harness connections keep writing the loopback origin.

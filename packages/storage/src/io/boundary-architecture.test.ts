@@ -9,8 +9,8 @@ const boundaryFiles = [
   "packages/acn/src/server.ts",
   "packages/acn/src/session-runtime-options.ts",
   "packages/storage/src/io/structured-file.ts",
-  "packages/client-common/src/sync/display-view-store.ts",
-  "packages/client-common/src/sync/apply-stream-event.ts",
+  "packages/acn/src/server-settings.ts",
+  "packages/acn/src/harness-connections.ts",
 ] as const;
 
 describe("external-data boundary architecture", () => {

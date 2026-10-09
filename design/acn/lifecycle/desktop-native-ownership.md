@@ -1,6 +1,8 @@
 ---
 applies_to:
   - packages/acn/src/owned-control.ts
+  - packages/acn/src/application-owner.ts
+  - packages/acn-protocol/src/boundary/application.ts
   - packages/utils/src/process-groups/**
   - packages/utils/src/windows-native/**
   - packages/utils/src/json-line-channel.ts
@@ -264,3 +266,25 @@ Host availability proves protocol support, not pixel visibility or user pinning.
 Application memory observation is read-only and rooted at the current desktop process. Native sampling runs outside the Electron thread, bounds process and input sizes, and checks creation identity and ancestry across memory reads. A failed member read invalidates the sample. Observation grants no termination authority and cannot create or restart a service. The host serializes sampling; releasing a subscription stops future work after any in-flight native read completes. Acceptance covers real child allocation and retirement, exclusion of unrelated processes, native failure recovery, and visibility-scoped refresh.
 
 Client device identification exposes only manufacturer, product/model, optional product family/version, and enclosure type from native OS metadata. It requires no elevated privileges or shell processes and does not export serial numbers or UUIDs. Firmware parsing bounds both input and string lengths. SMBIOS Type 1 supplies public product labels; Type 3 supplies enclosure type independently, in either record order. Linux uses the corresponding public DMI files; macOS uses hw.model. Placeholder product labels are rejected while a valid enclosure type remains available. Missing or invalid metadata yields unavailable without delaying service readiness or replacing inference-owned hardware facts.
+
+## Owner requests
+
+The private owned-control channel also carries what the owner answers for, so any ACN client can
+reach it, including a browser on another device:
+
+- After admitting the service, the owner sends its state whenever it changes: its kind (Desktop or
+  Headless), the requests it supports, its update state, and its launch-at-login state.
+- ACN sends typed requests (check, download, discard, or install an update; set automatic
+  downloads; set launch at login; restart the application; quit) with a request identity. The owner
+  answers each identity exactly once with Done, Unsupported, or Failed carrying a safe message.
+- A request that ends or restarts the service is answered before the owner acts, so the reply
+  reaches ACN while the channel still exists.
+- Requests before admission are refused. Losing the channel fails every pending request, which
+  clients see as the owner being unavailable.
+- ACN exposes these through the `Application` RPC group. The owner keeps executing them with the
+  same handlers it uses for its native controls and the CLI's application-control socket; ACN
+  never performs owner work itself.
+
+Desktop supports every request. Headless supports updates and quit; it refuses installing while
+serving with its existing guidance, and reports launch at login and application restart as
+unsupported, so clients hide those controls.

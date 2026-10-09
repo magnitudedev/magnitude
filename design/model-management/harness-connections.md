@@ -1,10 +1,11 @@
 ---
 applies_to:
-  - packages/client-common/src/harness-connections/**
   - packages/harness-connections/**
+  - packages/acn/src/harness-connections.ts
+  - packages/acn-protocol/src/schemas/harness-connections.ts
+  - packages/acn-protocol/src/boundary/connections.ts
   - cli/src/commands/connections.ts
   - cli/src/commands/connections-runtime.ts
-  - cli/src/server/harness-connections.ts
   - integrations/pi/**
   - scripts/dev-pi.ts
   - package.json
@@ -13,7 +14,22 @@ applies_to:
 # Harness connections
 
 `HarnessConnection` configures an external agent harness to use Magnitude. `Connections` is the
-public CLI noun; there is no separate connection-manager domain.
+public CLI noun and the ACN RPC group; there is no separate connection-manager domain.
+
+ACN owns harness connections for the machine it runs on. The desktop app and the CLI inspect,
+connect, synchronize, and disconnect through the `Connections` RPCs, so configuration is written
+where Magnitude runs. No client runs its own copy of the connection service.
+
+A browser never connects harnesses in place, because it can't know which computer its viewer's
+harnesses run on. `DescribeHarnessSetup` renders, for a harness, the default model, the viewer's
+platform, and the origin the browser used, a prompt the viewer pastes into an agent on their own
+computer. The prompt carries the same provider configuration the connectors write (built by the
+same functions), with every installed model and its metadata, merge instructions that keep the
+viewer's other settings, the configuration-location overrides, any environment step, a reachability
+check, and the command to start the harness. From another device it carries the Network access key
+the service enforces, sent as the harness expects (Codex through `MAGNITUDE_API_KEY`, Claude Code
+through `ANTHROPIC_AUTH_TOKEN`); on the server's own computer it needs none. The skill is not part
+of it, since it describes the CLI on the computer running Magnitude.
 
 ## Pi extension distribution
 
@@ -24,22 +40,26 @@ tests; there is no release-plan default or npm package selection in the connecti
 
 ## Observation
 
-The shared identifier schema, registry and unavailable-host fallback expose only external harnesses.
-An unavailable host supplies no destinations and rejects configuration mutations. Harnesses have one canonical order:
+The shared identifier schema and registry expose only external harnesses. Harnesses have one
+canonical order:
 
 ```text
 Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, Cline
 ```
 
-Detection proves that an external executable is launchable from the host-supplied user `PATH`, excluding
-dependency-local binaries. Desktop hosts may resolve a login environment asynchronously; its configuration
-roots and command environment are scoped to the connection service, never global process mutations. Installation and connection are independent observations. Connected means
+Detection proves that an external executable is launchable from the user's `PATH`, excluding
+dependency-local binaries. ACN resolves the user's login-shell environment once, through the
+protected command helper, because a service started by the desktop or a service manager does not
+inherit it; configuration roots and the command environment are scoped to the connection service,
+never global process mutations. Installation and connection are independent observations. Connected means
 that required Magnitude provider fields, skill contents, and plugin files/activation still exist and
 match the connector contract. Receipts alone never imply Connected. Missing or overwritten fields
 are Disconnected; unreadable or malformed configuration is Unavailable and is never overwritten
 to manufacture a successful connection. Managed disconnected configurations are presented as needing
 attention, with their reason and repair/removal actions. Unrelated user fields do not invalidate
-a connection. The desktop refreshes this observation after mutations and while the page is observed.
+a connection. `WatchHarnessConnections` reinspects when subscribed, after any connect or disconnect from any
+client, and every two seconds while observed, which also catches harnesses installed or configuration
+edited outside Magnitude.
 Every verified connection can be explicitly disconnected, including configurations with no manifest
 receipt. Without a receipt, disconnect first verifies the Magnitude provider, removes its projection,
 and clears its active selection without inventing a previous model or removing unrecorded companion

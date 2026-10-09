@@ -84,9 +84,10 @@ Each implementation is a Layer. Its requirements are its complete direct depende
 composed service obtains lower services by yielding their Tags; it does not call constructors,
 accept an aggregate client object, or look services up by object identity.
 
-For example, DesktopSession depends on LocalModels and the optional DesktopBridge. It observes
-model state and forwards presentation to the tray, while platform operations stay behind the
-bridge. The Layer declares both dependencies and owns its subscriptions for the connection scope.
+For example, ApplicationSession depends on LocalModels, ApplicationRouter, and ApplicationHost, whose
+window, shell, and desktop capabilities are each optional. It observes model state and forwards
+presentation to the tray when a shell exists, while host operations stay behind ApplicationHost. The
+Layer declares every dependency and owns its subscriptions for the connection scope.
 
 The renderer composition root assembles the complete Layer graph into the connection's existing
 Effect Atom runtime. `createAgentClient(sdk)` provides that same `MagnitudeClient` to the

@@ -27,7 +27,15 @@ Replace `MODEL_ID` with the exact model ID, such as `gemma-4-e2b-it-qat:gguf:q4`
 
 **Connect** writes `~/.hermes/config.yaml`. Location overrides: `HERMES_HOME`.
 
-Write the configuration yourself only when the agent runs where Connections cannot reach it, such as another device or WSL; see [Network access](/api/network-access) for `ADDRESS` and `API_KEY`.
+### On another computer
+
+1. In Magnitude, turn on **Settings → Network access**.
+2. On the other computer, open `http://ADDRESS:10100` in a browser, using the address from **Reachable at**, and sign in with the **API key**.
+3. In **Connections**, click **Copy setup prompt** on Hermes and send it to your agent.
+
+### Edit the files yourself
+
+Use the address from **Reachable at** for `ADDRESS` and the **API key** for `API_KEY`.
 
 `~/.hermes/config.yaml`:
 

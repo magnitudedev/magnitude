@@ -1,4 +1,4 @@
-import { DesktopConnectRequest, DesktopConnectionsSnapshot, ModelTrayPresentation } from "@magnitudedev/client-common/desktop/contracts"
+import { ModelTrayPresentation } from "@magnitudedev/client-common/application/contracts"
 import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
@@ -32,34 +32,13 @@ const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unkn
   },
 }))
 const api: DesktopApi = {
-  memory: (value, error) => observe(client => client.Memory({}), value, error),
-  machineIdentity: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.MachineIdentity({}))),
-  applicationInfo: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.ApplicationInfo({}))),
-  updates: (value, error) => observe(client => client.Updates({}), value, error),
-  setAutoDownload: enabled => command(client => client.SetAutoDownload({ enabled })),
-  checkUpdate: () => command(client => client.CheckUpdate({})),
-  discardUpdate: () => command(client => client.DiscardUpdate({})),
-  downloadUpdate: () => command(client => client.DownloadUpdate({})),
-  restartUpdate: () => command(client => client.RestartUpdate({})),
   platform: process.platform,
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
   actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
   presentModel: value => command(client => client.PresentModel(Schema.decodeUnknownSync(ModelTrayPresentation)(value))),
   getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
   setAppearance: preference => command(client => client.SetAppearance({ preference })),
-  getModelStorage: () => query(client => client.GetModelStorage({})),
-  setModelStorage: path => command(client => client.SetModelStorage({ path })),
-  chooseModelStorageDirectory: () => query(client => client.ChooseModelStorageDirectory({})).then(result => result.path),
-  relaunch: () => command(client => client.Relaunch({})),
-  getNetworkAccess: () => query(client => client.GetNetworkAccess({})),
-  setNetworkAccess: change => command(client => client.SetNetworkAccess(change)),
-  regenerateNetworkApiKey: () => command(client => client.RegenerateNetworkApiKey({})),
-  loginStartup: (value, error) => observe(client => client.LoginStartup({}), value, error),
-  setLoginStartup: enabled => command(client => client.SetLoginStartup({ enabled })),
-  connections: (value, error) => observe(client => client.Connections({}), rows => value(Schema.encodeSync(DesktopConnectionsSnapshot)(rows)), error),
-  connect: input => command(client => client.Connect(Schema.decodeUnknownSync(DesktopConnectRequest)(input))),
-  disconnect: harness => command(client => client.Disconnect({ harness })),
   retry: () => command(client => client.Retry({})),
-  quit: () => command(client => client.Quit({})),
+  resolveQuitFailure: decision => command(client => client.ResolveQuitFailure({ decision })),
 }
 contextBridge.exposeInMainWorld("__magnitudeDesktop", api)

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest"
-import { DesktopUpdateState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { renderApplicationUpdate } from "./update-runtime"
-const state = (transfer: DesktopUpdateState["transfer"], check: DesktopUpdateState["check"] = { _tag: "Succeeded", at: 1 }) => DesktopUpdateState.make({ transfer, check, preference: { _tag: "Known", autoDownload: false } })
+const state = (transfer: ApplicationUpdateState["transfer"], check: ApplicationUpdateState["check"] = { _tag: "Succeeded", at: 1 }) => ApplicationUpdateState.make({ transfer, check, preference: { _tag: "Known", autoDownload: false } })
 describe("headless application update output", () => {
   it("gives owner-specific installation instructions without suggesting a live server restart", () => {
     const ready = state({ _tag: "Ready", version: "2.0.0" })

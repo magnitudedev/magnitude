@@ -76,6 +76,6 @@ describe("Tailwind styling boundary", () => {
     )
 
     expect(stylesheet).toContain('@import "tailwindcss" source(none)')
-    expect(stylesheet).toContain('@source "../../../desktop/src/"')
+    expect(stylesheet).toContain('@source "../"')
   })
 })

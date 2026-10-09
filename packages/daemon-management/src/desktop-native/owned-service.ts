@@ -1,5 +1,5 @@
 import { Starting, Ready, Failed, CleanupFailed, Stopping, Stopped, OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
-import { type MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
+import { type ApplicationOwnerState, type MagnitudeHealthResponse, type OwnerReply, type OwnerRequest } from "@magnitudedev/acn-protocol"
 import { FSM } from "@magnitudedev/utils"
 import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Queue, Ref, Schema, Stream, SubscriptionRef } from "effect"
 import { OwnedChildSpawner, type OwnedChild, type OwnedChildCommand } from "./owned-child"
@@ -28,8 +28,15 @@ export class OwnedServiceUnavailable extends Schema.TaggedError<OwnedServiceUnav
   message: Schema.String,
 }) {}
 
+/** What the owning application answers for over the owned-control channel. */
+export interface OwnerAgent {
+  readonly state: Stream.Stream<ApplicationOwnerState>
+  /** `afterReply` runs once the reply is sent, for requests that end or restart the service. */
+  readonly handle: (request: OwnerRequest) => Effect.Effect<{ readonly reply: OwnerReply; readonly afterReply: Effect.Effect<void> }>
+}
+
 /** One application-scoped supervisor; observers and renderer lifetimes do not own it. */
-export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number) => Effect.gen(function* () {
+export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number, owner: OwnerAgent) => Effect.gen(function* () {
   const spawner = yield* OwnedChildSpawner
   const status = yield* SubscriptionRef.make<OwnedServiceState>(new Starting({ attempt: 0, health: Option.none() }))
   const active = yield* Ref.make(Option.none<OwnedChild>())
@@ -59,6 +66,15 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number)
         }
         yield* Ref.set(admitted, true)
         yield* child.send({ _tag: "Start" })
+        yield* owner.state.pipe(Stream.runForEach(state => child.send({ _tag: "OwnerState", state })), Effect.ignore, Effect.forkScoped)
+        return
+      }
+      if (event._tag === "OwnerRequest") {
+        if (!(yield* Ref.get(admitted))) return yield* new ServiceChildProtocolFailed({ message: "Owner request before service admission" })
+        yield* owner.handle(event.request).pipe(
+          Effect.flatMap(({ reply, afterReply }) => child.send({ _tag: "OwnerResponse", id: event.id, reply }).pipe(Effect.ignore, Effect.zipRight(afterReply))),
+          Effect.forkScoped,
+        )
         return
       }
       const health = event.health

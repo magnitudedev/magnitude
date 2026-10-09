@@ -10,17 +10,9 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts"
     },
-    "./platform/embedded-browser": {
-      "types": "./src/platform/embedded-browser.ts",
-      "import": "./src/platform/embedded-browser.ts"
-    },
-    "./desktop/contracts": {
-      "types": "./src/desktop/contracts.ts",
-      "import": "./src/desktop/contracts.ts"
-    },
-    "./types/menu-action": {
-      "types": "./src/types/menu-action.ts",
-      "import": "./src/types/menu-action.ts"
+    "./application/contracts": {
+      "types": "./src/application/contracts.ts",
+      "import": "./src/application/contracts.ts"
     }
   },
   "scripts": {
@@ -29,18 +21,12 @@
   "dependencies": {
     "@magnitudedev/sdk": "workspace:*",
     "@magnitudedev/effect-query": "workspace:*",
-    "@magnitudedev/generate-id": "workspace:*",
     "@magnitudedev/utils": "workspace:*",
     "@effect-atom/atom-react": "^0.5.0",
     "@effect/rpc": "0.75.1",
     "@effect/platform": "^0.96.0",
     "react": "^19.0.0",
-    "effect": "^3.21.2",
-    "fast-json-patch": "^3.1.1",
-    "string-width": "^8.1.1",
-    "remark": "^15.0.1",
-    "remark-gfm": "^4.0.0",
-    "@effect/opentelemetry": "^0.63.0"
+    "effect": "^3.21.2"
   },
   "devDependencies": {
     "@types/react-test-renderer": "^19.1.0",

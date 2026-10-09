@@ -3,7 +3,7 @@ import { accessSync, constants, statSync } from "node:fs"
 import { delimiter, resolve } from "node:path"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
-import { HarnessIdSchema, type HarnessId } from "@magnitudedev/client-common"
+import { HarnessIdSchema, type HarnessId } from "@magnitudedev/sdk"
 import {
   MAGNITUDE_CLAUDE_CODE_PROXY_BASE_URL,
   MAGNITUDE_CODEX_PROXY_BASE_URL,

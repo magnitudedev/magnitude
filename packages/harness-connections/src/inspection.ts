@@ -14,8 +14,8 @@ import { openClawProviderConfig } from "./connectors/openclaw"
 import { openCodeProviderConfig, readOpenCodeConfiguration } from "./connectors/opencode"
 import { piProviderConfig } from "./connectors/pi"
 
-import { ConnectionInspection } from "@magnitudedev/client-common"
-export { ConnectionInspection } from "@magnitudedev/client-common"
+import { ConnectionInspection } from "@magnitudedev/sdk"
+export { ConnectionInspection } from "@magnitudedev/sdk"
 
 const disconnected = (reason: string): ConnectionInspection => ({ _tag: "Disconnected", reason })
 const connected: ConnectionInspection = { _tag: "Connected" }

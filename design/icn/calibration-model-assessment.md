@@ -8,7 +8,6 @@ applies_to:
   - packages/icn-protocol/**
   - packages/acn/src/local-model*.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - web/src/components/model-center.tsx
 ---
 
 # Assessment environment and model assessment

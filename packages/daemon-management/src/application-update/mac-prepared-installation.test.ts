@@ -14,7 +14,7 @@ import { MacBundleVerifier, MacBundleVerificationFailed } from "../desktop-nativ
 import { MacUpdateArchiveStager, MacUpdateStagingFailed } from "../desktop-native/mac-update-staging"
 import { completeMacPreparedInstallation, recoverMacPreparedInstallation } from "./mac-prepared-installation"
 import { installMacApplicationArchive } from "./mac-archive-installation"
-import { GuardedCommand, GuardedCommandFailed } from "../desktop-native/guarded-command"
+import { GuardedCommand, GuardedCommandFailed } from "@magnitudedev/utils/guarded-command"
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const keys = generateKeyPairSync("ed25519")
 const release = await Effect.runPromise(signUpdateRelease({ version: "0.1.6", bytes: 1, sha256: "0".repeat(64) },

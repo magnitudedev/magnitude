@@ -4,7 +4,7 @@ import { Context, Effect, Layer, Schema, Stream } from "effect"
 import { dirname, join } from "node:path"
 import { MacBundleVerifier } from "./mac-update-validation"
 import { MacUpdateFilesystem } from "./mac-update-filesystem"
-import { GuardedCommand } from "./guarded-command"
+import { GuardedCommand } from "@magnitudedev/utils/guarded-command"
 import type { MacExclusiveInstallationLease } from "./mac-update-lease"
 import { readInstalledUpdateConfiguration, ApplicationUpdateConfiguration } from "../application-update/update-configuration"
 

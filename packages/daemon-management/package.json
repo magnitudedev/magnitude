@@ -5,10 +5,8 @@
   "type": "module",
   "exports": {
     "./bun": "./src/bun.ts",
-    "./sqlite-driver": "./src/sqlite-driver.ts",
     "./desktop-native": "./src/desktop-native/exports.ts",
     "./private-files": "./src/desktop-native/private-files.ts",
-    "./node": "./src/node-sqlite-driver.ts",
     "./application-update": "./src/application-update/index.ts"
   },
   "scripts": {

@@ -18,12 +18,9 @@ export * from "./application-state-directory"
 
 export * from "./login-startup"
 export { LinuxTrayHost, linuxTrayHostLayer, type TrayHostState } from "./tray-host"
-export { GuardedCommand, GuardedCommandFailed, guardedCommandLayer } from "./guarded-command"
 
 export { makeWindowsOwnedChildSpawner } from "./windows-owned-child"
 export { requireServicePort } from "./service-port"
-export { ApplicationMemory, nativeApplicationMemoryLayer, observeApplicationMemory } from "./application-memory"
-export { nativeMachineIdentity } from "./machine-identity"
 export { installLinuxApplicationUpdate, guardLinuxInstallerParent } from "./linux-update-maintenance"
 export { LinuxPackageUpdate } from "./linux-update-package"
 export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
@@ -36,8 +33,6 @@ export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } fro
 export { previousInstallationUpgrade } from "./previous-installation-live"
 
 export { AppearancePreferences, AppearancePreferencesFailed, makeAppearancePreferences } from "./appearance-preferences"
-export { ModelStoragePreferences, ModelStoragePreferencesFailed, makeModelStoragePreferences } from "./model-storage-preferences"
-export { NetworkPreferences, NetworkPreferencesFailed, makeNetworkPreferences, listNetworkInterfaces, networkAccessEquals, LOOPBACK_ONLY, type NetworkAccess, type NetworkAccessChange, type NetworkInterfaceAddress, type NetworkInterfaceKind } from "./network-preferences"
 
 export { recoverWindowsUpdateDirectory, WindowsUpdateDirectoryFailed } from "./windows-update-directory"
 
@@ -45,3 +40,5 @@ export { ApplicationRuntime, ApplicationProfile, ApplicationRuntimeUnavailable, 
 export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./unix-continuation"
 
 export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
+export type { OwnerAgent } from "./owned-service"
+export { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"

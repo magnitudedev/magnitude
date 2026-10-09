@@ -1,19 +1,19 @@
 /// <reference path="./assets.d.ts" />
 import { inspectHarnessConnection } from "./inspection"
-import { SqliteDriver } from "@magnitudedev/daemon-management/sqlite-driver"
+import { SqliteDriver } from "@magnitudedev/storage/sqlite"
 import * as CommandExecutor from "@effect/platform/CommandExecutor"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as Path from "@effect/platform/Path"
 import {
-  type DesktopHarnessConnection,
   HarnessConnectionError,
   HarnessIdSchema,
   type HarnessConnection,
   type HarnessConnectOptions,
   type HarnessDestination,
   type HarnessId,
-} from "@magnitudedev/client-common"
+} from "./types"
+import type { HarnessConnectionStatus } from "@magnitudedev/sdk"
 import {
   makeInferenceClient,
   ProviderModelIdSchema,
@@ -22,7 +22,7 @@ import {
   type ProviderModelId,
 } from "@magnitudedev/sdk"
 import { makeStateDocument } from "@magnitudedev/storage"
-import { Cause, Effect, Option, Schema } from "effect"
+import { Cause, DateTime, Effect, Option, Schema } from "effect"
 import { ConnectionTransaction, connectionTransaction } from "./transaction"
 import { withConnectionLock } from "./lock"
 import { delimiter } from "node:path"
@@ -39,6 +39,7 @@ import {
   HarnessRestoreSchema,
 } from "./contract"
 import { resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
+import { describeHarnessSetup } from "./setup"
 import { makeHarnessConnectorRegistry, type HarnessConnectorRegistry } from "./registry"
 import { OPENAI_BASE_URL, readOr } from "./shared"
 import skillContents from "./magnitude-skill.md" with { type: "text" }
@@ -68,6 +69,9 @@ export {
   piProviderConfig,
 } from "./connectors/pi"
 export { makeHarnessConnectorRegistry } from "./registry"
+export { describeHarnessSetup, type HarnessSetup, type HarnessSetupTarget, type SetupPlatform } from "./setup"
+export { resolveHarnessEnvironment, harnessCommandExecutor } from "./shell-env"
+export * from "./types"
 export { harnessConnectionPaths, resolveHarnessConnectionPaths, type HarnessConnectionPaths } from "./paths"
 export type { HarnessConnectionSpec, HarnessConnector, HarnessInstallation, HarnessModel } from "./contract"
 
@@ -231,7 +235,7 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
         inspection,
         configurationFiles: connector.configurationFiles,
         plugin: Option.fromNullable(connector.companion).pipe(Option.map(({ description }) => ({ name: description.name, source: description.source }))),
-      } satisfies DesktopHarnessConnection
+      } satisfies HarnessConnectionStatus
     }))
   })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("list", String(error))))
 
@@ -440,6 +444,12 @@ export const makeHarnessConnectionService = (options: HarnessConnectionOptions =
     disconnect: (harness) => withMutationLock("disconnect", disconnect(harness)),
     installSkill,
     installStartup,
+    describe: (target) => provide(Effect.gen(function* () {
+      const models = uniqueModels(yield* resolveModels)
+      const model = models.find(candidate => candidate.id === target.model)
+      if (model === undefined) return yield* failure("describe", `Magnitude model is not installed: ${target.model}`, target.harness)
+      return describeHarnessSetup({ ...target, models, model, updatedAt: DateTime.formatIso(yield* DateTime.now) })
+    })).pipe(Effect.mapError((error) => error instanceof HarnessConnectionError ? error : failure("describe", String(error), target.harness))),
   } satisfies HarnessConnection
   return { ...service, inspect: mutationLock.withPermits(1)(inspectConnections) }
 })

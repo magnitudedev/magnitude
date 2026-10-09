@@ -17,6 +17,7 @@
     "./canonical-key": "./src/canonical-key.ts",
     "./json-line-channel": "./src/json-line-channel.ts",
     "./atomic-file": "./src/atomic-file.ts",
+    "./guarded-command": "./src/guarded-command.ts",
     "./log-file": "./src/log-file.ts"
   },
   "scripts": {

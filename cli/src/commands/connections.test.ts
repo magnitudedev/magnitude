@@ -1,6 +1,5 @@
 import { Command } from "@commander-js/extra-typings"
-import { HarnessIdSchema } from "@magnitudedev/client-common"
-import { ProviderModelIdSchema } from "@magnitudedev/sdk"
+import { HarnessIdSchema, ProviderModelIdSchema } from "@magnitudedev/sdk"
 import { describe, expect, it, vi } from "vitest"
 import { Option } from "effect"
 import { registerConnectionsCommand } from "./connections"
@@ -89,7 +88,6 @@ describe("connections command contract", () => {
           activationInstructions: Option.some("Restart existing Pi sessions or run /reload to activate the extension."),
         }),
         skillInstalled: true,
-        startupInstalled: false,
       },
     })
 

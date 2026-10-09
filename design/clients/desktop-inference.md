@@ -1,17 +1,16 @@
 ---
 applies_to:
   - assets/hardware/**
-  - desktop/test/hardware/**
+  - web/test/hardware/**
   - desktop/src/*.ts
-  - desktop/src/*.tsx
+  - web/src/**
   - packages/daemon-management/src/desktop-native/*-preferences.ts
   - desktop/native/**
   - desktop/scripts/build-native.ts
   - desktop/scripts/dev.ts
   - packages/storage/src/types/config.ts
   - packages/sdk/src/desktop-host.ts
-  - packages/client-common/src/desktop/**
-  - packages/harness-connections/**
+  - packages/client-common/src/application/**
 ---
 
 # Desktop inference application
@@ -159,15 +158,16 @@ and exits unsuccessfully. Background failure cannot leave an inert process runni
 foreground startup also presents the failure. Service-supervisor failures remain recoverable in
 the running tray and window and do not use this fatal initialization path.
 
-Connections observe actual provider configuration, required skills, and plugin integrity through the
-privileged host. Detected installations appear first, with installation and Magnitude connection status shown separately. Within installed harnesses, connected entries appear first with a green dot and their configuration paths; disconnected entries use a neutral dot and do not present expected paths as existing configuration. Unverifiable configuration remains an explicit unknown state. Undetected harnesses appear below with their artwork, Not installed status, and an official installation link; configuration details and connection actions are hidden until installation is detected. Detection refreshes automatically and has no manual Detect action. Saved connection receipts govern restoration and ownership, not the Connected label.
+Connections observe actual provider configuration, required skills, and plugin integrity through
+ACN, which owns harness connections for the machine it runs on (see
+[Harness connections](../model-management/harness-connections.md)). Detected installations appear first, with installation and Magnitude connection status shown separately. Within installed harnesses, connected entries appear first with a green dot and their configuration paths; disconnected entries use a neutral dot and do not present expected paths as existing configuration. Unverifiable configuration remains an explicit unknown state. Undetected harnesses appear below with their artwork, Not installed status, and an official installation link; configuration details and connection actions are hidden until installation is detected. Detection refreshes automatically and has no manual Detect action. Saved connection receipts govern restoration and ownership, not the Connected label.
 Filesystem access failures remain distinguishable from missing or overwritten configuration. Connect
 writes configuration and required artifacts without launching a harness. Login startup is a separate
-explicit preference. Headless commands and the desktop share one connector implementation.
-Harness environment discovery is bounded asynchronous work, independent of tray and service startup.
-It never mutates the application environment. Connections use the resolved search path, configuration
+explicit preference. Every client uses the same ACN connection service.
+Harness environment discovery is bounded asynchronous work in ACN, independent of service readiness.
+It never mutates the process environment. Connections use the resolved search path, configuration
 roots, and child-command environment; explicit command overrides remain authoritative. Failure falls
-back to the inherited environment. Quit cancels the probe and retires its child process group.
+back to the inherited environment. Service shutdown cancels the probe and retires its child process group.
 Connect preserves the harness's
 current model. For an installed harness, Connect repairs configuration that has been overwritten; Disconnect removes an intact managed connection. Connection status sits beneath the harness title, with connection actions in the header. Only connected cards have a divided configuration-details section.
 Connected cards show a compact inline downloaded, compatible model selector and the exact
@@ -229,12 +229,13 @@ Settings is a flat list of rows in two groups, General and About, each row a lab
 control on the right and a one-line hint only when the state needs explaining: Theme (segmented
 control), Launch at login (switch), Model storage, and Automatic updates (switch), then one About row
 with the application version, update status, and the single update action for the current state.
-The version comes from the packaged bundle, or from the generated Magnitude version when unpackaged.
+The version is the running service's, from its health.
 
 Model storage is persisted as `modelsDirectory` in the canonical `config.json` that the service reads
-when it spawns the engine. The row shows the current path, marks the default, offers a native folder
-chooser and a return to the default, rejects relative paths, and re-reads the file whenever Settings
-opens so hand edits appear. Main records the folder in effect at launch; while the saved folder
+when it spawns the engine; ACN reads and writes it. The row shows the current path, marks the
+default, offers the app's own folder picker over the folders of the machine running Magnitude and a
+return to the default, rejects relative paths, and re-reads the file whenever Settings opens so hand
+edits appear. ACN records the folder its engine started with; while the saved folder
 differs, a persistent toast in the window's bottom-right corner on every page states that a restart
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
 path, and shows a copyable platform-specific command that moves the previous store into the new
@@ -252,15 +253,29 @@ Network access is a General row with a switch, off by default, persisted as `net
 reveals nested rows: Address (all interfaces or one detected IPv4 address, physical networks first,
 then Tailscale, then virtual adapters), API key (the key with the copy control, Regenerate, and a
 Require key switch that is on by default), and Reachable at (one OpenAI-compatible base URL for the
-chosen address, or the first physical address when all interfaces are selected). Main records the
-resolved settings in effect at launch; when the saved settings resolve differently the same restart
-toast appears, naming network settings. Its hint links the remote server guide.
+chosen address, or the first physical address when all interfaces are selected). ACN reads and writes
+these settings and compares them with what it bound at startup; when the saved settings resolve
+differently the same restart toast appears, naming network settings. Its hint links the remote server guide.
+A browser on another device opens the app at the server's address and signs in with this key on the
+app's own Sign in page, which says when the server has no key. While signed in remotely, Settings
+adds a This browser group with Sign out, and turning network access off, regenerating the key,
+changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
+AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
+loses the service, it checks whether the service now asks for the key, as after a restart, and
+returns to Sign in instead of showing that the service is unreachable.
 Below the harnesses, Connections presents one card for other apps and agents. It states that an
 OpenAI-compatible API runs on this computer that any app or agent can use. The base URL has a copy
 control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
 request toggle pinned right on the note's row, wrapping beneath it in narrow windows, reveals a request for the active or best downloaded model in the
 user's shell. A divided footer links to Settings for network
-access. Network addresses and controls stay in Settings.
+access. Network addresses and controls stay in Settings. Viewed from another device, the card
+describes the server's API at the address the browser used: the caption asks for the Network access
+key, the example request is in the viewer's shell and sends the key as a placeholder Bearer header,
+and the footer points to the key in Settings. In a browser, local or remote, the harness rows have no
+status or grouping and no Connect, Repair, or Disconnect: each row's only action is **Copy setup
+prompt**, which copies the prompt from `DescribeHarnessSetup` for the default model, ending with the
+command to start the harness. The desktop app keeps one-click connections, since it, its service,
+and the harnesses share one computer and user.
 The initializer installs the canonical client-common palette variables; importing Tailwind alone
 does not initialize that palette. Native window appearance follows the same selected preference. macOS integrates native traffic
 lights beside the collapse toggle in the sidebar’s top row, with branding below and no separate title bar. The sidebar border and main content extend to the window’s top edge. Collapsing slides the sidebar fully away while retaining the native controls and a background-free expand toggle. Content keeps the same width in both states and is centered in the remaining area; closing the sidebar adds margins instead of reflowing content. Reduced-motion settings disable the transition, and hidden navigation is inert. The toggle is pinned to the sidebar’s right edge when expanded and uses the same sidebar icon in both states. Windows integrates native caption controls

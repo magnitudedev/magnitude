@@ -5,8 +5,8 @@ import { Duplex } from "node:stream"
 import { Socket } from "node:net"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { receiveJsonLines, sendJsonLine, JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
-import { Deferred, Effect, Schema, Stream, type Scope } from "effect"
-import type { MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
+import { Deferred, Effect, Option, Ref, Schema, Stream, SubscriptionRef, type Scope } from "effect"
+import type { ApplicationOwnerState, MagnitudeHealthResponse, OwnerReply, OwnerRequest } from "@magnitudedev/acn-protocol"
 
 export class AcnOwnerUnavailable extends Schema.TaggedError<AcnOwnerUnavailable>()("AcnOwnerUnavailable", {
   message: Schema.String,
@@ -16,6 +16,10 @@ export interface AcnOwnerControl {
   readonly awaitStart: Effect.Effect<void, JsonLineChannelFailed>
   readonly awaitShutdown: Effect.Effect<void, JsonLineChannelFailed>
   readonly reportHealth: (health: MagnitudeHealthResponse) => Effect.Effect<void, JsonLineChannelFailed>
+  /** The owner's latest self-report, once it has sent one. */
+  readonly ownerState: Stream.Stream<ApplicationOwnerState>
+  /** Asks the owner to act; the owner replies before acting on requests that end this process. */
+  readonly request: (request: OwnerRequest) => Effect.Effect<OwnerReply, JsonLineChannelFailed>
 }
 
 /** Installed before any application/engine scope. fd 0 is exclusively native-owned. */
@@ -55,8 +59,22 @@ export const makeAcnOwnerControl: Effect.Effect<AcnOwnerControl, AcnOwnerUnavail
   const started = yield* Deferred.make<void, JsonLineChannelFailed>()
   const shutdown = yield* Deferred.make<void, JsonLineChannelFailed>()
   const stoppingObserved = yield* Deferred.make<void, JsonLineChannelFailed>()
+  const ownerState = yield* SubscriptionRef.make(Option.none<ApplicationOwnerState>())
+  const pending = yield* Ref.make(new Map<number, Deferred.Deferred<OwnerReply, JsonLineChannelFailed>>())
+  const nextRequest = yield* Ref.make(0)
+  const failPending = (error: JsonLineChannelFailed) => Ref.getAndSet(pending, new Map()).pipe(
+    Effect.flatMap(waiting => Effect.forEach(waiting.values(), deferred => Deferred.fail(deferred, error), { discard: true })))
   yield* receiveJsonLines(socket, DesktopOwnerCommand).pipe(
-    Stream.runForEach(command => command._tag === "StoppingObserved"
+    Stream.runForEach(command => command._tag === "OwnerState"
+      ? SubscriptionRef.set(ownerState, Option.some(command.state))
+      : command._tag === "OwnerResponse"
+      ? Ref.modify(pending, waiting => {
+          const deferred = waiting.get(command.id)
+          const rest = new Map(waiting)
+          rest.delete(command.id)
+          return [deferred, rest] as const
+        }).pipe(Effect.flatMap(deferred => deferred === undefined ? Effect.void : Deferred.succeed(deferred, command.reply).pipe(Effect.asVoid)))
+      : command._tag === "StoppingObserved"
       ? Deferred.succeed(stoppingObserved, undefined).pipe(Effect.asVoid)
       : command._tag === "Shutdown"
       ? Effect.all([Deferred.succeed(shutdown, undefined), Deferred.fail(started, new JsonLineChannelFailed({ message: "Desktop stopped before startup authorization" }))]).pipe(Effect.asVoid)
@@ -65,7 +83,7 @@ export const makeAcnOwnerControl: Effect.Effect<AcnOwnerControl, AcnOwnerUnavail
           yield* Deferred.succeed(started, undefined)
         })),
     Effect.zipRight(Effect.fail(new JsonLineChannelFailed({ message: "Desktop control channel closed" }))),
-    Effect.catchAll(error => Effect.all([Deferred.fail(started, error), Deferred.fail(shutdown, error), Deferred.fail(stoppingObserved, error)])),
+    Effect.catchAll(error => Effect.all([Deferred.fail(started, error), Deferred.fail(shutdown, error), Deferred.fail(stoppingObserved, error), failPending(error)])),
     Effect.forkScoped,
   )
   yield* sendJsonLine(socket, DesktopChildEvent, { _tag: "Booted", pid: process.pid })
@@ -77,5 +95,14 @@ export const makeAcnOwnerControl: Effect.Effect<AcnOwnerControl, AcnOwnerUnavail
         Effect.timeoutFail({ duration: "2 seconds", onTimeout: () => new JsonLineChannelFailed({ message: "Desktop did not acknowledge the final service status." }) }),
       ) : Effect.void),
     ),
+    ownerState: ownerState.changes.pipe(Stream.filterMap(state => state)),
+    request: request => Effect.gen(function* () {
+      const id = yield* Ref.getAndUpdate(nextRequest, value => value + 1)
+      const reply = yield* Deferred.make<OwnerReply, JsonLineChannelFailed>()
+      yield* Ref.update(pending, waiting => new Map(waiting).set(id, reply))
+      yield* sendJsonLine(socket, DesktopChildEvent, { _tag: "OwnerRequest", id, request }).pipe(
+        Effect.tapError(() => Ref.update(pending, waiting => { const rest = new Map(waiting); rest.delete(id); return rest })))
+      return yield* Deferred.await(reply)
+    }),
   }
 })

@@ -1,8 +1,10 @@
 import { Group } from "@magnitudedev/effect-query";
 import { Agent } from "./agent";
+import { Application } from "./application";
 import { Changes } from "./changes";
 import { Configuration } from "./configuration";
 import { Connection } from "./connection";
+import { Connections } from "./connections";
 import { Display } from "./display";
 import { Files } from "./files";
 import { Git } from "./git";
@@ -16,7 +18,9 @@ import { Skills } from "./skills";
 export const AcnQueries = Group.make({
   Projects,
   Agent,
+  Application,
   Connection,
+  Connections,
   Display,
   Shell,
   ProjectFiles,
@@ -30,9 +34,11 @@ export const AcnQueries = Group.make({
 });
 export {
   Agent,
+  Application,
   Changes,
   Configuration,
   Connection,
+  Connections,
   Display,
   Files,
   Git,

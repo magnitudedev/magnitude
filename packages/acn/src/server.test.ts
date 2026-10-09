@@ -8,11 +8,12 @@ import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import { Rpc, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
 import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { networkInterfaces } from "node:os"
-import type { NetworkAccess } from "@magnitudedev/storage"
+import { LOOPBACK_ONLY, type NetworkAccess } from "@magnitudedev/storage"
 import { IcnBinaryNotFound } from "@magnitudedev/icn"
 import { describe, expect, it, vi } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
+import { makeRemoteAccess } from "./remote-access"
 import { ACN_PUBLIC_PORT, acnStartupFailureDetail, installAcnHealthRoutes, installAcnPublicRoutes, launchAcnServer } from "./server"
 
 describe("ACN startup failure presentation", () => {
@@ -22,7 +23,7 @@ describe("ACN startup failure presentation", () => {
     vi.stubEnv("MAGNITUDE_ICN_PATH", join(root, "absent-installation.json"))
     try {
       const result = await Effect.runPromise(launchAcnServer({ dataDir: root, port: 0 }, {
-        awaitStart: Effect.void, awaitShutdown: Effect.never,
+        awaitStart: Effect.void, awaitShutdown: Effect.never, ownerState: Stream.never, request: () => Effect.never,
         reportHealth: health => Effect.sleep(health.state._tag === "Stopping" ? "25 millis" : "0 millis").pipe(
           Effect.zipRight(Effect.sync(() => { delivered.push(health) })),
         ),
@@ -85,14 +86,15 @@ describe("ACN public HTTP listener", () => {
       }))
       const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
       const publicRouter = yield* HttpLayerRouter.make
-      yield* installAcnHealthRoutes(publicRouter, lifecycle)
+      const remote = yield* makeRemoteAccess(LOOPBACK_ONLY)
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, remote)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, {
         origin: new URL(icnOrigin),
         clientOptions: { headers: { authorization: "Bearer private-icn" } },
-      })
+      }, remote)
       const origin = loopbackOrigin(yield* listen(publicRouter, 0))
       expect(ACN_PUBLIC_PORT).toBe(10100)
-      expect(yield* (yield* http.get(`${origin}/`)).text).toContain("/inference/v1")
+      expect(yield* (yield* http.get(`${origin}/inference`)).text).toContain("/inference/v1")
 
       const rpc = (base: string, id: string | undefined, tag = "Ping") => http.execute(
         HttpClientRequest.post(`${base}/rpc`, {
@@ -144,7 +146,7 @@ describe("ACN public HTTP listener", () => {
       expect((yield* http.get(`${origin}/health`)).status).toBe(503)
       expect((yield* rpc(origin, ACN_INSTANCE_ID)).status).toBe(503)
       expect(dispatched).toBe(1)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
 })
 
@@ -162,8 +164,9 @@ describe("ACN network access", () => {
       yield* icn.add("GET", "/v1/models", Effect.succeed(HttpServerResponse.text("inference models")))
       const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
       const publicRouter = yield* HttpLayerRouter.make
-      yield* installAcnHealthRoutes(publicRouter, lifecycle, network)
-      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, network)
+      const remoteAccess = yield* makeRemoteAccess(network)
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess)
+      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, remoteAccess)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
       const rpcRouter = yield* HttpLayerRouter.make
       yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
@@ -181,7 +184,7 @@ describe("ACN network access", () => {
       const remoteHealth = yield* get(`${remote}/health`)
       expect(remoteHealth.status).toBe(200)
       expect(yield* remoteHealth.text).not.toContain('"id"')
-      expect((yield* rpc(remote)).status).toBe(403)
+      expect((yield* rpc(remote)).status).toBe(401)
       const unauthenticated = yield* get(`${remote}/inference/v1/models`)
       expect(unauthenticated.status).toBe(401)
       expect(unauthenticated.headers["www-authenticate"]).toContain("Bearer")
@@ -194,7 +197,7 @@ describe("ACN network access", () => {
         expect((yield* get(`${remote}${path}`)).status).toBe(401)
       }
       expect((yield* get(`${remote}/INFERENCE/v1/models`, { authorization: "Bearer mag-test-key" })).status).toBe(200)
-      expect((yield* http.execute(HttpClientRequest.post(`${remote}/%72pc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))).status).toBe(403)
+      expect((yield* http.execute(HttpClientRequest.post(`${remote}/%72pc`, { headers: { "x-magnitude-acn-id": ACN_INSTANCE_ID }, body: HttpBody.text("{}\n", "application/ndjson") }))).status).toBe(401)
 
       const preflight = yield* http.execute(HttpClientRequest.options(`${remote}/inference/v1/models`, { headers: { origin: "http://localhost:3000" } }))
       expect(preflight.status).toBe(204)
@@ -204,19 +207,75 @@ describe("ACN network access", () => {
       expect((yield* get(`${remote}/health`, { host: "my-mac.local:1" })).status).toBe(200)
       expect((yield* get(`${remote}/health`, { host: "host.docker.internal:1" })).status).toBe(200)
       expect((yield* get(`${remote}/health`, { host: "mac.tail1234.ts.net" })).status).toBe(200)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
+  })
+  it("admits a browser on another device that signed in with the key, only from its own pages", async () => {
+    const external = externalAddress()
+    if (external === undefined) return
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const http = yield* HttpClient.HttpClient
+      const lifecycle = yield* makeAcnServiceLifecycle()
+      const publicRouter = yield* HttpLayerRouter.make
+      const remoteAccess = yield* makeRemoteAccess(network)
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess)
+      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL("http://127.0.0.1:1"), clientOptions: { headers: {} } }, remoteAccess)
+      const port = yield* listen(publicRouter, 0, "0.0.0.0")
+      const rpcRouter = yield* HttpLayerRouter.make
+      yield* rpcRouter.add("POST", "/rpc", Effect.succeed(HttpServerResponse.text("dispatched")))
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+      const local = loopbackOrigin(port)
+      const remote = `http://${external}:${port}`
+      const send = (method: "GET" | "POST", url: string, headers: Record<string, string> = {}, body?: string) => http.execute(
+        (method === "GET" ? HttpClientRequest.get(url, { headers }) : HttpClientRequest.post(url, { headers, body: HttpBody.text(body ?? "{}", "application/json") })))
+      const rpc = (headers: Record<string, string>) => send("POST", `${remote}/rpc`, { "x-magnitude-acn-id": ACN_INSTANCE_ID, ...headers })
+      const status = (url: string, headers: Record<string, string> = {}) => send("GET", `${url}/auth/session`, headers).pipe(Effect.flatMap(response => response.json))
+
+      expect(yield* status(local)).toEqual({ _tag: "Local" })
+      expect(yield* status(remote)).toEqual({ _tag: "SignInRequired", keyConfigured: true })
+      expect((yield* send("POST", `${remote}/auth/session`, {}, JSON.stringify({ key: "mag-test-key" }))).status).toBe(403)
+      expect((yield* send("POST", `${remote}/auth/session`, { origin: "http://evil.com" }, JSON.stringify({ key: "mag-test-key" }))).status).toBe(403)
+      const wrong = yield* send("POST", `${remote}/auth/session`, { origin: remote }, JSON.stringify({ key: "mag-wrong" }))
+      expect(wrong.status).toBe(401)
+      expect(yield* wrong.json).toEqual({ _tag: "SignInRefused", reason: "WrongKey" })
+
+      const signedIn = yield* send("POST", `${remote}/auth/session`, { origin: remote }, JSON.stringify({ key: "mag-test-key" }))
+      expect(signedIn.status).toBe(204)
+      const setCookie = signedIn.headers["set-cookie"] ?? ""
+      expect(setCookie).toMatch(/^magnitude_session=[\w-]{20,};/)
+      expect(setCookie).toContain("HttpOnly")
+      expect(setCookie).toContain("SameSite=Strict")
+      expect(setCookie).not.toContain("Secure")
+      const cookie = setCookie.split(";")[0]!
+      const secure = yield* send("POST", `${remote}/auth/session`, { origin: remote, "x-forwarded-proto": "https" }, JSON.stringify({ key: "mag-test-key" }))
+      expect(secure.headers["set-cookie"]).toContain("Secure")
+
+      expect(yield* status(remote, { cookie })).toEqual({ _tag: "SignedIn" })
+      expect(yield* (yield* send("GET", `${remote}/health`, { cookie })).text).toContain('"id"')
+      expect((yield* rpc({ cookie, origin: remote })).status).toBe(200)
+      expect((yield* rpc({ cookie })).status).toBe(403)
+      expect((yield* rpc({ cookie, origin: "http://evil.com" })).status).toBe(403)
+      expect((yield* rpc({ cookie: "magnitude_session=forged", origin: remote })).status).toBe(401)
+      expect((yield* send("GET", `${remote}/inference/v1/models`, { cookie })).status).toBe(401)
+
+      expect((yield* send("POST", `${remote}/auth/session/end`, { cookie })).status).toBe(403)
+      const ended = yield* send("POST", `${remote}/auth/session/end`, { cookie, origin: remote })
+      expect(ended.status).toBe(204)
+      expect(ended.headers["set-cookie"]).toContain("Max-Age=0")
+      expect((yield* rpc({ cookie, origin: remote })).status).toBe(401)
+      expect(yield* (yield* send("GET", `${remote}/health`, { cookie })).text).not.toContain('"id"')
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
   it("refuses non-local hosts and never gates while loopback only", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const http = yield* HttpClient.HttpClient
       const lifecycle = yield* makeAcnServiceLifecycle()
       const publicRouter = yield* HttpLayerRouter.make
-      yield* installAcnHealthRoutes(publicRouter, lifecycle)
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, yield* makeRemoteAccess(LOOPBACK_ONLY))
       const origin = loopbackOrigin(yield* listen(publicRouter, 0))
       const get = (headers: Record<string, string>) => http.execute(HttpClientRequest.get(`${origin}/health`, { headers }))
       expect((yield* get({ host: "192.168.1.2:1" })).status).toBe(421)
       expect((yield* get({ host: "host.docker.internal" })).status).toBe(421)
       expect((yield* get({ host: "localhost:1" })).status).toBe(503)
-    })).pipe(Effect.provide(FetchHttpClient.layer)))
+    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
 })

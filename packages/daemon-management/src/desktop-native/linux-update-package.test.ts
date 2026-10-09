@@ -8,7 +8,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { PublisherKeyId, signUpdateManifest, UpdateManifest } from "../../../release/src/hosted-update/manifest"
 import { makeLinuxPackageInstaller } from "./linux-update-package"
-import { GuardedCommand } from "./guarded-command"
+import { GuardedCommand } from "@magnitudedev/utils/guarded-command"
 
 const uid = process.getuid!()
 afterEach(() => vi.unstubAllGlobals())

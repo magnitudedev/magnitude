@@ -1,6 +1,7 @@
 import { BunContext } from "@effect/platform-bun"
 import { acquireUpdateInstallationLease, completeLinuxUpdateHandoff, installLinuxApplicationUpdate, guardLinuxInstallerParent, LinuxUpdateHandoffRequest,
-  nativeHostLayer, relaunchLinuxAfterUpdate, unixPrivateFilePermissions, guardedCommandLayer } from "@magnitudedev/daemon-management/desktop-native"
+  nativeHostLayer, relaunchLinuxAfterUpdate, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
+import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { Effect } from "effect"
 import { CLI_VERSION } from "../version"
 import { writeSync } from "node:fs"

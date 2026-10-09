@@ -15,8 +15,7 @@ applies_to:
   - packages/client-common/src/local-models/**
   - packages/client-common/src/utils/model-presentation.ts
   - cli/src/commands/inference-runtime.ts
-  - desktop/src/renderer.tsx
-  - web/src/components/model-center.tsx
+  - web/src/app.tsx
 ---
 
 # Model catalog and acquisition

@@ -5,7 +5,7 @@ applies_to:
   - inference/service/contracts/src/inventory.rs
   - packages/acn-protocol/src/schemas/inference-projection.ts
   - packages/acn-protocol/src/schemas/model-state.ts
-  - desktop/src/hardware-details.ts
+  - web/src/components/hardware-details.ts
 ---
 
 # Descriptive hardware observations

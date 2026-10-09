@@ -1,4 +1,4 @@
-import { ApplicationUpdateControlFailed, DesktopUpdateState, LoginStartupFailed, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationUpdateControlFailed, ApplicationUpdateState, LoginStartupFailed, type LoginStartupState } from "@magnitudedev/sdk/desktop-host"
 import { mkdtemp, rm, writeFile, stat } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -15,7 +15,7 @@ describe("local application control", () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const root = yield* setup
       const path = join(root, "application.sock")
-      const ready = DesktopUpdateState.make({ transfer: { _tag: "Ready", version: "2.0.0" }, check: { _tag: "Succeeded", at: 1 }, preference: { _tag: "Known", autoDownload: false } })
+      const ready = ApplicationUpdateState.make({ transfer: { _tag: "Ready", version: "2.0.0" }, check: { _tag: "Succeeded", at: 1 }, preference: { _tag: "Known", autoDownload: false } })
       const actions = yield* Ref.make<string[]>([])
       yield* serveApplicationControl(path, { snapshot: Effect.succeed(snapshot), login: () => Effect.die("Unexpected login request"), dispatch: () => Effect.die("Updates cannot show a window"),
         update: action => action === "download" ? new ApplicationUpdateControlFailed({ message: "Already prepared" }) : Effect.succeed({ state: ready, afterReply: Ref.update(actions, values => [...values, action]) }),

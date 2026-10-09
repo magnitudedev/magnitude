@@ -1,5 +1,5 @@
 import { Data, Effect, Schema } from "effect"
-import { BunSqliteDriver } from "@magnitudedev/daemon-management/bun"
+import { BunSqliteDriver } from "@magnitudedev/storage/sqlite/bun"
 
 class NativeRuntimeCheckFailed extends Data.TaggedError("NativeRuntimeCheckFailed")<{
   readonly message: string

@@ -1,13 +1,9 @@
 ---
 applies_to:
-  - web/src/app.tsx
-  - web/src/commands/**
   - web/src/components/**
-  - web/src/hooks/use-menu-actions.ts
-  - web/src/state/web-atoms.ts
   - web/src/stores/**
   - web/src/styles/**
-  - desktop/src/renderer.tsx
+  - web/src/app.tsx
   - packages/client-common/src/hooks/use-local-inference-state.ts
   - packages/client-common/src/local-models/**
   - packages/client-common/src/model-slots/**

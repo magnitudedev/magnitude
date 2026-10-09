@@ -21,3 +21,7 @@ export * from "./local-model-projection"
 export * from "./inference-projection"
 
 export * from "./serving-usage"
+export * from "./harness-connections"
+export * from "./server-settings"
+export * from "./application-owner"
+export * from "./remote-access"

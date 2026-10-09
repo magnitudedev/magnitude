@@ -1,13 +1,25 @@
 //! Emptiness questions over terminal languages, answered with derivre within
-//! a per-compilation work budget. Planning and certification ask them.
+//! a per-compilation work budget. Planning and certification ask them, and
+//! both treat a positive answer as the safe one, so a question may be asked
+//! about a superset of the languages it names.
 use crate::terminal::{has_byte, Bytes, Term, TermId, Terms};
 use llguidance::derivre::{raw::RelevanceCache, ExprRef, RegexAst, RegexBuilder};
 
-/// Derivative work allowed for one emptiness question.
-const FUEL: u64 = 200_000;
+/// Derivative work allowed for one emptiness question. A whole tool call's
+/// arguments can be one lexeme, and with parallel calls a question about it
+/// costs several hundred thousand units (733,147 for OpenClaw's 57 tools);
+/// one left unanswered peels or splits more of the plan, which asks more
+/// questions, so this budget must cover them.
+const FUEL: u64 = 2_000_000;
 /// Derivative work allowed per compilation. A question left unanswered
 /// counts as positive, which only makes the rendering finer.
 const TOTAL_FUEL: u64 = 20_000_000;
+/// Repetition bounds beyond this are asked about as unbounded. Derivative
+/// work grows with a counted bound and multiplies across the bounds one
+/// question combines (two strings of at most 200 characters exhaust it), and
+/// a superset can only turn an answer positive, which is as safe as a
+/// question left unanswered.
+const COUNTED: u32 = 16;
 
 /// derivre expressions for terminals and batched emptiness questions.
 pub(crate) struct Regexes {
@@ -75,8 +87,8 @@ impl Regexes {
                 }
                 Term::Repeat(part, min, max) => RegexAst::Repeat(
                     Box::new(child(*part, &self.exprs)),
-                    *min,
-                    max.unwrap_or(u32::MAX),
+                    (*min).min(COUNTED),
+                    max.filter(|&max| max <= COUNTED).unwrap_or(u32::MAX),
                 ),
                 Term::NonEmpty(part) => {
                     RegexAst::And(vec![child(*part, &self.exprs), Self::any_bytes(1)])
@@ -124,18 +136,6 @@ impl Regexes {
             ]),
         ]);
         self.builder.mk(&ast).expect("overrun of terminals")
-    }
-    /// Some text of `text` contains text of `delimiter`.
-    pub(crate) fn contains(&mut self, terms: &Terms, text: TermId, delimiter: TermId) -> ExprRef {
-        let ast = RegexAst::And(vec![
-            RegexAst::ExprRef(self.expr(terms, text)),
-            RegexAst::Concat(vec![
-                Self::any_bytes(0),
-                RegexAst::ExprRef(self.expr(terms, delimiter)),
-                Self::any_bytes(0),
-            ]),
-        ]);
-        self.builder.mk(&ast).expect("containment of terminals")
     }
     /// Non-emptiness of each expression; unanswerable questions count as
     /// non-empty.
