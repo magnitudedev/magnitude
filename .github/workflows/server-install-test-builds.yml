@@ -147,6 +147,7 @@ jobs:
 
   windows:
     needs: plan
+    if: needs.plan.outputs.windows != ''
     permissions:
       contents: write
     runs-on: blacksmith-8vcpu-windows-2025
