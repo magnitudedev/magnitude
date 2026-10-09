@@ -83,6 +83,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           preload: resolve(__dirname, "src/preload.ts"),
+          "server-conflict-preload": resolve(__dirname, "src/server-conflict-preload.ts"),
         },
       },
     },
@@ -93,6 +94,7 @@ export default defineConfig({
       rollupOptions: {
         input: {
           index: resolve(__dirname, "index.html"),
+          "server-conflict": resolve(__dirname, "server-conflict.html"),
         },
       },
     },

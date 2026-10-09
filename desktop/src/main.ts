@@ -1,3 +1,4 @@
+import { isServerRunning, resolveServerConflict } from "./server-conflict"
 import { windowChrome, windowControlColors } from "./window-chrome"
 import { makeMacCliRegistration } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateControlFailed } from "@magnitudedev/sdk/desktop-host"
@@ -89,6 +90,19 @@ const program = Effect.scoped(Effect.gen(function* () {
     canPresentErrors = true
   }
   const stateDir = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: dataDir, override: Option.fromNullable(stateOverride) })
+  yield* Effect.promise(() => app.whenReady())
+  yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
+  // The app and the server can't run at once. While the server runs, the window is one screen;
+  // a background launch at login leaves the server alone.
+  if (app.isPackaged && (process.platform === "linux" || process.platform === "darwin")) {
+    const decision = background
+      ? (yield* isServerRunning(stateDir)) ? "Quit" as const : "Proceed" as const
+      : yield* resolveServerConflict({ personalStateDirectory: stateDir,
+        pageUrl: `${process.env.ELECTRON_RENDERER_URL ?? DESKTOP_APP_ORIGIN}/server-conflict.html`,
+        preload: join(here, "../preload/server-conflict-preload.mjs"),
+        icon: join(process.resourcesPath, "application-icon.png") })
+    if (decision === "Quit") return "Quit" as const
+  }
   const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: background ? "EnsureRunning" : "ShowWindow" })
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
   if (yield* isUpdateInstallationActive(stateDir)) return "Quit" as const
@@ -100,8 +114,6 @@ const program = Effect.scoped(Effect.gen(function* () {
     yield* acquireMacApplicationInstallationLease(dirname(dirname(dirname(process.execPath)))).pipe(
       Effect.provide(nativeMacUpdateAdmission(addonPath)))
   }
-  yield* Effect.promise(() => app.whenReady())
-  yield* Effect.sync(() => handleAppProtocol(resolveRendererDir(here)))
   const preferenceWrites = yield* Effect.makeSemaphore(1)
   const appearance = yield* makeAppearancePreferences(dataDir).pipe(Effect.provide(NodeContext.layer))
   const initialAppearance = yield* appearance.read.pipe(Effect.catchAll(error =>

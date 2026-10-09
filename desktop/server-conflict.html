@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Magnitude</title>
+  <style>
+    :root { color-scheme: light dark; --background: #f8fafc; --text: #0f172a; --muted: #475569; --line: #e2e8f0; --primary: #0f172a; --primary-text: #f8fafc; --error: #b91c1c; }
+    @media (prefers-color-scheme: dark) { :root { --background: #0b1120; --text: #e2e8f0; --muted: #94a3b8; --line: #1e293b; --primary: #e2e8f0; --primary-text: #0f172a; --error: #f87171; } }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body { display: flex; align-items: center; justify-content: center; padding: 48px; background: var(--background); color: var(--text);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; -webkit-app-region: drag; }
+    main { max-width: 560px; -webkit-app-region: no-drag; }
+    h1 { font-size: 22px; line-height: 1.3; font-weight: 600; margin: 0 0 16px; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    a { color: var(--text); }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 28px; }
+    button { font: inherit; font-weight: 500; padding: 9px 16px; border-radius: 8px; border: 1px solid var(--line); background: transparent; color: var(--text); cursor: pointer; }
+    button.primary { background: var(--primary); color: var(--primary-text); border-color: var(--primary); }
+    button:disabled { opacity: 0.6; cursor: default; }
+    #status { min-height: 1.55em; margin-top: 16px; }
+    #status.error { color: var(--error); }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Magnitude is running as a server on this machine</h1>
+    <p>Using the desktop app will stop the server. Anything connected to it, including browsers and agents on other computers, will be disconnected.</p>
+    <p>Want the app without stopping it? Open the server in your browser: <a id="address" href="http://localhost:10100">http://localhost:10100</a></p>
+    <p id="data"></p>
+    <div class="actions">
+      <button id="keep" class="primary" type="button">Keep the server</button>
+      <button id="stop" type="button">Stop the server and use the app</button>
+    </div>
+    <p id="status" role="status"></p>
+  </main>
+  <script type="module" src="./src/server-conflict-page.ts"></script>
+</body>
+</html>
