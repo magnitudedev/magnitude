@@ -550,6 +550,52 @@ describe("Codex inference gateway", () => {
 })
 
 describe("Codex WebSocket gateway", () => {
+  test.each(["string", "binary"])("drops stale body headers for a rewritten local %s frame", (format) => {
+    const json = JSON.stringify({
+      type: "response.create",
+      model: `${LOCAL_CODEX_MODEL_PREFIX}canonical:model`,
+      input: [],
+    })
+    const firstMessage = format === "string" ? json : new TextEncoder().encode(json)
+    const sourceHeaders = new Headers({
+      authorization: "Bearer caller-token",
+      "content-encoding": "zstd",
+      "content-length": "123",
+      "openai-beta": "responses_websockets=2026-02-06",
+    })
+    const target = codexWebSocketTarget(firstMessage, sourceHeaders, icn)
+    expect(target._tag).toBe("Target")
+    if (target._tag !== "Target") return
+    expect(target.route).toBe("local")
+    expect(target.headers.get("content-encoding")).toBeNull()
+    expect(target.headers.get("content-length")).toBeNull()
+    expect(target.headers.get("authorization")).toBe("Bearer private-icn-token")
+    expect(target.headers.get("openai-beta")).toBe("responses_websockets=2026-02-06")
+    expect(JSON.parse(new TextDecoder().decode(target.firstMessage as Uint8Array))).toEqual({
+      type: "response.create",
+      model: "canonical:model",
+      input: [],
+    })
+    expect(sourceHeaders.get("content-encoding")).toBe("zstd")
+    expect(sourceHeaders.get("content-length")).toBe("123")
+    expect(sourceHeaders.get("authorization")).toBe("Bearer caller-token")
+  })
+
+  test.each(["string", "binary"])("preserves body headers for an unchanged upstream %s frame", (format) => {
+    const json = '{"type":"response.create","model":"gpt-5.6-sol","input":[]}'
+    const firstMessage = format === "string" ? json : new TextEncoder().encode(json)
+    const target = codexWebSocketTarget(firstMessage, new Headers({
+      "content-encoding": "zstd",
+      "content-length": "123",
+    }), icn)
+    expect(target._tag).toBe("Target")
+    if (target._tag !== "Target") return
+    expect(target.route).toBe("upstream")
+    expect(target.headers.get("content-encoding")).toBe("zstd")
+    expect(target.headers.get("content-length")).toBe("123")
+    expect(target.firstMessage).toBe(firstMessage)
+  })
+
   test("routes OpenAI models upstream without changing the first frame", () => {
     const firstMessage = '{"type":"response.create","model":"gpt-5.6-sol","input":[]}'
     const target = codexWebSocketTarget(

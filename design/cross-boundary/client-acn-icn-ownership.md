@@ -180,7 +180,8 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
   proxy. Harness-only alias discovery and upstream multiplexing exist only below the explicit
   Codex and Claude Code proxy subroutes.
 - Codex WebSocket model routing and socket replacement belong to ACN; native local Responses
-  WebSocket events and connection-scoped replay belong to ICN.
+  WebSocket events and connection-scoped replay belong to ICN. Rewritten frames do not forward
+  the original content encoding or length; unchanged upstream frames retain their metadata.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.
 - Query successes are direct domain values with no generic revision envelope.
 - No generic mirrored-resource service or wire schema exists. Private derived projections may

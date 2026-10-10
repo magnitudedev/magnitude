@@ -597,6 +597,8 @@ export const codexWebSocketTarget = (
   if (canonicalModel.length === 0) {
     return { _tag: "Invalid", message: "Local model alias is missing its canonical model ID" }
   }
+  headers.delete("content-encoding")
+  headers.delete("content-length")
   localAuthorization(headers, icn)
   return {
     _tag: "Target",
