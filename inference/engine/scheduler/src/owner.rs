@@ -1204,10 +1204,15 @@ impl<F: ProgramFamily> Service<F> {
     fn drive(&mut self, mut pipeline: Pipeline<F>, now: u64) -> Result<(Pipeline<F>, Ran), Fatal> {
         self.time(now).map_err(|error| (None, error))?;
         let mut unload = false;
+        // A flight submitted by this run is reconciled by a later one, even
+        // when the device completed it during submission (CPU): its
+        // completion event returns the worker here only after it has applied
+        // the controls and events that arrived during the flight.
+        let mut submitted = false;
         loop {
             pipeline = match pipeline {
                 Pipeline::InFlight(round, mut active) => {
-                    if !active.flight.completion().is_complete() {
+                    if submitted || !active.flight.completion().is_complete() {
                         unload |= self.observe(None).map_err(|error| (None, error))?;
                         return Ok((
                             Pipeline::InFlight(round, active),
@@ -1215,6 +1220,7 @@ impl<F: ProgramFamily> Service<F> {
                         ));
                     }
                     let (round, bindings) = self.reconcile(round, active)?;
+                    submitted = true;
                     self.advance(round, bindings)?
                 }
                 Pipeline::Idle(mut bindings) => {
@@ -1223,7 +1229,10 @@ impl<F: ProgramFamily> Service<F> {
                         .map_err(|error| (None, error))?;
                     self.publish_ready().map_err(|error| (None, error))?;
                     match self.select(&mut bindings)? {
-                        Selected::Round(round) => self.advance(round, bindings)?,
+                        Selected::Round(round) => {
+                            submitted = true;
+                            self.advance(round, bindings)?
+                        }
                         Selected::Retry => Pipeline::Idle(bindings),
                         Selected::Empty => {
                             if self.fail_capacity_waiters() {
