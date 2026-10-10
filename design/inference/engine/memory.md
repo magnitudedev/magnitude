@@ -70,8 +70,11 @@ Stable fit capacity bounds metadata-only model fit. It is
 the allocation domain's total capacity under applicable process limits and, on Metal, the device's
 recommended working set, less the planning reserve. A live claim uses fresh headroom for that same
 domain, bounded by process limits, and must leave headroom above the planning reserve; on Metal it
-must also fit the working set's remaining bytes. The observation already excludes the engine's own
-charges and other processes' use, so an existing charge is never subtracted again. A load onto a
+must also leave the working set's remaining bytes above the same reserve, so the engine's charge
+never exceeds stable fit capacity. The driver's submission memory lies outside the engine's charge,
+and a working set filled to its end fails a submission as a lost device instead of refusing a claim.
+The observation already excludes the engine's own charges and other processes' use, so an existing
+charge is never subtracted again. A load onto a
 dedicated device also claims its staged uploads against host RAM under the host's reserve.
 
 State is stored in fixed-size history and bank slabs on every backend: one history slab tensor per
@@ -186,9 +189,9 @@ kill is independent fault containment; it chooses nothing to release.
 - No new device allocation bypasses a fitting claim, and neither a rejected minimum nor a
   failed physical allocation changes accepted numerical state.
 - Reclamation follows the single order and stops when the measured deficit clears.
-- No engine claim leaves any used domain's headroom at or below its planning reserve; a claim
-  never unloads the model; persistent Reclaim ends in the typed unloaded state within the
-  one-second bound.
+- No engine claim leaves any used domain's headroom, or on Metal the working set's remaining bytes,
+  at or below its planning reserve; a claim never unloads the model; persistent Reclaim ends in the
+  typed unloaded state within the one-second bound.
 - Threshold values exist in one policy definition. Host distress is derived only from Seismic's
   host observation; no other code path reads an OS pressure signal.
 - On macOS every engine holding is wired from allocation to release, and no holding is counted in
@@ -240,6 +243,10 @@ one page per domain. Free space is tracked within each slab, and a freed slab in
 A Window(n) history releases its references on rows before `n` behind its accepted position after
 each advance; those rows are free again, a page is reused once none of its rows is referenced, and
 a slab left empty is released by the rules below.
+A launch may read rows its spans do not select (a tile covering several requests reads the
+union of their spans and masks the rest), so every slot of a slab table names device memory of a
+whole slab: a free slot names a backed slab of the same store, and only a store without backed
+slabs has none.
 Callers retain logical identities and published placement snapshots, never mutable physical bank
 indices.
 
