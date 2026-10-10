@@ -1664,9 +1664,14 @@ impl NativeImplementation {
     /// false prunes a partial assignment. `None` when no assignment over the
     /// candidates is admitted.
     pub fn search_statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
-        self.search(fixed, &|_| None, &|statics| match self.admissible(statics) {
-            Ok(admissible) if !admissible.is_empty() => Some(statics.clone()),
-            Ok(_) | Err(_) => None,
+        self.search(fixed, &|_| None, &|statics| {
+            let mut admitted = false;
+            self.walk_admissible(statics, |_| {
+                admitted = true;
+                true
+            })
+            .ok()?;
+            admitted.then(|| statics.clone())
         })
     }
 

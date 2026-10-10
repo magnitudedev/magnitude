@@ -34,7 +34,7 @@
 
 use super::abi::{self, render_source, Dialect};
 use super::plan::{self, LaunchVariant};
-use seismic_lang::checked::{CheckedModule, EntryInfo, NativeImplementation, NativeSpecialization};
+use seismic_lang::checked::{CheckedModule, EntryInfo, NativeImplementation, NativeParameter, NativeSpecialization};
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_lang::registry::{self, BackendName};
@@ -643,7 +643,9 @@ struct Subject<'m> {
     /// Searched statics, by the statics fixed.
     searched: std::sync::Mutex<std::collections::HashMap<Vec<(String, u64)>, Option<NativeSpecialization>>>,
     /// Admissible specializations, by statics.
-    specializations: std::sync::Mutex<std::collections::HashMap<NativeSpecialization, std::sync::Arc<Vec<NativeSpecialization>>>>,
+    specializations: std::sync::Mutex<std::collections::HashMap<NativeSpecialization, std::sync::Arc<Admissible<'m>>>>,
+    /// Whether programs are formed per code variant (CUDA and Metal).
+    variant_programs: bool,
 }
 
 impl<'m> Subject<'m> {
@@ -672,6 +674,7 @@ impl<'m> Subject<'m> {
             admitted: Default::default(),
             searched: Default::default(),
             specializations: Default::default(),
+            variant_programs: backend != BackendName::Vulkan,
         })
     }
 
@@ -689,7 +692,7 @@ impl<'m> Subject<'m> {
     }
 
     /// The admissible specializations at `statics`, walked once.
-    fn admissible(&self, statics: &NativeSpecialization) -> std::sync::Arc<Vec<NativeSpecialization>> {
+    fn admissible(&self, statics: &NativeSpecialization) -> std::sync::Arc<Admissible<'m>> {
         let mut walked = self
             .specializations
             .lock()
@@ -697,11 +700,11 @@ impl<'m> Subject<'m> {
         walked
             .entry(statics.clone())
             .or_insert_with(|| {
-                std::sync::Arc::new(
-                    self.implementation
-                        .admissible(statics)
-                        .expect("a row's statics admit its specialization"),
-                )
+                std::sync::Arc::new(Admissible::walk(
+                    self.implementation,
+                    statics,
+                    self.variant_programs,
+                ))
             })
             .clone()
     }
@@ -727,22 +730,7 @@ impl<'m> Subject<'m> {
     /// The code variants of each launch at `specialization`'s statics: every
     /// template instance an admissible configuration names.
     fn variants(&self, specialization: &NativeSpecialization) -> Vec<Vec<LaunchVariant>> {
-        let admissible = self.admissible(&statics_of(specialization));
-        (0..self.implementation.launches.len())
-            .map(|ordinal| {
-                let mut variants = Vec::<LaunchVariant>::new();
-                for candidate in admissible.iter() {
-                    let variant = LaunchVariant {
-                        code: plan::code_values(self.implementation, candidate, ordinal),
-                        group_size: self.implementation.static_group_size(candidate, ordinal),
-                    };
-                    if !variants.contains(&variant) {
-                        variants.push(variant);
-                    }
-                }
-                variants
-            })
-            .collect()
+        self.admissible(&statics_of(specialization)).variants.clone()
     }
 
     /// The programs preparation forms for `row`, every code variant of a
@@ -832,6 +820,119 @@ fn statics_of(specialization: &NativeSpecialization) -> NativeSpecialization {
 }
 
 /// The changes of one choice from `row` the search considers.
+/// The admissible specializations at one set of statics, held as the index
+/// of each parameter's value in its declaration rather than as maps: a
+/// declaration can admit hundreds of thousands of them.
+struct Admissible<'m> {
+    statics: NativeSpecialization,
+    /// Every parameter, then every launch's parameters (with their launch).
+    axes: Vec<(Option<usize>, &'m NativeParameter)>,
+    /// One row of `axes.len()` codes per configuration, in walk order.
+    codes: Vec<u16>,
+    count: usize,
+    /// The code variants of each launch the configurations name, when
+    /// programs are formed per variant.
+    variants: Vec<Vec<LaunchVariant>>,
+}
+
+/// A parameter a configuration leaves unset.
+const UNSET: u16 = u16::MAX;
+
+impl<'m> Admissible<'m> {
+    fn walk(implementation: &'m NativeImplementation, statics: &NativeSpecialization, variant_programs: bool) -> Self {
+        let axes = implementation
+            .params
+            .iter()
+            .map(|parameter| (None, parameter))
+            .chain(implementation.launches.iter().enumerate().flat_map(|(launch, declaration)| {
+                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
+            }))
+            .collect::<Vec<_>>();
+        let mut admissible = Self {
+            statics: NativeSpecialization::new(),
+            axes,
+            codes: Vec::new(),
+            count: 0,
+            variants: vec![Vec::new(); if variant_programs { implementation.launches.len() } else { 0 }],
+        };
+        let mut first = true;
+        implementation
+            .walk_admissible(statics, |candidate| {
+                if first {
+                    admissible.statics = statics_of(candidate);
+                    first = false;
+                }
+                let codes = admissible.codes_of(candidate);
+                debug_assert_eq!(
+                    codes.iter().filter(|code| **code != UNSET).count(),
+                    candidate.params().len() + candidate.launch_params().len(),
+                    "every parameter a configuration sets is declared"
+                );
+                admissible.codes.extend(codes);
+                admissible.count += 1;
+                for (ordinal, variants) in admissible.variants.iter_mut().enumerate() {
+                    let variant = LaunchVariant {
+                        code: plan::code_values(implementation, candidate, ordinal),
+                        group_size: implementation.static_group_size(candidate, ordinal),
+                    };
+                    if !variants.contains(&variant) {
+                        variants.push(variant);
+                    }
+                }
+                true
+            })
+            .expect("a row's statics admit its specialization");
+        admissible
+    }
+
+    /// `specialization`'s code on every axis.
+    fn codes_of(&self, specialization: &NativeSpecialization) -> Vec<u16> {
+        self.axes
+            .iter()
+            .map(|(launch, parameter)| {
+                let value = match launch {
+                    None => specialization.param(&parameter.name),
+                    Some(launch) => specialization.launch_param(*launch, &parameter.name),
+                };
+                value
+                    .and_then(|value| parameter.values.iter().position(|declared| *declared == value))
+                    .map_or(UNSET, |code| code as u16)
+            })
+            .collect()
+    }
+
+    fn row(&self, index: usize) -> &[u16] {
+        &self.codes[index * self.axes.len()..(index + 1) * self.axes.len()]
+    }
+
+    fn specialization(&self, index: usize) -> NativeSpecialization {
+        self.axes.iter().zip(self.row(index)).fold(self.statics.clone(), |specialization, ((launch, parameter), code)| {
+            if *code == UNSET {
+                return specialization;
+            }
+            let value = parameter.values[*code as usize];
+            match launch {
+                None => specialization.with_param(parameter.name.clone(), value),
+                Some(launch) => specialization.with_launch_param(*launch, parameter.name.clone(), value),
+            }
+        })
+    }
+
+    /// The first configuration holding `code` on `axis` with the fewest set
+    /// parameters differing from `held`.
+    fn nearest(&self, held: &[u16], axis: usize, code: u16) -> Option<usize> {
+        (0..self.count)
+            .filter(|index| self.row(*index)[axis] == code)
+            .min_by_key(|index| {
+                self.row(*index)
+                    .iter()
+                    .zip(held)
+                    .filter(|(candidate, held)| **candidate != UNSET && candidate != held)
+                    .count()
+            })
+    }
+}
+
 fn variations(subject: &Subject<'_>, former: &Former, row: &Row) -> Vec<Row> {
     let mut rows = Vec::new();
     for (parameter, candidates) in &subject.candidates {
@@ -857,52 +958,23 @@ fn variations(subject: &Subject<'_>, former: &Former, row: &Row) -> Vec<Row> {
             }
             if let Some(found) = subject.statics(&[(name.as_str(), value)]) {
                 rows.push(Row {
-                    specialization: subject.admissible(&found)[0].clone(),
+                    specialization: subject.admissible(&found).specialization(0),
                     ..row.clone()
                 });
             }
         }
     }
     let admissible = subject.admissible(&statics);
-    let distance = |candidate: &NativeSpecialization| {
-        candidate
-            .params()
-            .iter()
-            .filter(|(name, value)| row.specialization.param(name) != Some(**value))
-            .count()
-            + candidate
-                .launch_params()
-                .iter()
-                .filter(|((launch, name), value)| {
-                    row.specialization.launch_param(*launch, name) != Some(**value)
-                })
-                .count()
-    };
-    let mut nearest = |matches: &dyn Fn(&NativeSpecialization) -> bool| {
-        if let Some(candidate) = admissible
-            .iter()
-            .filter(|candidate| matches(candidate))
-            .min_by_key(|candidate| distance(candidate))
-        {
-            rows.push(Row {
-                specialization: candidate.clone(),
-                ..row.clone()
-            });
-        }
-    };
-    for parameter in &implementation.params {
-        for value in &parameter.values {
-            if row.specialization.param(&parameter.name) != Some(*value) {
-                nearest(&|candidate| candidate.param(&parameter.name) == Some(*value));
-            }
-        }
-    }
-    for (launch, declaration) in implementation.launches.iter().enumerate() {
-        for parameter in &declaration.params {
-            for value in &parameter.values {
-                if row.specialization.launch_param(launch, &parameter.name) != Some(*value) {
-                    nearest(&|candidate| {
-                        candidate.launch_param(launch, &parameter.name) == Some(*value)
+    // The admissible configuration nearest the row holding each parameter
+    // value the row does not hold, ties to the first in walk order.
+    let held = admissible.codes_of(&row.specialization);
+    for (axis, (_, parameter)) in admissible.axes.iter().enumerate() {
+        for code in 0..parameter.values.len() as u16 {
+            if held[axis] != code {
+                if let Some(index) = admissible.nearest(&held, axis, code) {
+                    rows.push(Row {
+                        specialization: admissible.specialization(index),
+                        ..row.clone()
                     });
                 }
             }
