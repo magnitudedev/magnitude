@@ -294,14 +294,15 @@ impl SlabTensor {
             storage,
             regions: views,
         };
-        self.write_addresses(index, slab.device_address())?;
-        if index < self.slabs.len() {
-            self.slabs[index] = Some(slab);
-            Ok(index)
-        } else {
-            self.slabs.push(Some(slab));
-            Ok(index)
+        if index == self.slabs.len() {
+            self.slabs.push(None);
         }
+        self.slabs[index] = Some(slab);
+        if let Err(error) = self.publish_addresses() {
+            self.slabs[index] = None;
+            return Err(error);
+        }
+        Ok(index)
     }
 
     /// Remove one slab. The observer reports when all device uses and views
@@ -311,28 +312,45 @@ impl SlabTensor {
         index: usize,
     ) -> Result<Option<TensorStorageObserver>, TensorError> {
         self.ensure_unbound()?;
-        if self.slab(index).is_none() {
+        let Some(slab) = self.slabs.get_mut(index).and_then(Option::take) else {
             return Ok(None);
+        };
+        if let Err(error) = self.publish_addresses() {
+            self.slabs[index] = Some(slab);
+            return Err(error);
         }
-        self.write_addresses(index, 0)?;
-        let slab = self.slabs[index].take().expect("checked backed slab");
         Ok(Some(slab.observe_storage()))
     }
 
-    fn write_addresses(&mut self, index: usize, base: u64) -> Result<(), TensorError> {
-        let mut next = self.address_words.clone();
-        for (region, offset) in self.offsets.iter().enumerate() {
-            let address = if base == 0 {
-                0
-            } else {
-                base.checked_add(*offset)
-                    .ok_or_else(|| TensorError::SlabLayout("slab address overflows".into()))?
+    /// Write every slot's address: a backed slot names its own slab, and a
+    /// free slot names the lowest backed slab. Kernels that read a query
+    /// tile's span union may load rows in slots no row's span selects; those
+    /// rows are masked, but their address must still be device memory of a
+    /// whole slab. Only an empty store keeps null addresses, and it has no
+    /// history rows to read.
+    fn publish_addresses(&mut self) -> Result<(), TensorError> {
+        let stand_in = self.slabs().next().map(|(_, slab)| slab.device_address());
+        let mut next = vec![0; self.address_words.len()];
+        for index in 0..self.capacity {
+            let Some(base) = self
+                .slab(index)
+                .map(Slab::device_address)
+                .or(stand_in)
+            else {
+                continue;
             };
-            let position = (region * self.capacity + index) * 8;
-            next[position..position + 8].copy_from_slice(&address.to_le_bytes());
+            for (region, offset) in self.offsets.iter().enumerate() {
+                let address = base
+                    .checked_add(*offset)
+                    .ok_or_else(|| TensorError::SlabLayout("slab address overflows".into()))?;
+                let position = (region * self.capacity + index) * 8;
+                next[position..position + 8].copy_from_slice(&address.to_le_bytes());
+            }
         }
-        self.addresses.write_from_host(&next)?;
-        self.address_words = next;
+        if next != self.address_words {
+            self.addresses.write_from_host(&next)?;
+            self.address_words = next;
+        }
         Ok(())
     }
 
@@ -430,18 +448,32 @@ mod tests {
         drop(logical);
         drop(sibling);
         let observer = tensor.free_slab(first).unwrap().unwrap();
-        assert_eq!(
+        // Free slots, freed or never backed, name the remaining slab.
+        let entry = |tensor: &SlabTensor, region: usize, index: u64| {
             tensor
-                .address_table(0)
+                .address_table(region)
                 .unwrap()
-                .slice_leading(0, 1)
+                .slice_leading(index, index + 1)
                 .unwrap()
                 .read_to_host()
-                .unwrap(),
-            [0; 8]
+                .unwrap()
+        };
+        let stand_in = tensor.slab(second).unwrap().device_address();
+        assert_eq!(entry(&tensor, 0, 0), stand_in.to_le_bytes());
+        assert_eq!(entry(&tensor, 0, 2), stand_in.to_le_bytes());
+        assert_eq!(
+            entry(&tensor, 1, 0),
+            (stand_in + tensor.region_offset(1).unwrap()).to_le_bytes()
         );
         assert!(observer.charged_bytes().is_some());
         assert_eq!(tensor.add_slab().unwrap(), first);
+        let own = tensor.slab(first).unwrap().device_address();
+        assert_eq!(entry(&tensor, 0, 0), own.to_le_bytes());
+        assert_eq!(entry(&tensor, 0, 2), own.to_le_bytes());
+        tensor.free_slab(first).unwrap();
+        tensor.free_slab(second).unwrap();
+        assert_eq!(entry(&tensor, 0, 0), [0; 8]);
+        tensor.add_slab().unwrap();
         assert!(!view.shares_allocation(tensor.slab(first).unwrap().region(0).unwrap()));
         drop(view);
         assert_eq!(observer.charged_bytes(), None);
