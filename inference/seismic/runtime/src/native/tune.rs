@@ -2833,6 +2833,7 @@ impl LaunchPrograms {
                 plan::LaunchSource {
                     ordinal,
                     variants: variants.into_iter().collect(),
+                    truncated: false,
                 }
             })
             .collect::<Vec<_>>();
@@ -3054,6 +3055,20 @@ impl FactoredRun {
         let shapes = point_shapes(formation.device, formation.logical, points)?;
         let partition = plan::partition(implementation, statics, &shapes)
             .map_err(|error| TuneError::Declaration(format!("factored native plan: {error:?}")))?;
+        for group in partition.groups.iter().filter(|group| group.truncated) {
+            eprintln!(
+                "seismic: tuning group {:?} candidate set capped at {}",
+                group.launches,
+                plan::MAX_GROUP_CANDIDATES
+            );
+        }
+        for source in partition.sources.iter().filter(|source| source.truncated) {
+            eprintln!(
+                "seismic: launch {} variant set capped at {}",
+                source.ordinal,
+                plan::MAX_GROUP_CANDIDATES
+            );
+        }
         let measuring = MeasureOptions {
             samples: search.settings.samples,
             min_sample_seconds: search.min_sample_seconds,
@@ -3428,7 +3443,8 @@ impl FactoredRun {
         let weighing = Weighing::of(points);
         let default_choices = self.default_choices.clone();
         let mut boundaries: Vec<Boundary> = Vec::new();
-        let mut complete = true;
+        let mut complete = !partition.groups.iter().any(|group| group.truncated)
+            && !partition.sources.iter().any(|source| source.truncated);
         let mut bases = Vec::new();
         for boundary in boundary_assignments(&partition, implementation) {
             let base = partition
@@ -4581,6 +4597,7 @@ mod tests {
             launches: vec![launch],
             parameters: Vec::new(),
             candidates,
+            truncated: false,
         };
         let groups = vec![
             group(

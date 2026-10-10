@@ -84,7 +84,12 @@ pub struct Group {
     pub parameters: Vec<ParameterAddress>,
     /// Distinct admissible assignments of this group's parameters.
     pub candidates: Vec<Vec<u64>>,
+    /// The declared candidate space exceeded the bounded materialized set.
+    pub truncated: bool,
 }
+
+/// Bound the materialized search set before the timed tuning search starts.
+pub const MAX_GROUP_CANDIDATES: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaunchSource {
@@ -92,6 +97,7 @@ pub struct LaunchSource {
     /// Distinct instances of this launch across the admissible
     /// configurations.
     pub variants: Vec<LaunchVariant>,
+    pub truncated: bool,
 }
 
 /// One instance of a launch: the values of the code parameters it owns and,
@@ -206,7 +212,7 @@ fn constraint_parts(condition: &NativeCondition, parts: &mut Vec<Vec<String>>) {
 /// admissible assignment of the addresses given.
 type Projection<'v> = dyn Fn(
         &[ParameterAddress],
-        &mut dyn FnMut(&NativeSpecialization) -> Result<(), PlanError>,
+        &mut dyn FnMut(&NativeSpecialization) -> Result<bool, PlanError>,
     ) -> Result<(), PlanError>
     + 'v;
 
@@ -245,9 +251,8 @@ fn restricted(
             break;
         }
     }
-    let free = |address: &ParameterAddress| {
-        selected.contains(address) || reached.contains(&name(address))
-    };
+    let free =
+        |address: &ParameterAddress| selected.contains(address) || reached.contains(&name(address));
     let mut restricted = implementation.clone();
     for parameter in &mut restricted.params {
         let address = entry_address(parameter);
@@ -271,14 +276,10 @@ fn restricted(
 /// condition reads it. An otherwise unowned entry parameter conservatively
 /// couples all launches unless it is a condition-only boundary parameter.
 ///
-/// The domain is never enumerated: its size is the product of its
-/// parameters' value counts, and every form or launch parameter a
-/// declaration gains multiplies it. What the partition needs of it are
-/// distinct assignments of a few parameters at a time (those the launch
-/// conditions read, each group's, each launch's code), and each is walked
-/// with every parameter it is not coupled to held at its default
-/// ([`restricted`]): time and memory follow the sizes of the groups, not
-/// their product.
+/// The full domain is never enumerated, but one coupled group's projected
+/// assignments can still be large. Those sets are capped at
+/// [`MAX_GROUP_CANDIDATES`] so preparation remains bounded before the timed
+/// tuning search starts.
 pub fn partition(
     implementation: &NativeImplementation,
     statics: &NativeSpecialization,
@@ -295,7 +296,7 @@ pub fn partition(
         let mut failure = None;
         restricted(implementation, &default, &parts, selected)
             .walk_admissible(statics, |configuration| match visit(configuration) {
-                Ok(()) => true,
+                Ok(keep_walking) => keep_walking,
                 Err(error) => {
                     failure = Some(error);
                     false
@@ -499,7 +500,7 @@ fn partition_over(
             }
             point_sets[index].insert(active);
         }
-        Ok(())
+        Ok(true)
     })?;
     let mut components = BTreeMap::<usize, Vec<usize>>::new();
     for launch in tuned {
@@ -522,19 +523,27 @@ fn partition_over(
                 .map(|(address, _)| address.clone())
                 .collect::<Vec<_>>();
             let mut candidates = BTreeSet::new();
+            let mut truncated = false;
             visit(&parameters, &mut |specialization| {
-                candidates.insert(
-                    parameters
-                        .iter()
-                        .map(|address| address.value(specialization))
-                        .collect::<Vec<_>>(),
-                );
-                Ok(())
+                let candidate = parameters
+                    .iter()
+                    .map(|address| address.value(specialization))
+                    .collect::<Vec<_>>();
+                if candidates.contains(&candidate) {
+                    return Ok(true);
+                }
+                if candidates.len() == MAX_GROUP_CANDIDATES {
+                    truncated = true;
+                    return Ok(false);
+                }
+                candidates.insert(candidate);
+                Ok(true)
             })?;
             Ok(Group {
                 launches,
                 parameters,
                 candidates: candidates.into_iter().collect(),
+                truncated,
             })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
@@ -575,19 +584,29 @@ fn partition_over(
                 }
             }
             let mut variants = BTreeSet::new();
+            let mut truncated = false;
             visit(&read, &mut |specialization| {
-                variants.insert(LaunchVariant {
+                let variant = LaunchVariant {
                     code: code
                         .iter()
                         .map(|address| address.value(specialization))
                         .collect(),
                     group_size: implementation.static_group_size(specialization, ordinal),
-                });
-                Ok(())
+                };
+                if variants.contains(&variant) {
+                    return Ok(true);
+                }
+                if variants.len() == MAX_GROUP_CANDIDATES {
+                    truncated = true;
+                    return Ok(false);
+                }
+                variants.insert(variant);
+                Ok(true)
             })?;
             Ok(LaunchSource {
                 ordinal,
                 variants: variants.into_iter().collect(),
+                truncated,
             })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
@@ -610,7 +629,7 @@ fn partition_over(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+    use seismic_lang::checked::{SourceFile, SourceSet, check_source};
     use seismic_lang::registry::BackendName;
 
     fn implementation(last_when: &str) -> NativeImplementation {
@@ -713,7 +732,12 @@ mod tests {
             .admissible(&NativeSpecialization::new())
             .unwrap();
         partition_over(implementation, points, &|_, visit| {
-            admissible.iter().try_for_each(|configuration| visit(configuration))
+            for configuration in &admissible {
+                if !visit(configuration)? {
+                    break;
+                }
+            }
+            Ok(())
         })
         .unwrap()
     }
@@ -785,15 +809,48 @@ mod tests {
         assert!(began.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(plan.groups.len(), 12);
         assert!(plan.groups.iter().all(|group| group.candidates.len() == 16));
-        assert!(plan
-            .sources
+        assert!(
+            plan.sources
+                .iter()
+                .all(|source| source.variants.len() == 16)
+        );
+        assert!(
+            plan.points
+                .iter()
+                .enumerate()
+                .all(|(point, planned)| planned.active_sets == [vec![point]])
+        );
+    }
+
+    #[test]
+    fn large_candidate_group_is_capped_without_losing_its_default() {
+        let params = (0..14)
+            .map(|index| format!("code P{index} in [1, 2]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let implementation = checked(format!(
+            "fn scale[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return to_owned(x)\n\nnative scale for metal from \"scale.metal\":\n    launch only:\n        params ({params})\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
+        ));
+        let plan = partition(
+            &implementation,
+            &NativeSpecialization::new(),
+            &[PointShape {
+                label: "decode".into(),
+                dimensions: BTreeMap::from([("N".into(), 1)]),
+            }],
+        )
+        .unwrap();
+
+        let candidates = &plan.groups[0].candidates;
+        assert!(candidates.len() <= 4096);
+        assert!(candidates.contains(&vec![1; 14]));
+        assert!(plan.groups[0].truncated);
+        assert!(plan.sources[0].variants.len() <= 4096);
+        assert!(plan.sources[0].truncated);
+        assert!(plan.sources[0]
+            .variants
             .iter()
-            .all(|source| source.variants.len() == 16));
-        assert!(plan
-            .points
-            .iter()
-            .enumerate()
-            .all(|(point, planned)| planned.active_sets == [vec![point]]));
+            .any(|variant| variant.code == vec![1; 14]));
     }
 
     #[test]
