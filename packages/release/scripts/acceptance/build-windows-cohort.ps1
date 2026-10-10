@@ -24,8 +24,7 @@ try {
     & choco install nsis --yes --no-progress
     if ($LASTEXITCODE -ne 0) { throw 'NSIS acquisition failed' }
   }
-  $versions = if ($env:MAGNITUDE_ACCEPTANCE_VERSIONS) { $env:MAGNITUDE_ACCEPTANCE_VERSIONS.Split(',') } else { @('0.0.38','0.0.39') }
-  foreach ($version in $versions) {
+  foreach ($version in @('0.0.38','0.0.39')) {
     $env:MAGNITUDE_ACCEPTANCE_VERSION = $version
     $env:MAGNITUDE_ACCEPTANCE_OUTPUT = Join-Path $root $version
     & bun (Join-Path $PSScriptRoot 'build-desktop.ts')
