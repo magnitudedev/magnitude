@@ -9,6 +9,7 @@ use magnitude_service_contracts::{
 };
 
 use crate::inventory::{ManagedModelStore, hf_repo_dir, repository_lock_path};
+use crate::snapshot_blobs::RepositoryBlobs;
 use crate::store_fs::acquire_exclusive_lock;
 
 impl ModelInventory for ManagedModelStore {
@@ -324,18 +325,10 @@ fn plan_managed_delete(
             "managed location is missing Hugging Face identity".to_owned(),
         ));
     };
-    let repo_root = root.join("hub").join(hf_repo_dir(repository));
-    let snapshot = repo_root.join("snapshots").join(commit);
-    let links = components
-        .iter()
-        .map(|component| snapshot.join(&component.path))
-        .collect::<BTreeSet<_>>();
-    let referenced = other_snapshot_blob_references(&repo_root, &links)?;
-    for component in components {
-        let link = snapshot.join(&component.path);
-        let blob = link.canonicalize().map_err(io_error)?;
+    let entries = managed_snapshot_entries(root, repository, commit, components)?;
+    for (component, ManagedSnapshotEntry { link, blob }) in components.iter().zip(entries.entries) {
         paths.push(link);
-        if referenced.contains(&blob) {
+        if entries.referenced.contains(&blob) {
             retained = retained.saturating_add(component.size_bytes);
         } else {
             reclaimable = reclaimable.saturating_add(component.size_bytes);
@@ -367,15 +360,12 @@ fn delete_managed(
     };
     let repo_root = root.join("hub").join(hf_repo_dir(repository));
     let snapshot = repo_root.join("snapshots").join(commit);
-    let links = components
-        .iter()
-        .map(|component| snapshot.join(&component.path))
-        .collect::<BTreeSet<_>>();
-    let referenced = other_snapshot_blob_references(&repo_root, &links)?;
+    let ManagedSnapshotEntries {
+        entries,
+        referenced,
+    } = managed_snapshot_entries(root, repository, commit, components)?;
     let mut freed = 0_u64;
-    for component in components {
-        let link = snapshot.join(&component.path);
-        let blob = link.canonicalize().map_err(io_error)?;
+    for ManagedSnapshotEntry { link, blob } in entries {
         if link.symlink_metadata().is_ok() {
             fs::remove_file(&link).map_err(io_error)?;
         }
@@ -390,23 +380,64 @@ fn delete_managed(
     Ok(freed)
 }
 
-fn other_snapshot_blob_references(
-    repo_root: &Path,
-    excluded_links: &BTreeSet<PathBuf>,
-) -> Result<BTreeSet<PathBuf>, InventoryError> {
-    let mut references = BTreeSet::new();
+struct ManagedSnapshotEntry {
+    link: PathBuf,
+    blob: PathBuf,
+}
+
+struct ManagedSnapshotEntries {
+    entries: Vec<ManagedSnapshotEntry>,
+    referenced: BTreeSet<PathBuf>,
+}
+
+/// Resolve a managed package's snapshot entries to their blobs, plus the blobs other snapshot
+/// entries of the repository still publish. Every entry must resolve to a repository blob.
+fn managed_snapshot_entries(
+    root: &Path,
+    repository: &str,
+    commit: &str,
+    components: &[magnitude_service_contracts::ModelComponent],
+) -> Result<ManagedSnapshotEntries, InventoryError> {
+    let repo_root = root.join("hub").join(hf_repo_dir(repository));
+    let snapshot = repo_root.join("snapshots").join(commit);
+    let blobs = RepositoryBlobs::open(&repo_root).map_err(io_error)?;
+    let entries = components
+        .iter()
+        .map(|component| {
+            let link = snapshot.join(&component.path);
+            let blob = repository_blob(&blobs, &link)?;
+            Ok(ManagedSnapshotEntry { link, blob })
+        })
+        .collect::<Result<Vec<_>, InventoryError>>()?;
+    let links = entries
+        .iter()
+        .map(|entry| entry.link.clone())
+        .collect::<BTreeSet<_>>();
+    let mut referenced = BTreeSet::new();
     collect_other_snapshot_blobs(
         &repo_root.join("snapshots"),
-        repo_root,
-        excluded_links,
-        &mut references,
+        &blobs,
+        &links,
+        &mut referenced,
     )?;
-    Ok(references)
+    Ok(ManagedSnapshotEntries {
+        entries,
+        referenced,
+    })
+}
+
+fn repository_blob(blobs: &RepositoryBlobs, link: &Path) -> Result<PathBuf, InventoryError> {
+    blobs.resolve(link).map_err(io_error)?.ok_or_else(|| {
+        InventoryError::DeletionUnsafe(format!(
+            "snapshot entry does not resolve to repository blobs: {}",
+            link.display()
+        ))
+    })
 }
 
 fn collect_other_snapshot_blobs(
     path: &Path,
-    repo_root: &Path,
+    blobs: &RepositoryBlobs,
     excluded_links: &BTreeSet<PathBuf>,
     output: &mut BTreeSet<PathBuf>,
 ) -> Result<(), InventoryError> {
@@ -418,16 +449,9 @@ fn collect_other_snapshot_blobs(
         let path = entry.path();
         let kind = entry.file_type().map_err(io_error)?;
         if kind.is_dir() {
-            collect_other_snapshot_blobs(&path, repo_root, excluded_links, output)?;
+            collect_other_snapshot_blobs(&path, blobs, excluded_links, output)?;
         } else if !excluded_links.contains(&path) && (kind.is_symlink() || kind.is_file()) {
-            let canonical = path.canonicalize().map_err(io_error)?;
-            if !canonical.starts_with(repo_root.join("blobs")) {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "snapshot entry does not resolve to repository blobs: {}",
-                    path.display()
-                )));
-            }
-            output.insert(canonical);
+            output.insert(repository_blob(blobs, &path)?);
         }
     }
     Ok(())

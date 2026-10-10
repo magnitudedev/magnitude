@@ -1,7 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -21,7 +20,7 @@ use sha2_state::{Digest as StateDigest, Sha256 as StatefulSha256};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-use crate::hugging_face::{require_requested_revision, revision_metadata_url};
+use crate::hugging_face::{HubCredential, require_requested_revision, revision_metadata_url};
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{ManagedModelStore, build_model, hf_repo_dir, now, repository_lock_path};
 use crate::store_fs::{
@@ -33,31 +32,88 @@ use crate::validation::ValidatedDownloadPackage;
 const MAX_ATTEMPTS: usize = 5;
 const INTEGRITY_CHECKPOINT_INTERVAL: u64 = 256 * 1024 * 1024;
 const MAX_INTEGRITY_RECORD_BYTES: u64 = 4 * 1024;
+/// Longest a source request may go without delivering bytes before the attempt is abandoned as a
+/// retryable network interruption.
+const SOURCE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) struct DownloadOperation {
     sender: watch::Sender<ModelDownloadEvent>,
-    cancelled: AtomicBool,
+    control: TransferControl,
 }
 
 impl DownloadOperation {
+    fn new(initial: ModelDownloadEvent) -> Self {
+        Self {
+            sender: watch::channel(initial).0,
+            control: TransferControl::new(SOURCE_STALL_TIMEOUT),
+        }
+    }
+
     fn subscribe(&self) -> DownloadEventStream {
         watch_stream(self.sender.subscribe())
     }
 
     fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.control.cancel();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.control.is_cancelled()
     }
 
     fn ensure_active(&self) -> Result<(), DownloadError> {
-        if self.cancelled.load(Ordering::Acquire) {
-            Err(DownloadError {
-                kind: DownloadErrorKind::Cancelled,
-                message: "download was cancelled".to_owned(),
-                retryable: true,
-                resumable: true,
-            })
+        if self.is_cancelled() {
+            Err(cancelled_error())
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Bounds every wait on the model source. Cancellation ends a wait immediately, so a stalled
+/// request or a retry backoff never delays settling a cancelled operation, and a wait that
+/// receives nothing for `stall_timeout` becomes a retryable network interruption.
+struct TransferControl {
+    cancelled: watch::Sender<bool>,
+    stall_timeout: Duration,
+}
+
+impl TransferControl {
+    fn new(stall_timeout: Duration) -> Self {
+        Self {
+            cancelled: watch::channel(false).0,
+            stall_timeout,
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.send_replace(true);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        *self.cancelled.borrow()
+    }
+
+    async fn cancellation(&self) {
+        let mut receiver = self.cancelled.subscribe();
+        let _ = receiver.wait_for(|cancelled| *cancelled).await;
+    }
+
+    async fn source_wait<T>(&self, future: impl Future<Output = T>) -> Result<T, DownloadError> {
+        tokio::select! {
+            biased;
+            () = self.cancellation() => Err(cancelled_error()),
+            result = tokio::time::timeout(self.stall_timeout, future) => {
+                result.map_err(|_| source_stalled(self.stall_timeout))
+            }
+        }
+    }
+
+    async fn backoff(&self, delay: Duration) -> Result<(), DownloadError> {
+        tokio::select! {
+            biased;
+            () = self.cancellation() => Err(cancelled_error()),
+            () = tokio::time::sleep(delay) => Ok(()),
         }
     }
 }
@@ -243,6 +299,7 @@ enum DownloadErrorKind {
         available_bytes: u64,
     },
     SourceUnavailable,
+    CredentialRejected,
     SourceAccessDenied,
     MissingSource,
     Network,
@@ -281,6 +338,7 @@ impl DownloadError {
                 available_bytes: *available_bytes,
             },
             DownloadErrorKind::SourceUnavailable
+            | DownloadErrorKind::CredentialRejected
             | DownloadErrorKind::SourceAccessDenied
             | DownloadErrorKind::MissingSource => DownloadFailure::SourceUnavailable,
             DownloadErrorKind::Network => DownloadFailure::NetworkUnavailable,
@@ -322,7 +380,12 @@ impl ManagedModelStore {
         let mut streams = Vec::with_capacity(resolved_packages.len());
         let mut admitted = Vec::new();
         for (key, package, installed) in resolved_packages {
-            if let Some(operation) = operations.get(&key) {
+            // A cancelled operation is still settling; joining it would end the new request
+            // as cancelled. A fresh operation replaces it and waits on the repository lock.
+            if let Some(operation) = operations
+                .get(&key)
+                .filter(|operation| !operation.is_cancelled())
+            {
                 streams.push(operation.subscribe());
                 continue;
             }
@@ -341,11 +404,7 @@ impl ManagedModelStore {
                 repository: repository.to_owned(),
                 revision: revision.to_owned(),
             };
-            let (sender, _receiver) = watch::channel(initial);
-            let operation = Arc::new(DownloadOperation {
-                sender,
-                cancelled: AtomicBool::new(false),
-            });
+            let operation = Arc::new(DownloadOperation::new(initial));
             streams.push(operation.subscribe());
             admitted.push((key.clone(), operation_id, package, Arc::clone(&operation)));
             operations.insert(key, operation);
@@ -393,10 +452,13 @@ impl ManagedModelStore {
             let model_id = current_model_id(&operation.sender.borrow());
             let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
             let Some(download_failure) = failure.to_failure() else {
-                if let Some(model_id) = model_id.as_ref() {
-                    if let Ok(mut models) = self.models.write() {
-                        models.remove(model_id);
-                    }
+                if let Some(model_id) = model_id.as_ref()
+                    && let Ok(mut models) = self.models.write()
+                    && models.get(model_id).is_none_or(|model| {
+                        !downloading_by_another(&model.availability, &operation_id)
+                    })
+                {
+                    models.remove(model_id);
                 }
                 operation
                     .sender
@@ -406,13 +468,14 @@ impl ManagedModelStore {
                         completed_bytes,
                         total_bytes,
                     });
-                self.operations.lock().await.remove(&operation_key);
+                self.release_operation(&operation_key, &operation).await;
                 return;
             };
             let resumable = failure.resumable();
             if let Some(model_id) = model_id.as_ref()
                 && let Ok(mut models) = self.models.write()
                 && let Some(model) = models.get_mut(model_id)
+                && !downloading_by_another(&model.availability, &operation_id)
             {
                 let (completed_bytes, total_bytes) = progress_totals(&operation.sender.borrow());
                 model.availability = ModelAvailability::Interrupted {
@@ -433,7 +496,19 @@ impl ManagedModelStore {
                 resumable,
             });
         }
-        self.operations.lock().await.remove(&operation_key);
+        self.release_operation(&operation_key, &operation).await;
+    }
+
+    /// Removes the admission entry only while it still names this operation; a request admitted
+    /// after cancellation may already have replaced it.
+    async fn release_operation(&self, key: &str, operation: &Arc<DownloadOperation>) {
+        let mut operations = self.operations.lock().await;
+        if operations
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, operation))
+        {
+            operations.remove(key);
+        }
     }
 
     async fn run_download_inner(
@@ -450,42 +525,28 @@ impl ManagedModelStore {
             retryable: false,
             resumable: false,
         })?;
-        let repo = self.client.model(owner.to_owned(), name.to_owned());
         let repository_lock =
             acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
-
-        let pinned = resolve_download_revision(
+        let required = package.components();
+        let control = &operation.control;
+        let (repo, commit) = resolve_with_credential_fallback(
+            self.hub_credential.as_ref(),
             &self.client,
-            &repo,
-            repository,
-            revision,
-            package.components(),
-            None,
-        )
-        .await;
-        let resolved = match pinned {
-            Ok(resolved) => resolved,
-            Err(error) if missing_upstream_content(&error) => {
-                let resolved = resolve_download_revision(
-                    &self.client,
-                    &repo,
+            |client, token| async move {
+                resolve_package(
+                    &client,
+                    token.as_deref(),
+                    owner,
+                    name,
                     repository,
-                    "main",
-                    package.components(),
-                    Some(revision),
+                    revision,
+                    required,
+                    control,
                 )
-                .await?;
-                tracing::info!(
-                    repository,
-                    pinned_revision = revision,
-                    resolved_revision = resolved,
-                    "using content-equivalent current revision for model acquisition"
-                );
-                resolved
-            }
-            Err(error) => return Err(error),
-        };
-        let commit = resolved;
+                .await
+            },
+        )
+        .await?;
         let (repository, revision, components) = package.into_parts();
         let content_id = content_id(&components);
         let repo_root = self.config.root.join("hub").join(hf_repo_dir(&repository));
@@ -685,7 +746,7 @@ impl ManagedModelStore {
                         model.updated_at = updated_at;
                     }
                 },
-                &operation.cancelled,
+                &operation.control,
             )
             .await?;
         }
@@ -819,7 +880,7 @@ async fn download_component_with_retry(
     commit: &str,
     component: &ModelComponent,
     mut progress: impl FnMut(u64, DownloadStage),
-    cancelled: &AtomicBool,
+    control: &TransferControl,
 ) -> Result<(), DownloadError> {
     let blobs = root
         .join("hub")
@@ -836,7 +897,7 @@ async fn download_component_with_retry(
         // buffered write fails later, e.g. on a full disk).
         let mut integrity = recover_partial(&paths, component).await?;
         progress(integrity.bytes, DownloadStage::Downloading);
-        if cancelled.load(Ordering::Acquire) {
+        if control.is_cancelled() {
             return Err(cancelled_error());
         }
         match download_component_once(
@@ -846,13 +907,22 @@ async fn download_component_with_retry(
             &paths,
             &mut integrity,
             &mut progress,
-            cancelled,
+            control,
         )
         .await
         {
             Ok(()) => return Ok(()),
             Err(error) if error.retryable() && attempt + 1 < MAX_ATTEMPTS => {
-                tokio::time::sleep(std::time::Duration::from_secs(1_u64 << attempt.min(4))).await;
+                tracing::warn!(
+                    path = %component.path.display(),
+                    attempt = attempt + 1,
+                    completed_bytes = integrity.checkpointed_bytes,
+                    error = %error,
+                    "model download attempt interrupted; resuming from the durable checkpoint"
+                );
+                control
+                    .backoff(Duration::from_secs(1_u64 << attempt.min(4)))
+                    .await?;
             }
             Err(error) => return Err(error),
         }
@@ -867,7 +937,7 @@ async fn download_component_once(
     paths: &DownloadComponentPaths,
     integrity: &mut DownloadIntegrity,
     progress: &mut impl FnMut(u64, DownloadStage),
-    cancelled: &AtomicBool,
+    control: &TransferControl,
 ) -> Result<(), DownloadError> {
     let mut offset = integrity.bytes;
     if offset == component.size_bytes {
@@ -880,29 +950,30 @@ async fn download_component_once(
         return Ok(());
     }
 
-    let (_reported_length, mut stream) = repo
+    let request = repo
         .download_file_stream()
         .filename(component.path.to_string_lossy().into_owned())
         .revision(commit.to_owned())
         .range(offset..component.size_bytes)
-        .send()
-        .await
-        .map_err(map_hf_error)?;
+        .send();
+    let (_reported_length, mut stream) =
+        control.source_wait(request).await?.map_err(map_hf_error)?;
     let std_file = open_partial(&paths.partial)?;
     let mut file = tokio::fs::File::from_std(std_file);
     file.seek(std::io::SeekFrom::Start(offset))
         .await
         .map_err(download_io)?;
-    while let Some(chunk) = stream.next().await {
-        if cancelled.load(Ordering::Acquire) {
-            persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
-            return Err(cancelled_error());
-        }
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
+    loop {
+        let chunk = match control
+            .source_wait(stream.next())
+            .await
+            .and_then(|chunk| chunk.transpose().map_err(map_hf_error))
+        {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
             Err(error) => {
                 persist_integrity_checkpoint(paths, component, integrity, Some(&mut file)).await?;
-                return Err(map_hf_error(error));
+                return Err(error);
             }
         };
         let chunk_len = u64::try_from(chunk.len()).map_err(|_| DownloadError {
@@ -1092,6 +1163,18 @@ fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
         ),
         retryable: true,
         resumable: false,
+    }
+}
+
+fn source_stalled(stall_timeout: Duration) -> DownloadError {
+    DownloadError {
+        kind: DownloadErrorKind::Network,
+        message: format!(
+            "the model source sent no data for {} seconds",
+            stall_timeout.as_secs()
+        ),
+        retryable: true,
+        resumable: true,
     }
 }
 
@@ -1315,6 +1398,15 @@ fn open_partial(path: &Path) -> Result<File, DownloadError> {
     options.open(path).map_err(download_io)
 }
 
+/// Whether a newer operation has taken over this inventory entry, so a settling operation must
+/// leave it alone.
+fn downloading_by_another(availability: &ModelAvailability, operation_id: &str) -> bool {
+    matches!(
+        availability,
+        ModelAvailability::Downloading { operation_id: current, .. } if current != operation_id
+    )
+}
+
 fn package_download_key(package: &ModelPackage) -> String {
     let bytes = serde_json::to_vec(package).expect("validated model packages serialize");
     format!("{:x}", Sha256::digest(bytes))
@@ -1351,19 +1443,94 @@ fn inventory_download_error(error: InventoryError) -> DownloadError {
     }
 }
 
+/// A configured Hub credential is presented first. Hugging Face rejects an expired or revoked token
+/// outright, even for public repositories, so a rejected credential falls back to anonymous access
+/// rather than making every public package unavailable.
+async fn resolve_with_credential_fallback<T, F, Fut>(
+    credential: Option<&HubCredential>,
+    anonymous: &hf_hub::HFClient,
+    resolve: F,
+) -> Result<T, DownloadError>
+where
+    F: Fn(hf_hub::HFClient, Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, DownloadError>>,
+{
+    let Some(credential) = credential else {
+        return resolve(anonymous.clone(), None).await;
+    };
+    match resolve(credential.client.clone(), Some(credential.token.clone())).await {
+        Err(error) if matches!(error.kind, DownloadErrorKind::CredentialRejected) => {
+            tracing::warn!(
+                reason = %error,
+                "Hugging Face rejected the configured HF_TOKEN; retrying anonymously"
+            );
+            resolve(anonymous.clone(), None).await
+        }
+        resolved => resolved,
+    }
+}
+
+async fn resolve_package(
+    client: &hf_hub::HFClient,
+    token: Option<&str>,
+    owner: &str,
+    name: &str,
+    repository: &str,
+    revision: &str,
+    components: &[ModelComponent],
+    control: &TransferControl,
+) -> Result<(hf_hub::HFRepository<hf_hub::RepoTypeModel>, String), DownloadError> {
+    let repo = client.model(owner.to_owned(), name.to_owned());
+    let pinned = resolve_download_revision(
+        client, token, &repo, repository, revision, components, None, control,
+    )
+    .await;
+    let commit = match pinned {
+        Ok(resolved) => resolved,
+        Err(error) if missing_upstream_content(&error) => {
+            let resolved = resolve_download_revision(
+                client,
+                token,
+                &repo,
+                repository,
+                "main",
+                components,
+                Some(revision),
+                control,
+            )
+            .await?;
+            tracing::info!(
+                repository,
+                pinned_revision = revision,
+                resolved_revision = resolved,
+                "using content-equivalent current revision for model acquisition"
+            );
+            resolved
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((repo, commit))
+}
+
 fn missing_upstream_content(error: &DownloadError) -> bool {
     matches!(error.kind, DownloadErrorKind::MissingSource)
 }
 
 async fn resolve_download_revision(
     client: &hf_hub::HFClient,
+    token: Option<&str>,
     repo: &hf_hub::HFRepository<hf_hub::RepoTypeModel>,
     repository: &str,
     revision: &str,
     components: &[ModelComponent],
     equivalent_to_revision: Option<&str>,
+    control: &TransferControl,
 ) -> Result<String, DownloadError> {
-    let api = match hub_api_metadata(client, repository, revision).await {
+    let api = match control
+        .source_wait(hub_api_metadata(client, token, repository, revision))
+        .await
+        .and_then(|api| api)
+    {
         Ok(api) => api,
         Err(error) if equivalent_to_revision.is_some() && missing_upstream_content(&error) => {
             let pinned = equivalent_to_revision.expect("checked equivalent package");
@@ -1402,7 +1569,16 @@ async fn resolve_download_revision(
     }
 
     for component in components {
-        let metadata = match resolve_remote_metadata(repo, &api, &commit, &component.path).await {
+        let metadata = match control
+            .source_wait(resolve_remote_metadata(
+                repo,
+                &api,
+                &commit,
+                &component.path,
+            ))
+            .await
+            .and_then(|metadata| metadata)
+        {
             Ok(metadata) => metadata,
             Err(error) if equivalent_to_revision.is_some() && missing_upstream_content(&error) => {
                 let pinned = equivalent_to_revision.expect("checked equivalent package");
@@ -1507,6 +1683,7 @@ fn package_unavailable(
 
 async fn hub_api_metadata(
     client: &hf_hub::HFClient,
+    token: Option<&str>,
     repository: &str,
     revision: &str,
 ) -> Result<HubApiModel, DownloadError> {
@@ -1521,7 +1698,7 @@ async fn hub_api_metadata(
         })?;
     let http = reqwest::Client::builder().build().map_err(download_io)?;
     let mut request = http.get(url).query(&[("blobs", "true")]);
-    if let Some(token) = std::env::var_os("HF_TOKEN").and_then(|value| value.into_string().ok()) {
+    if let Some(token) = token {
         request = request.bearer_auth(token);
     }
     let response = request.send().await.map_err(reqwest_download_error)?;
@@ -1530,7 +1707,8 @@ async fn hub_api_metadata(
         let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(DownloadError {
             kind: match status.as_u16() {
-                401 | 403 => DownloadErrorKind::SourceAccessDenied,
+                401 => DownloadErrorKind::CredentialRejected,
+                403 => DownloadErrorKind::SourceAccessDenied,
                 404 => DownloadErrorKind::MissingSource,
                 _ if retryable => DownloadErrorKind::Network,
                 _ => DownloadErrorKind::InvalidRequest,
@@ -1615,9 +1793,8 @@ fn reqwest_download_error(error: reqwest::Error) -> DownloadError {
 
 fn map_hf_error(error: HFError) -> DownloadError {
     let (kind, retryable) = match &error {
-        HFError::AuthRequired { .. } | HFError::Forbidden { .. } => {
-            (DownloadErrorKind::SourceAccessDenied, false)
-        }
+        HFError::AuthRequired { .. } => (DownloadErrorKind::CredentialRejected, false),
+        HFError::Forbidden { .. } => (DownloadErrorKind::SourceAccessDenied, false),
         HFError::RepoNotFound { .. }
         | HFError::RevisionNotFound { .. }
         | HFError::EntryNotFound { .. } => (DownloadErrorKind::MissingSource, false),
@@ -1972,6 +2149,282 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn admission_after_cancellation_starts_a_new_operation_instead_of_joining_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        let manager = ManagedModelStore::open(config)
+            .await
+            .expect("model manager");
+        let package = exact_package("model.gguf", b"model");
+        let key = package_download_key(&package);
+        let settling = Arc::new(DownloadOperation::new(ModelDownloadEvent::Resolving {
+            operation_id: "download_settling".to_owned(),
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+        }));
+        settling.cancel();
+        manager
+            .operations
+            .lock()
+            .await
+            .insert(key.clone(), Arc::clone(&settling));
+        // Holding the repository lock keeps the new operation from reaching the network.
+        let repository_lock = acquire_exclusive_lock(&repository_lock_path(
+            &manager.config.root,
+            "owner/repository",
+        ))
+        .expect("repository lock");
+
+        let mut streams = manager
+            .start_target_downloads(vec![package])
+            .await
+            .expect("admission");
+        let event = streams
+            .pop()
+            .expect("download stream")
+            .next()
+            .await
+            .expect("first event");
+
+        assert!(matches!(
+            &event,
+            ModelDownloadEvent::Resolving { operation_id, .. } if operation_id != "download_settling"
+        ));
+        let admitted = Arc::clone(
+            manager
+                .operations
+                .lock()
+                .await
+                .get(&key)
+                .expect("admitted operation"),
+        );
+        assert!(!Arc::ptr_eq(&admitted, &settling));
+        assert!(!admitted.is_cancelled());
+
+        manager.release_operation(&key, &settling).await;
+        assert!(
+            manager
+                .operations
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &admitted)),
+            "the settling operation must not remove its replacement"
+        );
+        drop(repository_lock);
+    }
+
+    #[test]
+    fn settling_operations_leave_inventory_owned_by_a_newer_operation() {
+        let downloading = |operation_id: &str| ModelAvailability::Downloading {
+            operation_id: operation_id.to_owned(),
+            stage: DownloadStage::Downloading,
+            completed_bytes: 0,
+            total_bytes: 1,
+            current_component: None,
+            started_at: 0,
+            updated_at: 0,
+        };
+        assert!(downloading_by_another(
+            &downloading("download_new"),
+            "download_old"
+        ));
+        assert!(!downloading_by_another(
+            &downloading("download_old"),
+            "download_old"
+        ));
+    }
+
+    /// Serves one file over HTTP the way the Hub resolve endpoint does. The first `stalled_gets`
+    /// GETs send `stall_after` body bytes and then go silent with the connection still open, like
+    /// a path whose packets are being dropped.
+    fn serve_source(
+        contents: Vec<u8>,
+        stall_after: usize,
+        stalled_gets: usize,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("source listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("source address"));
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&ranges);
+        std::thread::spawn(move || {
+            let mut gets = 0_usize;
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().expect("source stream"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut range = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("range")
+                    {
+                        range = Some(value.trim().to_owned());
+                    }
+                }
+                if request_line.starts_with("HEAD ") {
+                    let _ = write!(
+                        connection,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        contents.len()
+                    );
+                    continue;
+                }
+                let range = range.expect("ranged source request");
+                observed.lock().expect("ranges").push(range.clone());
+                let (start, end) = range
+                    .trim_start_matches("bytes=")
+                    .split_once('-')
+                    .map(|(start, end)| {
+                        (
+                            start.parse::<usize>().expect("range start"),
+                            end.parse::<usize>().expect("range end"),
+                        )
+                    })
+                    .expect("byte range");
+                let body = &contents[start..=end];
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    contents.len()
+                );
+                let stalled = gets < stalled_gets;
+                gets += 1;
+                if stalled {
+                    let _ = connection.write_all(&body[..stall_after.min(body.len())]);
+                    let _ = connection.flush();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(120));
+                        drop(connection);
+                    });
+                } else {
+                    let _ = connection.write_all(body);
+                }
+            }
+        });
+        (endpoint, ranges)
+    }
+
+    fn source_repository(
+        endpoint: &str,
+        directory: &Path,
+    ) -> hf_hub::HFRepository<hf_hub::RepoTypeModel> {
+        hf_hub::HFClient::builder()
+            .endpoint(endpoint)
+            .cache_dir(directory.join("hf-hub"))
+            .retry_max_attempts(0)
+            .build()
+            .expect("source client")
+            .model("owner".to_owned(), "repository".to_owned())
+    }
+
+    #[tokio::test]
+    async fn a_stalled_source_interrupts_the_attempt_and_the_retry_resumes_saved_bytes() {
+        let contents = (0..64 * 1024_u32)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), 16 * 1024, 1);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        let control = TransferControl::new(Duration::from_millis(300));
+
+        let mut integrity = DownloadIntegrity::empty(&component);
+        let started = Instant::now();
+        let error = download_component_once(
+            &repo,
+            &"a".repeat(40),
+            &component,
+            &paths,
+            &mut integrity,
+            &mut |_, _| {},
+            &control,
+        )
+        .await
+        .expect_err("stalled source");
+        assert!(matches!(error.kind, DownloadErrorKind::Network));
+        assert!(error.retryable() && error.resumable());
+        assert!(matches!(
+            error.to_failure(),
+            Some(DownloadFailure::NetworkUnavailable)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            recover_partial(&paths, &component)
+                .await
+                .expect("saved bytes")
+                .bytes,
+            16 * 1024
+        );
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            |_, _| {},
+            &control,
+        )
+        .await
+        .expect("resumed download");
+        assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
+        assert_eq!(
+            *ranges.lock().expect("ranges"),
+            vec!["bytes=0-65535".to_owned(), "bytes=16384-65535".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_ends_a_stalled_transfer_without_waiting_for_the_stall_timeout() {
+        let contents = vec![7_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, _ranges) = serve_source(contents, 1024, usize::MAX);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = Arc::new(TransferControl::new(Duration::from_secs(60)));
+        let cancel = Arc::clone(&control);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let started = Instant::now();
+        let error = download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            |_, _| {},
+            &control,
+        )
+        .await
+        .expect_err("cancelled download");
+        assert!(matches!(error.kind, DownloadErrorKind::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     #[test]
     fn streamed_integrity_matches_the_complete_source_digest() {
         let contents = b"streamed model contents";
@@ -2231,5 +2684,86 @@ mod tests {
         assert!(!missing_upstream_content(&failure(
             DownloadErrorKind::Network
         )));
+    }
+
+    fn hub_client() -> hf_hub::HFClient {
+        hf_hub::HFClient::builder().build().expect("hub client")
+    }
+
+    #[tokio::test]
+    async fn rejected_credential_falls_back_to_anonymous_resolution() {
+        let credential = HubCredential {
+            client: hub_client(),
+            token: "expired".to_owned(),
+        };
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let resolved = resolve_with_credential_fallback(
+            Some(&credential),
+            &hub_client(),
+            |_client, token| {
+                attempts.lock().expect("attempts").push(token.clone());
+                async move {
+                    match token {
+                        Some(_) => Err(DownloadError {
+                            kind: DownloadErrorKind::CredentialRejected,
+                            message: "OAuth token has expired".to_owned(),
+                            retryable: false,
+                            resumable: false,
+                        }),
+                        None => Ok("resolved"),
+                    }
+                }
+            },
+        )
+        .await
+        .expect("anonymous resolution");
+
+        assert_eq!(resolved, "resolved");
+        assert_eq!(
+            *attempts.lock().expect("attempts"),
+            vec![Some("expired".to_owned()), None]
+        );
+    }
+
+    #[tokio::test]
+    async fn other_failures_with_a_credential_are_not_retried_anonymously() {
+        let credential = HubCredential {
+            client: hub_client(),
+            token: "valid".to_owned(),
+        };
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let error = resolve_with_credential_fallback(
+            Some(&credential),
+            &hub_client(),
+            |_client, token| {
+                attempts.lock().expect("attempts").push(token);
+                async {
+                    Err::<(), _>(DownloadError {
+                        kind: DownloadErrorKind::SourceAccessDenied,
+                        message: String::new(),
+                        retryable: false,
+                        resumable: false,
+                    })
+                }
+            },
+        )
+        .await
+        .expect_err("forbidden content");
+
+        assert!(matches!(error.kind, DownloadErrorKind::SourceAccessDenied));
+        assert_eq!(*attempts.lock().expect("attempts"), vec![Some("valid".to_owned())]);
+    }
+
+    #[tokio::test]
+    async fn resolution_without_a_credential_is_anonymous() {
+        let attempts = std::sync::Mutex::new(Vec::new());
+        resolve_with_credential_fallback(None, &hub_client(), |_client, token| {
+            attempts.lock().expect("attempts").push(token);
+            async { Ok(()) }
+        })
+        .await
+        .expect("anonymous resolution");
+
+        assert_eq!(*attempts.lock().expect("attempts"), vec![None]);
     }
 }

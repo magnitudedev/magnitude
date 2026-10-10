@@ -17,6 +17,7 @@ mod model_projection;
 mod package_service;
 mod preview;
 mod service;
+mod snapshot_blobs;
 mod store_fs;
 mod validation;
 

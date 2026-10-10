@@ -138,6 +138,13 @@ inputs, or ranking scores. Authentication, authorization, rate-limit, timeout, a
 failures preserve their original classification. A fallback is accepted only when every required
 path, size, and digest matches.
 
+Acquisition presents only an explicit `HF_TOKEN`; implicit Hugging Face credentials (the token
+file under `HF_HOME`) are never discovered. When the Hub rejects the presented credential itself
+(HTTP 401, as for an expired or revoked token, which Hugging Face rejects even on public
+repositories), the package is resolved and downloaded anonymously instead. A rejected credential
+therefore never makes public packages unavailable; content that still requires authorization fails
+with its anonymous classification.
+
 ## Artifact stores and inventory
 
 Completed model files are the sole authority for physical presence. A package is installed when all
@@ -234,7 +241,9 @@ terminal outcome. ACN observes and addresses that occurrence by `CatalogInstalla
 Equivalent operations may share private package work, but sharing never changes their public
 model identity or operation state.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
-shared package work only when no other live occurrence depends on it. A retry creates a new
+shared package work only when no other live occurrence depends on it. Package work whose
+cancellation was requested is never joined: a later occurrence admits new work, which waits for the
+cancelled work to release the repository and resumes from its checkpoint. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 
@@ -267,7 +276,9 @@ An engine update that changes tuning keys leaves models to retune on their next 
 are not re-optimized after an update.
 
 Expected failures distinguish insufficient disk space, interruption, unavailable source content,
-unavailable network, local storage failure, and corrupt content. Cancellation is a separate
+unavailable network, local storage failure, and corrupt content. A source that delivers nothing for
+a bounded interval is unavailable network, never an indefinite wait: the attempt keeps its
+checkpoint, bounded retries resume from it, and exhausting them fails the occurrence as resumable. Cancellation is a separate
 terminal result. Structured facts, including required and available byte counts, cross boundaries
 without parsing diagnostic prose.
 
