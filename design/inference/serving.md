@@ -90,7 +90,12 @@ by ID over a whole conversation: the ID the model wrote when its format carries
 one (templates render it back), otherwise a fresh random one. A
 caller stop sequence ends output with a stop-sequence termination; tool calls
 terminate as tool calls; the output limit or context end is a length
-termination. A request samples with the seed it names (every
+termination. Output that stops inside a tool call (at the output limit, the
+context end or a stop sequence) terminates as that stop, never as tool calls and
+never as a failure: the cut-off call is incomplete, so complete responses hold
+only the calls that completed. A stream has already published the incomplete
+call's partial input; Responses concludes it as an `incomplete` item outside the
+response's `output`. A request samples with the seed it names (every
 protocol accepts `seed`) or, when it names none, a fresh one, so retrying an
 identical request samples anew; a seed's draws are position-addressed, so
 batching and speculation never change them. Terminal usage and timings come from actual engine execution;
@@ -125,6 +130,7 @@ response event.
 
 Qualification covers immutable input history, automatic/required/named/allowed/disabled
 tools, reasoning resolution and budgets, grammar and schema enforcement,
-fragmented streams, backpressure, cancellation, replay closure of every emitted
+output cut off inside a tool call in streaming and complete responses of every
+protocol, fragmented streams, backpressure, cancellation, replay closure of every emitted
 output shape, and consistency of terminal timing and token counts between
 counting and generation.

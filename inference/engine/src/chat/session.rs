@@ -358,18 +358,12 @@ async fn finish(
         }
     }
     emit(events, produced, None).await?;
-    let termination = if semantics.tool_calls > 0 {
-        Termination::ToolCalls
-    } else if let Some(stop) = parser.matched_stop() {
-        Termination::StopSequence(stop.to_owned())
-    } else {
-        match finish {
-            FinishReason::Length | FinishReason::Context => Termination::OutputLimit,
-            FinishReason::Stop | FinishReason::Cancelled | FinishReason::Failed => {
-                Termination::Natural
-            }
-        }
-    };
+    let termination = termination(
+        semantics.completed_calls,
+        semantics.calls.len(),
+        parser.matched_stop(),
+        finish,
+    );
     let reasoning_output_tokens = if semantics.reasoning.is_empty() {
         0
     } else {
@@ -402,6 +396,29 @@ async fn finish(
             },
         }))
         .await
+}
+
+/// Output ends with tool calls only when every call it started completed. A
+/// call cut off by a stop sequence or the output limit is incomplete: the turn
+/// ended there, not with tool calls.
+fn termination(
+    completed_calls: usize,
+    open_calls: usize,
+    stop: Option<&str>,
+    finish: FinishReason,
+) -> Termination {
+    if completed_calls > 0 && open_calls == 0 {
+        Termination::ToolCalls
+    } else if let Some(stop) = stop {
+        Termination::StopSequence(stop.to_owned())
+    } else {
+        match finish {
+            FinishReason::Length | FinishReason::Context => Termination::OutputLimit,
+            FinishReason::Stop | FinishReason::Cancelled | FinishReason::Failed => {
+                Termination::Natural
+            }
+        }
+    }
 }
 
 fn millis(duration: Duration) -> f64 {
@@ -443,7 +460,7 @@ impl Clock {
 /// completed value against its schema. Values are published as generated;
 /// violations are reported.
 struct Semantics {
-    tool_calls: usize,
+    completed_calls: usize,
     reasoning: String,
     schemas: OutputSchemas,
     /// Open tool calls: name and arguments so far.
@@ -455,7 +472,7 @@ struct Semantics {
 impl Semantics {
     fn new(schemas: OutputSchemas) -> Self {
         Self {
-            tool_calls: 0,
+            completed_calls: 0,
             reasoning: String::new(),
             schemas,
             calls: BTreeMap::new(),
@@ -479,7 +496,6 @@ impl Semantics {
                 }
                 Event::Content { .. } | Event::Reasoning { .. } => {}
                 Event::ToolStart { index, name, id } => {
-                    self.tool_calls += 1;
                     self.calls.insert(index, (name.clone(), String::new()));
                     output.push(OutputEvent::ToolCallStarted {
                         index: index as usize,
@@ -504,6 +520,7 @@ impl Semantics {
                         .calls
                         .remove(&index)
                         .ok_or("a tool call completed before it started")?;
+                    self.completed_calls += 1;
                     crate::telemetry::span_nonconforming_output(
                         &format!("tool {name}"),
                         &self.schemas.tool_call(&name, &arguments),
@@ -523,5 +540,40 @@ impl Semantics {
             }
         }
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generation stopped at `max_tokens` inside a call's arguments was once
+    /// reported as a tool-call termination for a call that never completed.
+    #[test]
+    fn a_call_cut_off_inside_its_arguments_does_not_terminate_as_tool_calls() {
+        for finish in [FinishReason::Length, FinishReason::Context] {
+            assert_eq!(termination(0, 1, None, finish), Termination::OutputLimit);
+            assert_eq!(termination(1, 1, None, finish), Termination::OutputLimit);
+        }
+        assert_eq!(
+            termination(1, 1, Some("END"), FinishReason::Stop),
+            Termination::StopSequence("END".into())
+        );
+    }
+
+    #[test]
+    fn completed_calls_terminate_as_tool_calls_however_generation_stopped() {
+        for finish in [FinishReason::Stop, FinishReason::Length] {
+            assert_eq!(termination(2, 0, None, finish), Termination::ToolCalls);
+        }
+        assert_eq!(
+            termination(1, 0, Some("END"), FinishReason::Stop),
+            Termination::ToolCalls
+        );
+        assert_eq!(termination(0, 0, None, FinishReason::Stop), Termination::Natural);
+        assert_eq!(
+            termination(0, 0, None, FinishReason::Length),
+            Termination::OutputLimit
+        );
     }
 }

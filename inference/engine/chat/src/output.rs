@@ -250,18 +250,22 @@ impl OutputJournal {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<Output, JournalError> {
+    /// Assembles the output of a stream that ended with `termination`. Output
+    /// cut short by the output limit or a stop sequence may end inside a tool
+    /// call; that call is incomplete and is not part of the output. Any other
+    /// ending with an open call violates the stream contract.
+    pub fn finish(self, termination: &Termination) -> Result<Output, JournalError> {
         if self.phase.is_none() {
             return Err(JournalError::MissingStart);
         }
-        if !self.open.is_empty() {
+        let truncated = matches!(
+            termination,
+            Termination::OutputLimit | Termination::StopSequence(_)
+        );
+        if !self.open.is_empty() && !truncated {
             return Err(JournalError::OpenToolCall);
         }
-        let tool_calls = self
-            .calls
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or(JournalError::OpenToolCall)?;
+        let tool_calls = self.calls.into_iter().flatten().collect();
         Ok(Output {
             reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
             text: (!self.text.is_empty()).then_some(self.text),
@@ -303,7 +307,7 @@ mod tests {
         ] {
             journal.push(&event).unwrap();
         }
-        let output = journal.finish().unwrap();
+        let output = journal.finish(&Termination::ToolCalls).unwrap();
         assert_eq!(output.reasoning.as_deref(), Some("think"));
         assert_eq!(output.text.as_deref(), Some("answer"));
         assert_eq!(output.tool_calls[0].arguments["q"], "rust");
@@ -327,7 +331,70 @@ mod tests {
                 name: "tool".into(),
             })
             .unwrap();
-        assert_eq!(journal.finish(), Err(JournalError::OpenToolCall));
+        assert_eq!(
+            journal.finish(&Termination::ToolCalls),
+            Err(JournalError::OpenToolCall)
+        );
+    }
+
+    /// Generation stopped at `max_tokens` inside a call's arguments once
+    /// failed the whole non-streaming response.
+    #[test]
+    fn journal_omits_a_call_cut_off_by_the_output_limit_or_a_stop_sequence() {
+        for termination in [
+            Termination::OutputLimit,
+            Termination::StopSequence("END".into()),
+        ] {
+            let mut journal = OutputJournal::default();
+            for event in [
+                OutputEvent::Started,
+                OutputEvent::TextDelta("writing".into()),
+                OutputEvent::ToolCallStarted {
+                    index: 0,
+                    id: "complete".into(),
+                    name: "one".into(),
+                },
+                OutputEvent::ToolInputDelta {
+                    index: 0,
+                    fragment: "{}".into(),
+                },
+                OutputEvent::ToolCallFinished { index: 0 },
+                OutputEvent::ToolCallStarted {
+                    index: 1,
+                    id: "cut".into(),
+                    name: "write_file".into(),
+                },
+                OutputEvent::ToolInputDelta {
+                    index: 1,
+                    fragment: "{\"content\":\"Once upon".into(),
+                },
+            ] {
+                journal.push(&event).unwrap();
+            }
+            let output = journal.finish(&termination).unwrap();
+            assert_eq!(output.text.as_deref(), Some("writing"));
+            assert_eq!(
+                output
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["complete"]
+            );
+        }
+        let mut journal = OutputJournal::default();
+        journal.push(&OutputEvent::Started).unwrap();
+        journal
+            .push(&OutputEvent::ToolCallStarted {
+                index: 0,
+                id: "cut".into(),
+                name: "tool".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            journal.finish(&Termination::Natural),
+            Err(JournalError::OpenToolCall)
+        );
     }
 
     #[test]
@@ -358,7 +425,7 @@ mod tests {
         ] {
             journal.push(&event).unwrap();
         }
-        let output = journal.finish().unwrap();
+        let output = journal.finish(&Termination::ToolCalls).unwrap();
         assert_eq!(output.tool_calls[0].id, "first");
         assert_eq!(output.tool_calls[1].id, "second");
     }
