@@ -1280,7 +1280,11 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
 # the other P V as scalar F16 products accumulated in F16 over a step of 96
 # keys (32 for 256 columns) before they fold into the F32 output (measured
 # within the BF16 tolerance of the default). Its threadgroups hold
-# QT * HEADS / 8 pairs and their exchange in place of a staged tile, and the
+# QT * HEADS / 8 pairs and their exchange in place of a staged tile, beside
+# the direct form's per-segment tables ((R + 1) * 64 + 16 bytes). `where`
+# cannot read R, so it charges the largest segment class a graph is sealed
+# for (64, `MAX_HISTORY_SPANS` rounded up): a configuration it admits
+# launches at every class, not only at the one segment tuning measures. The
 # window's planes end in 96 zero rows. The fresh rows' planes keep their 32
 # (a step that would end past them starts earlier and masks the keys before
 # its own) and hold one step at least, in a launch of fewer rows than that.
@@ -1310,7 +1314,7 @@ native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal
     let WINDOW = SPARE / 256 * 256
     let ROUND = max((SPARE - STATE) / 256 * 256, 256 * (1 - DIRECT))
     let ROUNDS = max(1, DIRECT * min(1, HT * 256 / (WINDOW + 1)) * ceil_div(HT * 256, ROUND))
-    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 64 * 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 65 * 64 + 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
     scratch values bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)

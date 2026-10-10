@@ -938,7 +938,7 @@ fn coissue_prefill_configs(geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> 
         .into_iter()
         .filter(|&(qt, _)| (qt == 8) == (w == 512))
         .filter(|&(qt, heads)| {
-            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 64 * 16 <= 32768
+            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 65 * 64 + 16 <= 32768
         })
         .flat_map(|(qt, heads)| [1, 256].into_iter().map(move |split| (qt, heads, split)))
         .map(|(qt, heads, split)| {
@@ -974,6 +974,56 @@ fn metal_coissue_prefill_agrees_with_the_default() {
             (512, 16384, 17024, None),
         ],
         coissue_prefill_configs,
+    );
+}
+
+/// Metal's COISSUE form admits only configurations whose attend launch fits
+/// the device's threadgroup memory at the largest segment class a graph is
+/// sealed for (64), not only at the one segment tuning measures: MiniCPM5's
+/// four pairs (QT 16, HEADS 2) need 33,328 bytes there, so it takes two.
+#[test]
+fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for geometry in [MINICPM5, QWEN, GEMMA_E4B_FULL] {
+        let w = geometry.w() as u64;
+        let keys = if w > 128 { 32 } else { 96 };
+        let windows = (w / 256).max(1);
+        let pair = 48 + 2 * (keys * 16 + 32) + 32 * w.min(256) + 2048 * (windows - 1);
+        for (qt, heads) in [(8, 1), (8, 2), (16, 1), (16, 2), (32, 1), (32, 2)] {
+            let config = [
+                ("QT", qt),
+                ("HEADS", heads),
+                ("SPLIT_GROUPS", 256),
+                ("DIRECT", 1),
+                ("COISSUE", 1),
+            ];
+            let admitted = attention_prefill_k8v4::native_for_device_with(
+                &device,
+                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &prefill_specialization(&device, geometry, &config),
+            )
+            .is_ok();
+            let bytes = 32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 65 * 64 + 16;
+            assert!(
+                !admitted || bytes <= 32768,
+                "w {w} g {} {config:?} is admitted but its attend launch needs {bytes} bytes at 64 segments",
+                geometry.g
+            );
+        }
+    }
+    let minicpm = [("QT", 16), ("HEADS", 2), ("SPLIT_GROUPS", 128), ("DIRECT", 1), ("COISSUE", 1)];
+    assert!(
+        attention_prefill_k8v4::native_for_device_with(
+            &device,
+            attention_prefill_k8v4::Elements { A: Element::bf16() },
+            &prefill_specialization(&device, MINICPM5, &minicpm),
+        )
+        .is_err()
     );
 }
 
