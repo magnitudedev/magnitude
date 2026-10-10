@@ -47,7 +47,7 @@ download, so the next check can fetch a newer release (or retry this one unless 
 anything: if another process holds or awaits it (the service's own shared lease does not count,
 so this reads the kernel's lock table rather than trying the lock), it keeps serving, records `deferred`, reports it with an
 immediate update check, and tries again at an idle point 15 minutes later. (A started service
-refuses to run while the lock is held, so stopping first would leave it down until the lock frees.) Update checks start only once the
+refuses to run while the lock is held, so stopping first would leave it down until the lock frees.) Update checks, scheduled or requested, start only once the
 service is ready, so a new version reports `applied` only after it starts; one that fails before
 Ready reports `failed`/`startup` and exits non-zero for the service manager to retry. There is no
 rollback; withdrawing the release stops it being offered.

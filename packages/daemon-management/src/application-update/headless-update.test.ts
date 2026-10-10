@@ -1,4 +1,4 @@
-import { Effect, Stream, TestClock, TestContext } from "effect"
+import { Deferred, Effect, Stream, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import type { ApplicationUpdate } from "./application-update"
 import { makeHeadlessUpdateControl } from "./headless-update"
@@ -19,6 +19,7 @@ describe("running headless update control", () => {
     const { calls, updates, state } = fixture()
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const control = yield* makeHeadlessUpdateControl(updates)
+      yield* TestClock.adjust("1 millis")
       expect((yield* control("status")).state).toEqual(state)
       expect(calls).toEqual([])
       const failure = yield* control("install").pipe(Effect.flip)
@@ -29,6 +30,19 @@ describe("running headless update control", () => {
         yield* reply.afterReply
       }
       expect(calls).toEqual(["check", "download", "discard"])
+    })).pipe(Effect.provide(TestContext.TestContext)))
+  })
+  it("runs no manual check before the service is first ready, so no outcome is reported early", async () => {
+    const { calls, updates, state } = fixture()
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const ready = yield* Deferred.make<void>()
+      const control = yield* makeHeadlessUpdateControl(updates, Deferred.await(ready))
+      expect((yield* control("check")).state).toEqual(state)
+      expect(calls).toEqual([])
+      yield* Deferred.succeed(ready, undefined)
+      yield* TestClock.adjust("1 millis")
+      yield* control("check")
+      expect(calls).toEqual(["check"])
     })).pipe(Effect.provide(TestContext.TestContext)))
   })
   it("owns one timer that ends with its scope", async () => {
