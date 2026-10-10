@@ -23,6 +23,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
     const std::string THINK_START     = "<think>";
     const std::string THINK_END       = "</think>";
     const std::string GEN_PROMPT      = "<|im_start|>assistant\n";
+    const std::string UNTHOUGHT_TEXT  = "unthought-content";
 
     // Copy reasoning to the "thinking" field the template expects
     auto adjusted_messages = json::array();
@@ -70,7 +71,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
 
         auto reasoning = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
+            reasoning = p.optional(p.rule("reasoning-block", THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END));
         }
 
         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -93,9 +94,15 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
             tool_calls = p.optional(tool_calls);
         }
 
-        auto content = p.text_before_calls(p.content(p.until(TOOL_CALL_START)), inputs.tool_choice);
+        auto content = p.text_before_calls(p.rule("content-text", p.content(p.until(TOOL_CALL_START))), inputs.tool_choice);
+        auto preamble = reasoning + content;
+        if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            // Text beginning with <think> reads as reasoning whenever it can, so
+            // content that no reasoning precedes never begins with it.
+            preamble = p.gbnf(preamble, "(reasoning-block content-text | " + UNTHOUGHT_TEXT + ")");
+        }
 
-        return generation_prompt + reasoning + content + tool_calls + end;
+        return generation_prompt + preamble + tool_calls + end;
     });
 
     data.parser = parser.save();
@@ -104,6 +111,10 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &    
         data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
             parser.build_grammar(builder, data.grammar_lazy);
+            if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE &&
+                inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED && extract_reasoning) {
+                unopened_text_grammar(builder, UNTHOUGHT_TEXT, THINK_START, TOOL_CALL_START, false);
+            }
         });
 
         data.grammar_triggers = {

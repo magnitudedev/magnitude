@@ -31,6 +31,14 @@ message carries a reasoning strength and the model chooses its recipient after `
 With `enable_thinking` false the strength is none unless the request names one, and the reply is
 opened to the user (` to=user<|message|>`); with callable tools the recipient stays the model's choice.
 
+Patch 0023 makes MiniCPM5 and LFM2 tool-call text read one way when a free-form argument makes
+the tool grammar recursive. Text the parser reads another way by ordered choice or negative
+lookahead (a MiniCPM5 value opening `<![CDATA[`, text opening `<think>` before content) has an exact
+GBNF form instead of being dropped, so content that no reasoning precedes never opens with the
+reasoning tag, and reasoning the LFM2.5 prompt opens closes before the turn ends. Whitespace has one
+owner: a MiniCPM5 argument owns the whitespace after it, and Python-style values leave whitespace to
+their separators.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

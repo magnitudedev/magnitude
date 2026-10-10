@@ -533,13 +533,16 @@ common_peg_parser common_chat_peg_builder::python_or_json_value() {
 
         auto member  = sequence({ python_string(), ws, literal(":"), ws, value });
         auto members = sequence({ member, zero_or_more(sequence({ ws, literal(","), ws, member })) });
+        // Whitespace around a value belongs to its container's separators: a
+        // value that also ended with it would meet a separator's whitespace,
+        // and the same text would read two ways.
         auto dict    = rule("python-or-json-dict", [&]() {
-            return sequence({ literal("{"), ws, choice({ literal("}"), sequence({ members, ws, literal("}") }) }), ws });
+            return sequence({ literal("{"), ws, choice({ literal("}"), sequence({ members, ws, literal("}") }) }) });
         });
 
-        auto elements = sequence({ value, zero_or_more(sequence({ literal(","), ws, value })) });
+        auto elements = sequence({ value, zero_or_more(sequence({ ws, literal(","), ws, value })) });
         auto array    = rule("python-or-json-array", [&]() {
-            return sequence({ literal("["), ws, choice({ literal("]"), sequence({ elements, ws, literal("]") }) }), ws });
+            return sequence({ literal("["), ws, choice({ literal("]"), sequence({ elements, ws, literal("]") }) }) });
         });
 
         return choice({ dict, array, python_string(), python_number(),
