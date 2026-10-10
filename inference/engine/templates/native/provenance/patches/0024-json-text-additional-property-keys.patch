@@ -1,0 +1,42 @@
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -1081,6 +1081,9 @@ private:
+         not_strings({"and", "also"})
+             -> ["] ( [a] ([l] ([s] ([o] char+ | [^"o] char*) | [^"s] char*) | [n] ([d] char+ | [^"d] char*) | [^"ln] char*) | [^"a] char* )? ["]
+     */
++    // A string other than each of `strings`: branches spell a string's JSON
++    // text character by character, and leave it at the first character none
++    // continues with. Every branch is valid JSON string text.
+     std::string _not_strings(const std::vector<std::string> & strings) {
+         common_trie trie(strings);
+ 
+@@ -1089,17 +1092,16 @@ private:
+         out << "[\"] ( ";
+         std::function<void(size_t)> visit = [&](size_t idx) {
+             const auto & node = trie.nodes[idx];
+-            std::string rejects;
++            codepoint_ranges rejects;
+             auto first = true;
+             for (const auto & [cpt, child] : node.children) {
+-                std::string c = common_unicode_cpt_to_utf8(cpt);
+-                rejects += c;
++                rejects.push_back({ cpt, cpt });
+                 if (first) {
+                     first = false;
+                 } else {
+                     out << " | ";
+                 }
+-                out << "[" << c << "]";
++                out << "\"" << json_text_literal(cpt) << "\"";
+                 if (!trie.nodes[child].children.empty()) {
+                     out << " (";
+                     visit(child);
+@@ -1109,7 +1111,7 @@ private:
+                 }
+             }
+             if (!node.children.empty()) {
+-                out << " | [^\"" << rejects << "] " << char_rule << "*";
++                out << " | " << json_text_class(rejects, true) << " " << char_rule << "*";
+             }
+         };
+         visit(0);

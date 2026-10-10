@@ -39,6 +39,10 @@ reasoning tag, and reasoning the LFM2.5 prompt opens closes before the turn ends
 owner: a MiniCPM5 argument owns the whitespace after it, and Python-style values leave whitespace to
 their separators.
 
+Patch 0024 makes the key grammar of an object's additional properties valid JSON string text: it
+spells keys other than the listed properties as escaped JSON text, never as raw characters a JSON
+string cannot hold.
+
 To refresh the extraction, use the provenance record and patch series in a maintainer workflow,
 then check in the resulting patched sources. Source preparation is deliberately not part of a
 consumer build.

@@ -384,6 +384,16 @@ fn strings_are_always_valid_json() {
             vec![r#""😀x""#],
             vec![r#""😀""#],
         ),
+        // Keys other than the listed properties are string text too.
+        (
+            json!({
+                "type": "object",
+                "properties": {"env": {"type": "string"}},
+                "additionalProperties": {"type": "integer"}
+            }),
+            vec![r#"{"envy": 1}"#, r#"{"e\n": 1}"#, r#"{"é": 1}"#, r#"{"env": "a", "x": 2}"#],
+            vec!["{\"\u{1}\": 1}", "{\"e\u{1}\": 1}", r#"{"\": 1}"#, r#"{"e\": 1}"#],
+        ),
     ] {
         let prepared = output.prepare(schema.clone());
         for text in accepted {
