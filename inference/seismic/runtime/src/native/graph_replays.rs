@@ -52,7 +52,7 @@ impl<G> Replays<G> {
         key: Vec<u64>,
         retained: &Arc<dyn Any + Send + Sync>,
         record: impl FnOnce() -> Result<G, CallError>,
-        replay: impl FnOnce(&G) -> Result<(), CallError>,
+        replay: impl FnOnce(&mut G) -> Result<(), CallError>,
     ) -> Result<(), CallError> {
         let mut entries = self
             .entries
@@ -85,6 +85,6 @@ impl<G> Replays<G> {
             .get_mut(&key)
             .expect("the submission's graph was recorded above");
         entry.used = clock;
-        replay(&entry.graph)
+        replay(&mut entry.graph)
     }
 }

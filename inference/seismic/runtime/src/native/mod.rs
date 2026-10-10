@@ -1722,7 +1722,7 @@ enum RouteSubmission {
     Metal(seismic_metal::DirectSubmission),
     Cuda(seismic_cuda::direct::DirectSubmission),
     #[cfg(not(target_os = "macos"))]
-    Vulkan(seismic_vulkan::direct::DirectSubmission),
+    Vulkan(vulkan::VulkanSubmission),
 }
 
 impl DeviceCompletion for RouteSubmission {

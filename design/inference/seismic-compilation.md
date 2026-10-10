@@ -270,7 +270,13 @@ storage rather than its tensor handles, so output leases it reads can be recycle
 later runs of the same sequence. On CUDA a submission's launches are fully determined by its
 plans and the addresses it binds: the device keeps the instantiated CUDA graph of each (plans,
 bound addresses) key (least recently used dropped beyond a bound) and a submission with a known
-key is one graph launch. A launch of a module that declares a programmatic dependency
+key is one graph launch. Vulkan keeps recorded secondary command buffers under the same key, and
+bounds the device time of each queue submission, since drivers reset a device whose submission
+outlives their watchdog (two seconds under Windows TDR and current amdgpu): a sealed submission is
+divided at launch boundaries, a launch of a kind (pipeline and group counts) not yet measured is
+submitted alone, and measured launches share a queue submission up to a budget far below any
+watchdog. Every queue submission's timestamps refine its kinds' measured time; a key's division is
+kept until a part's estimate passes a limit. One launch is never divided. A launch of a module that declares a programmatic dependency
 (`SEISMIC_PROGRAMMATIC_DEPENDENCY`, compute capability 9.0 and later) follows the node before it
 by a programmatic edge: it starts once every block of that node has triggered
 (`griddepcontrol.launch_dependents`, which a kernel issues only after its own wait) or exited, and

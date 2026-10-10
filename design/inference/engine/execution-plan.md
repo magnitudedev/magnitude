@@ -538,7 +538,9 @@ One program factory is selected at startup. A program returns its submission onc
 queued: the native target program queues every graph run of a step without waiting, in Seismic
 sequences of doubling length (1, 2, 4, … runs, the remainder submitted at the step's end), so the
 device starts on the first run at once, each sequence is prepared while the device runs the previous
-ones, and a step has about log2 of its run count submission boundaries. One submission per run
+ones, and a step has about log2 of its run count submission boundaries (a backend may divide a
+sequence further to bound each queue submission's device time, see
+[Seismic compilation](../seismic-compilation.md)). One submission per run
 leaves a device gap at every boundary; one submission per step starts the device only after the
 host has prepared the whole step; both measure slower. It then returns a pending submission whose completion is observed off the owning thread, while other lanes may
 return already ready submissions. Every submission owns its validated launch, state transactions,
