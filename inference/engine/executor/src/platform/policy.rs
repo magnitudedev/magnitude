@@ -309,7 +309,8 @@ pub struct DomainReading {
     pub constraint: MemoryConstraint,
     pub thresholds: DomainThresholds,
     /// Additional bytes the engine may still claim: headroom above the
-    /// planning reserve and, on Metal, the room left in the working set.
+    /// planning reserve and, on Metal, the room left in the working set
+    /// above the planning reserve.
     pub ceiling_bytes: u64,
     /// The host's distress, for a host RAM domain; a dedicated device's own
     /// memory has none.
@@ -342,9 +343,11 @@ impl DomainReading {
         }
     }
 
-    /// Bound the claimable ceiling by a further device constraint without a
-    /// reserve of its own; the band stays the domain's.
-    fn bounded(mut self, bytes: u64, constraint: MemoryConstraint) -> Self {
+    /// Bound the claimable ceiling by a further device constraint with
+    /// `remaining_bytes` left, keeping the domain's planning reserve inside
+    /// it too; the band stays the domain's.
+    fn bounded(mut self, remaining_bytes: u64, constraint: MemoryConstraint) -> Self {
+        let bytes = remaining_bytes.saturating_sub(self.thresholds.planning_bytes);
         if bytes < self.ceiling_bytes {
             self.ceiling_bytes = bytes;
             self.constraint = constraint;
@@ -405,8 +408,12 @@ fn domain_readings(
             host_distress,
         );
         return Ok(vec![match *measurements {
-            // Metal's working set bounds claims on the same host domain
-            // without a reserve of its own; host headroom decides the band.
+            // Metal's working set bounds claims on the same host domain, less
+            // the planning reserve as stable fit plans it: the driver's own
+            // submission memory lies outside the charge, and a working set
+            // filled to its end fails a submission (device lost) where a
+            // refused claim would have released. Host headroom decides the
+            // band.
             DeviceMeasurements::Metal {
                 recommended_working_set_bytes,
                 current_allocated_bytes,
@@ -762,8 +769,9 @@ mod tests {
             recommended_working_set_bytes: 12 * GIB,
             current_allocated_bytes: allocated,
         };
-        // Working-set room (1 GiB) is tighter than host ceiling (4 GiB).
-        let bounded = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(11 * GIB)).unwrap();
+        // Working-set room above the 2 GiB reserve (1 GiB) is tighter than
+        // the host ceiling (4 GiB).
+        let bounded = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(9 * GIB)).unwrap();
         assert_eq!(bounded[0].band, MemoryBand::Normal);
         assert_eq!(bounded[0].ceiling_bytes, GIB);
         assert_eq!(bounded[0].constraint, MemoryConstraint::DeviceWorkingSet);
@@ -771,13 +779,54 @@ mod tests {
         let host_bound = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(GIB)).unwrap();
         assert_eq!(host_bound[0].ceiling_bytes, 4 * GIB);
         assert_eq!(host_bound[0].constraint, MemoryConstraint::HostRam);
-        // A full working set grants nothing but is not Reclaim by itself.
-        let full = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(12 * GIB)).unwrap();
+        // A working set filled to its reserve grants nothing but is not
+        // Reclaim by itself: the claim is refused and the owner releases.
+        let full = readings(&host(6 * GIB, vec![]), 16 * GIB, None, metal(10 * GIB)).unwrap();
         assert_eq!(full[0].band, MemoryBand::Normal);
         assert_eq!(full[0].ceiling_bytes, 0);
+        assert_eq!(full[0].constraint, MemoryConstraint::DeviceWorkingSet);
         let reclaim = readings(&host(GIB, vec![]), 16 * GIB, None, metal(GIB)).unwrap();
         assert_eq!(reclaim[0].band, MemoryBand::Reclaim);
         assert_eq!(reclaim[0].ceiling_bytes, 0);
+    }
+
+    /// A 24 GiB Mac whose movable memory stays large while the engine's
+    /// wired state grows: claims stop at stable fit (working set less the
+    /// planning reserve), never at the working set's end, where the driver's
+    /// submission memory no longer fits and the device is lost.
+    #[test]
+    fn metal_claims_stop_at_stable_fit_below_the_working_set() {
+        let working_set = 16 * GIB;
+        let reserve = MemoryReserves::standard()
+            .for_domain(24 * GIB)
+            .planning_bytes;
+        let stable_fit = working_set - reserve;
+        for allocated in [
+            4 * GIB,
+            10 * GIB,
+            stable_fit - 1,
+            stable_fit,
+            working_set - GIB / 2,
+            working_set,
+        ] {
+            let reading = readings(
+                &host(14 * GIB, vec![]),
+                24 * GIB,
+                None,
+                DeviceMeasurements::Metal {
+                    recommended_working_set_bytes: working_set,
+                    current_allocated_bytes: allocated,
+                },
+            )
+            .unwrap();
+            assert_eq!(reading[0].band, MemoryBand::Normal);
+            assert_eq!(
+                reading[0].ceiling_bytes,
+                stable_fit.saturating_sub(allocated),
+                "allocated {allocated}"
+            );
+            assert_eq!(reading[0].constraint, MemoryConstraint::DeviceWorkingSet);
+        }
     }
 
     #[test]
