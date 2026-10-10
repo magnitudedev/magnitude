@@ -32,7 +32,8 @@ Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, Cline
 ```
 
 Detection proves that an external executable is launchable from the host-supplied user `PATH`, excluding
-dependency-local binaries. Desktop hosts may resolve a login environment asynchronously; its configuration
+dependency-local binaries. On Windows only `PATHEXT` matches are launchable, and batch shims run
+through `cmd.exe` in every host runtime. Desktop hosts may resolve a login environment asynchronously; its configuration
 roots and command environment are scoped to the connection service, never global process mutations. Installation and connection are independent observations. Connected means
 that required Magnitude provider fields, skill contents, and plugin files/activation still exist and
 match the connector contract. Receipts alone never imply Connected. Missing or overwritten fields
