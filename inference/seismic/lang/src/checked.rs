@@ -1607,10 +1607,19 @@ impl NativeImplementation {
     /// configuration, with `fixed` holding the statics it names. A
     /// depth-first search over the statics in declaration order: every
     /// top-level conjunct of `where` that the assigned statics decide as
-    /// false prunes a partial assignment. `None` when no assignment over the
-    /// candidates is admitted.
+    /// false prunes a partial assignment. `None` when none of the first 256
+    /// complete assignments walked is admitted.
     pub fn search_statics(&self, fixed: &[(&str, u64)]) -> Option<NativeSpecialization> {
+        // An admitted assignment is found among the first few walked; a
+        // search that admits none would otherwise walk every combination of
+        // the candidates.
+        const WALKS: usize = 256;
+        let walks = std::cell::Cell::new(0);
         self.search(fixed, &|_| None, &|statics| {
+            walks.set(walks.get() + 1);
+            if walks.get() > WALKS {
+                return None;
+            }
             let mut admitted = false;
             self.walk_admissible(statics, |_| {
                 admitted = true;
