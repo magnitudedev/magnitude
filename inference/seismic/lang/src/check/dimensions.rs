@@ -1,17 +1,17 @@
-//! The one construction of "how every family dimension is obtained from
-//! observed input axes" (L16). A family's plan is built once from its
-//! contract signature; every call applies it to the caller's actual axes,
-//! and entry construction replays it from the evaluated arguments.
+//! Dimension inference from observed input axes and explicit bindings (L16).
+//! A plan is a pure function of the callee contract and which of its
+//! dimensions a call binds explicitly. It lives in the contract's arena, so
+//! it is derived from the contract wherever it is used, never stored by a
+//! caller.
 
-use super::resolve::{SigParam, SignatureDimension};
+use super::resolve::SignatureDimension;
 use crate::expr::{AnyExpr, ExprArena, IntExpr, NodeView, SymbolId};
 use crate::types::ValueType;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// One tensor axis of one (possibly tuple-nested) parameter.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ObservedAxis {
     pub parameter: u32,
     pub path: Vec<u32>,
@@ -19,17 +19,17 @@ pub(crate) struct ObservedAxis {
 }
 
 /// A value an inverse operation combines with.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Known {
     Observation(ObservedAxis),
     /// An earlier solved family dimension.
-    Dimension(#[serde(deserialize_with = "crate::wire::deserialize_dimension")] u32),
+    Dimension(u32),
     Constant(i64),
     /// An expression over earlier solved dimensions, in the contract arena.
     Expression(IntExpr),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum InverseOp {
     Add(Known),
     Subtract(Known),
@@ -38,16 +38,15 @@ pub(crate) enum InverseOp {
 }
 
 /// Solve `dimension` from `observation` by the inverse operations, in order.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DimensionStep {
-    #[serde(deserialize_with = "crate::wire::deserialize_dimension")]
     pub dimension: u32,
     pub observation: ObservedAxis,
     pub operations: Vec<InverseOp>,
 }
 
 /// The family's dimension plan over its contract's arena.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DimensionPlan {
     /// The contract's dimension symbols, in declaration order.
     dimensions: Vec<SymbolId>,
@@ -108,20 +107,21 @@ pub(crate) fn tensor_axes(parameter: u32, ty: &ValueType) -> Vec<(ObservedAxis, 
     output
 }
 
-/// The plan of a signature whose dimensions and parameter types live in
-/// `arena`: `dimension_inference_order` over every input tensor axis.
-pub(crate) fn plan_dimensions(
+/// Explicit bindings are known before inference; all remaining dimensions
+/// must be uniquely obtained from input axes under those bindings.
+pub(crate) fn plan_dimensions_with_seeds(
     arena: &ExprArena,
     dimensions: &[SignatureDimension],
-    params: &[SigParam],
+    params: &[&ValueType],
+    seeds: &[u32],
 ) -> Result<DimensionPlan, DimensionPlanError> {
     let observations = params
         .iter()
         .enumerate()
-        .flat_map(|(ordinal, parameter)| {
+        .flat_map(|(ordinal, ty)| {
             tensor_axes(
                 u32::try_from(ordinal).expect("signature has more than u32::MAX parameters"),
-                &parameter.ty,
+                ty,
             )
         })
         .collect::<Vec<_>>();
@@ -139,7 +139,11 @@ pub(crate) fn plan_dimensions(
         .iter()
         .map(|(_, extent)| AnyExpr::Int(*extent))
         .collect::<Vec<_>>();
-    let order = dimension_inference_order(arena, &specs, &nodes)
+    let seeded = seeds
+        .iter()
+        .map(|ordinal| dimensions[*ordinal as usize].symbol)
+        .collect::<BTreeSet<_>>();
+    let order = dimension_inference_order_seeded(arena, &specs, &nodes, &seeded)
         .map_err(|underdetermined| DimensionPlanError { underdetermined })?;
     let ordinal = |symbol: SymbolId| {
         dimensions
@@ -259,6 +263,15 @@ pub(super) fn dimension_inference_order(
     dimensions: &[(&str, SymbolId, bool)],
     observations: &[AnyExpr],
 ) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp>)>, Vec<String>> {
+    dimension_inference_order_seeded(arena, dimensions, observations, &BTreeSet::new())
+}
+
+fn dimension_inference_order_seeded(
+    arena: &ExprArena,
+    dimensions: &[(&str, SymbolId, bool)],
+    observations: &[AnyExpr],
+    seeds: &BTreeSet<SymbolId>,
+) -> Result<Vec<(SymbolId, usize, Vec<InferenceOp>)>, Vec<String>> {
     // `Err` names every dimension no remaining observation determines.
     let observation_keys = observations
         .iter()
@@ -267,7 +280,7 @@ pub(super) fn dimension_inference_order(
         .collect::<Vec<_>>();
     let mut unresolved = dimensions
         .iter()
-        .map(|(_, symbol, _)| *symbol)
+        .filter_map(|(_, symbol, _)| (!seeds.contains(symbol)).then_some(*symbol))
         .collect::<BTreeSet<_>>();
     let guaranteed_nonzero = dimensions
         .iter()
@@ -408,7 +421,19 @@ impl CanonicalObservationKey {
                 operation: format!("{operation:?}"),
                 operands: operands
                     .iter()
-                    .map(|(dtype, value)| (dtype.name().into(), Self::new(arena, (*value).into())))
+                    .map(|operand| {
+                        (
+                            format!(
+                                "{}:{}",
+                                match operand {
+                                    crate::expr::ScalarOperand::Word { .. } => "word",
+                                    crate::expr::ScalarOperand::Scalar(_) => "scalar",
+                                },
+                                operand.dtype(arena).name()
+                            ),
+                            Self::new(arena, operand.expression()),
+                        )
+                    })
                     .collect(),
             },
             NodeView::Unary {

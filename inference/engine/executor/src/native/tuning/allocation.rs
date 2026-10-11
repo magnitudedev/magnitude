@@ -1,507 +1,1410 @@
-//! How one preparation's tuning time is divided among its units.
+//! One allocator spends a first-load tuning budget on the units' optional
+//! work by value.
 //!
-//! The time is planned before it is spent, so that tuning ends inside it
-//! because the planned work fits, not because work was cut off.
+//! The budget governs what is started, never what is running. Every unit
+//! enters holding a legal published choice, and its choice is legal and
+//! published after every piece of its work. What a unit's work adds to its
+//! record besides its choice, its measurements, is published once, when
+//! the allocator stops: a unit whose record changed since it was published
+//! owes that publication ([`Unit::owed`]), priced like any work, and a
+//! piece is started only when its whole price and everything owed once it
+//! has run fit what remains of the budget ([`seismic::Quote::fits`]). The
+//! allocator stops when no unit has such work left and settles what is
+//! owed ([`Unit::settle`]) inside the budget. The budget is used in full,
+//! to the smallest piece that still fits: a unit runs out of work only
+//! when its domain is exhausted.
+//! Work begun runs to its end. A forecast that was wrong leaves less for
+//! what follows; time past the budget is reported with the work that ran
+//! into it, its forecast and what it took, and fails nothing.
 //!
-//! Breadth comes before depth. Every unit is first started, the unit with
-//! the largest share of step time first: its defaults are measured, and its
-//! form starts when the plan has room. Each unit states what its start will
-//! cost: its planning and measurements, and the programs it must form. The
-//! plan prices a program at what forming one has taken so far in this
-//! preparation (a cold pipeline cache shows up here) and scales the units'
-//! own estimates by how the starts so far compared with theirs. A unit
-//! gets its form starts while they fit together with a defaults-only start
-//! and the conclusion of every unit after it; else a defaults-only start
-//! while that fits; else it waits. The plan is made again before each
-//! start, from what the starts before it took.
+//! # The ending is work
 //!
-//! A unit that waits is not dropped. The plan is made again for the units
-//! waiting, largest share first, before every later step: a start that did
-//! not fit can fit once the starts after it have shown what a start costs
-//! against its estimate, or once a conclusion has given back what it left
-//! of its reserve. Such a unit is started then, and being the unit that has
-//! received the least for its weight it is refined before the others. Only
-//! a unit whose start never fit keeps its defaults unmeasured.
+//! What ends the optional work is owed like any piece of it, and every
+//! start holds it back ([`Ending`]). Nothing of it starts unadmitted:
 //!
-//! The breadth is finished first: a unit started on its defaults alone is
-//! owed its form starts, and gets the step that measures them, largest
-//! share first, before any slice is dealt by weight (a search of three
-//! configurations is ended there whatever its share).
+//! - A unit that will be given no more work has its final choice, and what
+//!   it owes is settled then, not at the stop: a publication that has run
+//!   needs no forecast, and only the units still working at the stop are
+//!   held back for by one.
+//! - The allocator's own time is of classes it observes as it runs: a pass
+//!   that decides what starts, a unit narrowing its piece, a unit giving
+//!   up its inputs. A piece is started only if, after it, the pass that
+//!   finds nothing more to start and the inputs then given up also fit,
+//!   each at its class's price. A class the allocator has not yet run is
+//!   held at what bounds it from what the load has observed ([`Own`]): a
+//!   pass at the longest operation completed, a narrowing at a pass, and a
+//!   unit giving up its inputs at what building them took
+//!   ([`Unit::built`]). Inputs are given up after everything owed is
+//!   settled, so a release that outruns its price delays no publication.
+//! - Narrowing ([`Unit::narrow`]) is work of the allocator's: a unit's
+//!   piece is narrowed only while the narrowing and everything owed still
+//!   fit, the piece worth the most first. Units keep their inputs while
+//!   pieces are narrowed to what is left.
 //!
-//! The time left is then dealt in slices to the units whose searches are
-//! not finished, by the step time each still takes: a unit's share of step
-//! time at its defaults times its best cost so far relative to them, which
-//! is what further search can recover. What one of a unit's measurements
-//! costs takes no part: a unit whose measurements are slow (long prefill
-//! points, programs slow to form) gets its share of the time and fewer
-//! measurements in it, not less time for each of them. Each slice goes to
-//! the unit that with it will have received the least time per unit of that
-//! weight, so the units' time follows it from the first slice on (a unit of
-//! a hundredth of the step is not refined before the unit of a quarter of
-//! it has had twenty-five slices, and a round of first slices does not eat
-//! the time on a device whose every step is slow), a unit that overruns a
-//! slice waits for the others to catch up, and the time a finished unit
-//! does not need goes to the rest.
+//! Each unit names its next piece of work with its price and the share of
+//! its default service the work is expected to recover ([`seismic::Work`]).
+//! The allocator starts, of the pieces that fit:
 //!
-//! Every started unit can be concluded (its finalists confirmed, its choice
-//! validated) within its reserve, its own estimate of that cost. A reserve
-//! is a bound, not what the conclusion takes: a unit with nothing to
-//! confirm concludes in no time. So when the time left only covers the
-//! reserves of the units not yet concluded, one unit is concluded, the one
-//! that has received the most for its weight, and what its conclusion left
-//! of its reserve goes back to the others, which are refined on; and so on
-//! until every unit is concluded, the last when the time left covers only
-//! its own reserve. A unit whose search finishes is concluded at once.
+//! 1. a conversion ([`Stage::Promote`]) before anything else: a measured
+//!    lead not yet served is budget already spent with nothing to show;
+//! 2. then discovery ([`Stage::Discovery`]), the work whose classes this
+//!    load has not observed and so cannot price: a unit never started
+//!    first, then the largest share first (preparation order while no
+//!    share is known). Discovery is ahead of every challenger because
+//!    nothing can be valued without it: a unit's challenger has no price
+//!    and no gain before its defaults are measured, and a unit's share is
+//!    its defaults' time against every unit's, so until every unit is
+//!    discovered the shares that rank challengers overstate the units
+//!    measured so far and rank the others at nothing;
+//! 3. then the first representatives of structurally different forms
+//!    ([`Stage::Form`]), the piece worth the most per second first: no
+//!    refinement inside one form, of any unit, says whether another form
+//!    is faster, so every unit's forms that fit are measured before any
+//!    unit refines one. (A unit whose forms are compiling is in flight;
+//!    the device meanwhile takes other work rather than wait.)
+//! 4. then the challenger ([`Stage::Measure`]) or the conversion of a
+//!    lead not yet resolved ([`Stage::Confirm`]) worth the most per second
+//!    of its price: the unit's share of served time, times the gain the
+//!    unit expects of it.
 //!
-//! A slice is dealt only while what a unit cannot interrupt still fits
-//! before the reserves: the longest a refinement of any unit has run past
-//! its slice (a chunk's programs being formed and measured). A step that
-//! runs into the reserves takes the time of the conclusions after it, and
-//! a conclusion without its time gives up its choice. The first refinement
-//! of a unit started on its defaults alone measures its form starts
-//! whatever the slice: that step is held to the plan's price of those
-//! starts instead, and says nothing of the slices after it.
+//! A unit composed of other units' choices reads them as they stand when
+//! its own work starts; from then they are sealed and receive no more work.
 //!
-//! Under the plan lies a guarantee: every step is given the instant by
-//! which it must return with what it has. A step that reaches it, or ends
-//! after it, is a failure of the plan, and is reported as one.
+//! # Compiles overlap the device
+//!
+//! The budget is wall time, and a piece's compile ([`Work::forming`]) needs
+//! no device: it runs on a worker ([`Workers`]) while the device measures
+//! other work, and its piece measures when its programs are held. The piece
+//! is still the unit of admission. It is admitted whole, on its whole
+//! price, when its compile starts, and from then it is in flight: its
+//! measurement runs when its compile has ended, before anything new is
+//! admitted, and nothing admitted is given up.
+//!
+//! Three resources are contended, and each is counted as itself.
+//!
+//! *The device* measures one piece at a time, and takes the admitted
+//! pieces in the order they are ready for it: a piece in flight when its
+//! own compile is forecast to end ([`Flight::forming_ends`]), a piece that
+//! compiles nothing now. The forecast of when the admitted work ends is
+//! that queue run forward ([`device_ends`]): the device, free now, takes
+//! each piece when it is ready and the pieces ready before it are done. A
+//! new piece is admitted when the whole queue with it in its place, and
+//! what the units then owe, end within the budget: the one admission rule
+//! ([`seismic::Quote::fits`]), which with nothing in flight is that rule
+//! unchanged. A compile that is forecast to end long after a new piece
+//! would have measured is behind it in the queue and holds nothing of it
+//! back; only its own device time must still fit after.
+//!
+//! *Worker threads* run the compiles, and a compile needs as many as it
+//! forms at once ([`Workers::needs`]). There are as many as the host runs
+//! in parallel ([`Workers::free`]), and a compile starts only when the
+//! threads it needs are free: a compile started on threads it shares runs
+//! longer than it was priced. Nothing else limits how many compiles run at
+//! once.
+//!
+//! *Memory*: a piece in flight holds its footprint from the moment its
+//! compile starts (below), so compiles overlap only as far as their
+//! pieces' bytes fit under the ceiling together.
+//!
+//! A compile is started so that its piece is ready when the device is done
+//! with the pieces ready before it, and no sooner: at the forecast end of
+//! that work less the compile's own forecast, or now if that is past.
+//! Started later, the device would wait for it. Started earlier, it would
+//! commit the device to a piece that the evidence of the pieces ahead of
+//! it might outrank, and gain nothing: its piece would wait its turn. With
+//! compiles of one second and measurements of a fifth, five compiles are
+//! in flight at once, each started a fifth of a second after the last.
+//! Until a compile is due the allocator waits, for that moment or for a
+//! compile to end, whichever is first ([`Workers::wait`]).
+//!
+//! Time past the budget is at most what the pieces in flight when the
+//! budget ended took: nothing is admitted after it.
+//!
+//! # Bytes are admitted like seconds
+//!
+//! The load's tuning has a ceiling on what it holds ([`Unit::free`] is what
+//! is left under it). A piece is priced in bytes as it is in seconds
+//! ([`seismic::Footprint`]): what it adds, at its most, to what is held when
+//! it starts. It is started only if that fits what is free, less the bytes
+//! of the pieces in flight; a piece that does not fit is not started, and
+//! nothing raises the ceiling for it.
+//!
+//! Where the device has memory of its own, host RAM is a second domain with
+//! its own ceiling ([`Unit::host_free`]) and its own price
+//! ([`Unit::host_footprint`]). The two do not substitute: a piece starts
+//! only if it fits both, and one that the host refuses is made room for as
+//! one the device refuses is, by what the load returns and what other units
+//! give up.
+//!
+//! A unit's built inputs are owned by its work. They stay between two of
+//! its pieces while both hold: the unit still offers work that fits what
+//! remains of the budget, and no piece chosen ahead of it needs the bytes.
+//! Keeping them costs nothing while they fit, and building them again
+//! costs seconds of the budget, so nothing is given up without need. A
+//! unit with no work left that can start gives its inputs up at once: one
+//! whose work no longer fits the budget, and one refused for its bytes for
+//! the load, whose piece with its own inputs needs more than the optional
+//! work may ever hold ([`Unit::capacity`]). A unit refused for bytes that
+//! others still hold keeps its inputs while other work may free them, and
+//! gives them up when the allocator stops. When
+//! the chosen piece does not fit, the units not in flight give theirs up
+//! one at a time, the one whose own next work is worth least first, until
+//! it fits; a unit that gave its inputs up offers its next piece with
+//! their rebuilding priced in, so it competes at what it now costs.
+//!
+//! The programs a unit formed are held the same way ([`Unit::programs`]):
+//! they stay for as long as they fit, so nothing is compiled twice, and
+//! are given up by need alone, never by what they were formed for. When
+//! the chosen piece does not fit, a unit gives up its programs before its
+//! inputs ([`Unit::give_up`]), the unit whose next work is worth least
+//! first, and its next piece is priced with forming what it runs again.
+//! Everything a unit still holds leaves with it when the optional work
+//! ends.
 
+use seismic::{Quote, Stage, Work};
 use std::time::Duration;
+
+/// What is free of host RAM where it is a memory domain of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HostRoom {
+    /// The host is not a domain apart, or has no ceiling.
+    Unbounded,
+    /// The bytes left under the host's ceiling.
+    Free(u64),
+    /// The load's tuning holds more on the host than its ceiling: nothing
+    /// starts, whatever it is priced, until what is held for nothing has
+    /// been returned or given up. Most of what a compile takes it frees
+    /// again, and freed memory counts until it is returned
+    /// ([`Unit::reclaim`]), so this is also what returns it in time.
+    Exceeded,
+}
+
+impl HostRoom {
+    /// Whether a piece taken to add `bytes` may start beside pieces in
+    /// flight taken to add `flying`.
+    fn admits(self, bytes: u64, flying: u64) -> bool {
+        match self {
+            Self::Unbounded => true,
+            Self::Free(free) => bytes <= free.saturating_sub(flying),
+            Self::Exceeded => false,
+        }
+    }
+}
 
 /// Time since the tuning began.
 pub(crate) trait Clock {
     fn now(&self) -> Duration;
 }
 
-/// Where a unit's search stands, as the allocation reads it.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Progress {
-    /// The search ran to its own end.
-    pub finished: bool,
-    /// Its best configuration so far relative to its defaults.
-    pub cost: f64,
-}
-
-/// What a unit's start measures.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Depth {
-    /// The defaults and every form's start.
-    Forms,
-    /// The defaults alone; the first refinement measures the form starts.
-    Defaults,
-}
-
-/// A unit's estimate of its start and conclusion, before it starts.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Estimate {
-    /// Planning the search and measuring the defaults, formation aside.
-    pub defaults: Duration,
-    /// Measuring every form's start, formation aside.
-    pub forms: Duration,
-    /// Programs the defaults need formed, and the form starts besides.
-    pub default_programs: usize,
-    pub form_programs: usize,
-    /// Concluding the unit once started.
-    pub conclusion: Duration,
-}
-
-/// What a start did.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Started {
-    pub progress: Progress,
-    /// Programs formed, and what forming them took.
-    pub programs: usize,
-    pub forming: Duration,
-    /// The start reached its hard limit before its planned work was done.
-    pub cut: bool,
-}
-
-/// One tuning unit's search. Instants are times since the tuning began.
+/// One tuning unit's optional work. The unit holds a legal published choice
+/// before, between and after every piece of it.
 pub(crate) trait Unit {
     type Context;
     type Failure;
+    /// The compile of a piece of work, to run off the device, and what it
+    /// formed.
+    type Forming;
+    type Formed;
+    /// Recompute the shared served-work objective from current evidence.
+    /// Refresh performs no device work.
+    fn refresh(_units: &mut [Self], _context: &mut Self::Context)
+    where
+        Self: Sized,
+    {
+    }
+    /// The units whose current choices this unit's work reads.
+    fn prerequisites(&self) -> Vec<usize> {
+        Vec::new()
+    }
     /// The unit's share of expected step time at its defaults.
     fn share(&self) -> f64;
-    fn estimate(&self) -> Estimate;
-    /// Measure the defaults and, at [`Depth::Forms`], every form's start.
-    /// `until` is the hard limit: the start returns by it with what it has.
-    fn start(
+    /// The unit's next piece of work, priced in full; none when it has
+    /// none left.
+    fn next(&self) -> Option<Work>;
+    /// The compile of the unit's next piece of work ([`Work::forming`]);
+    /// none when the piece compiles nothing ahead of its measurement.
+    fn forming(&self) -> Option<Self::Forming>;
+    /// Hold what the next piece's compile formed, which took `took`.
+    fn formed(
         &mut self,
+        formed: Self::Formed,
+        took: Duration,
         context: &mut Self::Context,
-        depth: Depth,
-        until: Duration,
-    ) -> Result<Started, Self::Failure>;
-    /// Continue the search until `slice`, or until what remains before
-    /// `until` only covers the unit's reserve.
-    fn refine(
-        &mut self,
-        context: &mut Self::Context,
-        slice: Duration,
-        until: Duration,
-    ) -> Result<Progress, Self::Failure>;
-    /// What concluding the unit will take.
-    fn reserve(&self) -> Duration;
-    /// Confirm and validate the unit's choice, by `until`. A unit never
-    /// started keeps its defaults.
-    fn conclude(
-        &mut self,
-        context: &mut Self::Context,
-        until: Duration,
     ) -> Result<(), Self::Failure>;
-}
-
-/// What the plan gave a unit's start, and what it took.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct StartRecord {
-    pub unit: usize,
-    /// None: neither start ever fit, and the unit keeps its defaults
-    /// unmeasured.
-    pub depth: Option<Depth>,
-    /// What the plan expected the start it gave to take, and a start with
-    /// the form starts.
-    pub estimated: Duration,
-    pub with_forms: Duration,
-    /// The time the plan had for this start and everything after it; for a
-    /// unit never started, when its start was first refused.
-    pub available: Duration,
-    pub actual: Duration,
-    pub cut: bool,
-}
-
-/// A step that ended after the instant it was given.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Overrun {
-    pub unit: usize,
-    pub step: &'static str,
-    pub by: Duration,
-}
-
-/// The plan as it was made and what happened: for the log.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Report {
-    /// The starts in the order they were given, then the units never
-    /// started, largest share first.
-    pub starts: Vec<StartRecord>,
-    /// When the last start ended, the last refinement slice ended and the
-    /// last conclusion ended.
-    pub started: Duration,
-    pub refined: Duration,
-    pub concluded: Duration,
-    /// The conclusion reserves when the first unit was concluded for want
-    /// of time.
-    pub reserved: Duration,
-    pub slices: usize,
-    pub overruns: Vec<Overrun>,
-}
-
-#[derive(Clone, Copy)]
-enum State {
-    Waiting,
-    Open {
-        progress: Progress,
-        received: Duration,
-        /// The unit's next refinement measures its form starts, at this
-        /// price by the plan.
-        starts: Option<Duration>,
-    },
-    Concluded,
-}
-
-/// What the open units other than `except` need to conclude.
-fn reserved<U: Unit>(units: &[U], states: &[State], except: Option<usize>) -> Duration {
-    units
-        .iter()
-        .zip(states)
-        .enumerate()
-        .filter(|(unit, (_, state))| Some(*unit) != except && matches!(state, State::Open { .. }))
-        .map(|(_, (unit, _))| unit.reserve())
-        .sum()
-}
-
-/// What the starts so far say of the units' estimates.
-#[derive(Default)]
-struct Observed {
-    /// Programs formed and what forming them took.
-    programs: usize,
-    forming: Duration,
-    /// What the starts took besides forming, and what their units estimated.
-    spent: Duration,
-    estimated: Duration,
-}
-
-impl Observed {
-    /// The plan's price of a start of `estimate` at `depth`: the unit's
-    /// estimate scaled by how the starts so far compared with theirs, and
-    /// its programs at what forming one has taken so far.
-    fn price(&self, estimate: &Estimate, depth: Depth) -> Duration {
-        let (work, programs) = match depth {
-            Depth::Defaults => (estimate.defaults, estimate.default_programs),
-            Depth::Forms => (
-                estimate.defaults + estimate.forms,
-                estimate.default_programs + estimate.form_programs,
-            ),
-        };
-        let scale = if self.estimated.is_zero() {
-            1.
-        } else {
-            self.spent.as_secs_f64() / self.estimated.as_secs_f64()
-        };
-        let program = if self.programs == 0 {
-            0.
-        } else {
-            self.forming.as_secs_f64() / self.programs as f64
-        };
-        Duration::from_secs_f64(work.as_secs_f64() * scale + programs as f64 * program)
+    /// Run the unit's next piece of work to its end. Returns the longest
+    /// single operation the unit has completed.
+    fn perform(&mut self, context: &mut Self::Context) -> Result<Duration, Self::Failure>;
+    /// The bytes of the inputs the unit holds, built for its work; zero
+    /// when it holds none.
+    fn holding(&self) -> u64 {
+        0
     }
-
-    fn conclusion(&self, estimate: &Estimate) -> Duration {
-        estimate.conclusion
+    /// What building the inputs the unit holds took, priced: what giving
+    /// them up is held to before the load has observed inputs given up.
+    fn built(&self) -> Quote {
+        Quote::default()
     }
-}
-
-struct Run<'r, U: Unit, C: Clock> {
-    units: &'r mut [U],
-    states: Vec<State>,
-    clock: &'r C,
-    total: Duration,
-    report: Report,
-}
-
-impl<U: Unit, C: Clock> Run<'_, U, C> {
-    /// Record a step of `unit` that ended after `until`.
-    fn check(&mut self, unit: usize, step: &'static str, until: Duration) {
-        let now = self.clock.now();
-        if now > until {
-            self.report.overruns.push(Overrun {
-                unit,
-                step,
-                by: now - until,
-            });
-        }
+    /// The price of settling now what the unit owes ([`Unit::owed`]), when
+    /// that would be the load's first observation of a class of owed work
+    /// that until then is priced by a stand-in; none otherwise. A unit
+    /// that works again after it owes again, at the class's own price.
+    fn sample(&self) -> Option<Quote> {
+        None
     }
-
-    fn conclude(&mut self, context: &mut U::Context, unit: usize) -> Result<(), U::Failure> {
-        let until = self
-            .total
-            .saturating_sub(reserved(self.units, &self.states, Some(unit)));
-        self.units[unit].conclude(context, until)?;
-        self.states[unit] = State::Concluded;
-        self.check(unit, "conclusion", until);
+    /// Give up the inputs the unit holds. Its next piece builds them again
+    /// and is priced with that, in seconds and in bytes.
+    fn release(&mut self, _context: &mut Self::Context) {}
+    /// The bytes of the formed programs the unit holds for work to come;
+    /// zero when it holds none.
+    fn programs(&self) -> u64 {
+        0
+    }
+    /// Give up the formed programs the unit holds. Its next piece forms
+    /// what it runs again and is priced with that.
+    fn give_up(&mut self, _context: &mut Self::Context) {}
+    /// The most a single piece of the unit's work has added to the bytes
+    /// held: what an unpriced footprint is held to.
+    fn largest_footprint(&self) -> u64 {
+        0
+    }
+    /// The bytes the load's tuning may still take under its ceiling; none
+    /// when no ceiling is known, and nothing is then bounded.
+    fn free(_context: &Self::Context) -> Option<u64>
+    where
+        Self: Sized,
+    {
+        None
+    }
+    /// Offer the unit's next piece with one challenger fewer; false when it
+    /// has no fewer to offer. Asked when the piece's seconds do not fit
+    /// what remains of the budget and nothing else can start: the last
+    /// pieces of a load are sized to what is left, so no second of the
+    /// budget stays unused while a smaller piece would fit it.
+    fn narrow(&mut self, _context: &mut Self::Context) -> bool {
+        false
+    }
+    /// The allocator stopped with the unit's next piece refused for its
+    /// bytes ([`Refusal::Bytes`]): nothing in flight, what is held for
+    /// nothing returned, and nothing another unit could give up for it.
+    /// Told before what the unit owes is settled, so the record it then
+    /// publishes states what stopped its search.
+    fn refused_for_bytes(&mut self, _context: &mut Self::Context) {}
+    /// Give back what the load holds for nothing: memory it has freed that
+    /// still counts against its ceiling. Asked when a chosen piece's bytes
+    /// do not fit, before any unit gives its inputs up for it.
+    fn reclaim(_context: &mut Self::Context)
+    where
+        Self: Sized,
+    {
+    }
+    /// What the unit owes when the allocator stops, priced: publishing its
+    /// record, when its optional work changed the record since it was last
+    /// published. `worked`: what it owes once one more piece of its work
+    /// has run.
+    fn owed(&self, _worked: bool) -> Quote {
+        Quote::default()
+    }
+    /// Settle what the unit owes ([`Unit::owed`]): the allocator stopped.
+    fn settle(&mut self, _context: &mut Self::Context) -> Result<(), Self::Failure> {
         Ok(())
     }
+    /// The bytes free under the ceiling when the units' optional work holds
+    /// nothing: the most any piece can ever be given. None without a
+    /// ceiling.
+    fn capacity(_context: &Self::Context) -> Option<u64>
+    where
+        Self: Sized,
+    {
+        None
+    }
+    /// The host bytes the load's tuning may still take, where host RAM is
+    /// a memory domain apart from the one [`Unit::free`] counts (a device
+    /// whose driver holds its allocations); none where it is not, or
+    /// without a ceiling. The two domains do not substitute: a piece is
+    /// started only if it fits both.
+    fn host_free(_context: &Self::Context) -> HostRoom
+    where
+        Self: Sized,
+    {
+        HostRoom::Unbounded
+    }
+    /// What a piece of the unit's work is taken to add to that host domain:
+    /// the most one has added. None before a piece of the unit has run:
+    /// its price is then not known, and a piece without a price runs with
+    /// no other such piece in flight.
+    fn host_footprint(&self, _context: &Self::Context) -> Option<u64> {
+        Some(0)
+    }
+    /// The host bytes one thread of a compile holds while it runs, as this
+    /// load observed its compiles; nothing where the host is not a domain
+    /// apart.
+    fn compile_host(_context: &Self::Context) -> u64
+    where
+        Self: Sized,
+    {
+        0
+    }
 }
 
-/// Tune `units` within `total`, refining in slices of `slice`.
+/// Where units' compiles run while the device does other work.
+pub(crate) trait Workers<U: Unit> {
+    /// The threads `forming` runs on at once.
+    fn needs(&self, forming: &U::Forming) -> usize;
+    /// The threads no compile in flight runs on.
+    fn free(&self) -> usize;
+    /// The host bytes one thread of a compile holds while it runs, as the
+    /// compiles run here so far showed; nothing before one has.
+    fn compile_host(&self) -> u64 {
+        0
+    }
+    /// Start `unit`'s compile. It runs to its end.
+    fn start(&mut self, unit: usize, forming: U::Forming);
+    /// The compiles that have ended, without waiting: each unit, what its
+    /// compile formed and what it took.
+    fn ended(&mut self) -> Vec<(usize, U::Formed, Duration)>;
+    /// Wait for the next compile to end, no longer than `within` when one
+    /// is given: none when none ended in that time.
+    fn wait(&mut self, within: Option<Duration>) -> Option<(usize, U::Formed, Duration)>;
+}
+
+/// A piece of work the allocator started, and what it took.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Admitted {
+    pub unit: usize,
+    pub stage: Stage,
+    /// Its price when it was started.
+    pub quote: Quote,
+    /// When it was started.
+    pub began: Duration,
+    /// What its compile took on a worker, when it ran ahead.
+    pub formed: Option<Duration>,
+    /// When its work on the device began and what that took.
+    pub performed: Duration,
+    pub actual: Duration,
+}
+
+/// A piece of work admitted whose compile runs, or has ended and awaits
+/// the device.
+struct Flight {
+    unit: usize,
+    work: Work,
+    began: Duration,
+    /// When its compile is forecast to end.
+    forming_ends: Duration,
+    /// The forecast of its work on the device.
+    device: Duration,
+    /// What its compile took, once it ended.
+    formed: Option<Duration>,
+    /// The host bytes its compile is taken to hold while it runs
+    /// ([`Unit::compile_host`], on each of its threads).
+    compile_host: u64,
+    /// It was admitted with bytes of a price not yet observed: until it
+    /// has run, no other such piece starts.
+    unpriced: bool,
+}
+
+/// What a piece of work that was not started did not fit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// Its seconds did not fit what remained of the budget.
+    Seconds,
+    /// Its bytes did not fit under the ceiling, with every other unit's
+    /// inputs given up.
+    Bytes,
+}
+
+/// A piece of work not started because its price did not fit what remained.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Refused {
+    pub unit: usize,
+    pub stage: Stage,
+    pub quote: Quote,
+    pub footprint: seismic::Footprint,
+    pub refusal: Refusal,
+}
+
+/// What the allocator did with the budget: for the trace, whatever the
+/// load's outcome.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Report {
+    pub budget: Duration,
+    /// Every piece of work started, in order.
+    pub admitted: Vec<Admitted>,
+    /// The work still offered when the allocator stopped: none of it fit.
+    pub refused: Vec<Refused>,
+    /// What settling the units' owed publications took, those settled
+    /// when their units ran out of work with those settled at the stop.
+    pub settling: Duration,
+    /// When the allocator stopped, everything owed settled.
+    pub ended: Duration,
+    /// The allocator's own ending.
+    pub ending: Ending,
+}
+
+/// The allocator's own work from the end of the last piece it performed to
+/// its stop, beside the publications it settles: what it took, and what
+/// was held back for it when that piece was started.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Ending {
+    /// When the last piece performed ended; when the allocator began, with
+    /// none.
+    pub began: Duration,
+    /// What the start of that piece held back for the allocator's own
+    /// ending: a pass, and each unit's inputs given up.
+    pub held: Duration,
+    /// The passes since, and what deciding in them took.
+    pub passes: usize,
+    pub deciding: Duration,
+    /// The pieces narrowed since, and what narrowing them took.
+    pub narrowed: usize,
+    pub narrowing: Duration,
+    /// The units that gave their inputs up since, and what that took.
+    pub released: usize,
+    pub releasing: Duration,
+}
+
+/// The allocator's own operations by class, each priced by what it has
+/// taken in this load ([`seismic::Observed`]).
+#[derive(Default)]
+struct Own {
+    /// A pass: deciding what starts, apart from what the pass then runs.
+    deciding: seismic::Observed,
+    /// One unit narrowing its piece and pricing the narrower one.
+    narrowing: seismic::Observed,
+    /// One unit giving up its inputs.
+    releasing: seismic::Observed,
+}
+
+impl Own {
+    /// A class's price, once it was observed.
+    fn observed(class: &seismic::Observed) -> Option<Duration> {
+        class.price().map(Duration::from_secs_f64)
+    }
+
+    /// What a pass is held to: its class's price, and before the first
+    /// pass has ended the longest operation the load has completed, as any
+    /// operation not yet observed ([`seismic::Quote::fits`]).
+    fn pass(&self, longest: Duration) -> Duration {
+        Self::observed(&self.deciding).unwrap_or(longest)
+    }
+
+    /// What one unit's narrowing is held to: its class's price, and before
+    /// a piece was narrowed a pass's. Pricing the narrower piece is what a
+    /// pass does for the unit whose piece just ran, and a pass does that
+    /// and more.
+    fn narrow(&self, longest: Duration) -> Duration {
+        Self::observed(&self.narrowing).unwrap_or_else(|| self.pass(longest))
+    }
+
+    /// What `unit` giving up its inputs is held to: the class's price, and
+    /// before any unit gave its inputs up what building them took
+    /// ([`Unit::built`]): it frees what that allocated and writes nothing,
+    /// so building bounds it.
+    fn release<U: Unit>(&self, unit: &U, longest: Duration) -> Duration {
+        Self::observed(&self.releasing).unwrap_or_else(|| forecast(&unit.built(), longest))
+    }
+}
+
+/// `unit` gives up its inputs: an operation of the allocator's own, timed
+/// in its class. Returns what it took.
+fn give_up_inputs<U: Unit>(
+    units: &mut [U],
+    unit: usize,
+    context: &mut U::Context,
+    clock: &impl Clock,
+    own: &mut Own,
+    ending: &mut Ending,
+) -> Duration {
+    let began = clock.now();
+    units[unit].release(context);
+    let took = clock.now().saturating_sub(began);
+    own.releasing.observe(took.as_secs_f64());
+    ending.released += 1;
+    ending.releasing += took;
+    took
+}
+
+impl Report {
+    /// Budget left when the allocator stopped.
+    pub fn unused(&self) -> Duration {
+        self.budget.saturating_sub(self.ended)
+    }
+
+    /// Time past the budget when the allocator stopped: at most what the
+    /// work in flight when the budget ended took.
+    pub fn overrun(&self) -> Duration {
+        self.ended.saturating_sub(self.budget)
+    }
+}
+
+/// What work is taken to last: its price, with each unpriced operation at
+/// the longest operation completed, as in its admission.
+fn forecast(quote: &Quote, longest: Duration) -> Duration {
+    u32::try_from(quote.unpriced)
+        .ok()
+        .and_then(|unpriced| longest.checked_mul(unpriced))
+        .map_or(Duration::MAX, |unpriced| quote.priced.saturating_add(unpriced))
+}
+
+/// When the device, free at `now`, is done with `jobs`, each ready for it
+/// at its first time and taking its second: it takes them in the order
+/// they are ready, the first given among equals, each when it is ready and
+/// the ones before it are done.
+fn device_ends(now: Duration, mut jobs: Vec<(Duration, Duration)>) -> Duration {
+    jobs.sort_by_key(|(ready, _)| *ready);
+    jobs.iter().fold(now, |free, (ready, device)| {
+        free.max(*ready).saturating_add(*device)
+    })
+}
+
+/// Spend `total` on the units' work, starting only work whose price fits
+/// what remains. `longest` is the longest single operation the load
+/// completed before the allocator began. The report is complete whether or
+/// not a unit's work fails.
 pub(crate) fn allocate<U: Unit>(
     units: &mut [U],
     context: &mut U::Context,
     clock: &impl Clock,
+    workers: &mut impl Workers<U>,
     total: Duration,
-    slice: Duration,
-) -> Result<Report, U::Failure> {
-    let mut run = Run {
-        states: vec![State::Waiting; units.len()],
-        units,
-        clock,
-        total,
-        report: Report::default(),
+    mut longest: Duration,
+) -> (Report, Result<(), U::Failure>) {
+    let mut report = Report {
+        budget: total,
+        ..Report::default()
     };
-    // Largest share first; units of equal share in preparation order.
-    let mut order = (0..run.units.len()).collect::<Vec<_>>();
-    order.sort_by(|left, right| run.units[*right].share().total_cmp(&run.units[*left].share()));
-    let estimates = run.units.iter().map(Unit::estimate).collect::<Vec<_>>();
-    let mut observed = Observed::default();
-    // What the plan had for each unit when it first refused its start.
-    let mut refused = vec![None; run.units.len()];
-    // The longest an ordinary refinement has run past the end of its slice:
-    // what a unit cannot interrupt.
-    let mut overshoot = Duration::ZERO;
-    let mut short = None;
-    loop {
-        let now = clock.now();
-        let reserve = reserved(run.units, &run.states, None);
-        // What is left for a start and everything after it: the time less
-        // concluding the units already started.
-        let available = total.saturating_sub(now).saturating_sub(reserve);
-        let waiting = order
-            .iter()
-            .copied()
-            .filter(|unit| matches!(run.states[*unit], State::Waiting))
-            .collect::<Vec<_>>();
-        // The first unit waiting whose start fits, largest share first.
-        let mut fits = None;
-        for (position, &unit) in waiting.iter().enumerate() {
-            // Every later unit keeps room for its defaults and its
-            // conclusion.
-            let later = waiting[position + 1..]
-                .iter()
-                .map(|later| {
-                    observed.price(&estimates[*later], Depth::Defaults)
-                        + observed.conclusion(&estimates[*later])
-                })
-                .sum::<Duration>();
-            let conclusion = observed.conclusion(&estimates[unit]);
-            let with_forms = observed.price(&estimates[unit], Depth::Forms);
-            let defaults = observed.price(&estimates[unit], Depth::Defaults);
-            let depth = if with_forms + conclusion + later <= available {
-                Some(Depth::Forms)
-            } else if defaults + conclusion <= available {
-                Some(Depth::Defaults)
-            } else {
-                None
-            };
-            let record = StartRecord {
-                unit,
-                depth,
-                estimated: match depth {
-                    Some(Depth::Forms) => with_forms,
-                    Some(Depth::Defaults) => defaults,
-                    None => Duration::ZERO,
-                },
-                with_forms,
-                available,
-                actual: Duration::ZERO,
-                cut: false,
-            };
-            match depth {
-                Some(depth) => {
-                    fits = Some((depth, record, conclusion, with_forms.saturating_sub(defaults)));
-                    break;
-                }
-                None => {
-                    refused[unit].get_or_insert(record);
-                }
-            }
+    let mut started = vec![false; units.len()];
+    let mut sealed = vec![false; units.len()];
+    // Units whose next piece does not fit the bytes free with every other
+    // unit's inputs given up: nothing changes that until a piece runs.
+    let mut starved = vec![false; units.len()];
+    // Units whose next piece's compile needs more threads than are free:
+    // nothing changes that until a compile ends.
+    let mut crowded = vec![false; units.len()];
+    // Units whose next piece holds bytes of a price not yet observed while
+    // another such piece is in flight: nothing changes that until a piece
+    // runs or a compile ends.
+    let mut alone = vec![false; units.len()];
+    // In the order admitted.
+    let mut flights = Vec::<Flight>::new();
+    // The allocator's own operations, priced as they are observed.
+    let mut own = Own::default();
+    // Units settled since their last piece of work.
+    let mut published = vec![false; units.len()];
+    // When the pass before this one began, and what of the time since was
+    // not its deciding: work performed, waits, and operations of the
+    // allocator's other classes.
+    let mut opened = None::<Duration>;
+    let mut apart = Duration::ZERO;
+    report.ending.began = clock.now();
+    let outcome = loop {
+        let opening = clock.now();
+        if let Some(opened) = opened {
+            let deciding = opening.saturating_sub(opened).saturating_sub(apart);
+            own.deciding.observe(deciding.as_secs_f64());
+            report.ending.passes += 1;
+            report.ending.deciding += deciding;
         }
-        if let Some((depth, mut record, conclusion, forms)) = fits {
-            let unit = record.unit;
-            let until = total.saturating_sub(reserve + conclusion);
-            let started = run.units[unit].start(context, depth, until)?;
-            let actual = clock.now().saturating_sub(now);
-            observed.programs += started.programs;
-            observed.forming += started.forming;
-            observed.spent += actual.saturating_sub(started.forming);
-            observed.estimated += match depth {
-                Depth::Forms => estimates[unit].defaults + estimates[unit].forms,
-                Depth::Defaults => estimates[unit].defaults,
-            };
-            record.actual = actual;
-            record.cut = started.cut;
-            run.states[unit] = State::Open {
-                progress: started.progress,
-                received: Duration::ZERO,
-                starts: (depth == Depth::Defaults).then_some(forms),
-            };
-            run.check(unit, "start", until);
-            run.report.starts.push(record);
-            run.report.started = clock.now();
-            run.report.refined = run.report.started;
-            if started.progress.finished {
-                run.conclude(context, unit)?;
-            }
-            continue;
+        opened = Some(opening);
+        apart = Duration::ZERO;
+        let ended = workers.ended();
+        if !ended.is_empty() {
+            crowded.fill(false);
+            alone.fill(false);
         }
-        // Time received, with one more slice, per unit of step time still
-        // taken.
-        let served = |unit: usize| match run.states[unit] {
-            State::Open {
-                progress, received, ..
-            } if !progress.finished => {
-                let weight = run.units[unit].share() * progress.cost;
-                Some((received + slice).as_secs_f64() / weight.max(f64::MIN_POSITIVE))
+        let landed = ended
+            .into_iter()
+            .try_for_each(|ended| land(units, context, &mut flights, ended));
+        if let Err(failure) = landed {
+            break Err(failure);
+        }
+        U::refresh(units, context);
+        let flying = |unit: usize| flights.iter().any(|flight| flight.unit == unit);
+        let offers = units
+            .iter()
+            .enumerate()
+            .filter(|(unit, _)| !sealed[*unit] && !flying(*unit))
+            .filter_map(|(unit, offered)| offered.next().map(|work| (unit, work)))
+            .collect::<Vec<_>>();
+        // A unit that will be given no more work, sealed or with none left,
+        // has its final choice: what it owes is settled now. Held to the
+        // stop it would be held back for by forecast, and its publication
+        // would be no evidence of what one takes.
+        let mut failed = None;
+        for unit in 0..units.len() {
+            if published[unit]
+                || flying(unit)
+                || offers.iter().any(|(offering, _)| *offering == unit)
+            {
+                continue;
             }
-            _ => None,
-        };
-        // What the unit's next refinement cannot interrupt.
-        let guard = |unit: usize| match run.states[unit] {
-            State::Open {
-                starts: Some(price),
-                ..
-            } => price,
-            State::Open { .. } => overshoot,
-            State::Waiting | State::Concluded => Duration::ZERO,
-        };
-        let open = order
-            .iter()
-            .filter_map(|unit| served(*unit).map(|served| (*unit, served)))
-            .collect::<Vec<_>>();
-        let fitting = open
-            .iter()
-            .filter(|(unit, _)| now + reserve + guard(*unit) < total)
-            .copied()
-            .collect::<Vec<_>>();
-        // A unit owed its form starts first, largest share first; then the
-        // unit a slice leaves least served.
-        let owed = fitting.iter().find(|(unit, _)| {
-            matches!(run.states[*unit], State::Open { starts: Some(_), .. })
-        });
-        let Some((unit, _)) = owed
-            .or_else(|| {
-                fitting
-                    .iter()
-                    .min_by(|left, right| left.1.total_cmp(&right.1))
-            })
-            .copied()
-        else {
-            // No unit's slice fits before the reserves. Conclude the unit
-            // that has received the most for its weight: what its conclusion
-            // leaves of its reserve is dealt to the rest.
-            let Some((unit, _)) = open
-                .iter()
-                .max_by(|left, right| left.1.total_cmp(&right.1))
-                .copied()
-            else {
+            published[unit] = true;
+            if units[unit].owed(false) == Quote::default() {
+                continue;
+            }
+            let settling = clock.now();
+            let outcome = units[unit].settle(context);
+            let took = clock.now().saturating_sub(settling);
+            report.settling += took;
+            apart += took;
+            if let Err(failure) = outcome {
+                failed = Some(failure);
                 break;
-            };
-            short.get_or_insert(reserve);
-            run.conclude(context, unit)?;
-            continue;
-        };
-        let until = total.saturating_sub(reserved(run.units, &run.states, Some(unit)));
-        let end = (now + slice).min(until.saturating_sub(guard(unit)));
-        let progress = run.units[unit].refine(context, end, until)?;
-        run.report.slices += 1;
-        let over = clock.now().saturating_sub(end);
-        run.check(
-            unit,
-            "refinement",
-            total.saturating_sub(reserved(run.units, &run.states, None)),
-        );
-        let State::Open {
-            received, starts, ..
-        } = run.states[unit]
-        else {
-            unreachable!("the unit refined is open");
-        };
-        // The step that measured the form starts is not a slice like the
-        // ones after it.
-        if starts.is_none() {
-            overshoot = overshoot.max(over);
+            }
         }
-        run.states[unit] = State::Open {
-            progress,
-            received: received + clock.now().saturating_sub(now),
-            starts: None,
-        };
-        run.report.refined = clock.now();
-        if progress.finished {
-            run.conclude(context, unit)?;
+        if let Some(failure) = failed {
+            break Err(failure);
         }
-    }
-    run.report.reserved = short.unwrap_or_else(|| reserved(run.units, &run.states, None));
-    run.report.starts.extend(
-        order
+        // Owed work of a class the load has not run is priced by a
+        // stand-in, and a stand-in held back for every unit to the stop is
+        // budget no piece can use. The first unit to owe such work has it
+        // settled now, as a piece: at its price, when everything owed as
+        // things stand and the pass after it fit what remains. Settling
+        // it moves no time, since it was owed; from then the class is
+        // priced by what it took. One per class: once observed, no unit
+        // offers a first observation of it.
+        let standing = units
             .iter()
-            .filter(|unit| matches!(run.states[**unit], State::Waiting))
-            .map(|unit| refused[*unit].expect("a unit still waiting was refused its start")),
-    );
-    for unit in 0..run.units.len() {
-        if matches!(run.states[unit], State::Waiting) {
-            run.conclude(context, unit)?;
+            .fold(own.pass(longest), |sum, unit| {
+                sum.saturating_add(forecast(&unit.owed(false), longest))
+            });
+        let sampled = (0..units.len()).find(|unit| {
+            !flying(*unit)
+                && units[*unit]
+                    .sample()
+                    .is_some_and(|quote| quote.fits(total.saturating_sub(clock.now()), longest))
+        });
+        if let Some(unit) = sampled.filter(|_| clock.now().saturating_add(standing) <= total) {
+            let settling = clock.now();
+            let outcome = units[unit].settle(context);
+            let took = clock.now().saturating_sub(settling);
+            report.settling += took;
+            apart += took;
+            match outcome {
+                Ok(()) => continue,
+                Err(failure) => break Err(failure),
+            }
+        }
+        let now = clock.now();
+        let remaining = total.saturating_sub(now);
+        // The allocator's own ending once `working` has run one more
+        // piece: the pass that finds nothing more to start, and every unit
+        // that then holds inputs giving them up, `working` among them.
+        // A unit that holds none now is held to the class's price alone:
+        // what its piece builds is in the piece's own price.
+        let releases = units
+            .iter()
+            .filter(|unit| unit.holding() > 0)
+            .fold(Duration::ZERO, |sum, unit| {
+                sum.saturating_add(own.release(unit, longest))
+            });
+        let ending = (0..units.len())
+            .map(|working| {
+                let joining = if units[working].holding() == 0 {
+                    Own::observed(&own.releasing).unwrap_or_default()
+                } else {
+                    Duration::ZERO
+                };
+                own.pass(longest)
+                    .saturating_add(releases)
+                    .saturating_add(joining)
+            })
+            .collect::<Vec<_>>();
+        // What is owed when the allocator stops, once `working` has run
+        // one more piece: its own ending, and what the units owe, where
+        // the units with work in flight will have worked too.
+        let owed = (0..units.len())
+            .map(|working| {
+                units
+                    .iter()
+                    .enumerate()
+                    .fold(ending[working], |sum, (unit, offered)| {
+                        sum.saturating_add(forecast(
+                            &offered.owed(unit == working || flying(unit)),
+                            longest,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>();
+        // A piece that needs more bytes than the load's optional work may
+        // ever hold, its own unit's inputs with what it adds to them, is
+        // refused for the load: nothing another unit gives up changes it.
+        let capacity = U::capacity(context);
+        let barred = (0..units.len())
+            .map(|unit| {
+                offers.iter().any(|(offering, work)| {
+                    *offering == unit
+                        && capacity.is_some_and(|capacity| {
+                            units[unit].holding().saturating_add(
+                                work.footprint.forecast(units[unit].largest_footprint()),
+                            ) > capacity
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        // A unit with no work that can still start holds no inputs while
+        // other work can: what remains only shrinks, so work that does not
+        // fit it alone never will, and work refused for the load for its
+        // bytes never starts. When no unit's work can start and none is in
+        // flight, the allocator is at its stop: the pieces offered are
+        // narrowed to what is left with their inputs as they are, and what
+        // is held leaves when everything owed is settled.
+        let startable = (0..units.len())
+            .map(|unit| {
+                !barred[unit]
+                    && offers.iter().any(|(offering, work)| {
+                        *offering == unit
+                            && work
+                                .quote
+                                .fits(remaining.saturating_sub(owed[unit]), longest)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !flights.is_empty() || startable.iter().any(|startable| *startable) {
+            for unit in 0..units.len() {
+                if !flying(unit) && !startable[unit] && units[unit].holding() > 0 {
+                    apart += give_up_inputs(
+                        units,
+                        unit,
+                        context,
+                        clock,
+                        &mut own,
+                        &mut report.ending,
+                    );
+                }
+            }
+        }
+        // An operation whose bytes a unit has not observed is held to the
+        // most a piece of that unit has added: what another unit builds
+        // says nothing of it.
+        //
+        // This is where compiles are bounded by memory: a piece's bytes
+        // count from when its compile starts, and its footprint is priced
+        // from what its unit's pieces were observed to add to everything
+        // the load holds, the process's host bytes with the device's
+        // charges, so what a compile holds and leaves held is in it.
+        let flying_bytes = flights.iter().fold(0u64, |sum, flight| {
+            sum.saturating_add(
+                flight
+                    .work
+                    .footprint
+                    .forecast(units[flight.unit].largest_footprint()),
+            )
+        });
+        // A dependant's discovery reads nothing of its prerequisites. Its
+        // other work reads their choices, once their defaults are measured,
+        // no lead of theirs awaits conversion and no work of theirs is in
+        // flight.
+        let settled = |unit: usize| {
+            units[unit].prerequisites().iter().all(|prerequisite| {
+                sealed[*prerequisite]
+                    || !(flying(*prerequisite)
+                        || offers.iter().any(|(offering, work)| {
+                            offering == prerequisite
+                                && matches!(work.stage, Stage::Discovery | Stage::Promote)
+                        }))
+            })
+        };
+        // The device's queue: each piece in flight, when it is ready for
+        // the device (now, once its compile has ended) and the device time
+        // admitted with it.
+        let queue = flights
+            .iter()
+            .map(|flight| {
+                let ready = match flight.formed {
+                    Some(_) => now,
+                    None => flight.forming_ends.max(now),
+                };
+                (ready, flight.device)
+            })
+            .collect::<Vec<_>>();
+        let ahead = |work: &Work| work.forming != Quote::default();
+        // When a new piece would be ready for the device were it started
+        // now, and the device time it takes.
+        let job = |work: &Work| {
+            let whole = forecast(&work.quote, longest);
+            if ahead(work) {
+                let compile = forecast(&work.forming, longest);
+                (now.saturating_add(compile), whole.saturating_sub(compile))
+            } else {
+                (now, whole)
+            }
+        };
+        // The one admission rule over the whole queue: everything admitted,
+        // the new piece in its place among it, and what is owed after end
+        // within the budget.
+        let fits = |unit: usize, work: &Work| {
+            let mut jobs = queue.clone();
+            jobs.push(job(work));
+            device_ends(now, jobs).saturating_add(owed[unit]) <= total
+        };
+        let (fitting, refused): (Vec<_>, Vec<_>) = offers
+            .iter()
+            .copied()
+            .filter(|(unit, work)| work.stage == Stage::Discovery || settled(*unit))
+            .partition(|(unit, work)| !starved[*unit] && !barred[*unit] && fits(*unit, work));
+        // When a piece's compile is due to start: so that the piece is
+        // ready when the device is done with the pieces ready before it.
+        let due = |work: &Work| {
+            let (ready, _) = job(work);
+            let before = queue
+                .iter()
+                .copied()
+                .filter(|(queued, _)| *queued <= ready)
+                .collect();
+            device_ends(now, before).saturating_sub(ready.saturating_sub(now))
+        };
+        // A compile not yet due waits, as does one whose threads are taken:
+        // the device meanwhile takes other work.
+        let earliest = fitting
+            .iter()
+            .filter(|(unit, work)| ahead(work) && !crowded[*unit])
+            .map(|(_, work)| due(work))
+            .filter(|due| *due > now)
+            .min();
+        let fitting = fitting
+            .into_iter()
+            .filter(|(unit, work)| !ahead(work) || (!crowded[*unit] && due(work) <= now))
+            .filter(|(unit, _)| !alone[*unit])
+            .collect::<Vec<_>>();
+        let value = |(unit, work): &(usize, Work)| {
+            units[*unit].share() * work.gain
+                / forecast(&work.quote, longest)
+                    .as_secs_f64()
+                    .max(f64::MIN_POSITIVE)
+        };
+        let most_valuable = |stages: &[Stage]| {
+            fitting
+                .iter()
+                .filter(|(_, work)| stages.contains(&work.stage))
+                // The first of equals: preparation order.
+                .fold(None, |best: Option<&(usize, Work)>, offer| match best {
+                    Some(best) if value(best) >= value(offer) => Some(best),
+                    _ => Some(offer),
+                })
+        };
+        let discovery = fitting
+            .iter()
+            .filter(|(_, work)| work.stage == Stage::Discovery)
+            .fold(None, |best: Option<&(usize, Work)>, offer| match best {
+                Some(best)
+                    if (!started[best.0], units[best.0].share())
+                        >= (!started[offer.0], units[offer.0].share()) =>
+                {
+                    Some(best)
+                }
+                _ => Some(offer),
+            });
+        let choice = most_valuable(&[Stage::Promote])
+            .or(discovery)
+            .or_else(|| most_valuable(&[Stage::Form]))
+            .or_else(|| most_valuable(&[Stage::Measure, Stage::Confirm]))
+            .copied();
+        // The chosen piece starts only if its bytes fit what is free. When
+        // they do not, the unit whose own next work is worth least gives
+        // its inputs up; with none left to give, the piece is not started.
+        // Bytes of a price not yet observed: in the device's domain a
+        // footprint with an unpriced part whose unit has run no piece, in
+        // the host's a unit that has run no piece, or a compile before any
+        // compile's bytes were seen. Nothing says what such a piece adds,
+        // so no room can be divided by it: it runs with no other such
+        // piece in flight, on the room as measured, and what it added is
+        // then its kind's price.
+        let unpriced = choice.is_some_and(|(unit, work)| {
+            let device = U::free(context).is_some()
+                && work.footprint.unpriced > 0
+                && units[unit].largest_footprint() == 0;
+            let host = U::host_free(context) != HostRoom::Unbounded
+                && (units[unit].host_footprint(context).is_none()
+                    || (ahead(&work)
+                        && U::compile_host(context).max(workers.compile_host()) == 0));
+            device || host
+        });
+        if let Some((unit, _)) = choice {
+            if unpriced && flights.iter().any(|flight| flight.unpriced) {
+                alone[unit] = true;
+                continue;
+            }
+        }
+        if let Some((unit, work)) = choice {
+            let largest = units[unit].largest_footprint();
+            let free = |context: &U::Context| {
+                U::free(context).map(|free| free.saturating_sub(flying_bytes))
+            };
+            // Where host RAM is a domain of its own, the piece's host
+            // bytes fit what is free of it beside the pieces in flight:
+            // what is held now, as measured, with the whole price of every
+            // piece in flight, which is no less than what each has yet to
+            // add.
+            let host = units[unit].host_footprint(context).unwrap_or(0);
+            let flying_host = flights.iter().fold(0u64, |sum, flight| {
+                // A compile that has ended holds nothing more.
+                sum.saturating_add(units[flight.unit].host_footprint(context).unwrap_or(0))
+                    .saturating_add(if flight.formed.is_none() {
+                        flight.compile_host
+                    } else {
+                        0
+                    })
+            });
+            let host_fits = |context: &U::Context| U::host_free(context).admits(host, flying_host);
+            // Before any unit gives up inputs it would build again, the
+            // load gives back what it holds for nothing.
+            if !work.footprint.fits(free(context), largest) || !host_fits(context) {
+                U::reclaim(context);
+            }
+            let free = free(context);
+            if !work.footprint.fits(free, largest) || !host_fits(context) {
+                let worth = |holder: usize| {
+                    offers
+                        .iter()
+                        .find(|(offering, _)| *offering == holder)
+                        .map_or(f64::NEG_INFINITY, value)
+                };
+                // What a unit not in flight holds for work to come: the
+                // programs it formed and its inputs.
+                let holders = (0..units.len())
+                    .filter(|holder| {
+                        *holder != unit
+                            && !flying(*holder)
+                            && (units[*holder].programs() > 0 || units[*holder].holding() > 0)
+                    })
+                    .collect::<Vec<_>>();
+                // Nothing is given up for a piece that would not fit even
+                // with everything given up.
+                let given_up = holders.iter().fold(0u64, |sum, holder| {
+                    sum.saturating_add(units[*holder].programs())
+                        .saturating_add(units[*holder].holding())
+                });
+                let victim = holders
+                    .into_iter()
+                    .filter(|_| {
+                        work.footprint
+                            .fits(free.map(|free| free.saturating_add(given_up)), largest)
+                    })
+                    .min_by(|left, right| worth(*left).total_cmp(&worth(*right)));
+                // The unit whose own next work is worth least gives up
+                // first: its programs, and when it holds none, its inputs.
+                match victim {
+                    Some(victim) if units[victim].programs() > 0 => units[victim].give_up(context),
+                    Some(victim) => {
+                        apart += give_up_inputs(
+                            units,
+                            victim,
+                            context,
+                            clock,
+                            &mut own,
+                            &mut report.ending,
+                        );
+                    }
+                    None => starved[unit] = true,
+                }
+                continue;
+            }
+        }
+        // A piece started seals what its unit reads.
+        let mut start = |units: &[U], unit: usize, work: &Work| {
+            if work.stage != Stage::Discovery {
+                for prerequisite in units[unit].prerequisites() {
+                    sealed[prerequisite] = true;
+                }
+            }
+            started[unit] = true;
+        };
+        // The chosen piece's compile starts; the device then takes the
+        // admitted work that is ready for it before anything new.
+        let forming = choice
+            .filter(|(_, work)| ahead(work))
+            .and_then(|(unit, work)| Some((unit, work, units[unit].forming()?)));
+        let ready = flights.iter().position(|flight| flight.formed.is_some());
+        // A compile whose threads are taken is not started on them: the
+        // unit waits for a compile to end, and the next choice is made
+        // without it.
+        if let Some((unit, _, forming)) = &forming {
+            if workers.needs(forming) > workers.free() {
+                crowded[*unit] = true;
+                continue;
+            }
+        }
+        // A compile holds host memory of its own on every thread it runs
+        // on, while it runs. Where host RAM is a domain of its own, a
+        // compile starts only if that fits beside the compiles in flight:
+        // this, not the threads the host has, is then what bounds how many
+        // run at once. One that does not fit waits for a compile to end;
+        // with none in flight, the load first returns what it holds for
+        // nothing, and the piece is refused if that is not enough.
+        // A thread's compile is priced at the most one was seen to hold:
+        // by the load before its optional work, or by a burst of it.
+        let compile_host = forming.as_ref().map_or(0, |(_, _, forming)| {
+            U::compile_host(context)
+                .max(workers.compile_host())
+                .saturating_mul(workers.needs(forming) as u64)
+        });
+        if let Some((unit, _, _)) = &forming {
+            let piece = units[*unit]
+                .host_footprint(context)
+                .unwrap_or(0)
+                .saturating_add(compile_host);
+            let flying = flights.iter().fold(0u64, |sum, flight| {
+                sum.saturating_add(units[flight.unit].host_footprint(context).unwrap_or(0))
+                    .saturating_add(if flight.formed.is_none() {
+                        flight.compile_host
+                    } else {
+                        0
+                    })
+            });
+            if !U::host_free(context).admits(piece, flying) {
+                if !flights.is_empty() {
+                    crowded[*unit] = true;
+                    continue;
+                }
+                U::reclaim(context);
+                if !U::host_free(context).admits(piece, flying) {
+                    starved[*unit] = true;
+                    continue;
+                }
+            }
+        }
+        let (unit, work, began, formed) = match (forming, ready, choice) {
+            (Some((unit, work, forming)), _, _) => {
+                start(units, unit, &work);
+                workers.start(unit, forming);
+                let whole = forecast(&work.quote, longest);
+                let compile = forecast(&work.forming, longest);
+                flights.push(Flight {
+                    unit,
+                    work,
+                    began: now,
+                    forming_ends: now.saturating_add(compile),
+                    device: whole.saturating_sub(compile),
+                    formed: None,
+                    compile_host,
+                    unpriced,
+                });
+                continue;
+            }
+            (None, Some(ready), _) => {
+                let flight = flights.remove(ready);
+                (flight.unit, flight.work, flight.began, flight.formed)
+            }
+            (None, None, Some((unit, work))) => {
+                start(units, unit, &work);
+                (unit, work, now, None)
+            }
+            (None, None, None) if flights.is_empty() => {
+                // Nothing starts as offered. A piece refused for its
+                // seconds is offered again with a challenger fewer, until
+                // it fits what is left or has one challenger: the piece
+                // worth the most first, and each only while its narrowing
+                // and everything owed after it fit what is left.
+                let mut narrowing = refused
+                    .iter()
+                    .filter(|(unit, _)| !starved[*unit] && !barred[*unit])
+                    .map(|offer| (offer.0, value(offer)))
+                    .collect::<Vec<_>>();
+                narrowing.sort_by(|left, right| right.1.total_cmp(&left.1));
+                let mut narrowed = false;
+                for (unit, _) in narrowing {
+                    let began = clock.now();
+                    if began
+                        .saturating_add(own.narrow(longest))
+                        .saturating_add(owed[unit])
+                        > total
+                    {
+                        continue;
+                    }
+                    if !units[unit].narrow(context) {
+                        continue;
+                    }
+                    // The narrower piece is priced here, in its class.
+                    let _ = units[unit].next();
+                    let took = clock.now().saturating_sub(began);
+                    own.narrowing.observe(took.as_secs_f64());
+                    report.ending.narrowed += 1;
+                    report.ending.narrowing += took;
+                    apart += took;
+                    narrowed = true;
+                }
+                if narrowed {
+                    continue;
+                }
+                // Nothing more starts: every refusal is final.
+                report.refused = refused
+                    .into_iter()
+                    .map(|(unit, work)| Refused {
+                        unit,
+                        stage: work.stage,
+                        quote: work.quote,
+                        footprint: work.footprint,
+                        refusal: if starved[unit] || barred[unit] {
+                            Refusal::Bytes
+                        } else {
+                            Refusal::Seconds
+                        },
+                    })
+                    .collect();
+                // A unit refused for its bytes is told before what it
+                // owes is settled: its record states what stopped it.
+                for refused in &report.refused {
+                    if refused.refusal == Refusal::Bytes {
+                        units[refused.unit].refused_for_bytes(context);
+                    }
+                }
+                break Ok(());
+            }
+            // Work is in flight and nothing can start now: wait for a
+            // compile to end, or for the first compile that waits to be
+            // due.
+            (None, None, None) => {
+                let waiting = clock.now();
+                let ended = workers.wait(earliest.map(|due| due.saturating_sub(now)));
+                apart += clock.now().saturating_sub(waiting);
+                let Some(ended) = ended else {
+                    continue;
+                };
+                crowded.fill(false);
+                alone.fill(false);
+                match land(units, context, &mut flights, ended) {
+                    Ok(()) => continue,
+                    Err(failure) => break Err(failure),
+                }
+            }
+        };
+        let held = ending[unit];
+        let performing = clock.now();
+        let performed = units[unit].perform(context);
+        starved.fill(false);
+        alone.fill(false);
+        published[unit] = false;
+        let ended = clock.now();
+        apart += ended.saturating_sub(performing);
+        report.admitted.push(Admitted {
+            unit,
+            stage: work.stage,
+            quote: work.quote,
+            began,
+            formed,
+            performed: now,
+            actual: ended.saturating_sub(now),
+        });
+        // The allocator's ending is what follows the last piece performed.
+        report.ending = Ending {
+            began: ended,
+            held,
+            ..Ending::default()
+        };
+        match performed {
+            Ok(observed) => longest = longest.max(observed),
+            Err(failure) => break Err(failure),
+        }
+    };
+    if let Some(opened) = opened {
+        report.ending.passes += 1;
+        report.ending.deciding += clock.now().saturating_sub(opened).saturating_sub(apart);
+    }
+    // Every unit's record is published as it stands, whatever became of
+    // the work.
+    let settling = clock.now();
+    let settled = units
+        .iter_mut()
+        .try_for_each(|unit| unit.settle(context));
+    report.settling += clock.now().saturating_sub(settling);
+    // Everything owed is settled: what the units still hold of their
+    // inputs leaves with the optional work.
+    for unit in 0..units.len() {
+        if units[unit].holding() > 0 {
+            give_up_inputs(units, unit, context, clock, &mut own, &mut report.ending);
         }
     }
-    run.report.concluded = clock.now();
-    Ok(run.report)
+    report.ended = clock.now();
+    (report, outcome.and(settled))
+}
+
+/// `unit`'s compile ended: the unit holds what it formed, and its piece
+/// awaits the device.
+fn land<U: Unit>(
+    units: &mut [U],
+    context: &mut U::Context,
+    flights: &mut [Flight],
+    (unit, formed, took): (usize, U::Formed, Duration),
+) -> Result<(), U::Failure> {
+    units[unit].formed(formed, took, context)?;
+    flights
+        .iter_mut()
+        .find(|flight| flight.unit == unit)
+        .expect("a compile that ended was started")
+        .formed = Some(took);
+    Ok(())
+}
+
+/// The load's worker threads ([`seismic::Workers`]): each compile runs on
+/// them to its end, with the threads it forms on at once counted against
+/// the set's width. No compile has a thread of its own: the set's threads
+/// are reused from the first compile of the load to the last.
+pub(crate) struct Threads<U: Unit> {
+    workers: std::sync::Arc<seismic::Workers>,
+    run: fn(U::Forming) -> U::Formed,
+    needs: fn(&U::Forming) -> usize,
+    /// The threads of each compile in flight, by its unit.
+    taken: Vec<(usize, usize)>,
+    sender: std::sync::mpsc::Sender<(usize, std::thread::Result<U::Formed>, Duration)>,
+    receiver: std::sync::mpsc::Receiver<(usize, std::thread::Result<U::Formed>, Duration)>,
+    /// The burst of compiles in flight, from the first started with none
+    /// running to the last to end.
+    burst: Option<Burst>,
+    /// The most a burst raised the peak of the process's footprint, for
+    /// each thread it compiled on at once ([`Workers::compile_host`]), and
+    /// no less than what the load had seen a thread's compile hold before
+    /// these workers began.
+    compile_host: u64,
+    /// Each burst that showed a thread's compile to hold more than it was
+    /// priced at: the price it was admitted on and what it held.
+    mispriced: Vec<(u64, u64)>,
+}
+
+/// A burst of compiles: the process's footprint when it began, the peak of
+/// the footprint until then ([`seismic::ProcessMemory::footprint_peak`]),
+/// and the most threads the burst compiled on at once.
+struct Burst {
+    footprint: u64,
+    peak: u64,
+    threads: usize,
+}
+
+impl<U: Unit> Threads<U> {
+    /// Workers that `run` each compile, which forms on `needs` threads at
+    /// once, on the threads of `workers`. `compile_host`: what the load
+    /// has seen one thread's compile hold so far, nothing if it has seen
+    /// none.
+    pub fn new(
+        workers: std::sync::Arc<seismic::Workers>,
+        run: fn(U::Forming) -> U::Formed,
+        needs: fn(&U::Forming) -> usize,
+        compile_host: u64,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        Self {
+            workers,
+            run,
+            needs,
+            taken: Vec::new(),
+            sender,
+            receiver,
+            burst: None,
+            compile_host,
+            mispriced: Vec::new(),
+        }
+    }
+
+    /// The bursts that held more for each thread than a compile was priced
+    /// at when they ran: that price, and what a thread held.
+    pub fn mispriced(&self) -> &[(u64, u64)] {
+        &self.mispriced
+    }
+
+    /// A compile ended: its threads are free. A compile that panicked
+    /// panics the load here, where its end is read.
+    fn joined(
+        &mut self,
+        (unit, formed, took): (usize, std::thread::Result<U::Formed>, Duration),
+    ) -> (usize, U::Formed, Duration) {
+        self.taken.retain(|(compiling, _)| *compiling != unit);
+        // The burst is over when its last compile ends. If the peak of the
+        // process's footprint rose in it, the peak was reached while its
+        // compiles ran, and what it rose by over the burst's start is what
+        // that many threads of compiles held at their most (with whatever
+        // else the load took meanwhile, which only prices a compile
+        // higher). A burst below the peak already kept says nothing: there
+        // is one mark for the life of the process. A burst that held more
+        // than its compiles were priced at raises the price to what it
+        // held, and is kept as a mispricing.
+        if self.taken.is_empty() {
+            if let Some(burst) = self.burst.take() {
+                let peak = seismic::ProcessMemory::footprint_peak();
+                if let Some(peak) = peak.filter(|peak| *peak > burst.peak && burst.threads > 0) {
+                    let held = peak.saturating_sub(burst.footprint) / burst.threads as u64;
+                    if held > self.compile_host {
+                        if self.compile_host > 0 {
+                            self.mispriced.push((self.compile_host, held));
+                        }
+                        self.compile_host = held;
+                    }
+                }
+            }
+        }
+        match formed {
+            Ok(formed) => (unit, formed, took),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+}
+
+impl<U: Unit> Workers<U> for Threads<U>
+where
+    U::Forming: Send + 'static,
+    U::Formed: Send + 'static,
+{
+    fn needs(&self, forming: &U::Forming) -> usize {
+        (self.needs)(forming)
+    }
+
+    fn free(&self) -> usize {
+        self.workers
+            .width()
+            .saturating_sub(self.taken.iter().map(|(_, threads)| threads).sum())
+    }
+
+    fn compile_host(&self) -> u64 {
+        self.compile_host
+    }
+
+    fn start(&mut self, unit: usize, forming: U::Forming) {
+        if self.taken.is_empty() {
+            self.burst = seismic::ProcessMemory::footprint_now()
+                .zip(seismic::ProcessMemory::footprint_peak())
+                .map(|(footprint, peak)| Burst {
+                    footprint,
+                    peak,
+                    threads: 0,
+                });
+        }
+        self.taken.push((unit, (self.needs)(&forming)));
+        if let Some(burst) = &mut self.burst {
+            burst.threads = burst
+                .threads
+                .max(self.taken.iter().map(|(_, threads)| threads).sum());
+        }
+        let (run, sender) = (self.run, self.sender.clone());
+        self.workers.spawn(move || {
+            let began = std::time::Instant::now();
+            let formed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || run(forming)));
+            // The allocator reads every compile it started before it ends.
+            let _ = sender.send((unit, formed, began.elapsed()));
+        });
+    }
+
+    fn ended(&mut self) -> Vec<(usize, U::Formed, Duration)> {
+        let ended = self.receiver.try_iter().collect::<Vec<_>>();
+        ended.into_iter().map(|ended| self.joined(ended)).collect()
+    }
+
+    fn wait(&mut self, within: Option<Duration>) -> Option<(usize, U::Formed, Duration)> {
+        use std::sync::mpsc::RecvTimeoutError;
+        let ended = match within {
+            Some(within) => match self.receiver.recv_timeout(within) {
+                Ok(ended) => ended,
+                Err(RecvTimeoutError::Timeout) => return None,
+                Err(RecvTimeoutError::Disconnected) => {
+                    unreachable!("the allocator holds a sender of its own")
+                }
+            },
+            None => self
+                .receiver
+                .recv()
+                .expect("the allocator holds a sender of its own"),
+        };
+        Some(self.joined(ended))
+    }
 }
 
 #[cfg(test)]
@@ -525,626 +1428,1758 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Step {
-        Start(Depth),
-        Refine,
-        Conclude,
-    }
+    const SECOND: Duration = Duration::from_secs(1);
 
-    /// A unit whose search is `work` of measurement, each measurement
-    /// taking `step`. Its start measures its defaults in `defaults` and its
-    /// form starts in `forms`, forming `programs` programs for each at
-    /// `forming` a program; concluding takes `confirm`. It estimates each of
-    /// those at `believed` times what they take. Its best cost falls from 1
-    /// to `floor` as the work is done.
+    type Log = RefCell<Vec<(usize, Stage, Duration)>>;
+
+    /// A unit that discovers `points` points, then measures `challengers`,
+    /// each the cost it will measure relative to the defaults, converting
+    /// each lead before it measures on. Every piece takes `slow` times its
+    /// quote. The unit serves `served` at every instant: its defaults at
+    /// cost 1 until a challenger is promoted.
     struct Synthetic {
         name: usize,
         clock: Fake,
         share: f64,
-        defaults: Duration,
-        forms: Duration,
-        programs: usize,
-        forming: Duration,
-        believed: f64,
-        step: Duration,
-        work: Duration,
-        confirm: Duration,
-        /// What the unit reserves for its conclusion, when not `confirm`.
-        reserved: Option<Duration>,
-        floor: f64,
-        started: Option<Depth>,
-        cut: bool,
-        done: Duration,
-        concluded: Option<Duration>,
+        points: usize,
+        discovery: Duration,
+        measurement: Duration,
+        /// What each challenger's compile takes, ahead of its measurement.
+        compile: Duration,
+        /// The next challenger's compile has run.
+        compiled: bool,
+        promotion: Duration,
+        /// Discovery is of classes never observed: it has no price.
+        unpriced_discovery: bool,
+        slow: f64,
+        challengers: Vec<f64>,
+        /// A lead whose coverage check fails is not promoted.
+        covers: bool,
+        prerequisites: Vec<usize>,
+        discovered: usize,
+        /// Every challenger measured, in order: its record.
+        measured: Vec<f64>,
+        lead: Option<f64>,
+        served: f64,
+        /// The longest piece completed.
+        longest: Duration,
+        /// The bytes the unit's inputs hold while they are resident, and
+        /// whether they are; every piece of the unit needs them.
+        inputs: u64,
+        resident: bool,
+        /// How often the unit's inputs were built.
+        built: usize,
+        /// After discovery, the unit's pieces hold bytes of a class it has
+        /// not observed: one unpriced operation each.
+        unobserved: bool,
+        /// How many of the unit's first challengers are other forms'
+        /// representatives; the rest refine a form.
+        forms: usize,
+        /// Bytes the unit's discovery leaves held that are not inputs:
+        /// giving its inputs up does not give them back.
+        kept: u64,
+        /// What publishing the unit's record takes, whether a piece changed
+        /// the record since it was published, and how often it was.
+        publication: Duration,
+        changed: bool,
+        published: usize,
+        /// What publishing a promoted choice's serving artifact takes, and
+        /// whether the served choice was promoted since its artifact was
+        /// published: owed by a unit that promoted, and after a piece only
+        /// if that piece is a conversion.
+        artifact: Duration,
+        unformed: bool,
+        /// How many challengers a piece measures after its one compile, and
+        /// how many the next piece is offered with ([`Unit::narrow`]).
+        batch: usize,
+        size: usize,
+        /// Bytes each challenger's compile leaves in the process for good:
+        /// nothing the load does gives them back.
+        residue: u64,
+        /// Bytes each challenger's compile holds and frees, which count
+        /// until the load returns its freed memory ([`Unit::reclaim`]).
+        garbage: u64,
+        /// Bytes each challenger's formed program holds from its piece on,
+        /// until the unit gives its programs up ([`Unit::give_up`]); what
+        /// the unit's programs hold now, and how often it gave them up.
+        program: u64,
+        programs_held: u64,
+        given_up: usize,
+        /// Host bytes the unit's inputs hold beside their bytes on the
+        /// device, where host RAM is a domain of its own.
+        host: u64,
     }
 
-    type Log = RefCell<Vec<(usize, Step, Duration)>>;
+    /// The bytes the synthetic units hold, the most they held, the ceiling
+    /// on them (none unless a test sets one), and how many of the bytes
+    /// held are freed and not yet returned.
+    #[derive(Clone, Copy, Default)]
+    struct Memory {
+        held: u64,
+        peak: u64,
+        ceiling: Option<u64>,
+        freed: u64,
+        /// Where host RAM is a domain of its own: the host bytes the units'
+        /// inputs hold, the most they held, and the ceiling on them.
+        host: u64,
+        host_peak: u64,
+        host_ceiling: Option<u64>,
+    }
 
-    const SECOND: Duration = Duration::from_secs(1);
+    thread_local! {
+        static MEMORY: Cell<Memory> = const {
+            Cell::new(Memory {
+                held: 0,
+                peak: 0,
+                ceiling: None,
+                freed: 0,
+                host: 0,
+                host_peak: 0,
+                host_ceiling: None,
+            })
+        };
+    }
 
     impl Synthetic {
-        fn new(name: usize, clock: &Fake, share: f64, work: u64) -> Self {
+        /// The compile the next challenger still needs.
+        fn uncompiled(&self) -> Duration {
+            if self.compiled {
+                Duration::ZERO
+            } else {
+                self.compile
+            }
+        }
+
+        fn new(name: usize, clock: &Fake, share: f64, challengers: &[f64]) -> Self {
             Self {
+                compile: Duration::ZERO,
+                compiled: false,
                 name,
                 clock: clock.clone(),
                 share,
-                defaults: SECOND / 2,
-                forms: SECOND / 2,
-                programs: 0,
-                forming: Duration::ZERO,
-                believed: 1.,
-                step: Duration::from_millis(100),
-                work: Duration::from_secs(work),
-                confirm: Duration::from_millis(500),
-                reserved: None,
-                floor: 0.5,
-                started: None,
-                cut: false,
-                done: Duration::ZERO,
-                concluded: None,
+                points: 1,
+                discovery: SECOND,
+                measurement: SECOND,
+                promotion: SECOND * 2,
+                unpriced_discovery: false,
+                slow: 1.,
+                challengers: challengers.to_vec(),
+                covers: true,
+                prerequisites: Vec::new(),
+                discovered: 0,
+                measured: Vec::new(),
+                lead: None,
+                served: 1.,
+                longest: Duration::ZERO,
+                inputs: 0,
+                resident: false,
+                built: 0,
+                unobserved: false,
+                forms: 0,
+                kept: 0,
+                publication: Duration::ZERO,
+                changed: false,
+                published: 0,
+                artifact: Duration::ZERO,
+                unformed: false,
+                batch: 1,
+                size: 1,
+                residue: 0,
+                garbage: 0,
+                program: 0,
+                programs_held: 0,
+                given_up: 0,
+                host: 0,
             }
         }
 
-        fn progress(&self) -> Progress {
-            let done = self.done.as_secs_f64() / self.work.as_secs_f64().max(f64::MIN_POSITIVE);
-            Progress {
-                finished: self.done >= self.work,
-                cost: 1. - (1. - self.floor) * done.min(1.),
-            }
+        /// The challengers the next piece measures.
+        fn challenging(&self) -> usize {
+            self.size.min(self.challengers.len() - self.measured.len())
         }
 
-        /// Spend `time` in steps, stopping at the hard limit; whether all
-        /// of it was spent.
-        fn spend(&self, time: Duration, until: Duration) -> bool {
-            let mut spent = Duration::ZERO;
-            while spent < time {
-                if self.clock.now() >= until {
-                    return false;
-                }
-                let step = self.step.min(time - spent);
-                self.clock.pass(step);
-                spent += step;
+        /// What measuring the next challenger adds to the bytes held: the
+        /// unit's inputs when they are not resident, and what its compile
+        /// holds and leaves held.
+        fn measuring(&self) -> seismic::Footprint {
+            let mut footprint = self.footprint();
+            footprint.priced +=
+                self.residue + self.garbage + self.program * self.challenging() as u64;
+            footprint
+        }
+
+        /// What the next piece adds to the bytes held: the unit's inputs,
+        /// when they are not resident.
+        fn footprint(&self) -> seismic::Footprint {
+            seismic::Footprint {
+                priced: if self.resident { 0 } else { self.inputs },
+                unpriced: usize::from(self.unobserved && self.discovered >= self.points),
             }
-            true
+        }
+    }
+
+    fn priced(price: Duration) -> Quote {
+        Quote {
+            priced: price,
+            unpriced: 0,
         }
     }
 
     impl Unit for Synthetic {
         type Context = Log;
         type Failure = String;
+        type Forming = Duration;
+        type Formed = ();
+
+        fn prerequisites(&self) -> Vec<usize> {
+            self.prerequisites.clone()
+        }
 
         fn share(&self) -> f64 {
             self.share
         }
 
-        fn estimate(&self) -> Estimate {
-            Estimate {
-                defaults: self.defaults.mul_f64(self.believed),
-                forms: self.forms.mul_f64(self.believed),
-                default_programs: self.programs,
-                form_programs: self.programs,
-                conclusion: self.confirm,
+        fn next(&self) -> Option<Work> {
+            if self.discovered < self.points {
+                return Some(Work {
+                    stage: Stage::Discovery,
+                    quote: if self.unpriced_discovery {
+                        Quote {
+                            priced: Duration::ZERO,
+                            unpriced: 1,
+                        }
+                    } else {
+                        priced(self.discovery)
+                    },
+                    forming: Quote::default(),
+                    gain: 0.,
+                    footprint: self.footprint(),
+                });
             }
-        }
-
-        fn start(&mut self, log: &mut Log, depth: Depth, until: Duration) -> Result<Started, String> {
-            log.borrow_mut()
-                .push((self.name, Step::Start(depth), self.clock.now()));
-            let programs = match depth {
-                Depth::Defaults => self.programs,
-                Depth::Forms => 2 * self.programs,
-            };
-            let forming = self.forming * programs as u32;
-            let work = match depth {
-                Depth::Defaults => self.defaults,
-                Depth::Forms => self.defaults + self.forms,
-            };
-            let complete = self.spend(forming + work, until);
-            self.started = Some(depth);
-            self.cut = !complete;
-            Ok(Started {
-                progress: self.progress(),
-                programs,
-                forming,
-                cut: !complete,
+            if let Some(lead) = self.lead {
+                return Some(Work {
+                    stage: Stage::Promote,
+                    quote: priced(self.promotion),
+                    forming: Quote::default(),
+                    gain: self.served - lead,
+                    footprint: self.footprint(),
+                });
+            }
+            (self.measured.len() < self.challengers.len()).then(|| Work {
+                stage: if self.measured.len() < self.forms {
+                    Stage::Form
+                } else {
+                    Stage::Measure
+                },
+                quote: priced(
+                    self.measurement * self.challenging() as u32 + self.uncompiled(),
+                ),
+                forming: priced(self.uncompiled()),
+                gain: self.served / (self.measured.len() + 2) as f64,
+                footprint: self.measuring(),
             })
         }
 
-        fn refine(
-            &mut self,
-            log: &mut Log,
-            slice: Duration,
-            until: Duration,
-        ) -> Result<Progress, String> {
-            assert!(self.started.is_some() && self.concluded.is_none());
-            log.borrow_mut()
-                .push((self.name, Step::Refine, self.clock.now()));
-            // A measurement begun is finished: a slice can overrun by one.
-            while self.done < self.work
-                && self.clock.now() < slice
-                && self.clock.now() + self.reserve() < until
-            {
-                self.clock.pass(self.step);
-                self.done += self.step;
+        fn narrow(&mut self, _: &mut Log) -> bool {
+            let challenging = self.challenging();
+            if self.lead.is_some() || challenging <= 1 {
+                return false;
             }
-            Ok(self.progress())
+            self.size = challenging - 1;
+            true
         }
 
-        fn reserve(&self) -> Duration {
-            if self.started.is_some() && self.concluded.is_none() {
-                self.reserved.unwrap_or(self.confirm)
-            } else {
-                Duration::ZERO
+        fn reclaim(_: &mut Log) {
+            MEMORY.with(|memory| {
+                let mut now = memory.get();
+                now.held -= std::mem::take(&mut now.freed);
+                memory.set(now);
+            });
+        }
+
+        fn holding(&self) -> u64 {
+            if self.resident { self.inputs } else { 0 }
+        }
+
+        fn release(&mut self, _: &mut Log) {
+            if std::mem::take(&mut self.resident) {
+                MEMORY.with(|memory| {
+                    let mut now = memory.get();
+                    now.held -= self.inputs;
+                    now.host -= self.host;
+                    memory.set(now);
+                });
             }
         }
 
-        fn conclude(&mut self, log: &mut Log, _until: Duration) -> Result<(), String> {
-            log.borrow_mut()
-                .push((self.name, Step::Conclude, self.clock.now()));
-            if self.started.is_some() {
-                self.clock.pass(self.confirm);
+        fn host_free(_: &Log) -> HostRoom {
+            let memory = MEMORY.with(Cell::get);
+            match memory.host_ceiling {
+                None => HostRoom::Unbounded,
+                Some(ceiling) => ceiling
+                    .checked_sub(memory.host)
+                    .map_or(HostRoom::Exceeded, HostRoom::Free),
             }
-            self.concluded = Some(self.clock.now());
+        }
+
+        fn host_footprint(&self, _: &Log) -> Option<u64> {
+            Some(if self.resident { 0 } else { self.host })
+        }
+
+        fn programs(&self) -> u64 {
+            self.programs_held
+        }
+
+        fn give_up(&mut self, _: &mut Log) {
+            let given_up = std::mem::take(&mut self.programs_held);
+            self.given_up += 1;
+            MEMORY.with(|memory| {
+                let mut now = memory.get();
+                now.held -= given_up;
+                memory.set(now);
+            });
+        }
+
+        fn largest_footprint(&self) -> u64 {
+            if self.built > 0 { self.inputs } else { 0 }
+        }
+
+        fn free(_: &Log) -> Option<u64> {
+            let memory = MEMORY.with(Cell::get);
+            memory
+                .ceiling
+                .map(|ceiling| ceiling.saturating_sub(memory.held))
+        }
+
+        fn capacity(_: &Log) -> Option<u64> {
+            MEMORY.with(Cell::get).ceiling
+        }
+
+        fn owed(&self, worked: bool) -> Quote {
+            let mut owed = Duration::ZERO;
+            // Only a conversion changes the served choice.
+            if self.unformed || (worked && self.lead.is_some()) {
+                owed += self.artifact;
+            }
+            if self.changed || worked {
+                owed += self.publication;
+            }
+            priced(owed)
+        }
+
+        fn settle(&mut self, _: &mut Log) -> Result<(), String> {
+            if std::mem::take(&mut self.unformed) {
+                self.clock.pass(self.artifact);
+            }
+            if std::mem::take(&mut self.changed) {
+                self.clock.pass(self.publication);
+                self.published += 1;
+            }
             Ok(())
+        }
+
+        fn forming(&self) -> Option<Duration> {
+            let work = self.next()?;
+            (work.forming != Quote::default()).then(|| self.uncompiled().mul_f64(self.slow))
+        }
+
+        fn formed(&mut self, (): (), took: Duration, _: &mut Log) -> Result<(), String> {
+            self.compiled = true;
+            self.longest = self.longest.max(took);
+            Ok(())
+        }
+
+        fn perform(&mut self, log: &mut Log) -> Result<Duration, String> {
+            let work = self.next().expect("a unit performs the work it named");
+            log.borrow_mut()
+                .push((self.name, work.stage, self.clock.now()));
+            // Every piece holds the unit's inputs, built when they are not
+            // resident.
+            if !std::mem::replace(&mut self.resident, true) {
+                self.built += 1;
+                MEMORY.with(|memory| {
+                    let mut now = memory.get();
+                    now.held += self.inputs;
+                    now.peak = now.peak.max(now.held);
+                    now.host += self.host;
+                    now.host_peak = now.host_peak.max(now.host);
+                    memory.set(now);
+                });
+            }
+            let quoted = match work.stage {
+                Stage::Discovery => self.discovery,
+                // A compile that did not run ahead runs with its piece.
+                Stage::Form | Stage::Measure => {
+                    self.measurement * self.challenging() as u32 + self.uncompiled()
+                }
+                Stage::Promote | Stage::Confirm => self.promotion,
+            };
+            let actual = quoted.mul_f64(self.slow);
+            // Work begun runs to its end, whatever the clock reads.
+            self.clock.pass(actual);
+            self.longest = self.longest.max(actual);
+            self.changed = true;
+            match work.stage {
+                Stage::Discovery => {
+                    self.discovered += 1;
+                    MEMORY.with(|memory| {
+                        let mut now = memory.get();
+                        now.held += self.kept;
+                        now.peak = now.peak.max(now.held);
+                        memory.set(now);
+                    });
+                }
+                Stage::Form | Stage::Measure => {
+                    let programs = self.program * self.challenging() as u64;
+                    self.programs_held += programs;
+                    MEMORY.with(|memory| {
+                        let mut now = memory.get();
+                        now.held += programs + self.residue + self.garbage;
+                        now.freed += self.garbage;
+                        now.peak = now.peak.max(now.held);
+                        memory.set(now);
+                    });
+                    for _ in 0..self.challenging() {
+                        let cost = self.challengers[self.measured.len()];
+                        self.measured.push(cost);
+                        if cost < self.served {
+                            self.lead = Some(cost);
+                        }
+                    }
+                    self.compiled = false;
+                    self.size = self.batch;
+                }
+                Stage::Promote | Stage::Confirm => {
+                    let lead = self.lead.take().expect("a promotion converts a lead");
+                    if self.covers {
+                        self.served = lead;
+                        self.unformed = true;
+                    }
+                }
+            }
+            Ok(self.longest)
         }
     }
 
-    const SLICE: Duration = Duration::from_millis(500);
+    /// Workers on the fake clock: a compile ends when the clock has passed
+    /// what it takes, whatever the device did meanwhile. Each compile runs
+    /// on one of `threads` threads.
+    struct Overlapping {
+        clock: Fake,
+        threads: usize,
+        /// Each compile in flight: its unit, when it ends, what it takes.
+        compiling: Vec<(usize, Duration, Duration)>,
+        /// The most compiles in flight at once.
+        most: usize,
+    }
 
-    fn run(
-        units: &mut [Synthetic],
-        clock: &Fake,
-        total: u64,
-    ) -> (Vec<(usize, Step, Duration)>, Report) {
+    impl Overlapping {
+        fn new(clock: &Fake, threads: usize) -> Self {
+            Self {
+                clock: clock.clone(),
+                threads,
+                compiling: Vec::new(),
+                most: 0,
+            }
+        }
+    }
+
+    impl Workers<Synthetic> for Overlapping {
+        fn needs(&self, _: &Duration) -> usize {
+            1
+        }
+
+        fn free(&self) -> usize {
+            self.threads - self.compiling.len()
+        }
+
+        fn start(&mut self, unit: usize, takes: Duration) {
+            self.compiling
+                .push((unit, self.clock.now() + takes, takes));
+            self.most = self.most.max(self.compiling.len());
+        }
+
+        fn ended(&mut self) -> Vec<(usize, (), Duration)> {
+            let now = self.clock.now();
+            let (ended, compiling) = std::mem::take(&mut self.compiling)
+                .into_iter()
+                .partition(|(_, ends, _)| *ends <= now);
+            self.compiling = compiling;
+            ended
+                .into_iter()
+                .map(|(unit, _, took)| (unit, (), took))
+                .collect()
+        }
+
+        fn wait(&mut self, within: Option<Duration>) -> Option<(usize, (), Duration)> {
+            let first = (0..self.compiling.len())
+                .min_by_key(|index| self.compiling[*index].1)
+                .expect("a compile is in flight");
+            let left = self.compiling[first].1.saturating_sub(self.clock.now());
+            if let Some(within) = within.filter(|within| *within < left) {
+                self.clock.pass(within);
+                return None;
+            }
+            let (unit, _, took) = self.compiling.remove(first);
+            self.clock.pass(left);
+            Some((unit, (), took))
+        }
+    }
+
+    /// No workers: a compile runs where it is started, the device waiting.
+    struct Serial(Fake, Vec<(usize, Duration)>);
+
+    impl Workers<Synthetic> for Serial {
+        fn needs(&self, _: &Duration) -> usize {
+            1
+        }
+
+        fn free(&self) -> usize {
+            1
+        }
+
+        fn start(&mut self, unit: usize, takes: Duration) {
+            self.0.pass(takes);
+            self.1.push((unit, takes));
+        }
+
+        fn ended(&mut self) -> Vec<(usize, (), Duration)> {
+            self.1.drain(..).map(|(unit, took)| (unit, (), took)).collect()
+        }
+
+        fn wait(&mut self, _: Option<Duration>) -> Option<(usize, (), Duration)> {
+            unreachable!("a serial compile has ended when it is started")
+        }
+    }
+
+    fn run(units: &mut [Synthetic], clock: &Fake, total: u64) -> (Vec<(usize, Stage, Duration)>, Report) {
         let mut log = Log::default();
-        let report = allocate(units, &mut log, clock, Duration::from_secs(total), SLICE).unwrap();
+        let (report, outcome) = allocate(
+            units,
+            &mut log,
+            clock,
+            &mut Overlapping::new(clock, usize::MAX),
+            SECOND * total as u32,
+            Duration::ZERO,
+        );
+        outcome.expect("no synthetic work fails");
         (log.into_inner(), report)
     }
 
-    fn depths(report: &Report) -> Vec<(usize, Option<Depth>)> {
-        report
-            .starts
-            .iter()
-            .map(|start| (start.unit, start.depth))
+    /// Units whose every challenger compiles for 3 s and measures for 1 s.
+    fn compiling(clock: &Fake, units: usize, challengers: usize, slow: f64) -> Vec<Synthetic> {
+        (0..units)
+            .map(|name| Synthetic {
+                compile: SECOND * 3,
+                slow,
+                ..Synthetic::new(name, clock, 1. / units as f64, &vec![1.; challengers])
+            })
             .collect()
     }
 
-    /// A breadth phase that fits: every unit gets its form starts, largest
-    /// share first, refinement fills the rest by step time left, and tuning
-    /// ends inside the time with no step cut and none late.
+    /// Compiles run while the device measures: the same work ends sooner
+    /// than with the device waiting on each compile, every compile and
+    /// every measurement takes what it was quoted, and the device goes
+    /// from one measurement to the next.
     #[test]
-    fn a_breadth_phase_that_fits_starts_every_form_and_refinement_fills_the_rest() {
+    fn compiles_overlap_the_device_and_the_same_work_ends_sooner() {
         let clock = Fake::default();
-        // Preparation order is not share order; the searches are far longer
-        // than the time.
+        let mut serial = compiling(&clock, 4, 3, 1.);
+        let (report, outcome) = allocate(
+            &mut serial,
+            &mut Log::default(),
+            &clock,
+            &mut Serial(clock.clone(), Vec::new()),
+            SECOND * 600,
+            Duration::ZERO,
+        );
+        outcome.unwrap();
+        // 4 discoveries, then 12 challengers at 3 s + 1 s.
+        assert_eq!(report.ended, SECOND * 52);
+        let clock = Fake::default();
+        let mut units = compiling(&clock, 4, 3, 1.);
+        let (log, report) = run(&mut units, &clock, 600);
+        assert!(units.iter().all(|unit| unit.measured.len() == 3));
+        // 4 discoveries, one wait of 3 s for the first compiles, then the
+        // device measures without a gap: every later compile ended behind
+        // the measurements admitted before it.
+        assert_eq!(report.ended, SECOND * 19);
+        let measured = log
+            .iter()
+            .filter(|(_, stage, _)| *stage == Stage::Measure)
+            .map(|(_, _, began)| *began)
+            .collect::<Vec<_>>();
+        assert_eq!(measured, (7..19).map(|second| SECOND * second).collect::<Vec<_>>());
+        for admitted in &report.admitted {
+            if admitted.stage == Stage::Measure {
+                assert_eq!(admitted.formed, Some(SECOND * 3));
+                assert_eq!(admitted.actual, SECOND);
+                assert_eq!(admitted.quote.forecast(), Some(SECOND * 4));
+                // Admitted on its whole price: it ended no sooner than that.
+                assert!(admitted.performed + admitted.actual >= admitted.began + SECOND * 4);
+            }
+        }
+    }
+
+    /// Forecasts stay honest under overlap: with accurate prices, work in
+    /// flight is counted against what remains, so nothing is admitted that
+    /// would end past the budget, and what does not fit behind the work
+    /// in flight is not started.
+    #[test]
+    fn work_in_flight_is_counted_against_what_remains() {
+        let clock = Fake::default();
+        let mut units = compiling(&clock, 4, 3, 1.);
+        let (_, report) = run(&mut units, &clock, 12);
+        // The four first challengers' compiles start a second apart from
+        // 4 s, each so that its piece is ready as the device ends the one
+        // before, and their measurements end at 11 s. The first unit's
+        // second challenger compiles from 8 s, while the device measures
+        // the others, and measures from 11 s: it ends with the budget, and
+        // nothing more does.
+        assert_eq!(report.ended, SECOND * 12);
+        assert_eq!((report.unused(), report.overrun()), (Duration::ZERO, Duration::ZERO));
+        let compiles = report
+            .admitted
+            .iter()
+            .filter(|admitted| admitted.stage == Stage::Measure)
+            .map(|admitted| admitted.began)
+            .collect::<Vec<_>>();
+        assert_eq!(compiles, [4, 5, 6, 7, 8].map(|second| SECOND * second));
+        assert_eq!(
+            units.iter().map(|unit| unit.measured.len()).collect::<Vec<_>>(),
+            [2, 1, 1, 1]
+        );
+        assert_eq!(report.refused.len(), 4);
+        // One second less and the fourth does not fit behind the other
+        // three: it is not started.
+        let clock = Fake::default();
+        let mut units = compiling(&clock, 4, 3, 1.);
+        let (_, report) = run(&mut units, &clock, 10);
+        assert_eq!(report.ended, SECOND * 10);
+        assert_eq!(report.overrun(), Duration::ZERO);
+        assert_eq!(
+            units.iter().map(|unit| unit.measured.len()).sum::<usize>(),
+            3
+        );
+    }
+
+    /// Run `units` on workers of `threads` threads: the log, the report, and
+    /// the most compiles that were in flight at once.
+    fn threaded(
+        units: &mut [Synthetic],
+        clock: &Fake,
+        total: Duration,
+        threads: usize,
+    ) -> (Vec<(usize, Stage, Duration)>, Report, usize) {
+        let mut log = Log::default();
+        let mut workers = Overlapping::new(clock, threads);
+        let (report, outcome) =
+            allocate(units, &mut log, clock, &mut workers, total, Duration::ZERO);
+        outcome.expect("no synthetic work fails");
+        (log.into_inner(), report, workers.most)
+    }
+
+    /// One unit's challenger compiles for 10 s beside three units whose
+    /// challengers compile for 1 s and measure for a fifth of one. The long
+    /// compile holds back nothing but its own device time: the short
+    /// compiles overlap it and each other, each started as the device nears
+    /// the end of the pieces before it, their pieces are measured while it
+    /// runs, and a budget that ends with the long piece's measurement
+    /// admits every one of them. Counted together with the long compile,
+    /// as they were, the short pieces were forecast to end behind it: none
+    /// of them fit this budget.
+    #[test]
+    fn a_short_compile_is_not_forecast_behind_an_unrelated_long_one() {
+        let clock = Fake::default();
+        let short = |name: usize| Synthetic {
+            compile: SECOND,
+            measurement: SECOND / 5,
+            ..Synthetic::new(name, &clock, 0.1, &[1.; 3])
+        };
+        let mut units = vec![
+            Synthetic {
+                compile: SECOND * 10,
+                ..Synthetic::new(0, &clock, 0.7, &[1.])
+            },
+            short(1),
+            short(2),
+            short(3),
+        ];
+        // Four discoveries; the long piece, started then, measures from
+        // 14 s to 15 s.
+        let (log, report, most) = threaded(&mut units, &clock, SECOND * 15, usize::MAX);
+        assert_eq!(
+            units.iter().map(|unit| unit.measured.len()).collect::<Vec<_>>(),
+            [1, 3, 3, 3]
+        );
+        assert_eq!((report.ended, report.overrun()), (SECOND * 15, Duration::ZERO));
+        let long = report
+            .admitted
+            .iter()
+            .find(|admitted| admitted.unit == 0 && admitted.stage == Stage::Measure)
+            .unwrap();
+        assert_eq!((long.began, long.performed), (SECOND * 4, SECOND * 14));
+        // Every short piece ran, start to end, inside the long compile.
+        for admitted in &report.admitted {
+            if admitted.unit != 0 && admitted.stage == Stage::Measure {
+                assert!(admitted.began >= long.began, "{admitted:?}");
+                assert!(admitted.performed + admitted.actual <= long.performed, "{admitted:?}");
+                assert_eq!(admitted.formed, Some(SECOND));
+            }
+        }
+        // The long compile and the three units' short ones at once.
+        assert_eq!(most, 4);
+        // The device went from one short piece to the next: after the
+        // first, none waited for a compile that could have started sooner.
+        let measured = log
+            .iter()
+            .filter(|(unit, stage, _)| *unit != 0 && *stage == Stage::Measure)
+            .map(|(_, _, began)| *began)
+            .collect::<Vec<_>>();
+        assert_eq!(measured[0], SECOND * 5);
+        assert_eq!(measured[..3], [50, 52, 54].map(|tenths| SECOND * tenths / 10));
+    }
+
+    /// Compiles overlap as far as the worker threads there are, and no
+    /// further: each compile runs on a thread of its own.
+    #[test]
+    fn compiles_overlap_up_to_the_worker_threads() {
+        let most = |threads: usize| {
+            let clock = Fake::default();
+            let mut units = compiling(&clock, 6, 2, 1.);
+            let (_, report, most) = threaded(&mut units, &clock, SECOND * 600, threads);
+            assert!(units.iter().all(|unit| unit.measured.len() == 2));
+            (most, report.ended)
+        };
+        // Compiles of 3 s and measurements of 1 s keep three compiles in
+        // flight when nothing limits them.
+        let (unlimited, sooner) = most(usize::MAX);
+        assert_eq!(unlimited, 3);
+        let (two, later) = most(2);
+        assert_eq!(two, 2);
+        let (one, latest) = most(1);
+        assert_eq!(one, 1);
+        assert!(sooner < later && later < latest, "{sooner:?} {later:?} {latest:?}");
+    }
+
+    /// Compiles overlap as far as their pieces' bytes fit under the ceiling
+    /// together: a piece in flight holds its footprint from the moment its
+    /// compile starts.
+    #[test]
+    fn compiles_overlap_up_to_the_bytes_their_pieces_hold() {
+        let most = |ceiling: Option<u64>| {
+            let clock = Fake::default();
+            let mut units = compiling(&clock, 6, 2, 1.);
+            for unit in &mut units {
+                unit.inputs = 100;
+            }
+            MEMORY.with(|memory| {
+                memory.set(Memory {
+                    ceiling,
+                    ..Memory::default()
+                })
+            });
+            let (_, _, most) = threaded(&mut units, &clock, SECOND * 600, usize::MAX);
+            let memory = MEMORY.with(Cell::take);
+            assert!(units.iter().all(|unit| unit.measured.len() == 2));
+            (most, memory.peak)
+        };
+        assert_eq!(most(None).0, 3);
+        // Two units' inputs fit under the ceiling: two pieces fly at once.
+        let (two, peak) = most(Some(250));
+        assert_eq!(two, 2);
+        assert!(peak <= 250, "{peak}");
+    }
+
+    /// Every compile and measurement takes ten times its quote: nothing is
+    /// admitted once the budget has ended, nothing admitted is given up,
+    /// and the time past the budget is at most what the pieces in flight
+    /// when it ended took.
+    #[test]
+    fn overlapping_work_overruns_by_at_most_the_pieces_in_flight() {
+        let clock = Fake::default();
+        let mut units = compiling(&clock, 4, 3, 10.);
+        let budget = SECOND * 100;
+        let (log, report) = run(&mut units, &clock, 100);
+        assert_eq!(log.len(), report.admitted.len());
+        assert!(report.overrun() > Duration::ZERO);
+        assert!(report.admitted.iter().all(|admitted| admitted.began < budget));
+        let in_flight = report
+            .admitted
+            .iter()
+            .filter(|admitted| admitted.performed + admitted.actual > budget)
+            .map(|admitted| admitted.formed.unwrap_or_default() + admitted.actual)
+            .sum::<Duration>();
+        assert!(report.overrun() <= in_flight, "{report:?}");
+        // Each piece admitted was measured: none was left compiled only.
+        assert_eq!(
+            report
+                .admitted
+                .iter()
+                .filter(|admitted| admitted.stage == Stage::Measure)
+                .count(),
+            units.iter().map(|unit| unit.measured.len()).sum::<usize>()
+        );
+    }
+
+    fn stages(log: &[(usize, Stage, Duration)]) -> Vec<(usize, Stage)> {
+        log.iter().map(|(unit, stage, _)| (*unit, *stage)).collect()
+    }
+
+    /// Accurate quotes: the allocator stops at or before the budget with no
+    /// overrun, every piece it started took what it was quoted, and it
+    /// stops early, the remaining budget unused, when nothing that is left
+    /// fits.
+    #[test]
+    fn accurate_quotes_end_within_the_budget_and_stop_early_when_nothing_fits() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic::new(0, &clock, 0.6, &[1.; 100]),
+            Synthetic::new(1, &clock, 0.4, &[1.; 100]),
+        ];
+        // No challenger leads: only discovery and measurement run.
+        let (_, report) = run(&mut units, &clock, 20);
+        assert_eq!(report.ended, SECOND * 20);
+        assert_eq!((report.unused(), report.overrun()), (Duration::ZERO, Duration::ZERO));
+        assert!(
+            report
+                .admitted
+                .iter()
+                .all(|admitted| admitted.quote.forecast() == Some(admitted.actual))
+        );
+        // Pieces that do not fit what is left are never started: 2.5 s of
+        // work does not fit the last 2 s, and the budget is left unused.
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            measurement: SECOND * 5 / 2,
+            ..Synthetic::new(0, &clock, 1., &[1.; 100])
+        }];
+        let (log, report) = run(&mut units, &clock, 8);
+        // 1 s of discovery, two measurements, and 2 s left.
+        assert_eq!(report.ended, SECOND * 6);
+        assert_eq!(report.unused(), SECOND * 2);
+        assert_eq!(report.overrun(), Duration::ZERO);
+        assert_eq!(log.len(), 3);
+        assert_eq!(
+            report.refused,
+            [Refused {
+                unit: 0,
+                stage: Stage::Measure,
+                quote: priced(SECOND * 5 / 2),
+                footprint: seismic::Footprint::default(),
+                refusal: Refusal::Seconds,
+            }]
+        );
+        // With budget for everything, the allocator stops when the work
+        // ends, not when the budget does.
+        let clock = Fake::default();
+        let mut units = [Synthetic::new(0, &clock, 1., &[1., 1.])];
+        let (_, report) = run(&mut units, &clock, 600);
+        assert_eq!(report.ended, SECOND * 3);
+        assert!(report.refused.is_empty());
+        assert_eq!(units[0].measured.len(), 2);
+    }
+
+    /// Every piece takes ten times its quote: every unit still serves a
+    /// legal choice, nothing fails and nothing begun is abandoned, and the
+    /// time past the budget is at most what the last piece started took
+    /// beyond its forecast, reported with that forecast and what it took.
+    #[test]
+    fn work_ten_times_its_quote_overruns_by_at_most_the_piece_in_flight() {
+        let clock = Fake::default();
+        let mut units = [0.5, 0.3, 0.2]
+            .into_iter()
+            .enumerate()
+            .map(|(name, share)| Synthetic {
+                slow: 10.,
+                ..Synthetic::new(name, &clock, share, &[0.9, 0.8, 0.7, 0.6])
+            })
+            .collect::<Vec<_>>();
+        let (log, report) = run(&mut units, &clock, 55);
+        // Each piece started ran to its end and changed its unit's state.
+        assert_eq!(log.len(), report.admitted.len());
+        let last = report.admitted.last().unwrap();
+        assert!(last.began < SECOND * 55, "nothing starts past the budget");
+        assert!(last.began + last.quote.priced <= SECOND * 55);
+        assert_eq!(report.ended, last.began + last.actual);
+        assert!(report.overrun() > Duration::ZERO);
+        assert!(report.overrun() <= last.actual - last.quote.priced);
+        assert_eq!(last.actual, last.quote.forecast().unwrap() * 10);
+        for unit in &units {
+            // A legal choice at every instant: the defaults, or a
+            // challenger measured faster and promoted.
+            assert!(unit.served == 1. || unit.measured.contains(&unit.served));
+            assert!(unit.served <= 1.);
+        }
+    }
+
+    /// A measured lead is converted before any new challenger is measured,
+    /// whatever the other units' shares, and the challenger that measured
+    /// faster and passed its conversion is the unit's served choice.
+    #[test]
+    fn a_lead_is_converted_before_new_measurement_and_the_promoted_challenger_serves() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic::new(0, &clock, 0.1, &[0.5, 1., 1.]),
+            Synthetic::new(1, &clock, 0.9, &[1.; 20]),
+        ];
+        let (log, report) = run(&mut units, &clock, 30);
+        let log = stages(&log);
+        let lead = log
+            .iter()
+            .position(|step| *step == (0, Stage::Measure))
+            .unwrap();
+        assert_eq!(
+            log[lead + 1],
+            (0, Stage::Promote),
+            "the conversion follows its measurement at once: {log:?}"
+        );
+        assert_eq!(units[0].served, 0.5, "the promoted challenger is served");
+        assert_eq!(units[1].served, 1.);
+        assert_eq!(report.overrun(), Duration::ZERO);
+        // A lead that fails its coverage is not served, and the next
+        // challenger is measured against the choice that stands.
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            covers: false,
+            ..Synthetic::new(0, &clock, 1., &[0.5, 0.4])
+        }];
+        let (log, _) = run(&mut units, &clock, 30);
+        assert_eq!(
+            stages(&log)[1..],
+            [
+                (0, Stage::Measure),
+                (0, Stage::Promote),
+                (0, Stage::Measure),
+                (0, Stage::Promote)
+            ]
+        );
+        assert_eq!(units[0].served, 1.);
+        assert_eq!(units[0].measured, [0.5, 0.4]);
+    }
+
+    /// A conversion whose whole price does not fit what remains is never
+    /// started: its challenger stays recorded as a measurement and does not
+    /// serve, and the unit measures nothing more it could not convert.
+    #[test]
+    fn a_conversion_that_does_not_fit_is_not_started_and_its_measurement_stays_recorded() {
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            promotion: SECOND * 5,
+            ..Synthetic::new(0, &clock, 1., &[0.5, 0.4, 0.3])
+        }];
+        // Discovery and one measurement leave 4 s: less than the 5 s
+        // conversion.
+        let (log, report) = run(&mut units, &clock, 6);
+        assert_eq!(
+            stages(&log),
+            [(0, Stage::Discovery), (0, Stage::Measure)]
+        );
+        assert_eq!(report.ended, SECOND * 2);
+        assert_eq!(
+            report.refused,
+            [Refused {
+                unit: 0,
+                stage: Stage::Promote,
+                quote: priced(SECOND * 5),
+                footprint: seismic::Footprint::default(),
+                refusal: Refusal::Seconds,
+            }]
+        );
+        assert_eq!(units[0].measured, [0.5], "the measurement is recorded");
+        assert_eq!(units[0].lead, Some(0.5));
+        assert_eq!(units[0].served, 1., "an unconverted lead does not serve");
+        assert_eq!(report.overrun(), Duration::ZERO);
+    }
+
+    /// Discovery comes before any challenger: every unit's first piece
+    /// before any unit's second, a unit never started first.
+    #[test]
+    fn every_unit_is_discovered_before_any_challenger_is_measured() {
+        let clock = Fake::default();
+        // Preparation order is not share order.
         let mut units = [0.1, 0.5, 0.15, 0.25]
             .into_iter()
             .enumerate()
             .map(|(name, share)| Synthetic {
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
+                points: 2,
+                ..Synthetic::new(name, &clock, share, &[1.; 50])
             })
             .collect::<Vec<_>>();
-        let (log, report) = run(&mut units, &clock, 60);
+        let (log, _) = run(&mut units, &clock, 60);
+        let log = stages(&log);
+        // Each unit's first point before any unit's second, the largest
+        // share first both times.
         assert_eq!(
-            depths(&report),
-            [1, 3, 2, 0].map(|unit| (unit, Some(Depth::Forms)))
+            log[..8],
+            [1, 3, 2, 0, 1, 3, 2, 0].map(|unit| (unit, Stage::Discovery))
         );
-        assert!(log[..4]
-            .iter()
-            .all(|(_, step, _)| *step == Step::Start(Depth::Forms)));
-        assert!(log[4..]
-            .iter()
-            .all(|(_, step, _)| !matches!(step, Step::Start(_))));
-        // The plan's estimates were what the starts took.
-        assert!(report
-            .starts
-            .iter()
-            .all(|start| start.estimated == start.actual && !start.cut));
-        assert!(report.overruns.is_empty());
-        assert_eq!(report.started, Duration::from_secs(4));
-        // Refinement ran until only the four conclusions were left, and
-        // they ended with the time.
-        assert_eq!(report.refined, Duration::from_secs(58));
-        assert_eq!(report.reserved, Duration::from_secs(2));
-        assert_eq!(report.concluded, Duration::from_secs(60));
-        // Its time followed the shares: the searches found nothing, and
-        // their measurements cost the same.
-        let refined = units
-            .iter()
-            .map(|unit| unit.done.as_secs_f64())
+        assert!(log[8..].iter().all(|(_, stage)| *stage == Stage::Measure));
+    }
+
+    /// Challengers go where a second of their price recovers most: by
+    /// share, and less to a unit the more it has measured, so the time
+    /// follows the shares instead of one unit taking it all.
+    #[test]
+    fn measurement_follows_share_and_expected_gain_per_second() {
+        let clock = Fake::default();
+        let mut units = [0.5, 0.3, 0.2]
+            .into_iter()
+            .enumerate()
+            .map(|(name, share)| Synthetic::new(name, &clock, share, &[1.; 1000]))
             .collect::<Vec<_>>();
-        for (unit, share) in [0.1, 0.5, 0.15, 0.25].into_iter().enumerate() {
+        let (log, _) = run(&mut units, &clock, 103);
+        // The largest share measures first.
+        assert_eq!(stages(&log)[3], (0, Stage::Measure));
+        let measured = units.iter().map(|unit| unit.measured.len()).collect::<Vec<_>>();
+        assert_eq!(measured.iter().sum::<usize>(), 100);
+        for (unit, share) in [0.5, 0.3, 0.2].into_iter().enumerate() {
             assert!(
-                (refined[unit] / 54. - share).abs() < 0.02,
-                "unit {unit}: {refined:?}"
+                (measured[unit] as f64 - 100. * share).abs() <= 2.,
+                "{measured:?}"
             );
         }
-        // Nothing is refined once conclusions begin.
-        let first = log
-            .iter()
-            .position(|(_, step, _)| *step == Step::Conclude)
-            .unwrap();
-        assert!(log[first..]
-            .iter()
-            .all(|(_, step, _)| *step == Step::Conclude));
-    }
-
-    /// A breadth phase that does not fit (a cold pipeline cache: every
-    /// program takes a second to form): the largest units get their form
-    /// starts while the rest keep room for their defaults, no step is cut,
-    /// and tuning ends inside the time.
-    #[test]
-    fn a_breadth_phase_that_does_not_fit_gives_form_starts_by_share() {
-        let clock = Fake::default();
-        let mut units = [0.05, 0.4, 0.1, 0.3, 0.15]
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                programs: 4,
-                forming: SECOND,
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        // Defaults-only: 4 programs and half a second, 4.5 s; with forms 9 s;
-        // five of the latter and their conclusions are 47.5 s.
-        let (log, report) = run(&mut units, &clock, 40);
-        // The first start is planned before any program was formed, at the
-        // units' estimates alone, and shows what a program costs; from the
-        // second on the plan prices them. Three units' form starts fit with
-        // the defaults of the two after them.
-        assert_eq!(
-            depths(&report),
-            [
-                (1, Some(Depth::Forms)),
-                (3, Some(Depth::Forms)),
-                (4, Some(Depth::Forms)),
-                (2, Some(Depth::Defaults)),
-                (0, Some(Depth::Defaults)),
-            ]
-        );
-        assert!(report.starts[1..]
-            .iter()
-            .all(|start| start.estimated == start.actual));
-        assert!(report.starts.iter().all(|start| !start.cut));
-        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
-        assert!(report.concluded <= Duration::from_secs(40));
-        assert!(units.iter().all(|unit| unit.concluded.is_some() && !unit.cut));
-        // What was left went to refinement.
-        assert!(report.refined > report.started);
-        assert!(log.iter().any(|(_, step, _)| *step == Step::Refine));
-    }
-
-    /// Time for no more than some units' defaults: the smallest units keep
-    /// their defaults unmeasured, and no start is begun that cannot end.
-    #[test]
-    fn units_whose_defaults_do_not_fit_are_not_started() {
-        let clock = Fake::default();
-        let mut units = [0.1, 0.5, 0.4]
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                defaults: SECOND,
-                forms: SECOND,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        let (_, report) = run(&mut units, &clock, 3);
-        assert_eq!(
-            depths(&report),
-            [
-                (1, Some(Depth::Defaults)),
-                (2, Some(Depth::Defaults)),
-                (0, None)
-            ]
-        );
-        assert!(units.iter().all(|unit| unit.concluded.is_some()));
-        assert!(report.overruns.is_empty());
-        assert_eq!(report.concluded, Duration::from_secs(3));
-    }
-
-    /// The largest unit's start does not fit by its own estimate, four times
-    /// what it takes. It waits; the next unit's start shows what starts cost
-    /// against their estimates, the plan made again has room for the largest
-    /// unit, and it is started before the unit after it.
-    #[test]
-    fn a_unit_refused_by_its_estimate_is_started_once_the_starts_correct_it() {
-        let clock = Fake::default();
-        let mut units = [0.5, 0.3, 0.2]
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                defaults: SECOND / 4,
-                forms: SECOND / 4,
-                believed: 4.,
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        // Its defaults alone are estimated at 8 s, with its conclusion more
-        // than the time.
-        units[0].defaults = SECOND * 2;
-        units[0].forms = SECOND * 2;
-        let (log, report) = run(&mut units, &clock, 8);
-        assert_eq!(
-            depths(&report),
-            [1, 0, 2].map(|unit| (unit, Some(Depth::Forms)))
-        );
-        assert_eq!(report.starts[1].estimated, report.starts[1].actual);
-        // It is refined with the others in the time left.
-        assert!(log
-            .iter()
-            .any(|(name, step, _)| *name == 0 && *step == Step::Refine));
-        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
-        assert!(report.concluded <= Duration::from_secs(8));
-        assert!(units.iter().all(|unit| unit.concluded.is_some() && !unit.cut));
-    }
-
-    /// The reserves of the units started fill the time, so the last unit's
-    /// start does not fit. It waits; a conclusion gives back what it left of
-    /// its reserve, and the unit is started and refined in that time instead
-    /// of tuning ending with it unspent.
-    #[test]
-    fn a_unit_whose_start_did_not_fit_is_started_in_the_time_a_conclusion_gives_back() {
-        let clock = Fake::default();
-        let mut units = [0.5, 0.3, 0.2]
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                confirm: Duration::from_millis(100),
-                reserved: (name < 2).then_some(SECOND * 5),
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        let (log, report) = run(&mut units, &clock, 12);
-        // Two starts and their reserves are the time: the third unit waits.
-        let position = |unit: usize, step: Step| {
-            log.iter()
-                .position(|(name, at, _)| *name == unit && *at == step)
-                .unwrap()
-        };
-        let concluded = position(1, Step::Conclude);
-        let started = position(2, Step::Start(Depth::Forms));
-        assert!(concluded < started);
-        assert_eq!(log[concluded].2, SECOND * 2);
-        assert_eq!(
-            depths(&report),
-            [0, 1, 2].map(|unit| (unit, Some(Depth::Forms)))
-        );
-        // The time follows the weights from there: both units left are
-        // refined.
-        assert!(units[2].done > Duration::ZERO);
-        assert!(units[0].done > units[2].done);
-        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
-        assert!(report.concluded <= Duration::from_secs(12));
-        assert!(units.iter().all(|unit| unit.concluded.is_some() && !unit.cut));
-    }
-
-    /// Estimates wrong by a factor of two: the first start shows it, the
-    /// plan for the rest is made from what it took, and tuning still ends
-    /// inside the time.
-    #[test]
-    fn estimates_wrong_by_half_are_corrected_from_what_the_starts_took() {
-        let clock = Fake::default();
-        let mut units = [0.4, 0.3, 0.2, 0.1]
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                defaults: SECOND * 2,
-                forms: SECOND * 2,
-                believed: 0.5,
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        // By the units' estimates four full starts and their conclusions
-        // take 10 s; they take 18.
-        let (_, report) = run(&mut units, &clock, 13);
-        assert_eq!(report.starts[0].depth, Some(Depth::Forms));
-        assert_eq!(report.starts[0].estimated, SECOND * 2);
-        assert_eq!(report.starts[0].actual, SECOND * 4);
-        // From the second start on the plan prices starts at twice the
-        // units' estimates, and gives what fits.
-        assert!(report.starts[1..]
-            .iter()
-            .all(|start| start.estimated == start.actual));
-        assert_eq!(
-            depths(&report)[1..],
-            [
-                (1, Some(Depth::Defaults)),
-                (2, Some(Depth::Defaults)),
-                (3, Some(Depth::Defaults))
-            ]
-        );
-        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
-        assert!(report.concluded <= Duration::from_secs(13));
-    }
-
-    /// A start that takes far longer than its estimate and the time left:
-    /// the hard limit ends it, the cut is reported, and tuning ends at the
-    /// deadline with every unit concluded.
-    #[test]
-    fn a_start_far_longer_than_the_time_is_cut_at_the_deadline_and_reported() {
+        // Equal shares: the unit whose challengers cost four times as much
+        // measures a quarter as many, for the same time.
         let clock = Fake::default();
         let mut units = [
-            Synthetic::new(0, &clock, 0.2, 1000),
             Synthetic {
-                // Believed to take a tenth of a second; takes a hundred.
-                defaults: SECOND * 100,
-                believed: 0.001,
-                ..Synthetic::new(1, &clock, 0.5, 1000)
+                measurement: SECOND * 4,
+                ..Synthetic::new(0, &clock, 0.5, &[1.; 1000])
             },
-            Synthetic::new(2, &clock, 0.3, 1000),
+            Synthetic::new(1, &clock, 0.5, &[1.; 1000]),
         ];
-        let (_, report) = run(&mut units, &clock, 10);
-        let cut = report.starts[0];
-        assert_eq!((cut.unit, cut.cut), (1, true));
-        assert!(cut.actual > cut.estimated * 10);
-        // The start returned at its limit: the time less its own
-        // conclusion.
-        assert_eq!(cut.actual, Duration::from_millis(9500));
-        // Nothing else fit; every unit holds a choice, and tuning ended
-        // with the time.
-        assert_eq!(
-            depths(&report)[1..],
-            [(2, None), (0, None)]
-        );
-        assert!(units.iter().all(|unit| unit.concluded.is_some()));
-        assert!(report.overruns.is_empty());
-        assert_eq!(report.concluded, Duration::from_secs(10));
+        run(&mut units, &clock, 202);
+        let (slow, fast) = (units[0].measured.len() as f64, units[1].measured.len() as f64);
+        assert!((fast / slow - 4.).abs() < 0.5, "{slow} {fast}");
     }
 
+    /// A unit composed of another's choice reads it as it stands when its
+    /// own work starts: the prerequisite is sealed from then on and
+    /// receives no more work, and nothing is paid to seal it.
     #[test]
-    fn refinement_follows_the_step_time_each_unit_still_takes() {
-        // A unit that has recovered most of its time yields to one that has
-        // not: equal shares, one search cutting its cost to a fifth.
+    fn a_dependants_work_seals_its_prerequisites_at_no_cost() {
         let clock = Fake::default();
         let mut units = [
+            Synthetic::new(0, &clock, 0.5, &[0.5, 1., 1., 1.]),
             Synthetic {
-                floor: 1.,
-                ..Synthetic::new(0, &clock, 0.5, 1000)
+                prerequisites: vec![0],
+                ..Synthetic::new(1, &clock, 0.5, &[1.])
             },
-            Synthetic {
-                floor: 0.2,
-                ..Synthetic::new(1, &clock, 0.5, 20)
-            },
-        ];
-        run(&mut units, &clock, 33);
-        assert!(units[0].done > units[1].done);
-        // Equal shares and gains: the unit whose measurements cost four
-        // times as much gets the same time, and a quarter of the
-        // measurements in it.
-        let clock = Fake::default();
-        let mut units = [
-            Synthetic {
-                step: Duration::from_millis(400),
-                floor: 1.,
-                ..Synthetic::new(0, &clock, 0.5, 1000)
-            },
-            Synthetic {
-                floor: 1.,
-                ..Synthetic::new(1, &clock, 0.5, 1000)
-            },
-        ];
-        run(&mut units, &clock, 53);
-        let (slow, fast) = (units[0].done.as_secs_f64(), units[1].done.as_secs_f64());
-        assert!((fast / slow - 1.).abs() < 0.1, "{slow} {fast}");
-    }
-
-    /// Reserves far above what the conclusions take (units with nothing to
-    /// confirm): a unit is concluded when the reserves fill the time left,
-    /// what its conclusion did not use is dealt to the rest, and tuning uses
-    /// the time instead of ending with the reserves unspent.
-    #[test]
-    fn a_reserve_a_conclusion_does_not_use_is_dealt_to_the_units_still_open() {
-        let clock = Fake::default();
-        let mut units = [0.5, 0.3, 0.2]
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                confirm: Duration::from_millis(100),
-                reserved: Some(SECOND * 5),
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        let (log, report) = run(&mut units, &clock, 30);
-        // The three reserves are half the time: the first unit is concluded
-        // with 15 s left.
-        let first = log
-            .iter()
-            .position(|(_, step, _)| *step == Step::Conclude)
-            .unwrap();
-        assert!(log[first].2 <= Duration::from_secs(15), "{:?}", log[first]);
-        assert_eq!(report.reserved, SECOND * 15);
-        // The others were refined on after it, and the last unit until only
-        // its own reserve was left.
-        assert!(log[first + 1..]
-            .iter()
-            .any(|(_, step, _)| *step == Step::Refine));
-        assert!(report.refined >= Duration::from_millis(24_500), "{report:?}");
-        assert!(report.concluded <= Duration::from_secs(30));
-        assert!(report.overruns.is_empty(), "{:?}", report.overruns);
-        assert!(units.iter().all(|unit| unit.concluded.is_some()));
-        // Refined 3 s of the first 15 by the old rule, the units now hold
-        // most of the time.
-        let refined = units.iter().map(|unit| unit.done).sum::<Duration>();
-        assert!(refined >= Duration::from_secs(20), "{refined:?}");
-    }
-
-    /// Slow steps (every slice runs seconds past its end) and many small
-    /// units: the time still follows the shares, the small units' first
-    /// slices do not take it from the large unit.
-    #[test]
-    fn a_round_of_first_slices_does_not_take_the_time_from_the_largest_unit() {
-        let clock = Fake::default();
-        let mut shares = vec![0.5];
-        shares.extend([0.05; 10]);
-        let mut units = shares
-            .into_iter()
-            .enumerate()
-            .map(|(name, share)| Synthetic {
-                step: SECOND * 2,
-                floor: 1.,
-                ..Synthetic::new(name, &clock, share, 1000)
-            })
-            .collect::<Vec<_>>();
-        run(&mut units, &clock, 60);
-        // Half the step: about half of the refinement, not one slice in
-        // eleven.
-        let refined = units.iter().map(|unit| unit.done).sum::<Duration>();
-        let largest = units[0].done.as_secs_f64() / refined.as_secs_f64();
-        assert!(largest > 0.35, "{largest}: {refined:?}");
-    }
-
-    #[test]
-    fn finished_searches_conclude_at_once_and_their_time_goes_to_the_rest() {
-        let clock = Fake::default();
-        let mut units = [
-            Synthetic::new(0, &clock, 0.4, 2),
-            Synthetic::new(1, &clock, 0.4, 1000),
-            Synthetic::new(2, &clock, 0.2, 3),
         ];
         let (log, report) = run(&mut units, &clock, 60);
-        // The short searches ran to their ends and concluded then, not at
-        // the end of the time.
-        for unit in [0, 2] {
-            assert_eq!(units[unit].done, units[unit].work);
-            assert!(units[unit].concluded.unwrap() < Duration::from_secs(30));
-            let concluded = log
-                .iter()
-                .position(|(name, step, _)| *name == unit && *step == Step::Conclude)
-                .unwrap();
-            assert!(log[concluded + 1..].iter().all(|(name, _, _)| *name != unit));
-        }
-        // The long one got everything else: 60 s less three starts, three
-        // conclusions and the two short searches.
-        assert!(units[1].done >= Duration::from_secs(50), "{:?}", units[1].done);
-        assert!(report.concluded <= Duration::from_secs(60));
-        assert!(report.overruns.is_empty());
+        let log = stages(&log);
+        let dependant = log
+            .iter()
+            .position(|step| *step == (1, Stage::Measure))
+            .unwrap();
+        // The prerequisite's lead was converted before it was read.
+        assert!(log[..dependant].contains(&(0, Stage::Promote)));
+        assert!(
+            log[dependant..].iter().all(|(unit, _)| *unit != 0),
+            "a sealed prerequisite receives no more work: {log:?}"
+        );
+        assert_eq!(units[0].served, 0.5);
+        // Sealing took no time: the clock is the sum of the pieces.
+        assert_eq!(
+            report.ended,
+            report.admitted.iter().map(|admitted| admitted.actual).sum()
+        );
     }
 
+    /// Work of a class never observed has no price. It is started while
+    /// the longest operation completed fits what remains, and not after.
     #[test]
-    fn with_time_for_everything_every_search_runs_to_its_end() {
+    fn unpriced_work_is_not_started_late() {
+        let unit = |clock: &Fake, name, challengers: &[f64]| Synthetic {
+            unpriced_discovery: name == 1,
+            discovery: if name == 1 { SECOND } else { SECOND * 3 },
+            ..Synthetic::new(name, clock, 0.5, challengers)
+        };
+        // With the whole budget left the unpriced discovery runs first
+        // among the never-started units' pieces it shares the order with.
         let clock = Fake::default();
-        let mut units = [0.2, 0.5, 0.3]
+        let mut units = [unit(&clock, 0, &[]), unit(&clock, 1, &[])];
+        let (log, _) = run(&mut units, &clock, 10);
+        assert_eq!(
+            stages(&log),
+            [(0, Stage::Discovery), (1, Stage::Discovery)]
+        );
+        // The first unit's 3 s discovery is the longest operation the load
+        // has completed; with 2 s left the unpriced discovery is late.
+        let clock = Fake::default();
+        let mut units = [unit(&clock, 0, &[]), unit(&clock, 1, &[])];
+        let (log, report) = run(&mut units, &clock, 5);
+        assert_eq!(stages(&log), [(0, Stage::Discovery)]);
+        assert_eq!(report.ended, SECOND * 3);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].quote.forecast(), None);
+        assert_eq!(units[1].served, 1., "the unit keeps its published defaults");
+    }
+
+    /// Run `units` under `ceiling` bytes and return what they held at most.
+    fn bounded(units: &mut [Synthetic], clock: &Fake, total: u64, ceiling: u64) -> (Memory, Report) {
+        MEMORY.with(|memory| {
+            memory.set(Memory {
+                ceiling: Some(ceiling),
+                ..Memory::default()
+            })
+        });
+        let (_, report) = run(units, clock, total);
+        (MEMORY.with(Cell::take), report)
+    }
+
+    /// Many units whose inputs together are several times the ceiling: what
+    /// they hold never exceeds it at any instant, every unit still gets its
+    /// work, and inputs are given up only when a chosen piece needs their
+    /// bytes. This fails if any piece is started that does not fit.
+    #[test]
+    fn what_the_units_hold_never_exceeds_the_ceiling() {
+        let clock = Fake::default();
+        let mut units = (0..12)
+            .map(|name| Synthetic {
+                inputs: 100 + 10 * name as u64,
+                ..Synthetic::new(name, &clock, 1. / 12., &[1.; 6])
+            })
+            .collect::<Vec<_>>();
+        let whole = units.iter().map(|unit| unit.inputs).sum::<u64>();
+        let ceiling = 400;
+        assert!(whole > 4 * ceiling);
+        let (memory, report) = bounded(&mut units, &clock, 600, ceiling);
+        assert!(memory.peak <= ceiling, "{} bytes held", memory.peak);
+        assert!(memory.peak > ceiling / 2, "the bytes free were used");
+        // Every unit was discovered and measured to its end.
+        assert!(units.iter().all(|unit| unit.measured.len() == 6));
+        assert!(report.refused.is_empty());
+        // Nothing is held when no unit has work left.
+        assert_eq!(memory.held, 0);
+        assert!(units.iter().all(|unit| !unit.resident));
+        // With bytes for everything, nothing is built twice: inputs are
+        // kept between a unit's pieces while they fit.
+        let clock = Fake::default();
+        let mut units = (0..12)
+            .map(|name| Synthetic {
+                inputs: 100,
+                ..Synthetic::new(name, &clock, 1. / 12., &[1.; 6])
+            })
+            .collect::<Vec<_>>();
+        let (memory, _) = bounded(&mut units, &clock, 600, 1200);
+        assert_eq!(memory.peak, 1200);
+        assert!(units.iter().all(|unit| unit.built == 1));
+    }
+
+    /// The whole budget is used, whatever it is. A toolchain whose compile
+    /// call costs 3 s whatever it forms, with a second of measurement a
+    /// challenger: pieces of eight challengers share one call, and the
+    /// last piece of a budget is offered with as many challengers as what
+    /// is left fits, so the time unused is less than the smallest piece
+    /// (one call and one challenger). Nothing is refused for its seconds
+    /// while a smaller piece would fit. A domain smaller than the budget
+    /// measures is measured whole, and the load then ends early with
+    /// nothing refused.
+    #[test]
+    fn the_budget_is_used_to_the_smallest_piece_whatever_a_compile_call_costs() {
+        let (call, challenger, batch) = (SECOND * 3, SECOND, 8);
+        let unit = |clock: &Fake, challengers: usize| Synthetic {
+            compile: call,
+            measurement: challenger,
+            batch,
+            size: batch,
+            ..Synthetic::new(0, clock, 1., &vec![1.; challengers])
+        };
+        let mut measured = Vec::new();
+        for budget in [5u64, 20, 60, 120] {
+            let clock = Fake::default();
+            let mut units = [unit(&clock, 1000)];
+            let (log, report) = run(&mut units, &clock, budget);
+            let unused = report.unused();
+            assert!(unused < call + challenger, "{budget} s: {unused:?} unused");
+            assert_eq!(report.overrun(), Duration::ZERO);
+            // What is refused when nothing more starts is a piece of one
+            // challenger, and it does not fit.
+            assert_eq!(report.refused.len(), 1);
+            assert_eq!(units[0].challenging(), 1);
+            assert!(report.refused[0].quote.priced > unused);
+            // As many configurations a compile call as a piece holds, but
+            // for the last piece: a call for each challenger would measure
+            // one for every four seconds.
+            let calls = log
+                .iter()
+                .filter(|(_, stage, _)| *stage == Stage::Measure)
+                .count();
+            let formed = units[0].measured.len();
+            assert!(formed > batch * (calls - 1), "{formed} in {calls} calls");
+            if budget >= 20 {
+                let each_alone = (budget - 1) / (call + challenger).as_secs();
+                assert!(formed as u64 >= 2 * each_alone, "{formed} against {each_alone}");
+            }
+            measured.push(formed);
+        }
+        assert!(measured.windows(2).all(|pair| pair[0] < pair[1]), "{measured:?}");
+        // A domain the budget exhausts: everything is measured, nothing is
+        // refused, and the time left is the domain's doing.
+        let clock = Fake::default();
+        let mut units = [unit(&clock, 5)];
+        let (_, report) = run(&mut units, &clock, 120);
+        assert_eq!(units[0].measured.len(), 5);
+        assert!(report.refused.is_empty());
+        assert!(report.unused() > SECOND * 100);
+        // Units that promoted beside one still measuring: each owes its
+        // choice's serving artifact, a compile call, when the work stops,
+        // and nothing else is held back for it. The measuring unit's pieces
+        // promote nothing and add no artifact to what is owed, so the
+        // budget is still used to the smallest piece: what is unused is
+        // less than one call and one challenger, and what was owed is
+        // settled inside the budget.
+        for budget in [20u64, 60, 120] {
+            let clock = Fake::default();
+            let promoting = |name: usize| Synthetic {
+                artifact: call,
+                promotion: challenger,
+                ..Synthetic::new(name, &clock, 0.1, &[0.5])
+            };
+            let mut units = [
+                Synthetic {
+                    artifact: call,
+                    ..unit(&clock, 1000)
+                },
+                promoting(1),
+                promoting(2),
+            ];
+            let (_, report) = run(&mut units, &clock, budget);
+            assert!(units[1..].iter().all(|unit| unit.served == 0.5));
+            assert!(units.iter().all(|unit| !unit.unformed));
+            let unused = report.unused();
+            assert!(unused < call + challenger, "{budget} s: {unused:?} unused");
+            assert_eq!(report.overrun(), Duration::ZERO);
+            assert_eq!(report.settling, call * 2);
+        }
+    }
+
+    /// Formed programs are held by need, not by role. While everything
+    /// fits, nothing a unit formed is given up, whatever it forms after.
+    /// When a chosen piece does not fit, another unit gives up its programs
+    /// before any unit gives up its inputs, and only as often as the bytes
+    /// are needed: every challenger is still measured, no inputs are built
+    /// twice, and the ceiling holds at every instant.
+    #[test]
+    fn formed_programs_stay_held_while_they_fit_and_go_before_inputs() {
+        let (inputs, program, challengers) = (100, 30, 5);
+        let pair = |clock: &Fake| {
+            [0, 1].map(|name| Synthetic {
+                inputs,
+                program,
+                ..Synthetic::new(name, clock, 0.5, &vec![1.; challengers])
+            })
+        };
+        let everything = 2 * (inputs + program * challengers as u64);
+        // Room for everything: nothing is given up.
+        let clock = Fake::default();
+        let mut units = pair(&clock);
+        let (memory, report) = bounded(&mut units, &clock, 600, everything);
+        assert!(report.refused.is_empty());
+        assert!(units.iter().all(|unit| unit.given_up == 0));
+        assert!(units.iter().all(|unit| unit.measured.len() == challengers));
+        assert_eq!(
+            memory.held,
+            units.iter().map(|unit| unit.programs_held).sum::<u64>()
+        );
+        // Room for less: programs go, by need, and inputs stay.
+        let ceiling = 400;
+        assert!(ceiling < everything);
+        let clock = Fake::default();
+        let mut units = pair(&clock);
+        let (memory, report) = bounded(&mut units, &clock, 600, ceiling);
+        assert!(memory.peak <= ceiling, "{} bytes held", memory.peak);
+        assert!(report.refused.is_empty());
+        assert!(units.iter().all(|unit| unit.measured.len() == challengers));
+        assert!(units.iter().any(|unit| unit.given_up > 0));
+        assert!(units.iter().all(|unit| unit.built == 1));
+        // No more was given up than the bytes that did not fit: one
+        // unit's programs, at most twice.
+        assert!(units.iter().map(|unit| unit.given_up).sum::<usize>() <= 2);
+    }
+
+    /// Compiles hold bytes too. What a challenger's compile frees counts
+    /// until the load returns it, which it does before any unit gives its
+    /// inputs up; what a compile leaves for good is given back by nothing,
+    /// so the unit stops forming challengers before the next would cross
+    /// the ceiling, with budget left, and is refused for its bytes. The
+    /// ceiling is never exceeded, what compiles left for good included.
+    #[test]
+    fn compiles_are_bounded_by_the_bytes_they_hold_and_leave_held() {
+        let (inputs, residue, garbage, ceiling) = (100, 30, 50, 400);
+        let challengers = 20;
+        let unit = |clock: &Fake, residue, garbage| Synthetic {
+            inputs,
+            residue,
+            garbage,
+            ..Synthetic::new(0, clock, 1., &vec![1.; challengers])
+        };
+        let clock = Fake::default();
+        let mut units = [unit(&clock, residue, garbage)];
+        let (memory, report) = bounded(&mut units, &clock, 600, ceiling);
+        assert!(memory.peak <= ceiling, "{} bytes held", memory.peak);
+        // The inputs and one compile's freed bytes fit beside what the
+        // compiles left for good until the tenth: 100 + 50 + 30 n <= 400.
+        let formed = units[0].measured.len() as u64;
+        assert_eq!(formed, (ceiling - inputs - garbage) / residue);
+        assert!(formed < challengers as u64);
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(0, Refusal::Bytes)]
+        );
+        assert!(clock.now() < SECOND * 600, "the budget was not what ended it");
+        // What the compiles left for good is still held when the unit has
+        // given everything else up.
+        assert_eq!(memory.held - memory.freed, formed * residue);
+        // Compiles that leave nothing for good are bounded by nothing: what
+        // they free is returned whenever a piece needs the bytes.
+        let clock = Fake::default();
+        let mut units = [unit(&clock, 0, garbage)];
+        let (memory, report) = bounded(&mut units, &clock, 600, ceiling);
+        assert!(memory.peak <= ceiling, "{} bytes held", memory.peak);
+        assert_eq!(units[0].measured.len(), challengers);
+        assert!(report.refused.is_empty());
+    }
+
+    /// A piece whose bytes do not fit under the ceiling, whatever every
+    /// other unit gives up, is not started: its unit keeps its published
+    /// defaults, holds nothing, and the others' work goes on.
+    #[test]
+    fn a_piece_whose_bytes_do_not_fit_is_not_started() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic {
+                inputs: 500,
+                ..Synthetic::new(0, &clock, 0.9, &[0.5])
+            },
+            Synthetic {
+                inputs: 100,
+                ..Synthetic::new(1, &clock, 0.1, &[0.5])
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 60, 300);
+        assert!(memory.peak <= 300);
+        assert_eq!(units[0].discovered, 0, "the piece that does not fit never ran");
+        assert_eq!(units[0].built, 0);
+        assert_eq!(units[0].served, 1.);
+        assert_eq!(units[1].served, 0.5, "the unit that fits was tuned");
+        assert_eq!(
+            report.refused,
+            [Refused {
+                unit: 0,
+                stage: Stage::Discovery,
+                quote: priced(SECOND),
+                footprint: seismic::Footprint {
+                    priced: 500,
+                    unpriced: 0,
+                },
+                refusal: Refusal::Bytes,
+            }]
+        );
+    }
+
+    /// Host RAM and a device with memory of its own are two domains, and
+    /// room in one admits nothing in the other: with a device that could
+    /// hold every unit's inputs many times over, what the units hold on the
+    /// host still never passes the host's ceiling. Two units whose host
+    /// bytes do not fit together are tuned one after the other, and a unit
+    /// whose host bytes alone pass the ceiling is never started.
+    #[test]
+    fn host_bytes_are_admitted_against_the_hosts_own_ceiling() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic {
+                inputs: 100,
+                host: 200,
+                ..Synthetic::new(0, &clock, 0.5, &[0.5])
+            },
+            Synthetic {
+                inputs: 100,
+                host: 200,
+                ..Synthetic::new(1, &clock, 0.3, &[0.5])
+            },
+            Synthetic {
+                inputs: 100,
+                host: 500,
+                ..Synthetic::new(2, &clock, 0.2, &[0.5])
+            },
+        ];
+        MEMORY.with(|memory| {
+            memory.set(Memory {
+                ceiling: Some(1_000_000),
+                host_ceiling: Some(300),
+                ..Memory::default()
+            })
+        });
+        let (_, report) = run(&mut units, &clock, 600);
+        let memory = MEMORY.with(Cell::take);
+        assert!(memory.peak <= 300, "the device was never near its ceiling");
+        assert!(memory.host_peak <= 300, "{} host bytes held", memory.host_peak);
+        assert_eq!(memory.host_peak, 200, "one unit's inputs at a time");
+        assert_eq!((units[0].served, units[1].served), (0.5, 0.5));
+        assert_eq!(units[2].built, 0, "the unit the host cannot hold never ran");
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(2, Refusal::Bytes)]
+        );
+    }
+
+    /// Under the host's ceiling a piece starts when its bytes fit beside
+    /// those in flight; past the ceiling nothing starts, a piece priced at
+    /// nothing included, so what is held for nothing is returned first.
+    #[test]
+    fn nothing_starts_while_the_host_holds_more_than_its_ceiling() {
+        assert!(HostRoom::Unbounded.admits(u64::MAX, u64::MAX));
+        assert!(HostRoom::Free(300).admits(200, 100));
+        assert!(!HostRoom::Free(300).admits(200, 101));
+        assert!(HostRoom::Free(0).admits(0, 0));
+        assert!(!HostRoom::Exceeded.admits(0, 0));
+    }
+
+    /// A piece whose bytes have no observed price is admitted on nothing
+    /// but the room as it is, so two such pieces are never in flight
+    /// together: units whose compiles would overlap compile one at a time
+    /// while their pieces' bytes stay unpriced, and all their work still
+    /// runs.
+    #[test]
+    fn a_piece_without_a_price_runs_with_no_other_such_piece_in_flight() {
+        let clock = Fake::default();
+        let overlap = |unobserved: bool| {
+            let mut units = compiling(&clock, 3, 2, 1.);
+            for unit in &mut units {
+                unit.unobserved = unobserved;
+            }
+            MEMORY.with(|memory| {
+                memory.set(Memory {
+                    ceiling: Some(1_000_000),
+                    ..Memory::default()
+                })
+            });
+            let mut workers = Overlapping::new(&clock, usize::MAX);
+            let (_, outcome) = allocate(
+                &mut units,
+                &mut Log::default(),
+                &clock,
+                &mut workers,
+                clock.now() + SECOND * 600,
+                Duration::ZERO,
+            );
+            MEMORY.with(Cell::take);
+            outcome.expect("no synthetic work fails");
+            assert!(units.iter().all(|unit| unit.measured.len() == 2));
+            workers.most
+        };
+        assert!(overlap(false) > 1, "priced pieces' compiles overlap");
+        assert_eq!(overlap(true), 1);
+    }
+
+    /// Every unit's other forms are measured before any unit refines a
+    /// form, the more valuable unit's first: a low-share unit's form
+    /// representative comes before the refinement of a unit worth nine
+    /// times as much, and no refinement of the lesser unit precedes a form
+    /// of the greater.
+    #[test]
+    fn forms_are_measured_by_value_before_any_refinement() {
+        let clock = Fake::default();
+        let mut units = [0.1, 0.6, 0.3]
             .into_iter()
             .enumerate()
-            .map(|(name, share)| Synthetic::new(name, &clock, share, 4 + name as u64))
+            .map(|(name, share)| Synthetic {
+                forms: 2,
+                ..Synthetic::new(name, &clock, share, &[1.; 6])
+            })
             .collect::<Vec<_>>();
-        let (log, report) = run(&mut units, &clock, 600);
-        assert!(units.iter().all(|unit| unit.done == unit.work));
-        // Starts, the searches and the conclusions: nothing waits for the
-        // time to end.
-        assert_eq!(report.concluded, Duration::from_millis(3000 + 15000 + 1500));
+        let (log, _) = run(&mut units, &clock, 600);
+        let log = stages(&log);
+        let measured = log
+            .iter()
+            .filter(|(_, stage)| matches!(stage, Stage::Form | Stage::Measure))
+            .copied()
+            .collect::<Vec<_>>();
+        // Six form representatives, the largest share's first, then
+        // refinement.
         assert_eq!(
-            log.iter()
-                .filter(|(_, step, _)| *step == Step::Conclude)
-                .count(),
-            3
+            measured[..6],
+            [1, 1, 2, 2, 0, 0].map(|unit| (unit, Stage::Form)),
+            "{measured:?}"
         );
+        assert!(measured[6..].iter().all(|(_, stage)| *stage == Stage::Measure));
+        for (position, (unit, stage)) in measured.iter().enumerate() {
+            if *stage == Stage::Measure {
+                assert!(
+                    measured[position..].iter().all(|(later, stage)| {
+                        *stage != Stage::Form || units[*later].share <= units[*unit].share
+                    }),
+                    "a refinement of unit {unit} preceded a form of a unit worth more"
+                );
+            }
+        }
+    }
+
+    /// A mix of units as a load has them: four whose launches are formed
+    /// separately, one short compile a piece, and holding nearly all of
+    /// step time; and one of a few percent whose programs are formed whole,
+    /// a compile eight times its measurement for every piece (on CUDA two
+    /// such units once spent most of a budget compiling on the device's
+    /// thread while most units stopped at their defaults). Its compiles run
+    /// ahead on a worker like any other, so they take none of the device's
+    /// time; every unit's other forms are measured, the units worth more
+    /// first, before any unit refines one; and the device is given to the
+    /// lesser unit for its measurements alone.
+    #[test]
+    fn a_low_share_units_long_compiles_do_not_crowd_out_other_units_forms() {
+        let clock = Fake::default();
+        let whole = Synthetic {
+            compile: SECOND * 8,
+            forms: 2,
+            ..Synthetic::new(0, &clock, 0.03, &[1.; 8])
+        };
+        let mut units = std::iter::once(whole)
+            .chain((1..=4).map(|name| Synthetic {
+                compile: SECOND,
+                forms: 2,
+                ..Synthetic::new(name, &clock, 0.2425, &[1.; 4])
+            }))
+            .collect::<Vec<_>>();
+        let budget = 40;
+        let (log, report) = run(&mut units, &clock, budget);
+        assert_eq!(report.overrun(), Duration::ZERO);
+        // Every unit's other forms were measured, and every unit worth
+        // more refined its forms too: none stopped at its defaults.
+        assert!(units.iter().all(|unit| unit.measured.len() >= unit.forms));
+        assert!(units[1..].iter().all(|unit| unit.measured.len() == 4));
+        // No refinement of any unit was admitted before every unit's forms
+        // were: a form whose long compile is in flight is admitted, and the
+        // device takes other work meanwhile rather than wait for it.
+        let began = |stage: Stage| {
+            report
+                .admitted
+                .iter()
+                .filter(move |admitted| admitted.stage == stage)
+                .map(|admitted| admitted.began)
+        };
+        assert!(began(Stage::Form).max() <= began(Stage::Measure).min());
+        // Of the forms, the units worth more were measured first.
+        let pieces = stages(&log)
+            .into_iter()
+            .filter(|(_, stage)| matches!(stage, Stage::Form | Stage::Measure))
+            .collect::<Vec<_>>();
+        let first_of_whole = pieces
+            .iter()
+            .position(|(unit, _)| *unit == 0)
+            .expect("the lesser unit's form was measured");
+        assert!(
+            (1..=4).all(|unit| pieces[..first_of_whole]
+                .iter()
+                .any(|(earlier, _)| *earlier == unit)),
+            "{pieces:?}"
+        );
+        // Every piece of the lesser unit compiled ahead for the eight
+        // seconds it was quoted and held the device for its one second of
+        // measurement: its compiles cost the device nothing.
+        let lesser = report
+            .admitted
+            .iter()
+            .filter(|admitted| admitted.unit == 0 && admitted.stage != Stage::Discovery)
+            .collect::<Vec<_>>();
+        assert!(lesser.len() >= 2);
+        for admitted in &lesser {
+            assert_eq!(admitted.formed, Some(SECOND * 8));
+            assert_eq!(admitted.actual, SECOND);
+        }
+        // What the device did is every piece's own time, compiles
+        // excluded: the 5 discoveries, 16 measurements of the units worth
+        // more, and the lesser unit's.
+        let device = report
+            .admitted
+            .iter()
+            .fold(Duration::ZERO, |sum, admitted| sum + admitted.actual);
+        assert_eq!(device, SECOND * (5 + 16 + lesser.len() as u32));
+    }
+
+    /// What one unit builds says nothing of another unit's work: a unit
+    /// whose first challengers' bytes are not yet observed starts them
+    /// beside a unit that made a large build, where holding each of its
+    /// unobserved operations to that build would refuse it for the load.
+    #[test]
+    fn an_unobserved_piece_is_not_held_to_another_units_largest_build() {
+        let clock = Fake::default();
+        let mut units = [
+            // A large build: more than is free beside it.
+            Synthetic {
+                inputs: 600,
+                unobserved: true,
+                ..Synthetic::new(0, &clock, 0.1, &[1.; 3])
+            },
+            Synthetic {
+                inputs: 50,
+                unobserved: true,
+                ..Synthetic::new(1, &clock, 0.9, &[0.5, 1., 1.])
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 60, 1000);
+        assert!(memory.peak <= 1000);
+        assert_eq!(units[1].measured.len(), 3, "{:?}", report.refused);
+        assert_eq!(units[1].served, 0.5);
+        // Nothing was given up for it: both units' inputs were built once.
+        assert_eq!((units[0].built, units[1].built), (1, 1));
+        // The large unit's own unobserved piece is held to its own build,
+        // which does not fit: it is refused for its bytes, and says so.
+        assert!(units[0].measured.is_empty());
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(0, Refusal::Bytes)]
+        );
+    }
+
+    /// Each unit whose work changed its record owes one publication when
+    /// the allocator stops. The publications are priced and work is
+    /// admitted only so that they fit: the allocator stops with them
+    /// settled inside the budget, where pieces admitted on their own price
+    /// alone would leave them to run past it.
+    #[test]
+    fn publications_owed_at_the_stop_fit_the_budget_by_planning() {
+        let clock = Fake::default();
+        let unit = |name: usize, clock: &Fake, challengers: usize| Synthetic {
+            publication: SECOND * 2,
+            ..Synthetic::new(name, clock, 0.5, &vec![1.; challengers])
+        };
+        let mut units = [unit(0, &clock, 100), unit(1, &clock, 100), unit(2, &clock, 0)];
+        // The third unit has no points to discover and no work at all.
+        units[2].points = 0;
+        let (log, report) = run(&mut units, &clock, 20);
+        // Two discoveries, each leaving 2 s owed; then pieces of 1 s while
+        // 4 s stay for the two publications: 16 s of work, 4 s of settling.
+        assert_eq!(log.len(), 16);
+        assert_eq!(report.settling, SECOND * 4);
+        assert_eq!(report.ended, SECOND * 20);
+        assert_eq!((report.unused(), report.overrun()), (Duration::ZERO, Duration::ZERO));
+        // Each unit that worked was published once; the one that did not
+        // owed nothing.
+        assert_eq!(units.each_ref().map(|unit| unit.published), [1, 1, 0]);
+        assert!(units.iter().all(|unit| !unit.changed));
+        // A budget that holds one unit's discovery and its publication but
+        // not the other's too starts one unit only.
+        let clock = Fake::default();
+        let mut units = [unit(0, &clock, 0), unit(1, &clock, 0)];
+        let (log, report) = run(&mut units, &clock, 5);
+        assert_eq!(stages(&log), [(0, Stage::Discovery)]);
+        assert_eq!((report.ended, report.overrun()), (SECOND * 3, Duration::ZERO));
+        assert_eq!(report.refused.len(), 1);
+    }
+
+    /// A unit whose next piece, with its own inputs, needs more than the
+    /// ceiling is refused for the load: it gives its inputs up at once, so
+    /// the next unit's inputs are never resident beside them.
+    #[test]
+    fn a_unit_refused_for_bytes_for_the_load_holds_nothing() {
+        let clock = Fake::default();
+        let mut units = [
+            // Its unobserved challenger is held to its own build: 600 on
+            // top of its 600 of inputs never fits 1000.
+            Synthetic {
+                inputs: 600,
+                unobserved: true,
+                ..Synthetic::new(0, &clock, 0.5, &[1.; 3])
+            },
+            Synthetic {
+                inputs: 50,
+                ..Synthetic::new(1, &clock, 0.4, &[1.; 3])
+            },
+            Synthetic {
+                inputs: 300,
+                ..Synthetic::new(2, &clock, 0.1, &[1.; 3])
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 60, 1000);
+        assert!(units[0].measured.is_empty());
+        assert_eq!(units[0].built, 1);
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(0, Refusal::Bytes)]
+        );
+        // Its refusal is known when its discovery ends: no other unit's
+        // inputs were ever held beside its 600.
+        assert_eq!(memory.peak, 600);
+        assert_eq!(memory.held, 0);
+        assert!(units.iter().skip(1).all(|unit| unit.measured.len() == 3));
+    }
+
+    /// A unit refused for bytes that another unit's kept work holds keeps
+    /// its inputs while that could change, and holds none when the
+    /// allocator stops.
+    #[test]
+    fn a_unit_refused_for_bytes_holds_nothing_when_the_allocator_stops() {
+        let clock = Fake::default();
+        let mut units = [
+            Synthetic {
+                kept: 300,
+                ..Synthetic::new(0, &clock, 0.5, &[])
+            },
+            // 400 of inputs and 400 more for its unobserved challenger fit
+            // the ceiling, but not beside the other unit's 300.
+            Synthetic {
+                inputs: 400,
+                unobserved: true,
+                ..Synthetic::new(1, &clock, 0.5, &[1.; 3])
+            },
+        ];
+        let (memory, report) = bounded(&mut units, &clock, 60, 1000);
+        assert!(units[1].measured.is_empty());
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refused| (refused.unit, refused.refusal))
+                .collect::<Vec<_>>(),
+            [(1, Refusal::Bytes)]
+        );
+        assert!(!units[1].resident);
+        assert_eq!(memory.held, 300, "only what is not inputs stays held");
+    }
+
+    /// A unit whose remaining work no longer fits the budget gives its
+    /// inputs up at once, not when the load's tuning ends.
+    #[test]
+    fn a_unit_with_no_work_that_can_start_holds_no_inputs() {
+        let clock = Fake::default();
+        let mut units = [
+            // Its challengers take longer than what is left after its
+            // discovery.
+            Synthetic {
+                inputs: 100,
+                measurement: SECOND * 30,
+                ..Synthetic::new(0, &clock, 0.5, &[1.; 4])
+            },
+            Synthetic {
+                inputs: 100,
+                ..Synthetic::new(1, &clock, 0.5, &[1.; 4])
+            },
+        ];
+        let (memory, _) = bounded(&mut units, &clock, 20, 1000);
+        assert!(units[0].measured.is_empty());
+        assert_eq!(units[0].built, 1);
+        // The two were never resident together past the first's discovery:
+        // it gave its inputs up before the second unit's work held more.
+        assert_eq!(memory.peak, 100);
+        assert_eq!(units[1].measured.len(), 4);
     }
 }

@@ -16,30 +16,38 @@
 
 use super::cases::projection_shape;
 use super::{
-    longest_history, row_points, served_row_points, with_contexts, CaseState, EntryTuning,
-    ModelInputs, PointShape, TuningInputs, TuningLimits,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, across_sequences,
+    history_placement, longest_history, row_points, served_row_points, with_contexts,
 };
 use crate::operators;
 use crate::operators::attention::graph::{
-    affine_coefficients, rotary_amplitudes, rotary_components, rotary_frequencies, DECODE_ROWS,
+    DECODE_ROWS, rotary_amplitudes, rotary_components, rotary_frequencies,
 };
 use crate::{AttentionBinding, AttentionShape};
 use magnitude_family_contracts::{
-    Attention, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
+    Attention, HeadHistory, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
 };
 use magnitude_kernels::{
     attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
     attention_prefill_k8v4, attention_project,
 };
 use seismic::{Device, Element, Tensor};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
-/// Start the Vulkan key-parallel form and Metal's grouped-query matrix
-/// forms at a bounded encoded-history slice of the longest history the
-/// case's layers keep (a window layer never holds the whole context). A start
-/// changes only the form's first measurement; every admissible configuration
-/// remains searchable and is judged on the case's served points. Metal verification
-/// also starts from the first legal scalar query-group split.
+/// Start CUDA verification with a query tile sized for its served rows;
+/// start the Vulkan key-parallel and Metal matrix forms at a bounded
+/// encoded-history slice of the longest history the case's layers keep
+/// (a window layer never holds the whole context), and every other Metal
+/// matrix form at the partitions that fill the device for its kv heads
+/// (one kv head of a long history needs many). Metal verification also
+/// starts from the first legal scalar query-group split. Starts expose useful
+/// candidates early; every admissible configuration remains searchable and
+/// is judged on the case's served points.
+/// Threadgroups a Metal decode-attention grid needs to keep an Apple GPU
+/// busy over a long history (`decode_starts`).
+const DECODE_GRID: u64 = 128;
+
 fn decode_starts(
     mix: &AttentionMix,
     backend: seismic::BackendName,
@@ -52,8 +60,12 @@ fn decode_starts(
     };
     let default_parts = defaults.param("PARTS").unwrap_or(1);
     let history = longest_history(limits, mix.window);
-    // K8/V4 codes and the scale/zero pairs use 7W/4 bytes per KV head row.
-    let bytes_per_head = history.saturating_mul(mix.shape.width).saturating_mul(7) / 4;
+    // Physical history traffic follows the selected load-owned descriptor.
+    let bytes_per_head = history.saturating_mul(
+        mix.codec
+            .bytes_per_head()
+            .expect("validated history descriptor") as u64,
+    );
     // Wide heads run the keywise walk in one subgroup. Across multiple
     // verification rows, extra partitions multiply its merge and dispatch
     // work; start at the default partition count and let the search compare
@@ -66,6 +78,35 @@ fn decode_starts(
         bytes_per_head.div_ceil(256 * 1024)
     };
     let mut starts = match backend {
+        seismic::BackendName::Cuda
+            if mix.shape.width <= 256
+                && mix.decode_rows.as_ref().is_some_and(|rows| rows.start >= 2)
+                && limits.max_rows >= 2 =>
+        {
+            let rows = mix.decode_rows.as_ref().unwrap();
+            let widest = (rows.end - 1).min(DECODE_ROWS).min(limits.max_rows);
+            nearest(
+                implementation,
+                statics,
+                |choice| choice.param("MATRIX") == Some(1) && choice.param("QREG") == Some(1),
+                |choice| {
+                    let warps = choice.param("WARPS").unwrap_or(1);
+                    let tokens = (warps * 16 / mix.shape.group).max(1);
+                    // Share history across the widest served verification
+                    // tile with the fewest row warps. Register-held queries
+                    // need room per thread, so start at the fewest column
+                    // groups and operand stages. The declared domain and
+                    // normal served-resource checks remain authoritative.
+                    (
+                        widest.div_ceil(tokens),
+                        warps,
+                        choice.param("COLUMNS").unwrap_or(1),
+                        choice.param("STAGES").unwrap_or(2),
+                        choice.param("PARTS").unwrap_or(1).abs_diff(default_parts),
+                    )
+                },
+            )
+        }
         seismic::BackendName::Vulkan if desired_parts > default_parts || wide_verification => {
             nearest(
                 implementation,
@@ -134,6 +175,34 @@ fn decode_starts(
                         choice.param("KEYS").unwrap_or(16).abs_diff(keys),
                         choice.param("SIMDS").unwrap_or(4).abs_diff(simds),
                         choice.param("SPAN").unwrap_or(128).abs_diff(span),
+                    )
+                },
+            )
+        }
+        // Every other Metal matrix form walks a partition of its kv head's
+        // history per threadgroup, in a grid of one row of partitions per kv
+        // head, so the default partition count leaves the device idle over
+        // long histories when there are few kv heads (Gemma 4 full layers:
+        // one kv head of 512 columns, E2B 64K, four verification rows: P16
+        // 2.9 ms, P128 1.8 ms). Seed the partitions that give the grid about
+        // DECODE_GRID threadgroups, no partition holding under 64 KiB of
+        // encoded history, rows of one token each over eight simdgroups.
+        seismic::BackendName::Metal => {
+            let target_parts = (DECODE_GRID / mix.shape.kv_heads.max(1))
+                .min(bytes_per_head.div_ceil(64 * 1024))
+                .max(1)
+                .next_power_of_two();
+            nearest(
+                implementation,
+                statics,
+                |choice| choice.param("MATRIX") == Some(1),
+                |choice| {
+                    (
+                        choice.param("PARTS").unwrap_or(1).abs_diff(target_parts),
+                        choice.param("TOKENS").unwrap_or(1).abs_diff(1),
+                        choice.param("SIMDS").unwrap_or(4).abs_diff(8),
+                        choice.param("KEYS").unwrap_or(16).abs_diff(16),
+                        choice.param("SPAN").unwrap_or(32).abs_diff(32),
                     )
                 },
             )
@@ -273,7 +342,9 @@ impl EntryTuning for AttentionProjectTuning {
         }
         let [_, statics @ ..] = if self.binding.key_value_only {
             shape.key_value_dimensions(0)
-        } else { shape.project_dimensions(0) };
+        } else {
+            shape.project_dimensions(0)
+        };
         Ok(statics.to_vec())
     }
 
@@ -305,8 +376,11 @@ impl EntryTuning for AttentionProjectTuning {
                     gate: {
                         let gate = segment(shape.gate_rows(), WeightKind::AttentionGate)?;
                         if self.binding.key_value_only {
-                            gate.slice_leading(0, 0).map_err(|error| error.to_string())?
-                        } else { gate }
+                            gate.slice_leading(0, 0)
+                                .map_err(|error| error.to_string())?
+                        } else {
+                            gate
+                        }
                     },
                     key: segment(shape.key_rows(), WeightKind::Key)?,
                     value: segment(shape.value_rows(), WeightKind::Value)?,
@@ -317,8 +391,12 @@ impl EntryTuning for AttentionProjectTuning {
                     )?,
                     input_norm: inputs.weight(scope, WeightKind::InputNorm)?,
                     query: if self.binding.key_value_only {
-                        query.slice_leading(0, 0).map_err(|error| error.to_string())?
-                    } else { query },
+                        query
+                            .slice_leading(0, 0)
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        query
+                    },
                     epsilon: self.epsilon,
                 })
             })
@@ -428,12 +506,13 @@ impl EntryTuning for AttentionOutputTuning {
         }
     }
 
-    generated_entry!(attention_output, this => this.elements(), rounded to this.activation);
+    generated_entry!(attention_output, this => this.elements());
 }
 
 /// What every fused attention entry tunes over.
 #[derive(Clone)]
 pub(crate) struct AttentionMix {
+    pub codec: magnitude_state::CodecSpec,
     pub activation: Element,
     pub shape: AttentionShape,
     pub scopes: Vec<WeightScope>,
@@ -452,7 +531,8 @@ pub(crate) struct AttentionMix {
 
 /// The most history rows the layers `scopes` name keep: the largest window
 /// among them, none when any keeps the whole context. A Shared layer reads
-/// its source's history and keeps what the source does.
+/// its source's history and keeps what the source does; a head reading the
+/// target's history names a target layer as its source.
 pub(crate) fn history_window(
     inputs: &ModelInputs<'_>,
     scopes: &[WeightScope],
@@ -462,16 +542,31 @@ pub(crate) fn history_window(
         let domain = match &operator(inputs, &[*scope])?.key_value {
             KeyValue::Owned { domain, .. } => *domain,
             KeyValue::Shared { source } => {
-                let owner = match scope {
-                    WeightScope::TargetSublayer(_) => WeightScope::TargetSublayer(*source),
-                    WeightScope::HeadSublayer(_) => WeightScope::HeadSublayer(*source),
-                    WeightScope::DraftSublayer(_) => WeightScope::DraftSublayer(*source),
-                    other => return Err(format!("{other:?} names no sublayer")),
-                };
-                match &operator(inputs, &[owner])?.key_value {
-                    KeyValue::Owned { domain, .. } => *domain,
-                    KeyValue::Shared { .. } => {
-                        return Err(format!("{owner:?} owns no history for {scope:?} to read"))
+                let target_read = matches!(scope, WeightScope::HeadSublayer(_))
+                    && inputs
+                        .definition
+                        .head
+                        .as_ref()
+                        .is_some_and(|head| head.history == HeadHistory::Target);
+                if target_read {
+                    // Through the target's own sharing to the owning layer.
+                    inputs
+                        .definition
+                        .decoder
+                        .history_domain(*source)
+                        .ok_or_else(|| format!("{scope:?} reads no target history"))?
+                } else {
+                    let owner = match scope {
+                        WeightScope::TargetSublayer(_) => WeightScope::TargetSublayer(*source),
+                        WeightScope::HeadSublayer(_) => WeightScope::HeadSublayer(*source),
+                        WeightScope::DraftSublayer(_) => WeightScope::DraftSublayer(*source),
+                        other => return Err(format!("{other:?} names no sublayer")),
+                    };
+                    match &operator(inputs, &[owner])?.key_value {
+                        KeyValue::Owned { domain, .. } => *domain,
+                        KeyValue::Shared { .. } => {
+                            return Err(format!("{owner:?} owns no history for {scope:?} to read"));
+                        }
                     }
                 }
             }
@@ -535,6 +630,8 @@ pub(crate) struct AttentionMixCase<H> {
 /// shared by every point with the same history rows (one history length, in
 /// any unit of the tuning), ending at a point's appended rows.
 pub(crate) trait MixHistory: Sized {
+    /// The codec of the store whose histories these planes are.
+    const CODEC: magnitude_state::KvCodec;
     /// Planes of `rows` history rows, viewed up to `view` rows with
     /// `appended` written.
     fn build(
@@ -556,6 +653,8 @@ pub(crate) struct DenseMixHistory {
 }
 
 impl MixHistory for DenseMixHistory {
+    const CODEC: magnitude_state::KvCodec = magnitude_state::KvCodec::Dense;
+
     fn build(
         inputs: &mut TuningInputs<'_, '_>,
         mix: &AttentionMix,
@@ -638,6 +737,8 @@ impl AffineMixHistory {
 }
 
 impl MixHistory for AffineMixHistory {
+    const CODEC: magnitude_state::KvCodec = magnitude_state::KvCodec::AffineK8V4;
+
     fn build(
         inputs: &mut TuningInputs<'_, '_>,
         mix: &AttentionMix,
@@ -649,24 +750,37 @@ impl MixHistory for AffineMixHistory {
         let mut plane =
             |name: &str, build: &dyn Fn(&TuningInputs<'_, '_>) -> Result<Tensor, String>| {
                 let plane = inputs.shared(
-                    format!("{name}-affine-{rows}x{}x{}", shape.kv_heads, shape.width),
+                    format!(
+                        "{name}-affine-{rows}x{}x{}-{:?}",
+                        shape.kv_heads, shape.width, mix.codec
+                    ),
                     |inputs| build(inputs),
                 )?;
                 inputs.slab_state(plane, view, appended.clone())
             };
-        let pairs = [rows, shape.kv_heads, affine_coefficients(shape.width)];
+        let geometry = mix.codec.affine_geometry().map_err(|e| e.to_string())?;
+        let pairs = [rows, shape.kv_heads, geometry.key_coefficients as u64];
+        let value_pairs = [rows, shape.kv_heads, geometry.value_coefficients as u64];
         Ok(Self {
             key_codes: plane("history_key_codes", &|inputs| {
-                Self::codes(inputs, &[rows, shape.kv_heads, shape.width / 4], 0x6b)
+                Self::codes(
+                    inputs,
+                    &[rows, shape.kv_heads, geometry.key_codes as u64],
+                    0x6b,
+                )
             })?,
             key_coefficients: plane("history_key_coefficients", &|inputs| {
-                Self::coefficients(inputs, &pairs, 255)
+                Self::coefficients(inputs, &pairs, (1 << geometry.key_bits) - 1)
             })?,
             value_codes: plane("history_value_codes", &|inputs| {
-                Self::codes(inputs, &[rows, shape.kv_heads, shape.width / 8], 0x76)
+                Self::codes(
+                    inputs,
+                    &[rows, shape.kv_heads, geometry.value_codes as u64],
+                    0x76,
+                )
             })?,
             value_coefficients: plane("history_value_coefficients", &|inputs| {
-                Self::coefficients(inputs, &pairs, 15)
+                Self::coefficients(inputs, &value_pairs, (1 << geometry.value_bits) - 1)
             })?,
         })
     }
@@ -691,6 +805,52 @@ impl MixHistory for AffineMixHistory {
 }
 
 impl AttentionMix {
+    /// The dimensions of the unit's calls at `shapes` over every history
+    /// segment class a store seals graphs for: a tuning point's rows see one
+    /// span, a served launch's up to the class of
+    /// [`magnitude_state::MAX_HISTORY_SPANS`], and the attend launches'
+    /// threadgroup memory grows with the spans they schedule.
+    fn served_dimensions(&self, shapes: &[PointShape]) -> Vec<BTreeMap<String, u64>> {
+        let classes = std::iter::successors(Some(1u64), |segments| segments.checked_mul(2))
+            .take_while(|segments| {
+                *segments <= magnitude_state::MAX_HISTORY_SPANS.next_power_of_two() as u64
+            });
+        classes
+            .flat_map(|segments| {
+                shapes.iter().filter_map(move |point| {
+                    let context = point.context?;
+                    // A listed launch lists the tiles its rows see, one at
+                    // least; an unlisted one passes an empty list of one
+                    // column.
+                    let tiles = if self.listed {
+                        context.div_ceil(256).max(1)
+                    } else {
+                        1
+                    };
+                    Some(
+                        self.shape
+                            .mix_dimensions(point.rows, context + point.rows, segments)
+                            .into_iter()
+                            .chain([("L", u64::from(self.listed)), ("HT", tiles)])
+                            .chain(
+                                if self.codec.encoding() == magnitude_state::HistoryEncoding::Affine
+                                {
+                                    crate::operators::attention::graph::affine_dimensions(
+                                        self.codec,
+                                    )
+                                    .expect("validated affine descriptor")
+                                } else {
+                                    Vec::new()
+                                },
+                            )
+                            .map(|(name, value)| (name.to_owned(), value))
+                            .collect(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     fn bindings(&self) -> String {
         match &self.decode_rows {
             Some(rows) => format!(
@@ -709,16 +869,25 @@ impl AttentionMix {
             .mix_statics()
             .into_iter()
             .chain([("L", u64::from(self.listed))])
+            .chain(
+                if self.codec.encoding() == magnitude_state::HistoryEncoding::Affine {
+                    crate::operators::attention::graph::affine_dimensions(self.codec)
+                        .expect("validated affine descriptor")
+                } else {
+                    Vec::new()
+                },
+            )
             .collect()
     }
 
-    /// The history rows the planes of points with `context` history rows
-    /// hold: the history plus the most rows any such point appends.
-    fn history_rows(points: &[PointShape], context: u64) -> u64 {
-        context
+    /// The history rows the planes of points with `context` history rows in
+    /// each of `sequences` sequences hold: the histories, `histories` rows
+    /// as they are laid out, plus the most rows any such point appends.
+    fn history_rows(points: &[PointShape], context: u64, sequences: u64, histories: u64) -> u64 {
+        histories
             + points
                 .iter()
-                .filter(|point| point.context == Some(context))
+                .filter(|point| point.context == Some(context) && point.sequences == sequences)
                 .map(|point| point.rows)
                 .max()
                 .unwrap_or(0)
@@ -735,19 +904,23 @@ impl AttentionMix {
         let context = point
             .context
             .ok_or("attention tuning points carry a history length")?;
-        // Points of one history length share planes: they all read their
-        // first `context` rows, which nothing writes, and append after them.
-        // A longer history has its own planes, so no point ever reads rows
-        // another point appended.
-        let view = context + rows;
+        // Points of one history length and sequence count share planes: they
+        // all read their sequences' first `context` rows, which nothing
+        // writes, and append after them. Another history length or sequence
+        // count has its own planes, so no point ever reads rows another
+        // point appended.
+        let sequences = point.sequences;
+        let placement = history_placement(inputs, H::CODEC, point)?;
+        let histories = placement.extent;
+        let view = histories + rows;
         let history = H::build(
             inputs,
             self,
-            Self::history_rows(&points, context),
+            Self::history_rows(&points, context, sequences, histories),
             view,
-            context..view,
+            histories..view,
         )?;
-        let tables = inputs.batch(rows, context, 1, context)?;
+        let tables = inputs.batch(rows, context, &placement.sequences, histories)?;
         let segments = tables.class.segments() as u64;
         let attention = operator(inputs, &self.scopes)?;
         let components = rotary_components(&attention.rotary)?;
@@ -865,17 +1038,31 @@ macro_rules! mix_entry {
      $(, search_starts $starts:path)?) => {
         impl $tuning {
             fn served(&self, limits: TuningLimits) -> Vec<PointShape> {
+                let rows = served_row_points(limits, |rows| {
+                    ($serves)(rows)
+                        && self
+                            .0
+                            .decode_rows
+                            .as_ref()
+                            .is_none_or(|range| range.contains(&rows))
+                });
+                // Decode rows are one sequence's (a drafter's verification)
+                // or several sequences' (requests decoding together), each
+                // of which reads a history of its own: a point for every
+                // slot class the rows can span, beside the one sequence's.
+                let across = rows
+                    .iter()
+                    .filter(|point| point.rows <= DECODE_ROWS)
+                    .flat_map(|point| {
+                        std::iter::successors(Some(2u64), |sequences| sequences.checked_mul(2))
+                            .take_while(|sequences| *sequences <= point.rows)
+                            .map(|sequences| across_sequences(point, sequences))
+                    })
+                    .collect::<Vec<_>>();
                 with_contexts(
                     limits,
                     self.0.window,
-                    served_row_points(limits, |rows| {
-                        ($serves)(rows)
-                            && self
-                                .0
-                                .decode_rows
-                                .as_ref()
-                                .is_none_or(|range| range.contains(&rows))
-                    }),
+                    rows.into_iter().chain(across).collect(),
                 )
             }
         }
@@ -889,7 +1076,7 @@ macro_rules! mix_entry {
             }
 
             fn bindings(&self) -> String {
-                self.0.bindings()
+                format!("{};codec={:?}", self.0.bindings(), self.0.codec)
             }
 
             fn statics(
@@ -903,6 +1090,29 @@ macro_rules! mix_entry {
                 self.served(limits)
             }
 
+            fn invocation_rows(&self, rows: u64, representatives: &[u64]) -> Option<u64> {
+                if rows == 0 || !($serves)(rows)
+                    || self.0.decode_rows.as_ref().is_some_and(|range| !range.contains(&rows))
+                {
+                    return None;
+                }
+                if rows <= DECODE_ROWS {
+                    // A dedicated upper decode band can begin below its
+                    // first representative (5..9 is represented by 8).
+                    // Keep those owned calls rather than dropping their
+                    // demand; the support/range guard above prevents a
+                    // call from crossing into another entry's row band.
+                    representatives.iter().copied().filter(|at| *at <= rows).max()
+                        .or_else(|| representatives.iter().copied().min())
+                } else {
+                    representatives.iter().copied().filter(|at| *at >= rows).min()
+                }
+            }
+
+            fn served_dimensions(&self, shapes: &[PointShape]) -> Vec<BTreeMap<String, u64>> {
+                self.0.served_dimensions(shapes)
+            }
+
             $(fn search_starts(
                 &self,
                 device: &Device,
@@ -912,6 +1122,12 @@ macro_rules! mix_entry {
             ) -> Vec<seismic::ParameterValues> {
                 $starts(&self.0, device.backend(), implementation, statics, limits)
             })?
+
+            fn workload(&self, _cases: usize) -> seismic::WorkloadRotation {
+                // Four distributions qualify the same history/layout geometry;
+                // they are witnesses, not four served attention invocations.
+                seismic::WorkloadRotation::Selected(vec![0])
+            }
 
             fn rotation(
                 &self,
@@ -1023,6 +1239,11 @@ mod tests {
         ] {
             for group in [1, 2, 3, 4, 8] {
                 let mut mix = AttentionMix {
+                    codec: magnitude_state::KvCodec::AffineK8V4.spec(
+                        seismic::DType::BF16,
+                        256,
+                        256,
+                    ),
                     listed: false,
                     activation: Element::bf16(),
                     shape: AttentionShape {
@@ -1093,10 +1314,221 @@ mod tests {
         }
     }
 
+    #[test]
+    fn metal_matrix_start_fills_the_grid_for_its_kv_heads() {
+        let implementation = seismic::generated::native_implementation_for_backend::<
+            attention_decode_k8v4::Entry,
+        >(seismic::BackendName::Metal)
+        .unwrap()
+        .unwrap();
+        // Gemma 4 E2B and 12B full layers (one kv head, 512 columns), Gemma
+        // 4 31B full layers (four), Qwen 3.8 27B (four kv heads of six).
+        for (kv_heads, group, width, rows, expected) in [
+            (1, 8, 512, 1..2, 128),
+            (1, 8, 512, 2..DECODE_ROWS + 1, 128),
+            (1, 16, 512, 2..DECODE_ROWS + 1, 128),
+            (4, 8, 512, 2..DECODE_ROWS + 1, 32),
+            (4, 6, 256, 2..DECODE_ROWS + 1, 32),
+        ] {
+            let mix = AttentionMix {
+                codec: magnitude_state::KvCodec::AffineK8V4.spec(
+                    seismic::DType::BF16,
+                    width as usize,
+                    width as usize,
+                ),
+                listed: false,
+                activation: Element::bf16(),
+                shape: AttentionShape {
+                    hidden: 1536,
+                    kv_heads,
+                    group,
+                    rotary_pairs: 64,
+                    width,
+                    interleaved_gate: 0,
+                    separate_gate: 0,
+                    fresh: 1,
+                    head_norm: 1,
+                    value_norm: 1,
+                    projected_value: true,
+                },
+                scopes: Vec::new(),
+                epsilon: 1.0e-6,
+                decode_rows: Some(rows),
+                window: None,
+            };
+            let statics = mix
+                .statics()
+                .into_iter()
+                .filter(|(name, _)| implementation.statics.iter().any(|item| item == name))
+                .fold(
+                    seismic::NativeSpecialization::new(),
+                    |spec, (name, value)| spec.with_static(name, value),
+                );
+            let parts = |context_tokens| {
+                let limits = TuningLimits {
+                    max_rows: 8,
+                    max_projected_rows: 8,
+                    context_tokens,
+                };
+                let starts = decode_starts(
+                    &mix,
+                    seismic::BackendName::Metal,
+                    &implementation,
+                    &statics,
+                    limits,
+                );
+                let matrix = starts
+                    .iter()
+                    .find(|choice| choice.get("MATRIX") == Some(&1))
+                    .expect("a wide head has a matrix start");
+                matrix["PARTS"]
+            };
+            assert_eq!(parts(65_536), expected);
+            // A short history keeps its partitions large.
+            assert!(parts(1_024) < parts(65_536));
+        }
+    }
+
+    #[test]
+    fn cuda_verification_start_follows_served_rows_and_declared_domain() {
+        use seismic::{BackendName, NativeSpecialization};
+        let implementations = [
+            seismic::generated::native_implementation_for_backend::<attention_decode::Entry>(
+                BackendName::Cuda,
+            )
+            .unwrap()
+            .unwrap(),
+            seismic::generated::native_implementation_for_backend::<attention_decode_k8v4::Entry>(
+                BackendName::Cuda,
+            )
+            .unwrap()
+            .unwrap(),
+        ];
+        for implementation in implementations {
+            for (group, width, max_rows, expected_warps) in [
+                (2, 256, 8, 1),
+                (6, 256, 8, 4),
+                (8, 128, 8, 4),
+                (16, 256, 8, 8),
+                (6, 256, 4, 2),
+            ] {
+                let mut mix = AttentionMix {
+                    codec: magnitude_state::KvCodec::AffineK8V4.spec(
+                        seismic::DType::BF16,
+                        width as usize,
+                        width as usize,
+                    ),
+                    listed: false,
+                    activation: Element::bf16(),
+                    shape: AttentionShape {
+                        hidden: 2048,
+                        kv_heads: 4,
+                        group,
+                        rotary_pairs: 32,
+                        width,
+                        interleaved_gate: 0,
+                        separate_gate: 0,
+                        fresh: 1,
+                        head_norm: 1,
+                        value_norm: 0,
+                        projected_value: true,
+                    },
+                    scopes: Vec::new(),
+                    epsilon: 1.0e-5,
+                    decode_rows: Some(2..DECODE_ROWS + 1),
+                    window: None,
+                };
+                let limits = TuningLimits {
+                    max_rows,
+                    max_projected_rows: max_rows,
+                    context_tokens: 65536,
+                };
+                let statics = mix
+                    .statics()
+                    .into_iter()
+                    .filter(|(name, _)| implementation.statics.iter().any(|item| item == name))
+                    .fold(NativeSpecialization::new(), |spec, (name, value)| {
+                        spec.with_static(name, value)
+                    });
+                let start =
+                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, limits);
+                assert_eq!(start.len(), 1);
+                let mut choice = statics.clone();
+                for (name, value) in &start[0] {
+                    choice = choice.with_param(name.clone(), *value);
+                }
+                implementation.validate(&choice).unwrap();
+                assert_eq!(choice.param("QREG"), Some(1));
+                assert_eq!(choice.param("MATRIX"), Some(1));
+                assert_eq!(choice.param("WARPS"), Some(expected_warps));
+                assert_eq!(choice.param("COLUMNS"), Some(1));
+                assert_eq!(choice.param("STAGES"), Some(2));
+                assert_eq!(
+                    implementation
+                        .default_specialization(&statics)
+                        .unwrap()
+                        .param("QREG"),
+                    Some(0)
+                );
+
+                mix.decode_rows = Some(1..2);
+                assert!(
+                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, limits)
+                        .is_empty()
+                );
+                mix.decode_rows = None;
+                assert!(
+                    decode_starts(&mix, BackendName::Cuda, &implementation, &statics, limits)
+                        .is_empty()
+                );
+                mix.decode_rows = Some(2..DECODE_ROWS + 1);
+                mix.shape.width = 512;
+                mix.codec.key_width = 512;
+                mix.codec.value_width = 512;
+                let wide_statics = statics.clone().with_static("S", 448);
+                assert!(
+                    decode_starts(
+                        &mix,
+                        BackendName::Cuda,
+                        &implementation,
+                        &wide_statics,
+                        limits
+                    )
+                    .is_empty()
+                );
+            }
+        }
+    }
 
     #[test]
     fn verify_decode_has_distinct_tuning_identity_and_served_rows() {
+        use crate::native::preparation::separates_packed_attention_rows;
+        for group in 1..=8 {
+            for width in [128, 256] {
+                assert!(separates_packed_attention_rows(
+                    seismic::BackendName::Metal,
+                    group,
+                    width,
+                    8,
+                ));
+                // TOKENS=SIMDS=4, KEYS=16 is a legal shared tile throughout
+                // this capability. The planner does not select that tuple.
+                let shared_bytes = (4 * 8 * width * 2).max(16 * width * 4) + 64;
+                assert!(shared_bytes <= 32768);
+            }
+        }
+        for (backend, group, width, rows) in [
+            (seismic::BackendName::Cuda, 8, 256, 8),
+            (seismic::BackendName::Metal, 16, 256, 8),
+            (seismic::BackendName::Metal, 8, 512, 8),
+            (seismic::BackendName::Metal, 8, 256, 3),
+        ] {
+            assert!(!separates_packed_attention_rows(
+                backend, group, width, rows
+            ));
+        }
         let mix = AttentionMix {
+            codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 256, 256),
             listed: false,
             activation: Element::bf16(),
             shape: AttentionShape {
@@ -1132,7 +1564,10 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             [1].into()
         );
-        assert_eq!(single.bindings(), "A=bf16,M=1..2");
+        assert_eq!(
+            single.bindings(),
+            format!("A=bf16,M=1..2;codec={:?}", single.0.codec)
+        );
         let mut mix = single.0;
         mix.decode_rows = Some(2..DECODE_ROWS + 1);
         let verify = AttentionDecodeK8V4Tuning(mix);
@@ -1144,7 +1579,31 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             [2, 4, 8].into()
         );
-        assert_eq!(verify.bindings(), "A=bf16,M=2..9");
+        assert_eq!(
+            verify.bindings(),
+            format!("A=bf16,M=2..9;codec={:?}", verify.0.codec)
+        );
+
+        // Dense and compressed history use disjoint decode/verification
+        // row domains on every backend with split graph dispatch. A
+        // multirow cache identity cannot reuse the old combined
+        // result, and neither class can train on the other's row counts.
+        let dense_verify = AttentionDecodeTuning(verify.0.clone());
+        let mut dense_single_mix = verify.0.clone();
+        dense_single_mix.decode_rows = Some(1..2);
+        let dense_single = AttentionDecodeTuning(dense_single_mix);
+        assert_eq!(
+            dense_single.bindings(),
+            format!("A=bf16,M=1..2;codec={:?}", dense_single.0.codec)
+        );
+        assert_eq!(dense_verify.bindings(), verify.bindings());
+        assert!(
+            dense_single
+                .points(limits)
+                .iter()
+                .all(|point| point.rows == 1)
+        );
+        assert_eq!(dense_verify.points(limits), verify.points(limits));
 
         let mut classes = Vec::new();
         for range in [2..4, 4..5, 5..DECODE_ROWS + 1] {
@@ -1157,8 +1616,89 @@ mod tests {
                 .map(|point| point.rows)
                 .collect::<Vec<_>>();
             assert!(rows.iter().all(|row| range.contains(row)));
+            let representatives = rows
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            for logical in 1..=DECODE_ROWS {
+                let represented = tuned.invocation_rows(logical, &representatives);
+                assert_eq!(represented.is_some(), range.contains(&logical));
+                assert!(represented.is_none_or(|row| range.contains(&row)));
+            }
             classes.extend(range);
         }
         assert_eq!(classes, (2..DECODE_ROWS + 1).collect::<Vec<_>>());
+        // The base decode plus the dedicated verification domains own
+        // every physical decode row exactly once. This also excludes
+        // duplicate workload pricing by a combined base domain.
+        let owned = std::iter::once(1).chain(classes).collect::<Vec<_>>();
+        assert_eq!(owned, (1..DECODE_ROWS + 1).collect::<Vec<_>>());
+    }
+
+    /// A tuning point's rows see one history span; the unit names each of
+    /// its points' calls at every span class a store seals graphs for, so a
+    /// candidate is checked at the largest before it is chosen.
+    #[test]
+    fn served_dimensions_cover_every_span_class_of_every_point() {
+        let mix = AttentionMix {
+            codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 128, 128),
+            listed: true,
+            activation: Element::bf16(),
+            shape: AttentionShape {
+                hidden: 2048,
+                kv_heads: 2,
+                group: 16,
+                rotary_pairs: 32,
+                width: 128,
+                interleaved_gate: 0,
+                separate_gate: 0,
+                fresh: 1,
+                head_norm: 1,
+                value_norm: 0,
+                projected_value: true,
+            },
+            scopes: Vec::new(),
+            epsilon: 1.0e-5,
+            decode_rows: None,
+            window: None,
+        };
+        let tuning = AttentionPrefillK8V4Tuning(mix);
+        let limits = TuningLimits {
+            max_rows: 512,
+            max_projected_rows: 512,
+            context_tokens: 65536,
+        };
+        let points = tuning.points(limits);
+        let served = tuning.served_dimensions(&points);
+        let classes = [1, 2, 4, 8, 16, 32, 64];
+        assert_eq!(
+            magnitude_state::MAX_HISTORY_SPANS.next_power_of_two(),
+            *classes.last().unwrap() as usize
+        );
+        assert_eq!(served.len(), points.len() * classes.len());
+        let planes = crate::operators::attention::graph::affine_dimensions(tuning.0.codec).unwrap();
+        for dimensions in &served {
+            for (name, value) in &planes {
+                assert_eq!(dimensions.get(*name), Some(value), "codec plane {name}");
+            }
+        }
+        for point in &points {
+            let context = point.context.unwrap();
+            for segments in classes {
+                assert!(
+                    served.iter().any(|dimensions| {
+                        dimensions["M"] == point.rows
+                            && dimensions["T"] == context + point.rows
+                            && dimensions["R"] == segments
+                            && dimensions["L"] == 1
+                            && dimensions["HT"] == context.div_ceil(256).max(1)
+                    }),
+                    "{} at {segments} spans",
+                    point.label
+                );
+            }
+        }
     }
 }

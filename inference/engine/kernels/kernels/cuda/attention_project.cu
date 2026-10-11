@@ -1,10 +1,6 @@
-// attention_project: RMS prologue over the F32 hidden rows, then one
-// segmented projection query | gate | key | value, each segment with its own
-// representation and result (a segment of zero rows has no blocks). GEMV for
-// M <= 16 (`gemv` to 8 rows, `gemv16` beyond; at M = 1 the block forms the A
-// row in shared memory, else `stage` forms the A rows first), GEMM otherwise:
-// `gemm_small` to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged by
-// `stage_s8`), `gemm` beyond (A rows).
+// attention_project: the shared projection producer publishes semantic Act rows
+// or explicitly selected matrix operands. GEMV retains semantic inputs;
+// small and large matrix row bands share the same operand eligibility.
 #define KERNEL_W0 SEISMIC_QUERY_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_KEY_WEIGHT
@@ -111,7 +107,7 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
 
 // The segmented GEMM of one row band over the staged rows (A rows, or q8_1
 // rows with Q): block column `gemm_column` of query | gate | key | value.
-template <class Shape, bool Q>
+template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands>
 __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
                                              unsigned long long D, const Segments &s,
                                              unsigned project_mode) {
@@ -131,19 +127,19 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
     }
     switch (segment) {
     case 0:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[0], s.query,
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, D, groups, M, D, column, s.rows[0], s.query,
                                        projection::NoWeight{}, s.out[0]);
         break;
     case 1:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[1], s.gate,
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, D, groups, M, D, column, s.rows[1], s.gate,
                                        projection::NoWeight{}, s.out[1]);
         break;
     case 2:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[2], s.key,
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, D, groups, M, D, column, s.rows[2], s.key,
                                        projection::NoWeight{}, s.out[2]);
         break;
     case 3:
-        projection::gemm_run<Shape, Q>(shared, staged, D, groups, M, D, column, s.rows[3], s.value,
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, D, groups, M, D, column, s.rows[3], s.value,
                                        projection::NoWeight{}, s.out[3]);
         break;
     }
@@ -158,21 +154,15 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
      (SEISMIC_DIM_V == 0 || projection::quantizable<packets::W3>))
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, GROUPS);
+    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_D, STAGING, GROUPS);
 }
 #endif
 
-#ifdef SEISMIC_FORMING_ATTENTION_PROJECT_STAGE_S8
-template <unsigned INT8>
-__global__ void attention_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
-    seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, GROUPS);
-}
-#endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMV
 template <unsigned KSPLIT>
@@ -193,18 +183,19 @@ __global__ void attention_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM_SMALL
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+    project_gemm<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
                                              SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void attention_project_gemm(SEISMIC_KERNEL_PARAMS) {
-    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
+    constexpr bool S8 = INT8 == 1 && QUANTIZABLE;
+    project_gemm<projection::LargeGemm<ROTATE>, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_D,
                                                        SEGMENTS, (unsigned)SEISMIC_PARAM_PROJECT_MODE);
 }
 #endif

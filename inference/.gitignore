@@ -5,14 +5,10 @@
 # Local compiler/runtime cache.
 .seismic-cache/
 
-# Generated validation fixtures, reports, measurements, and environments.
-validation/**/results/
-validation/**/venv/
-validation/**/.venv/
-validation/**/*.json
-validation/**/*.jsonl
-validation/**/*.ndjson
-validation/**/__pycache__/
+# Local catalog GGUF header dumps and hardware-research outputs.
+catalog/headers
+catalog/results/
+seismic/hardware/results/
 
 # Solver lab output.
 solver/lab/results/

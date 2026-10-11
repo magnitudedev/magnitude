@@ -161,23 +161,26 @@ pub(super) fn qualify_attention(
         AttentionHistoryKernels::AffineK8V4 {
             decode, prefill, ..
         } => {
-            let pairs = crate::operators::attention::graph::affine_coefficients(width);
+            let geometry = binding
+                .history
+                .affine_geometry()
+                .map_err(|e| qualification_dynamic(ENTRY, label, e.to_string()))?;
             [
                 (
                     "attention_decode_k8v4",
                     mix!(decode, attention_decode_k8v4,
-                        history_key_codes: Element::u32(), width / 4,
-                        history_key_coefficients: Element::f16(), pairs,
-                        history_value_codes: Element::u32(), width / 8,
-                        history_value_coefficients: Element::f16(), pairs),
+                        history_key_codes: Element::u32(), geometry.key_codes as u64,
+                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64,
+                        history_value_codes: Element::u32(), geometry.value_codes as u64,
+                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64),
                 ),
                 (
                     "attention_prefill_k8v4",
                     mix!(@call prefill, attention_prefill_k8v4, {history_tiles: &history_tiles},
-                        history_key_codes: Element::u32(), width / 4,
-                        history_key_coefficients: Element::f16(), pairs,
-                        history_value_codes: Element::u32(), width / 8,
-                        history_value_coefficients: Element::f16(), pairs),
+                        history_key_codes: Element::u32(), geometry.key_codes as u64,
+                        history_key_coefficients: Element::f16(), geometry.key_coefficients as u64,
+                        history_value_codes: Element::u32(), geometry.value_codes as u64,
+                        history_value_coefficients: Element::f16(), geometry.value_coefficients as u64),
                 ),
             ]
         }
@@ -205,7 +208,7 @@ pub(super) fn qualify_attention(
                     "attention_output",
                     label,
                     "attention output entries disagree with the binding's tail",
-                ))
+                ));
             }
         };
         require_f32_values(&result, &residual_values, entry, label)?;

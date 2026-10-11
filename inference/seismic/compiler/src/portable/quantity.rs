@@ -11,42 +11,10 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         out: SemanticValueId,
     ) {
         use seismic_lang::syntax::ast::BinaryOp as B;
-        // A literal quantity, or one over invocation values only, is already
-        // an immutable exact source value. Keep
-        // that value as the binding itself, so geometry defined by it cannot
-        // acquire an unrelated schedule slot and an artificial entry premise.
-        // Public results still use their declared publication destination.
-        if matches!(self.function.value(out).ty, SemanticType::Integer)
-            && !self.function.results().contains(&out)
-        {
-            let literal = match primitive {
-                PrimitiveId::Symbolic(expression)
-                    if invocation_evaluable(self.builder.arena(), (*expression).into()) =>
-                {
-                    Some(*expression)
-                }
-                PrimitiveId::Constant(ReferenceScalar::I32(value)) => {
-                    Some(self.builder.arena().int(i64::from(*value)))
-                }
-                PrimitiveId::Constant(ReferenceScalar::U32(value)) => {
-                    Some(self.builder.arena().int(i64::from(*value)))
-                }
-                _ => None,
-            };
-            if let Some(literal) = literal {
-                self.values.bind(
-                    self.builder.bindings_mut(),
-                    out,
-                    Bound::Scalar(ScalarBinding::Integer(literal)),
-                );
-                return;
-            }
-        }
         let operands = inputs
             .iter()
             .map(|value| self.bound(*value))
             .collect::<Vec<_>>();
-        let target = self.output_target(out);
         let arena = self.builder.arena();
         let integer = match primitive {
             PrimitiveId::Symbolic(expression) => *expression,
@@ -79,6 +47,33 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             }
             _ => panic!("checked quantity primitive has no exact host meaning: {primitive:?}"),
         };
+        // A quantity over invocation values only is already an immutable
+        // exact value. Keep that value as the binding itself, so geometry
+        // defined by it (an allocation's extents, a callee's dimensions) is
+        // the same expression its accesses state, instead of an unrelated
+        // schedule slot. Division keeps its reached zero-divisor check, and
+        // public results still use their declared publication destination.
+        let exact = match self.function.value(out).ty {
+            SemanticType::Integer | SemanticType::Index { .. } => {
+                !self.function.results().contains(&out)
+                    && !matches!(primitive, PrimitiveId::Binary(B::Div | B::Rem))
+                    && invocation_evaluable(self.builder.arena(), integer.into())
+            }
+            _ => false,
+        };
+        if exact {
+            let binding = match self.function.value(out).ty {
+                SemanticType::Index { .. } => {
+                    ScalarBinding::Index(natural(self.builder.arena(), integer))
+                }
+                _ => ScalarBinding::Integer(integer),
+            };
+            self.values
+                .bind(self.builder.bindings_mut(), out, Bound::Scalar(binding));
+            return;
+        }
+        let target = self.output_target(out);
+        let arena = self.builder.arena();
         let (value, to) = match &target {
             Bound::Scalar(ScalarBinding::Quantity(slot)) => {
                 let value = match slot.kind() {
@@ -86,7 +81,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                         HostValueExpr::Integer(integer)
                     }
                     seismic_ir::schedule::HostQuantityKind::Natural => {
-                        HostValueExpr::Natural(arena.nat_from_int(integer))
+                        HostValueExpr::Natural(natural(arena, integer))
                     }
                 };
                 (value, HostValueDestination::Quantity(*slot))
@@ -111,10 +106,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                         HostValueExpr::Bool(arena.int_cmp(comparison, left, right))
                     }
                     (DType::I32 | DType::U32, PrimitiveId::Cast(_)) => {
-                        let typed = arena.scalar_integer(
-                            seismic_lang::reference_math::ScalarOp::Cast(dtype),
-                            &[(dtype, integer)],
-                        );
+                        let typed = arena.int_to_word(integer, dtype);
                         HostValueExpr::Word {
                             dtype,
                             value: typed,
@@ -235,33 +227,38 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             for symbol in symbols {
                 if let SymbolKind::RuntimeValue(value) = self.builder.arena().symbol_kind(symbol) {
                     let bound = self.values.get(self.builder.bindings(), value);
-                    let expression = match prepare_scalar(self.builder.arena(), bound.scalar()) {
-                        PreparedArg::Index(value) => Some(self.builder.arena().int_from_nat(value)),
-                        PreparedArg::Integer(value) => Some(value),
-                        PreparedArg::Scalar(symbol, _) => {
-                            match self.builder.arena().symbol_sort(symbol) {
-                                SymbolSort::Int => Some(self.builder.arena().int_symbol(symbol)),
-                                SymbolSort::Nat => {
-                                    let value = self.builder.arena().nat_symbol(symbol);
-                                    Some(self.builder.arena().int_from_nat(value))
-                                }
-                                SymbolSort::Scalar(DType::I32) => {
-                                    let value = self
-                                        .builder
-                                        .arena()
-                                        .scalar_symbol::<seismic_lang::expr::I32>(symbol);
-                                    Some(self.builder.arena().int_from_scalar(value))
-                                }
-                                SymbolSort::Scalar(DType::U32) => {
-                                    let value = self
-                                        .builder
-                                        .arena()
-                                        .scalar_symbol::<seismic_lang::expr::U32>(symbol);
-                                    Some(self.builder.arena().int_from_scalar(value))
-                                }
-                                SymbolSort::Scalar(_) => None,
-                            }
+                    let prepared = prepare_scalar(self.builder.arena(), bound.scalar());
+                    let arena = self.builder.arena();
+                    // A runtime value symbol is replaced by its reached value
+                    // of its own sort: an exact quantity by its integer, a
+                    // word by the slot holding that word.
+                    let expression = match (arena.symbol_sort(symbol), prepared) {
+                        (SymbolSort::Scalar(dtype), PreparedArg::Scalar(reached, actual))
+                            if actual == dtype =>
+                        {
+                            Some(AnyExpr::Scalar(arena.scalar_symbol_erased(reached)))
                         }
+                        (SymbolSort::Scalar(_), _) => None,
+                        (_, PreparedArg::Index(value)) => {
+                            Some(AnyExpr::Int(arena.int_from_nat(value)))
+                        }
+                        (_, PreparedArg::Integer(value)) => Some(AnyExpr::Int(value)),
+                        (_, PreparedArg::Scalar(reached, _)) => match arena.symbol_sort(reached) {
+                            SymbolSort::Int => Some(AnyExpr::Int(arena.int_symbol(reached))),
+                            SymbolSort::Nat => {
+                                let value = arena.nat_symbol(reached);
+                                Some(AnyExpr::Int(arena.int_from_nat(value)))
+                            }
+                            SymbolSort::Scalar(DType::I32) => {
+                                let value = arena.scalar_symbol::<seismic_lang::expr::I32>(reached);
+                                Some(AnyExpr::Int(arena.int_from_scalar(value)))
+                            }
+                            SymbolSort::Scalar(DType::U32) => {
+                                let value = arena.scalar_symbol::<seismic_lang::expr::U32>(reached);
+                                Some(AnyExpr::Int(arena.int_from_scalar(value)))
+                            }
+                            SymbolSort::Scalar(_) => None,
+                        },
                     };
                     if let Some(expression) = expression {
                         values.push((value, expression));
@@ -271,7 +268,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             resolved = PrimitiveId::Symbolic(
                 self.builder
                     .arena()
-                    .resolve_runtime_values(*expression, &values),
+                    .resolve_runtime_symbols(*expression, &values),
             );
             &resolved
         } else {
@@ -281,7 +278,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             if matches!(self.function.value(output).ty, SemanticType::Index { .. }) {
                 // Index bounds express admissibility, never the scalar value.
                 // The checked symbolic operation carries its exact expression.
-                let direct = self.builder.arena().nat_from_int(*expression);
+                let direct = natural(self.builder.arena(), *expression);
                 if invocation_evaluable(self.builder.arena(), AnyExpr::Nat(direct)) {
                     self.values.bind(
                         self.builder.bindings_mut(),
@@ -396,10 +393,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 // `extent` is a source i32 value. The selected view supplies
                 // its actual logical axis, and the language cast owns wrapping.
                 let exact = self.builder.arena().int_from_nat(value);
-                let word = self.builder.arena().scalar_integer(
-                    seismic_lang::reference_math::ScalarOp::Cast(DType::I32),
-                    &[(DType::I32, exact)],
-                );
+                let word = self.builder.arena().int_to_word(exact, DType::I32);
                 (
                     HostValueExpr::Word {
                         dtype: DType::I32,
@@ -421,6 +415,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
 }
 
 /// Only invocation symbols: call values, target constants and decisions.
+/// A checked nonnegative integer as a natural: the natural expression it
+/// identically is when its normal form is one, otherwise its conversion.
+pub(super) fn natural(arena: &mut ExprArena, integer: IntExpr) -> NatExpr {
+    arena
+        .natural_integer(integer)
+        .unwrap_or_else(|| arena.nat_from_int(integer))
+}
+
 fn invocation_evaluable(arena: &ExprArena, expression: AnyExpr) -> bool {
     arena.free_symbols(expression).iter().all(|symbol| {
         matches!(

@@ -8,7 +8,7 @@
 //! A draft pass then runs one block `[anchor, mask, …]` through the draft
 //! layers over that history and the block (all of it, or its rows up to the
 //! reading row, per layer's [`BlockAttention`]), and reads the block's slots
-//! out through the target's vocabulary projection.
+//! out through an owned or target-shared vocabulary projection.
 
 use crate::decoder::{self, Context};
 use crate::{
@@ -183,12 +183,19 @@ pub struct DraftDefinition {
     pub fusion: WeightDescriptor,
     pub fusion_norm: RmsNorm,
     pub embedding: DraftEmbedding,
+    /// Own full-vocabulary projection; absent means the target projection is shared.
+    pub output: Option<WeightDescriptor>,
+    /// Explicit draft input scale, independent of the target's input transform.
+    pub embedding_scale: f64,
     /// Draft layers over the target's width. Their attention reads the
     /// injected context and the fresh block.
     pub blocks: Vec<Block>,
     /// One per draft layer: how its block rows attend the block.
     pub block_attention: Vec<BlockAttention>,
     pub output_norm: RmsNorm,
+    /// Explicit draft projection softcap, before any Markov/selector bias.
+    /// An absent value preserves raw logits even if the target has a softcap.
+    pub logit_softcap: Option<f64>,
     /// Rows of the trained draft block, anchor included: the widest block a
     /// pass runs (`block_rows`).
     pub block_size: u64,
@@ -224,6 +231,18 @@ impl DraftDefinition {
 
     pub fn validate(&self, decoder: &Decoder, coordinate_axes: u8) -> Result<(), DefinitionError> {
         let hidden = decoder.hidden;
+        if !self.embedding_scale.is_finite()
+            || self.embedding_scale <= 0.0
+            || !(self.embedding_scale as f32).is_finite()
+            || self.embedding_scale as f32 <= 0.0
+        {
+            return Err(DefinitionError::new("invalid draft embedding scale"));
+        }
+        if self.logit_softcap.is_some_and(|cap| {
+            !cap.is_finite() || cap <= 0.0 || !(cap as f32).is_finite() || cap as f32 <= 0.0
+        }) {
+            return Err(DefinitionError::new("invalid draft logit softcap"));
+        }
         if self.taps.is_empty() || self.blocks.is_empty() || self.block_size < 2 {
             return Err(DefinitionError::new(
                 "draft has no taps, blocks or proposals",
@@ -263,12 +282,16 @@ impl DraftDefinition {
                 "draft token embedding",
             )?;
         }
+        if let Some(output) = &self.output {
+            expect_shape(output, &[decoder.vocabulary, hidden], "draft output projection")?;
+        }
         decoder::validate_blocks(
             &self.blocks,
             &Context {
                 hidden,
                 coordinate_axes,
                 per_layer: None,
+                shared_sources: None,
             },
         )?;
         // Every draft attention layer injects its own context history.

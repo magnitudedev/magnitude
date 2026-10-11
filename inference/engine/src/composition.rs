@@ -6,17 +6,19 @@
 use crate::error::{ArtifactError, LoadError, ResolveError, UnsupportedModel};
 use crate::host::HostArtifacts;
 use crate::options::{ExecutionManifest, InputModalities, ModelPolicy, PackageOptions, ReadyInfo};
-use magnitude_artifacts::PackageIdentity;
-use std::fmt;
+use crate::execution::LoadAttempt;
 use crate::worker::{
-    connect_worker, protocol::LoadProgress, run_worker, transport::channel_pair, EngineClient,
-    WorkerConnection,
+    connect_worker, load_prepared, protocol::LoadProgress, run_worker, start_worker_process,
+    transport::channel_pair, EngineClient, Preparation, WorkerConnection,
 };
+use magnitude_executor::UnpreparedUnits;
+use magnitude_artifacts::PackageIdentity;
 use magnitude_executor::{
     platform::{DeviceRequest, MemoryReserves},
     ExecutionPath,
 };
 use magnitude_scheduler::ServiceLimits;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,7 +39,8 @@ pub struct EngineConfiguration {
     pub device: DeviceRequest,
     /// The directory the host keeps formed kernels and tuning results in
     /// (`--cache-dir`; ACN names `<dataDir>/cache/kernels`). `None` caches
-    /// nothing: every load forms and tunes every entry.
+    /// nothing: no tuning record reaches a load, which forms every entry
+    /// at its canonical default.
     pub kernel_cache: Option<PathBuf>,
     /// The host's threshold policy (`MemoryReserves::standard()` for the
     /// service and CLI). The engine never defaults it.
@@ -185,25 +188,94 @@ impl ReadyEngine {
     }
 }
 
+/// [`load_prepared`] for a host that loads in its own process: `load` is its
+/// load, and `worker` starts the host's executable in its worker role
+/// ([`crate::worker::serve_worker`] over its standard streams) for the
+/// model's Prepare when the load finds tuning units without a stored record.
+/// A Prepare that does not finish is reported on the diagnostic stream; the
+/// load then serves canonical defaults for the units without a record. The
+/// stream also carries `kernel preparation began` when the Prepare's process
+/// is started and `kernel preparation ended in S s` once it is gone.
+pub fn load_in_process<L>(
+    manifest: &ExecutionManifest,
+    load: impl FnMut(UnpreparedUnits) -> Result<LoadAttempt<L>, LoadError>,
+    worker: std::process::Command,
+    prepare_progress: impl FnMut(LoadProgress),
+) -> Result<L, LoadError> {
+    // The diagnostic stream says when the Prepare's process began and that it
+    // is gone, so a log's reader can tell preparation from the load itself.
+    let preparing = std::cell::Cell::new(None);
+    let mut load = load;
+    let (loaded, preparation) = load_prepared(
+        manifest,
+        |unprepared| {
+            if let Some(began) = preparing.take() {
+                let began: std::time::Instant = began;
+                eprintln!(
+                    "magnitude-engine: kernel preparation ended in {:.3} s",
+                    began.elapsed().as_secs_f64()
+                );
+            }
+            load(unprepared)
+        },
+        || {
+            eprintln!("magnitude-engine: kernel preparation began");
+            preparing.set(Some(std::time::Instant::now()));
+            start_worker_process(worker)
+        },
+        prepare_progress,
+    )?;
+    if let Preparation::Incomplete(error) = preparation {
+        eprintln!(
+            "magnitude-engine: kernel preparation did not finish ({error}); the load serves \
+             canonical defaults for the units without a stored tuning record"
+        );
+    }
+    Ok(loaded)
+}
+
 /// Load the model on a worker thread of this process over the in-process
-/// transport: the same worker and protocol a worker process runs.
+/// transport: the same worker and protocol a worker process runs. Like every
+/// load it searches nothing: `worker` starts this executable in its worker
+/// role for the model's Prepare when records are missing
+/// ([`load_in_process`]).
 pub fn start_in_process(
     resolved: ResolvedEngineConfiguration,
+    worker: std::process::Command,
     progress: impl FnMut(LoadProgress),
 ) -> Result<ReadyEngine, LoadError> {
     let ResolvedEngineConfiguration { host, manifest } = resolved;
-    let (host_end, worker_end) = channel_pair();
-    std::thread::Builder::new()
-        .name("magnitude-worker".into())
-        .spawn(move || {
-            let exit = run_worker(manifest, worker_end);
-            eprintln!("magnitude-engine: in-process worker exited: {exit:?}");
-        })
-        .map_err(|error| LoadError::Internal {
-            reason: error.to_string(),
-        })?;
-    let connection = connect_worker(host_end, None, progress)?;
-    ReadyEngine::new(Arc::new(host), connection).map_err(|mismatch| LoadError::Internal {
-        reason: mismatch.to_string(),
+    let host = Arc::new(host);
+    // The load's attempts and the Prepare report to one observer, in turn.
+    let progress = std::cell::RefCell::new(progress);
+    let attempt = |unprepared| -> Result<LoadAttempt<ReadyEngine>, LoadError> {
+        let (host_end, worker_end) = channel_pair();
+        let worker_manifest = manifest.clone();
+        let worker = std::thread::Builder::new()
+            .name("magnitude-worker".into())
+            .spawn(move || {
+                let exit = run_worker(worker_manifest, unprepared, worker_end);
+                eprintln!("magnitude-engine: in-process worker exited: {exit:?}");
+            })
+            .map_err(|error| LoadError::Internal {
+                reason: error.to_string(),
+            })?;
+        match connect_worker(host_end, None, |update| (progress.borrow_mut())(update))? {
+            LoadAttempt::Loaded(connection) => ReadyEngine::new(Arc::clone(&host), connection)
+                .map(LoadAttempt::Loaded)
+                .map_err(|mismatch| LoadError::Internal {
+                    reason: mismatch.to_string(),
+                }),
+            LoadAttempt::Unprepared => {
+                // Everything the attempt opened is gone with its thread.
+                worker.join().map_err(|_| LoadError::Internal {
+                    reason: "the in-process worker panicked".into(),
+                })?;
+                Ok(LoadAttempt::Unprepared)
+            }
+        }
+    };
+    load_in_process(&manifest, attempt, worker, |update| {
+        (progress.borrow_mut())(update)
     })
 }

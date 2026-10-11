@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-fixtures"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["pydantic==2.13.5"]
+
+[project.scripts]
+magnitude-fixtures = "magnitude_fixtures.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_fixtures"]

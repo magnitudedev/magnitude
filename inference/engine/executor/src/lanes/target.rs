@@ -2,9 +2,9 @@
 //! planned device leases.
 
 use crate::{
-    ConditioningRef, FeatureSpan, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
-    NativeGraphWorkspaceLease, PoolClass, ResourceDomainId, TargetGraphOutputLease,
-    TargetGraphWorkspaceLease,
+    ConditioningRef, FeatureRef, FeatureSpan, GraphOutputTensor, InvariantError,
+    NativeGraphOutputLease, NativeGraphWorkspaceLease, PoolClass, ResourceDomainId,
+    TargetGraphOutputLease, TargetGraphWorkspaceLease,
 };
 use magnitude_batching::ValidatedTargetBatch;
 use magnitude_state::{StateStore, TentativeAdvance};
@@ -26,6 +26,7 @@ pub struct TargetLaunchInputs {
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
+    boundary: Option<FeatureRef>,
     graph_workspace: TargetGraphWorkspaceLease,
     graph_outputs: [TargetGraphOutputLease; 2],
     readout_workspace: NativeGraphWorkspaceLease,
@@ -62,7 +63,13 @@ impl TargetLaunchInputs {
             graph_outputs,
             readout_workspace,
             readout_output: Some(readout_output),
+            boundary: None,
         }
+    }
+
+    pub(crate) fn with_boundary(mut self, boundary: Option<FeatureRef>) -> Self {
+        self.boundary = boundary;
+        self
     }
 
     pub(crate) fn into_parts(
@@ -91,6 +98,24 @@ impl TargetLaunchInputs {
             context: "target launch",
             detail,
         };
+        if let Some(boundary) = &self.boundary {
+            if self.batch.actual_slots() != 1
+                || boundary.domain() != domain
+                || boundary.allocation().rows() != 1
+                || boundary.allocation().width() != hidden_width
+                || boundary.allocation().is_graph_backed()
+                || boundary.allocation().tensor().is_err()
+                || !self
+                    .batch
+                    .class()
+                    .demand()
+                    .contains(magnitude_batching::Demand::FEATURES)
+            {
+                return Err(invalid(
+                    "invalid independent boundary feature destination".into(),
+                ));
+            }
+        }
         let slots = self.batch.actual_slots();
         if slots != self.advances.len()
             || slots != self.conditioning.len()
@@ -164,28 +189,17 @@ impl TargetLaunchInputs {
                 let packed = slot
                     .history(read)
                     .ok_or_else(|| invalid(format!("slot {index} lacks a shared history read")))?;
-                let appended = &binding.destinations[domain.0];
+                let appended = crate::domain::AppendedRuns::of(store, advance, domain);
                 for (row, visible) in packed.visible.iter().enumerate() {
                     let (accepted, _) =
                         crate::domain::accepted_history(store, advance, domain, row)
                             .map_err(invalid)?;
-                    let appends_only = |ranges: &[[i32; 2]]| {
-                        ranges.iter().all(|&[start, end]| {
-                            (start..end).all(|row| {
-                                usize::try_from(row)
-                                    .is_ok_and(|row| appended.contains(&row))
-                            })
-                        })
-                    };
                     if visible.len() < accepted.len()
                         || visible[..accepted.len()] != accepted
-                        || !appends_only(
-                            &visible[accepted.len()..]
-                                .iter()
-                                .copied()
-                                .filter(|range| *range != [0, 0])
-                                .collect::<Vec<_>>(),
-                        )
+                        || !visible[accepted.len()..]
+                            .iter()
+                            .filter(|range| **range != [0, 0])
+                            .all(|&[start, end]| appended.covers(start, end))
                     {
                         return Err(invalid(format!(
                             "slot {index} shared visibility differs from accepted state"
@@ -202,6 +216,8 @@ impl TargetLaunchInputs {
                     return Err(invalid(format!("slot {index} destination count differs")));
                 }
                 let kind = store.history_domain_kind(domain);
+                let appended = crate::domain::cached_causal_domain(store, domain)
+                    .then(|| crate::domain::AppendedRuns::of(store, advance, domain));
                 for (row, (destination, visible)) in
                     packed.destinations.iter().zip(packed.visible).enumerate()
                 {
@@ -230,11 +246,24 @@ impl TargetLaunchInputs {
                                 "slot {index} history range exceeds packed coordinates"
                             ))
                         })?;
-                    if visible.len() < expected.len()
-                        || visible[..expected.len()] != expected
-                        || visible[expected.len()..]
-                            .iter()
-                            .any(|padding| *padding != [0, 0])
+                    let supplied = visible
+                        .iter()
+                        .copied()
+                        .filter(|range| *range != [0, 0])
+                        .collect::<Vec<_>>();
+                    let mut prepared = expected.clone();
+                    if let Some(appended) = &appended {
+                        // The row's first fresh row in the slot, as
+                        // `accepted_history` reports it.
+                        let fresh_start = from.saturating_sub(advance.position());
+                        prepared.extend(appended.causal_prior(fresh_start, row).map_err(invalid)?);
+                    }
+                    // Media rows retain their declared dense fresh block;
+                    // causal compressed rows may additionally see exactly
+                    // their own earlier destinations, never a future row.
+                    if supplied != expected
+                        && (supplied != prepared
+                            || packed.fresh[row][1] - packed.fresh[row][0] != 1)
                     {
                         return Err(invalid(format!(
                             "slot {index} visibility differs from accepted state"
@@ -315,6 +344,7 @@ impl ValidatedTargetLaunch {
             advances,
             conditioning,
             conditioning_slices,
+            boundary,
             graph_workspace,
             graph_outputs,
             readout_workspace,
@@ -327,6 +357,7 @@ impl ValidatedTargetLaunch {
                 advances,
                 conditioning,
                 conditioning_slices,
+                boundary,
                 store: store.clone(),
                 domain: domain.clone(),
             },
@@ -397,6 +428,7 @@ pub struct TargetLaunchCore {
     advances: Vec<TentativeAdvance>,
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
+    boundary: Option<FeatureRef>,
     /// The store every advance belongs to: it names each attention layer's
     /// history domain and the layer whose regions it binds.
     store: Rc<StateStore>,
@@ -404,6 +436,10 @@ pub struct TargetLaunchCore {
 }
 
 impl TargetLaunchCore {
+    pub fn boundary(&self) -> Option<&FeatureRef> {
+        self.boundary.as_ref()
+    }
+
     pub fn batch(&self) -> &ValidatedTargetBatch {
         &self.batch
     }

@@ -1,0 +1,41 @@
+[package]
+name = "magnitude-harness"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+# The evaluation harness: the only in-process driver of the engine. It runs
+# fixture sets (specs/26-10-08/evaluation-contracts.md) through the serving
+# chat path and the executor, and writes evaluation result records.
+[[bin]]
+name = "magnitude-harness"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+magnitude-chat = { path = "../../engine/chat" }
+magnitude-engine = { path = "../../engine" }
+magnitude-executor = { path = "../../engine/executor" }
+magnitude-family-contracts = { path = "../../engine/families/contracts" }
+magnitude-generation = { path = "../../engine/generation" }
+magnitude-scheduler = { path = "../../engine/scheduler" }
+magnitude-serving = { path = "../../engine/serving" }
+magnitude-state = { path = "../../engine/state" }
+seismic.workspace = true
+serde.workspace = true
+# Fixture key order is rendered: chat templates print tool schemas in it.
+serde_json = { workspace = true, features = ["preserve_order"] }
+sha2.workspace = true
+
+[features]
+# Development-only: `--tuning-record FILE`, `--tuning-replay FILE` and
+# `--tuning-defaults` pin tuned configurations across runs for bit-exact
+# comparisons (`magnitude_executor::pinned_tuning`).
+pinned-tuning = ["magnitude-engine/pinned-tuning"]
+# Development-only: `--tuning-survey DIR` surveys every admissible tuning
+# configuration for replaying the search (`magnitude_executor::tuning_survey`).
+tuning-survey = ["magnitude-engine/tuning-survey"]
+# Development-only: `precision-probe` compares the logits of a pinned tuning
+# selection with the defaults' (and references) alongside the tuning trace's
+# dimensionless precision measurements. It pins through `pinned-tuning`.
+precision-probe = ["pinned-tuning"]

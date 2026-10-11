@@ -154,11 +154,18 @@ pub fn normalize_name(name: &str) -> String {
         .replace("(r)", "")
         .replace("(tm)", "")
         .replace(['®', '™'], "");
-    while let Some(open) = name.trim_end().strip_suffix(')').and_then(|body| body.rfind('(')) {
+    while let Some(open) = name
+        .trim_end()
+        .strip_suffix(')')
+        .and_then(|body| body.rfind('('))
+    {
         name.truncate(open);
     }
     let mut words = name.split_whitespace().collect::<Vec<_>>();
-    for prefixes in [["nvidia", "amd", "intel"].as_slice(), &["geforce", "radeon"]] {
+    for prefixes in [
+        ["nvidia", "amd", "intel"].as_slice(),
+        &["geforce", "radeon"],
+    ] {
         if words.len() > 1 && prefixes.contains(&words[0]) {
             words.remove(0);
         }
@@ -241,7 +248,16 @@ const PUBLISHED: &[PublishedBandwidth] = &[
     fixed(&["rx 6450m", "rx 6500m", "rx 6550s"], 128_000),
     fixed(&["rx 6550m"], 144_000),
     fixed(&["rx 6600m", "rx 6600s", "rx 6700s"], 224_000),
-    fixed(&["rx 6650m", "rx 6650m xt", "rx 6800s", "rx 7600m", "rx 7600s"], 256_000),
+    fixed(
+        &[
+            "rx 6650m",
+            "rx 6650m xt",
+            "rx 6800s",
+            "rx 7600m",
+            "rx 7600s",
+        ],
+        256_000,
+    ),
     fixed(&["rx 6700m"], 320_000),
     fixed(&["rx 6800m"], 384_000),
     fixed(&["rx 6850m xt", "rx 7800m"], 432_000),
@@ -298,7 +314,10 @@ const PUBLISHED: &[PublishedBandwidth] = &[
     // (https://www.nvidia.com/en-us/geforce/graphics-cards/compare/); RTX
     // 20–40: TPU; laptops: the part's maximum (NBC, TPU).
     fixed(&["rtx 2060"], 336_000),
-    fixed(&["rtx 2060 super", "rtx 2070", "rtx 2070 super", "rtx 2080"], 448_000),
+    fixed(
+        &["rtx 2060 super", "rtx 2070", "rtx 2070 super", "rtx 2080"],
+        448_000,
+    ),
     // The desktop "SUPER" (495.9) and laptop "Super" (448) share the name.
     fixed(&["rtx 2080 super"], 448_000),
     fixed(&["rtx 2080 ti"], 616_000),
@@ -343,12 +362,20 @@ const PUBLISHED: &[PublishedBandwidth] = &[
         384_000,
     ),
     fixed(
-        &["rtx 2070 super with max-q design", "rtx 2080 super with max-q design"],
+        &[
+            "rtx 2070 super with max-q design",
+            "rtx 2080 super with max-q design",
+        ],
         352_000,
     ),
     fixed(&["rtx 3050 6gb laptop gpu"], 168_000),
     fixed(
-        &["rtx 3050 laptop gpu", "rtx 3050 ti laptop gpu", "rtx 3050ti laptop gpu", "rtx 4050 laptop gpu"],
+        &[
+            "rtx 3050 laptop gpu",
+            "rtx 3050 ti laptop gpu",
+            "rtx 3050ti laptop gpu",
+            "rtx 4050 laptop gpu",
+        ],
         192_000,
     ),
     fixed(&["rtx 3060 laptop gpu"], 288_000),
@@ -360,7 +387,11 @@ const PUBLISHED: &[PublishedBandwidth] = &[
     fixed(&["rtx 4080 laptop gpu"], 432_000),
     fixed(&["rtx 4090 laptop gpu"], 576_000),
     fixed(
-        &["rtx 5050 laptop gpu", "rtx 5060 laptop gpu", "rtx 5070 laptop gpu"],
+        &[
+            "rtx 5050 laptop gpu",
+            "rtx 5060 laptop gpu",
+            "rtx 5070 laptop gpu",
+        ],
         384_000,
     ),
     fixed(&["rtx 5070 ti laptop gpu"], 672_000),
@@ -412,13 +443,25 @@ mod tests {
         ] {
             assert_eq!(normalize_name(spelling), "rtx 4090");
         }
-        assert_eq!(normalize_name("AMD Radeon RX 7900 XTX (RADV NAVI31)"), "rx 7900 xtx");
+        assert_eq!(
+            normalize_name("AMD Radeon RX 7900 XTX (RADV NAVI31)"),
+            "rx 7900 xtx"
+        );
         assert_eq!(normalize_name("AMD Radeon RX 9070 XT"), "rx 9070 xt");
         assert_eq!(normalize_name("AMD Radeon(TM) 8060S Graphics"), "8060s");
-        assert_eq!(normalize_name("AMD Radeon 780M Graphics (RADV PHOENIX)"), "780m");
+        assert_eq!(
+            normalize_name("AMD Radeon 780M Graphics (RADV PHOENIX)"),
+            "780m"
+        );
         assert_eq!(normalize_name("Intel(R) Arc(TM) B580 Graphics"), "arc b580");
-        assert_eq!(normalize_name("Intel(R) Arc(tm) A770 Graphics (DG2)"), "arc a770");
-        assert_eq!(normalize_name("Intel(R) Arc(TM) 140V GPU (16GB)"), "arc 140v gpu");
+        assert_eq!(
+            normalize_name("Intel(R) Arc(tm) A770 Graphics (DG2)"),
+            "arc a770"
+        );
+        assert_eq!(
+            normalize_name("Intel(R) Arc(TM) 140V GPU (16GB)"),
+            "arc 140v gpu"
+        );
         assert_eq!(normalize_name("Apple M4 Max"), "apple m4 max");
         assert_eq!(
             normalize_name("NVIDIA GeForce RTX 4070 Laptop GPU"),
@@ -442,7 +485,10 @@ mod tests {
         // magnitudedev/magnitude#142: M1 Max, M2 Max and an RX 9070 XT.
         assert_eq!(published("Apple M1 Max", 10, None), Some(400 * GB));
         assert_eq!(published("Apple M2 Max", 12, None), Some(400 * GB));
-        assert_eq!(published("AMD Radeon RX 9070 XT", 16, Some(16 << 30)), Some(640 * GB));
+        assert_eq!(
+            published("AMD Radeon RX 9070 XT", 16, Some(16 << 30)),
+            Some(640 * GB)
+        );
     }
 
     #[test]
@@ -459,7 +505,10 @@ mod tests {
             published("NVIDIA GeForce RTX 3060", 8, Some((12 << 30) - 300 * MB)),
             Some(360 * GB)
         );
-        assert_eq!(published("NVIDIA GeForce RTX 3060", 8, Some(8 << 30)), Some(240 * GB));
+        assert_eq!(
+            published("NVIDIA GeForce RTX 3060", 8, Some(8 << 30)),
+            Some(240 * GB)
+        );
         assert_eq!(published("NVIDIA GeForce RTX 3060", 8, None), None);
     }
 

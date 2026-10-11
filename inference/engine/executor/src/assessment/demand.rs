@@ -10,9 +10,7 @@ use crate::{
     FeedForwardProgramSlot, GeneralRoutedBinding, MixerProgramSlot, ModelLoadPlan,
     PerLayerEntryBinding, ReadoutHead, SublayerTail, WeightPlan,
 };
-use magnitude_family_contracts::{
-    ModelDefinition, ProgressivePlane, SublayerIndex, WeightKind, WeightScope,
-};
+use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, WeightScope};
 use magnitude_state::{HistoryDomainLayout, KvCodec, LayerRef, ModelStateLayout};
 use seismic::Element;
 
@@ -70,7 +68,11 @@ fn output_rows(weight: &WeightPlan) -> Result<u64, AssessmentError> {
 
 /// The bytes a decode row streams of `selected` of an expert tensor's
 /// `experts` equal slabs.
-fn selected_bytes(weight: &WeightPlan, experts: u64, selected: u64) -> Result<u64, AssessmentError> {
+fn selected_bytes(
+    weight: &WeightPlan,
+    experts: u64,
+    selected: u64,
+) -> Result<u64, AssessmentError> {
     let rows = output_rows(weight)?;
     if experts == 0
         || selected > experts
@@ -113,7 +115,9 @@ impl Step {
     fn project(&mut self, weights: &[&WeightPlan]) -> Result<(), AssessmentError> {
         let bytes = weights
             .iter()
-            .try_fold(0u64, |total, weight| total.checked_add(weight.resident_bytes))
+            .try_fold(0u64, |total, weight| {
+                total.checked_add(weight.resident_bytes)
+            })
             .ok_or_else(|| demand_error("projection bytes overflow"))?;
         self.launch(bytes)
     }
@@ -150,6 +154,13 @@ fn planned<'a>(
         .target()
         .iter()
         .find(|weight| weight.role.scope == scope && weight.role.kind == kind)
+        // An output projection of a scope stored as planes is planned and
+        // not placed: its canonical full-projection demand stands.
+        .or_else(|| {
+            (kind == WeightKind::Output)
+                .then(|| load.planned_output(scope))
+                .flatten()
+        })
         .ok_or_else(|| demand_error(format!("{kind:?} weight is absent for {scope:?}")))?;
     if weight.resident != bound {
         return Err(demand_error(format!(
@@ -178,7 +189,11 @@ fn tail<'a>(
 
 /// A post-norm tail: the `output` projection into F32 rows, then the row op
 /// normalizing it with `norm` into the residual.
-fn post_norm(step: &mut Step, output: &WeightPlan, norm: &WeightPlan) -> Result<(), AssessmentError> {
+fn post_norm(
+    step: &mut Step,
+    output: &WeightPlan,
+    norm: &WeightPlan,
+) -> Result<(), AssessmentError> {
     step.project(&[output])?;
     step.launch(norm.resident_bytes)
 }
@@ -270,7 +285,10 @@ fn general_routed(
             .ok_or_else(|| demand_error("expert expansion bytes overflow"))?;
     }
     step.launch(expansion)?;
-    step.launch(chosen(weight(WeightKind::ExpertDown, binding.expert_down)?)?)
+    step.launch(chosen(weight(
+        WeightKind::ExpertDown,
+        binding.expert_down,
+    )?)?)
 }
 
 fn usize_bytes(bytes: usize) -> Result<u64, AssessmentError> {
@@ -290,7 +308,7 @@ fn history_read(
             // A window domain's rows are its window's tokens.
             HistoryDomainLayout::Window { rows, .. } => Some(usize_bytes(*rows)?),
             HistoryDomainLayout::Block { .. } => {
-                return Err(demand_error("block history domains have no decode demand"))
+                return Err(demand_error("block history domains have no decode demand"));
             }
             HistoryDomainLayout::Shared { source, layers } => {
                 if layers.contains(&layer) {
@@ -312,7 +330,9 @@ fn history_read(
             return Ok((row_bytes, window));
         }
     }
-    Err(demand_error(format!("attention layer {layer:?} has no history")))
+    Err(demand_error(format!(
+        "attention layer {layer:?} has no history"
+    )))
 }
 
 /// The bytes of `count` recurrent bank components from `first`.
@@ -383,7 +403,11 @@ impl DecodeDemand {
                     };
                     let projections = [
                         (true, query, binding.query),
-                        (shape.gate_rows() > 0, WeightKind::AttentionGate, binding.gate),
+                        (
+                            shape.gate_rows() > 0,
+                            WeightKind::AttentionGate,
+                            binding.gate,
+                        ),
                         (shape.key_rows() > 0, WeightKind::Key, binding.key),
                         (shape.value_rows() > 0, WeightKind::Value, binding.value),
                     ]
@@ -392,7 +416,7 @@ impl DecodeDemand {
                     .map(|(_, kind, bound)| weight(kind, bound))
                     .collect::<Result<Vec<_>, _>>()?;
                     step.project(&projections)?;
-                    if binding.history == KvCodec::RotatedK4V4 {
+                    if binding.history.encoding() == magnitude_state::HistoryEncoding::Unsupported {
                         return Err(demand_error(
                             "rotated K4/V4 history has no native attention entry",
                         ));
@@ -409,10 +433,15 @@ impl DecodeDemand {
                 // (`operators::state_space`).
                 MixerProgramSlot::StateSpace(binding) => {
                     weight(WeightKind::InputNorm, binding.norm)?;
-                    step.project(&[weight(WeightKind::StateSpaceProjection, binding.projection)?])?;
+                    step.project(&[weight(
+                        WeightKind::StateSpaceProjection,
+                        binding.projection,
+                    )?])?;
                     step.launch(bank_bytes(&layout, recurrent_component, 3, index)?)?;
                     recurrent_component += 3;
-                    step.launch(weight(WeightKind::StateSpaceNorm, Element::f32())?.resident_bytes)?;
+                    step.launch(
+                        weight(WeightKind::StateSpaceNorm, Element::f32())?.resident_bytes,
+                    )?;
                     step.project(&[weight(WeightKind::RecurrentOutput, binding.output)?])?;
                 }
                 // The segmented `u | C` projection, the gated taps over the
@@ -529,12 +558,24 @@ impl DecodeDemand {
                     sublayer: 2,
                 });
                 let SublayerTail::PostNorm { norm, .. } = binding.tail else {
-                    return Err(demand_error("a per-layer input sublayer without a post-norm tail"));
+                    return Err(demand_error(
+                        "a per-layer input sublayer without a post-norm tail",
+                    ));
                 };
-                step.project(&[planned(load, scope, WeightKind::PerLayerGate, binding.gate)?])?;
+                step.project(&[planned(
+                    load,
+                    scope,
+                    WeightKind::PerLayerGate,
+                    binding.gate,
+                )?])?;
                 post_norm(
                     &mut step,
-                    planned(load, scope, WeightKind::PerLayerProjection, binding.projection)?,
+                    planned(
+                        load,
+                        scope,
+                        WeightKind::PerLayerProjection,
+                        binding.projection,
+                    )?,
                     planned(load, scope, WeightKind::PostNorm, norm)?,
                 )?;
             }
@@ -554,27 +595,16 @@ impl DecodeDemand {
             .resident_bytes,
         )?;
         match readout.head {
-            ReadoutHead::Packed { weight, .. } => step.project(&[planned(
-                load,
-                WeightScope::Target,
-                WeightKind::Output,
-                weight,
-            )?])?,
-            // A certified selection streams the top plane, the scales and
-            // the radii; its later levels read too few rows to plan.
-            ReadoutHead::Progressive => step.project(
-                &[ProgressivePlane::Top, ProgressivePlane::Scales, ProgressivePlane::Radius]
-                    .map(|plane| {
-                        planned(
-                            load,
-                            WeightScope::Target,
-                            WeightKind::OutputPlane(plane),
-                            crate::progressive::element(plane),
-                        )
-                    })
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()?,
-            )?,
+            // Admission keeps the canonical full-projection demand even
+            // when bounded classes have an optional qualified implementation.
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
+                step.project(&[planned(
+                    load,
+                    WeightScope::Target,
+                    WeightKind::Output,
+                    weight,
+                )?])?;
+            }
         }
         step.launch(
             vocabulary

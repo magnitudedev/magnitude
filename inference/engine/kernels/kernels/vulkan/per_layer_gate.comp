@@ -77,7 +77,7 @@ projection_epilogue per_layer_gate_output() {
 }
 
 projection_weights per_layer_gate_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, GATE_D, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, GATE_D, 0ul, 1ul);
 }
 
 void per_layer_gate_stage() {

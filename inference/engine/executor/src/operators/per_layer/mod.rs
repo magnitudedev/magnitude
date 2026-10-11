@@ -5,7 +5,7 @@
 
 pub(crate) mod graph;
 
-use super::{post_norm_epsilon, tail, PlanError, WeightPush};
+use super::{PlanError, WeightPush, post_norm_epsilon, tail};
 use crate::PerLayerBinding;
 use magnitude_family_contracts::{
     ActivationFunction, InputNorm, OutputForm, PerLayerEntry, PerLayerInput, Sublayer, WeightKind,

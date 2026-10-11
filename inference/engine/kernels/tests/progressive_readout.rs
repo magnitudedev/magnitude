@@ -8,7 +8,7 @@ use magnitude_kernels::{
 };
 use seismic::{BackendName, Device, DeviceCatalog, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile, check_source},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -41,7 +41,13 @@ fn scan_launch(device: &Device, planes: bool) -> usize {
 /// A top level's or full pass's specialization with the scan parameters;
 /// on Metal also the first row count its batched GEMV serves (3 with four
 /// rows per simdgroup, so the batched path is exercised, else never).
-fn scan_spec(device: &Device, head: &Head, planes: bool, scan: u64, rows: u64) -> NativeSpecialization {
+fn scan_spec(
+    device: &Device,
+    head: &Head,
+    planes: bool,
+    scan: u64,
+    rows: u64,
+) -> NativeSpecialization {
     let launch = scan_launch(device, planes);
     let spec = statics(head)
         .with_launch_param(launch, width_param(device), scan)
@@ -105,6 +111,7 @@ fn f16_value(bits: u16) -> f32 {
 struct Head {
     v: usize,
     d: usize,
+    bits: usize,
     top: Vec<u32>,
     bit3: Vec<u32>,
     rest: Vec<u32>,
@@ -116,23 +123,38 @@ struct Head {
 impl Head {
     /// Rows of random codes and scales.
     fn new(v: usize, d: usize, seed: u64) -> Self {
+        Self::with_bits(v, d, seed, 8)
+    }
+    fn with_bits(v: usize, d: usize, seed: u64, bits: usize) -> Self {
+        assert!(matches!(bits, 4 | 8));
+        let half = bits / 2;
+        let low = half - 1;
+        let per_word = 32 / half;
+        let offset = (1u32 << (bits - 1)) as f32;
         let mut rng = Rng(seed);
         let groups = d / 32;
         let mut codes = vec![0u8; v * d];
         let mut scales = vec![0u16; v * groups];
         for n in 0..v {
             for g in 0..groups {
-                scales[n * groups + g] = f16_bits(rng.uniform(0.5, 1.5) * 0.02 / (d as f32).sqrt());
+                let sign = if bits == 4 && (n + g) % 2 == 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                scales[n * groups + g] =
+                    f16_bits(sign * rng.uniform(0.5, 1.5) * 0.02 / (d as f32).sqrt());
                 for i in 0..32 {
-                    codes[n * d + 32 * g + i] = (rng.next() % 256) as u8;
+                    codes[n * d + 32 * g + i] = (rng.next() % (1u32 << bits)) as u8;
                 }
             }
         }
-        let value =
-            |n: usize, k: usize, code: f32| f16_value(scales[n * groups + k / 32]) * (code - 128.0);
-        let mut top = vec![0u32; v * d / 8];
+        let value = |n: usize, k: usize, code: f32| {
+            f16_value(scales[n * groups + k / 32]) * (code - offset)
+        };
+        let mut top = vec![0u32; v * d * half / 32];
         let mut bit3 = vec![0u32; v * groups];
-        let mut rest = vec![0u32; v * groups * 3];
+        let mut rest = vec![0u32; v * groups * low];
         let mut exact = vec![0f32; v * d];
         let mut views = [vec![0f32; v * d], vec![0f32; v * d]];
         for n in 0..v {
@@ -140,14 +162,22 @@ impl Head {
                 let u = u32::from(codes[n * d + k]);
                 let (g, within) = (k / 32, k % 32);
                 let shift = 4 * (within % 8) + within / 8;
-                top[n * d / 8 + k / 8] |= (u >> 4) << (4 * (k % 8));
-                bit3[n * groups + g] |= ((u >> 3) & 1) << shift;
-                for j in 0..3 {
-                    rest[(n * groups + g) * 3 + j] |= ((u >> (2 - j)) & 1) << shift;
+                top[n * d / per_word + k / per_word] |= (u >> half) << (half * (k % per_word));
+                bit3[n * groups + g] |= ((u >> low) & 1) << shift;
+                for j in 0..low {
+                    rest[(n * groups + g) * low + j] |= ((u >> (low - 1 - j)) & 1) << shift;
                 }
                 exact[n * d + k] = value(n, k, u as f32);
-                views[0][n * d + k] = value(n, k, (u >> 4) as f32 * 16.0 + 7.5);
-                views[1][n * d + k] = value(n, k, (u >> 3) as f32 * 8.0 + 3.5);
+                views[0][n * d + k] = value(
+                    n,
+                    k,
+                    (u >> half) as f32 * (1u32 << half) as f32 + 0.5 * ((1u32 << half) - 1) as f32,
+                );
+                views[1][n * d + k] = value(
+                    n,
+                    k,
+                    (u >> low) as f32 * (1u32 << low) as f32 + 0.5 * ((1u32 << low) - 1) as f32,
+                );
             }
         }
         let norm =
@@ -165,6 +195,7 @@ impl Head {
         Self {
             v,
             d,
+            bits,
             top,
             bit3,
             rest,
@@ -350,9 +381,19 @@ impl Case {
         Tensors {
             hidden: tensor(device, Element::f32(), &[self.m, d], f32s(&self.hidden)),
             norm: tensor(device, Element::bf16(), &[d], bf16_bytes(&self.norm)),
-            top: tensor(device, Element::u32(), &[v, d / 8], words(&head.top)),
+            top: tensor(
+                device,
+                Element::u32(),
+                &[v, groups, head.bits / 2],
+                words(&head.top),
+            ),
             bit3: tensor(device, Element::u32(), &[v, groups], words(&head.bit3)),
-            rest: tensor(device, Element::u32(), &[v, groups, 3], words(&head.rest)),
+            rest: tensor(
+                device,
+                Element::u32(),
+                &[v, groups, head.bits / 2 - 1],
+                words(&head.rest),
+            ),
             scales: tensor(
                 device,
                 Element::f16(),
@@ -406,10 +447,21 @@ fn statics(head: &Head) -> NativeSpecialization {
     NativeSpecialization::new()
         .with_static("V", head.v as u64)
         .with_static("D", head.d as u64)
+        .with_static("P", (head.bits / 2 - 1) as u64)
 }
 
 /// Every level natively, each from the previous native level.
-fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) -> Levels {
+fn run(device: &Device, head: &Head, t: &Tensors, params: Params) -> Levels {
+    run_with_softcap(device, head, t, params, 0.0)
+}
+
+fn run_with_softcap(
+    device: &Device,
+    head: &Head,
+    t: &Tensors,
+    (scan, rows, gather): Params,
+    softcap: f32,
+) -> Levels {
     let width = width_param(device);
     let top = readout_top_rows::native_for_device_with(
         device,
@@ -421,6 +473,7 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
     )
     .unwrap()
     .call(readout_top_rows::Args {
+        softcap,
         hidden: &t.hidden,
         norm: &t.norm,
         top: &t.top,
@@ -443,6 +496,7 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
     )
     .unwrap()
     .call(readout_refine_rows::Args {
+        softcap,
         features: &top.r2,
         top: &t.top,
         bit3: &t.bit3,
@@ -465,6 +519,7 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
     )
     .unwrap()
     .call(readout_exact_rows::Args {
+        softcap,
         features: &top.r2,
         top: &t.top,
         bit3: &t.bit3,
@@ -491,6 +546,7 @@ fn run(device: &Device, head: &Head, t: &Tensors, (scan, rows, gather): Params) 
     )
     .unwrap()
     .call(readout_planes_rows::Args {
+        softcap,
         hidden: &t.hidden,
         norm: &t.norm,
         top: &t.top,
@@ -578,7 +634,8 @@ fn progressive_selection_selects_what_the_full_readout_selects() {
                                 );
                             } else {
                                 assert!(
-                                    (f64::from(exact) - f64::from(planes)).abs() <= 1e-5 * (magnitude + 1e-6),
+                                    (f64::from(exact) - f64::from(planes)).abs()
+                                        <= 1e-5 * (magnitude + 1e-6),
                                     "{context}: row {row} token {token} exact {exact} planes {planes}"
                                 );
                             }
@@ -618,6 +675,55 @@ fn progressive_selection_selects_what_the_full_readout_selects() {
     }
 }
 
+/// A monotone cap can turn distinct raw logits into equal F32 scores.
+/// Bounds must keep every tied competitor, including one preferred by the
+/// sampler's token tie rule, while sampled/constrained rows use the same draws.
+#[test]
+fn progressive_softcap_preserves_full_selection_and_saturated_ties() {
+    let Some(device) = device() else { return };
+    for bits in [4, 8] {
+        let head = Head::with_bits(67, 256, 41, bits);
+        let mut rng = Rng(5);
+        for rows in [1, 3] {
+            let case = Case::new(rows, &head, false, &mut rng);
+            let t = case.tensors(&device, &head);
+            for cap in [0.0, 0.001, 0.1, 30.0] {
+                let levels = run_with_softcap(&device, &head, &t, (8, 2, 8), cap);
+                for (token, (&selected, &full)) in
+                    levels.exact.iter().zip(&levels.planes).enumerate()
+                {
+                    if selected.is_finite() {
+                        assert_eq!(
+                            selected.to_bits(),
+                            full.to_bits(),
+                            "cap {cap} token {token}: survivor and full scan must publish the same dot"
+                        );
+                    }
+                }
+                for row in 0..case.o {
+                    assert_eq!(
+                        case.selection.select(row, &levels.exact, head.v),
+                        case.selection.select(row, &levels.planes, head.v),
+                        "cap {cap} row {row}: certified selection differs"
+                    );
+                    assert!(levels.threshold4[row] <= levels.threshold5[row]);
+                }
+                if cap == 0.001 {
+                    let maximum = levels.planes[..head.v]
+                        .iter()
+                        .copied()
+                        .fold(f32::NEG_INFINITY, f32::max);
+                    let tied = levels.planes[..head.v]
+                        .iter()
+                        .filter(|&&z| z == maximum)
+                        .count();
+                    assert!(tied > 1, "the fixture must create actual published ties");
+                }
+            }
+        }
+    }
+}
+
 /// The full planes readout projects every row class, in blocks of eight rows:
 /// each row's logits are its features' exact dot products with the head.
 #[test]
@@ -640,6 +746,7 @@ fn planes_readout_projects_every_row_class() {
             )
             .unwrap()
             .call(readout_planes_rows::Args {
+                softcap: 0.0,
                 hidden: &t.hidden,
                 norm: &t.norm,
                 top: &t.top,
@@ -790,10 +897,16 @@ fn assert_covers(label: &str, native: &[f32], portable: &[f32], scale: f32) {
 fn progressive_portable_bodies_match_the_natives() {
     let Some(device) = device() else { return };
     let module = module();
+    let softcap = 30.0;
     // A vocabulary that is no multiple of 32 or of the scan's rows, and a
     // width with a partial 1,024-column chunk.
-    for (v, d) in [(67usize, 256usize), (45, 1088)] {
-        let head = Head::new(v, d, 77);
+    for (v, d, bits) in [
+        (67usize, 256usize, 4usize),
+        (67, 256, 8),
+        (45, 1088, 4),
+        (45, 1088, 8),
+    ] {
+        let head = Head::with_bits(v, d, 77, bits);
         let mut rng = Rng(9);
         let case = Case::new(3, &head, false, &mut rng);
         let (o, m, groups) = (case.o, case.m, d / 32);
@@ -801,9 +914,17 @@ fn progressive_portable_bodies_match_the_natives() {
         let words = |values: &[u32]| values.iter().map(|w| f64::from(*w)).collect::<Vec<_>>();
         let planes = || {
             vec![
-                dense(DType::U32, &[v, d / 8], words(&head.top).into_iter()),
+                dense(
+                    DType::U32,
+                    &[v, groups, head.bits / 2],
+                    words(&head.top).into_iter(),
+                ),
                 dense(DType::U32, &[v, groups], words(&head.bit3).into_iter()),
-                dense(DType::U32, &[v, groups, 3], words(&head.rest).into_iter()),
+                dense(
+                    DType::U32,
+                    &[v, groups, head.bits / 2 - 1],
+                    words(&head.rest).into_iter(),
+                ),
                 dense(
                     DType::F16,
                     &[v, groups],
@@ -861,6 +982,7 @@ fn progressive_portable_bodies_match_the_natives() {
         inputs.push(out_rows);
         inputs.extend(selecting());
         inputs.push(Input::F32(EPSILON));
+        inputs.push(Input::F32(softcap));
         let top = interpret(&module, "readout_top_rows", &["NW", "A"], inputs);
         let (coarse, threshold4, features, length) = (
             result(&top, 0),
@@ -887,6 +1009,7 @@ fn progressive_portable_bodies_match_the_natives() {
                 length.iter().map(|x| f64::from(*x)),
             ));
             inputs.extend(selecting());
+            inputs.push(Input::F32(softcap));
             interpret(&module, name, &["A"], inputs)
         };
         let refine = level("readout_refine_rows", &coarse, &threshold4);
@@ -897,6 +1020,7 @@ fn progressive_portable_bodies_match_the_natives() {
         inputs.extend(planes().into_iter().take(4));
         inputs.push(out_rows);
         inputs.push(Input::F32(EPSILON));
+        inputs.push(Input::F32(softcap));
         let full = result(
             &interpret(&module, "readout_planes_rows", &["NW", "A"], inputs),
             0,
@@ -907,7 +1031,7 @@ fn progressive_portable_bodies_match_the_natives() {
         let scale = full.iter().fold(0f32, |a, b| a.max(b.abs()));
         let context = format!("V {v} D {d}");
         for params in [(4u64, 1u64, 4u64), (8, 2, 8)] {
-            let levels = run(&device, &head, &t, params);
+            let levels = run_with_softcap(&device, &head, &t, params, softcap);
             assert_close(
                 &format!("{context} top logits"),
                 &levels.coarse,
@@ -951,6 +1075,7 @@ fn progressive_portable_bodies_match_the_natives() {
         )
         .unwrap()
         .call(readout_refine_rows::Args {
+            softcap,
             features: &features_tensor,
             top: &t.top,
             bit3: &t.bit3,
@@ -985,6 +1110,7 @@ fn progressive_portable_bodies_match_the_natives() {
         )
         .unwrap()
         .call(readout_exact_rows::Args {
+            softcap,
             features: &features_tensor,
             top: &t.top,
             bit3: &t.bit3,
@@ -1037,6 +1163,7 @@ fn progressive_timings() {
     let head = Head {
         v,
         d,
+        bits: 8,
         top: random(v * d / 8),
         bit3: random(v * groups),
         rest: random(v * groups * 3),
@@ -1069,6 +1196,7 @@ fn progressive_timings() {
             )
             .unwrap();
             let args = readout_top_rows::Args {
+                softcap: 0.0,
                 hidden: &t.hidden,
                 norm: &t.norm,
                 top: &t.top,
@@ -1099,6 +1227,7 @@ fn progressive_timings() {
             )
             .unwrap();
             let args = readout_planes_rows::Args {
+                softcap: 0.0,
                 hidden: &t.hidden,
                 norm: &t.norm,
                 top: &t.top,
@@ -1151,6 +1280,7 @@ fn progressive_timings() {
                 )
                 .unwrap();
                 let args = readout_refine_rows::Args {
+                    softcap: 0.0,
                     features: &features,
                     top: &t.top,
                     bit3: &t.bit3,
@@ -1178,6 +1308,7 @@ fn progressive_timings() {
                 )
                 .unwrap();
                 let args = readout_exact_rows::Args {
+                    softcap: 0.0,
                     features: &features,
                     top: &t.top,
                     bit3: &t.bit3,
@@ -1197,6 +1328,108 @@ fn progressive_timings() {
                     &format!("exact O {o} share {share} {width} {gather}"),
                     measured.median,
                     (v * d) as f64 * share * 1.0625,
+                );
+            }
+        }
+    }
+}
+
+/// Canonical selection changes the physical row lookup, not the projection's
+/// scale/cap semantics. Invalid sentinels must never become weight addresses.
+#[test]
+fn prepared_full_and_indexed_share_projection_and_mask_invalid_ids() {
+    let Some(device) = device() else { return };
+    let (o, v, d, s) = (2usize, 9usize, 64usize, 5usize);
+    let features = (0..o * d)
+        .map(|i| bf16_round(((i * 13 % 31) as f32 - 15.0) / 32.0))
+        .collect::<Vec<_>>();
+    let weights = (0..v * d)
+        .map(|i| bf16_round(((i * 7 % 43) as f32 - 21.0) / 64.0))
+        .collect::<Vec<_>>();
+    let features_tensor = tensor(&device, Element::bf16(), &[o, d], bf16_bytes(&features));
+    let weight_tensor = tensor(&device, Element::bf16(), &[v, d], bf16_bytes(&weights));
+    let ids = [8i32, 2, 2, -1, 9, 0, 7, 3, i32::MAX, -17];
+    let scale_tensor = tensor(&device, Element::f32(), &[1], f32s(&[-0.75]));
+    let project = |indexed: bool, cap: f32| {
+        let columns = if indexed { s } else { v };
+        let tokens = tensor(
+            &device,
+            Element::i32(),
+            &[o, usize::from(indexed), columns],
+            if indexed {
+                ids.iter().flat_map(|id| id.to_le_bytes()).collect()
+            } else {
+                Vec::new()
+            },
+        );
+        let spec = NativeSpecialization::new()
+            .with_static("V", v as u64)
+            .with_static("D", d as u64)
+            .with_static("S", columns as u64)
+            .with_static("I", u64::from(indexed))
+            .with_static("WS", 1);
+        let spec = match device.backend() {
+            BackendName::Metal => spec
+                .with_launch_param(0, "SIMDGROUPS", 4)
+                .with_launch_param(0, "ROWS", 1)
+                .with_launch_param(0, "LANES", 32),
+            BackendName::Cuda => spec
+                .with_param("OPERAND", 0)
+                .with_launch_param(1, "KSPLIT", 4)
+                .with_launch_param(2, "KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2)
+                .with_launch_param(5, "KSPLIT", 4),
+            _ => spec,
+        };
+        let kernel = magnitude_kernels::readout_project_rows::native_for_device_with(
+            &device,
+            magnitude_kernels::readout_project_rows::Elements {
+                A: Element::bf16(),
+                OW: Element::bf16(),
+            },
+            &spec,
+        )
+        .unwrap();
+        read_f32(
+            &kernel
+                .call(magnitude_kernels::readout_project_rows::Args {
+                    features: &features_tensor,
+                    weight: &weight_tensor,
+                    token_rows: &tokens,
+                    weight_scale: &scale_tensor,
+                    softcap: cap,
+                })
+                .unwrap()
+                .value,
+        )
+    };
+    for cap in [0.0f32, 0.1, 30.0] {
+        let full = project(false, cap);
+        let indexed = project(true, cap);
+        for row in 0..o {
+            for column in 0..s {
+                let id = ids[row * s + column];
+                let actual = indexed[row * s + column];
+                if id < 0 || id as usize >= v {
+                    assert_eq!(actual, f32::NEG_INFINITY);
+                    continue;
+                }
+                let sum = (0..d)
+                    .map(|k| features[row * d + k] * weights[id as usize * d + k])
+                    .sum::<f32>()
+                    * -0.75;
+                let expected = if cap > 0.0 {
+                    cap * (sum / cap).tanh()
+                } else {
+                    sum
+                };
+                assert!(
+                    (actual - expected).abs() <= 2e-5,
+                    "indexed {actual} oracle {expected}"
+                );
+                assert!(
+                    (actual - full[row * v + id as usize]).abs() <= 2e-5,
+                    "canonical projection differs between Full and Indexed"
                 );
             }
         }

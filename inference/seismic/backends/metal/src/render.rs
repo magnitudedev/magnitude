@@ -200,7 +200,11 @@ struct LookupTables {
 
 impl LookupTables {
     fn name(&mut self, table: &'static [i32]) -> String {
-        let index = match self.tables.iter().position(|known| std::ptr::eq(*known, table)) {
+        let index = match self
+            .tables
+            .iter()
+            .position(|known| std::ptr::eq(*known, table))
+        {
             Some(index) => index,
             None => {
                 self.tables.push(table);
@@ -1397,7 +1401,8 @@ impl<'a> Renderer<'a> {
                         panic!("dense conversion recipe targets a non-dense plane")
                     };
                     for (element, expression) in values.iter().enumerate() {
-                        let expression = repack_expression(expression, &source_base, &mut self.lookups);
+                        let expression =
+                            repack_expression(expression, &source_base, &mut self.lookups);
                         let expression = strict_f32_publication(*dtype, &expression);
                         let offset =
                             u64::from(plane.offset) + element as u64 * u64::from(dtype.bytes());
@@ -1706,10 +1711,9 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
             "float(as_type<half>(ushort({})))",
             repack_expression(value, source, lookups)
         ),
-        RepackExpr::I32ToF32(value) => format!(
-            "float(int({}))",
-            repack_expression(value, source, lookups)
-        ),
+        RepackExpr::I32ToF32(value) => {
+            format!("float(int({}))", repack_expression(value, source, lookups))
+        }
         RepackExpr::MultiplyF32(left, right) => format!(
             "f32_mul(float({}), float({}))",
             repack_expression(left, source, lookups),
@@ -1989,7 +1993,9 @@ fn math_expr(op: MathOp, ty: &ValueType, a: &str) -> String {
 fn physical_math_expr(op: MathOp, ty: &ValueType, a: &str) -> String {
     let namespace = "fast";
     let function = match op {
+        MathOp::Rint => return format!("rint({a})"),
         MathOp::Exp => "exp",
+        MathOp::Exp2 => "exp2",
         MathOp::Rsqrt => "rsqrt",
         MathOp::Sqrt => "sqrt",
         MathOp::Log => "log",
@@ -2025,7 +2031,7 @@ fn cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
 fn physical_cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
     match (from, to) {
         (ValueType::Index, ValueType::Scalar(DType::I32)) => {
-            return format!("as_type<int>(uint({a}))")
+            return format!("as_type<int>(uint({a}))");
         }
         (ValueType::Index, _) | (_, ValueType::Index) => {
             // IR natural conversions preserve the full natural word. Source

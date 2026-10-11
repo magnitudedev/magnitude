@@ -4,24 +4,25 @@
 
 use crate::census::MemoryDomain;
 use crate::error::{
-    classify_catalog, classify_plan, classify_platform, ArtifactError, InsufficientMemory,
-    LoadError,
+    ArtifactError, InsufficientMemory, LoadError, classify_catalog, classify_plan,
+    classify_platform,
 };
-use crate::options::ExecutionManifest;
+use crate::options::{ExecutionManifest, ResolvedMethod};
 use crate::worker::protocol::LoadProgress;
 use magnitude_artifacts::Package;
 use magnitude_batching::Demand;
 use magnitude_executor::{
+    AttestedPrograms, ClaimRefusal, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceHeap,
+    ExecutionPlanDraft, ExecutorDomain, KernelCache, Operation, RequestId, ReservedResources,
+    ResidencyError, ResidencyStore, ResourceAllocator, ResourceCapacity, ResourceDomainId,
+    CatalogError, CatalogFailure, ResourcePlan, ResourcePlanner, SEARCH_VERSION, StateBindings,
+    TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
+    TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WeightImportError, WorkKind,
     memory::{ClaimId, HoldingClass},
     platform::{self, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
     require_normal,
-    AttestedPrograms, ExecutionPlanDraft, ClaimRefusal, ComponentLoader, DeviceHeap, ExecutorDomain, KernelCache,
-    Operation, RequestId, ReservedResources, ResidencyError, ResidencyStore, ResourceAllocator,
-    ResourceCapacity, ResourceDomainId, ResourcePlan, ResourcePlanner, StateBindings, TokenId,
-    TuningContext, TuningEvent,
-    TuningObserver, TuningOrigin, WeightImportError, WorkKind, DEFAULT_KERNEL_CACHE_BYTES,
 };
-use magnitude_family_contracts::{InputLayout, PreparedModelInput, TokenPlan};
+use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, TokenPlan};
 use seismic::{BackendName, DeviceCatalog, DeviceMemory, DeviceSelector, MemoryPoolKind};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -52,19 +53,44 @@ fn platform_error(error: PlatformError) -> LoadError {
 }
 
 /// Construct the executor domain from an admitted manifest, opening and
-/// charging nothing a load would not. Measurement and memory tools call this
-/// to drive the domain below the scheduler.
+/// charging nothing a load would not: this is a load, so it reads stored
+/// tuning records and searches nothing. Measurement and memory tools call
+/// this to drive the domain below the scheduler; with `unprepared` as
+/// [`UnpreparedUnits::Report`] it is the load step of
+/// [`crate::worker::load_prepared`].
+pub fn load_native_domain(
+    manifest: &ExecutionManifest,
+    package: Arc<Package>,
+    unprepared: UnpreparedUnits,
+) -> Result<LoadAttempt<(ExecutorDomain, StateBindings, ResourcePlan)>, LoadError> {
+    let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
+    Ok(
+        match build(catalog, manifest, package, unprepared, Rc::new(|_| {}))? {
+            LoadAttempt::Loaded(built) => {
+                LoadAttempt::Loaded((built.domain, built.bindings, built.plan))
+            }
+            LoadAttempt::Unprepared => LoadAttempt::Unprepared,
+        },
+    )
+}
+
+/// [`load_native_domain`] serving canonical defaults for every tuning unit
+/// without a stored record: the load of a host that has no search run.
 pub fn build_native_domain(
     manifest: &ExecutionManifest,
     package: Arc<Package>,
 ) -> Result<(ExecutorDomain, StateBindings, ResourcePlan), LoadError> {
-    let catalog = DeviceCatalog::discover().map_err(|error| internal(error.to_string()))?;
-    build(catalog, manifest, package, Rc::new(|_| {}))
-        .map(|built| (built.domain, built.bindings, built.plan))
+    match load_native_domain(manifest, package, UnpreparedUnits::ServeDefaults)? {
+        LoadAttempt::Loaded(built) => Ok(built),
+        LoadAttempt::Unprepared => Err(internal(
+            "a load serving canonical defaults stopped unprepared",
+        )),
+    }
 }
 
 /// A load's front half on its opened device: the selected device, the plan
-/// draft and the attested programs, tuned against the kernel cache.
+/// draft and the attested programs, prepared from the kernel cache's stored
+/// tuning records.
 pub(crate) struct PreparedPrograms {
     pub draft: ExecutionPlanDraft,
     pub opened: OpenedPlatform,
@@ -72,18 +98,32 @@ pub(crate) struct PreparedPrograms {
     pub backend: BackendName,
     pub pool: MemoryPoolKind,
     pub capacity: ResourceCapacity,
+    /// The load's one set of worker threads: everything its preparation
+    /// does off the calling thread runs on these and no others. It is lent
+    /// to the opened device for the programs the load forms, and seals the
+    /// load's graphs.
+    pub workers: Arc<seismic::Workers>,
 }
 
-/// Select and open the manifest's device, plan the model on it and prepare
-/// its programs, tuning whatever the kernel cache lacks. A load continues
-/// from here; the post-install prepare job ends here, so both produce and
-/// look up the same tuning keys.
-pub(crate) fn prepare(
+/// A manifest's model planned on its selected and opened device: where a
+/// search and a load both start, so both derive the same tuning keys.
+struct PlannedModel {
+    draft: ExecutionPlanDraft,
+    opened: OpenedPlatform,
+    backend: BackendName,
+    pool: MemoryPoolKind,
+    capacity: ResourceCapacity,
+    kernel_cache: Option<Arc<KernelCache>>,
+    numerical_profile: magnitude_executor::ResolvedNumericalProfile,
+}
+
+/// Select and open the manifest's device and plan the model on it.
+fn plan_on_device(
     catalog: &DeviceCatalog,
     manifest: &ExecutionManifest,
     package: &Package,
-    progress: Rc<dyn Fn(LoadProgress)>,
-) -> Result<PreparedPrograms, LoadError> {
+    progress: &dyn Fn(LoadProgress),
+) -> Result<PlannedModel, LoadError> {
     let mut phase_started = Instant::now();
     if package.manifest() != manifest.package {
         return Err(LoadError::Artifact(ArtifactError::Invalid {
@@ -141,28 +181,88 @@ pub(crate) fn prepare(
     )
     .map_err(platform_error)?;
     report_load_phase("device open", &mut phase_started);
-    let preparing = Instant::now();
-    let error_classes = magnitude_executor::AdmittedErrorClasses::of(&manifest.model.error_classes)
+    report_load_memory("device opened", opened.device());
+    let numerical_profile = manifest
+        .model
+        .numerical_profile
+        .clone()
+        .unwrap_or_else(magnitude_executor::NumericalProfile::standard)
+        .resolve()
         .map_err(internal)?;
-    let programs = AttestedPrograms::prepare_draft(
+    Ok(PlannedModel {
+        draft,
+        opened,
+        backend,
+        pool,
+        capacity,
+        kernel_cache,
+        numerical_profile,
+    })
+}
+
+/// The tuning report of `work` on `manifest`: progress to the host, units to
+/// the diagnostic stream, every event to the trace the host asked for.
+fn tuning_report(
+    manifest: &ExecutionManifest,
+    work: TracedWork,
+    numerical_profile: &magnitude_executor::ResolvedNumericalProfile,
+    progress: Rc<dyn Fn(LoadProgress)>,
+) -> Result<TuningReport, LoadError> {
+    Ok(TuningReport {
+        progress,
+        trace: manifest
+            .tuning_trace
+            .as_deref()
+            .map(|path| TuningTrace::begin(path, work, manifest.tuning, numerical_profile))
+            .transpose()
+            .map_err(internal)?,
+    })
+}
+
+/// The Prepare request's work, and the engine's only search: on the device a
+/// load of `manifest` selects, search every tuning unit the kernel cache has
+/// no record for, within the manifest's tuning budget, publishing each
+/// unit's record as it stands. Nothing is prepared for serving and the model
+/// is not imported: the process ends here, and a load reads the records.
+pub(crate) fn search(
+    catalog: &DeviceCatalog,
+    manifest: &ExecutionManifest,
+    package: &Package,
+    progress: Rc<dyn Fn(LoadProgress)>,
+) -> Result<(), LoadError> {
+    let PlannedModel {
+        draft,
+        opened,
+        kernel_cache,
+        numerical_profile,
+        ..
+    } = plan_on_device(catalog, manifest, package, progress.as_ref())?;
+    let searching = Instant::now();
+    let report = tuning_report(manifest, TracedWork::Search, &numerical_profile, progress)?;
+    let tuned = AttestedPrograms::search_draft(
         &draft,
         opened.device(),
         TuningContext {
             definition: &manifest.definition,
             weights: package,
-            observer: &TuningReport { progress },
+            observer: &report,
             cache: kernel_cache.as_deref(),
-            error_classes: &error_classes,
+            numerical_profile: &numerical_profile,
+            settings: manifest.tuning,
         },
+        Some(opened.tuning_room()),
     )
     .map_err(|error| LoadError::from(classify_catalog(error)))?;
-    let tuned = programs.tuned();
+    if let Some(trace) = &report.trace {
+        trace.conclude(&tuned).map_err(internal)?;
+    }
+    let sum = |part: fn(&TunedEntry) -> f64| tuned.iter().map(part).sum::<f64>();
     eprintln!(
-        "magnitude-engine: prepared programs in {:.2} s, {:.2} s of it tuning {} entries \
+        "magnitude-engine: searched in {:.2} s, {:.2} s of it tuning {} entries \
          ({} searched, {} stored; building inputs {:.2} s, forming {:.2} s, measuring {:.2} s, \
          validating {:.2} s)",
-        preparing.elapsed().as_secs_f64(),
-        tuned.iter().map(|tuned| tuned.seconds).sum::<f64>(),
+        searching.elapsed().as_secs_f64(),
+        sum(|tuned| tuned.seconds),
         tuned.len(),
         tuned
             .iter()
@@ -172,39 +272,159 @@ pub(crate) fn prepare(
             .iter()
             .filter(|tuned| tuned.origin == TuningOrigin::Stored)
             .count(),
-        tuned
-            .iter()
-            .map(|tuned| tuned.time.building_seconds)
-            .sum::<f64>(),
-        tuned
-            .iter()
-            .map(|tuned| tuned.time.forming_seconds)
-            .sum::<f64>(),
-        tuned
-            .iter()
-            .map(|tuned| tuned.time.measuring_seconds)
-            .sum::<f64>(),
-        tuned
-            .iter()
-            .map(|tuned| tuned.time.validating_seconds)
-            .sum::<f64>(),
+        sum(|tuned| tuned.time.building_seconds),
+        sum(|tuned| tuned.time.forming_seconds),
+        sum(|tuned| tuned.time.measuring_seconds),
+        sum(|tuned| tuned.time.validating_seconds),
     );
-    Ok(PreparedPrograms {
+    report_load_memory("searched", opened.device());
+    if let Some(cache) = &kernel_cache {
+        cache.store_prepared(&prepared_key(manifest)?);
+    }
+    Ok(())
+}
+
+/// The kernel cache key under which a finished Prepare of `manifest` is
+/// recorded ([`KernelCache::prepared`]): everything of the manifest that
+/// decides what a Prepare searches, and the search's version. Where the host
+/// keeps its cache and trace is not part of it, nor whether the Prepare
+/// searched afresh.
+fn prepared_key(manifest: &ExecutionManifest) -> Result<TuningCacheKey, LoadError> {
+    let load = ExecutionManifest {
+        kernel_cache: None,
+        tuning_trace: None,
+        tuning: TuningSettings {
+            fresh: false,
+            ..manifest.tuning
+        },
+        ..manifest.clone()
+    };
+    let load = serde_json::to_string(&load).map_err(|error| internal(error.to_string()))?;
+    Ok(TuningCacheKey::of(&format!(
+        "prepared {SEARCH_VERSION}\n{load}"
+    )))
+}
+
+/// How an attempt to load ended, short of failing.
+#[derive(Debug)]
+pub enum LoadAttempt<L> {
+    Loaded(L),
+    /// A load asked to report tuning units without a stored record
+    /// ([`UnpreparedUnits::Report`]) met one. Nothing of the model was
+    /// placed, and nothing of the attempt remains: the host has the model's
+    /// Prepare run and loads again ([`crate::worker::load_prepared`]).
+    Unprepared,
+}
+
+/// A load's front half: select and open the manifest's device, plan the
+/// model on it and prepare its programs from the kernel cache's stored
+/// tuning records. A load never searches: at a unit without a record it
+/// stops unprepared or prepares the unit at its canonical default, as
+/// `unprepared` says.
+fn prepare(
+    catalog: &DeviceCatalog,
+    manifest: &ExecutionManifest,
+    package: &Package,
+    unprepared: UnpreparedUnits,
+    progress: Rc<dyn Fn(LoadProgress)>,
+) -> Result<LoadAttempt<PreparedPrograms>, LoadError> {
+    // A load asked to report stops here when no Prepare of it has finished,
+    // or when its Prepare is to search afresh: before the device is opened,
+    // so a host that loads in its own process has formed no program when
+    // its Prepare runs ([`KernelCache::prepared`]).
+    if unprepared == UnpreparedUnits::Report {
+        if let Some(root) = &manifest.kernel_cache {
+            let cache = KernelCache::open(root.clone(), DEFAULT_KERNEL_CACHE_BYTES)
+                .map_err(|error| internal(error.to_string()))?;
+            if manifest.tuning.fresh || !cache.prepared(&prepared_key(manifest)?) {
+                return Ok(LoadAttempt::Unprepared);
+            }
+        }
+    }
+    let PlannedModel {
+        draft,
+        opened,
+        backend,
+        pool,
+        capacity,
+        kernel_cache,
+        numerical_profile,
+    } = plan_on_device(catalog, manifest, package, progress.as_ref())?;
+    let preparing = Instant::now();
+    let workers = Arc::new(seismic::Workers::of_the_host());
+    opened.device().staff(Some(workers.clone()));
+    let report = tuning_report(manifest, TracedWork::Load, &numerical_profile, progress)?;
+    let mut programs = match AttestedPrograms::prepare_draft(
+        &draft,
+        opened.device(),
+        TuningContext {
+            definition: &manifest.definition,
+            weights: package,
+            observer: &report,
+            cache: kernel_cache.as_deref(),
+            numerical_profile: &numerical_profile,
+            settings: manifest.tuning,
+        },
+        unprepared,
+    ) {
+        Ok(programs) => programs,
+        Err(CatalogError {
+            failure: CatalogFailure::Unprepared { entry, bindings },
+            ..
+        }) => {
+            eprintln!(
+                "magnitude-engine: no stored tuning record for {entry} [{bindings}]: the load \
+                 stops unprepared, before placing anything"
+            );
+            // The load that follows the Prepare writes the load's trace.
+            if let Some(trace) = report.trace {
+                trace.abandon().map_err(internal)?;
+            }
+            return Ok(LoadAttempt::Unprepared);
+        }
+        Err(error) => return Err(LoadError::from(classify_catalog(error))),
+    };
+    let draft = draft
+        .finalize_readout(&manifest.definition, programs.readout_choices())
+        .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
+    if draft.load().readout_choices() != programs.readout_choices() {
+        programs
+            .discard_readout_choices(draft.programs())
+            .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
+    }
+    let tuned = programs.tuned();
+    if let Some(trace) = &report.trace {
+        trace.conclude(tuned).map_err(internal)?;
+    }
+    eprintln!(
+        "magnitude-engine: prepared programs in {:.2} s: {} tuned entries from stored records, \
+         {} at canonical defaults for want of one",
+        preparing.elapsed().as_secs_f64(),
+        tuned.len(),
+        programs.unprepared(),
+    );
+    report_load_memory("programs prepared", opened.device());
+    Ok(LoadAttempt::Loaded(PreparedPrograms {
         draft,
         opened,
         programs,
         backend,
         pool,
         capacity,
-    })
+        workers,
+    }))
 }
 
+/// A load: one code path whose `unprepared` decides only what happens at a
+/// tuning unit without a stored record, which it meets while its programs
+/// are prepared, before anything of the model is placed.
 pub(crate) fn build(
     catalog: DeviceCatalog,
     manifest: &ExecutionManifest,
     package: Arc<Package>,
+    unprepared: UnpreparedUnits,
     progress: Rc<dyn Fn(LoadProgress)>,
-) -> Result<NativeDomain, LoadError> {
+) -> Result<LoadAttempt<NativeDomain>, LoadError> {
     let PreparedPrograms {
         draft,
         opened,
@@ -212,7 +432,11 @@ pub(crate) fn build(
         backend,
         pool,
         capacity,
-    } = prepare(&catalog, manifest, &package, progress.clone())?;
+        workers,
+    } = match prepare(&catalog, manifest, &package, unprepared, progress.clone())? {
+        LoadAttempt::Loaded(prepared) => prepared,
+        LoadAttempt::Unprepared => return Ok(LoadAttempt::Unprepared),
+    };
     let reserves = manifest.reserves;
     let limits = draft.policy().limits();
     let head_enabled = draft.policy().selection().head;
@@ -234,6 +458,7 @@ pub(crate) fn build(
             &state,
             draft.programs().target(),
             limits,
+            &workers,
         )
         .map_err(internal)?;
     let target_readout_graphs = programs
@@ -249,11 +474,10 @@ pub(crate) fn build(
             opened.device(),
             draft.load(),
             &manifest.definition,
-            draft.programs().vision(),
-            state.target_state(),
-            state.head_state(),
+            draft.programs(),
+            &state,
             limits,
-            manifest.model.method.proposals(),
+            draft.policy().method(),
         )
         .map_err(internal)?;
     let resources = ResourcePlanner::plan_with_state(
@@ -274,13 +498,78 @@ pub(crate) fn build(
         "magnitude-engine: sealed {} target graph classes ({} graphs) in {:.2} s",
         seal.classes, seal.sealed_graphs, seal.seconds
     );
+    // What the sealed graphs hold on the host against what the plan held
+    // them to before any was sealed, from both sides: one line of JSON,
+    // beside the memory moments around it (`programs prepared`, `graphs
+    // planned`). Each heap is requested bytes, its allocations, and the
+    // bound of the allocator's rounding of them, which no plan counts.
+    let heap = |heap: seismic::HostHeap| {
+        serde_json::json!({
+            "bytes": heap.bytes,
+            "allocations": heap.allocations,
+            "rounding_bound": heap.rounding,
+        })
+    };
+    let graphs = |graphs: &magnitude_executor::SealedGraphsHeap| {
+        serde_json::json!({
+            "graphs": graphs.graphs,
+            "plans": heap(graphs.plans),
+            "storage": heap(graphs.storage),
+            "owned": heap(graphs.owned),
+        })
+    };
+    let held = seal.held();
+    let total = |graphs: &magnitude_executor::SealedGraphsHeap, constants: seismic::HostHeap| {
+        graphs
+            .heap()
+            .and_then(|graphs| graphs.plus(constants))
+            .map(heap)
+    };
+    eprintln!(
+        "magnitude-engine: sealed graph host heap {}",
+        serde_json::json!({
+            "planned_exact": seal.planned.exact(),
+            "planned_at_most": graphs(&seal.planned.at_most),
+            "planned_at_least": graphs(&seal.planned.at_least),
+            "planned_constants": heap(seal.planned.constants),
+            "planned_at_most_total": total(&seal.planned.at_most, seal.planned.constants),
+            "planned_at_least_total": total(&seal.planned.at_least, seal.planned.constants),
+            "held": graphs(&held),
+            "held_constants": heap(seal.constants),
+            "held_total": total(&held, seal.constants),
+            "mismatched_graphs": seal.mismatched_graphs,
+        })
+    );
+    if let Some(state_graphs) = programs.state_graphs() {
+        eprintln!(
+            "magnitude-engine: state copy graph host heap {}",
+            serde_json::json!({
+                "planned": heap(state_graphs.planned_host_heap()),
+                "held": heap(state_graphs.host_heap()),
+            })
+        );
+    }
     programs.install_target_graphs(target_graphs);
     programs.install_target_readout_graphs(target_readout_graphs);
     let execution_plan = draft
         .admit(resources)
         .map_err(|error| LoadError::from(classify_plan(error, backend)))?;
     let plan = execution_plan.resources().clone();
+    // The load's preparation off the calling thread is over: its threads
+    // are taken back from the device and joined.
+    opened.device().staff(None);
+    drop(workers);
+    // Every graph family of the load is checked and sealed: the shapes its
+    // checked entries evaluated for them, class by class, serve nothing
+    // further and are released. The moments on either side say what they
+    // held.
+    report_load_memory("graphs sealed", opened.device());
+    eprintln!(
+        "magnitude-engine: released {} evaluated entry shapes",
+        seismic::forget_evaluated_entry_shapes()
+    );
     report_load_phase("graph and resource planning", &mut phase_started);
+    report_load_memory("graphs planned", opened.device());
     if opened.selector() != execution_plan.device().selector() {
         return Err(internal(
             "opened device differs from the selected execution plan",
@@ -325,6 +614,7 @@ pub(crate) fn build(
     )
     .map_err(|error| internal(error.to_string()))?;
     report_load_phase("resource allocation", &mut phase_started);
+    report_load_memory("resources allocated", &device);
     let mut residency = ResidencyStore::new(
         device.clone(),
         programs.clone(),
@@ -391,6 +681,7 @@ pub(crate) fn build(
             import.publishing.as_secs_f64(),
         );
     }
+    report_load_memory("target imported", &device);
     phase_started = Instant::now();
     progress(LoadProgress::Finalizing);
     let definition = Rc::new(manifest.definition.clone());
@@ -450,14 +741,26 @@ pub(crate) fn build(
         .register_allocated_holdings()
         .map_err(|error| internal(format!("register allocated memory holdings: {error}")))?;
     report_load_phase("state and domain allocation", &mut phase_started);
-    let bindings = warm_up(&mut domain, bindings)?;
-    Ok(NativeDomain {
+    report_load_memory("domain allocated", &device);
+    // A drafter that keeps its own history is primed by the warm-up; a draft
+    // head reading the target's history keeps none to prime.
+    let primes_drafter = head_enabled
+        && !matches!(
+            manifest.model.method,
+            ResolvedMethod::Mtp {
+                history: HeadHistory::Target,
+                ..
+            }
+        );
+    let bindings = warm_up(&mut domain, bindings, primes_drafter)?;
+    report_load_memory("loaded", &device);
+    Ok(LoadAttempt::Loaded(NativeDomain {
         domain,
         bindings,
         plan,
         device: device_selector,
         pool,
-    })
+    }))
 }
 
 fn report_load_phase(name: &str, started: &mut Instant) {
@@ -466,6 +769,29 @@ fn report_load_phase(name: &str, started: &mut Instant) {
         started.elapsed().as_secs_f64()
     );
     *started = Instant::now();
+}
+
+/// Report what the process holds at one moment of a load, by what holds it
+/// ([`seismic::ProcessMemory`]), with Seismic's charges on the opened device
+/// and the most the footprint has been so far: one line of JSON on the
+/// engine's diagnostic stream. Every load reports the same moments, so two
+/// loads compare line by line, part by part; a search reports the device's
+/// opening and its own end (`searched`), whose peak is its process's.
+fn report_load_memory(moment: &str, device: &seismic::Device) {
+    let memory = seismic::ProcessMemory::read();
+    eprintln!(
+        "magnitude-engine: memory {}",
+        serde_json::json!({
+            "moment": moment,
+            "footprint_bytes": memory.footprint_bytes,
+            "malloc_live_bytes": memory.malloc_live_bytes,
+            "graphics_bytes": memory.graphics_bytes,
+            "mapped_bytes": memory.mapped_bytes,
+            "rest_bytes": memory.rest_bytes(),
+            "device_charged_bytes": device.memory_usage().charged,
+            "peak_footprint_bytes": seismic::ProcessMemory::peak_footprint(),
+        })
+    );
 }
 
 /// Startup allocations claimed from the device's heap, the same heap the
@@ -553,13 +879,17 @@ impl StartupClaims {
 
 /// Run one throwaway single-row forward before readiness, so a broken device
 /// path fails the load instead of the first request, and the process's
-/// one-time first-forward cost is paid here. Tuning has already executed every
-/// kernel, and no row class carries its own first-use cost, so one row
-/// suffices. The request's state advance is aborted, so no state survives it.
+/// one-time first-forward cost is paid here. No row class carries its own
+/// first-use cost, so one row suffices. An enabled drafter that keeps its own history also receives one
+/// state-only priming row (`primes_drafter`), so its component import and
+/// binding complete before readiness; a draft head reading the target's
+/// history keeps none, and its component was imported and bound at load. The
+/// request's state advances are aborted, so no state survives it.
 /// The bindings travel with the forward and return with it.
 fn warm_up(
     domain: &mut ExecutorDomain,
     mut bindings: StateBindings,
+    primes_drafter: bool,
 ) -> Result<StateBindings, LoadError> {
     let began = std::time::Instant::now();
     let request = RequestId(u64::MAX);
@@ -579,14 +909,27 @@ fn warm_up(
         .map_err(|error| failed(error.to_string()))?;
     let operations = [Operation::Forward {
         request,
-        kind: WorkKind::Replay,
+        kind: if primes_drafter {
+            WorkKind::Prefill
+        } else {
+            WorkKind::Replay
+        },
         tokens: vec![TokenId(0)],
         position: 0,
         conditioning: None,
-        demand: Demand::NONE,
+        demand: if primes_drafter {
+            Demand::FEATURES
+        } else {
+            Demand::NONE
+        },
         select: Vec::new(),
         committed: 1,
-        prime: None,
+        prime: primes_drafter.then(|| magnitude_executor::Priming {
+            boundary: false,
+            tokens: vec![TokenId(0)],
+            position: 0,
+            draft_from: 1,
+        }),
     }];
     let resources = domain
         .reserve(&mut bindings, &operations)
@@ -614,16 +957,22 @@ fn warm_up(
     Ok(bindings)
 }
 
-/// Reports tuning at load: its progress to the host, and each unit on the
-/// engine's diagnostic stream while the worker is not yet ready.
+/// Reports a search's tuning, or the records a load read: a search's
+/// progress to the host, each unit on the engine's diagnostic stream, and
+/// every event to the tuning trace the host asked for.
 struct TuningReport {
     progress: Rc<dyn Fn(LoadProgress)>,
+    trace: Option<TuningTrace>,
 }
 
 impl TuningObserver for TuningReport {
     fn event(&self, event: &TuningEvent) {
+        if let Some(trace) = &self.trace {
+            trace.event(event);
+        }
         match event {
-            // A load whose every unit has a stored result does not tune.
+            // Only a search that finds a unit without a record reports
+            // progress; a load never does.
             TuningEvent::Progress { completed, total } => {
                 if *total > 0 {
                     (self.progress)(LoadProgress::Tuning {
@@ -637,47 +986,44 @@ impl TuningObserver for TuningReport {
                 bindings,
                 points,
             } => eprintln!("magnitude-engine: tuning {entry} [{bindings}] at {points} points"),
-            TuningEvent::Planned(plan) => {
-                for start in &plan.starts {
-                    let given = match start.forms {
-                        Some(true) => "defaults and form starts".to_owned(),
-                        Some(false) => format!(
-                            "defaults only (with form starts {:.2} s did not fit)",
-                            start.with_forms_seconds
-                        ),
-                        None => "not started (its defaults did not fit)".to_owned(),
-                    };
-                    eprintln!(
-                        "magnitude-engine: tuning plan: start {} [{}], share {:.1}%: {given}; estimated {:.2} s of {:.2} s available, took {:.2} s{}",
-                        start.entry,
-                        start.bindings,
-                        start.share * 100.0,
-                        start.estimated_seconds,
-                        start.available_seconds,
-                        start.actual_seconds,
-                        if start.cut { "; CUT at its limit" } else { "" }
-                    );
-                }
+            // Each unit's mandatory work, each piece of optional work and
+            // each record published when the optional work stops are in
+            // the tuning trace, the latter two with their forecasts.
+            TuningEvent::Mandatory { .. }
+            | TuningEvent::Stage(_)
+            | TuningEvent::Published { .. } => {}
+            TuningEvent::Budget(budget) => {
                 eprintln!(
-                    "magnitude-engine: tuning plan: starts ended at {:.2} s, refinement ({} slices) at {:.2} s with {:.2} s reserved for conclusions, conclusions at {:.2} s",
-                    plan.started_seconds,
-                    plan.slices,
-                    plan.refined_seconds,
-                    plan.reserved_seconds,
-                    plan.concluded_seconds
+                    "magnitude-engine: tuning budget {:.2} s: {} pieces of work used {:.2} s, {:.2} s unused, {:.2} s over; {} offered pieces did not fit",
+                    budget.budget_seconds,
+                    budget.stages,
+                    budget.used_seconds,
+                    budget.unused_seconds,
+                    budget.overrun_seconds,
+                    budget.refused.len()
                 );
-                for (unit, step, seconds) in &plan.overruns {
-                    eprintln!(
-                        "magnitude-engine: tuning plan: the {step} of {unit} ended {seconds:.2} s after its limit"
-                    );
-                }
             }
+            TuningEvent::Unprepared {
+                entry,
+                bindings,
+                statics,
+            } => eprintln!(
+                "magnitude-engine: no stored tuning record for {entry} [{bindings}] {statics:?}: \
+                 canonical default"
+            ),
+            TuningEvent::Pinned {
+                entry,
+                bindings,
+                statics,
+                choice,
+                ..
+            } => eprintln!(
+                "magnitude-engine: pinned {entry} [{bindings}] {statics:?}: {choice:?} (not tuned)"
+            ),
             TuningEvent::Finished(tuned) => {
-                let origin = match (tuned.origin, tuned.search) {
+                let origin = match (tuned.origin, tuned.stop) {
                     (TuningOrigin::Stored, _) => "stored".to_owned(),
-                    (TuningOrigin::Searched, Some((allowance, stop))) => {
-                        format!("budget {:.2} s, stop {stop:?}", allowance.as_secs_f64())
-                    }
+                    (TuningOrigin::Searched, Some(stop)) => format!("stop {stop:?}"),
                     (TuningOrigin::Searched, None) if tuned.progress.is_some() => {
                         "not searched".to_owned()
                     }
@@ -685,25 +1031,17 @@ impl TuningObserver for TuningReport {
                 };
                 // How far the unit's search got: reported here, not stored.
                 if let Some(progress) = &tuned.progress {
-                    let start = progress.start.map_or("not started".to_owned(), |(seconds, programs)| {
-                        format!("started in {seconds:.2} s with {programs} programs formed")
-                    });
-                    let search = progress.standing.map_or(String::new(), |standing| {
-                        format!(
-                            "; search {}: {} of {} configurations, {} of {} programs formed, best {:.3} of the defaults",
-                            if standing.finished { "complete" } else { "partial" },
-                            standing.measured,
-                            standing.admissible,
-                            standing.programs,
-                            standing.declared_programs,
-                            standing.cost
-                        )
-                    });
+                    let standing = progress.standing;
                     eprintln!(
-                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {start}{search}; building {:.2} s, references {:.2} s, forming {:.2} s, measuring {:.2} s, validating {:.2} s",
+                        "magnitude-engine: searched {} [{}]: share {:.1}% of step time; {} pieces of work: {} of the {} configurations asked for measured, {} programs formed, serving {:.3} of the defaults; building {:.2} s, references {:.2} s, forming {:.2} s, measuring {:.2} s, validating {:.2} s",
                         tuned.entry,
                         tuned.bindings,
                         progress.share * 100.0,
+                        progress.stages,
+                        standing.measured,
+                        standing.generated,
+                        standing.programs,
+                        standing.cost,
                         tuned.time.building_seconds,
                         tuned.time.reference_seconds,
                         tuned.time.forming_seconds,
@@ -712,17 +1050,25 @@ impl TuningObserver for TuningReport {
                     );
                 }
                 eprintln!(
-                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}): {:?} ({} measured, {} excluded, {} qualification rejections)",
+                    "magnitude-engine: tuned {} [{}] in {:.2} s ({origin}, {}): {:?} ({} measured, {} excluded, {} qualification rejections)",
                     tuned.entry,
                     tuned.bindings,
                     tuned.seconds,
+                    if tuned.qualified {
+                        "qualified"
+                    } else {
+                        "canonical default, unqualified"
+                    },
                     tuned.overall.params,
                     tuned.measured,
                     tuned.excluded,
                     tuned.rejections
                 );
                 if let Some(rejection) = &tuned.first_rejection {
-                    eprintln!("magnitude-engine:   first qualification rejection of {}: {rejection}", tuned.entry);
+                    eprintln!(
+                        "magnitude-engine:   first qualification rejection of {}: {rejection}",
+                        tuned.entry
+                    );
                 }
             }
         }

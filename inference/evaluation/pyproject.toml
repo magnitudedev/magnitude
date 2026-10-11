@@ -1,0 +1,35 @@
+[project]
+name = "magnitude-evaluation"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "magnitude-fixtures",
+  "magnitude-references",
+  "magnitude-bench",
+  "magnitude-compare",
+  "magnitude-remote",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["fixtures", "references", "bench", "compare", "remote"]
+
+[tool.uv.sources]
+magnitude-fixtures = { workspace = true }
+magnitude-references = { workspace = true }
+magnitude-bench = { workspace = true }
+magnitude-compare = { workspace = true }
+magnitude-remote = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=9.1.1", "pytest-asyncio>=1"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

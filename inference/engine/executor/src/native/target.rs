@@ -3,12 +3,13 @@ use crate::{
     ReadoutBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
 };
 use magnitude_kernels::{
-    attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
-    attention_prefill_k8v4, attention_project, dense_expand, dense_output, embedding_rows,
-    gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
-    gated_delta_step_convolved, post_norm_residual, project_rows, readout_exact_rows,
-    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
-    readout_selected_rows, readout_top_rows, routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
+    attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4,
+    attention_output, attention_prefill, attention_prefill_k8v4, attention_project, dense_expand,
+    dense_output, embedding_rows, gated_delta_chunk, gated_delta_project,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved,
+    post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
+    readout_planes_rows, readout_refine_rows, readout_selected_rows, readout_top_rows,
+    routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
     routed_route_shared,
 };
 use magnitude_kernels::{
@@ -109,7 +110,33 @@ pub enum ReadoutHeadKernels {
         head: NativeKernel<readout_head_rows::Entry>,
         selected: NativeKernel<readout_selected_rows::Entry>,
     },
-    Progressive(ProgressiveReadoutKernels),
+    Qualified {
+        packed: Box<ReadoutHeadKernels>,
+        progressive: ProgressiveReadoutKernels,
+    },
+}
+
+impl ReadoutHeadKernels {
+    pub(crate) fn invocation_workspace_bytes(&self) -> u128 {
+        match self {
+            Self::Packed { head, selected } => {
+                u128::from(head.invocation_workspace_bytes())
+                    + u128::from(selected.invocation_workspace_bytes())
+            }
+            Self::Qualified {
+                packed,
+                progressive,
+                ..
+            } => packed.invocation_workspace_bytes() + progressive_workspace_bytes(progressive),
+        }
+    }
+}
+
+fn progressive_workspace_bytes(kernels: &ProgressiveReadoutKernels) -> u128 {
+    u128::from(kernels.top.invocation_workspace_bytes())
+        + u128::from(kernels.refine.invocation_workspace_bytes())
+        + u128::from(kernels.exact.invocation_workspace_bytes())
+        + u128::from(kernels.planes.invocation_workspace_bytes())
 }
 
 /// A progressive head's certified levels and its full exact pass.
@@ -153,6 +180,7 @@ pub enum RoutedDecodeKernels {
 /// residual.
 #[derive(Clone, Debug)]
 pub struct AttentionKernels {
+    pub codec: magnitude_state::CodecSpec,
     pub project: NativeKernel<attention_project::Entry>,
     pub history: AttentionHistoryKernels,
     pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
@@ -224,9 +252,12 @@ impl AttentionHistoryKernels {
                 verify,
                 prefill,
             } => {
-                append.invocation_workspace_bytes() + decode
-                    .invocation_workspace_bytes()
-                    .max(verify.as_ref().map_or(0, |kernel| kernel.invocation_workspace_bytes()))
+                append.invocation_workspace_bytes()
+                    + decode.invocation_workspace_bytes().max(
+                        verify
+                            .as_ref()
+                            .map_or(0, |kernel| kernel.invocation_workspace_bytes()),
+                    )
                     + prefill.invocation_workspace_bytes()
             }
             Self::AffineK8V4 {
@@ -238,23 +269,24 @@ impl AttentionHistoryKernels {
                 prefill,
                 prefill_listed,
             } => {
-                append.invocation_workspace_bytes() + decode
-                    .invocation_workspace_bytes()
-                    .max(
-                        verify
-                            .as_ref()
-                            .map_or(0, NativeKernel::invocation_workspace_bytes),
-                    )
-                    .max(
-                        verify_four
-                            .as_ref()
-                            .map_or(0, NativeKernel::invocation_workspace_bytes),
-                    )
-                    .max(
-                        verify_eight
-                            .as_ref()
-                            .map_or(0, NativeKernel::invocation_workspace_bytes),
-                    )
+                append.invocation_workspace_bytes()
+                    + decode
+                        .invocation_workspace_bytes()
+                        .max(
+                            verify
+                                .as_ref()
+                                .map_or(0, NativeKernel::invocation_workspace_bytes),
+                        )
+                        .max(
+                            verify_four
+                                .as_ref()
+                                .map_or(0, NativeKernel::invocation_workspace_bytes),
+                        )
+                        .max(
+                            verify_eight
+                                .as_ref()
+                                .map_or(0, NativeKernel::invocation_workspace_bytes),
+                        )
                     + prefill.invocation_workspace_bytes().max(
                         prefill_listed
                             .as_ref()

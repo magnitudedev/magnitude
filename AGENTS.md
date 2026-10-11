@@ -60,6 +60,10 @@ cd packages/agent && bunx --bun vitest run    # single run
 cd packages/agent && bunx --bun vitest        # watch mode
 ```
 
+## Model Evaluation
+
+Model quality and speed are measured only through `inference/evaluation` (`design/inference/evaluation.md`). The only model input is a fixture (a chat conversation) rendered by the engine's own chat template. Never feed a model raw text, token lists or random tokens, and never judge quality against a reference that fails its sanity gate.
+
 ## Type Checking
 
 Run targeted type checks per package — do not run project-wide `tsc -b`

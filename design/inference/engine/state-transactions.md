@@ -96,8 +96,22 @@ indices, and stores the resulting logical state in one owned
 `PreparedGenerationTransition`. The executor receives only its `ReconcileDecision`. Applying
 the transition after physical reconciliation has no recoverable errors. A cancelled or failed
 physical reconciliation drops the staged method and grammar without changing the live request.
+An independently captured drafter boundary is tentative until the target and attached head
+advance reconcile. Abort preserves the prior boundary; successful reconciliation publishes the
+new row with the numerical state. Resume states own the row across forks and retention, while
+generation holds only an obligation to use it while resident.
 A started round is a value that owns its generation until its reconciled transition commits;
 eviction and cancellation consume it and return the rewound or terminal generation.
+A finishing prompt may publish its reconciled target token while its separately submitted
+drafter-history entry remains in flight. That entry retains the binding right and all of its
+leases until its own completion, then commits only if the target chunk was accepted. No
+checkpoint, eviction, or dependent head submission can observe the unresolved pair of lanes.
+Its physical service remains prompt work even when the token publishes before it completes.
+A draft head that keeps no history (`HeadHistory::Target`) reserves no rows or banks: its head
+reservation moves each request's accepted target state into the flight, which binds that state's
+history planes read-only and returns it unchanged at physical completion or refusal. While held,
+the request has no other target work, checkpoint or close, exactly as for an in-flight advance, and
+reconciling the head's decision commits nothing.
 
 **Binding right.** Each store has exactly one right to change its slab bindings: adding slabs,
 moving rows and banks, and releasing slabs. The executor holds the stores' rights together with
@@ -111,7 +125,9 @@ right. Its tentative rows are indistinguishable from another history's in every 
 (a blocked last page, rows in place, growth), so it lives only until the next operation that
 uses the binding right: a matching submission claims it, and every other such operation orphans
 it on entry, before asking any layout question. Growth has no blocked outcome: it succeeds or
-returns a memory deficit.
+returns a memory deficit. Reservation recomputes its row requirements after
+provisioning relocates shared tails, so availability is checked against the new
+layout rather than charging again for the page relocation already consumed.
 
 An interior accepted prefix with recurrent state requires numerical repair before the successor
 can be published or checkpointed. State compaction, copying, and codec conversion follow the same

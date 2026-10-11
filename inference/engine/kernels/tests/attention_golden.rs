@@ -637,6 +637,7 @@ fn attention_golden() {
                                     .with_param("MATRIX", 0)
                                     .with_param("STAGES", 2)
                                     .with_param("COLUMNS", 1)
+                                    .with_param("QREG", 0)
                             }
                             BackendName::Vulkan => {
                                 specialization = specialization.with_param("MATRIX", 0);

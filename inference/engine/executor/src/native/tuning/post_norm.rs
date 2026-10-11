@@ -3,7 +3,7 @@
 //! no tuning parameters.
 
 use super::cases::{projection_shape, scale_extent};
-use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
 use seismic::{Element, Tensor};

@@ -31,8 +31,9 @@ pub use decoder::{
     ValueNorm, ValueSource,
 };
 pub use draft::{
-    BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition, DraftEmbedding, DraftMethod,
-    DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead, TapPoint,
+    BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition,
+    DraftEmbedding, DraftMethod, DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead,
+    TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
 pub use images::{ImageMarkers, SequentialImageInput, SpatialControls};
@@ -149,7 +150,7 @@ impl WeightDescriptor {
                         )));
                     }
                 }
-                ImportTransform::Progressive(plane) => {
+                ImportTransform::Progressive { plane, depth } => {
                     let [rows, columns] = shape[..] else {
                         return Err(DefinitionError::new(format!(
                             "{:?} is not a matrix of whole 32-value groups",
@@ -162,7 +163,7 @@ impl WeightDescriptor {
                             self.name
                         )));
                     }
-                    shape = plane.shape(rows, columns);
+                    shape = plane.shape(rows, columns, *depth);
                 }
             }
         }
@@ -199,40 +200,74 @@ pub enum ImportTransform {
     /// (NVFP4) stays a separate factor of the resident weight, so it is exact
     /// for block encodings too.
     ScaleByTensor { tensor: String },
-    /// One plane of the progressive placement of a Q8_0 matrix (the last
+    /// One plane of a symmetric 32-value code matrix (the last
     /// transform; `ProgressivePlane`).
-    Progressive(ProgressivePlane),
+    Progressive {
+        plane: ProgressivePlane,
+        depth: ProgressiveCodeDepth,
+    },
 }
 
-/// The progressive placement of a Q8_0 matrix `[rows, columns]`: its
-/// offset-binary codes `u = c + 128` in significance-ordered bit planes, so a
+/// The exact symmetric 32-value code representation a progressive placement
+/// preserves. The coarse view owns half its bits, then one refinement bit;
+/// the remaining planes complete the original codes without duplicated weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProgressiveCodeDepth {
+    Four,
+    Eight,
+}
+
+impl ProgressiveCodeDepth {
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Four => 4,
+            Self::Eight => 8,
+        }
+    }
+    pub const fn coarse_bits(self) -> u8 {
+        self.bits() / 2
+    }
+}
+
+/// The progressive placement of a matrix `[rows, columns]`: its
+/// offset-binary codes `u = c + 2^(depth-1)` in significance-ordered bit planes, so a
 /// reader of the top bits reads only them (`readout.seismic`, the progressive
 /// head readout). The planes hold the matrix's values bit for bit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ProgressivePlane {
-    /// Bits 7..4, eight codes per u32 (`[rows, columns / 8]`).
+    /// The coarse half of each code, packed into u32 words.
     Top,
-    /// Bit 3, a u32 per 32-value group (`[rows, columns / 32]`).
-    Bit3,
-    /// Bits 2..0, three u32 per group (`[rows, columns / 32, 3]`).
+    /// The next refinement bit, a u32 per 32-value group.
+    Next,
+    /// The remaining significance-ordered bit planes of each group.
     Rest,
     /// The f16 scale of every group (`[rows, columns / 32]`).
     Scales,
-    /// Per row, bounds on how far a dot product moves from the 4- and 5-bit
+    /// Per row, bounds on how far a dot product moves from the coarse and refined
     /// views to the exact row, per unit Euclidean length of the activation
     /// row, F32 rounding included (`[2, rows]` F32).
     Radius,
 }
 
 impl ProgressivePlane {
-    pub const ALL: [Self; 5] = [Self::Top, Self::Bit3, Self::Rest, Self::Scales, Self::Radius];
+    pub const ALL: [Self; 5] = [
+        Self::Top,
+        Self::Next,
+        Self::Rest,
+        Self::Scales,
+        Self::Radius,
+    ];
 
     /// The plane's shape for a `[rows, columns]` matrix.
-    pub fn shape(self, rows: u64, columns: u64) -> Vec<u64> {
+    pub fn shape(self, rows: u64, columns: u64, depth: ProgressiveCodeDepth) -> Vec<u64> {
         match self {
-            Self::Top => vec![rows, columns / 8],
-            Self::Bit3 | Self::Scales => vec![rows, columns / 32],
-            Self::Rest => vec![rows, columns / 32, 3],
+            Self::Top => vec![rows, columns / 32, u64::from(depth.coarse_bits())],
+            Self::Next | Self::Scales => vec![rows, columns / 32],
+            Self::Rest => vec![
+                rows,
+                columns / 32,
+                u64::from(depth.bits() - depth.coarse_bits() - 1),
+            ],
             Self::Radius => vec![rows, 2],
         }
     }
@@ -252,7 +287,10 @@ impl std::hash::Hash for ImportTransform {
             Self::Scale { factor } => factor.to_bits().hash(state),
             Self::Flatten => {}
             Self::ScaleByTensor { tensor } => tensor.hash(state),
-            Self::Progressive(plane) => plane.hash(state),
+            Self::Progressive { plane, depth } => {
+                plane.hash(state);
+                depth.hash(state);
+            }
         }
     }
 }
@@ -269,9 +307,10 @@ pub enum WeightScope {
         sublayer: SublayerIndex,
         branch: u32,
     },
-    /// Weights of a draft head block outside its sublayers.
+    /// Weights of a draft head block outside its decoder blocks' sublayers.
     HeadBlock(u32),
-    /// A sublayer of a draft head block (`block` is the head block).
+    /// A sublayer of a draft head's decoder block (`block` counts the
+    /// decoder blocks of every head block in order).
     HeadSublayer(SublayerIndex),
     HeadBranch {
         sublayer: SublayerIndex,
@@ -350,12 +389,20 @@ pub enum WeightKind {
     RotaryDivisors,
     OutputNorm,
     Output,
+    /// The model-defined centroid projection for clustered proposals.
+    OutputCentroids,
     /// A plane of the output projection's progressive placement
     /// (`ImportTransform::Progressive`), which then replaces `Output`.
     OutputPlane(ProgressivePlane),
     HeadEmbeddingNorm,
     HeadHiddenNorm,
     HeadCombine,
+    /// A draft head's projection of `[embedding ‖ hidden]` into its width
+    /// (`HeadInput::Projected`).
+    HeadInputProjection,
+    /// A draft head's projection of its normalized output into the hidden
+    /// row its next chained step conditions on (`HeadChain::Projected`).
+    HeadChainProjection,
     /// A draft's projection of the concatenated target taps.
     DraftFusion,
     DraftFusionNorm,
@@ -407,24 +454,131 @@ pub fn checked_product(dimensions: &[u64]) -> Result<u64, DefinitionError> {
         .ok_or_else(|| DefinitionError::new("model dimensions overflow"))
 }
 
-/// One draft block following the target decoder: it combines the embedding
-/// of the next token with the target's hidden row, runs one decoder block and
-/// normalizes its output for the target's vocabulary projection.
+/// How a draft head forms its input row from the target's embedding `e` of
+/// the next token and a conditioning hidden row `h` (the target's normalized
+/// output row, or the head's own chain feature).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HeadBlock {
-    pub embedding_norm: RmsNorm,
-    pub hidden_norm: RmsNorm,
-    /// `[hidden, 2·hidden]`.
-    pub combine: WeightDescriptor,
-    pub block: Block,
-    pub output_norm: ExitNorm,
+pub enum HeadInput {
+    /// `combine · [RMS(e)·w_e ‖ RMS(h)·w_h]`, at the target's width.
+    Combine {
+        embedding_norm: RmsNorm,
+        hidden_norm: RmsNorm,
+        /// `[hidden, 2·hidden]`.
+        combine: WeightDescriptor,
+    },
+    /// `pre · [e·scale ‖ h]`, into the head's own width.
+    Projected {
+        /// `[width, 2·hidden]`.
+        pre: WeightDescriptor,
+        embedding_scale: EmbeddingScale,
+    },
 }
 
-/// An embedded draft head (MTP): blocks that read the target's embedding and
-/// vocabulary projection.
+/// The vocabulary projection, independent of proposal candidate policy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum VocabularyProjection {
+    /// The target's output projection.
+    Target,
+    /// The head's own table, `[vocabulary, width]`.
+    Own { table: WeightDescriptor },
+}
+
+/// Model-defined candidate policy for a proposal distribution.
+/// This never changes the target's exact readout or acceptance semantics.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ProposalReadoutPolicy {
+    Full,
+    Clustered {
+        /// `[clusters, width]` centroid projection.
+        centroids: WeightDescriptor,
+        /// Cluster-major permutation of every canonical vocabulary token.
+        token_order: Vec<TokenId>,
+        selected_clusters: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadReadout {
+    pub projection: VocabularyProjection,
+    pub policy: ProposalReadoutPolicy,
+}
+
+impl HeadReadout {
+    pub fn full(projection: VocabularyProjection) -> Self {
+        Self {
+            projection,
+            policy: ProposalReadoutPolicy::Full,
+        }
+    }
+
+    pub fn own_table(&self) -> Option<&WeightDescriptor> {
+        match &self.projection {
+            VocabularyProjection::Target => None,
+            VocabularyProjection::Own { table } => Some(table),
+        }
+    }
+}
+
+/// The hidden row a chained step conditions on after the step before it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HeadChain {
+    /// The head's normalized output.
+    Output,
+    /// `post ·` the head's normalized output: `[hidden, width]`.
+    Projected { post: WeightDescriptor },
+}
+
+/// The attention history a draft head's blocks read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeadHistory {
+    /// The head stores its own rows: every committed row enters it, and its
+    /// blocks' attention owns or shares history among themselves.
+    Own,
+    /// The head stores nothing. Every attention sublayer is
+    /// `KeyValue::Shared` with a source naming a sublayer of the *target*
+    /// decoder, whose accepted history it reads; a draft is one row per step
+    /// at the anchor's position.
+    Target,
+}
+
+/// The package component a draft head's weights are stored in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeadComponent {
+    /// Embedded in the target artifact.
+    Target,
+    /// The package's separate draft component.
+    Draft,
+}
+
+/// One draft head following the target decoder: it forms its input from the
+/// embedding of the next token and a hidden row, runs its decoder blocks at
+/// its own width and normalizes their output for its vocabulary projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadBlock {
+    pub input: HeadInput,
+    pub blocks: Vec<Block>,
+    pub output_norm: ExitNorm,
+    pub readout: HeadReadout,
+    pub chain: HeadChain,
+}
+
+impl HeadBlock {
+    /// The residual width of the head's blocks.
+    pub fn width(&self, decoder: &Decoder) -> u64 {
+        match &self.input {
+            HeadInput::Combine { .. } => decoder.hidden,
+            HeadInput::Projected { pre, .. } => pre.shape.first().copied().unwrap_or(0),
+        }
+    }
+}
+
+/// A draft head (MTP): chained blocks that read the target's embedding and a
+/// hidden row and propose the tokens after the anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Head {
     pub blocks: Vec<HeadBlock>,
+    pub history: HeadHistory,
+    pub component: HeadComponent,
 }
 
 impl Head {
@@ -437,21 +591,113 @@ impl Head {
             return Err(DefinitionError::new("draft head has no blocks"));
         }
         let combined_hidden = checked_product(&[2, decoder.hidden])?;
-        let context = decoder::Context {
-            hidden: decoder.hidden,
-            coordinate_axes,
-            per_layer: None,
-        };
         for block in &self.blocks {
-            decoder::validate_rms(&block.embedding_norm, decoder.hidden, "draft head norm")?;
-            decoder::validate_rms(&block.hidden_norm, decoder.hidden, "draft head norm")?;
-            expect_shape(
-                &block.combine,
-                &[decoder.hidden, combined_hidden],
-                "draft head input projection",
-            )?;
-            decoder::validate_blocks(std::slice::from_ref(&block.block), &context)?;
-            decoder::validate_exit_norm(&block.output_norm, decoder.hidden, "draft head norm")?;
+            let width = block.width(decoder);
+            match &block.input {
+                HeadInput::Combine {
+                    embedding_norm,
+                    hidden_norm,
+                    combine,
+                } => {
+                    decoder::validate_rms(embedding_norm, decoder.hidden, "draft head norm")?;
+                    decoder::validate_rms(hidden_norm, decoder.hidden, "draft head norm")?;
+                    expect_shape(
+                        combine,
+                        &[decoder.hidden, combined_hidden],
+                        "draft head input projection",
+                    )?;
+                }
+                HeadInput::Projected { pre, .. } => {
+                    if width == 0 {
+                        return Err(DefinitionError::new("draft head has no width"));
+                    }
+                    expect_shape(
+                        pre,
+                        &[width, combined_hidden],
+                        "draft head input projection",
+                    )?;
+                }
+            }
+            if block.blocks.is_empty() {
+                return Err(DefinitionError::new("draft head has no decoder blocks"));
+            }
+            let context = decoder::Context {
+                hidden: width,
+                coordinate_axes,
+                per_layer: None,
+                shared_sources: match self.history {
+                    HeadHistory::Own => None,
+                    HeadHistory::Target => Some(&decoder.blocks),
+                },
+            };
+            decoder::validate_blocks(&block.blocks, &context)?;
+            decoder::validate_exit_norm(&block.output_norm, width, "draft head norm")?;
+            if let Some(table) = block.readout.own_table() {
+                expect_shape(
+                    table,
+                    &[decoder.vocabulary, width],
+                    "draft head readout table",
+                )?;
+            }
+            if let ProposalReadoutPolicy::Clustered {
+                centroids,
+                token_order,
+                selected_clusters,
+                ..
+            } = &block.readout.policy
+            {
+                let clusters = centroids.shape.first().copied().unwrap_or(0);
+                if clusters == 0
+                    || *selected_clusters == 0
+                    || *selected_clusters > clusters
+                    || decoder.vocabulary % clusters != 0
+                {
+                    return Err(DefinitionError::new(
+                        "invalid proposal readout cluster geometry",
+                    ));
+                }
+                expect_shape(centroids, &[clusters, width], "proposal readout centroids")?;
+                if token_order.len() as u64 != decoder.vocabulary {
+                    return Err(DefinitionError::new(
+                        "proposal readout ordering must cover the vocabulary",
+                    ));
+                }
+                let mut seen = vec![false; token_order.len()];
+                for token in token_order {
+                    let Some(entry) = seen.get_mut(token.0 as usize) else {
+                        return Err(DefinitionError::new(
+                            "proposal readout ordering has a noncanonical token",
+                        ));
+                    };
+                    if std::mem::replace(entry, true) {
+                        return Err(DefinitionError::new(
+                            "proposal readout ordering repeats a token",
+                        ));
+                    }
+                }
+            }
+            match &block.chain {
+                HeadChain::Output if width != decoder.hidden => {
+                    return Err(DefinitionError::new(
+                        "a draft head of its own width chains through a projection",
+                    ));
+                }
+                HeadChain::Output => {}
+                HeadChain::Projected { post } => {
+                    expect_shape(
+                        post,
+                        &[decoder.hidden, width],
+                        "draft head chain projection",
+                    )?;
+                }
+            }
+            if matches!(block.readout.projection, VocabularyProjection::Target)
+                && width != decoder.hidden
+            {
+                return Err(DefinitionError::new(
+                    "a draft head of its own width reads out through its own table",
+                ));
+            }
         }
         Ok(())
     }
@@ -505,7 +751,7 @@ impl ModelDefinition {
         }
         if let Some(head) = &self.head {
             for block in &head.blocks {
-                decoder::blocks_deferred_forms(std::slice::from_ref(&block.block), &mut forms);
+                decoder::blocks_deferred_forms(&block.blocks, &mut forms);
                 if matches!(block.output_norm, ExitNorm::HyperConnectionHead(_)) {
                     forms.push(DeferredForm::HyperConnectionHead);
                 }
@@ -702,6 +948,71 @@ mod tests {
         ]);
         assert_eq!(
             backwards.validate().unwrap_err().to_string(),
+            "shared attention history names no earlier attention sublayer"
+        );
+    }
+
+    #[test]
+    fn a_head_reading_target_history_names_target_layers_and_owns_none() {
+        let target_layer = SublayerIndex {
+            block: 0,
+            sublayer: 0,
+        };
+        let head = |key_value, history| Head {
+            blocks: vec![HeadBlock {
+                input: HeadInput::Projected {
+                    pre: weight("pre", &[4, 8]),
+                    embedding_scale: EmbeddingScale::Unit,
+                },
+                blocks: vec![Block {
+                    sublayers: vec![attention("h", key_value)],
+                }],
+                output_norm: ExitNorm::Rms(rms("head_norm", 4)),
+                readout: HeadReadout::full(VocabularyProjection::Own {
+                    table: weight("head_table", &[8, 4]),
+                }),
+                chain: HeadChain::Projected {
+                    post: weight("post", &[4, 4]),
+                },
+            }],
+            history,
+            component: HeadComponent::Draft,
+        };
+        let mut model = definition(vec![attention("a", owned("a", HistoryDomain::Token))]);
+        model.head = Some(head(
+            KeyValue::Shared {
+                source: target_layer,
+            },
+            HeadHistory::Target,
+        ));
+        assert!(model.validate().is_ok());
+        model.head = Some(head(owned("h", HistoryDomain::Token), HeadHistory::Target));
+        assert_eq!(
+            model.validate().unwrap_err().to_string(),
+            "attention reading target history owns its own"
+        );
+        model.head = Some(head(
+            KeyValue::Shared {
+                source: SublayerIndex {
+                    block: 1,
+                    sublayer: 0,
+                },
+            },
+            HeadHistory::Target,
+        ));
+        assert_eq!(
+            model.validate().unwrap_err().to_string(),
+            "shared attention history names no target attention sublayer"
+        );
+        // The same source names the head's own layers when it keeps its own.
+        model.head = Some(head(
+            KeyValue::Shared {
+                source: target_layer,
+            },
+            HeadHistory::Own,
+        ));
+        assert_eq!(
+            model.validate().unwrap_err().to_string(),
             "shared attention history names no earlier attention sublayer"
         );
     }

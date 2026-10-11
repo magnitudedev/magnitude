@@ -24,6 +24,7 @@ use crate::registry::{self, BackendName, RepresentationAccess, RepresentationKin
 use crate::span::Span;
 use crate::types::DType;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// One source file. Paths are diagnostic labels; they grant nothing.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -323,7 +324,7 @@ impl std::error::Error for SourceError {}
 pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
     let sources = sources.canonicalized().map_err(SourceError::new)?;
     internals::check(sources).map(|inner| CheckedModule {
-        inner,
+        inner: Arc::new(inner),
         assets: Default::default(),
     })
 }
@@ -332,9 +333,9 @@ pub fn check_source(sources: SourceSet) -> Result<CheckedModule, SourceError> {
 /// canonical bodies, lowering declarations, capability requirements, and
 /// stable identities. It decides nothing about targets, schedules,
 /// allocations, or native code (§2.1).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct CheckedModule {
-    inner: internals::Module,
+    inner: Arc<internals::Module>,
     pub(crate) assets: std::collections::BTreeMap<(EntryId, BackendName), String>,
 }
 
@@ -420,7 +421,7 @@ impl CheckedModule {
     /// [`crate::bundle::decode_checked_bundle`].
     pub(crate) fn decoded(inner: internals::Module) -> Self {
         Self {
-            inner,
+            inner: Arc::new(inner),
             assets: Default::default(),
         }
     }
@@ -465,6 +466,10 @@ pub struct ElementParameter {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ElementUses {
     pub decoded_read: bool,
+    /// A logical component of the registered packed decode recipe.
+    pub component_read: bool,
+    /// The component additionally requires an interpreted integer code.
+    pub integer_code_read: bool,
     pub stored: bool,
     pub conversion_source: bool,
     /// `to_owned` of a view selecting part of the packing axis.
@@ -556,6 +561,14 @@ impl ElementUses {
                     info.access,
                     RepresentationAccess::ReadWrite | RepresentationAccess::ReadOnly
                 ) && decodable))
+            && (!self.component_read
+                || registry::decode_recipe(representation, DType::F32).is_some())
+            && (!self.integer_code_read
+                || registry::decode_recipe(representation, DType::F32).is_some_and(|recipe| {
+                    recipe
+                        .component(registry::QuantizedComponent::Code)
+                        .is_some()
+                }))
             && (!self.partial_copy || matches!(info.kind, RepresentationKind::Dense(_)))
     }
 }
@@ -577,6 +590,27 @@ impl ElementDomain {
 
     pub fn conversions(&self) -> &[ElementConversion] {
         &self.conversions
+    }
+
+    /// Whether parameter names are unique and every conversion names its own
+    /// parameters, as the checker constructs every domain. A decoded domain
+    /// is used only once this holds.
+    pub(crate) fn well_formed(&self) -> bool {
+        let named = |name: &str| {
+            self.parameters
+                .iter()
+                .filter(|parameter| parameter.name == name)
+                .count()
+                == 1
+        };
+        self.parameters.iter().all(|parameter| named(&parameter.name))
+            && self.conversions.iter().all(|conversion| {
+                named(&conversion.source)
+                    && match &conversion.target {
+                        ElementTarget::Parameter(name) => named(name),
+                        ElementTarget::Concrete(_) => true,
+                    }
+            })
     }
 
     /// Decides whether `bindings` bind exactly this domain's parameters to
@@ -664,10 +698,6 @@ pub struct NativeImplementation {
     /// The `where` condition restricting admissible parameter
     /// configurations. It reads only static dimensions and parameters.
     pub constraint: Option<NativeCondition>,
-    /// The error classes of the configurations that change numerics beyond
-    /// summation order. A configuration in no class agrees with the default
-    /// within the caller's tolerances; the default itself is in none.
-    pub error_classes: Vec<NativeErrorClass>,
     /// Call-private scratch buffers, in ABI order.
     pub scratch: Vec<NativeScratch>,
     /// Ordered dispatches of one call. Never empty.
@@ -693,10 +723,9 @@ impl NativeImplementation {
     /// The launch ordinals of one call in dispatch order when its repeat
     /// block runs `rounds` times.
     pub fn dispatch_order(&self, rounds: u64) -> impl Iterator<Item = usize> + '_ {
-        let (first, end) = self
-            .repeat
-            .as_ref()
-            .map_or((0, 0), |repeat| (repeat.first, repeat.first + repeat.launches));
+        let (first, end) = self.repeat.as_ref().map_or((0, 0), |repeat| {
+            (repeat.first, repeat.first + repeat.launches)
+        });
         (0..first)
             .chain((0..rounds).flat_map(move |_| first..end))
             .chain(end..self.launches.len())
@@ -828,46 +857,6 @@ pub enum NativeCondition {
     },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
-}
-
-impl NativeCondition {
-    /// The condition that holds exactly where this one does not.
-    pub fn negated(&self) -> Self {
-        match self {
-            Self::Compare {
-                comparison,
-                left,
-                right,
-            } => Self::Compare {
-                comparison: match comparison {
-                    NativeComparison::Lt => NativeComparison::Ge,
-                    NativeComparison::Le => NativeComparison::Gt,
-                    NativeComparison::Gt => NativeComparison::Le,
-                    NativeComparison::Ge => NativeComparison::Lt,
-                    NativeComparison::Eq => NativeComparison::Ne,
-                    NativeComparison::Ne => NativeComparison::Eq,
-                },
-                left: left.clone(),
-                right: right.clone(),
-            },
-            Self::And(left, right) => {
-                Self::Or(Box::new(left.negated()), Box::new(right.negated()))
-            }
-            Self::Or(left, right) => Self::And(Box::new(left.negated()), Box::new(right.negated())),
-        }
-    }
-}
-
-/// One error class of a native implementation: the configurations whose
-/// static dimensions and entry parameters satisfy `when` differ from the
-/// default by an error of this class (reduced-precision operands, a result
-/// row that depends on its launch's other rows). Tuning forms such a
-/// configuration only when the caller admits the class, and validates it
-/// under the class's envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeErrorClass {
-    pub name: String,
-    pub when: NativeCondition,
 }
 
 /// Call-private device memory of one native call.
@@ -1594,49 +1583,6 @@ impl NativeImplementation {
         first.ok_or(NativeSpecializationError::Inadmissible)
     }
 
-    /// The error classes of `specialization` (its static and entry parameter
-    /// values), in declaration order. None for a configuration that changes
-    /// no numerics beyond summation order.
-    pub fn error_classes_of(
-        &self,
-        specialization: &NativeSpecialization,
-    ) -> Result<Vec<&str>, NativeSpecializationError> {
-        let dimension = |name: &str| specialization.static_value(name);
-        let parameter = |name: &str| specialization.param(name);
-        let mut classes = Vec::new();
-        for class in &self.error_classes {
-            if class
-                .when
-                .holds(&dimension, &parameter)
-                .map_err(NativeSpecializationError::Evaluation)?
-            {
-                classes.push(class.name.as_str());
-            }
-        }
-        Ok(classes)
-    }
-
-    /// This implementation restricted to the error classes `admitted`
-    /// accepts: the condition of every other class, negated, joins `where`,
-    /// so no configuration of such a class is admissible.
-    pub fn admitting(mut self, admitted: impl Fn(&str) -> bool) -> Self {
-        let excluded: Vec<NativeCondition> = self
-            .error_classes
-            .iter()
-            .filter(|class| !admitted(&class.name))
-            .map(|class| class.when.negated())
-            .collect();
-        for condition in excluded {
-            self.constraint = Some(match self.constraint.take() {
-                Some(constraint) => {
-                    NativeCondition::And(Box::new(constraint), Box::new(condition))
-                }
-                None => condition,
-            });
-        }
-        self
-    }
-
     /// The values a static search tries, most preferred first: powers of two
     /// up to 4096, then the `where` condition's other literals above one,
     /// then one and zero.
@@ -1700,8 +1646,7 @@ impl NativeImplementation {
             None => configuration.param(name),
             Some(launch) => configuration.launch_param(launch, name),
         };
-        let parameter =
-            |parameter: &str| (launch.is_none() && parameter == name).then_some(value);
+        let parameter = |parameter: &str| (launch.is_none() && parameter == name).then_some(value);
         self.search(&[], &parameter, &|statics| {
             let mut found = None;
             self.walk_admissible(statics, |configuration| {
@@ -1731,7 +1676,15 @@ impl NativeImplementation {
         }
         let candidates = self.static_candidates();
         let mut assigned = std::collections::BTreeMap::new();
-        self.search_from(0, fixed, &conjuncts, &candidates, parameter, found, &mut assigned)
+        self.search_from(
+            0,
+            fixed,
+            &conjuncts,
+            &candidates,
+            parameter,
+            found,
+            &mut assigned,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1790,6 +1743,17 @@ impl NativeImplementation {
     pub fn walk_admissible(
         &self,
         statics: &NativeSpecialization,
+        visit: impl FnMut(&NativeSpecialization) -> bool,
+    ) -> Result<(), NativeSpecializationError> {
+        self.walk_admissible_while(statics, || true, visit)
+    }
+
+    /// Cancellation is checked for rejected prefixes too, so a sparse legal
+    /// domain cannot strand its caller between admissible configurations.
+    pub fn walk_admissible_while(
+        &self,
+        statics: &NativeSpecialization,
+        mut keep_going: impl FnMut() -> bool,
         mut visit: impl FnMut(&NativeSpecialization) -> bool,
     ) -> Result<(), NativeSpecializationError> {
         let mut base = NativeSpecialization::new();
@@ -1893,6 +1857,9 @@ impl NativeImplementation {
         // still does.
         let mut changed = 0;
         loop {
+            if !keep_going() {
+                return Ok(());
+            }
             let dimension = |name: &str| configuration.static_value(name);
             let parameter = |name: &str| {
                 let (launch, _) = domains[owner(name)?];
@@ -2084,7 +2051,9 @@ mod native_tests {
     fn a_repeat_block_dispatches_in_order_and_only_on_metal() {
         let check = |target: &str| {
             let launch = |name: &str, indent: &str| {
-                format!("{indent}launch {name}:\n{indent}    threadgroups (1, 1, 1)\n{indent}    threads_per_threadgroup (1, 1, 1)\n")
+                format!(
+                    "{indent}launch {name}:\n{indent}    threadgroups (1, 1, 1)\n{indent}    threads_per_threadgroup (1, 1, 1)\n"
+                )
             };
             check_source(SourceSet::new(vec![SourceFile {
                 path: "scale.seismic".into(),
@@ -2101,10 +2070,16 @@ mod native_tests {
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        assert_eq!(native.dispatch_order(2).collect::<Vec<_>>(), [0, 1, 2, 1, 2, 3]);
+        assert_eq!(
+            native.dispatch_order(2).collect::<Vec<_>>(),
+            [0, 1, 2, 1, 2, 3]
+        );
         assert_eq!(native.dispatch_order(0).collect::<Vec<_>>(), [0, 3]);
         let refused = format!("{:?}", check("cuda").err().unwrap());
-        assert!(refused.contains("`repeat` is not implemented for cuda"), "{refused}");
+        assert!(
+            refused.contains("`repeat` is not implemented for cuda"),
+            "{refused}"
+        );
     }
 
     /// Terms are names for expressions: a declaration that names them checks
@@ -2128,11 +2103,11 @@ mod native_tests {
             )
         };
         let named = check(
-            "    let MOST = ceil_div(64, N)\n    let SPARE = (MOST - PARTS) * N - 1\n    let ROUNDS = max(1, ceil_div(N, SPARE))\n    where PARTS <= MOST\n    error_class coarse when SPARE < 8\n    scratch window bytes (SPARE * 4) when ROUNDS > 1\n    launch prepare when ROUNDS > 1:\n        threadgroups (MOST, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes (SPARE)\n    repeat (ROUNDS):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min(SPARE, 32), 1, 1)\n",
+            "    let MOST = ceil_div(64, N)\n    let SPARE = (MOST - PARTS) * N - 1\n    let ROUNDS = max(1, ceil_div(N, SPARE))\n    where PARTS <= MOST\n    scratch window bytes (SPARE * 4) when ROUNDS > 1\n    launch prepare when ROUNDS > 1:\n        threadgroups (MOST, 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes (SPARE)\n    repeat (ROUNDS):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min(SPARE, 32), 1, 1)\n",
         )
         .unwrap();
         let written = check(
-            "    where PARTS <= ceil_div(64, N)\n    error_class coarse when (ceil_div(64, N) - PARTS) * N - 1 < 8\n    scratch window bytes (((ceil_div(64, N) - PARTS) * N - 1) * 4) when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1\n    launch prepare when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1:\n        threadgroups (ceil_div(64, N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes ((ceil_div(64, N) - PARTS) * N - 1)\n    repeat (max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1))):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min((ceil_div(64, N) - PARTS) * N - 1, 32), 1, 1)\n",
+            "    where PARTS <= ceil_div(64, N)\n    scratch window bytes (((ceil_div(64, N) - PARTS) * N - 1) * 4) when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1\n    launch prepare when max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1)) > 1:\n        threadgroups (ceil_div(64, N), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n        shared_bytes ((ceil_div(64, N) - PARTS) * N - 1)\n    repeat (max(1, ceil_div(N, (ceil_div(64, N) - PARTS) * N - 1))):\n        launch attend:\n            threadgroups (ceil_div(N, 32), PARTS, 1)\n            threads_per_threadgroup (min((ceil_div(64, N) - PARTS) * N - 1, 32), 1, 1)\n",
         )
         .unwrap();
         // Each source is its own module; everything else is equal.
@@ -2146,7 +2121,10 @@ mod native_tests {
 
         let launch = "    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n";
         for (terms, message) in [
-            ("    let N = 4\n", "term `N` is already a dimension, a parameter or a term"),
+            (
+                "    let N = 4\n",
+                "term `N` is already a dimension, a parameter or a term",
+            ),
             ("    let PARTS = 4\n", "term `PARTS` is already"),
             ("    let A = 1\n    let A = 2\n", "term `A` is already"),
             ("    let A = B + 1\n    let B = 2\n", "references `B`"),
@@ -2330,67 +2308,65 @@ mod native_tests {
         ));
     }
 
+
     #[test]
-    fn error_classes_follow_their_conditions() {
-        let declaration = |classes: &str| {
-            format!(
-                "native scale for metal from \"scale.metal\":\n    static (N)\n    params (arithmetic form DEPTH in [0, 1, 2], code PACKED in [0, 1])\n{classes}    launch scale:\n        params (ROWS in [1, 2])\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n"
+    fn ordinary_boolean_shape_domain_is_retained_and_not_split() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "boolean-domain.seismic".into(),
+            text: "fn choose[N, FLAG](x: &tensor[N] f32, flag: &tensor[FLAG + 1] f32) -> tensor[N] f32 where FLAG >= 0 and (FLAG == 0 or FLAG == 1):\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n".into(),
+        }])).unwrap();
+        let logical = module
+            .entry(
+                module.entry_named("choose").unwrap(),
+                &ElementBindings::new(),
             )
-        };
-        let module = check_source(source(&declaration(
-            "    error_class row_mixing when DEPTH >= 1\n    error_class int8_activations when PACKED == 1 and N >= 64\n",
-        )))
-        .expect("error classes check");
-        let native = module
-            .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
-        let classes = |n, depth, packed| {
-            native
-                .error_classes_of(
-                    &NativeSpecialization::new()
-                        .with_static("N", n)
-                        .with_param("DEPTH", depth)
-                        .with_param("PACKED", packed),
-                )
-                .unwrap()
-        };
-        assert!(classes(64, 0, 0).is_empty());
-        assert_eq!(classes(64, 2, 0), ["row_mixing"]);
-        assert_eq!(classes(64, 1, 1), ["row_mixing", "int8_activations"]);
-        assert!(classes(32, 0, 1).is_empty());
-
-        // Only admitted classes' configurations stay admissible.
-        let statics = NativeSpecialization::new().with_static("N", 64);
-        let count = |admitted: &[&str]| {
-            native
-                .clone()
-                .admitting(|name| admitted.contains(&name))
-                .admissible(&statics)
-                .unwrap()
-                .len()
-        };
-        assert_eq!(count(&["row_mixing", "int8_activations"]), 12);
-        assert_eq!(count(&["row_mixing"]), 6);
-        assert_eq!(count(&["int8_activations"]), 4);
-        assert_eq!(count(&[]), 2);
-
-        for (classes, message) in [
-            (
-                "    error_class row_mixing when DEPTH >= 1\n    error_class row_mixing when PACKED == 1\n",
-                "declared twice",
-            ),
-            (
-                "    error_class row_mixing when ROWS == 2\n",
-                "references `ROWS`",
-            ),
-        ] {
-            let error = check_source(source(&declaration(classes))).expect_err(message);
-            assert!(error.to_string().contains(message), "{error}");
+        let predicate = logical
+            .arena()
+            .compile_bool(logical.domain().predicate().node());
+        let mut values = crate::expr::compiled::InvocationValues::new();
+        for dimension in logical.schema().dimensions() {
+            values.bind(dimension.symbol, crate::expr::SymbolValue::Nat(1u64.into()));
         }
-        let dynamic = "native scale for metal from \"scale.metal\":\n    params (code PACKED in [0, 1])\n    error_class int8_activations when PACKED == 1 and N >= 64\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n";
-        let error = check_source(source(dynamic)).expect_err("a dynamic dimension is unknown");
-        assert!(error.to_string().contains("which is not static"), "{error}");
+        let flag = logical
+            .schema()
+            .dimensions()
+            .iter()
+            .find(|dimension| dimension.name == "FLAG")
+            .unwrap()
+            .symbol;
+        for (value, admitted) in [(0u64, true), (1, true), (2, false)] {
+            values.bind(flag, crate::expr::SymbolValue::Nat(value.into()));
+            assert_eq!(predicate.evaluate(&values).unwrap(), admitted);
+        }
+        let rejected = check_source(SourceSet::new(vec![SourceFile {
+            path: "boolean-call.seismic".into(),
+            text: "fn zero_only[N, FLAG](x: &tensor[N] f32) -> tensor[N] f32 where FLAG >= 0 and FLAG == 0:\n    let mut y = tensor[N] f32\n    for i in 0..N:\n        y[i] = x[i]\n    return y\n\nfn unsafe_call[N, FLAG](x: &tensor[N] f32) -> tensor[N] f32 where FLAG >= 0 and (FLAG == 0 or FLAG == 1):\n    return zero_only[FLAG = FLAG](x)\n".into(),
+        }]));
+        assert!(
+            rejected.is_err(),
+            "a disjunction cannot establish its zero arm"
+        );
     }
+
+    #[test]
+    fn integer_min_max_uses_exact_quantity_semantics() {
+        let module = check_source(SourceSet::new(vec![SourceFile {
+            path: "integer-min-max.seismic".into(),
+            text: "fn cap[N](x: &tensor[N] f32) -> i32:\n    return i32(min(N, max(2, 4)))\n"
+                .into(),
+        }]))
+        .unwrap();
+        assert!(
+            module
+                .entry(module.entry_named("cap").unwrap(), &ElementBindings::new())
+                .is_ok()
+        );
+    }
+
+
+
+
 
     #[test]
     fn launch_parameters_cannot_escape_their_launch() {
@@ -2441,7 +2417,10 @@ mod native_tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(values, [(0, 1, 4), (0, 2, 4), (0, 4, 4), (1, 1, 4), (1, 1, 8)]);
+        assert_eq!(
+            values,
+            [(0, 1, 4), (0, 2, 4), (0, 4, 4), (1, 1, 4), (1, 1, 8)]
+        );
         for configuration in &configurations {
             native.validate(configuration).unwrap();
         }
@@ -2457,15 +2436,20 @@ mod native_tests {
                 "native scale for metal from \"scale.metal\":\n    static (N)\n    params (form WIDE in [0, 1], ROWS in [8, 4])\n    where N >= 2 and {condition}\n    launch scale:\n        threadgroups (ceil_div(N, ROWS), 1, 1)\n        threads_per_threadgroup (32, 1, 1)\n"
             )
         };
-        let module =
-            check_source(source(&declaration("(WIDE == 0 or (N == 96 and ROWS == 4))"))).unwrap();
+        let module = check_source(source(&declaration(
+            "(WIDE == 0 or (N == 96 and ROWS == 4))",
+        )))
+        .unwrap();
         let native = module
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
         let first = native.search_statics(&[]).unwrap();
         assert_eq!(first.static_value("N"), Some(2));
         let narrow = native.search_form(None, "WIDE", 0).unwrap();
-        assert_eq!((narrow.static_value("N"), narrow.param("ROWS")), (Some(2), Some(8)));
+        assert_eq!(
+            (narrow.static_value("N"), narrow.param("ROWS")),
+            (Some(2), Some(8))
+        );
         let wide = native.search_form(None, "WIDE", 1).unwrap();
         assert_eq!(wide.static_value("N"), Some(96));
         assert_eq!((wide.param("WIDE"), wide.param("ROWS")), (Some(1), Some(4)));
@@ -2491,7 +2475,11 @@ mod native_tests {
             .native_implementation(module.entries()[0].id, BackendName::Metal)
             .unwrap();
         let mut conjuncts = Vec::new();
-        native.constraint.as_ref().unwrap().conjuncts(&mut conjuncts);
+        native
+            .constraint
+            .as_ref()
+            .unwrap()
+            .conjuncts(&mut conjuncts);
         let none = |_: &str| None;
         let wide = |name: &str| (name == "WIDE").then_some(1);
         let at = |n: u64| move |name: &str| (name == "N").then_some(n);
@@ -3054,6 +3042,14 @@ mod diagnostic_tests {
             partial_copy: true,
             ..ElementUses::default()
         };
+        let component = ElementUses {
+            component_read: true,
+            integer_code_read: true,
+            ..ElementUses::default()
+        };
+        assert!(component.admits(registry::representation("q4g32s").unwrap()));
+        assert!(!component.admits(dense(DType::F32)));
+        assert!(!component.admits(external));
         assert!(stored.admits(dense(DType::BF16)));
         assert!(!stored.admits(q4g64));
         assert!(!stored.admits(dense(DType::I32)));

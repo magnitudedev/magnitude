@@ -34,6 +34,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             draft: None,
         },
         model: ModelPolicy {
+            draft_budget: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: std::env::var("MAGNITUDE_TEST_KV_CODEC")
@@ -41,7 +42,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
                 .unwrap_or(KvCodec::AffineK8V4),
             lookahead: false,
             exported_logits_rows: 64,
-            error_classes: Vec::new(),
+            numerical_profile: None,
         },
         context_tokens: Some(8192),
         service: ServiceLimits {

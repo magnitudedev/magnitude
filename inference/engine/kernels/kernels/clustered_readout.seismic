@@ -1,0 +1,70 @@
+# Expand selected clusters into per-row canonical vocabulary IDs. The model
+# owns the cluster-major permutation; implementation selection does not.
+fn cluster_token_rows[M, C, B, K](selected: &tensor[M, K, 2] i32,
+    token_order: &tensor[C, B] i32) -> tensor[M, K * B] i32:
+    let mut rows = tensor[M, K * B] i32
+    parallel for row in 0..M:
+        parallel for rank in 0..K:
+            let cluster = selected[row, rank, 0]
+            parallel for offset in 0..B:
+                rows[row, rank * B + offset] = i32(-1)
+                if cluster >= 0 and cluster < i32(C):
+                    rows[row, rank * B + offset] = token_order[cluster, offset]
+    return rows
+
+# Place compact scores in canonical vocabulary order. Exclusion belongs to
+# proposal policy; this operation never approximates target readout.
+# Each row has unique canonical IDs, established by the model permutation
+# and distinct selected clusters before this placement operation.
+fn place_logits_rows[M, V, S](scores: &tensor[M, S] f32,
+    token_rows: &tensor[M, S] i32, logits: &mut tensor[M, V] f32):
+    parallel for row in 0..M:
+        parallel for token in 0..V:
+            logits[row, token] = -inf
+        for index in 0..S:
+            let token = token_rows[row, index]
+            if token >= 0 and token < i32(V):
+                logits[row, token] = scores[row, index]
+
+native cluster_token_rows for metal from "metal/cluster_token_rows.metal":
+    launch cluster_token_rows:
+        threadgroups (ceil_div(M * K * B, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native cluster_token_rows for cuda from "cuda/cluster_token_rows.cu":
+    launch cluster_token_rows:
+        threadgroups (ceil_div(M * K * B, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native cluster_token_rows for vulkan from "vulkan/cluster_token_rows.comp":
+    launch cluster_token_rows:
+        threadgroups (min(ceil_div(M * K * B, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native cluster_token_rows for cpu from "cpu/cluster_token_rows.rs":
+    launch cluster_token_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+native place_logits_rows for metal from "metal/place_logits_rows.metal":
+    launch place_logits_fill:
+        threadgroups (ceil_div(M * V, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch place_logits_rows:
+        threadgroups (ceil_div(M * S, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native place_logits_rows for cuda from "cuda/place_logits_rows.cu":
+    launch place_logits_fill:
+        threadgroups (ceil_div(M * V, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch place_logits_rows:
+        threadgroups (ceil_div(M * S, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native place_logits_rows for vulkan from "vulkan/place_logits_rows.comp":
+    launch place_logits_fill:
+        threadgroups (min(ceil_div(M * V, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch place_logits_rows:
+        threadgroups (min(ceil_div(M * S, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+native place_logits_rows for cpu from "cpu/place_logits_rows.rs":
+    launch place_logits_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

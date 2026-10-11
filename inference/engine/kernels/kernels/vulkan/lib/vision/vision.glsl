@@ -174,7 +174,7 @@ void vision_gemm(const int wk, projection_prologue in_, vision_epilogue out_, pr
 // Dense weight rows of an [N, K] row-major matrix (`stride` elements per row
 // of `bytes` each).
 projection_weights vision_weights(uint64_t base, uint64_t stride, const uint bytes, uint k) {
-    return projection_weights(base, packets_rows16(stride * uint64_t(bytes), 0ul, 0ul, 0ul, 0ul), k, 0ul);
+    return projection_weights(base, packets_rows16(stride * uint64_t(bytes), 0ul, 0ul, 0ul, 0ul), k, 0ul, 1ul);
 }
 
 // ---------------------------------------------------------------------------

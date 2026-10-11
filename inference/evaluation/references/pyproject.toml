@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-references"
+version = "0.1.0"
+requires-python = ">=3.12"
+# magnitude-remote only for the build identity of local runs (record.build).
+dependencies = ["numpy==2.5.3", "gguf==0.19.0", "torch==2.14.0", "magnitude-remote"]
+
+[project.optional-dependencies]
+# Validation of the references themselves against released modeling code and checkpoints.
+check = ["transformers==5.17.0", "safetensors", "huggingface-hub"]
+
+[project.scripts]
+magnitude-references = "magnitude_references.cli:entry"
+
+[tool.uv.sources]
+magnitude-remote = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_references"]

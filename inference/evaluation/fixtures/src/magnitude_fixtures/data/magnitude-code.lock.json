@@ -1,0 +1,22 @@
+{
+  "repository": "magnitude",
+  "commit": "b2f79f00f4aa8d4ca6ad97f37a8c457ddba4e8a9",
+  "files": [
+    {"path": "inference/engine/chat/src/generation.rs", "sha256": "e6a8921ed34af9f39c476c43c7ec9126cc04ad3dcd1c4574b6655a2b5b3f93f2"},
+    {"path": "inference/engine/chat/src/schema.rs", "sha256": "4d76dc8296b900dc1ed1e7c18565542b65c709a832117efe63dee1f283048df1"},
+    {"path": "inference/engine/grammar/src/lark.rs", "sha256": "3d84349f9e04f64b6d0bb424244d6cc0a9a7ea0fb22e9c49cc06f6c45f829403"},
+    {"path": "inference/engine/grammar/src/constraint.rs", "sha256": "9016c2590ff33ba2e72d955fe0d39a03d13649b7652cde29be94c087315fa2c7"},
+    {"path": "inference/engine/generation/src/plain.rs", "sha256": "b8ddcd9e1347522578818a0ef469e05ea5b9104153a52d5de1058026da0d3071"},
+    {"path": "inference/engine/generation/src/shaping.rs", "sha256": "2bfaf9cdbf029787529f2851b68784e5b52603b0077db969eeba11e7896cc044"},
+    {"path": "inference/engine/families/common/src/rotary.rs", "sha256": "3e76e1f80fbc32f80b418a58e75bc2c0e8fc7fb0af91d3791c557d8ca6e98332"},
+    {"path": "inference/engine/executor/src/error.rs", "sha256": "dec3a4abcf915d097afd5cfea6c2d76ea42366d4aeab2d5a5327274595c9d933"},
+    {"path": "inference/engine/kernels/kernels/cpu/attention_prefill.rs", "sha256": "7a4df80fb64dfb7507c6153b2274bce0901cea286ad81af5263124874c6b4654"},
+    {"path": "inference/engine/batching/src/state.rs", "sha256": "8cbb05ba072dc7fe700e66c167b9304bdb6f92f74a95e7a9521a0d3fac0fa5e9"},
+    {"path": "packages/ai/src/codec/native-chat-completions/encode.ts", "sha256": "25ee6eab25f75f3dbafdda6fb1d0bd60019a2e5d204af6e5b27c5e3eafe07280"},
+    {"path": "packages/ai/src/streaming/parser/parser.ts", "sha256": "a60a950b4c82554653a1631b41ad2d7842a987db00b39012dcdcdde5608721bc"},
+    {"path": "packages/ai/src/provider/model.ts", "sha256": "f3112685061f8986d1aaced02a525c28a6c643db3affcd7848c5838c7d8c94ab"},
+    {"path": "packages/ai/src/options/option.ts", "sha256": "c12282ed2e815e5642bfc057628e6dad5a797d0fafcb51b3bf453b3294733f5d"},
+    {"path": "inference/benchmarks/src/magnitude_benchmarks/session_bench/validation.py", "sha256": "be0ff06c9b706d4a97493d4e547e4998159986012a6b66b6b19a93cdcf64482a"},
+    {"path": "inference/benchmarks/src/magnitude_benchmarks/host/temperature.py", "sha256": "94cda09eaba38c66c888ce9b3b11d7bf5ff58d466542d34a00bdde74c52f1176"}
+  ]
+}

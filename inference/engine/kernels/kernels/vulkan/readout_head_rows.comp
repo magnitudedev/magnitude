@@ -83,7 +83,7 @@ projection_epilogue head_rows_output() {
 }
 
 projection_weights head_rows_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), HEAD_GEOMETRY, HEAD_K, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), HEAD_GEOMETRY, HEAD_K, 0ul, 1ul);
 }
 
 void readout_head_rows_gemv() {

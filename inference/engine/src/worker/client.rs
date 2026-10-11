@@ -11,6 +11,8 @@ use super::protocol::{
 };
 use super::transport::{HostTransport, MessageReceiver, MessageSender};
 use crate::error::{LoadError, RequestError};
+use crate::execution::LoadAttempt;
+use magnitude_executor::UnpreparedUnits;
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
 use magnitude_family_contracts::PreparedModelInput;
@@ -178,6 +180,7 @@ impl State {
             | WorkerMessage::LoadProgress { .. }
             | WorkerMessage::Ready { .. }
             | WorkerMessage::Prepared
+            | WorkerMessage::Unprepared
             | WorkerMessage::LoadFailed { .. } => {
                 return Err("load message after readiness".into())
             }
@@ -238,21 +241,29 @@ pub struct WorkerConnection {
 /// With `load`, this is a worker process that has not yet been told what to
 /// load: the host sends `Hello` and `Load`. Without it, the worker was given
 /// its manifest directly (in-process). Either way the worker's `Hello` must
-/// carry this build, and its `LoadProgress` events reach `progress` until `Ready`.
+/// carry this build, and its `LoadProgress` events reach `progress` until
+/// `Ready`, or until `Unprepared`: a worker asked to report tuning units
+/// without a stored record met one, placed nothing and is ending. Hosts
+/// reach this through [`super::load_prepared`].
 pub fn connect_worker(
     transport: impl HostTransport,
-    load: Option<ExecutionManifest>,
+    load: Option<(ExecutionManifest, UnpreparedUnits)>,
     mut progress: impl FnMut(LoadProgress),
-) -> Result<WorkerConnection, LoadError> {
+) -> Result<LoadAttempt<WorkerConnection>, LoadError> {
     let (mut receiver, mut sender) = transport.split();
     let lost = |reason: String| LoadError::WorkerLost { reason };
     let build = EngineBuild::current();
-    if let Some(manifest) = load {
+    if let Some((manifest, unprepared)) = load {
         sender
             .send(HostMessage::Hello {
                 build: build.clone(),
             })
-            .and_then(|()| sender.send(HostMessage::Load { manifest }))
+            .and_then(|()| {
+                sender.send(HostMessage::Load {
+                    manifest,
+                    unprepared,
+                })
+            })
             .map_err(|error| lost(error.to_string()))?;
     }
     let mut next = || match receiver.receive() {
@@ -273,6 +284,7 @@ pub fn connect_worker(
         match next()? {
             WorkerMessage::LoadProgress { progress: current } => progress(current),
             WorkerMessage::Ready { ready } => break ready,
+            WorkerMessage::Unprepared => return Ok(LoadAttempt::Unprepared),
             WorkerMessage::LoadFailed { error } => return Err(error),
             _ => return Err(lost("unexpected message during load".into())),
         }
@@ -308,20 +320,24 @@ pub fn connect_worker(
         .map_err(|error| LoadError::Internal {
             reason: error.to_string(),
         })?;
-    Ok(WorkerConnection {
+    Ok(LoadAttempt::Loaded(WorkerConnection {
         client: EngineClient { connection },
         ready,
-    })
+    }))
 }
 
-/// Ask a worker process to prepare `manifest`'s programs on its device and
-/// wait until it has, reporting its `LoadProgress` to `progress`. The worker
-/// exits once prepared; it never loads the model.
-pub fn prepare_worker(
+/// Ask a worker process for a Prepare of `manifest` and wait for its
+/// outcome, reporting its `LoadProgress` to `progress`. The worker exits once
+/// prepared; it never loads the model. Hosts reach this through
+/// [`super::load_prepared`] or [`super::prepare`], which also see the
+/// process ended. The outer error is a worker that reported no outcome (it
+/// was lost, or broke the protocol); the inner result is the outcome a
+/// worker reported, after which it exits on its own.
+pub(super) fn prepare_worker(
     transport: impl HostTransport,
     manifest: ExecutionManifest,
     mut progress: impl FnMut(LoadProgress),
-) -> Result<(), LoadError> {
+) -> Result<Result<(), LoadError>, LoadError> {
     let (mut receiver, mut sender) = transport.split();
     let lost = |reason: String| LoadError::WorkerLost { reason };
     let build = EngineBuild::current();
@@ -348,8 +364,8 @@ pub fn prepare_worker(
     loop {
         match next()? {
             WorkerMessage::LoadProgress { progress: current } => progress(current),
-            WorkerMessage::Prepared => return Ok(()),
-            WorkerMessage::LoadFailed { error } => return Err(error),
+            WorkerMessage::Prepared => return Ok(Ok(())),
+            WorkerMessage::LoadFailed { error } => return Ok(Err(error)),
             _ => return Err(lost("unexpected message during preparation".into())),
         }
     }

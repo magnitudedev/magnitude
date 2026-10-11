@@ -1,6 +1,0 @@
-.venv/
-runtimes/*/.venv/
-runs/
-models.local.json
-.pytest_cache/
-__pycache__/

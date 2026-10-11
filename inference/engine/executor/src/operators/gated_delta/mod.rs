@@ -38,7 +38,11 @@ pub(super) fn weights<'a>(delta: &'a GatedDelta, push: &mut WeightPush<'_, 'a>) 
 pub(super) fn shape_key(delta: &GatedDelta) -> String {
     format!(
         "gated delta {} {} {} {} {:?}",
-        delta.convolution_width, delta.key_heads, delta.value_heads, delta.width, delta.head_mapping
+        delta.convolution_width,
+        delta.key_heads,
+        delta.value_heads,
+        delta.width,
+        delta.head_mapping
     )
 }
 

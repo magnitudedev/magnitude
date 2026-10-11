@@ -4,7 +4,7 @@
 
 pub(crate) mod graph;
 
-use super::{tail, PlanError, WeightPush};
+use super::{PlanError, WeightPush, tail};
 use crate::{DenseBinding, DenseScales, ScalableWeight};
 use magnitude_family_contracts::{
     ActivationFunction, DenseFfn, FeedForwardUp, OutputForm, WeightKind,
@@ -64,6 +64,7 @@ pub(super) fn binding(
     );
     Ok(DenseBinding {
         features: dense.intermediate,
+        function: activation_code(dense.up.activation()),
         norm: lookup(WeightKind::InputNorm)?,
         gate: gate.element,
         up: up.element,

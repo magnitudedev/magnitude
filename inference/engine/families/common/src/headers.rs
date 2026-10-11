@@ -1,5 +1,5 @@
 //! Exact GGUF headers of catalog components, as dumped under
-//! `inference/validation/results/catalog-headers/` (metadata plus the full
+//! `inference/catalog/headers/` (metadata plus the full
 //! tensor directory; long metadata arrays keep only their head), for family
 //! tests.
 
@@ -10,7 +10,7 @@ use serde_json::Value as Json;
 use std::path::PathBuf;
 
 pub fn root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../validation/results/catalog-headers")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../catalog/headers")
 }
 
 /// Every dumped component: `(model, role, file)`.

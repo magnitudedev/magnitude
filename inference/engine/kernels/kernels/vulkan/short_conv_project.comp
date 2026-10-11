@@ -184,13 +184,13 @@ projection_epilogue short_conv_project_c() {
 }
 
 projection_weights short_conv_project_b() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT), B_GEOMETRY, CONV_H, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_B_WEIGHT), B_GEOMETRY, CONV_H, 0ul, 1ul);
 }
 projection_weights short_conv_project_x() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT), X_GEOMETRY, CONV_H, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_X_WEIGHT), X_GEOMETRY, CONV_H, 0ul, 1ul);
 }
 projection_weights short_conv_project_cw() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT), C_GEOMETRY, CONV_H, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_C_WEIGHT), C_GEOMETRY, CONV_H, 0ul, 1ul);
 }
 
 void short_conv_project_gemv() {

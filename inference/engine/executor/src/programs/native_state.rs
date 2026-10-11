@@ -2,15 +2,15 @@
 
 use super::{ReadySubmission, StateProgram};
 use crate::{
-    native::AttestedState,
-    programs::graph::{draft::GraphDraft, GraphError},
     DeviceError, InvariantError, NativeGraphWorkspaceLease, StateLaunchCore, StateStorePlan,
     StateWork, SubmitError, ValidatedStateLaunch,
+    native::AttestedState,
+    programs::graph::{GraphError, draft::GraphDraft},
 };
 use magnitude_kernels::copy_rows;
 use seismic::{
-    BackendName, Device, Element, NativeGraphBindings, NativeGraphClassSlice, NativeGraphFamily,
-    NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata, NativeGraphOutputs,
+    BackendName, Device, Element, HostHeap, NativeGraphBindings, NativeGraphClassSlice,
+    NativeGraphFamily, NativeGraphFamilySlot, NativeGraphLayout, NativeGraphMetadata, NativeGraphOutputs,
     NativeGraphPlan, NativeGraphStorageBytes, NativePort, Tensor,
 };
 use std::rc::Rc;
@@ -191,6 +191,9 @@ pub(crate) struct StateCopyGraphClass {
 pub struct PreparedStateCopyGraphs {
     variants: Vec<PreparedStateCopyGraph>,
     family: NativeGraphFamily,
+    /// The host heap the plan counted for the graphs
+    /// (`planned_host_heap`).
+    planned: HostHeap,
 }
 
 struct PreparedStateCopyGraph {
@@ -210,8 +213,13 @@ impl PreparedStateCopyGraphs {
         let classes = classes.into_iter().collect::<Vec<_>>();
         let (_, layouts) = certify_copy_family(target_device.backend(), &classes)
             .map_err(|error| invalid(error.to_string()))?;
-        let mut variants = Vec::new();
-        for (class, layout) in classes.into_iter().zip(layouts) {
+        let planned = copy_family_heap(&classes, &layouts).map_err(invalid)?;
+        // The graphs go into a vector of exactly the classes, and each
+        // class's extents hold exactly their lengths: what the plan counted.
+        let mut variants = Vec::with_capacity(classes.len());
+        for (mut class, layout) in classes.into_iter().zip(layouts) {
+            class.source_extents.shrink_to_fit();
+            class.destination_extents.shrink_to_fit();
             validate_class(&class).map_err(invalid)?;
             if variants
                 .iter()
@@ -247,7 +255,47 @@ impl PreparedStateCopyGraphs {
             .map(|variant| variant.plan.clone())
             .collect::<Vec<_>>();
         let family = NativeGraphFamily::new(&plans).map_err(device)?;
-        Ok(Self { variants, family })
+        let graphs = Self {
+            variants,
+            family,
+            planned,
+        };
+        // Graphs that hold another heap than the plan counted are a defect
+        // of the plan's accounting: an error in a debug build.
+        let held = graphs.host_heap();
+        if cfg!(debug_assertions) && held != planned {
+            return Err(invalid(format!(
+                "the state copy graphs hold {held:?}; the plan counted {planned:?}"
+            )));
+        }
+        Ok(graphs)
+    }
+
+    /// The host heap the plan counted for these graphs before any was
+    /// sealed (`copy_family_heap`).
+    pub fn planned_host_heap(&self) -> HostHeap {
+        self.planned
+    }
+
+    /// The host heap these graphs hold: their vector, each one's sealed
+    /// plan and its class's extents, at their capacities.
+    pub fn host_heap(&self) -> HostHeap {
+        use std::mem::size_of;
+        let mut heap = HostHeap::allocation(
+            self.variants.capacity(),
+            size_of::<PreparedStateCopyGraph>(),
+        );
+        for variant in &self.variants {
+            heap.hold(variant.class.source_extents.capacity(), size_of::<u64>());
+            heap.hold(
+                variant.class.destination_extents.capacity(),
+                size_of::<u64>(),
+            );
+            heap = heap
+                .plus(variant.plan.host_heap())
+                .expect("state copy graph heap overflows");
+        }
+        heap
     }
 
     pub fn workspace_bytes_max(&self) -> u64 {
@@ -361,8 +409,39 @@ pub(crate) fn checked_copy_family_storage(
     backend: BackendName,
     classes: impl IntoIterator<Item = StateCopyGraphClass>,
 ) -> Result<NativeGraphStorageBytes, GraphError> {
+    checked_copy_family(backend, classes).map(|(storage, _)| storage)
+}
+
+/// The family's storage with the host heap its prepared graphs hold
+/// (`copy_family_heap`): what a load's assessment charges, from the classes
+/// the load prepares.
+pub(crate) fn checked_copy_family(
+    backend: BackendName,
+    classes: impl IntoIterator<Item = StateCopyGraphClass>,
+) -> Result<(NativeGraphStorageBytes, HostHeap), GraphError> {
     let classes = classes.into_iter().collect::<Vec<_>>();
-    certify_copy_family(backend, &classes).map(|(storage, _)| storage)
+    let (storage, layouts) = certify_copy_family(backend, &classes)?;
+    Ok((storage, copy_family_heap(&classes, &layouts)?))
+}
+
+/// The host heap the prepared state copy graphs of `classes` hold, each
+/// sealed into its layout: the vector of them, each one's sealed plan
+/// (`NativeGraphLayout::plan_heap`) and its class's extents. What the
+/// planner counts and what `PreparedStateCopyGraphs::prepare` allocates.
+fn copy_family_heap(
+    classes: &[StateCopyGraphClass],
+    layouts: &[NativeGraphLayout],
+) -> Result<HostHeap, String> {
+    use std::mem::size_of;
+    let mut heap = HostHeap::allocation(classes.len(), size_of::<PreparedStateCopyGraph>());
+    for (class, layout) in classes.iter().zip(layouts) {
+        heap.hold(class.source_extents.len(), size_of::<u64>());
+        heap.hold(class.destination_extents.len(), size_of::<u64>());
+        heap = heap
+            .plus(layout.plan_heap())
+            .ok_or("state copy graph heap overflows")?;
+    }
+    Ok(heap)
 }
 
 fn certify_copy_family(
@@ -451,6 +530,12 @@ mod tests {
         )
         .unwrap();
         let handles = AttestedState {
+            feature_copy: magnitude_kernels::feature_copy::native_for_device_with(
+                &device,
+                magnitude_kernels::feature_copy::Elements { A: element },
+                &seismic::NativeSpecialization::new(),
+            )
+            .unwrap(),
             copies: vec![(element, kernel)],
             conditioning: None,
         };

@@ -1,5 +1,5 @@
 //! Interpretation of every catalog Gemma 4 header
-//! (`inference/validation/results/catalog-headers/`), plus negative cases
+//! (`inference/catalog/headers/`), plus negative cases
 //! derived from them.
 
 use magnitude_artifacts::{

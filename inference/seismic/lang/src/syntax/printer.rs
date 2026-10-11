@@ -2,7 +2,7 @@
 //!
 //! Headers print on one line, blocks indent by four spaces, comments are not preserved.
 use super::ast::*;
-use super::parser::{binary_bp, NOT_BP, RANGE_BP, UNARY_BP};
+use super::parser::{NOT_BP, RANGE_BP, UNARY_BP, binary_bp};
 use std::fmt::Write;
 
 pub(crate) fn print(file: &File) -> String {
@@ -103,12 +103,6 @@ impl Printer {
                     self.indent();
                     self.out.push_str("where ");
                     self.expr(constraint, 0);
-                    self.out.push('\n');
-                }
-                for class in &n.error_classes {
-                    self.indent();
-                    let _ = write!(self.out, "error_class {} when ", class.name.name);
-                    self.expr(&class.when, 0);
                     self.out.push('\n');
                 }
                 for scratch in &n.scratch {
@@ -362,10 +356,12 @@ impl Printer {
         let Some(els) = els else { return };
         self.indent();
         match els.stmts.as_slice() {
-            [Stmt {
-                kind: StmtKind::If { cond, then, els },
-                ..
-            }] => {
+            [
+                Stmt {
+                    kind: StmtKind::If { cond, then, els },
+                    ..
+                },
+            ] => {
                 self.out.push_str("else ");
                 self.if_stmt(cond, then, els.as_ref());
             }

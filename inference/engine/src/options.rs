@@ -7,11 +7,12 @@
 use magnitude_artifacts::{Package, PackageIdentity, PackageManifest};
 use magnitude_chat::generation::MethodPolicy;
 use magnitude_executor::{
+    ExecutionPath, MAX_DRAFT_PROPOSALS, ResourcePlan, TuningSettings,
     platform::{DeviceRequest, MemoryReserves},
-    ExecutionPath, ResourcePlan, MAX_DRAFT_PROPOSALS,
 };
-use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
+use magnitude_family_contracts::{DraftVariant, HeadHistory, ModelDefinition, ModelFamily};
 use magnitude_generation::{DFlash, Method, Mtp, Plain};
+pub use magnitude_generation::DraftBudget;
 
 /// MTP width when none is requested.
 const DEFAULT_PROPOSALS: u8 = 3;
@@ -92,6 +93,9 @@ impl ModelMethod {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPolicy {
+    /// The proposals each round generates and offers to verification. None
+    /// generates and offers the method's whole proposal width.
+    pub draft_budget: Option<DraftBudget>,
     pub method: ModelMethod,
     /// Explicit proposal width of the drafter (MTP or DFlash) for both greedy
     /// and sampled requests. When absent, the measured fixed-width policy is
@@ -104,22 +108,21 @@ pub struct ModelPolicy {
     /// Rows one launch may export full logits for: zero for serving, which
     /// never reads them; set by diagnostics that do.
     pub exported_logits_rows: usize,
-    /// The kernel error classes this model's qualification admits (top-1
-    /// agreement and KL against an F32 forward with the class's forms
-    /// selected). Tuning forms a configuration of an error class only when
-    /// it is named here; none by default.
-    pub error_classes: Vec<String>,
+    /// The caller's numerical requirement (α and the allowed deviation
+    /// classes); the engine's standard profile when absent.
+    pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
 }
 
 impl Default for ModelPolicy {
     fn default() -> Self {
         Self {
             method: ModelMethod::Auto,
+            draft_budget: None,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: true,
             exported_logits_rows: 0,
-            error_classes: Vec::new(),
+            numerical_profile: None,
         }
     }
 }
@@ -130,6 +133,9 @@ pub enum ResolvedMethod {
     Mtp {
         greedy_proposals: u8,
         sampled_proposals: u8,
+        /// The history the bound draft head reads: its own, primed from
+        /// committed rows, or the target's, which it never primes.
+        history: HeadHistory,
     },
     /// A separate draft drafting `proposals` tokens per block.
     DFlash {
@@ -146,6 +152,7 @@ impl ResolvedMethod {
             Self::Mtp {
                 greedy_proposals,
                 sampled_proposals,
+                ..
             } => usize::from(greedy_proposals.max(sampled_proposals)),
             Self::DFlash { proposals } => usize::from(proposals),
         }
@@ -169,7 +176,9 @@ impl ResolvedMethod {
     pub fn factory(self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
         match self {
             Self::Plain => Ok(Arc::new(Plain)),
-            Self::Mtp { .. } => Ok(Arc::new(Mtp::new(artifact_identity, self.proposals())?)),
+            Self::Mtp { history, .. } => {
+                Ok(Arc::new(mtp(history, artifact_identity, self.proposals())?))
+            }
             Self::DFlash { .. } => Ok(Arc::new(DFlash::new(artifact_identity, self.proposals())?)),
         }
     }
@@ -193,34 +202,52 @@ impl ResolvedMethod {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedModelPolicy {
+    pub draft_budget: Option<DraftBudget>,
     pub method: ResolvedMethod,
     #[serde(with = "KvCodecEncoding")]
     pub kv_codec: KvCodec,
     pub lookahead: bool,
     pub exported_logits_rows: usize,
-    /// The admitted kernel error classes, sorted and distinct.
-    #[serde(default)]
-    pub error_classes: Vec<String>,
+    /// The caller's profile, checked before device opening.
+    pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
+}
+
+impl ResolvedModelPolicy {
+    pub fn factory(&self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
+        match (self.method, self.draft_budget) {
+            (ResolvedMethod::Mtp { history, .. }, Some(budget)) => Ok(Arc::new(
+                mtp(history, artifact_identity, self.method.proposals())?.with_budget(budget)?,
+            )),
+            (ResolvedMethod::DFlash { .. }, Some(budget)) => Ok(Arc::new(
+                DFlash::new(artifact_identity, self.method.proposals())?.with_budget(budget)?,
+            )),
+            _ => self.method.factory(artifact_identity),
+        }
+    }
 }
 
 impl ModelPolicy {
-    /// Optional draft admission is host policy, never a numerical model property.
+    /// Optional draft admission is host policy, never a numerical model
+    /// property: when the package's separate draft is unavailable, a method
+    /// that would draft with it (a separate-draft method, or MTP on a target
+    /// without its own draft head) resolves as plain generation.
     pub(crate) fn resolve_admitted(
         &self,
         definition: &ModelDefinition,
-        draft_unavailable: Option<&magnitude_family_dflash::Error>,
+        draft_unavailable: Option<&crate::host::DraftUnavailable>,
     ) -> Result<ResolvedModelPolicy, String> {
-        if draft_unavailable.is_some()
-            && matches!(
-                self.method,
-                ModelMethod::Auto
-                    | ModelMethod::DFlash
-                    | ModelMethod::DSpark
-                    | ModelMethod::DFlash2
-            )
-        {
+        let drafts_with_separate = match self.method {
+            ModelMethod::Auto
+            | ModelMethod::DFlash
+            | ModelMethod::DSpark
+            | ModelMethod::DFlash2 => true,
+            ModelMethod::Mtp => definition.head.is_none(),
+            ModelMethod::Plain => false,
+        };
+        if draft_unavailable.is_some() && drafts_with_separate {
             return Self {
                 method: ModelMethod::Plain,
+                draft_budget: None,
                 mtp_proposals: None,
                 ..self.clone()
             }
@@ -232,19 +259,24 @@ impl ModelPolicy {
     pub fn resolve(&self, definition: &ModelDefinition) -> Result<ResolvedModelPolicy, String> {
         definition.validate().map_err(|error| error.to_string())?;
         let method = resolve_method(self.method, self.mtp_proposals, definition)?;
-        let mut error_classes = self.error_classes.clone();
-        error_classes.sort();
-        error_classes.dedup();
-        // A class no kernel declares is a configuration error.
-        magnitude_executor::AdmittedErrorClasses::of(&error_classes)?;
+        if let Some(budget) = &self.draft_budget {
+            if method == ResolvedMethod::Plain {
+                return Err("draft_budget requires an admitted speculative method".into());
+            }
+            budget.validate(method.proposals())?;
+        }
+        if let Some(profile) = &self.numerical_profile {
+            profile.resolve()?;
+        }
         Ok(ResolvedModelPolicy {
+            draft_budget: self.draft_budget,
             method,
             kv_codec: self.kv_codec,
             // A per-layer entry gathers host-table rows by host tokens, so
             // its steps cannot chain on device-selected tokens.
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
-            error_classes,
+            numerical_profile: self.numerical_profile.clone(),
         })
     }
 }
@@ -263,6 +295,14 @@ pub struct ExecutionManifest {
     /// The host's threshold policy: every engine claim keeps each domain's
     /// headroom above its planning reserve.
     pub reserves: MemoryReserves,
+    /// How the model's Prepare tunes, and the budget its load reads records
+    /// under: [`TuningSettings::STANDARD`] unless a diagnostic host chooses
+    /// a budget or fresh tuning. A load never searches and reads stored
+    /// records whether or not its Prepare searched afresh.
+    pub tuning: TuningSettings,
+    /// Where the Prepare and the load each append their tuning trace (JSON
+    /// Lines); `None` records none.
+    pub tuning_trace: Option<PathBuf>,
 }
 
 /// Device-free readiness evidence returned only after worker construction has
@@ -395,6 +435,8 @@ impl ExecutionManifest {
             device,
             kernel_cache,
             reserves,
+            tuning: TuningSettings::STANDARD,
+            tuning_trace: None,
         })
     }
 }
@@ -430,7 +472,7 @@ fn resolve_method(
             Some(width) if width > bound => {
                 return Err(format!(
                     "the draft proposes at most {bound} tokens per block"
-                ))
+                ));
             }
             Some(width) => width,
             None => DEFAULT_PROPOSALS.min(bound),
@@ -451,11 +493,13 @@ fn resolve_method(
         }
         return Ok(ResolvedMethod::Plain);
     }
-    head.ok_or("MTP was requested but the artifact has no draft head")?;
+    let history = head
+        .ok_or("MTP was requested but the artifact has no draft head")?
+        .history;
     let (greedy_proposals, sampled_proposals) = match override_width {
         Some(0) => return Err("mtp_proposals must be positive".into()),
         Some(width) if width > MAX_DRAFT_PROPOSALS => {
-            return Err(format!("mtp_proposals exceeds {MAX_DRAFT_PROPOSALS}"))
+            return Err(format!("mtp_proposals exceeds {MAX_DRAFT_PROPOSALS}"));
         }
         Some(width) => (width, width),
         None => (DEFAULT_PROPOSALS, DEFAULT_PROPOSALS),
@@ -463,18 +507,31 @@ fn resolve_method(
     Ok(ResolvedMethod::Mtp {
         greedy_proposals,
         sampled_proposals,
+        history,
     })
 }
 
+/// The MTP method driving a head of `history`: a head reading the target's
+/// history is never primed and drafts from the anchor and the target feature
+/// that selected it.
+fn mtp(history: HeadHistory, artifact_identity: &str, proposals: usize) -> Result<Mtp, String> {
+    match history {
+        HeadHistory::Own => Mtp::new(artifact_identity, proposals),
+        HeadHistory::Target => Mtp::reading_target(artifact_identity, proposals),
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::host::DraftUnavailable;
     use magnitude_artifacts::PackageIdentity;
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, Head,
-        HeadBlock, HeadNorm, HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention,
-        Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource,
+        HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm, HeadReadout,
+        HistoryDomain, HistoryReads, InputNorm, KeyValue, MediaRowAttention, Operator, OutputForm,
+        ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, VocabularyProjection,
         WeightDescriptor,
     };
 
@@ -546,12 +603,18 @@ mod tests {
     fn definition(with_head: bool) -> ModelDefinition {
         let head = with_head.then(|| Head {
             blocks: vec![HeadBlock {
-                embedding_norm: rms("en"),
-                hidden_norm: rms("hn"),
-                combine: weight("combine", &[2, 4]),
-                block: block("h"),
+                input: HeadInput::Combine {
+                    embedding_norm: rms("en"),
+                    hidden_norm: rms("hn"),
+                    combine: weight("combine", &[2, 4]),
+                },
+                blocks: vec![block("h")],
                 output_norm: ExitNorm::Rms(rms("hon")),
+                readout: HeadReadout::full(VocabularyProjection::Target),
+                chain: HeadChain::Output,
             }],
+            history: HeadHistory::Own,
+            component: HeadComponent::Target,
         });
         ModelDefinition {
             family: magnitude_family_contracts::FamilyId("fixture".into()),
@@ -587,12 +650,90 @@ mod tests {
     }
 
     #[test]
+    fn draft_budget_is_shared_bounded_and_opt_in() {
+        let budget = DraftBudget {
+            generated: 3,
+            verified: 1,
+        };
+        for (method, model) in [
+            (ModelMethod::Mtp, definition(true)),
+            (
+                ModelMethod::DFlash,
+                with_draft(magnitude_family_contracts::DraftMethod::DFlash),
+            ),
+        ] {
+            let policy = ModelPolicy {
+                method,
+                draft_budget: Some(budget),
+                ..ModelPolicy::default()
+            };
+            let resolved = policy.resolve(&model).unwrap();
+            assert_eq!(resolved.draft_budget, Some(budget));
+            let configured = resolved.factory("test").unwrap();
+            let default = ModelPolicy {
+                method,
+                ..ModelPolicy::default()
+            }
+            .resolve(&model)
+            .unwrap()
+            .factory("test")
+            .unwrap();
+            assert_ne!(configured.identity(), default.identity());
+            let encoded = serde_json::to_vec(&resolved).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ResolvedModelPolicy>(&encoded).unwrap(),
+                resolved
+            );
+            let over = ModelPolicy {
+                draft_budget: Some(DraftBudget {
+                    generated: 4,
+                    verified: 1,
+                }),
+                ..policy
+            };
+            assert!(over.resolve(&model).is_err());
+        }
+        let plain = ModelPolicy {
+            method: ModelMethod::Plain,
+            draft_budget: Some(budget),
+            ..ModelPolicy::default()
+        };
+        assert!(plain.resolve(&definition(false)).is_err());
+        assert!(
+            plain
+                .resolve_admitted(
+                    &definition(false),
+                    Some(&DraftUnavailable::Block(
+                        magnitude_family_dflash::Error::MissingCausality
+                    ))
+                )
+                .is_err()
+        );
+        let fallback = ModelPolicy {
+            method: ModelMethod::DFlash,
+            ..plain
+        };
+        assert!(
+            fallback
+                .resolve_admitted(
+                    &definition(true),
+                    Some(&DraftUnavailable::Block(
+                        magnitude_family_dflash::Error::MissingCausality
+                    ))
+                )
+                .unwrap()
+                .draft_budget
+                .is_none()
+        );
+    }
+
+    #[test]
     fn unavailable_separate_draft_resolves_plain_even_with_mtp_head_and_width() {
-        let missing = magnitude_family_dflash::Error::MissingCausality;
-        let malformed = magnitude_family_dflash::Error::Metadata {
+        let missing = DraftUnavailable::Block(magnitude_family_dflash::Error::MissingCausality);
+        let malformed = DraftUnavailable::Block(magnitude_family_dflash::Error::Metadata {
             key: "dflash.attention.causal".into(),
             expected: "BOOL",
-        };
+        });
         for reason in [&missing, &malformed] {
             for method in [
                 ModelMethod::Auto,
@@ -628,6 +769,33 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_draft_leaves_a_headless_target_plain_for_mtp() {
+        let unavailable = DraftUnavailable::Architecture(Some("eagle3".into()));
+        for method in [ModelMethod::Auto, ModelMethod::Mtp] {
+            let policy = ModelPolicy {
+                method,
+                ..ModelPolicy::default()
+            };
+            assert_eq!(
+                policy
+                    .resolve_admitted(&definition(false), Some(&unavailable))
+                    .unwrap()
+                    .method,
+                ResolvedMethod::Plain
+            );
+        }
+        // Without an unavailable draft, MTP on a headless target is an error.
+        assert!(
+            ModelPolicy {
+                method: ModelMethod::Mtp,
+                ..ModelPolicy::default()
+            }
+            .resolve_admitted(&definition(false), None)
+            .is_err()
+        );
+    }
+
+    #[test]
     fn defaults_resolve_after_artifact_inspection() {
         let plain = ModelPolicy::default().resolve(&definition(false)).unwrap();
         assert_eq!(plain.method, ResolvedMethod::Plain);
@@ -639,23 +807,9 @@ mod tests {
             ResolvedMethod::Mtp {
                 greedy_proposals: DEFAULT_PROPOSALS,
                 sampled_proposals: DEFAULT_PROPOSALS,
+                history: HeadHistory::Own,
             }
         );
-    }
-
-    #[test]
-    fn an_error_class_no_kernel_declares_is_refused() {
-        let policy = ModelPolicy {
-            error_classes: vec!["undeclared".to_owned()],
-            ..ModelPolicy::default()
-        };
-        let error = policy.resolve(&definition(false)).unwrap_err();
-        assert!(error.contains("unknown error class `undeclared`"), "{error}");
-        assert!(ModelPolicy::default()
-            .resolve(&definition(false))
-            .unwrap()
-            .error_classes
-            .is_empty());
     }
 
     #[test]
@@ -688,9 +842,12 @@ mod tests {
                 fusion: weight("fc", &[2, 2]),
                 fusion_norm: rms("enc"),
                 embedding: DraftEmbedding::Target,
+                output: None,
+                embedding_scale: 1.0,
                 blocks: vec![block("d")],
                 block_attention: vec![BlockAttention::Bidirectional],
                 output_norm: rms("don"),
+                logit_softcap: None,
                 block_size: 4,
                 mask_token: TokenId(7),
                 layout: BlockLayout::MaskSlots,
@@ -719,9 +876,11 @@ mod tests {
             let error = policy(method).resolve(&draft).unwrap_err();
             assert!(error.contains("the package's draft is DFlash"), "{error}");
         }
-        assert!(policy(ModelMethod::DFlash)
-            .resolve(&definition(true))
-            .is_err());
+        assert!(
+            policy(ModelMethod::DFlash)
+                .resolve(&definition(true))
+                .is_err()
+        );
         // Plain and MTP loads ignore the draft.
         assert_eq!(
             policy(ModelMethod::Plain).resolve(&draft).unwrap().method,
@@ -739,9 +898,25 @@ mod tests {
     /// arrives unchanged.
     #[test]
     fn execution_manifest_round_trips_through_the_worker_encoding() {
+        let manifest = manifest_with_kernel_cache(Some(PathBuf::from("/cache/kernels")));
+        let encoded = postcard::to_allocvec(&manifest).unwrap();
+        let decoded: ExecutionManifest = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.package, manifest.package);
+        assert_eq!(decoded.definition, manifest.definition);
+        assert_eq!(decoded.model, manifest.model);
+        assert_eq!(decoded.device, manifest.device);
+        assert_eq!(decoded.reserves, manifest.reserves);
+        assert_eq!(decoded.kernel_cache, manifest.kernel_cache);
+        assert_eq!(decoded.tuning, manifest.tuning);
+        assert_eq!(decoded.tuning_trace, manifest.tuning_trace);
+        assert_eq!(postcard::to_allocvec(&decoded).unwrap(), encoded);
+    }
+
+    /// A fixture manifest whose host named `kernel_cache`.
+    pub(crate) fn manifest_with_kernel_cache(kernel_cache: Option<PathBuf>) -> ExecutionManifest {
         use magnitude_artifacts::{
-            gguf::{Encoding, TensorDescriptor},
             ComponentFile, ComponentManifest,
+            gguf::{Encoding, TensorDescriptor},
         };
         let definition = definition(true);
         let package = PackageManifest {
@@ -764,25 +939,16 @@ mod tests {
             draft: None,
         };
         let model = ModelPolicy::default().resolve(&definition).unwrap();
-        let manifest = ExecutionManifest::new(
+        ExecutionManifest::new(
             package,
             definition,
             model,
             standard_service_limits(),
             ExecutionPath::Native,
             "metal:00000001000004a5".parse().unwrap(),
-            Some(PathBuf::from("/cache/kernels")),
+            kernel_cache,
             MemoryReserves::standard(),
         )
-        .unwrap();
-        let encoded = postcard::to_allocvec(&manifest).unwrap();
-        let decoded: ExecutionManifest = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.package, manifest.package);
-        assert_eq!(decoded.definition, manifest.definition);
-        assert_eq!(decoded.model, manifest.model);
-        assert_eq!(decoded.device, manifest.device);
-        assert_eq!(decoded.reserves, manifest.reserves);
-        assert_eq!(decoded.kernel_cache, manifest.kernel_cache);
-        assert_eq!(postcard::to_allocvec(&decoded).unwrap(), encoded);
+        .unwrap()
     }
 }

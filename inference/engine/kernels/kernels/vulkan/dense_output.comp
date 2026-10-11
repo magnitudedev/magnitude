@@ -73,7 +73,7 @@ projection_epilogue dense_output_output() {
 }
 
 projection_weights dense_output_down() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), DOWN_GEOMETRY, uint(SEISMIC_DIM_F), 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_DOWN_WEIGHT), DOWN_GEOMETRY, uint(SEISMIC_DIM_F), 0ul, 1ul);
 }
 
 void dense_output_gemv() {

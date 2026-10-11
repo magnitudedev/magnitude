@@ -1,11 +1,6 @@
-// project_rows: the plain projection of the A rows `source` [M, K], published
-// in Y. `attention_output`'s bands: GEMV for M <= 16 (`gemv` to 8 rows,
-// `gemv16` beyond) reading the rows in place, GEMM otherwise: `gemm_small` to
-// 64 rows (the rows in place, or the INT8 candidate's q8_1 rows staged by
-// `stage_s8`), `gemm` beyond; up to 128 rows split over K into SPLIT shares
-// of partials that `finalize` sums in part order. A present `weight_scale`
-// (static WS = 1) scales the F32 accumulator in the epilogue (after
-// `finalize`'s sum when split).
+// project_rows: the shared projection producer publishes semantic Act rows
+// or explicitly selected matrix operands. GEMV retains semantic inputs;
+// small and large matrix row bands share the same operand eligibility.
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
@@ -34,12 +29,12 @@ __device__ __forceinline__ void project_gemv(const Pro &source, unsigned M, unsi
         projection::gemv_segment<Shape>(shared, source, M, K / 64, group, N, weight, projection::NoWeight{}, epi);
 }
 
-#ifdef SEISMIC_FORMING_PROJECT_ROWS_STAGE_S8
-template <unsigned INT8>
-__global__ void project_rows_stage_s8(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_PROJECT_ROWS_STAGE
+template <unsigned INT8, unsigned OPERAND>
+__global__ void project_rows_stage(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
-    static_assert(!Pro::STAGED, "the 16-bit path reads the rows in place");
-    projection::stage_row<S8>(SOURCE_ROWS, blockIdx.x, SEISMIC_DIM_K, STAGING, GROUPS);
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    projection::stage_projection_row<S8, Operands>(SOURCE_ROWS, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_K, STAGING, GROUPS);
 }
 #endif
 
@@ -58,29 +53,32 @@ __global__ void project_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMM_SMALL
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void project_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
     if (column < projection::gemm_columns(SEISMIC_DIM_N))
-        projection::gemm_run_split<projection::SmallGemm, S8>(
-            reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
-            S8 ? SEISMIC_DIM_K : SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column,
+        projection::gemm_run_split<projection::SmallGemm, S8, Operands>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared), (S8 || Operands::MATERIALIZE) ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
+            (S8 || Operands::MATERIALIZE) ? SEISMIC_DIM_K : SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column,
             SEISMIC_DIM_N, WEIGHT, EPILOGUE, PARTIALS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void project_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();
     if (column < projection::gemm_columns(SEISMIC_DIM_N))
-        projection::gemm_run_split<Shape, false>(
-            reinterpret_cast<projection::u8 *>(dynamic_shared), SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
-            SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column, SEISMIC_DIM_N, WEIGHT,
+        projection::gemm_run_split<Shape, S8, Operands>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared), (S8 || Operands::MATERIALIZE) ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_SOURCE),
+            (S8 || Operands::MATERIALIZE) ? SEISMIC_DIM_K : SEISMIC_SOURCE_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_K, column, SEISMIC_DIM_N, WEIGHT,
             EPILOGUE, PARTIALS);
 }
 #endif

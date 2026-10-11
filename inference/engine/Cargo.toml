@@ -32,6 +32,12 @@ opentelemetry = "0.33.0"
 opentelemetry_sdk = "0.33.0"
 opentelemetry-otlp = { version = "0.33.0", features = ["http-json", "reqwest"] }
 
+# Re-executes itself as a worker process whose stdout carries the protocol,
+# so it runs without the libtest harness (which prints to stdout).
+[[test]]
+name = "worker_parity"
+harness = false
+
 [dev-dependencies]
 magnitude-family-common = { path = "families/common", features = ["catalog-headers"] }
 
@@ -42,12 +48,10 @@ sha2 = "=0.11.0"
 libc = "=0.2.189"
 
 [features]
-# Development-only bounded precision calibration; production uses fixed limits.
-tuning-precision-experiment = ["magnitude-executor/tuning-precision-experiment"]
-# Development-only: lets the `forward_bench` example record tuned
-# configurations and replay them in a later run (bit-exact comparisons).
-# The served `magnitude-engine` binary (engine/cli) never installs a pin.
+# Development-only: lets `magnitude-harness` record tuned configurations and
+# replay them in a later run (bit-exact comparisons). The served
+# `magnitude-engine` binary (engine/cli) never installs a pin.
 pinned-tuning = ["magnitude-executor/pinned-tuning"]
-# Development-only: lets the `forward_bench` example survey every admissible
-# tuning configuration (`--tuning-survey DIR`) for replaying the search.
+# Development-only: lets `magnitude-harness` survey every admissible tuning
+# configuration (`--tuning-survey DIR`) for replaying the search.
 tuning-survey = ["magnitude-executor/tuning-survey"]

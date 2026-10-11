@@ -219,10 +219,11 @@ struct projection_weights {
     packets_rows16 geometry;
     uint k;
     uint64_t table;     // 0: rows in order
+    uint64_t table_stride;
 };
 
 uint64_t projection_weights_row(projection_weights w, uint n) {
-    const uint64_t r = w.table == 0ul ? uint64_t(n) : uint64_t(element_i32_at(w.table + uint64_t(n) * 4ul));
+    const uint64_t r = w.table == 0ul ? uint64_t(n) : uint64_t(element_i32_at(w.table + uint64_t(n) * w.table_stride * 4ul));
     return w.base + r * w.geometry.stride;
 }
 

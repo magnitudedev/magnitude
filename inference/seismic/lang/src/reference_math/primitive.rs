@@ -869,6 +869,37 @@ pub(super) fn absolute(b: &Recipe, a: V) -> V {
     };
     b.typed(result, dtype)
 }
+/// Integral rounding is expressed entirely through payload words. In particular,
+/// ties do not depend on a host rounding mode and negative zero survives.
+fn round_integral(b: &Recipe, a: V) -> V {
+    let f = Format::of(a.ty);
+    let bits = b.bits(a);
+    let sign = b.mask(bits, f.sign_mask());
+    let magnitude = b.mask(bits, !f.sign_mask());
+    let exponent = b.mask(magnitude, f.exponent_mask());
+    let half = ((f.bias() - 1) as u32) << f.fraction;
+    let one = (f.bias() as u32) << f.fraction;
+    let small = b.select(b.lt(b.u(half), magnitude), b.u(one), b.u(0));
+    let mut rounded = b.select(b.lt(exponent, b.u(one)), small, magnitude);
+    for integral_bits in 0..f.fraction {
+        let shift = f.fraction - integral_bits;
+        let mask = (1u32 << shift) - 1;
+        let remainder = b.mask(magnitude, mask);
+        let midpoint = b.u(1u32 << (shift - 1));
+        let odd = b.nonzero(b.mask(magnitude, 1u32 << shift));
+        let up = b.or(
+            b.lt(midpoint, remainder),
+            b.and(b.eq(remainder, midpoint), odd),
+        );
+        let truncated = b.mask(magnitude, !mask);
+        let value = b.add(truncated, b.select(up, b.u(1u32 << shift), b.u(0)));
+        let band = ((f.bias() as u32) + integral_bits) << f.fraction;
+        rounded = b.select(b.eq(exponent, b.u(band)), value, rounded);
+    }
+    let nan = b.lt(b.u(f.exponent_mask()), magnitude);
+    b.typed(b.select(nan, b.u(f.nan()), b.union(sign, rounded)), a.ty)
+}
+
 fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
     let dtype = a.ty;
     let x = b.bits(a);
@@ -1072,7 +1103,7 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
     let arity = match op {
         ScalarOp::Binary(_) | ScalarOp::IntegerToFloat(_) => 2,
         ScalarOp::Math(op) => op.arity(),
-        ScalarOp::Unary(_) | ScalarOp::Cast(_) => 1,
+        ScalarOp::Unary(_) | ScalarOp::Cast(_) | ScalarOp::Bitcast(_) => 1,
     };
     assert_eq!(args.len(), arity, "scalar recipe operand arity");
     match op {
@@ -1100,6 +1131,10 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
                 "integer_to_float operands are U32 words"
             );
         }
+        ScalarOp::Bitcast(to) => assert!(matches!(
+            (args[0].ty, to),
+            (DType::F32, DType::U32) | (DType::U32, DType::F32)
+        )),
         ScalarOp::Binary(_) | ScalarOp::Cast(_) => {}
     }
     match op {
@@ -1119,11 +1154,13 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
             assert_eq!(args.len(), 1);
             cast(b, args[0], to)
         }
+        ScalarOp::Bitcast(to) => b.typed(b.bits(args[0]), to),
         ScalarOp::IntegerToFloat(to) => word_integer_to_float(b, args[0], args[1], to),
         ScalarOp::Math(op) => {
             assert_eq!(args.len(), op.arity());
             match op {
                 MathOp::Abs => absolute(b, args[0]),
+                MathOp::Rint => round_integral(b, args[0]),
                 MathOp::Min => minmax(b, args[0], args[1], false),
                 MathOp::Max => minmax(b, args[0], args[1], true),
                 MathOp::Fma => float_multiply(b, args[0], args[1], Some(args[2])),

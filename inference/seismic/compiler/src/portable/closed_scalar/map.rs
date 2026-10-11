@@ -41,7 +41,7 @@ impl Analysis<'_> {
             match effect {
                 Effect::Write(place, value) => observed.push((place.clone(), *value)),
                 Effect::Failure(..) | Effect::Map { .. } => {
-                    return Err("parallel map failure or nested map relation is unfinished")
+                    return Err("parallel map failure or nested map relation is unfinished");
                 }
             }
         }

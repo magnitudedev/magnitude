@@ -8,18 +8,17 @@
 //!
 //! Nothing here is constructible outside `check`.
 
-use super::dimensions::DimensionPlan;
 use super::ownership::LocalPlace;
 use super::resolve::SignatureDimension;
 use crate::checked::ElementDomain;
-use crate::expr::{ExprArena, IntExpr, SymbolId};
+use crate::expr::{BoolExpr, ErasedScalarExpr, ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, IntrinsicId, StableFunctionId};
 use crate::initialization::{InitializationContract, LoopInitialization, VisitSeparation};
 use crate::intrinsics::{PrimitiveFailure, PrimitiveId};
 use crate::reference_math::ReferenceScalar;
 use crate::registry::BackendName;
 use crate::span::Span;
-use crate::types::{Elem, ValueType};
+use crate::types::{DType, Elem, ValueType};
 use serde::{Deserialize, Serialize};
 
 /// A local of one checked body. Parameters occupy the first locals in
@@ -103,12 +102,15 @@ pub(crate) enum Predicate {
     Zero(IntExpr),
     /// `expr != 0`
     NonZero(IntExpr),
+    /// A boolean relationship (including a disjunction) retained as a whole.
+    Boolean(BoolExpr),
 }
 
 impl Predicate {
     pub(crate) fn expression(self) -> IntExpr {
         match self {
             Self::NonNegative(e) | Self::Zero(e) | Self::NonZero(e) => e,
+            Self::Boolean(_) => panic!("boolean predicate requires boolean transfer"),
         }
     }
 }
@@ -182,9 +184,6 @@ pub(crate) struct Family {
     pub bodies: Vec<FunctionId>,
     /// Backend `lower` bodies.
     pub lowerings: Vec<FunctionId>,
-    /// How every family dimension is obtained from observed input axes,
-    /// over the contract's arena.
-    pub dimension_plan: DimensionPlan,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,7 +199,7 @@ pub(crate) struct Local {
     pub span: Span,
     /// The symbol standing for this local's runtime integer value (index
     /// parameters, loop binders, word and quantity locals), when it has one.
-    pub symbol: Option<SymbolId>,
+    pub value: SourceValue,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -222,13 +221,15 @@ pub(crate) enum Stmt {
     Let {
         pattern: Pattern,
         value: Expr,
+        /// Value identities minted by this declaration, before later versions.
+        value_bindings: Vec<(LocalId, SourceValue)>,
     },
     /// `place = value`; compound assignment is desugared by the checker.
     Assign {
         place: Place,
         value: Expr,
         /// Fresh exact-value symbols for the installed local SSA versions.
-        value_symbols: Vec<(LocalId, SymbolId)>,
+        value_bindings: Vec<(LocalId, SourceValue)>,
         /// Checker-minted proof for each parallel-captured storage root.
         authorities: Vec<ExclusiveWriteCapability>,
     },
@@ -239,7 +240,7 @@ pub(crate) enum Stmt {
         end: Expr,
         body: Block,
         /// Captured quantity/word locals: body parameter and exit result.
-        value_symbols: Vec<(LocalId, SymbolId, SymbolId)>,
+        value_versions: Vec<(LocalId, SourceValue, SourceValue)>,
         initialization: LoopInitialization,
         /// L25 (I1)-(I3), recorded by the initialization pass.
         separation: VisitSeparation,
@@ -249,9 +250,9 @@ pub(crate) enum Stmt {
         then_body: Block,
         else_body: Block,
         /// Active source value version mapped to each branch parameter.
-        capture_symbols: Vec<(LocalId, SymbolId)>,
+        capture_bindings: Vec<(LocalId, SourceValue)>,
         /// Fresh source value version mapped to each changed join result.
-        join_symbols: Vec<(LocalId, SymbolId)>,
+        join_bindings: Vec<(LocalId, SourceValue)>,
     },
     Evaluate(Expr),
 }
@@ -403,25 +404,80 @@ pub(crate) enum Index {
     Full,
 }
 
+/// Exact meaning and its dominating source publication are distinct owners.
+/// Mathematical/header quantities need no executable publication; words and
+/// floating/Boolean source values always name their actual occurrence.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum SourceScalar {
+    Quantity { meaning: IntExpr, binding: Option<SymbolId> },
+    Word { dtype: DType, meaning: IntExpr, binding: SymbolId },
+    Scalar { value: ErasedScalarExpr, binding: SymbolId },
+}
+impl SourceScalar {
+    pub(crate) fn integer(self) -> Option<IntExpr> {
+        match self {
+            Self::Quantity { meaning, .. } | Self::Word { meaning, .. } => Some(meaning),
+            Self::Scalar { .. } => None,
+        }
+    }
+    pub(crate) fn binding(self) -> Option<SymbolId> {
+        match self {
+            Self::Quantity { binding, .. } => binding,
+            Self::Word { binding, .. } | Self::Scalar { binding, .. } => Some(binding),
+        }
+    }
+    pub(crate) fn scalar(self) -> Option<ErasedScalarExpr> {
+        match self { Self::Scalar { value, .. } => Some(value), _ => None }
+    }
+}
+/// Source publication structure; no additional executable product IR.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum SourceValue {
+    Untracked,
+    Scalar(SourceScalar),
+    Tuple(Vec<SourceValue>),
+    Range { start: SourceScalar, end: SourceScalar },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SourceProjection { Tuple(usize), RangeStart, RangeEnd }
+impl SourceValue {
+    pub(crate) fn scalar_value(&self) -> Option<SourceScalar> {
+        match self { Self::Scalar(value) => Some(*value), _ => None }
+    }
+    pub(crate) fn integer(&self) -> Option<IntExpr> { self.scalar_value().and_then(SourceScalar::integer) }
+    pub(crate) fn binding(&self) -> Option<SymbolId> { self.scalar_value().and_then(SourceScalar::binding) }
+    pub(crate) fn scalar(&self) -> Option<ErasedScalarExpr> { self.scalar_value().and_then(SourceScalar::scalar) }
+    pub(crate) fn leaf_bindings(&self) -> Vec<(Vec<SourceProjection>, SymbolId)> {
+        fn visit(value: &SourceValue, path: &mut Vec<SourceProjection>, out: &mut Vec<(Vec<SourceProjection>, SymbolId)>) {
+            match value {
+                SourceValue::Untracked => {},
+                SourceValue::Scalar(value) => if let Some(binding) = value.binding() { out.push((path.clone(), binding)); },
+                SourceValue::Tuple(parts) => for (index, value) in parts.iter().enumerate() {
+                    path.push(SourceProjection::Tuple(index)); visit(value, path, out); path.pop();
+                },
+                SourceValue::Range { start, end } => for (step, value) in [(SourceProjection::RangeStart, start), (SourceProjection::RangeEnd, end)] {
+                    if let Some(binding) = value.binding() { path.push(step); out.push((path.clone(), binding)); path.pop(); }
+                },
+            }
+        }
+        let mut out = Vec::new(); visit(self, &mut Vec::new(), &mut out); out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Expr {
     pub kind: ExprKind,
     pub ty: ValueType,
-    /// Symbolic value of integer expressions over dimensions and bounded
-    /// integer locals, when it equals the value exactly.
-    pub sym: Option<IntExpr>,
+    pub value: SourceValue,
     pub span: Span,
 }
-
 impl Expr {
-    pub(crate) fn new(kind: ExprKind, ty: ValueType, sym: Option<IntExpr>, span: Span) -> Expr {
-        Expr {
-            kind,
-            ty,
-            sym,
-            span,
-        }
+    pub(crate) fn new(kind: ExprKind, ty: ValueType, meaning: Option<IntExpr>, span: Span) -> Expr {
+        Expr { kind, ty, value: meaning.map_or(SourceValue::Untracked, |meaning| SourceValue::Scalar(SourceScalar::Quantity { meaning, binding: None })), span }
     }
+    pub(crate) fn integer(&self) -> Option<IntExpr> { self.value.integer() }
+    pub(crate) fn binding(&self) -> Option<SymbolId> { self.value.binding() }
+    pub(crate) fn scalar(&self) -> Option<ErasedScalarExpr> { self.value.scalar() }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

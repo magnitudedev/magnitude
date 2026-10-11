@@ -20,6 +20,22 @@
 #include "../core/arrive.h"
 #include "../core/gumbel.h"
 
+#define PROGRESSIVE_LOW_PLANES uint(SEISMIC_DIM_P)
+#define PROGRESSIVE_HALF_BITS (PROGRESSIVE_LOW_PLANES + 1u)
+#define PROGRESSIVE_OFFSET (1u << (2u * PROGRESSIVE_HALF_BITS - 1u))
+#define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
+#define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
+
+inline uint4 progressive_high(device const uint *row, uint group) {
+    if constexpr (PROGRESSIVE_LOW_PLANES == 3u)
+        return *reinterpret_cast<device const uint4 *>(row + 4u * group);
+    const uint2 words = *reinterpret_cast<device const uint2 *>(row + 2u * group);
+    uint4 high = uint4(0u);
+    for (uint k = 0; k < 32u; ++k)
+        high[k / 8u] |= ((words[k / 16u] >> (2u * (k % 16u))) & 3u) << (4u * (k % 8u));
+    return high;
+}
+
 #define PROGRESSIVE_ROWS 8u
 #define PROGRESSIVE_MARGIN 0x1p-18f
 // The largest Gumbel noise the sampler draws: -log(-log u) at the largest
@@ -71,22 +87,22 @@ struct ProgressiveExact {
     // Step q's code bytes u: codes 8q, 8q + 2, ... in `even`, the others in
     // `odd`.
     static void bytes(thread const packet &k, uint step, thread uint &even, thread uint &odd) {
-        const uint low = (((k.low.x >> step) & 0x11111111u) << 3) | (((k.low.y >> step) & 0x11111111u) << 2)
+        const uint low = (((k.low.x >> step) & 0x11111111u) << PROGRESSIVE_LOW_PLANES) | (((k.low.y >> step) & 0x11111111u) << (PROGRESSIVE_LOW_PLANES - 1u))
             | (((k.low.z >> step) & 0x11111111u) << 1) | ((k.low.w >> step) & 0x11111111u);
         const uint high = k.high[step];
-        even = ((high & 0x0f0f0f0fu) << 4) | (low & 0x0f0f0f0fu);
-        odd = (high & 0xf0f0f0f0u) | ((low >> 4) & 0x0f0f0f0fu);
+        even = ((high & 0x0f0f0f0fu) << PROGRESSIVE_HALF_BITS) | (low & 0x0f0f0f0fu);
+        odd = ((high & 0xf0f0f0f0u) >> (4u - PROGRESSIVE_HALF_BITS)) | ((low >> 4) & 0x0f0f0f0fu);
     }
     static void codes(thread const packet &k, uint step, thread float4 &even, thread float4 &odd) {
         uint e, o;
         bytes(k, step, e, o);
-        even = byte_floats(e, 1152.0h);
-        odd = byte_floats(o, 1152.0h);
+        even = byte_floats(e, half(1024u + PROGRESSIVE_OFFSET));
+        odd = byte_floats(o, half(1024u + PROGRESSIVE_OFFSET));
     }
     static float2 pair(thread const packet &k, uint step, uint j) {
         uint e, o;
         bytes(k, step, e, o);
-        return code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), 1152.0h);
+        return code_pair(((e >> (8u * j)) & 0xffu) | (((o >> (8u * j)) & 0xffu) << 16), half(1024u + PROGRESSIVE_OFFSET));
     }
     static float scale(thread const packet &k, uint) { return k.scale; }
     static float bias(thread const packet &, uint) { return 0.0f; }
@@ -106,8 +122,8 @@ struct Weights<packets::ProgressiveTop> {
     ulong scale_stride;
     packets::ProgressiveTop::packet packet(uint n, uint p) const {
         const float s = float(scales[ulong(n) * scale_stride + p]);
-        return {*reinterpret_cast<device const uint4 *>(top + ulong(n) * top_stride + 4u * p), 16.0f * s,
-            -120.5f * s};
+        return {progressive_high(top + ulong(n) * top_stride, p), float(PROGRESSIVE_COARSE_SCALE) * s,
+            PROGRESSIVE_COARSE_BIAS * s};
     }
     // The planes keep no coefficient run (every packet has its own scale)
     // and no row tiles.
@@ -137,8 +153,8 @@ struct Weights<packets::ProgressiveExact> {
     ulong scale_stride;
     packets::ProgressiveExact::packet packet(uint n, uint p) const {
         device const uint *low = rest + ulong(n) * rest_row + ulong(p) * rest_group;
-        return {*reinterpret_cast<device const uint4 *>(top + ulong(n) * top_stride + 4u * p),
-            uint4(bit3[ulong(n) * bit3_stride + p], low[0], low[rest_plane], low[2u * rest_plane]),
+        return {progressive_high(top + ulong(n) * top_stride, p),
+            uint4(bit3[ulong(n) * bit3_stride + p], low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u, PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u),
             float(scales[ulong(n) * scale_stride + p])};
     }
     // The planes keep no coefficient run: every packet has its own scale.
@@ -200,11 +216,11 @@ struct Codes {
 inline Codes exact_codes(thread const Group &group) {
     Codes codes;
     for (uint q = 0; q < 4u; ++q) {
-        const uint low = (quarter(group.bit3, q) << 3) | (quarter(group.rest0, q) << 2)
+        const uint low = (quarter(group.bit3, q) << PROGRESSIVE_LOW_PLANES) | (quarter(group.rest0, q) << (PROGRESSIVE_LOW_PLANES - 1u))
             | (quarter(group.rest1, q) << 1) | quarter(group.rest2, q);
         const uint high = group.high[q];
-        codes.even[q] = float4(as_type<char4>((((high & 0x0f0f0f0fu) << 4) | (low & 0x0f0f0f0fu)) ^ 0x80808080u));
-        codes.odd[q] = float4(as_type<char4>(((high & 0xf0f0f0f0u) | ((low >> 4) & 0x0f0f0f0fu)) ^ 0x80808080u));
+        codes.even[q] = float4(as_type<uchar4>(((high & 0x0f0f0f0fu) << PROGRESSIVE_HALF_BITS) | (low & 0x0f0f0f0fu))) - float(PROGRESSIVE_OFFSET);
+        codes.odd[q] = float4(as_type<uchar4>(((high & 0xf0f0f0f0u) >> (4u - PROGRESSIVE_HALF_BITS)) | ((low >> 4) & 0x0f0f0f0fu))) - float(PROGRESSIVE_OFFSET);
     }
     return codes;
 }
@@ -235,6 +251,11 @@ struct Selection {
     ulong mask_row, mask_word;
     device const int *constrained;
     ulong constrained_stride;
+    float softcap;
+
+    float transform(float logit) const {
+        return softcap > 0.0f ? functions::softcap(softcap, logit) : logit;
+    }
 
     bool competes(uint m, uint v) const {
         return constrained[m * constrained_stride] == 0
@@ -244,7 +265,7 @@ struct Selection {
         return temperature[ulong(m) * temperature_stride];
     }
     float score(uint m, uint v, float logit) const {
-        return logit / divisor(m) + gumbel::noise(v, draws + ulong(m) * draw_row, draw_word);
+        return transform(logit) / divisor(m) + gumbel::noise(v, draws + ulong(m) * draw_row, draw_word);
     }
     // Whether a competing row whose view logit is within `reach` of its
     // exact logit can reach `threshold`.
@@ -295,7 +316,7 @@ struct Planes {
     ulong scale_stride;
 
     uint4 high(uint v, uint g) const {
-        return *reinterpret_cast<device const uint4 *>(top + ulong(v) * top_stride + 4u * g);
+        return progressive_high(top + ulong(v) * top_stride, g);
     }
     float scale(uint v, uint g) const {
         return float(scales[ulong(v) * scale_stride + g]);
@@ -305,7 +326,7 @@ struct Planes {
     }
     Group group(uint v, uint g) const {
         device const uint *low = rest + ulong(v) * rest_row + ulong(g) * rest_group;
-        return Group{high(v, g), third(v, g), low[0], low[rest_plane], low[2u * rest_plane], scale(v, g)};
+        return Group{high(v, g), third(v, g), low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u, PROGRESSIVE_LOW_PLANES == 3u ? low[2u * rest_plane] : 0u, scale(v, g)};
     }
 };
 
@@ -376,7 +397,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
                         dot += metal::dot(be, xe[q]) + metal::dot(bo, xo[q]);
                         sum += (xe[q].x + xe[q].y + xe[q].z + xe[q].w) + (xo[q].x + xo[q].y + xo[q].z + xo[q].w);
                     }
-                    acc = metal::fma(planes.scale(v, g), metal::fma(8.0f, dot, -4.0f * sum), acc);
+                    acc = metal::fma(planes.scale(v, g), metal::fma(float(1u << PROGRESSIVE_LOW_PLANES), dot, -float(1u << (PROGRESSIVE_LOW_PLANES - 1u)) * sum), acc);
                 } else {
                     acc += exact(planes.scale(v, g), exact_codes(planes.group(v, g)), xe, xo);
                 }
@@ -385,7 +406,7 @@ inline void gather(device const uchar *features, ulong feature_stride, thread co
             if (lane != 0u)
                 continue;
             const float logit = REFINE ? coarse[m * coarse_row + ulong(v) * coarse_col] + acc : acc;
-            out[m * out_row + ulong(v) * out_col] = logit;
+            out[m * out_row + ulong(v) * out_col] = REFINE ? logit : selection.transform(logit);
             if (REFINE && selection.competes(m, v))
                 atomic_fetch_max_explicit(&lowest[m],
                     key(selection.score(m, v, logit - radius_next[v * radius_stride] * lengths[m * length_stride])),

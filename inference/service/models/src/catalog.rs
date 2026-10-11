@@ -7,7 +7,7 @@ use std::sync::Arc;
 use futures_util::future::BoxFuture;
 use futures_util::{StreamExt, stream};
 use magnitude_service_contracts::models::{
-    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure, ModelFileRole, ModelPackage, ModelPackageSource,
+    CatalogBaseId, CatalogDiagnostic, CatalogSupport, CatalogVariantId, ModelFailure, ModelFileRole, ModelId, ModelPackage, ModelPackageSource,
     ModelParameterization, ModelReleaseDate, ModelServingConfiguration, PackageValidation,
     ParsedModelId,
     RecommendableModel, RecommendableModelCatalog, RecommendableModelCatalogProvider,
@@ -15,7 +15,7 @@ use magnitude_service_contracts::models::{
     SpeculativeMethod,
 };
 use magnitude_service_contracts::{
-    ContentId, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
+    ContentId, HuggingFaceRepositoryFile, HuggingFaceRepositoryRequest, HuggingFaceRepositorySnapshot, Integrity,
     InventoryEntryId, InventoryError, InventoryModel, InventoryProperties, ModelAvailability,
     ModelComponent, ModelLocation, ModelPreviewComponentRole, ModelPreviewComponentSource,
     ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
@@ -497,14 +497,20 @@ fn resolve_projector_path(
             }
         }
     };
+    // An embedded MTP head embeds every prompt token, so it cannot enter the
+    // projector's media rows. A separately packaged assistant reads the
+    // target's history, media rows included, and keeps none of its own.
     if projector.is_some()
         && declaration
             .speculative_decoding
             .as_ref()
-            .is_some_and(|speculative| speculative.method == CatalogSpeculativeMethod::Mtp)
+            .is_some_and(|speculative| {
+                speculative.method == CatalogSpeculativeMethod::Mtp
+                    && matches!(speculative.draft, CatalogSpeculativeDraftSource::Embedded)
+            })
     {
         return Err(InventoryError::Integrity(format!(
-            "{} combines a projector with MTP, which cannot process projector embedding batches",
+            "{} combines a projector with embedded MTP, which cannot enter projector media rows",
             declaration.id
         )));
     }
@@ -811,11 +817,18 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
         || model_ids.len() != catalog.models.len()
         || target_package_ids.len() != catalog.models.len()
         || catalog.models.iter().any(|model| {
-            let (target, method) = match &model.configuration.bundle {
-                ServableModelBundle::Standalone { package } => (package, None),
-                ServableModelBundle::SpeculativeDecoding { target, method, .. } => {
-                    (target, Some(method))
-                }
+            // An embedded MTP head cannot enter the projector's media rows.
+            let (target, embedded_mtp) = match &model.configuration.bundle {
+                ServableModelBundle::Standalone { package } => (package, false),
+                ServableModelBundle::SpeculativeDecoding {
+                    target,
+                    method,
+                    draft_source,
+                } => (
+                    target,
+                    *method == SpeculativeMethod::Mtp
+                        && matches!(draft_source, SpeculativeDraftSource::Embedded),
+                ),
             };
             let projector_count = target
                 .files
@@ -826,7 +839,7 @@ fn validate_runtime_catalog(catalog: &RecommendableModelCatalog) -> Result<(), I
                 || target.properties.maximum_context_length
                     != Some(model.configuration.profile.context_length)
                 || projector_count > 1
-                || (projector_count == 1 && method == Some(&SpeculativeMethod::Mtp))
+                || (projector_count == 1 && embedded_mtp)
                 || servable_bundle_packages(&model.configuration.bundle).any(|package| {
                     !matches!(
                         &package.source,
@@ -1470,28 +1483,7 @@ impl ResolvingRecommendableCatalog {
                 declaration.repository
             ))
         })?;
-        let selector = variant.format.to_ascii_lowercase();
-        let mut matches = snapshot
-            .gguf_files
-            .iter()
-            .filter(|file| {
-                let path = file.path.to_string_lossy().to_ascii_lowercase();
-                let basename = path.rsplit('/').next().unwrap_or(path.as_str());
-                path.contains(&selector)
-                    && !is_projector_path(&file.path)
-                    && !basename.contains("imatrix")
-                    && (!is_later_shard(basename) || is_first_shard(basename))
-            })
-            .collect::<Vec<_>>();
-        if matches.len() != 1 {
-            return Err(InventoryError::Integrity(format!(
-                "{} format {} resolved to {} primary files",
-                declaration.repository,
-                variant.format,
-                matches.len()
-            )));
-        }
-        let primary = matches.remove(0);
+        let primary = select_primary_gguf(snapshot, &variant.format)?;
         let projector = resolve_projector_path(declaration, snapshot)?;
         let additional_components = projector
             .map(|path| ModelPreviewComponentSource {
@@ -1644,6 +1636,36 @@ impl ResolvingRecommendableCatalog {
     }
 }
 
+/// The variant's primary GGUF: the one non-projector, non-imatrix file (or first shard) whose
+/// repository path contains the variant's upstream format selector.
+fn select_primary_gguf<'a>(
+    snapshot: &'a HuggingFaceRepositorySnapshot,
+    format: &str,
+) -> Result<&'a HuggingFaceRepositoryFile, InventoryError> {
+    let selector = format.to_ascii_lowercase();
+    let matches = snapshot
+        .gguf_files
+        .iter()
+        .filter(|file| {
+            let path = file.path.to_string_lossy().to_ascii_lowercase();
+            let basename = path.rsplit('/').next().unwrap_or(path.as_str());
+            path.contains(&selector)
+                && !is_projector_path(&file.path)
+                && !basename.contains("imatrix")
+                && (!is_later_shard(basename) || is_first_shard(basename))
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [primary] => Ok(primary),
+        _ => Err(InventoryError::Integrity(format!(
+            "{} format {} resolved to {} primary files",
+            snapshot.repository,
+            format,
+            matches.len()
+        ))),
+    }
+}
+
 fn merge_content_map(
     target: &mut BTreeMap<String, Vec<u8>>,
     source: BTreeMap<String, Vec<u8>>,
@@ -1695,7 +1717,118 @@ fn insert_locked_repository(
     Ok(())
 }
 
+/// Insert the locked revisions of a declaration's target repository and, when its speculative
+/// draft is a separate file, its draft repository.
+fn insert_declaration_repositories(
+    repositories: &mut BTreeMap<String, String>,
+    declaration: &CatalogModel,
+    lock: &ModelCatalogLock,
+) -> Result<(), InventoryError> {
+    let entry = lock.get(&declaration.id).ok_or_else(|| {
+        InventoryError::Integrity(format!(
+            "model catalog lock is missing {}",
+            declaration.id
+        ))
+    })?;
+    insert_locked_repository(repositories, &declaration.repository, &entry.target)?;
+    if let Some(speculative) = &declaration.speculative_decoding {
+        if let Some((repository, _)) = speculative.draft.file(&declaration.repository) {
+            insert_locked_repository(
+                repositories,
+                repository,
+                entry.speculative_draft.as_deref().ok_or_else(|| {
+                    InventoryError::Integrity(format!(
+                        "model catalog lock is missing {} speculative draft",
+                        declaration.id
+                    ))
+                })?,
+            )?;
+        } else if entry.speculative_draft.is_some() {
+            return Err(InventoryError::Integrity(format!(
+                "model catalog lock unexpectedly includes {} embedded speculative draft",
+                declaration.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// One catalog variant addressed by its catalog `ModelId`, with the locked repository revisions
+/// its target and separately packaged draft resolve from.
+struct LockedCatalogVariant {
+    declaration: CatalogModel,
+    variant: CatalogVariant,
+    repositories: BTreeMap<String, String>,
+}
+
+fn locked_catalog_variant(
+    source: &CatalogSource,
+    lock: &ModelCatalogLock,
+    id: &ModelId,
+) -> Result<LockedCatalogVariant, InventoryError> {
+    let ParsedModelId::Catalog {
+        base_id,
+        variant_id,
+    } = id.parsed()
+    else {
+        return Err(InventoryError::InvalidRequest(format!(
+            "{id} is not a catalog model ID"
+        )));
+    };
+    let declaration = source
+        .models
+        .iter()
+        .find(|model| model.id == base_id.as_str())
+        .ok_or_else(|| InventoryError::NotFound(format!("catalog model {base_id}")))?;
+    let variant = declaration
+        .variants
+        .iter()
+        .find(|variant| variant.variant_id == variant_id.as_str())
+        .ok_or_else(|| {
+            InventoryError::NotFound(format!("catalog model {base_id} variant {variant_id}"))
+        })?;
+    let mut repositories = BTreeMap::new();
+    insert_declaration_repositories(&mut repositories, declaration, lock)?;
+    Ok(LockedCatalogVariant {
+        declaration: declaration.clone(),
+        variant: variant.clone(),
+        repositories,
+    })
+}
+
 impl ResolvingRecommendableCatalog {
+    /// Resolve one catalog variant at its locked revisions into its exact servable bundle:
+    /// the target package (with its projector), and the separately packaged draft if declared.
+    pub async fn resolve_catalog_model(
+        &self,
+        id: &ModelId,
+    ) -> Result<RecommendableModel, InventoryError> {
+        let source = catalog_source()?;
+        let lock = model_catalog_lock()?;
+        let selected = locked_catalog_variant(&source, &lock, id)?;
+        let mut snapshots = BTreeMap::new();
+        for (repository, revision) in selected.repositories {
+            let snapshot = refresh_hugging_face_repository(
+                &self.models,
+                HuggingFaceRepositoryRequest {
+                    repository: repository.clone(),
+                    revision,
+                },
+            )
+            .await?;
+            snapshots.insert(repository, snapshot);
+        }
+        let (model, _, _) = self
+            .resolve_model(
+                &selected.declaration,
+                &source.artificial_analysis_frontier,
+                &selected.variant,
+                &snapshots,
+            )
+            .await?;
+        Ok(model)
+    }
+
     pub fn resolve_release_catalog<F>(
         &self,
         progress: F,
@@ -1738,32 +1871,7 @@ impl ResolvingRecommendableCatalog {
     {
         let mut repositories = BTreeMap::new();
         for declaration in &source.models {
-            let entry = lock.get(&declaration.id).ok_or_else(|| {
-                InventoryError::Integrity(format!(
-                    "model catalog lock is missing {}",
-                    declaration.id
-                ))
-            })?;
-            insert_locked_repository(&mut repositories, &declaration.repository, &entry.target)?;
-            if let Some(speculative) = &declaration.speculative_decoding {
-                if let Some((repository, _)) = speculative.draft.file(&declaration.repository) {
-                    insert_locked_repository(
-                        &mut repositories,
-                        repository,
-                        entry.speculative_draft.as_deref().ok_or_else(|| {
-                            InventoryError::Integrity(format!(
-                                "model catalog lock is missing {} speculative draft",
-                                declaration.id
-                            ))
-                        })?,
-                    )?;
-                } else if entry.speculative_draft.is_some() {
-                    return Err(InventoryError::Integrity(format!(
-                        "model catalog lock unexpectedly includes {} embedded speculative draft",
-                        declaration.id
-                    )));
-                }
-            }
+            insert_declaration_repositories(&mut repositories, declaration, &lock)?;
         }
         let repositories = repositories.into_iter().collect::<Vec<_>>();
         let repository_total = repositories.len();
@@ -1988,7 +2096,7 @@ mod tests {
     }
 
     #[test]
-    fn projector_resolution_rejects_invalid_paths_and_mtp() {
+    fn projector_resolution_rejects_invalid_paths_and_embedded_mtp() {
         let source = catalog_source().expect("catalog source should be valid");
         let mut declaration = source.models[0].clone();
         let snapshot = repository_snapshot(&["model.gguf", "mmproj-BF16.gguf"]);
@@ -2010,7 +2118,24 @@ mod tests {
             draft: CatalogSpeculativeDraftSource::Embedded,
         });
         let error = resolve_projector_path(&declaration, &snapshot).unwrap_err();
-        assert!(error.to_string().contains("combines a projector with MTP"));
+        assert!(
+            error
+                .to_string()
+                .contains("combines a projector with embedded MTP")
+        );
+
+        // A separately packaged assistant reads the target's history.
+        declaration.speculative_decoding = Some(CatalogSpeculativeDecoding {
+            method: CatalogSpeculativeMethod::Mtp,
+            draft: CatalogSpeculativeDraftSource::File {
+                repository: None,
+                path: PathBuf::from("mtp-gemma-4-12B-it.gguf"),
+            },
+        });
+        assert_eq!(
+            resolve_projector_path(&declaration, &snapshot).unwrap(),
+            Some(PathBuf::from("mmproj-BF16.gguf"))
+        );
     }
 
     #[test]
@@ -2191,5 +2316,101 @@ mod tests {
             repository,
             commit,
         ));
+    }
+
+    fn select(id: &str) -> Result<LockedCatalogVariant, InventoryError> {
+        let source = catalog_source().expect("catalog source should be valid");
+        let lock = model_catalog_lock().expect("catalog lock should be valid");
+        locked_catalog_variant(&source, &lock, &id.parse().expect("valid model ID"))
+    }
+
+    #[test]
+    fn catalog_variant_selection_locks_target_and_separate_draft_repositories() {
+        let selected = select("qwen3.5-4b:gguf:q4").unwrap();
+        let lock = model_catalog_lock().unwrap();
+        let entry = &lock["qwen3.5-4b"];
+        assert_eq!(selected.declaration.id, "qwen3.5-4b");
+        assert_eq!(selected.variant.variant_id, "gguf:q4");
+        assert_eq!(selected.variant.format, "UD-Q4_K_XL");
+        let (draft_repository, draft_path) = selected
+            .declaration
+            .speculative_decoding
+            .as_ref()
+            .and_then(|speculative| speculative.draft.file(&selected.declaration.repository))
+            .expect("qwen3.5-4b declares a separate drafter");
+        assert_eq!(draft_path, Path::new("Qwen3.5-4B-DFlash-Q8_0.gguf"));
+        assert_eq!(
+            selected.repositories,
+            BTreeMap::from([
+                (selected.declaration.repository.clone(), entry.target.clone()),
+                (
+                    draft_repository.to_owned(),
+                    entry.speculative_draft.clone().unwrap()
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn catalog_variant_selection_needs_no_draft_repository_for_embedded_or_absent_drafts() {
+        let source = catalog_source().unwrap();
+        let lock = model_catalog_lock().unwrap();
+        for declaration in source.models.iter().filter(|declaration| {
+            declaration
+                .speculative_decoding
+                .as_ref()
+                .is_none_or(|speculative| {
+                    matches!(speculative.draft, CatalogSpeculativeDraftSource::Embedded)
+                })
+        }) {
+            let id = format!("{}:{}", declaration.id, declaration.variants[0].variant_id);
+            let selected = select(&id).unwrap();
+            assert_eq!(
+                selected.repositories,
+                BTreeMap::from([(
+                    declaration.repository.clone(),
+                    lock[&declaration.id].target.clone()
+                )]),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_variant_selection_rejects_unknown_and_non_catalog_ids() {
+        assert!(matches!(
+            select("no-such-model:gguf:q4"),
+            Err(InventoryError::NotFound(_))
+        ));
+        assert!(matches!(
+            select("qwen3.5-4b:gguf:q3"),
+            Err(InventoryError::NotFound(_))
+        ));
+        assert!(matches!(
+            select("hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"),
+            Err(InventoryError::InvalidRequest(_))
+        ));
+    }
+
+    #[test]
+    fn primary_gguf_is_the_single_format_match_excluding_projectors_imatrix_and_later_shards() {
+        let snapshot = repository_snapshot(&[
+            "Model-UD-Q4_K_XL.gguf",
+            "Model-UD-Q5_K_XL.gguf",
+            "mmproj-UD-Q4_K_XL.gguf",
+            "imatrix-UD-Q4_K_XL.gguf",
+            "Q8/Model-UD-Q8_K_XL-00001-of-00002.gguf",
+            "Q8/Model-UD-Q8_K_XL-00002-of-00002.gguf",
+        ]);
+        assert_eq!(
+            select_primary_gguf(&snapshot, "UD-Q4_K_XL").unwrap().path,
+            Path::new("Model-UD-Q4_K_XL.gguf")
+        );
+        assert_eq!(
+            select_primary_gguf(&snapshot, "ud-q8_k_xl").unwrap().path,
+            Path::new("Q8/Model-UD-Q8_K_XL-00001-of-00002.gguf")
+        );
+        assert!(select_primary_gguf(&snapshot, "Q6_K").is_err());
+        assert!(select_primary_gguf(&snapshot, "UD-Q").is_err());
     }
 }

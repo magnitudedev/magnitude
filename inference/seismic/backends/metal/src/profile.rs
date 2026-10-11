@@ -65,7 +65,7 @@ pub fn open_analytical(
     device: &MetalDevice,
     description: std::sync::Arc<DeviceDescription<Metal>>,
 ) -> Result<seismic_compiler::evaluation::AnalyticalEvaluationContext<Metal>, TargetError> {
-    let execution_parts = acquire_execution_parts(device, description)?;
+    let execution_parts = crate::pooled(|| acquire_execution_parts(device, description))?;
     seismic_compiler::evaluation::AnalyticalEvaluationContext::assemble(
         execution_parts,
         crate::model::MetalAnalyticalModel,
@@ -75,7 +75,7 @@ pub fn open_analytical(
 pub fn open_device(
     device: &MetalDevice,
 ) -> Result<std::sync::Arc<DeviceDescription<Metal>>, TargetError> {
-    discover_device(device).map(std::sync::Arc::new)
+    crate::pooled(|| discover_device(device)).map(std::sync::Arc::new)
 }
 
 /// Gathers every Metal target fact of one device.
@@ -518,9 +518,11 @@ pub fn probe_language_version(device: &crate::DeviceHandle) -> Option<LanguageVe
     ]
     .into_iter()
     .find(|version| {
-        device
-            .newLibraryWithSource_options_error(&source, Some(&compile_options(*version)))
-            .is_ok()
+        crate::pooled(|| {
+            device
+                .newLibraryWithSource_options_error(&source, Some(&compile_options(*version)))
+                .is_ok()
+        })
     })
 }
 
@@ -531,14 +533,16 @@ fn probe_pipeline(
     function: &str,
     body: &str,
 ) -> Option<objc2::rc::Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
-    let source = NSString::from_str(&format!("{PROBE_PRELUDE}{body}"));
-    let library = device
-        .newLibraryWithSource_options_error(&source, Some(&compile_options(language)))
-        .ok()?;
-    let function = library.newFunctionWithName(&NSString::from_str(function))?;
-    device
-        .newComputePipelineStateWithFunction_error(&function)
-        .ok()
+    crate::pooled(|| {
+        let source = NSString::from_str(&format!("{PROBE_PRELUDE}{body}"));
+        let library = device
+            .newLibraryWithSource_options_error(&source, Some(&compile_options(language)))
+            .ok()?;
+        let function = library.newFunctionWithName(&NSString::from_str(function))?;
+        device
+            .newComputePipelineStateWithFunction_error(&function)
+            .ok()
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -654,7 +658,8 @@ fn probe_matrix_combinations(
 /// Apple GPU family 10 or later, and the tensor probe forms a pipeline at
 /// `language`.
 fn tensor_operations_at(device: &ProtocolObject<dyn MTLDevice>, language: LanguageVersion) -> bool {
-    device.supportsFamily(MTLGPUFamily::Apple10) && probe_tensor_ops(device, language)
+    crate::pooled(|| device.supportsFamily(MTLGPUFamily::Apple10))
+        && probe_tensor_ops(device, language)
 }
 
 /// Whether an unopened device forms tensor operations: the fact its opened

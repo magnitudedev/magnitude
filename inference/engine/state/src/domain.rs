@@ -4,7 +4,7 @@
 //! with its own components, placement geometry (pages, slabs and span limit),
 //! free space and per-row references.
 
-use crate::{history_geometry, ComponentDescriptor, Error, HistoryGeometry, LayerRef, LayoutError};
+use crate::{ComponentDescriptor, Error, HistoryGeometry, LayerRef, LayoutError, history_geometry};
 use std::collections::BTreeSet;
 
 /// A stored history domain of one store: its index among the store's stored
@@ -141,16 +141,16 @@ impl HistoryDomainLayout {
         history_geometry(
             self.row_bytes()?,
             self.kind().row_limit(context, max_advance)?,
-            shared_appended_rows(self.components(), domains, max_advance),
+            prepared_appended_rows(self.components(), domains, max_advance),
         )
         .map_err(Error::Request)
     }
 }
 
-/// The appended rows Shared readers of a stored domain with `components`
-/// see within one advance: `max_advance` when any Shared layout of `domains`
-/// reads one of its layers, else none.
-fn shared_appended_rows(
+/// Rows within an advance read through stored history by Shared layers or
+/// compressed causal target attention. Both require room for their prepared
+/// destination spans beside the already accepted spans.
+fn prepared_appended_rows(
     components: &[ComponentDescriptor],
     domains: &[HistoryDomainLayout],
     max_advance: usize,
@@ -161,7 +161,11 @@ fn shared_appended_rows(
             .any(|component| component.layer == *source),
         _ => false,
     });
-    if read {
+    if read
+        || components
+            .iter()
+            .any(ComponentDescriptor::causal_rows_use_cache)
+    {
         max_advance
     } else {
         0
@@ -259,7 +263,7 @@ pub(crate) fn validate_domains(
                 let geometry = history_geometry(
                     row_bytes,
                     row_limit,
-                    shared_appended_rows(&components, &layouts, max_advance),
+                    prepared_appended_rows(&components, &layouts, max_advance),
                 )
                 .map_err(Error::Request)?;
                 // Every plane's capacity is at most the domain's total.

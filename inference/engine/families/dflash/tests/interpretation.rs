@@ -180,7 +180,9 @@ fn qwen_dflash_taps_eight_layers_with_five_sliding_windows() {
             window.clone(),
             window.clone(),
             window,
-            HistoryDomain::Token
+            // The full layer reads back as far as the draft's declared
+            // context, here its header's 262144 tokens.
+            HistoryDomain::Window { tokens: 262144 }
         ]
     );
     // Sliding layers read their block causally, the full layer wholly.
@@ -236,7 +238,10 @@ fn nemotron_dflash_has_yarn_its_own_embedding_and_second_level_scales() {
     assert!(
         matches!(draft.embedding, DraftEmbedding::Own(ref table) if table.shape == [131072, 2688])
     );
-    assert_eq!(domains(&draft), vec![HistoryDomain::Token; 6]);
+    assert_eq!(
+        domains(&draft),
+        vec![HistoryDomain::Window { tokens: 1048576 }; 6]
+    );
     assert_eq!(draft.taps.len(), 6);
     assert_eq!(draft.taps.last(), Some(&TapPoint::Exit));
     assert_eq!(
@@ -378,7 +383,7 @@ fn a_missing_weight_is_refused() {
 fn an_unbound_or_foreign_weight_is_refused() {
     let (mut directory, model) = qwen_draft();
     directory.tensors.push(TensorDescriptor {
-        name: "output.weight".into(),
+        name: "foreign.weight".into(),
         shape: vec![248320, 2048],
         encoding: Encoding::F32,
         offset: 0,
@@ -386,7 +391,7 @@ fn an_unbound_or_foreign_weight_is_refused() {
     });
     assert_eq!(
         recognize(&directory).unwrap_err(),
-        Error::UnboundWeight("output.weight".into())
+        Error::UnboundWeight("foreign.weight".into())
     );
     // A layer beyond `block_count` is a known role no layer binds.
     let (mut directory, _) = qwen_draft();
@@ -548,6 +553,8 @@ fn qwen38_dspark_drafts_seven_from_the_anchor_with_yarn() {
 fn qwen38_dflash2_convolves_every_sublayer_and_selects_a_path() {
     let draft = qwen38(QWEN38_DFLASH2).unwrap();
     assert_eq!(draft.method.variant(), DraftVariant::DFlash2);
+    assert_eq!(draft.logit_softcap, None, "existing selector receives raw projected logits");
+    assert_eq!(draft.embedding_scale, 1.0);
     assert_eq!(draft.layout, BlockLayout::MaskSlots);
     assert_eq!((draft.block_size, draft.max_proposals()), (8, 7));
     assert_eq!(draft.mask_token, TokenId(248070));
@@ -691,8 +698,26 @@ fn scalar_causality_is_independent_of_window_pattern() {
                 6
             ]
         );
-        assert_eq!(domains(&draft)[5], HistoryDomain::Token);
+        assert_eq!(domains(&draft)[5], HistoryDomain::Window { tokens: 262144 });
     }
+}
+
+#[test]
+fn a_full_layer_reads_no_further_back_than_the_trained_context() {
+    // A draft trained on 40k-token sequences declares that context; its
+    // full layer never reads keys further back than it, while its sliding
+    // layers keep their narrower windows.
+    let (mut directory, model) = qwen_draft();
+    directory
+        .metadata
+        .iter_mut()
+        .find(|entry| entry.name == "dflash.context_length")
+        .unwrap()
+        .value = Value::Scalar(Scalar::Unsigned(40960));
+    let draft = inspect_qwen(&directory, &model).unwrap();
+    let mut expected = vec![HistoryDomain::Window { tokens: 4096 }; 5];
+    expected.push(HistoryDomain::Window { tokens: 40960 });
+    assert_eq!(domains(&draft), expected);
 }
 
 /// Release qualification uses actual binary GGUF headers, not reconstructed JSON.
@@ -755,4 +780,59 @@ fn publication_binary_headers_bind() {
                 .all(|attention| *attention == BlockAttention::Bidirectional));
         }
     }
+}
+
+#[test]
+fn draft_readout_transforms_are_explicit_and_do_not_inherit_target_softcap() {
+    let (mut directory, mut model) = qwen_draft();
+    model.decoder.exit.softcap = Some(30.0);
+    let raw = inspect_qwen(&directory, &model).unwrap();
+    assert_eq!(raw.embedding_scale, 1.0);
+    assert_eq!(raw.logit_softcap, None);
+    headers::set(&mut directory, "dflash.final_logit_softcapping", Value::Scalar(Scalar::Float(30.0)));
+    headers::set(&mut directory, "dflash.embedding_scale", Value::Scalar(Scalar::Float(2.0)));
+    let transformed = inspect_qwen(&directory, &model).unwrap();
+    assert_eq!(transformed.logit_softcap, Some(30.0));
+    assert_eq!(transformed.embedding_scale, 2.0);
+    for invalid in [-1.0, 1e-300, f64::NAN, f64::INFINITY, f64::MAX] {
+        headers::set(&mut directory, "dflash.final_logit_softcapping", Value::Scalar(Scalar::Float(invalid)));
+        assert!(inspect_qwen(&directory, &model).is_err());
+    }
+    headers::set(&mut directory, "dflash.final_logit_softcapping", Value::Scalar(Scalar::Float(0.0)));
+    assert_eq!(inspect_qwen(&directory, &model).unwrap().logit_softcap, None);
+    headers::set(&mut directory, "dflash.embedding_scale", Value::Scalar(Scalar::Float(0.0)));
+    assert!(inspect_qwen(&directory, &model).is_err());
+}
+
+#[test]
+fn owned_projection_is_optional_and_requires_full_target_geometry() {
+    let (mut directory, model) = qwen_draft();
+    assert!(inspect_qwen(&directory, &model).unwrap().output.is_none());
+    directory.tensors.push(TensorDescriptor {
+        name: "output.weight".into(),
+        shape: vec![model.decoder.vocabulary, model.decoder.hidden],
+        encoding: Encoding::BF16,
+        offset: 0,
+        nbytes: 0,
+    });
+    let draft = inspect_qwen(&directory, &model).unwrap();
+    assert!(draft.output.is_some());
+    directory.tensors.last_mut().unwrap().shape[0] -= 1;
+    assert!(inspect_qwen(&directory, &model).is_err());
+    directory.tensors.last_mut().unwrap().shape[0] += 1;
+    directory.tensors.last_mut().unwrap().shape[1] -= 1;
+    assert!(inspect_qwen(&directory, &model).is_err());
+}
+
+#[test]
+fn orphan_output_scale_is_refused() {
+    let (mut directory, model) = qwen_draft();
+    directory.tensors.push(TensorDescriptor {
+        name: "output.scale".into(),
+        shape: vec![1],
+        encoding: Encoding::F32,
+        offset: 0,
+        nbytes: 0,
+    });
+    assert_eq!(inspect_qwen(&directory, &model).unwrap_err(), Error::UnboundWeight("output.scale".into()));
 }

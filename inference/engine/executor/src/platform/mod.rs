@@ -10,16 +10,16 @@ mod qualification;
 mod selection;
 
 pub use policy::{
-    band_of, fit_capacities, host_distress, observe_domains, refresh_device_ceiling,
     DomainReading, DomainRole, DomainThresholds, FitCapacity, HostDistress, MemoryBand,
-    MemoryConstraint, MemoryPolicyError, MemoryReserves,
+    MemoryConstraint, MemoryPolicyError, MemoryReserves, band_of, fit_capacities, host_distress,
+    observe_domains, refresh_device_ceiling,
 };
 pub use qualification::{
-    open_selected, select_device, OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice,
+    OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, open_selected, select_device,
 };
 pub use selection::{
-    select, unusable_reason, DeviceRequest, DeviceRequestParseError, SelectionError,
-    AUTOMATIC_BACKEND_ORDER,
+    AUTOMATIC_BACKEND_ORDER, DeviceRequest, DeviceRequestParseError, SelectionError, select,
+    unusable_reason,
 };
 
 /// Relaxes the macOS GPU watchdog for this process. M1 and M2 GPUs cannot

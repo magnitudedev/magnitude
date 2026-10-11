@@ -162,6 +162,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         &mut self,
         destination: &seismic_ir::region::Product<seismic_ir::region::ValueDestination>,
         source: &Bound,
+        ty: &SemanticType,
         contents: &StorageContents,
         alternate: Option<(&Bound, &StorageContents)>,
     ) -> Bound {
@@ -179,8 +180,22 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 Bound::Tensor(TensorRealization::Stored(source)),
             ) => {
                 let layout = self.builder.portable_layout(*view).clone();
-                let axes = layout
-                    .extents
+                // Every value a carry takes has its type's axes. Where the
+                // source's extents are exactly those axes, the header and the
+                // result have them too; so does a result whose entry and
+                // backedge share extents. Otherwise the destination's own
+                // extents name them.
+                let typed = matches!(ty, SemanticType::Tensor(tensor)
+                    if tensor.axes.as_slice() == source.view.extents());
+                let shared = matches!(alternate,
+                    Some((Bound::Tensor(TensorRealization::Stored(other)), _))
+                        if other.view.extents() == source.view.extents());
+                let extents = if typed || shared {
+                    source.view.extents().to_vec()
+                } else {
+                    layout.extents.clone()
+                };
+                let axes = extents
                     .iter()
                     .map(|axis| self.builder.arena().int_from_nat(*axis))
                     .collect::<Vec<_>>();
@@ -196,7 +211,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 Bound::stored(self.values.contents.root(
                     &mut context,
                     layout.base,
-                    StoredView::new(*view, layout.extents.clone()),
+                    StoredView::new(*view, extents),
                     &axes,
                     state,
                 ))
@@ -212,12 +227,14 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                     start: Box::new(self.region_destination_product(
                         a,
                         start,
+                        ty,
                         contents,
                         alternatives.map(|a| a.0),
                     )),
                     end: Box::new(self.region_destination_product(
                         b,
                         end,
+                        ty,
                         contents,
                         alternatives.map(|a| a.1),
                     )),
@@ -225,6 +242,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             }
             (Product::Tuple(destinations), Bound::Tuple(values)) => {
                 assert_eq!(destinations.len(), values.len());
+                let SemanticType::Tuple(types) = ty else {
+                    panic!("tuple carry has non-tuple semantics")
+                };
                 let other = alternate.map(|(other, contents)| {
                     let Bound::Tuple(values) = other else {
                         panic!("tuple carry changed shape")
@@ -240,6 +260,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                             self.region_destination_product(
                                 destination,
                                 value,
+                                &types[index],
                                 contents,
                                 other.map(|(values, contents)| (&values[index], contents)),
                             )
@@ -295,9 +316,12 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         }
     }
 
+    /// A branch arm's results are transported into its branch's destination
+    /// exactly as a loop backedge is: a result still selected by a branch
+    /// enclosed in the arm is that branch's one joined destination.
     pub(super) fn realized_region_results(&mut self, region: RegionId) -> Vec<Bound> {
         let ids = self.function.region(region).results().to_vec();
-        let values = Bound::Tuple(ids.iter().map(|value| self.bound(*value)).collect());
+        let values = Bound::Tuple(ids.iter().map(|value| self.transported(*value)).collect());
         let types = SemanticType::Tuple(
             ids.iter()
                 .map(|value| self.function.value(*value).ty.clone())
@@ -309,43 +333,90 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         values
     }
 
-    /// Descriptor forwarding changes physical location only. The selected
-    /// source arm keeps its actual storage origin and initialized view.
-    pub(super) fn forward_region_product(
+    /// Descriptor forwarding changes physical location only. Each arm keeps
+    /// its actual storage origin and initialized view. A leaf both arms give
+    /// the same meaning keeps that meaning in the join: identical extents or
+    /// scalars can mention only what both arms see, which is what precedes
+    /// the branch, so the join needs no fresh name for them. Only where the
+    /// arms differ does the join's value become its destination's own slot.
+    pub(super) fn forward_branch_products(
         &mut self,
         destination: &seismic_ir::region::Product<seismic_ir::region::ValueDestination>,
-        source: &Bound,
-    ) -> Bound {
+        then: &Bound,
+        otherwise: &Bound,
+    ) -> (Bound, Bound) {
         use seismic_ir::region::{Product, ValueDestination};
-        match (destination, source) {
-            (Product::Unit, Bound::Unit) => Bound::Unit,
-            (Product::Leaf(ValueDestination::Scalar(slot)), Bound::Scalar(_)) => {
-                Bound::Scalar(ScalarBinding::Published(*slot))
+        match (destination, then, otherwise) {
+            (Product::Unit, Bound::Unit, Bound::Unit) => (Bound::Unit, Bound::Unit),
+            (Product::Leaf(_), Bound::Scalar(a), Bound::Scalar(b)) if a == b => {
+                (Bound::Scalar(*a), Bound::Scalar(*b))
             }
-            (Product::Leaf(ValueDestination::Quantity(slot)), Bound::Scalar(_)) => {
-                Bound::Scalar(ScalarBinding::Quantity(*slot))
+            (Product::Leaf(ValueDestination::Scalar(slot)), Bound::Scalar(_), Bound::Scalar(_)) => {
+                (
+                    Bound::Scalar(ScalarBinding::Published(*slot)),
+                    Bound::Scalar(ScalarBinding::Published(*slot)),
+                )
             }
             (
+                Product::Leaf(ValueDestination::Quantity(slot)),
+                Bound::Scalar(_),
+                Bound::Scalar(_),
+            ) => (
+                Bound::Scalar(ScalarBinding::Quantity(*slot)),
+                Bound::Scalar(ScalarBinding::Quantity(*slot)),
+            ),
+            (
                 Product::Leaf(ValueDestination::Tensor(view)),
-                Bound::Tensor(TensorRealization::Stored(source)),
+                Bound::Tensor(TensorRealization::Stored(a)),
+                Bound::Tensor(TensorRealization::Stored(b)),
             ) => {
-                let layout = self.builder.portable_layout(*view);
-                let mut value = source.clone();
-                value.view = StoredView::new(*view, layout.extents);
-                Bound::stored(value)
+                let extents = if a.view.extents() == b.view.extents() {
+                    a.view.extents().to_vec()
+                } else {
+                    self.builder.portable_layout(*view).extents
+                };
+                let forward = |source: &StoredTensor| {
+                    let mut value = source.clone();
+                    value.view = StoredView::new(*view, extents.clone());
+                    Bound::stored(value)
+                };
+                (forward(a), forward(b))
             }
-            (Product::Range(a, b), Bound::Range { start, end }) => Bound::Range {
-                start: Box::new(self.forward_region_product(a, start)),
-                end: Box::new(self.forward_region_product(b, end)),
-            },
-            (Product::Tuple(a), Bound::Tuple(b)) => {
-                assert_eq!(a.len(), b.len());
-                Bound::Tuple(
-                    a.iter()
-                        .zip(b)
-                        .map(|(a, b)| self.forward_region_product(a, b))
-                        .collect(),
+            (
+                Product::Range(a, b),
+                Bound::Range {
+                    start: then_start,
+                    end: then_end,
+                },
+                Bound::Range {
+                    start: else_start,
+                    end: else_end,
+                },
+            ) => {
+                let (then_start, else_start) =
+                    self.forward_branch_products(a, then_start, else_start);
+                let (then_end, else_end) = self.forward_branch_products(b, then_end, else_end);
+                (
+                    Bound::Range {
+                        start: Box::new(then_start),
+                        end: Box::new(then_end),
+                    },
+                    Bound::Range {
+                        start: Box::new(else_start),
+                        end: Box::new(else_end),
+                    },
                 )
+            }
+            (Product::Tuple(destinations), Bound::Tuple(a), Bound::Tuple(b)) => {
+                assert_eq!(destinations.len(), a.len());
+                assert_eq!(destinations.len(), b.len());
+                let (a, b) = destinations
+                    .iter()
+                    .zip(a)
+                    .zip(b)
+                    .map(|((destination, a), b)| self.forward_branch_products(destination, a, b))
+                    .unzip();
+                (Bound::Tuple(a), Bound::Tuple(b))
             }
             _ => panic!("branch product changed shape"),
         }
@@ -373,11 +444,8 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let destination =
             self.builder
                 .finish_value_branch(branch.schedule, then_operands, else_operands);
-        let Bound::Tuple(then_values) = self.forward_region_product(&destination, &then_values)
-        else {
-            unreachable!()
-        };
-        let Bound::Tuple(else_values) = self.forward_region_product(&destination, &else_values)
+        let (Bound::Tuple(then_values), Bound::Tuple(else_values)) =
+            self.forward_branch_products(&destination, &then_values, &else_values)
         else {
             unreachable!()
         };
@@ -454,9 +522,13 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             *binder_value,
             Bound::Scalar(ScalarBinding::Index(index)),
         );
-        let Bound::Tuple(headers) =
-            self.region_destination_product(schedule.header(), &initial, &parent.contents, None)
-        else {
+        let Bound::Tuple(headers) = self.region_destination_product(
+            schedule.header(),
+            &initial,
+            &initial_type,
+            &parent.contents,
+            None,
+        ) else {
             unreachable!()
         };
         for (carry, header) in carries.iter().zip(headers) {
@@ -498,107 +570,251 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         }
     }
 
-    /// A value transported by a region product (a loop backedge). A value
-    /// still selected by an enclosed branch joins its arms: every arm was
-    /// forwarded into that branch's one destination, so the product is that
-    /// destination with the contents both arms guarantee.
+    /// A value transported by a region product (a branch arm's result or a
+    /// loop backedge) is one product, never a selection the region's
+    /// destination cannot represent. A value still selected by an enclosed
+    /// branch joins its arms: when every arm was already forwarded into that
+    /// branch's one destination, the product is that destination with the
+    /// contents both arms guarantee. Arms a selected construction left in
+    /// their own storage are forwarded now, by a branch on the same selector
+    /// whose arms only transport their value into one destination.
     fn transported(&mut self, value: SemanticValueId) -> Bound {
-        let mut values = self
-            .builder
-            .bindings()
-            .possible_values(self.values.handle(value), &self.values.selections);
+        let ty = self.function.value(value).ty.clone();
+        self.transported_binding(self.values.handle(value), &ty)
+    }
+
+    fn transported_binding(&mut self, id: BindingId, ty: &SemanticType) -> Bound {
+        let bindings = self.builder.bindings();
+        let mut values = bindings.possible_values(id, &self.values.selections);
         if values.len() == 1 {
             return values.pop().expect("one possible value");
         }
-        self.joined(values)
+        if one_destination(&values) {
+            let mut selections = self.values.selections.clone();
+            let joined = self.joined_tree(id, &mut selections);
+            return self.published_join(joined);
+        }
+        let Resolution::Undecided { selector, options } =
+            bindings.resolve(id, &self.values.selections)
+        else {
+            unreachable!("a binding with several possible values is undecided")
+        };
+        self.forwarded_selection(selector, &options, ty)
     }
 
-    fn joined(&mut self, values: Vec<Bound>) -> Bound {
-        match &values[0] {
-            Bound::Tensor(TensorRealization::Stored(first)) => {
-                let view = *first
+    fn forwarded_selection(
+        &mut self,
+        selector: BindingSelector,
+        options: &[(i64, BindingId)],
+        ty: &SemanticType,
+    ) -> Bound {
+        let option = |selected: i64| {
+            options
+                .iter()
+                .find(|(option, _)| *option == selected)
+                .expect("selected binding option is complete")
+                .1
+        };
+        let parent = self.values.clone();
+        let (selected, mut schedule) = self.builder.begin_source_selection(selector);
+        assert_eq!(selected, 1, "a selection begins with its taken arm");
+        self.values.selections.insert(selector, 1);
+        let then = self.transported_binding(option(1), ty);
+        let then = self.realize_region_product(then, ty);
+        let then_contents = self.values.contents.clone();
+        assert_eq!(self.builder.next_source_branch(&mut schedule), Some(0));
+        self.values = parent.clone();
+        self.values.selections.insert(selector, 0);
+        let otherwise = self.transported_binding(option(0), ty);
+        let otherwise = self.realize_region_product(otherwise, ty);
+        let else_contents = self.values.contents.clone();
+        let then_operands = self.region_operand_product(&then);
+        let else_operands = self.region_operand_product(&otherwise);
+        let destination = self
+            .builder
+            .finish_value_branch(schedule, then_operands, else_operands);
+        let (then, otherwise) = self.forward_branch_products(&destination, &then, &otherwise);
+        self.values = parent;
+        self.values.contents.branch(
+            &mut InitializationContext::new(self.builder.arena()),
+            selector,
+            &self.values.binders,
+            &then_contents,
+            &else_contents,
+        );
+        let (then, otherwise) = (self.joined_leaf(then), self.joined_leaf(otherwise));
+        let joined = self.joined_branch(selector, then, otherwise);
+        self.published_join(joined)
+    }
+
+    /// The join of a binding's arms that share one destination, each arm's
+    /// contents holding exactly where its selection does.
+    fn joined_tree(&mut self, id: BindingId, selections: &mut BindingSelections) -> Joined {
+        match self.builder.bindings().resolve(id, selections) {
+            Resolution::Value(bound) => self.joined_leaf(bound),
+            Resolution::Undecided { selector, options } => {
+                assert_eq!(
+                    options.len(),
+                    2,
+                    "a selection has a taken and an untaken arm"
+                );
+                let option = |selected: i64| {
+                    options
+                        .iter()
+                        .find(|(option, _)| *option == selected)
+                        .expect("selected binding option is complete")
+                        .1
+                };
+                selections.insert(selector, 1);
+                let then = self.joined_tree(option(1), selections);
+                selections.insert(selector, 0);
+                let otherwise = self.joined_tree(option(0), selections);
+                selections.remove(&selector);
+                self.joined_branch(selector, then, otherwise)
+            }
+        }
+    }
+
+    fn joined_leaf(&mut self, bound: Bound) -> Joined {
+        match bound {
+            Bound::Tensor(TensorRealization::Stored(arm)) => {
+                let state = InitializationContext::new(self.builder.arena())
+                    .project(self.values.contents.state(&arm), &arm.initialized_view);
+                Joined::Tensor {
+                    arm,
+                    shared_extents: true,
+                    state,
+                }
+            }
+            Bound::Tensor(TensorRealization::Computed(_)) => {
+                panic!("a branch product is realized before its join")
+            }
+            Bound::Scalar(scalar) => Joined::Scalar(scalar),
+            Bound::Range { start, end } => Joined::Range(
+                Box::new(self.joined_leaf(*start)),
+                Box::new(self.joined_leaf(*end)),
+            ),
+            Bound::Tuple(items) => Joined::Tuple(
+                items
+                    .into_iter()
+                    .map(|item| self.joined_leaf(item))
+                    .collect(),
+            ),
+            Bound::Unit => Joined::Unit,
+        }
+    }
+
+    /// The join of two arms of `selector` forwarded into one destination.
+    /// The destination holds the taken arm's contents where the selector
+    /// holds and the other arm's where it does not; an arm's contents never
+    /// stand for the other world.
+    fn joined_branch(
+        &mut self,
+        selector: BindingSelector,
+        then: Joined,
+        otherwise: Joined,
+    ) -> Joined {
+        match (then, otherwise) {
+            (
+                Joined::Tensor {
+                    arm,
+                    shared_extents: then_shared,
+                    state: then_state,
+                },
+                Joined::Tensor {
+                    arm: other,
+                    shared_extents: else_shared,
+                    state: else_state,
+                },
+            ) => {
+                assert!(
+                    arm.view.direct_backing() == other.view.direct_backing(),
+                    "joined tensor arms have one destination"
+                );
+                let state = InitializationContext::new(self.builder.arena()).branch(
+                    selector,
+                    &self.values.binders,
+                    &then_state,
+                    &else_state,
+                );
+                Joined::Tensor {
+                    shared_extents: then_shared
+                        && else_shared
+                        && arm.view.extents() == other.view.extents(),
+                    arm,
+                    state,
+                }
+            }
+            (Joined::Scalar(a), Joined::Scalar(b)) => {
+                assert_eq!(
+                    a, b,
+                    "joined scalar arms were forwarded into one destination"
+                );
+                Joined::Scalar(a)
+            }
+            (Joined::Range(a_start, a_end), Joined::Range(b_start, b_end)) => Joined::Range(
+                Box::new(self.joined_branch(selector, *a_start, *b_start)),
+                Box::new(self.joined_branch(selector, *a_end, *b_end)),
+            ),
+            (Joined::Tuple(a), Joined::Tuple(b)) => {
+                assert_eq!(a.len(), b.len(), "joined tuple arms differ in arity");
+                Joined::Tuple(
+                    a.into_iter()
+                        .zip(b)
+                        .map(|(a, b)| self.joined_branch(selector, a, b))
+                        .collect(),
+                )
+            }
+            (Joined::Unit, Joined::Unit) => Joined::Unit,
+            _ => panic!("joined arms differ in kind"),
+        }
+    }
+
+    /// Publish a join as the destination's one root.
+    fn published_join(&mut self, joined: Joined) -> Bound {
+        match joined {
+            Joined::Tensor {
+                arm,
+                shared_extents,
+                state,
+            } => {
+                let view = *arm
                     .view
                     .direct_backing()
                     .expect("a branch product is its destination view");
                 let layout = self.builder.portable_layout(view).clone();
-                let axes = layout
-                    .extents
+                // Arms forwarded with one shared meaning of their extents
+                // keep it; otherwise the destination's own extents name them.
+                let extents = if shared_extents {
+                    arm.view.extents().to_vec()
+                } else {
+                    layout.extents.clone()
+                };
+                let axes = extents
                     .iter()
                     .map(|axis| self.builder.arena().int_from_nat(*axis))
                     .collect::<Vec<_>>();
                 let mut context = InitializationContext::new(self.builder.arena());
-                let mut state = None;
-                for value in &values {
-                    let Bound::Tensor(TensorRealization::Stored(arm)) = value else {
-                        panic!("joined tensor arms differ in kind")
-                    };
-                    assert!(
-                        arm.view.direct_backing() == Some(&view),
-                        "joined tensor arms have one destination"
-                    );
-                    let arm =
-                        context.project(self.values.contents.state(arm), &arm.initialized_view);
-                    state = Some(match state {
-                        None => arm,
-                        Some(state) => arm.intersection(&state),
-                    });
-                }
-                let state = state.expect("a join has arms");
                 Bound::stored(self.values.contents.root(
                     &mut context,
                     layout.base,
-                    StoredView::new(view, layout.extents.clone()),
+                    StoredView::new(view, extents),
                     &axes,
                     state,
                 ))
             }
-            Bound::Tuple(first) => {
-                let arity = first.len();
-                let mut columns = vec![Vec::new(); arity];
-                for value in values {
-                    let Bound::Tuple(items) = value else {
-                        panic!("joined tuple arms differ in kind")
-                    };
-                    assert_eq!(items.len(), arity, "joined tuple arms differ in arity");
-                    for (column, item) in columns.iter_mut().zip(items) {
-                        column.push(item);
-                    }
-                }
-                Bound::Tuple(
-                    columns
-                        .into_iter()
-                        .map(|column| self.joined(column))
-                        .collect(),
-                )
-            }
-            Bound::Range { .. } => {
-                let (mut starts, mut ends) = (Vec::new(), Vec::new());
-                for value in values {
-                    let Bound::Range { start, end } = value else {
-                        panic!("joined range arms differ in kind")
-                    };
-                    starts.push(*start);
-                    ends.push(*end);
-                }
-                Bound::Range {
-                    start: Box::new(self.joined(starts)),
-                    end: Box::new(self.joined(ends)),
-                }
-            }
-            Bound::Scalar(first) => {
-                let first = *first;
-                assert!(
-                    values
-                        .iter()
-                        .all(|value| matches!(value, Bound::Scalar(arm) if *arm == first)),
-                    "joined scalar arms were forwarded into one destination"
-                );
-                Bound::Scalar(first)
-            }
-            Bound::Unit => Bound::Unit,
-            Bound::Tensor(TensorRealization::Computed(_)) => {
-                panic!("a branch product is realized before its join")
-            }
+            Joined::Scalar(scalar) => Bound::Scalar(scalar),
+            Joined::Range(start, end) => Bound::Range {
+                start: Box::new(self.published_join(*start)),
+                end: Box::new(self.published_join(*end)),
+            },
+            Joined::Tuple(items) => Bound::Tuple(
+                items
+                    .into_iter()
+                    .map(|item| self.published_join(item))
+                    .collect(),
+            ),
+            Joined::Unit => Bound::Unit,
         }
     }
 
@@ -637,6 +853,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let Bound::Tuple(results) = self.region_destination_product(
             &destinations,
             &yielded,
+            &yielded_type,
             &iteration,
             Some((&ticket.initial, &before)),
         ) else {
@@ -737,4 +954,68 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             .map(|result| self.values.handle(*result))
             .collect();
     }
+}
+
+/// Whether the arms of a selection already share their branch's one
+/// destination: the same storage view for every tensor and the same
+/// realization for every scalar.
+fn one_destination(values: &[Bound]) -> bool {
+    let first = &values[0];
+    match first {
+        Bound::Unit => values.iter().all(|value| matches!(value, Bound::Unit)),
+        Bound::Scalar(scalar) => values
+            .iter()
+            .all(|value| matches!(value, Bound::Scalar(arm) if arm == scalar)),
+        Bound::Tensor(TensorRealization::Stored(stored)) => {
+            let Some(view) = stored.view.direct_backing() else {
+                return false;
+            };
+            values.iter().all(|value| {
+                matches!(
+                    value,
+                    Bound::Tensor(TensorRealization::Stored(arm))
+                        if arm.view.direct_backing() == Some(view)
+                )
+            })
+        }
+        Bound::Tensor(TensorRealization::Computed(_)) => false,
+        Bound::Range { .. } => {
+            let mut starts = Vec::with_capacity(values.len());
+            let mut ends = Vec::with_capacity(values.len());
+            for value in values {
+                let Bound::Range { start, end } = value else {
+                    panic!("selected range arms differ in kind")
+                };
+                starts.push((**start).clone());
+                ends.push((**end).clone());
+            }
+            one_destination(&starts) && one_destination(&ends)
+        }
+        Bound::Tuple(items) => (0..items.len()).all(|index| {
+            let column = values
+                .iter()
+                .map(|value| {
+                    let Bound::Tuple(items) = value else {
+                        panic!("selected tuple arms differ in kind")
+                    };
+                    items[index].clone()
+                })
+                .collect::<Vec<_>>();
+            one_destination(&column)
+        }),
+    }
+}
+
+/// A join of branch arms before it is published as one destination root:
+/// each tensor leaf carries the contents of every world it may come from.
+enum Joined {
+    Unit,
+    Scalar(ScalarBinding),
+    Tensor {
+        arm: StoredTensor,
+        shared_extents: bool,
+        state: InitializationState,
+    },
+    Range(Box<Joined>, Box<Joined>),
+    Tuple(Vec<Joined>),
 }

@@ -132,6 +132,14 @@ pub(crate) struct BindingArena {
 
 pub(crate) type BindingSelector = seismic_lang::expr::BoolExpr;
 
+pub(super) enum Resolution {
+    Value(Bound),
+    Undecided {
+        selector: BindingSelector,
+        options: Vec<(i64, BindingId)>,
+    },
+}
+
 pub(crate) type BindingSelections = std::collections::HashMap<BindingSelector, i64>;
 
 pub(crate) fn initialization_context<'a>(
@@ -308,21 +316,40 @@ impl BindingArena {
     }
 
     /// Every value a binding may hold after its selections: one value when
-    /// the dominating arms decide it, otherwise every option of each
-    /// undecided selection (a join the caller transports as one product).
+    /// the dominating arms decide it, otherwise the values of each arm of an
+    /// undecided selection, each resolved under that arm.
     pub(super) fn possible_values(
         &self,
         id: BindingId,
         selections: &BindingSelections,
     ) -> Vec<Bound> {
+        match self.resolve(id, selections) {
+            Resolution::Value(value) => vec![value],
+            Resolution::Undecided { selector, options } => {
+                let mut arm = selections.clone();
+                options
+                    .iter()
+                    .flat_map(|(option, binding)| {
+                        arm.insert(selector, *option);
+                        self.possible_values(*binding, &arm)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// A binding after the arms its selections decide: its value, or the
+    /// first selection no dominating arm decides. An undecided option is
+    /// itself resolved under that selection's arm, never across arms.
+    pub(super) fn resolve(&self, id: BindingId, selections: &BindingSelections) -> Resolution {
         assert_eq!(
             id.owner, self.owner,
             "binding belongs to another construction"
         );
         match &self.nodes[id.index] {
-            BindingValue::Value(value) => vec![value.clone()],
+            BindingValue::Value(value) => Resolution::Value(value.clone()),
             BindingValue::Selected { selector, options } => match selections.get(selector) {
-                Some(value) => self.possible_values(
+                Some(value) => self.resolve(
                     options
                         .iter()
                         .find(|(option, _)| option == value)
@@ -330,10 +357,10 @@ impl BindingArena {
                         .1,
                     selections,
                 ),
-                None => options
-                    .iter()
-                    .flat_map(|(_, option)| self.possible_values(*option, selections))
-                    .collect(),
+                None => Resolution::Undecided {
+                    selector: *selector,
+                    options: options.clone(),
+                },
             },
         }
     }

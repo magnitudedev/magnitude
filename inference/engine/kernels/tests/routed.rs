@@ -286,18 +286,23 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f64], tolerance: f64) {
     }
 }
 
-/// CUDA, else Metal; `SEISMIC_TEST_BACKEND=vulkan` selects Vulkan (a CUDA
-/// host also has a Vulkan device).
+/// CUDA, else Metal; `SEISMIC_TEST_BACKEND` explicitly selects CUDA or Vulkan
+/// and requires that backend to open.
 fn native_device() -> Option<seismic::Device> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     match std::env::var("SEISMIC_TEST_BACKEND").ok().as_deref() {
         // A selected backend must open: never skip silently.
+        Some("cuda") => Some(
+            catalog
+                .open_backend(seismic::BackendName::Cuda)
+                .expect("the CUDA device opens"),
+        ),
         Some("vulkan") => Some(
             catalog
                 .open_backend(seismic::BackendName::Vulkan)
                 .expect("the Vulkan device opens"),
         ),
-        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only vulkan is selectable"),
+        Some(other) => panic!("SEISMIC_TEST_BACKEND={other}: only cuda and vulkan are selectable"),
         None => [seismic::BackendName::Cuda, seismic::BackendName::Metal]
             .into_iter()
             .find_map(|backend| catalog.open_backend(backend).ok()),
@@ -338,12 +343,37 @@ fn group_specialization(
     device: &seismic::Device,
     experts: u64,
     choices: u64,
-    parts: u64,
+    parts: Option<u64>,
 ) -> seismic::NativeSpecialization {
     if is_cpu(device) {
         return seismic::NativeSpecialization::new();
     }
-    specialize(&[("E", experts), ("K", choices)], &[("PARTS", parts)])
+    let params = parts
+        .map(|parts| vec![("PARTS", parts)])
+        .unwrap_or_default();
+    specialize(&[("E", experts), ("K", choices)], &params)
+}
+
+/// The group's parts parameter on `device`: Vulkan tunes it; Metal and CUDA
+/// derive their parts from E.
+fn group_parts(device: &seismic::Device) -> Vec<Option<u64>> {
+    match device.backend() {
+        seismic::BackendName::Vulkan => vec![Some(1), Some(2), Some(4)],
+        _ => vec![None],
+    }
+}
+
+/// The group's specialization with the device's default parts.
+fn default_group_specialization(
+    device: &seismic::Device,
+    experts: u64,
+    choices: u64,
+) -> seismic::NativeSpecialization {
+    let parts = match device.backend() {
+        seismic::BackendName::Vulkan => Some(4),
+        _ => None,
+    };
+    group_specialization(device, experts, choices, parts)
 }
 
 /// The route's hidden-axis splits on the device's backend (CUDA splits its
@@ -603,7 +633,7 @@ fn native_group_matches_portable_tables_on(device: &seismic::Device) {
         let case = GroupCase::new(rows, experts, tile);
         let expected = case.portable(&module);
         let blocks = case.blocks();
-        for parts in [1, 2, 4] {
+        for parts in group_parts(device) {
             let kernel = routed_group::native_for_device(
                 device,
                 &group_specialization(device, experts as u64, K as u64, parts),
@@ -638,7 +668,7 @@ fn native_group_matches_portable_tables_on(device: &seismic::Device) {
             {
                 assert_eq!(
                     actual, expected,
-                    "{name}: rows {rows} experts {experts} tile {tile} parts {parts}"
+                    "{name}: rows {rows} experts {experts} tile {tile} parts {parts:?}"
                 );
             }
         }
@@ -1899,6 +1929,15 @@ fn cuda_scoped_routed_decode_matches_reference_for_all_code_variants() {
     );
 }
 
+/// What these tests hold a tuned configuration to against its default: 8
+/// rounding steps of the `bf16` activations, the engine's standard α.
+fn tuning_requirement() -> seismic::NumericalRequirement {
+    seismic::NumericalRequirement::RoundingSteps {
+        alpha: 8.,
+        activation: Some(seismic::DType::BF16),
+    }
+}
+
 #[test]
 #[ignore]
 fn cuda_scoped_routed_expand_tunes_declared_candidates() {
@@ -1934,7 +1973,7 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: vec![routed_expand::Args {
                 normalized,
                 routes,
@@ -1949,15 +1988,9 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-        admission: std::time::Duration::from_secs(600),
-        required: std::time::Duration::from_secs(600),
+
         settings: seismic::SearchSettings {
-            improvement: 0.01,
-            restarts: 2,
-            confirmed: 3,
-            default_margin: 0.02,
-            samples: 5,
-            confirmation_samples: 5,
+            error_rate: 0.05,
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
@@ -1974,21 +2007,14 @@ fn cuda_scoped_routed_expand_tunes_declared_candidates() {
         },
         &statics,
         points,
-        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-            absolute: seismic::precision::Limit::new(0.01).unwrap(),
-            relative: seismic::precision::Limit::new(0.05).unwrap(),
-            relative_floor: seismic::precision::Limit::ZERO,
-            ulps: None,
-        }),
+        tuning_requirement(),
         search,
-        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         &result.method,
-        seismic::TuningMethod::Factored {
+        seismic::TuningMethod::Search {
             groups: 1,
-            candidates: 6,
             complete: true,
             ..
         }
@@ -2044,7 +2070,7 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: vec![routed_output::Args {
                 residual: &input.0,
                 expert_product: &input.1,
@@ -2061,15 +2087,9 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-        admission: std::time::Duration::from_secs(600),
-        required: std::time::Duration::from_secs(600),
+
         settings: seismic::SearchSettings {
-            improvement: 0.01,
-            restarts: 2,
-            confirmed: 3,
-            default_margin: 0.02,
-            samples: 5,
-            confirmation_samples: 5,
+            error_rate: 0.05,
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
@@ -2084,21 +2104,14 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
         },
         &statics,
         points,
-        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-            absolute: seismic::precision::Limit::new(0.01).unwrap(),
-            relative: seismic::precision::Limit::new(0.05).unwrap(),
-            relative_floor: seismic::precision::Limit::ZERO,
-            ulps: None,
-        }),
+        tuning_requirement(),
         search,
-        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         &result.method,
-        seismic::TuningMethod::Factored {
+        seismic::TuningMethod::Search {
             groups: 1,
-            candidates: 6,
             complete: true,
             ..
         }
@@ -2116,9 +2129,9 @@ fn cuda_scoped_routed_output_tunes_declared_candidates() {
 #[test]
 fn native_grouped_prefill_matches_reference() {
     for device in devices() {
-        native_grouped_prefill_matches_reference_on(&device, Experts::Packed, false);
+        native_grouped_prefill_matches_reference_on(&device, Experts::Packed, false, 0);
         if is_cpu(&device) {
-            native_grouped_prefill_matches_reference_on(&device, Experts::Packed, true);
+            native_grouped_prefill_matches_reference_on(&device, Experts::Packed, true, 0);
         }
     }
 }
@@ -2127,7 +2140,23 @@ fn native_grouped_prefill_matches_reference() {
 #[test]
 fn native_grouped_prefill_matches_reference_with_bf16_experts() {
     for device in devices() {
-        native_grouped_prefill_matches_reference_on(&device, Experts::Bf16, false);
+        native_grouped_prefill_matches_reference_on(&device, Experts::Bf16, false, 0);
+    }
+}
+
+#[test]
+fn cuda_grouped_physical_f16_operands_match_reference() {
+    let device = devices()
+        .into_iter()
+        .find(|device| device.backend() == seismic::BackendName::Cuda);
+    if let Some(device) = device {
+        for operand in if std::env::var_os("MAGNITUDE_ROUTED_COMPONENT_ONLY").is_some() {
+            vec![1]
+        } else {
+            vec![0, 1]
+        } {
+            native_grouped_prefill_matches_reference_on(&device, Experts::Bf16, false, operand);
+        }
     }
 }
 
@@ -2135,6 +2164,7 @@ fn native_grouped_prefill_matches_reference_on(
     device: &seismic::Device,
     experts: Experts,
     int8: bool,
+    operand: u64,
 ) {
     let block = PackedBlock::new(&device, experts);
     let (h, e, k, f, s) = (
@@ -2145,7 +2175,15 @@ fn native_grouped_prefill_matches_reference_on(
         PackedBlock::SHARED as u64,
     );
     let tile = 32u64;
-    for rows in [16usize, 40, 64] {
+    for rows in if std::env::var_os("MAGNITUDE_ROUTED_COMPONENT_ONLY").is_some() {
+        if std::env::var("MAGNITUDE_ROUTED_COMPONENT_ROWS").as_deref() == Ok("40,64") {
+            vec![40usize, 64]
+        } else {
+            vec![16usize]
+        }
+    } else {
+        vec![16usize, 40, 64]
+    } {
         let routing = PackedBlock::routing(rows, 90 + rows as u32);
         let m = rows as u64;
         let (expert, shared) = block.routed.expand(&routing, bf16_round);
@@ -2163,7 +2201,7 @@ fn native_grouped_prefill_matches_reference_on(
         let mut order = fill(&[blocks, tile]);
         let mut inverse = fill(&[m, k]);
         let mut table = fill(&[blocks]);
-        routed_group::native_for_device(device, &group_specialization(device, e, k, 4))
+        routed_group::native_for_device(device, &default_group_specialization(device, e, k))
             .unwrap()
             .call(routed_group::Args {
                 routes: &routes,
@@ -2175,11 +2213,13 @@ fn native_grouped_prefill_matches_reference_on(
             .unwrap();
         let normalized = bf16_tensor(&device, &[m, h], &routing.normalized);
         for mapping in grouped_mappings(&device) {
-            let label = format!("rows {rows} mapping {mapping:?} INT8 {int8}");
+            let label = format!("rows {rows} mapping {mapping:?} INT8 {int8} OPERAND {operand}");
             let specialization = |statics: &[(&str, u64)]| {
                 let specialization = specialization_on(device, statics, &mapping);
                 if is_cpu(device) {
                     specialization.with_param("INT8", u64::from(int8))
+                } else if device.backend() == seismic::BackendName::Cuda {
+                    specialization.with_param("OPERAND", operand)
                 } else {
                     specialization
                 }
@@ -2192,7 +2232,14 @@ fn native_grouped_prefill_matches_reference_on(
                     EUW: block.expert_up.element(),
                     EDW: block.expert_down.element(),
                 },
-                &specialization(&[("H", h), ("F", f)]),
+                &{
+                    let choice = specialization(&[("H", h), ("F", f)]);
+                    if device.backend() == seismic::BackendName::Cuda {
+                        choice.with_param("OPERAND", operand)
+                    } else {
+                        choice
+                    }
+                },
             )
             .unwrap()
             .call(routed_experts::Args {
@@ -2230,9 +2277,45 @@ fn native_grouped_prefill_matches_reference_on(
             })
             .unwrap()
             .value;
+            let combined_values = read_f32(&combined);
+            let worst = combined_values
+                .iter()
+                .zip(&reference)
+                .enumerate()
+                .max_by(|(_, (a, b)), (_, (c, d))| (**a - **b).abs().total_cmp(&(**c - **d).abs()))
+                .map(|(index, _)| index)
+                .unwrap();
+            let row = worst / h as usize;
+            let column = worst % h as usize;
+            let positions = read_i32(&inverse);
+            let actual_experts = read_bf16(&experts);
+            let mut actual_selected = 0.0f32;
+            let mut expected_selected = 0.0f32;
+            for choice in 0..k as usize {
+                let flat = row * k as usize + choice;
+                let expert_id = routing.routes[flat] as usize;
+                let position = positions[flat] as usize;
+                let actual_value = actual_experts[position * h as usize + column];
+                let product = &expert[flat * f as usize..(flat + 1) * f as usize];
+                let weight_row = (expert_id * h as usize + column) * f as usize;
+                let expected_value = bf16_round(dot(
+                    product,
+                    &block.routed.expert_down[weight_row..weight_row + f as usize],
+                ));
+                actual_selected = routing.scores[flat].mul_add(actual_value, actual_selected);
+                expected_selected = routing.scores[flat].mul_add(expected_value, expected_selected);
+            }
+            let expected_shared = bf16_round(dot(
+                &shared[row * s as usize..(row + 1) * s as usize],
+                &block.routed.shared_down[column * s as usize..(column + 1) * s as usize],
+            ));
+            let actual_shared =
+                (combined_values[worst] - routing.residual[worst] - actual_selected)
+                    / routing.coefficient[row];
+            eprintln!("{label} largest-delta[{worst}] selected native={actual_selected} reference={expected_selected}; shared native={actual_shared} reference={expected_shared}");
             assert_arithmetic(
                 &format!("{label} output"),
-                &read_f32(&combined),
+                &combined_values,
                 &reference,
                 int8,
                 2e-2,
@@ -2782,7 +2865,7 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
         let mut order = fill(&[blocks, t]);
         let mut inverse = fill(&[m, k]);
         let mut table = fill(&[blocks]);
-        routed_group::native_for_device(device, &group_specialization(device, e, k, 4))
+        routed_group::native_for_device(device, &default_group_specialization(device, e, k))
             .unwrap()
             .call(routed_group::Args {
                 routes: &routing.routes,
@@ -3085,16 +3168,19 @@ fn native_35b_grouped_capacity_keeps_every_bit_on(device: &seismic::Device) {
                 let mut order = fill(&[blocks, t]);
                 let mut inverse = fill(&[m, k]);
                 let mut table = fill(&[blocks]);
-                routed_group::native_for_device(device, &group_specialization(device, e, k, 4))
-                    .unwrap()
-                    .call(routed_group::Args {
-                        routes: &routing.routes,
-                        counts: &mut counts,
-                        order: &mut order,
-                        inverse: &mut inverse,
-                        blocks: &mut table,
-                    })
-                    .unwrap();
+                routed_group::native_for_device(
+                    device,
+                    &default_group_specialization(device, e, k),
+                )
+                .unwrap()
+                .call(routed_group::Args {
+                    routes: &routing.routes,
+                    counts: &mut counts,
+                    order: &mut order,
+                    inverse: &mut inverse,
+                    blocks: &mut table,
+                })
+                .unwrap();
                 let experts = routed_experts::native_for_device_with(
                     device,
                     routed_experts::Elements {
@@ -3254,15 +3340,9 @@ fn routed_kernel_timings() {
         ) {
             seismic::Strategy::Search(seismic::SearchPlan {
                 allowance: std::time::Duration::from_secs(600),
-                admission: std::time::Duration::from_secs(600),
-                required: std::time::Duration::from_secs(600),
+
                 settings: seismic::SearchSettings {
-                    improvement: 0.01,
-                    restarts: 2,
-                    confirmed: 3,
-                    default_margin: 0.02,
-                    samples: 7,
-                    confirmation_samples: 7,
+                    error_rate: 0.05,
                 },
                 min_sample_seconds: 0.002,
                 start: Vec::new(),
@@ -3271,12 +3351,7 @@ fn routed_kernel_timings() {
             measure.clone()
         }
     };
-    let validation = seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-        absolute: seismic::precision::Limit::new(0.01).unwrap(),
-        relative: seismic::precision::Limit::new(0.05).unwrap(),
-        relative_floor: seismic::precision::Limit::ZERO,
-        ulps: None,
-    });
+    let validation = tuning_requirement();
     let statics = |pairs: &[(&str, u64)]| {
         pairs.iter().fold(
             seismic::NativeSpecialization::new(),
@@ -3312,7 +3387,7 @@ fn routed_kernel_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter_mut()
                 .zip(&layers)
@@ -3345,7 +3420,6 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             measure.clone(),
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3380,7 +3454,7 @@ fn routed_kernel_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3411,7 +3485,6 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             decode_measure(),
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3423,7 +3496,7 @@ fn routed_kernel_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3454,7 +3527,6 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             decode_measure(),
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3501,7 +3573,7 @@ fn routed_kernel_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3532,7 +3604,6 @@ fn routed_kernel_timings() {
             points,
             validation.clone(),
             measure.clone(),
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3544,7 +3615,7 @@ fn routed_kernel_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3577,7 +3648,6 @@ fn routed_kernel_timings() {
             points,
             validation,
             measure.clone(),
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3610,7 +3680,7 @@ fn routed_kernel_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(tables.iter_mut())
@@ -3633,9 +3703,8 @@ fn routed_kernel_timings() {
             &device,
             &statics(&[("E", e), ("K", k)]),
             points,
-            seismic::PrecisionPolicy::Exact,
+            seismic::NumericalRequirement::BitExact,
             measure,
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );
@@ -3715,12 +3784,7 @@ fn routed_decode_timings() {
             )
         })
         .collect::<Vec<_>>();
-    let validation = seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-        absolute: seismic::precision::Limit::new(0.01).unwrap(),
-        relative: seismic::precision::Limit::new(0.05).unwrap(),
-        relative_floor: seismic::precision::Limit::ZERO,
-        ulps: None,
-    });
+    let validation = tuning_requirement();
     let statics = |pairs: &[(&str, u64)]| {
         pairs.iter().fold(
             seismic::NativeSpecialization::new(),
@@ -3737,15 +3801,9 @@ fn routed_decode_timings() {
     let exhaustive = || {
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
-            admission: std::time::Duration::from_secs(600),
-            required: std::time::Duration::from_secs(600),
+
             settings: seismic::SearchSettings {
-                improvement: 0.0,
-                restarts: 0,
-                confirmed: 3,
-                default_margin: 0.0,
-                samples: 9,
-                confirmation_samples: 9,
+                error_rate: 0.05,
             },
             min_sample_seconds: 0.004,
             start: Vec::new(),
@@ -3776,7 +3834,7 @@ fn routed_decode_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter_mut()
                 .zip(&layers)
@@ -3810,7 +3868,6 @@ fn routed_decode_timings() {
                 points,
                 validation.clone(),
                 survey,
-                seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
@@ -3844,7 +3901,7 @@ fn routed_decode_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3876,7 +3933,6 @@ fn routed_decode_timings() {
                 points,
                 validation.clone(),
                 exhaustive(),
-                seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
@@ -3889,7 +3945,7 @@ fn routed_decode_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -3921,7 +3977,6 @@ fn routed_decode_timings() {
                 points,
                 validation.clone(),
                 exhaustive(),
-                seismic::TuningReference::Portable,
             )
             .unwrap(),
         );
@@ -3987,7 +4042,7 @@ fn routed_down_timings() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: inputs
                 .iter()
                 .zip(&layers)
@@ -4005,15 +4060,9 @@ fn routed_down_timings() {
         .collect();
     let exhaustive = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-        admission: std::time::Duration::from_secs(600),
-        required: std::time::Duration::from_secs(600),
+
         settings: seismic::SearchSettings {
-            improvement: 0.0,
-            restarts: 0,
-            confirmed: 3,
-            default_margin: 0.0,
-            samples: 9,
-            confirmation_samples: 9,
+            error_rate: 0.05,
         },
         min_sample_seconds: 0.004,
         start: Vec::new(),
@@ -4028,14 +4077,8 @@ fn routed_down_timings() {
             },
             &specialize(&[("H", h), ("K", k), ("F", f)], &[]),
             points,
-            seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-                absolute: seismic::precision::Limit::new(0.01).unwrap(),
-                relative: seismic::precision::Limit::new(0.05).unwrap(),
-                relative_floor: seismic::precision::Limit::ZERO,
-                ulps: None,
-            }),
+            tuning_requirement(),
             exhaustive,
-            seismic::TuningReference::Portable,
         )
         .unwrap(),
     );

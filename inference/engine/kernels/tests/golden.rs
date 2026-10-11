@@ -1187,7 +1187,7 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
         .collect()
 }
 
-fn head_logits_rows(ctx: &Ctx) -> Vec<Variant> {
+fn readout_project_rows(ctx: &Ctx) -> Vec<Variant> {
     projection_variants()
         .into_iter()
         .map(|(label, a, _, dense, every)| {
@@ -2364,11 +2364,11 @@ const ENTRIES: &[EntrySpec] = &[
         build: selected_rows,
     },
     EntrySpec {
-        id: "head_logits_rows",
-        names: &["head_logits_rows"],
+        id: "readout_project_rows",
+        names: &["readout_project_rows"],
         family: "readout",
         library: true,
-        build: head_logits_rows,
+        build: readout_project_rows,
     },
     EntrySpec {
         id: "draft_rows",
