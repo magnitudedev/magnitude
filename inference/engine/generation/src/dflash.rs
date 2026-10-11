@@ -9,14 +9,16 @@
 //! layout, and selects its proposals in one pass (`DraftForm::Block`).
 
 use crate::mtp::{Drafter, DrafterState};
-use crate::{DraftBudget, Method, MethodCheckpoint, MethodRequirements, MethodState};
+use crate::{DraftBudget, DraftLoad, Method, MethodCheckpoint, MethodRequirements, MethodState};
 use magnitude_executor::Demand;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct DFlash {
     identity: String,
     proposals: usize,
     budget: DraftBudget,
+    adaptive: Option<Arc<DraftLoad>>,
 }
 
 impl DFlash {
@@ -32,7 +34,15 @@ impl DFlash {
                 generated: proposals,
                 verified: proposals,
             },
+            adaptive: None,
         })
+    }
+    /// Choose each round's generated and verified widths from what the
+    /// load's rounds measure, up to the proposal width.
+    pub fn adaptive(mut self) -> Self {
+        self.identity.push_str(":adaptive");
+        self.adaptive = Some(Arc::default());
+        self
     }
     /// Draft and verify `budget` each round; its generated width must fit
     /// this load.
@@ -72,6 +82,7 @@ impl Method for DFlash {
             Drafter::DFlash,
             self.proposals,
             self.budget,
+            self.adaptive.clone(),
             checkpoint,
         )?))
     }

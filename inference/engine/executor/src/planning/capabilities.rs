@@ -16,9 +16,28 @@ pub enum PlannedMethod {
         sampled_proposals: u8,
     },
     /// A separate DFlash/DSpark draft, greedy and sampled alike: a round
-    /// carries at most `proposals` draft rows, and each block pass drafts
-    /// exactly `generated` of them (none when 0). Both are fixed per load.
-    DFlash { proposals: u8, generated: u8 },
+    /// carries at most `proposals` draft rows. Each block pass drafts exactly
+    /// `generated` of them (none when 0), or with `ladder` any width of
+    /// [`draft_ladder`] up to `generated`. All are fixed per load.
+    DFlash {
+        proposals: u8,
+        generated: u8,
+        ladder: bool,
+    },
+}
+
+/// The draft widths worth a round of their own, up to `widest`: those whose
+/// verification (the drafts and their anchor) fills a launch row class, and
+/// `widest` itself. Any other width pays for the next class's rows and
+/// commits fewer tokens.
+pub fn draft_ladder(widest: usize) -> Vec<usize> {
+    let mut ladder = (1..=widest)
+        .filter(|width| (width + 1).is_power_of_two())
+        .collect::<Vec<_>>();
+    if widest > 0 && ladder.last() != Some(&widest) {
+        ladder.push(widest);
+    }
+    ladder
 }
 
 impl PlannedMethod {
@@ -35,12 +54,22 @@ impl PlannedMethod {
         }
     }
 
-    /// The proposals each block pass of a separate draft generates: 0 when
-    /// the method drafts no block.
-    pub fn block_proposals(self) -> u8 {
+    /// The proposal counts a block pass of a separate draft may generate, in
+    /// increasing order: none when the method drafts no block.
+    pub fn block_widths(self) -> Vec<u8> {
         match self {
-            Self::DFlash { generated, .. } => generated,
-            Self::Plain | Self::Mtp { .. } => 0,
+            Self::DFlash {
+                generated,
+                ladder: true,
+                ..
+            } => draft_ladder(usize::from(generated))
+                .into_iter()
+                .map(|width| width as u8)
+                .collect(),
+            Self::DFlash { generated, .. } => {
+                (generated > 0).then_some(generated).into_iter().collect()
+            }
+            Self::Plain | Self::Mtp { .. } => Vec::new(),
         }
     }
 

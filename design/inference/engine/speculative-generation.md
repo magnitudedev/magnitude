@@ -281,240 +281,92 @@ selected, belongs to the generation method and remains explicit and measurable.
 
 ## Shared draft budgeting
 
-MTP and external drafters use one request-owned controller over load-owned
-evidence. Its action is a pair:
-the number of proposals physically generated and the prefix offered to target
-verification. The verified count cannot exceed the generated count. Counts exclude
-the anchor and target bonus token. The method implements proposal execution and
-state reconciliation; the scheduler reports completion evidence without branching
-on the drafting algorithm.
+A round's draft budget is a pair: the proposals the drafter generates and the
+prefix of them offered to target verification. The verified count cannot exceed
+the generated count. Counts exclude the anchor and the target's bonus token. MTP
+and separate drafters share one budget mechanism; the method implements proposal
+execution and state reconciliation, and the scheduler reports launch durations
+without branching on the drafting algorithm.
 
-Fixed budgets are the default. Explicit adaptive policies name a bounded set of
-admitted actions and an initial action. When no configured action fits a round
-grant, the method runs a plain round; it does not invent a smaller physical block. The executor prepares the required physical
-shapes before readiness and includes them in assessment and memory admission.
-Changing only verification length does not create another draft graph. Unequal
-noncausal block widths cannot batch through padding: a wider block may change every
-proposal. Metadata defines attention and layout semantics, not the profitable width.
+A load's draft policy is fixed or adaptive. A drafter given neither a width nor
+a budget is adaptive over every width it has: all a separate drafter's block
+holds, or all a draft head chains. An explicit width alone is that fixed width.
 
-The controller learns from ordinary generation. It never runs device work,
-fences or transfers solely to learn; it takes another configured action for one
-round only when that round's value of information exceeds its expected cost (see
-below). It reuses each completed target matching prefix as conditional
-match evidence. A first mismatch observes one conditional failure; later suffix
-positions are unobserved. An all-matching offered prefix right-censors its unseen
-tail. Stop, terminal, forced, and invalid observations do not train continuation.
-Shortened offers can contribute their actually observed prefix without labeling
-the original action's full service cost as measured. Under deterministic (greedy,
-unshaped) selection, acceptance is equality with the selected token, so proposals a
-fully matched offer generated but did not verify are compared after the fact with
-the target's committed continuation. That completes the round's outcome for every
-wider verification of the same block at no device cost. Under sampling the
-comparison is not acceptance and contributes nothing.
+### Fixed
 
-For separate block drafters, evidence is keyed by the exact physical generated
-count. Every verification prefix of that same block shares its proposal sequence;
-changing generated count may change its first proposal. MTP explicitly permits
-chained-prefix evidence across its generated counts, because later head passes
-consume earlier selections and do not feed backward. Causal GGUF flags alone never
-authorize physical-block pooling. Target-sampling and shape-dependent numerical
-agreement remain separate qualification obligations.
+Every round takes one configured budget. A round whose grant cannot hold the
+generated count runs plain; it does not invent a smaller block. The load prepares
+exactly that generated count.
 
-Acceptance evidence is one distribution of first-mismatch positions and
-right-censored matching prefixes, owned by the loaded method and shared by all of
-its requests. It pools without forgetting while acceptance is steady. A two-sided
-e-CUSUM bets on each observed conditional match against the pooled posterior mean at
-its depth; while match probabilities are unchanged its false-alarm run length is at
-least the configured number of trials. When it alarms, evidence before the
-detector's restart is stale and is discarded, so pooling stays long in a steady
-state and reacts within a few rounds to a shift. Conditional
-match probabilities for independent block comparisons are derived from that same
-distribution. An early mismatch determines the accepted-prefix outcome for every
-longer offer without pretending that later conditional matches were observed.
-Short all-matching offers leave their unseen suffix unresolved. The paired test
-uses only offers that resolve the wider action: offer length is fixed before the
-outcome, so this selection is unbiased. Censored shorter offers (typically
-grant-clipped) are not in the paired test: the test needs each outcome's whole
-utility, and scoring the unseen suffix as its worst case would bias against
-narrowing; their observed prefix still informs conditional match evidence.
+### Adaptive
 
-The controller compares expected committed-token rewards against observed
-component-service forecasts. Confidence dominance can promote an action; when
-uncertainty remains, the same decision compares the information from an ordinary
-candidate completion with that from an ordinary incumbent completion. Missing
-coverage is priced only by the existing ordinary-round rule below. For shared-prefix actions, conservative bounds on
-the narrower action's cost and paired cost difference give a sufficient linear
-utility of the accepted-prefix outcome for the ratio of expectations. The
-confidence test uses those paired utility observations directly, preserving
-reward covariance rather than multiplying independent conditional-depth bounds.
-It never substitutes the mean of outcome-wise reward/cost products for the
-ratio-of-expectations objective. The paired test uses only observations whose
-offered prefix covers the wider action. Offer length is fixed before the outcome,
-so this selection is unbiased; a shorter, typically grant-clipped, offer neither
-resolves the comparison nor counts as its worst suffix, while its observed prefix
-still informs conditional match evidence. A right-censored observation contributes the
-least favorable utility of every still-possible suffix.
+Each round's budget is chosen from measurements of the load's own rounds.
 
-A fixed mixture of bounded likelihood bets tests positive expected utility.
-Its one-sided nominal threshold is 2.5%; stakes are fixed before observing data,
-not selected by their apparent success. Evidence discarded by a detected change
-leaves the test at neutral. The
-fixed-utility, independent stationary null justifies that single-look threshold;
-adaptive cost forecasts, repeated decisions and arbitrary drift have no claimed
-confidence guarantee. This remains advisory estimation and requires
-runtime qualification, including changes in acceptance regime and censoring.
+**Widths.** Launch rows round up to a row class, so a verification that does not
+fill its class pays for rows it does not use. The candidate widths are those whose
+verification (the proposals and their anchor) fills a class, the method's widest
+width, and none. Both counts of a budget are taken from them. The load prepares
+every candidate generated count before readiness and counts them in assessment and
+memory admission; the tuner's workload lists their launches as alternatives of
+one method. A round near the end of a request takes the widest candidate that
+fits the tokens it may still produce.
 
-Physical operation prices are grouped by actual identity before lookup. Their
-coefficients are derived from the complete conditional expected-reward and
-expected-cost contrast, retaining shared-prefix dependence. Only an exactly zero
-aggregate coefficient removes a price obligation. Identical work can cancel in a
-cost difference while still carrying a nonzero coefficient in a throughput
-contrast: the common host residual, for example, remains multiplied by the
-expected reward difference. Head identity requires the same physical entry class,
-start position and generated width; target start positions remain separate
-observations. Equal numerical estimates alone do not establish shared identity.
+**Acceptance.** Acceptance is equality with the target's selection, and the
+selection at a position is a function of the request's seed, the position and the
+logits. So the proposals a full verification would have accepted are those that
+agree with the tokens the request goes on to commit. Every drafted proposal is
+scored against them, verified or not, at no device cost, under sampling as under
+greedy selection. The controller keeps, per request, how often a block is right
+through each depth: the mean of the depth's recent blocks, never above a
+shallower depth's. A request starts from the load's latest values.
 
-A load-owned cost model prices each prepared target row class and head
-(entry rows, generated count, context) class. It does not assume verification time
-is linear in rows. Unobserved component classes or unsupported context coverage
-are explicitly unknown. No hot graph traversal, compilation, device operation, or new
-timing measurement is permitted. Ordinary isolated component completions
-fill a load-owned table keyed by actual dispatched row class, exact generated
-count, and context. These physical observations remain useful after terminal or
-grant-clipped work, even when continuation acceptance is censored. Missing classes
-remain unknown. A bounded chronological window retains actual completed samples,
-including repeated contexts. The controller compares expected service, so cached
-affine context forecasts bound the conditional mean, not one future completion:
-mean leverage scales fitted timing variation, inflated for lag-one serial
-dependence of chronological residuals, plus the magnitude of the average
-chronological miss measured before each completion entered the fit, which more
-samples cannot average away. Uncertainty grows with extrapolation distance instead of expiring
-an unused class after a fixed number of tokens. Repeated positions measure timing
-noise but cannot identify a context slope; until a second position is seen, other
-positions keep the level with a prior as wide as the level itself. Nonpositive
-predictions remain unknown. A broad startup prior applies until residual variation
-is identifiable; it does not impose a permanent fraction-of-mean uncertainty floor.
-The statistical scaling and observed-error envelope are empirical assumptions,
-not calibrated confidence guarantees, a proof of latency monotonicity, or a
-substitute for missing widths. Shared flights and
-unsupported shaping do not populate the table. Greedy unshaped masked and
-unmasked selections use separate views of the same load-owned table: target
-verification masks every row, while drafting masks only its first proposal.
-History penalties and categorical selection remain uncovered.
+A block's proposals depend on how many were generated, because bidirectional
+drafter layers see the whole block. Acceptance is nevertheless kept by depth
+alone, and corrected by the rounds that follow any change of generated count.
 
-At load, the selected configuration's qualified point measurements provide an
-immutable physical service basis. Terminal cache records retain those same
-measurements; no load repeats work to populate a forecast. Actual graph builders
-declare each invocation's service row axis, readonly capacity axes and dependence
-on visible history. Query position and visible-history length are distinct, and a
-windowed layer retains its authored history limit. The case that creates tuning
-arguments owns live-row projection onto its performance representatives. Artifact
-identity and every other geometry dimension must match; prepared capacity alone
-never establishes workload coverage. History interpolation is an empirical
-forecast over measured points, not an exact workload identity or latency bound.
+**Costs.** The load keeps the measured duration of each drafter launch by
+generated count and each target launch by rows, per context class and per number
+of requests sharing the launch. Nothing is forecast. A launch not yet measured
+costs at least what a smaller one measured, and at least what the same launch
+measured at a shorter context; a larger launch proves nothing about a smaller
+one. With nothing measured every width costs the same.
 
-Ordinary isolated completions remain the preferred component observations. They
-also calibrate the nonnegative additive residual over declared untimed work
-families and multiplicities. Transfer is available only when the alternative's
-untimed families are covered by those observations with supported multiplicity
-ratios. A union of possible graph classes is not an observed work multiset;
-different unmeasured class multisets remain unknown. Allocation uncertainty is
-persistent, supplies no acceptance or reducible service information, and cannot
-turn uncovered geometry into zero cost. These empirical forecasts permit an
-independently generated action to be evaluated without manufacturing paired
-prefix evidence, extra device probes or a mandatory exploration schedule.
+**Choice.** Expected tokens are one plus the acceptance of each verified depth;
+a round's time is its two launches. Three rules:
 
-Pending drafter entry is real work. The method supplies one actual round's
-head and target operations, accepted-prefix-dependent post-target maintenance,
-and successor boundary. It also describes the canonical causal catch-up retaining
-one anchor at the incoming and successor boundaries. The forecaster prices these
-operations; the controller charges actual round service plus successor catch-up
-value minus incoming catch-up value. This potential telescopes over ordinary
-rounds and submits no additional work for a decision. A target-reading head has
-zero private-history liability by its actual state semantics. Plain work can
-append pairs and require real zero-proposal maintenance; it is never represented
-by an invented draft-head call or a missing price treated as zero.
+1. The round takes the budget committing the most tokens per second. Once its
+   block is drafted, it verifies the prefix that does so with the drafter's
+   launch already paid. Of equal rates the narrowest wins.
+2. A width that stops being the fastest is still generated for a while, with
+   verification following rule 1. Its depths stay scored, so the text supporting
+   it again is seen in the next round. Each round a width is the fastest earns it
+   one such round, up to the rounds a look would take to return, and a kept round
+   spends more of them the less of the rate is at stake.
+3. A look is a round generating wider than rules 1 and 2 would. It is an ordinary
+   round that loses a known time to the fastest budget. It goes to the wider
+   width with the most to gain for that time, where the gain is that width's rate
+   if every proposal were right. Looks take a fixed share of decode time, scaled
+   down where little can be gained.
 
-Batch economies can make an individual potential-adjusted cost nonpositive. A
-throughput comparison is available only with finite, strictly positive supported
-conditional denominators; it never clamps an invalid denominator. Missing
-current, maintenance or potential prices remain explicit missing evidence.
-Shared flights cannot establish isolated service costs. There is no probe
-interval, trial warm-up, exploration debt, or mandatory revisit.
+The controller runs no device work solely to learn: every round it causes
+commits tokens. An unmeasured launch is tried because its bound makes it the
+fastest; a deeper depth is scored because a look or a kept width drafted it.
 
-A narrower incumbent cannot observe the tail a wider action would verify, and an
-action's service is measured only when it runs. A blanket ban on taking another
-action would make narrowing a one-way ratchet: a later rise in acceptance could
-never be seen. Instead, another configured action runs for one round only when the
-value of what it reveals exceeds its expected cost. The round is ordinary generation
-with identical output, so its only cost is the expected loss if the incumbent is in
-fact better. Its value is the probability-weighted gain if the candidate is better,
-over the remaining regime, whose expected length is its observed age since the last
-detected change. The posterior combines independent Beta conditional match
-probabilities, each with the uniform prior's weight centered on the regime's
-pooled match rate (so an unseen tail is expected to behave like the observed
-prefix), and point service forecasts whose envelopes are read as two standard
-errors. Same-group actions use their shared-prefix paired posterior. Distinct
-generated blocks use separate conditional-match posteriors, each centered only on
-its own group's observed depths. Their comparison is the sign of candidate expected
-reward times incumbent expected cost minus incumbent expected reward times candidate
-expected cost; it does not average outcome-wise throughput or manufacture matched
-outcomes across blocks. Shared-group comparisons retain joint survival-product
-moments in the ratio-of-expectations contrast; multiplying posterior means or
-averaging realized reward/cost products would lose that dependence. The predictive
-first-failure and all-match outcomes of the actual offered prefix determine the
-expected posterior decision value directly. The empirical prior remains fixed
-within the decision, and an observation updates only reached depths of its own
-group. Future entry prices retain their acceptance-dependent geometry. Identical
-physical operation coefficients cancel symbolically before missing-price lookup;
-matching numerical estimates alone do not establish identity. Continuous service
-learning uses the physical estimator's explicit normal approximation, conditioned
-on each possible prefix observation. Persistent service bias is not reducible
-information. This economic rule remains advisory, not an optimal or calibrated
-exploration guarantee.
+**Shared launches.** Requests whose drafted blocks are verified in one launch
+share its rows: the launch takes the row class committing the most tokens per
+second, and its rows go to the proposals most often right, whichever requests
+drafted them. Each request then verifies no more than its share. A drafter launch
+batches equal blocks only, so requests generating different counts draft in
+separate launches.
 
-Only uncertainty the candidate's round resolves counts: its own service and its
-own independently generated proposals, or a same-block tail no incumbent round
-or unverified proposal reveals. One round resolves
-only its share of each: about 1/(k + 1) of a posterior built from k observations
-(tail trials past the narrow prefix; the candidate's previous rounds for service).
-The value is that one round's knowledge gradient, the expected improvement of the
-decision after it, so a burst of rounds inside one short request is not justified
-by uncertainty those rounds cannot remove. A component the candidate's current
-round would measure, that the cost model cannot forecast and the incumbent's own
-round would not measure, is priced by one round; components the two share, or the
-incumbent also lacks, are priced by running the incumbent. Exploration is
-therefore rare when evidence is clear and ends by itself. Before a regime has any
-evidence the configured action stands; the prior alone never overrides it.
-After that initial evidence, a different generated group may be selected using
-its own posterior or to price a candidate-only unknown current component. No
-forced coverage round, shared-block prior, or periodic revisit is required. A candidate the posterior already favors is the Bayes action, not
-exploration, and becomes the incumbent. Configured initialization remains
-meaningful; it is not silently changed to make a benchmark favorable.
+**Guarantees and limits.**
 
-Acceptance evidence and the economic incumbent are load-owned and advisory: a new
-request starts from the load's current incumbent, and output-grant clipping never
-replaces it. Acceptance and physical service evidence are shared only within the
-same loaded model, drafter, device, and program preparation; separate loads never
-share them. Checkpoints retain numerical drafter
-obligations without learned statistics. Fixed budgets collect no controller timing.
-Existing completion boundaries supply feedback without GPU fences, logits transfers,
-or catch-up operations performed solely for learning.
-
-Qualification compares fixed action pairs, adaptive selection, and the same fixed
-policy with instrumentation disabled. Report startup graph costs, controller CPU
-cost, draft/verify/repair service, throughput, and output agreement separately.
-Removing forced exploration eliminates its extra rounds; inexpensive host arithmetic
-alone still establishes no throughput improvement. No adaptive default is enabled without this evidence.
-
-Adaptive budgeting separates physical generated proposals from the prefix offered
-for verification. One action comparison prices current service and the following
-entry implied by each accepted prefix. Shared physical components cancel before
-uncertainty is compared. The same comparison owns economic promotion and temporary
-information collection: an ordinary incumbent completion also teaches its service,
-so a candidate's information value is measured against that completion. Shared
-component observations use their net utility coefficient and are counted once.
-Acceptance censoring, deterministic later resolution of unverified tails, and
-change detection retain their existing committed-state ownership. Missing service
-coverage can justify a prepared action only when the incumbent's own completion
-would not cover it. No decision launches extra measurement work.
+- On text that one width serves throughout, decode is within the looks' share of
+  that width's rate once its launches are measured.
+- On text that changes, verification follows within the few rounds the depth
+  means take to move, and generation within the rounds a width is kept or a look
+  takes to come.
+- Measuring a load's launches costs one round per width per context class.
+- The means, the kept rounds and the looks' share are fixed constants, not
+  statistical guarantees. Acceptance that alternates faster than the means move
+  is not followed.

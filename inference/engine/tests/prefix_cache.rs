@@ -55,7 +55,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,

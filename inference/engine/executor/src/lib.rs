@@ -104,8 +104,8 @@ pub use planning::{
     StartupSlots,
     StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan, SublayerTail,
     TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, TensorOperations, VisionProgramPlan,
-    WeightPlan, WeightScalePlan, WeightStorageIdentity, image_cell_limit, resident_element,
-    resident_layout, source_element,
+    WeightPlan, WeightScalePlan, WeightStorageIdentity, draft_ladder, image_cell_limit,
+    resident_element, resident_layout, source_element,
 };
 
 /// Whether this executor runs `definition` with its draft head selected.

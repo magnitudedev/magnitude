@@ -27,14 +27,16 @@
 
 use crate::{
     method::{OpenFeature, PendingRows},
-    DraftBudget, DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
-    MethodRequirements, MethodState, Propose, Verification,
+    DraftBudget, DraftCheckpoint, DraftController, DraftLoad, DraftOutlook, Method, MethodCheckpoint,
+    MethodCheckpointError, MethodEffects, MethodRequirements, MethodState, Propose, TimedLaunch,
+    Verification,
 };
 use crate::{DraftHistory, DraftRoundState};
 use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, Operation,
     Outcome, RequestId, SelectSpec, TokenId,
 };
+use std::{sync::Arc, time::Duration};
 
 #[derive(Clone, Debug)]
 pub struct Mtp {
@@ -42,6 +44,7 @@ pub struct Mtp {
     proposals: usize,
     drafter: Drafter,
     budget: DraftBudget,
+    adaptive: Option<Arc<DraftLoad>>,
 }
 
 impl Mtp {
@@ -70,6 +73,7 @@ impl Mtp {
                 generated: proposals,
                 verified: proposals,
             },
+            adaptive: None,
         })
     }
     /// Draft and verify `budget` each round; its generated width must fit
@@ -79,6 +83,13 @@ impl Mtp {
         self.identity.push_str(&format!(":{budget:?}"));
         self.budget = budget;
         Ok(self)
+    }
+    /// Choose each round's generated and verified widths from what the
+    /// load's rounds measure, up to the proposal width.
+    pub fn adaptive(mut self) -> Self {
+        self.identity.push_str(":adaptive");
+        self.adaptive = Some(Arc::default());
+        self
     }
 }
 
@@ -119,6 +130,7 @@ impl Method for Mtp {
             self.drafter,
             self.proposals,
             self.budget,
+            self.adaptive.clone(),
             checkpoint,
         )?))
     }
@@ -190,6 +202,12 @@ pub(crate) struct DrafterState {
     /// Reconciled proposals awaiting their verification.
     proposal: Option<Vec<TokenId>>,
     budget: DraftBudget,
+    /// The controller choosing each round's widths in place of `budget`.
+    control: Option<DraftController>,
+    /// This round's generated and verified widths, once chosen: a round
+    /// started again proposes what it proposed before.
+    generated: Option<usize>,
+    verified: Option<usize>,
 }
 
 impl DrafterState {
@@ -197,6 +215,7 @@ impl DrafterState {
         drafter: Drafter,
         proposals: usize,
         budget: DraftBudget,
+        adaptive: Option<Arc<DraftLoad>>,
         checkpoint: Option<&MethodCheckpoint>,
     ) -> Result<Self, String> {
         let checkpoint = match checkpoint {
@@ -226,6 +245,9 @@ impl DrafterState {
             head: None,
             proposal: None,
             budget,
+            control: adaptive.map(|load| DraftController::new(proposals, load)),
+            generated: None,
+            verified: None,
         })
     }
 
@@ -494,12 +516,15 @@ impl MethodState for DrafterState {
 
     fn propose(&mut self, request: RequestId, selects: &[SelectSpec]) -> Propose {
         if let Some(proposal) = self.proposal.as_ref() {
-            // The budget's verified prefix is all a round offers the target.
-            let count = self
-                .budget
-                .verified
-                .min(proposal.len())
-                .min(selects.len());
+            // The verified prefix is all a round offers the target.
+            let count = match (&mut self.control, self.verified) {
+                (_, Some(verified)) => verified,
+                (Some(control), None) => control.verify(proposal.len(), selects.len()),
+                (None, None) => self.budget.verified,
+            }
+            .min(proposal.len())
+            .min(selects.len());
+            self.verified = Some(count);
             return Propose::Tokens(proposal[..count].to_vec());
         }
         let (Some(pending), None, None, false) =
@@ -510,8 +535,18 @@ impl MethodState for DrafterState {
         if pending.tokens.len() > self.entry_bound() {
             return Propose::Tokens(Vec::new());
         }
-        // A round drafts its whole generated width or nothing.
-        let generated = self.budget.generated;
+        // A round drafts its whole generated width or nothing. Launch costs
+        // depend on the history the round reads, the target's position.
+        let position = self
+            .round_state()
+            .target_position()
+            .expect("drafter state preserves its method boundary");
+        let generated = match (&mut self.control, self.generated) {
+            (_, Some(generated)) => generated,
+            (Some(control), None) => control.generate(selects.len(), position),
+            (None, None) => self.budget.generated,
+        };
+        self.generated = Some(generated);
         if generated == 0 || generated > selects.len() {
             return Propose::Tokens(Vec::new());
         }
@@ -559,6 +594,25 @@ impl MethodState for DrafterState {
             return Err(format!("{name} verification prefix is invalid"));
         }
         let transition = self.round_state().observed(accepted)?;
+        self.generated = None;
+        self.verified = None;
+        if let Some(control) = &mut self.control {
+            let mut committed = verification.inputs[1..accepted].to_vec();
+            committed.push(verification.next);
+            control.committed(&committed);
+            if std::env::var_os("MAGNITUDE_TRACE_DRAFT_WIDTH").is_some() {
+                let choice = control.choice();
+                eprintln!(
+                    "draft width request={request:?} generated={} verified={} look={} committed={} right={:.2?} measured={:.4?}",
+                    choice.generated,
+                    choice.verified,
+                    choice.look,
+                    committed.len(),
+                    control.right(),
+                    control.measured(),
+                );
+            }
+        }
         // After a replay the last replayed row's feature selected the anchor.
         if let Some(open) = self.open.take() {
             self.append(vec![verification.inputs[0]], Self::open_rows(reader, open)?)?;
@@ -625,15 +679,30 @@ impl MethodState for DrafterState {
         }
         if !proposals.is_empty() {
             self.pending = None;
-            self.proposal = Some(
-                selected
-                    .iter()
-                    .take_while(|selected| selected.status == 0)
-                    .map(|selected| selected.token)
-                    .collect(),
-            );
+            let proposal = selected
+                .iter()
+                .take_while(|selected| selected.status == 0)
+                .map(|selected| selected.token)
+                .collect::<Vec<_>>();
+            if let Some(control) = &mut self.control {
+                control.drafted(proposals.len(), &proposal);
+            }
+            self.proposal = Some(proposal);
         }
         Ok(())
+    }
+
+    fn timed(&mut self, launch: TimedLaunch, duration: Duration, sequences: usize, rows: usize) {
+        if let Some(control) = &mut self.control {
+            control.timed(launch, duration, sequences, rows);
+        }
+    }
+
+    fn outlook(&self) -> Option<DraftOutlook> {
+        match (&self.control, &self.proposal, self.verified) {
+            (Some(control), Some(_), None) => control.outlook(),
+            _ => None,
+        }
     }
 
     fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError> {
@@ -681,6 +750,8 @@ impl MethodState for DrafterState {
         self.open = None;
         self.head = None;
         self.proposal = None;
+        self.generated = None;
+        self.verified = None;
     }
 
     fn reclaimable(&self) -> u64 {

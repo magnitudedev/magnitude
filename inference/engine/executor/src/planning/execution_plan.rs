@@ -375,6 +375,7 @@ impl ExecutionPlanner {
             PlannedMethod::DFlash {
                 proposals,
                 generated,
+                ..
             } => {
                 let block = definition.draft.as_ref().map_or(
                     0,

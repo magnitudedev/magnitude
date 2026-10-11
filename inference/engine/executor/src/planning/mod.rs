@@ -15,7 +15,7 @@ pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, SealedGraphHostBytes,
 };
-pub use capabilities::{CapabilityPlan, MAX_DRAFT_PROPOSALS, PlannedMethod};
+pub use capabilities::{CapabilityPlan, MAX_DRAFT_PROPOSALS, PlannedMethod, draft_ladder};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
     BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,

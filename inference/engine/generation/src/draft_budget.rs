@@ -9,6 +9,16 @@ pub struct DraftBudget {
     pub verified: usize,
 }
 
+/// How a load's rounds take their proposal budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DraftPolicy {
+    /// Every round takes this budget.
+    Fixed(DraftBudget),
+    /// Each round's budget is chosen from what the load's rounds measure,
+    /// among the widths the load prepared up to its proposal width.
+    Adaptive,
+}
+
 impl DraftBudget {
     pub fn new(generated: usize, verified: usize) -> Result<Self, String> {
         if verified > generated || generated > u8::MAX as usize {

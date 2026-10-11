@@ -146,10 +146,9 @@ impl GraphInvocationDemand {
                 greedy_proposals,
                 sampled_proposals,
             } => (1..=u64::from(greedy_proposals.max(sampled_proposals))).collect(),
-            PlannedMethod::DFlash { generated, .. } => (generated > 0)
-                .then(|| u64::from(generated))
-                .into_iter()
-                .collect(),
+            PlannedMethod::DFlash { .. } => {
+                method.block_widths().into_iter().map(u64::from).collect()
+            }
         };
         // Each slot is a sequence: a launch over `slots` of them has that
         // many sequences' rows, whatever its rows per slot.

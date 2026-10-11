@@ -122,7 +122,12 @@ def measurement_options(parser: argparse.ArgumentParser) -> None:
                                 f"(`run` default: {KERNEL_CACHE_ROOT})")
     magnitude.add_argument("--magnitude-prefill-tokens", type=int)
     magnitude.add_argument("--magnitude-mtp-proposals", type=int)
-    magnitude.add_argument("--magnitude-draft-budget", help="exact draft-budget JSON")
+    magnitude.add_argument("--magnitude-draft-budget",
+                           help="exact draft-budget JSON, or `adaptive`")
+    magnitude.add_argument("--magnitude-alpha", type=float,
+                           help="the numerical profile's α; the engine's standard when unset")
+    magnitude.add_argument("--magnitude-method", choices=("mtp",),
+                           help="draft with the target's own head in place of the catalog drafter")
     llama = parser.add_argument_group("llama.cpp")
     llama.add_argument("--llama-binary", type=Path, help="llama-server (default: PATH)")
     llama.add_argument("--llama-draft-proposals", type=int, default=3)
@@ -182,6 +187,8 @@ def engine_options(args: argparse.Namespace) -> EngineOptions:
         prefill_tokens=args.magnitude_prefill_tokens,
         mtp_proposals=args.magnitude_mtp_proposals,
         draft_budget=args.magnitude_draft_budget,
+        method=args.magnitude_method,
+        alpha=args.magnitude_alpha,
         tuning_seconds=args.tuning_seconds,
         fresh_tuning=args.fresh_tuning,
         tuning_trace=not args.no_tuning_trace,

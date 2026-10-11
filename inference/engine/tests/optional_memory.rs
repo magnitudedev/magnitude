@@ -49,7 +49,7 @@ fn plain_owner(
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
@@ -309,7 +309,7 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(4),
             kv_codec: KvCodec::AffineK8V4,
@@ -440,7 +440,7 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(4),
             kv_codec: KvCodec::AffineK8V4,
@@ -534,7 +534,7 @@ fn admission_reclaims_under_a_real_process_limit() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
@@ -784,7 +784,7 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,

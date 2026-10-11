@@ -936,8 +936,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     } = operation
                     {
                         if !proposals.is_empty()
-                            && usize::from(self.execution.policy().method().block_proposals())
-                                != proposals.len()
+                            && !self
+                                .execution
+                                .policy()
+                                .method()
+                                .block_widths()
+                                .iter()
+                                .any(|width| usize::from(*width) == proposals.len())
                         {
                             return Err(DomainError::Input(
                                 "draft width was not prepared by this load".into(),

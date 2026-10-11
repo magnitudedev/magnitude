@@ -42,8 +42,15 @@ class MagnitudeOptions(Record):
     prefill_tokens: int | None = Field(default=None, gt=0)
     #: Proposals per draft for the catalog drafter; the engine's own when unset.
     mtp_proposals: int | None = Field(default=None, gt=0)
-    #: Exact engine draft-budget JSON, preserved in run identity.
+    #: Exact engine draft-budget JSON, or ``adaptive``, preserved in run identity.
     draft_budget: str | None = None
+    #: The engine draft method that drafts with the target's own head (``mtp``) in place of
+    #: the catalog drafter.
+    method: Literal["mtp"] | None = None
+    #: The numerical profile's α (how far an admitted kernel may move a result from its
+    #: default's); the engine's standard when unset. A value near zero admits only kernels that
+    #: move almost nothing.
+    alpha: float | None = Field(default=None, gt=0)
     #: Seconds the first load spends tuning; the engine's standard budget when unset.
     tuning_seconds: float | None = Field(default=None, gt=0)
     #: Tune the run's first launch afresh, ignoring stored results (compiled kernels are kept).

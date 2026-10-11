@@ -24,7 +24,7 @@ def build(family: Family, *, count: int = 8, queries: int = 4) -> list[Fixture]:
     """
     if family == "tools":
         return tools.build(*tools.load(), count=count)
-    if family in ("prose-continue", "prose-repeat"):
+    if family in ("prose-continue", "prose-repeat", "prose-shift"):
         return prose.build(*prose.load(), family, count=count)
     if family == "retrieval":
         return retrieval.build(count=count, queries=queries)

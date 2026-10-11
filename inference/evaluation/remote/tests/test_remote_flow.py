@@ -43,11 +43,24 @@ def test_pool_and_host_names_must_not_collide(tmp_path):
         Hosts.load(path)
 
 
+def test_lock_holder_names_the_agent_session_and_checkout(monkeypatch):
+    monkeypatch.setattr(flow.getpass, "getuser", lambda: "user")
+    monkeypatch.setattr(flow.socket, "gethostname", lambda: "machine")
+    for _, name in flow.AGENT_SESSIONS:
+        monkeypatch.delenv(name, raising=False)
+    checkout = sync.INFERENCE.parent.name
+    assert flow._who() == f"{checkout} user@machine"
+    monkeypatch.setenv("CODEX_THREAD_ID", "thread-1")
+    assert flow._who() == f"codex:thread-1 {checkout} user@machine"
+    monkeypatch.delenv("CODEX_THREAD_ID")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "session-1")
+    assert flow._who() == f"claude:session-1 {checkout} user@machine"
+
+
 def test_manifest_excludes_native_submodule_and_build_outputs():
     paths = sync.manifest()
     assert "Cargo.toml" in paths
     assert "evaluation/remote/hosts.example.json" in paths
-    assert "evaluation/remote/hosts.json" not in paths
     assert any(p.startswith("engine/templates/native/") for p in paths)
     assert not any(p == "native" or p.startswith("native/") for p in paths)
     assert not any("target" in p.split("/")[:-1] for p in paths)

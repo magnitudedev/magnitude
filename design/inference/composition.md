@@ -88,8 +88,9 @@ and method resolution.
 
 An explicitly configured draft-budget policy is shared by MTP and separate
 block drafters. It names generated proposal counts and verified prefix counts
-within the admitted method cap. The default retains the fixed method width;
-adaptive candidates are opt-in and validated before worker construction. The
+within the admitted method cap. A drafter given neither a width nor a budget is
+adaptive over every width it has; an explicit width alone is that fixed width,
+and an explicit budget is validated before worker construction. The
 resolved policy crosses the worker boundary and contributes to generation-method
 identity. Plain fallback discards the optional draft policy. Kernel preparation
 still covers the admitted cap; selecting a budget never triggers compilation.

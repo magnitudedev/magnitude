@@ -15,7 +15,7 @@ use magnitude_engine::chat::SessionLimits;
 use magnitude_engine::composition::{EngineConfiguration, start_in_process};
 use magnitude_engine::invocation::{InvocationSource, SingleEngine};
 use magnitude_engine::options::{
-    DraftBudget, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+    DraftPolicy, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
     standard_service_limits,
 };
 use magnitude_engine::telemetry::{DEFAULT_TRACES_ENDPOINT, Telemetry};
@@ -45,7 +45,7 @@ struct Options {
     prefill_tokens: usize,
     method: ModelMethod,
     mtp_proposals: Option<u8>,
-    draft_budget: Option<DraftBudget>,
+    draft_policy: Option<DraftPolicy>,
     kv_codec: KvCodec,
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     lookahead: bool,
@@ -58,7 +58,7 @@ struct Options {
 
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
-[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] [--draft-budget JSON] \
+[--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
 [--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--lookahead on|off] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
 [--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
@@ -102,7 +102,7 @@ fn parse() -> Result<Options, String> {
     let mut prefill_tokens = standard_service_limits().prefill_tokens;
     let mut method = ModelMethod::Auto;
     let mut mtp_proposals = None;
-    let mut draft_budget = None;
+    let mut draft_policy = None;
     let mut kv_codec = defaults.kv_codec;
     let mut numerical_profile = defaults.numerical_profile;
     let mut lookahead = defaults.lookahead;
@@ -139,10 +139,15 @@ fn parse() -> Result<Options, String> {
             }
             "--mtp-proposals" => mtp_proposals = Some(number(&flag, &mut args)?),
             "--draft-budget" => {
-                draft_budget = Some(
-                    serde_json::from_str(&value(&flag, &mut args)?)
-                        .map_err(|error| format!("--draft-budget: {error}"))?,
-                );
+                let budget = value(&flag, &mut args)?;
+                draft_policy = Some(if budget == "adaptive" {
+                    DraftPolicy::Adaptive
+                } else {
+                    DraftPolicy::Fixed(
+                        serde_json::from_str(&budget)
+                            .map_err(|error| format!("--draft-budget: {error}"))?,
+                    )
+                });
             }
             "--kv-codec" => kv_codec = value(&flag, &mut args)?.parse()?,
             "--numerical-profile" => {
@@ -201,7 +206,7 @@ fn parse() -> Result<Options, String> {
         prefill_tokens,
         method,
         mtp_proposals,
-        draft_budget,
+        draft_policy,
         kv_codec,
         numerical_profile,
         lookahead,
@@ -329,7 +334,7 @@ fn run() -> Result<(), String> {
             draft: options.draft,
         },
         model: ModelPolicy {
-            draft_budget: options.draft_budget,
+            draft_policy: options.draft_policy,
             method: options.method,
             mtp_proposals: options.mtp_proposals,
             kv_codec: options.kv_codec,

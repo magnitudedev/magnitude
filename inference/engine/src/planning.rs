@@ -7,7 +7,7 @@
 //! tensor directory (a header-only open is sufficient), the model
 //! definition, the resolved model policy and the service limits.
 
-use crate::options::{ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
+use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
     image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection,
@@ -105,13 +105,24 @@ fn planner_inputs(
             greedy_proposals,
             sampled_proposals,
         },
-        // A block pass drafts exactly the budget's generated width.
-        ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash {
-            proposals,
-            generated: manifest
-                .model
-                .draft_budget
-                .map_or(proposals, |budget| budget.generated as u8),
+        // A block pass drafts exactly a fixed budget's generated width, or
+        // any width an adaptive load may choose.
+        ResolvedMethod::DFlash { proposals } => match manifest.model.draft_policy {
+            Some(DraftPolicy::Fixed(budget)) => PlannedMethod::DFlash {
+                proposals,
+                generated: budget.generated as u8,
+                ladder: false,
+            },
+            Some(DraftPolicy::Adaptive) => PlannedMethod::DFlash {
+                proposals,
+                generated: proposals,
+                ladder: true,
+            },
+            None => PlannedMethod::DFlash {
+                proposals,
+                generated: proposals,
+                ladder: false,
+            },
         },
     };
     let image_cells = image_cell_limit(&manifest.definition, manifest.service.launch_rows())
@@ -170,7 +181,7 @@ mod tests {
 
     fn model(exported_logits_rows: usize) -> ResolvedModelPolicy {
         ResolvedModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ResolvedMethod::Plain,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,

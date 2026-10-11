@@ -239,7 +239,7 @@ impl AssessmentGraphResourceBounds {
                     crate::programs::native_draft::draft_graph_classes(
                         limits,
                         method.draft_rows(),
-                        method.block_proposals(),
+                        &method.block_widths(),
                         draft,
                     )?,
                 )?;
@@ -1534,6 +1534,7 @@ mod tests {
                 PlannedMethod::DFlash {
                     proposals: 1,
                     generated: 1,
+                    ladder: false,
                 },
                 KvCodec::Dense,
                 limits,

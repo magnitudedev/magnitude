@@ -12,10 +12,8 @@ use magnitude_executor::{
 };
 use magnitude_family_contracts::{DraftVariant, HeadHistory, ModelDefinition, ModelFamily};
 use magnitude_generation::{DFlash, Method, Mtp, Plain};
-pub use magnitude_generation::DraftBudget;
+pub use magnitude_generation::{DraftBudget, DraftPolicy};
 
-/// MTP width when none is requested.
-const DEFAULT_PROPOSALS: u8 = 3;
 use crate::census::AllocationCensus;
 use magnitude_scheduler::ServiceLimits;
 use magnitude_state::KvCodec;
@@ -93,13 +91,14 @@ impl ModelMethod {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPolicy {
-    /// The proposals each round generates and offers to verification. None
-    /// generates and offers the method's whole proposal width.
-    pub draft_budget: Option<DraftBudget>,
+    /// How each round takes the proposals it generates and offers to
+    /// verification. None with an explicit `mtp_proposals` generates and
+    /// offers that whole width every round. None without one is adaptive.
+    pub draft_policy: Option<DraftPolicy>,
     pub method: ModelMethod,
     /// Explicit proposal width of the drafter (MTP or DFlash) for both greedy
-    /// and sampled requests. When absent, the measured fixed-width policy is
-    /// resolved from model shape.
+    /// and sampled requests. When absent, the width is the widest the drafter
+    /// has: all a separate draft's block holds, or all a head chains.
     pub mtp_proposals: Option<u8>,
     pub kv_codec: KvCodec,
     /// Queue each plain decode step's successor on the device before the
@@ -117,7 +116,7 @@ impl Default for ModelPolicy {
     fn default() -> Self {
         Self {
             method: ModelMethod::Auto,
-            draft_budget: None,
+            draft_policy: None,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: true,
@@ -202,7 +201,7 @@ impl ResolvedMethod {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedModelPolicy {
-    pub draft_budget: Option<DraftBudget>,
+    pub draft_policy: Option<DraftPolicy>,
     pub method: ResolvedMethod,
     #[serde(with = "KvCodecEncoding")]
     pub kv_codec: KvCodec,
@@ -214,13 +213,21 @@ pub struct ResolvedModelPolicy {
 
 impl ResolvedModelPolicy {
     pub fn factory(&self, artifact_identity: &str) -> Result<Arc<dyn Method>, String> {
-        match (self.method, self.draft_budget) {
-            (ResolvedMethod::Mtp { history, .. }, Some(budget)) => Ok(Arc::new(
-                mtp(history, artifact_identity, self.method.proposals())?.with_budget(budget)?,
-            )),
-            (ResolvedMethod::DFlash { .. }, Some(budget)) => Ok(Arc::new(
-                DFlash::new(artifact_identity, self.method.proposals())?.with_budget(budget)?,
-            )),
+        match (self.method, self.draft_policy) {
+            (ResolvedMethod::Mtp { history, .. }, Some(policy)) => {
+                let method = mtp(history, artifact_identity, self.method.proposals())?;
+                Ok(Arc::new(match policy {
+                    DraftPolicy::Fixed(budget) => method.with_budget(budget)?,
+                    DraftPolicy::Adaptive => method.adaptive(),
+                }))
+            }
+            (ResolvedMethod::DFlash { .. }, Some(policy)) => {
+                let method = DFlash::new(artifact_identity, self.method.proposals())?;
+                Ok(Arc::new(match policy {
+                    DraftPolicy::Fixed(budget) => method.with_budget(budget)?,
+                    DraftPolicy::Adaptive => method.adaptive(),
+                }))
+            }
             _ => self.method.factory(artifact_identity),
         }
     }
@@ -247,7 +254,7 @@ impl ModelPolicy {
         if draft_unavailable.is_some() && drafts_with_separate {
             return Self {
                 method: ModelMethod::Plain,
-                draft_budget: None,
+                draft_policy: None,
                 mtp_proposals: None,
                 ..self.clone()
             }
@@ -259,17 +266,28 @@ impl ModelPolicy {
     pub fn resolve(&self, definition: &ModelDefinition) -> Result<ResolvedModelPolicy, String> {
         definition.validate().map_err(|error| error.to_string())?;
         let method = resolve_method(self.method, self.mtp_proposals, definition)?;
-        if let Some(budget) = &self.draft_budget {
+        if let Some(policy) = &self.draft_policy {
             if method == ResolvedMethod::Plain {
-                return Err("draft_budget requires an admitted speculative method".into());
+                return Err("draft_policy requires an admitted speculative method".into());
             }
-            budget.validate(method.proposals())?;
+            if let DraftPolicy::Fixed(budget) = policy {
+                budget.validate(method.proposals())?;
+            }
         }
         if let Some(profile) = &self.numerical_profile {
             profile.resolve()?;
         }
+        // A drafter given neither a width nor a budget chooses each round's
+        // budget itself. An explicit width alone is that fixed width.
+        let adaptive = method != ResolvedMethod::Plain
+            && self.mtp_proposals.is_none()
+            && self.draft_policy.is_none();
         Ok(ResolvedModelPolicy {
-            draft_budget: self.draft_budget,
+            draft_policy: if adaptive {
+                Some(DraftPolicy::Adaptive)
+            } else {
+                self.draft_policy
+            },
             method,
             kv_codec: self.kv_codec,
             // A per-layer entry gathers host-table rows by host tokens, so
@@ -475,7 +493,9 @@ fn resolve_method(
                 ));
             }
             Some(width) => width,
-            None => DEFAULT_PROPOSALS.min(bound),
+            // Unless a width is asked for, a separate draft's rounds choose
+            // theirs among all its block holds (`ModelPolicy::resolve`).
+            None => bound,
         };
         return Ok(ResolvedMethod::DFlash { proposals });
     }
@@ -502,7 +522,9 @@ fn resolve_method(
             return Err(format!("mtp_proposals exceeds {MAX_DRAFT_PROPOSALS}"));
         }
         Some(width) => (width, width),
-        None => (DEFAULT_PROPOSALS, DEFAULT_PROPOSALS),
+        // Unless a width is asked for, a head's rounds choose theirs among
+        // all it chains (`ModelPolicy::resolve`).
+        None => (MAX_DRAFT_PROPOSALS, MAX_DRAFT_PROPOSALS),
     };
     Ok(ResolvedMethod::Mtp {
         greedy_proposals,
@@ -664,11 +686,20 @@ pub(crate) mod tests {
         ] {
             let policy = ModelPolicy {
                 method,
-                draft_budget: Some(budget),
+                draft_policy: Some(DraftPolicy::Fixed(budget)),
                 ..ModelPolicy::default()
             };
             let resolved = policy.resolve(&model).unwrap();
-            assert_eq!(resolved.draft_budget, Some(budget));
+            assert_eq!(resolved.draft_policy, Some(DraftPolicy::Fixed(budget)));
+            let adaptive = ModelPolicy {
+                draft_policy: Some(DraftPolicy::Adaptive),
+                ..policy.clone()
+            }
+            .resolve(&model)
+            .unwrap()
+            .factory("test")
+            .unwrap();
+            assert!(adaptive.identity().ends_with(":adaptive"));
             let configured = resolved.factory("test").unwrap();
             let default = ModelPolicy {
                 method,
@@ -685,17 +716,18 @@ pub(crate) mod tests {
                 resolved
             );
             let over = ModelPolicy {
-                draft_budget: Some(DraftBudget {
-                    generated: 4,
+                // Wider than a head chains and than this draft's block holds.
+                draft_policy: Some(DraftPolicy::Fixed(DraftBudget {
+                    generated: usize::from(MAX_DRAFT_PROPOSALS) + 1,
                     verified: 1,
-                }),
+                })),
                 ..policy
             };
             assert!(over.resolve(&model).is_err());
         }
         let plain = ModelPolicy {
             method: ModelMethod::Plain,
-            draft_budget: Some(budget),
+            draft_policy: Some(DraftPolicy::Fixed(budget)),
             ..ModelPolicy::default()
         };
         assert!(plain.resolve(&definition(false)).is_err());
@@ -722,7 +754,7 @@ pub(crate) mod tests {
                     ))
                 )
                 .unwrap()
-                .draft_budget
+                .draft_policy
                 .is_none()
         );
     }
@@ -805,11 +837,12 @@ pub(crate) mod tests {
         assert_eq!(
             mtp.method,
             ResolvedMethod::Mtp {
-                greedy_proposals: DEFAULT_PROPOSALS,
-                sampled_proposals: DEFAULT_PROPOSALS,
+                greedy_proposals: MAX_DRAFT_PROPOSALS,
+                sampled_proposals: MAX_DRAFT_PROPOSALS,
                 history: HeadHistory::Own,
             }
         );
+        assert_eq!(mtp.draft_policy, Some(DraftPolicy::Adaptive));
     }
 
     #[test]
@@ -872,6 +905,29 @@ pub(crate) mod tests {
                 ResolvedMethod::DFlash { proposals: 3 }
             );
         }
+        // Given neither a width nor a budget, a separate draft's rounds
+        // choose their own; a width alone is that fixed width.
+        assert_eq!(
+            policy(ModelMethod::Auto).resolve(&draft).unwrap().draft_policy,
+            Some(DraftPolicy::Adaptive)
+        );
+        let fixed = ModelPolicy {
+            mtp_proposals: Some(2),
+            ..ModelPolicy::default()
+        }
+        .resolve(&draft)
+        .unwrap();
+        assert_eq!(
+            (fixed.method, fixed.draft_policy),
+            (ResolvedMethod::DFlash { proposals: 2 }, None)
+        );
+        assert_eq!(
+            policy(ModelMethod::Mtp)
+                .resolve(&definition(true))
+                .unwrap()
+                .draft_policy,
+            Some(DraftPolicy::Adaptive)
+        );
         for method in [ModelMethod::DSpark, ModelMethod::DFlash2] {
             let error = policy(method).resolve(&draft).unwrap_err();
             assert!(error.contains("the package's draft is DFlash"), "{error}");

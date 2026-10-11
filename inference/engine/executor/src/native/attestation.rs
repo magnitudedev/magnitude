@@ -491,7 +491,7 @@ impl AttestedPrograms {
             let classes = crate::programs::native_draft::draft_graph_classes(
                 limits,
                 proposals,
-                method.block_proposals(),
+                &method.block_widths(),
                 draft,
             )?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(

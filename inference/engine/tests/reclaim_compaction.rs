@@ -34,7 +34,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: std::env::var("MAGNITUDE_TEST_KV_CODEC")

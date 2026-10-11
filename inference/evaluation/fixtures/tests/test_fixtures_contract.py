@@ -31,6 +31,7 @@ def families(interactions, book, files):
         "tools": lambda: tools.build(interactions, SOURCE, count=2),
         "prose-continue": lambda: prose.build(book, SOURCE, "prose-continue", count=2),
         "prose-repeat": lambda: prose.build(book, SOURCE, "prose-repeat", count=2),
+        "prose-shift": lambda: prose.build(book, SOURCE, "prose-shift", count=2),
         "retrieval": lambda: retrieval.build(count=2, queries=2),
         "code": lambda: code.build(files, SOURCE, count=2),
     }

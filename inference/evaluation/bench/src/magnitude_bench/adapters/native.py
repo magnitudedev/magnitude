@@ -11,6 +11,7 @@ kernel cache root, or exactly ``cache_dir``), so later launches reuse stored tun
 the run tunes afresh.
 """
 
+import json
 import os
 
 import httpx
@@ -32,8 +33,10 @@ class Native(Adapter):
 
     @property
     def drafting(self) -> str | None:
+        if not self.options.drafting:
+            return None
         drafter = self.acquisition.drafter
-        return drafter.method if self.options.drafting and drafter is not None else None
+        return self.magnitude.method or (drafter.method if drafter is not None else None)
 
     async def prepare(self):
         binary = self.magnitude.binary
@@ -68,9 +71,11 @@ class Native(Adapter):
     def generation(self) -> list[str]:
         """The catalog drafter, or plain decoding when drafting is off or none is declared."""
         drafter = self.acquisition.drafter
-        if self.drafting is None or drafter is None:
+        if self.drafting is None or (drafter is None and self.magnitude.method is None):
             return ["--method", "plain"]
-        if self.acquisition.embedded_drafter:
+        if self.magnitude.method is not None:
+            arguments = ["--method", self.magnitude.method]
+        elif self.acquisition.embedded_drafter:
             arguments = ["--method", drafter.method]
         else:
             arguments = ["--method", drafter.method, "--draft", str(drafter.path)]
@@ -113,6 +118,10 @@ class Native(Adapter):
             *self.generation(),
             *self.tuning(),
         ]
+        if magnitude.alpha is not None:
+            profile = self.store.path / "numerical-profile.json"
+            profile.write_text(json.dumps({"alpha": magnitude.alpha}))
+            arguments += ["--numerical-profile", str(profile)]
         self.launches += 1
         return arguments
 

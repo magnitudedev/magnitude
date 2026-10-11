@@ -54,6 +54,8 @@ CATALOG_ACQUIRE = (
 )
 PROBED_TOOLS = ("uv",)  # `{uv}` resolves to the host's own executable, probed on use
 COMPILER = "RUSTC_WORKSPACE_WRAPPER"  # cargo runs rustc for workspace crates through it
+# The environment variable each coding agent gives its commands to identify its session.
+AGENT_SESSIONS = (("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"))
 OutputSink = Callable[[str, str, str], None]  # (step, stream, text)
 
 
@@ -233,7 +235,10 @@ def new_run_id(tool: str) -> str:
 
 
 def _who() -> str:
-    return f"{getpass.getuser()}@{socket.gethostname()}"
+    """The lock holder as other sessions see it: the coding agent session running this, when
+    there is one, then the checkout's directory name, then the user and machine."""
+    sessions = [f"{agent}:{os.environ[name]}" for agent, name in AGENT_SESSIONS if name in os.environ]
+    return " ".join([*sessions, sync.INFERENCE.parent.name, f"{getpass.getuser()}@{socket.gethostname()}"])
 
 
 def _report_holder(alias: str, log: Callable[[str], None]) -> Callable[[dict | None, int], None]:

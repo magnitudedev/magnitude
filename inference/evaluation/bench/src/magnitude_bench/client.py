@@ -190,7 +190,7 @@ async def measure(
                         f"response carries {len(reasoned)} characters of reasoning text "
                         "although the request disables thinking",
                     )
-                elif request.family in ("prose-continue", "prose-repeat"):
+                elif request.family in ("prose-continue", "prose-repeat", "prose-shift"):
                     if calls or generated < 1:
                         raise ValueError(
                             "prose response must report generated tokens and no tool calls"

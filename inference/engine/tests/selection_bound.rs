@@ -48,7 +48,7 @@ fn plain_owner(limits: ServiceLimits) -> (Host, usize, std::sync::Arc<ByteBpeTok
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
@@ -205,7 +205,7 @@ fn plain_domain(bound: usize, exported: usize) -> (ExecutorDomain, StateBindings
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,

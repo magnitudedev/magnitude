@@ -507,7 +507,8 @@ Unequal physical block widths form separate execution groups because padding can
 change noncausal predictions. Block rows append nowhere.
 The planned separate-draft method records the sorted, distinct positive generated
 proposal counts its configured policy may choose. Only those physical block
-sizes are prepared, with a singleton for the default fixed width; verification
+sizes are prepared: one for a fixed width, and for the adaptive default every
+width whose verification fills a launch row class; verification
 prefix choices add no block graph classes. A short output grant selects an
 eligible configured action or plain decoding, never an unprepared physical size.
 Entry/catch-up capacity remains bounded by the load's proposal cap, since the

@@ -305,7 +305,7 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
             let classes = crate::programs::native_draft::draft_graph_classes(
                 LIMITS,
                 proposals as usize,
-                generated,
+                &[generated][..usize::from(generated > 0)],
                 definition.draft.as_ref().unwrap(),
             )
             .unwrap();
@@ -323,6 +323,7 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
         let method = PlannedMethod::DFlash {
             proposals,
             generated: proposals,
+            ladder: false,
         };
         for backend in BACKENDS {
             let context = format!("{draft_file} {}", backend.as_str());

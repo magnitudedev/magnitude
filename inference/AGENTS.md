@@ -26,6 +26,11 @@ for that cost.
 across all of them, so that independent work runs at the same time. An idle machine is time lost.
 Keep expensive work off the local machine.
 
+**Take a host through its lock, by pool.** Run on the machines only through the evaluation flow,
+never over ssh directly, and name a pool rather than one host unless the work needs that specific
+machine. A pool run takes whichever member frees first. `magnitude-remote status` shows who holds
+and who waits on each host: the agent session, its checkout, and its run.
+
 ## Autonomy
 
 **Act with full autonomy.** Make the decisions the work requires and keep going. Do what has been

@@ -36,7 +36,9 @@ use magnitude_executor::{
     SubmitFailure, WorkKind, platform::DomainRole,
 };
 use magnitude_family_contracts::PreparedModelInput;
-use magnitude_generation::{FinishReason, Generation, OutputToken, RoundStart, StartedRound};
+use magnitude_generation::{
+    FinishReason, Generation, OutputToken, RoundStart, StartedRound, TimedLaunch,
+};
 use magnitude_state::ShrinkPolicy;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -1617,6 +1619,30 @@ impl<F: ProgramFamily> Service<F> {
         let mut attempted = 0;
         let mut members = BTreeMap::new();
         let mut operations = Vec::new();
+        // Requests whose drafted blocks await verification share the launch
+        // that verifies them: its rows go to the proposals most often right,
+        // whichever request drafted them.
+        let drafted = selection
+            .requests()
+            .iter()
+            .filter_map(|id| Some((*id, candidates[id].1.generation().draft_outlook()?)))
+            .collect::<Vec<_>>();
+        let outlooks = drafted
+            .iter()
+            .map(|(_, outlook)| outlook.clone())
+            .collect::<Vec<_>>();
+        let shares = magnitude_generation::share_rows(
+            &outlooks,
+            remaining_rows * drafted.len() / selection.requests().len().max(1),
+        )
+        .map(|shares| {
+            drafted
+                .iter()
+                .map(|(id, _)| *id)
+                .zip(shares)
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
         for &id in selection.requests() {
             if remaining_rows == 0 {
                 break;
@@ -1624,7 +1650,11 @@ impl<F: ProgramFamily> Service<F> {
             // Share the remaining rows across requests still eligible in this
             // round. A lone request can use the whole budget, while peers get
             // compatible chunks instead of the first request consuming it.
-            let allowance = remaining_rows.div_ceil(selection.requests().len() - attempted);
+            let allowance = shares
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| remaining_rows.div_ceil(selection.requests().len() - attempted))
+                .min(remaining_rows);
             attempted += 1;
             let (record, candidate) = candidates.remove(&id).expect("selected candidate");
             // Work composed before this round joins as it is, or waits.
@@ -2351,6 +2381,8 @@ impl<F: ProgramFamily> Service<F> {
             ));
         }
         let mut followups = Vec::new();
+        let sequences = pending.len();
+        let rows = operations.iter().map(Operation::row_count).sum::<usize>();
         for item in pending {
             let request = item.request();
             if !matches!(expected[&request], Operation::Forward { .. }) {
@@ -2364,7 +2396,8 @@ impl<F: ProgramFamily> Service<F> {
             };
             record.add_physical_duration(item.physical_duration());
             let state = match state {
-                Membership::Started(started) if !ended(started.generation()) => {
+                Membership::Started(mut started) if !ended(started.generation()) => {
+                    started.timed(TimedLaunch::Target, item.physical_duration(), sequences, rows);
                     match reconcile_forward(started, &mut self.domain, request, item) {
                         Ok((generation, effects)) => {
                             followups.extend(effects.operations);
@@ -2428,6 +2461,8 @@ impl<F: ProgramFamily> Service<F> {
                 "method outcomes do not match submitted requests".into(),
             ));
         }
+        let sequences = pending.len();
+        let rows = operations.iter().map(Operation::row_count).sum::<usize>();
         for item in pending {
             let request = item.request();
             let operation = expected[&request];
@@ -2457,6 +2492,9 @@ impl<F: ProgramFamily> Service<F> {
                     ),
                 );
                 continue;
+            }
+            if matches!(operation, Operation::Head { proposals, .. } if !proposals.is_empty()) {
+                generation.timed(TimedLaunch::Draft, item.physical_duration(), sequences, rows);
             }
             let transition = match generation.prepare_method_transition(operation, item.outcome()) {
                 Ok(transition) => transition,

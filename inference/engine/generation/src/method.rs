@@ -1,7 +1,9 @@
+use crate::{DraftOutlook, TimedLaunch};
 use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, FeatureRows, Operation, Outcome, RequestId, SelectSpec,
     TokenId, WeakFeatureRef,
 };
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MethodChoice {
@@ -200,6 +202,15 @@ pub trait MethodState {
     ) -> Result<MethodEffects, String>;
     /// Consume the outcome of the exact operation `propose` returned.
     fn reconcile(&mut self, operation: &Operation, outcome: Outcome) -> Result<(), String>;
+    /// A launch carrying this request's work finished in `duration`: `rows`
+    /// rows of `sequences` requests.
+    fn timed(&mut self, _launch: TimedLaunch, _duration: Duration, _sequences: usize, _rows: usize) {
+    }
+    /// The drafted block this request's next target round verifies, when
+    /// the method chooses how much of it to verify.
+    fn outlook(&self) -> Option<DraftOutlook> {
+        None
+    }
     fn checkpoint(&self) -> Result<MethodCheckpoint, MethodCheckpointError>;
     fn evict(&mut self);
     fn reclaimable(&self) -> u64;

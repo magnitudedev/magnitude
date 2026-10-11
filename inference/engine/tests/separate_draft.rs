@@ -17,7 +17,7 @@ use magnitude_engine::{
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
     options::{
-        standard_service_limits, DraftBudget, ModelMethod, ModelPolicy, PackageOptions,
+        standard_service_limits, DraftBudget, DraftPolicy, ModelMethod, ModelPolicy, PackageOptions,
         ProjectorSelection,
     },
 };
@@ -52,9 +52,11 @@ fn policy() -> ModelPolicy {
         } else {
             ModelPolicy::default().kv_codec
         },
-        draft_budget: test_width().map(|width| DraftBudget {
-            generated: width,
-            verified: width,
+        draft_policy: test_width().map(|width| {
+            DraftPolicy::Fixed(DraftBudget {
+                generated: width,
+                verified: width,
+            })
         }),
         method: method(),
         ..ModelPolicy::default()

@@ -5,7 +5,8 @@
   ``null`` is among its allowed values (BFCL possible-answer semantics).
 - ``retrieval``: ``{"values": {key: value}}``. The answer must be a JSON object of strings
   with no duplicate keys; it is exact when it equals the expected values.
-- ``prose-repeat``: ``{"text": …}`` is the canonical repeat; ``prose-continue``: ``{}``.
+- ``prose-repeat``: ``{"text": …}`` is the canonical repeat; ``prose-shift``: ``{"text": …}``
+  is the words its answer repeats before and after new writing; ``prose-continue``: ``{}``.
   Prose answers are valid when they contain text; the serving benchmark judges finish
   reasons against its output budget.
 """

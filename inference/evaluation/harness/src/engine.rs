@@ -93,7 +93,7 @@ pub fn configuration(
             draft,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: if load.drafter {
                 ModelMethod::Auto
             } else {

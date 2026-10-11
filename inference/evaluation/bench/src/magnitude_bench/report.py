@@ -192,6 +192,10 @@ def markdown(summary: dict) -> str:
             "prose-repeat": "Prose repeat: each request repeats a Moby Dick passage back; no "
             "answer-quality scoring. EOS or reaching the output budget ends a valid "
             "measurement; actual lengths are in summary.json.",
+            "prose-shift": "Prose shift: each request repeats the end of a Moby Dick passage, "
+            "writes new prose, and repeats the same words again; no answer-quality scoring. "
+            "EOS or reaching the output budget ends a valid measurement; actual lengths are "
+            "in summary.json.",
             "tools": "BFCL-derived tool correctness; not an official BFCL leaderboard score. "
             "Context rows may include semantically invalid responses with complete protocol "
             "evidence; all other sections require valid semantics.",

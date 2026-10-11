@@ -37,7 +37,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
+            draft_policy: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(PROPOSALS),
             kv_codec: KvCodec::AffineK8V4,

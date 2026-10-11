@@ -1,4 +1,5 @@
-"""Reading sessions over the pinned Moby Dick text: ``prose-continue`` and ``prose-repeat``.
+"""Reading sessions over the pinned Moby Dick text: ``prose-continue``, ``prose-repeat`` and
+``prose-shift``.
 
 The book body from "Call me Ishmael." is unwrapped into paragraphs with straight quotes and
 cut into consecutive fixed word windows, one per turn, so turn sizes never depend on a
@@ -9,6 +10,10 @@ tokenizer:
 - ``prose-repeat``: the user supplies a passage and asks for it to be repeated verbatim
   from a paragraph opening; the answer is the latest paragraph-aligned suffix of at least
   ``REPEAT_COPY_WORDS`` words, which covers the serving output budget for any tokenizer.
+- ``prose-shift``: a repeat session whose probe asks for the passage's last
+  ``SHIFT_COPY_WORDS`` words verbatim, then new writing, then the same words verbatim again.
+  One answer then holds text a drafter predicts, text it does not, and text it predicts
+  again; ``expected`` is the repeated words, which locate the three parts in an answer.
 
 Each fixture's probe is a later window than every turn in its history; lanes probe
 consecutive windows near the end of the book, so their sessions differ at the tail.
@@ -27,9 +32,18 @@ from .canonical import digest
 from .fixture import Fixture, Generation, Message, Source, TurnSizing
 from .sources import DATA
 
-ProseFamily = Literal["prose-continue", "prose-repeat"]
+ProseFamily = Literal["prose-continue", "prose-repeat", "prose-shift"]
 START = "Call me Ishmael."
 OUTPUT_TOKENS = 256
+SHIFT_COPY_WORDS = 128
+SHIFT_OUTPUT_TOKENS = 768
+SHIFT_INSTRUCTION = (
+    "Write three parts, one after another, with a blank line between them and nothing else. "
+    "First, starting with “{opening}”, repeat the supplied passage verbatim to its end. "
+    "Second, write about 150 words of your own that continue the story. "
+    "Third, starting again with “{opening}”, repeat the supplied passage verbatim to its end "
+    "once more."
+)
 CONTINUE_PASSAGE_WORDS = 256
 CONTINUATION_WORDS = 128
 REPEAT_PASSAGE_WORDS = 512
@@ -133,12 +147,31 @@ def repeat_turn(book: Book, start: int, *, scored: bool) -> list[Message]:
     ]
 
 
+def shift_turn(book: Book, start: int) -> list[Message]:
+    """The probe of ``prose-shift``: the passage's last words repeated, new writing, and the
+    same words repeated again, so one answer holds predictable, unpredictable and predictable
+    text in turn."""
+    end = start + REPEAT_PASSAGE_WORDS
+    copy = book.passage(end - SHIFT_COPY_WORDS, end)
+    opening = " ".join(copy.split()[:6])
+    return [
+        {
+            "role": "user",
+            "content": "Supplied text:\n\n"
+            + book.passage(start, end)
+            + "\n\n"
+            + SHIFT_INSTRUCTION.format(opening=opening),
+        },
+        {"role": "assistant", "content": copy, "scored": True},
+    ]
+
+
 def build(text: str, source: Source, family: ProseFamily, *, count: int) -> list[Fixture]:
     book = Book(text)
     window, turn = (
-        (REPEAT_PASSAGE_WORDS, repeat_turn)
-        if family == "prose-repeat"
-        else (CONTINUE_PASSAGE_WORDS + CONTINUATION_WORDS, continue_turn)
+        (CONTINUE_PASSAGE_WORDS + CONTINUATION_WORDS, continue_turn)
+        if family == "prose-continue"
+        else (REPEAT_PASSAGE_WORDS, repeat_turn)
     )
     turns = book.words // window
     if not 1 <= count < turns:
@@ -149,17 +182,23 @@ def build(text: str, source: Source, family: ProseFamily, *, count: int) -> list
         messages: list[Message] = [{"role": "system", "content": f"Reading session {lane}."}]
         for index in range(probe):
             messages.extend(turn(book, index * window, scored=False))
-        final = turn(book, probe * window, scored=True)
+        # A shift session's history is repeat turns; only its probe asks for the three parts.
+        final = (
+            shift_turn(book, probe * window)
+            if family == "prose-shift"
+            else turn(book, probe * window, scored=True)
+        )
         prefix = len(messages) + 1
         messages.extend(final)
-        expected = {"text": final[-1]["content"]} if family == "prose-repeat" else {}
+        expected = {} if family == "prose-continue" else {"text": final[-1]["content"]}
+        max_tokens = SHIFT_OUTPUT_TOKENS if family == "prose-shift" else OUTPUT_TOKENS
         fixtures.append(
             Fixture(
                 id=f"{family}/moby-dick/{lane}",
                 family=family,
                 source=source,
                 messages=messages,
-                generation=Generation(prefix=prefix, max_tokens=OUTPUT_TOKENS, expected=expected),
+                generation=Generation(prefix=prefix, max_tokens=max_tokens, expected=expected),
                 sizing=TurnSizing(keep_head=1),
             )
         )

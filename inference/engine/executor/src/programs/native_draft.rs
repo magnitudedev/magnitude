@@ -144,13 +144,13 @@ pub(crate) fn skips_windowed_layers(draft: &DraftDefinition) -> Result<bool, Str
 }
 
 /// The admitted draft classes: every entry row class injecting only, and
-/// every slot class whose blocks (`block` rows each) fit a launch drafting
-/// `generated` proposals after entry rows up to its proposal rows. A load
-/// generating none admits no drafting class.
+/// every slot class whose blocks fit a launch drafting one of the
+/// `generated` proposal counts after entry rows up to its proposal rows. A
+/// load generating none admits no drafting class.
 pub(crate) fn draft_graph_classes(
     limits: ResourceLimits,
     proposals: usize,
-    generated: u8,
+    generated: &[u8],
     draft: &DraftDefinition,
 ) -> Result<Vec<DraftGraphClass>, String> {
     let skips = skips_windowed_layers(draft)?;
@@ -186,7 +186,7 @@ pub(crate) fn draft_graph_classes(
                 })
         })
         .collect::<Vec<_>>();
-    if generated > 0 {
+    for &generated in generated {
         for &slots in slot_classes
             .iter()
             .filter(|&&slots| slots * draft.block_rows(generated as u64) <= max_rows)

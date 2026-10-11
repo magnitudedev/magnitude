@@ -1702,3 +1702,169 @@ fn plain_round_geometry_matches_history_and_target_reading_execution() {
         assert_eq!(state.position(), if history == DraftHistory::Own { 4 } else { 5 });
     }
 }
+
+/// A separate draft under the adaptive policy, with `max_tokens` to
+/// generate.
+fn adaptive_generation(max_tokens: usize) -> Generation {
+    let mut configured = options();
+    configured.max_tokens = max_tokens;
+    configured.method = MethodChoice::DFlash { proposals: 3 };
+    resident(
+        Generation::new_with_method(
+            vec![TokenId(1), TokenId(2)],
+            InputLayout::new(2, vec![]).unwrap(),
+            configured,
+            None,
+            Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()),
+        )
+        .unwrap(),
+    )
+}
+
+/// An adaptive round with nothing measured drafts and verifies the whole
+/// width. Rejected drafts are scored from the tokens that commit, and once
+/// the launches are timed a text nothing is accepted on is no longer
+/// drafted.
+#[test]
+fn adaptive_drafting_stops_where_no_draft_is_accepted() {
+    use magnitude_generation::TimedLaunch;
+    use std::time::Duration;
+    let (mut generation, first) = drafting(adaptive_generation(16));
+    assert_eq!(head_parts(&first).3.len(), 3);
+    generation.timed(TimedLaunch::Draft, Duration::from_millis(20), 1, 5);
+    reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+    let mut verify = start(generation, 4);
+    assert_eq!(
+        verify.round_forward().tokens,
+        [TokenId(10), TokenId(11), TokenId(12), TokenId(13)]
+    );
+    verify.timed(TimedLaunch::Target, Duration::from_millis(40), 1, 4);
+    // The target rejects the first draft.
+    let (mut generation, effects) = resolve(verify, &[21, 30, 31, 32], Some(feature(2)));
+    assert!(effects.is_empty());
+    generation.take(8).unwrap();
+    // Blocks go on being drafted and scored for a few rounds (the width is
+    // kept, and launches not yet measured are tried), none of them
+    // verified. Then nothing is drafted.
+    let mut last = 21;
+    for round in 0.. {
+        assert!(round < 8, "drafting did not stop");
+        generation = match generation.start_round(RequestId(1), 4) {
+            Ok(RoundStart::Target(round)) => {
+                assert_eq!(round.round_forward().tokens, [TokenId(last)]);
+                break;
+            }
+            Ok(RoundStart::Method(mut generation, operations)) => {
+                generation.timed(TimedLaunch::Draft, Duration::from_millis(20), 1, 5);
+                let proposals = head_parts(&operations[0]).3.len();
+                let block = (0..proposals as u32).map(|slot| (50 + slot, 0)).collect::<Vec<_>>();
+                reconcile_head(&mut generation, &operations[0], &block);
+                let mut verify = start(generation, 4);
+                assert_eq!(verify.round_forward().tokens, [TokenId(last)]);
+                verify.timed(TimedLaunch::Target, Duration::from_millis(30), 1, 1);
+                last += 1;
+                let (mut generation, _) = resolve(verify, &[last], Some(feature(3)));
+                generation.take(8).unwrap();
+                generation
+            }
+            Err((_, error)) => panic!("{error}"),
+        };
+    }
+}
+
+/// Near the end of a request an adaptive round drafts the widest width that
+/// still fits, where a fixed budget drafts nothing.
+#[test]
+fn adaptive_drafting_fits_the_tokens_a_request_has_left() {
+    // The prompt's closing chunk generates one token and the first round
+    // four, leaving two of seven.
+    let (mut generation, first) = drafting(adaptive_generation(7));
+    reconcile_head(&mut generation, &first, &[(11, 0), (12, 0), (13, 0)]);
+    let (mut generation, _) = resolve(start(generation, 4), &[11, 12, 13, 20], Some(feature(2)));
+    generation.take(8).unwrap();
+    let (mut generation, operations) = draft(generation, 4);
+    assert_eq!(head_parts(&operations[0]).3.len(), 1);
+    reconcile_head(&mut generation, &operations[0], &[(21, 0)]);
+    assert_eq!(
+        start(generation, 4).round_forward().tokens,
+        [TokenId(20), TokenId(21)]
+    );
+}
+
+/// Whatever a draft policy generates and verifies, a request commits exactly
+/// the tokens its target selects: a draft only decides how many of them one
+/// round commits. Fixed budgets and the adaptive policy produce one answer.
+#[test]
+fn every_draft_policy_commits_the_targets_own_tokens() {
+    use magnitude_generation::{DraftBudget, TimedLaunch};
+    use std::time::Duration;
+    const TOKENS: usize = 48;
+    // What the target selects at each generated position, and a drafter that
+    // is wrong at every fifth.
+    let target = |position: usize| 10 + (position * 7 % 80) as u32;
+    let drafted = |position: usize| if position % 5 == 0 { 97 } else { target(position) };
+    let answer = (0..TOKENS).map(|position| TokenId(target(position))).collect::<Vec<_>>();
+    let methods: [Arc<dyn Method>; 4] = [
+        Arc::new(DFlash::new("fixture", 3).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(3, 1).unwrap()).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap().with_budget(DraftBudget::new(1, 1).unwrap()).unwrap()),
+        Arc::new(DFlash::new("fixture", 3).unwrap().adaptive()),
+    ];
+    for method in methods {
+        let mut configured = options();
+        configured.max_tokens = TOKENS;
+        configured.context_limit = 64;
+        configured.method = MethodChoice::DFlash { proposals: 3 };
+        let mut generation = resident(
+            Generation::new_with_method(
+                vec![TokenId(1), TokenId(2)],
+                InputLayout::new(2, vec![]).unwrap(),
+                configured,
+                None,
+                method.clone(),
+            )
+            .unwrap(),
+        );
+        let reconcile = |generation: &mut Generation, operations: &[Operation]| {
+            for operation in operations {
+                let from = generation.generated().len();
+                let proposals = (0..head_parts(operation).3.len())
+                    .map(|slot| (drafted(from + slot), 0))
+                    .collect::<Vec<_>>();
+                generation.timed(TimedLaunch::Draft, Duration::from_millis(20), 1, 4);
+                reconcile_head(generation, operation, &proposals);
+            }
+        };
+        let mut rounds = 0;
+        while generation.finish_reason().is_none() {
+            rounds += 1;
+            assert!(rounds < 4 * TOKENS, "{} did not finish", method.identity());
+            generation = match generation.start_round(RequestId(1), 4) {
+                Ok(RoundStart::Method(mut generation, operations)) => {
+                    reconcile(&mut generation, &operations);
+                    generation
+                }
+                Ok(RoundStart::Target(mut round)) => {
+                    // A prompt chunk selects once; a decode or verification
+                    // selects after each of its rows.
+                    let from = round.generation().generated().len();
+                    let rows = round.round_forward().selects.len();
+                    let samples = (0..rows).map(|row| target(from + row)).collect::<Vec<_>>();
+                    round.timed(
+                        TimedLaunch::Target,
+                        Duration::from_millis(10 * rows as u64),
+                        1,
+                        rows,
+                    );
+                    let (mut generation, effects) =
+                        resolve(round, &samples, Some(feature(rounds as u64 % 200)));
+                    reconcile(&mut generation, &effects);
+                    generation.take(8).unwrap();
+                    generation
+                }
+                Err((_, error)) => panic!("{}: {error}", method.identity()),
+            };
+        }
+        assert_eq!(generation.generated(), answer, "{}", method.identity());
+    }
+}

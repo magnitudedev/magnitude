@@ -57,6 +57,7 @@ only when the head and probe alone exceed the target.
 | `tools` | BFCL v4 at a pinned gorilla commit, hash-locked (`data/bfcl-v4.*`) | system | user question → assistant tool calls → tool acknowledgements | ground-truth calls; `{"calls": [{"name", "arguments": {key: [allowed values]}}]}`; `max_tokens` 32768 | 797 turns, ≈1.35 MB |
 | `prose-continue` | Moby Dick (Gutenberg), vendored and hash-locked (`data/moby-dick.*`) | system | user: 256-word passage → assistant: next 128 words | `{}` (output varies by engine; prose must be non-empty); `max_tokens` 256 | ≈535 turns, ≈1.25 MB |
 | `prose-repeat` | same | system | user: 512-word passage plus a repeat instruction → assistant: latest paragraph-aligned suffix of ≥256 words | `{"text": suffix}`; `max_tokens` 256 | ≈400 turns, ≈2 MB |
+| `prose-shift` | same | system | as `prose-repeat` | the probe asks for the passage's last 128 words verbatim, about 150 new words, then the same 128 words again; `{"text": the 128 words}`; `max_tokens` 768 | ≈400 turns, ≈2 MB |
 | `retrieval` | RULER NIAH recipe (pinned commit, no upstream runtime) | system, first record block with the needles, "Noted." | user: 64 distractor records → "Noted." | JSON object of the needle values; `{"values": {key: value}}`; `max_tokens` 1024 | 192 turns, ≈0.47 MB |
 | `code` | 16 files of this repository at a pinned commit, read with `git show` and hash-locked (`data/magnitude-code.lock.json`) | system | user asks for a file → assistant returns it in a fenced block | no `generation` | 16 turns, ≈90 KB |
 

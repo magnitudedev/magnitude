@@ -6,7 +6,7 @@ BENCH = Path(__file__).resolve().parents[2]
 INFERENCE = BENCH.parents[1]
 RUNTIMES = BENCH / "runtimes"
 
-MODES = ("prose-repeat", "prose-continue", "tools", "retrieval")
+MODES = ("prose-repeat", "prose-continue", "prose-shift", "tools", "retrieval")
 ENGINES = ("magnitude", "llama.cpp", "ollama", "ollama-mlx", "ollama-registry", "mlx-vlm", "omlx")
 
 #: Independent sessions a run can offer at once (the concurrency section's widest point).

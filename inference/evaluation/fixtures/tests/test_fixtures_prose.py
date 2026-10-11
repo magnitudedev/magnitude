@@ -5,6 +5,7 @@ from magnitude_fixtures.prose import (
     CONTINUE_PASSAGE_WORDS,
     REPEAT_COPY_WORDS,
     REPEAT_PASSAGE_WORDS,
+    SHIFT_COPY_WORDS,
     Book,
 )
 
@@ -54,6 +55,20 @@ def test_repeat_answer_is_the_latest_sufficient_paragraph_suffix(book):
             assert " ".join(answer["content"].split()[:6]) in instruction
             assert instruction.endswith("Output only the passage text.")
         assert fixture.generation.expected == {"text": fixture.messages[-1]["content"]}
+
+
+def test_shift_probe_asks_for_the_passage_end_twice_around_new_writing(book):
+    shift, repeat = (prose.build(book, SOURCE, family, count=2)[0] for family in ("prose-shift", "prose-repeat"))
+    # The history is a repeat session's; only the probe differs.
+    assert shift.messages[1:-2] == repeat.messages[1:-2]
+    user, answer = shift.messages[-2:]
+    supplied = user["content"].removeprefix("Supplied text:\n\n")
+    passage, _, instruction = supplied.rpartition("\n\n")
+    assert passage.endswith(answer["content"])
+    assert len(answer["content"].split()) == SHIFT_COPY_WORDS
+    assert instruction.count(" ".join(answer["content"].split()[:6])) == 2
+    assert shift.generation.expected == {"text": answer["content"]}
+    assert shift.generation.max_tokens == 768
 
 
 def test_repeat_single_paragraph_copies_whole_passage():

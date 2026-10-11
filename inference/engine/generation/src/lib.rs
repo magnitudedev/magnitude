@@ -4,6 +4,7 @@ mod acceptance;
 mod controls;
 mod dflash;
 mod draft_budget;
+mod draft_control;
 mod draft_transition;
 mod method;
 mod mtp;
@@ -13,7 +14,10 @@ mod shaping;
 pub use acceptance::accept_prefix;
 pub use controls::{EndOfGeneration, ReasoningBudget};
 pub use dflash::DFlash;
-pub use draft_budget::DraftBudget;
+pub use draft_budget::{DraftBudget, DraftPolicy};
+pub use draft_control::{
+    DraftController, DraftLoad, DraftOutlook, RoundChoice, TimedLaunch, share_rows,
+};
 pub use draft_transition::{DraftHeadCall, DraftHistory, DraftRoundState, DraftTargetTransition};
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
@@ -904,6 +908,26 @@ impl Generation {
         })
     }
 
+    /// A launch carrying this request's work finished in `duration`: `rows`
+    /// rows of `sequences` requests. Call it before the launch's outcome is
+    /// reconciled.
+    pub fn timed(
+        &mut self,
+        launch: TimedLaunch,
+        duration: std::time::Duration,
+        sequences: usize,
+        rows: usize,
+    ) {
+        self.method.timed(launch, duration, sequences, rows);
+    }
+
+    /// The drafted block this request's next target round verifies, when
+    /// its method chooses how much of it to verify. Requests sharing a
+    /// launch share its rows by these ([`share_rows`]).
+    pub fn draft_outlook(&self) -> Option<DraftOutlook> {
+        self.method.outlook()
+    }
+
     pub fn commit_method_transition(&mut self, transition: PreparedMethodTransition) {
         assert!(
             self.resident_position == transition.expected_resident_position
@@ -1186,6 +1210,17 @@ impl StartedRound {
     /// The generation as it was when the round started.
     pub fn generation(&self) -> &Generation {
         &self.generation
+    }
+
+    /// See [`Generation::timed`].
+    pub fn timed(
+        &mut self,
+        launch: TimedLaunch,
+        duration: std::time::Duration,
+        sequences: usize,
+        rows: usize,
+    ) {
+        self.generation.timed(launch, duration, sequences, rows);
     }
 
     pub fn round_forward(&self) -> &RoundForward {

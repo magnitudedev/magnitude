@@ -2,7 +2,8 @@
 host environment (`env`, applied to every step on that host, e.g. a toolkit location).
 A host entry may omit `root` or `models` to use the defaults.
 
-`hosts.json` is machine-specific and gitignored; `hosts.example.json` shows its shape.
+`~/.magnitude/evaluation/hosts.json` is machine-specific and lives outside every checkout, so
+all of a machine's checkouts share it; `hosts.example.json` shows its shape.
 Without it, every host gets the built-in defaults and no pools exist. Connection details
 come from the user's ssh configuration. OS and architecture are probed on connect, never
 stored.
@@ -12,7 +13,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-HOSTS_FILE = Path(__file__).resolve().parents[2] / "hosts.json"
+HOSTS_FILE = Path.home() / ".magnitude" / "evaluation" / "hosts.json"
 DEFAULT_ROOT = "~/.cache/magnitude-evaluation"
 DEFAULT_MODELS = "~/.magnitude/models"
 
