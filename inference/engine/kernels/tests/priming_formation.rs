@@ -12,6 +12,19 @@ fn request(
         statics: statics.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
     }
 }
+/// The K8/V4 history plane widths for a `width`-column head, as the engine's
+/// affine codec lays them out and `attention_append_k8v4` declares them: 8-bit
+/// key and 4-bit value codes packed into u32 words, and a (scale, zero) pair per
+/// 32-column group.
+fn k8v4_planes(width: u64) -> [(&'static str, u64); 4] {
+    let coefficients = 2 * width / 32;
+    [
+        ("KC", width * 8 / 32),
+        ("KP", coefficients),
+        ("VC", width * 4 / 32),
+        ("VP", coefficients),
+    ]
+}
 #[test]
 fn vulkan_priming_abi_forms() {
     let module = magnitude_kernels::module().unwrap();
@@ -27,21 +40,26 @@ fn vulkan_priming_abi_forms() {
     };
     let mut requests = Vec::new();
     // Qwen 4B fixture geometry; cover all normalization/presence branches.
-    for entry in ["attention_append_dense", "attention_append_k8v4"] {
+    let (p, s) = (32, 192);
+    for (entry, planes) in [
+        ("attention_append_dense", &[][..]),
+        ("attention_append_k8v4", &k8v4_planes(2 * p + s)[..]),
+    ] {
         for f in [0, 1] {
             for n in [0, 1] {
                 for nv in [0, 1] {
+                    let statics = [
+                        ("KV", 4),
+                        ("P", p),
+                        ("S", s),
+                        ("F", f),
+                        ("N", n),
+                        ("NV", nv),
+                    ];
                     requests.push(request(
                         entry,
                         &[("A", Element::bf16())],
-                        &[
-                            ("KV", 4),
-                            ("P", 32),
-                            ("S", 192),
-                            ("F", f),
-                            ("N", n),
-                            ("NV", nv),
-                        ],
+                        &[&statics[..], planes].concat(),
                     ));
                 }
             }
