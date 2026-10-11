@@ -485,6 +485,27 @@ pub fn specialization_valid(
         })
 }
 
+/// The default specialization of `entry` at `statics` as `device` offers the
+/// implementation ([`on_device`]): on a CPU device it also values the
+/// Seismic-owned worker counts and tier, which a stored choice carries and
+/// the bare declaration's default lacks. `None` when the backend has no
+/// implementation or nothing is admissible at `statics`.
+pub fn default_specialization(
+    device: &Arc<DeviceInner>,
+    module: &CheckedModule,
+    entry: EntryId,
+    statics: &NativeSpecialization,
+) -> Option<NativeSpecialization> {
+    module
+        .native_implementation(entry, backend_name(&device.kind))
+        .cloned()
+        .and_then(|implementation| {
+            on_device(device, implementation)
+                .default_specialization(statics)
+                .ok()
+        })
+}
+
 /// The CPU route of `implementation` (as [`on_device`] offers it) for a
 /// validated `specialization`: the tier it runs at, one function per launch
 /// for that tier and the bound dense elements, the participants of each

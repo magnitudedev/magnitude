@@ -1107,6 +1107,18 @@ pub(crate) trait EntryTuning: Clone + 'static {
             .specialization_valid(device, specialization)
             .unwrap_or(false)
     }
+    /// The default at `statics` of the same device-augmented declaration
+    /// that native preparation uses: what a stored canonical fallback holds.
+    fn device_default(
+        &self,
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Option<NativeSpecialization> {
+        self.entry()
+            .default_specialization(device, statics)
+            .ok()
+            .flatten()
+    }
     /// The entry bound to the case's elements (its generated
     /// `native_entry[_with]`).
     fn entry(&self) -> seismic::BoundEntry<Self::Entry>;
@@ -4405,8 +4417,8 @@ impl<'a> Tuner<'a> {
             if matches!(
                 choice.disposition,
                 seismic::TuningDisposition::CanonicalFallback { .. }
-            ) && implementation
-                .default_specialization(statics)
+            ) && case
+                .device_default(self.device, statics)
                 .map_or(true, |defaults| choice.overall.specialization() != defaults)
             {
                 return Err(failure(

@@ -2135,6 +2135,15 @@ impl<E: Entry> BoundEntry<E> {
             .map(|(_, element)| *element)
     }
 
+    /// The default specialization at `statics` as `device` offers this entry.
+    pub fn default_specialization(
+        &self,
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
+        generated::native_default_specialization::<E>(device, statics)
+    }
+
     /// Validate a stored choice for this entry's actual element bindings.
     pub fn specialization_valid(
         &self,
@@ -3902,6 +3911,24 @@ pub mod generated {
         device: &Device,
     ) -> Result<Option<NativeImplementation>, CheckedBundleError> {
         native_implementation_for_backend::<E>(device.backend())
+    }
+
+    /// The entry's default specialization at `statics` as the opened device
+    /// offers its implementation, including Seismic-owned CPU workers and ISA
+    /// tier. `None` when the backend has no implementation or nothing is
+    /// admissible at `statics`.
+    pub fn native_default_specialization<E: Entry>(
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(seismic_runtime::native::default_specialization(
+            device.inner(),
+            module.checked(),
+            entry.id(),
+            statics,
+        ))
     }
 
     /// Validate a stored native choice against the opened device's complete

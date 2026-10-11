@@ -3722,3 +3722,31 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     assert_eq!(served_unprepared, 0);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A canonical fallback stored on CPU carries the Seismic-owned worker and
+/// tier parameters; the default it is checked against is the device's, not
+/// the bare declaration's, or every later Prepare refuses to reopen it.
+#[test]
+fn stored_cpu_fallback_matches_the_device_default() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let implementation = seismic::generated::native_implementation::<shape_rows::Entry>(&device)
+        .unwrap()
+        .unwrap();
+    let declared = implementation
+        .default_specialization(&NativeSpecialization::new())
+        .unwrap();
+    let stored = declared
+        .clone()
+        .with_param("cpu.tier", 0)
+        .with_param("cpu.workers.0", 0)
+        .with_param("cpu.workers.1", 0);
+    assert_ne!(stored, declared);
+    let case = super::readout::ShapeRowsTuning { vocabulary: 1024 };
+    assert_eq!(
+        case.device_default(&device, &NativeSpecialization::new()),
+        Some(stored)
+    );
+}
