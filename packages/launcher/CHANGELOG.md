@@ -1,5 +1,49 @@
 # @magnitudedev/cli
 
+## 0.2.7
+
+### Patch Changes
+
+- [`3fe2c30`](https://github.com/magnitudedev/magnitude/commit/3fe2c30b6c8daa58211947df822fd67c2424fb94) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Magnitude is available for Arch Linux, Omarchy, and other Arch-based distributions (x64) as a pacman package. Install it with `sudo pacman -U ./magnitude-desktop.pkg.tar.zst` or the install script, and in-app updates install through pacman. As with the Debian and RPM packages, pacman refuses to upgrade or remove Magnitude while it is running.
+
+- [`c74b8b0`](https://github.com/magnitudedev/magnitude/commit/c74b8b00b1971f910d8e5a73ae9719516363bb01) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix OpenClaw requests hanging: its `automations` tool kept the server busy without answering and could push the loaded model out of memory. These requests now answer in seconds.
+
+  - Fix Claude Code and Oh My Pi requests failing with "Too many items" on MiniCPM5 and LFM2.5, and Oh My Pi failing on Qwen3.5 with reasoning off.
+  - A response cut off by its output limit in the middle of a tool call now ends as an ordinary length stop (`length`, `max_tokens`, or `incomplete`) instead of failing with an error.
+  - Fix connecting Codex from the Magnitude app on Windows, which always failed.
+
+- [`b2f79f0`](https://github.com/magnitudedev/magnitude/commit/b2f79f00f4aa8d4ca6ad97f37a8c457ddba4e8a9) Thanks [@anerli](https://github.com/anerli)! - - Qwen3.5 4B and 9B now use their DFlash drafters for speculative decoding, so they generate considerably faster.
+
+  - Faster prefill and decode on Apple Silicon Macs (M1 through M4): weights use a new tiled layout, prompt processing packs tokens, and attention runs on the matrix and scalar units together. The one-time optimization now plans its time across every kernel instead of searching them in order.
+  - Faster time to the first token for models with a built-in drafting head: each prompt chunk is no longer computed twice.
+  - Follow-up turns in a conversation reuse the previous turn's prompt even when the template renders past turns differently, so later turns start sooner.
+
+- [`44e9fd5`](https://github.com/magnitudedev/magnitude/commit/44e9fd5d1e2fe5f5cd00c5ed5be0e0780231ec8d) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix a request without a `seed` repeating the same sample on every retry, which made some requests (such as Gemma 4 E2B over the Responses API with reasoning off) return an empty answer every time. Each request now samples with a fresh seed unless it names one, and the Responses and Anthropic APIs accept `seed` like Chat Completions.
+
+- [`7d62661`](https://github.com/magnitudedev/magnitude/commit/7d626619f4bed1da6611028e0f27acc1e9a6f071) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix long agent sessions on Macs running the GPU out of memory, which unloaded the model mid-session. Memory used for earlier turns is now released before the GPU fills.
+
+  - Fix NVIDIA GPUs crashing with an illegal memory access when several requests run together after a long prompt.
+  - Fix large images and long prompts resetting AMD GPUs on Linux and unloading the model: GPU work is now split so no single piece runs past the driver's time limit.
+  - On computers without a supported GPU, replies now stream as they are written instead of arriving all at once, stopping or abandoning a request no longer holds up the next one, and generation is faster on Intel and other x86 processors.
+
+- [`a54897b`](https://github.com/magnitudedev/magnitude/commit/a54897b2993dab95352737532531efa2468e820b) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix large images failing in vision models. An image that needed more rows than the engine's per-launch limit failed; images now encode up to 4,096 cells, and larger images are resized to fit.
+
+- [`7f65eb3`](https://github.com/magnitudedev/magnitude/commit/7f65eb322422a4679c6455b4c442ba969f2c3844) Thanks [@anerli](https://github.com/anerli)! - - macOS loads a model that fits beside wired and compressed memory instead of refusing it, including right after a download.
+
+  - Qwen 3.8 27B loads on NVIDIA GPUs, and Gemma 4 E2B and E4B no longer hit an illegal memory access on NVIDIA GPUs.
+  - The one-time optimization is more reliable: it no longer settles on slow defaults for large contexts (Gemma 4 12B at a 65,536-token context decoded at 4.8 tok/s), tunes sliding-window layers at the history they keep, and finishes in bounded time on first load.
+  - Muse Glimmer can turn reasoning off.
+
+- [`9452ff4`](https://github.com/magnitudedev/magnitude/commit/9452ff4e59517ea197597521c8fa53545b2e7626) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - A download that stops receiving data now reports that it can't reach the model source and offers Retry, which resumes from where it stopped, instead of freezing.
+
+  - Clicking Download right after cancelling a download now starts it again instead of doing nothing.
+  - An expired or revoked `HF_TOKEN` no longer blocks downloads of public models.
+  - Removing a model on Windows now deletes its files and frees the disk space.
+
+- [`4dba3cd`](https://github.com/magnitudedev/magnitude/commit/4dba3cd7d018660673d6b7edb303fee981bbc187) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix a stray horizontal scrollbar on Windows and Linux in windows narrower than about 1,380 pixels. Page content now fits beside the vertical scrollbar instead of extending under it.
+
+- [`541ccf1`](https://github.com/magnitudedev/magnitude/commit/541ccf13192dab55472e1a03bb8a9a80a9d20cda) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Magnitude writes logs again: `service.log`, `inference.log` and `desktop.log` in `~/.magnitude/logs` record the service, the inference engine and the app, including crashes and restarts. Each file is size-capped. Attach them when reporting a problem.
+
 ## 0.2.6
 
 ### Patch Changes

@@ -41,6 +41,11 @@ impl TokenizerEnv for Environment {
     }
 }
 
+/// Lexer derivatives llguidance may build for one step, ten times its default. Flattened tool
+/// schemas start lexeme sets whose states need more construction than the default allows, while
+/// a mask over them still takes milliseconds.
+const LEXER_FUEL: u64 = 2_000_000;
+
 #[derive(Clone, Copy, Debug)]
 pub struct CacheLimits {
     pub entries: usize,
@@ -153,7 +158,10 @@ impl Vocabulary {
         let mut factory = ParserFactory::new_simple(&env)
             .map_err(|error| GrammarError::Binding(error.to_string()))?;
         factory.quiet();
-        factory.limits_mut().verbose_errors = false;
+        let parser = factory.limits_mut();
+        parser.verbose_errors = false;
+        parser.initial_lexer_fuel = LEXER_FUEL;
+        parser.step_lexer_fuel = LEXER_FUEL;
         Ok(Self {
             table,
             factory,

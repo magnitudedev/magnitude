@@ -23,7 +23,9 @@ use crate::cache::{ModelCache, ModelIndexKind};
 use crate::catalog_affiliations::CatalogAffiliations;
 use crate::download::blob_key;
 use crate::gguf;
+use crate::hugging_face::HubCredential;
 use crate::identity::{content_id, fingerprint, inventory_entry_id};
+use crate::snapshot_blobs::RepositoryBlobs;
 use crate::store_fs::ensure_store_layout;
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -172,6 +174,7 @@ impl InventoryConfig {
 pub struct ManagedModelStore {
     pub(crate) config: InventoryConfig,
     pub(crate) client: HFClient,
+    pub(crate) hub_credential: Option<HubCredential>,
     pub(crate) http: reqwest::Client,
     pub(crate) models: Arc<RwLock<BTreeMap<InventoryEntryId, InventoryModel>>>,
     pub(crate) operations:
@@ -209,6 +212,7 @@ impl Clone for ManagedModelStore {
         Self {
             config: self.config.clone(),
             client: self.client.clone(),
+            hub_credential: self.hub_credential.clone(),
             http: self.http.clone(),
             models: Arc::clone(&self.models),
             operations: Arc::clone(&self.operations),
@@ -276,23 +280,30 @@ impl ManagedModelStore {
     pub async fn open(config: InventoryConfig) -> Result<Self, InventoryError> {
         validate_config(&config)?;
         ensure_store_layout(&config.root).await?;
-        let client_builder = HFClient::builder().cache_dir(config.root.join("hub"));
-        let explicit_token = std::env::var("HF_TOKEN")
-            .ok()
-            .filter(|token| !token.trim().is_empty());
-        let client_builder = match explicit_token {
-            Some(token) => client_builder.token(token),
-            None => client_builder,
-        };
-        let client = client_builder
+        // The engine runs with implicit Hub credentials disabled, so this client is anonymous; only
+        // an explicit HF_TOKEN is presented, through the credentialed client.
+        let client_builder = || HFClient::builder().cache_dir(config.root.join("hub"));
+        let client = client_builder()
             .build()
             .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+        let hub_credential = std::env::var("HF_TOKEN")
+            .ok()
+            .filter(|token| !token.trim().is_empty())
+            .map(|token| {
+                client_builder()
+                    .token(token.clone())
+                    .build()
+                    .map(|client| HubCredential { client, token })
+                    .map_err(|error| InventoryError::Upstream(error.to_string()))
+            })
+            .transpose()?;
         let cache = ModelCache::new(&config.cache_root);
         let catalog_affiliations = CatalogAffiliations::load(&config.root);
         let manager = Self {
             download_slots: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent_downloads)),
             config,
             client,
+            hub_credential,
             http: reqwest::Client::new(),
             models: Arc::new(RwLock::new(BTreeMap::new())),
             operations: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -1131,8 +1142,9 @@ fn append_discovered_groups(
     commit: &str,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
+    let blobs = RepositoryBlobs::open(repository_root).map_err(io_error)?;
     for group in discover_groups(snapshot, repository_root)? {
-        let components = components_for_group(snapshot, &group)?;
+        let components = components_for_group(snapshot, &group, &blobs)?;
         let Some(primary) = primary_path(snapshot, &components) else {
             continue;
         };
@@ -1190,8 +1202,9 @@ fn scan_hf_cache(cache: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(
             let commit = snapshot_entry.file_name().to_string_lossy().into_owned();
             let snapshot = snapshot_entry.path();
             let groups = discover_groups(&snapshot, &repo_root)?;
+            let blobs = RepositoryBlobs::open(&repo_root).map_err(io_error)?;
             for group in groups {
-                let components = components_for_group(&snapshot, &group)?;
+                let components = components_for_group(&snapshot, &group, &blobs)?;
                 let primary = match primary_path(&snapshot, &components) {
                     Some(path) => path,
                     None => continue,
@@ -1578,6 +1591,7 @@ fn is_execution_companion_name(name: &str) -> bool {
 fn components_for_group(
     root: &Path,
     group: &ModelGroup,
+    blobs: &RepositoryBlobs,
 ) -> Result<Vec<ModelComponent>, InventoryError> {
     let mut components = Vec::new();
     for (offset, path) in group.paths.iter().enumerate() {
@@ -1593,7 +1607,7 @@ fn components_for_group(
                 ComponentRole::Shard
             },
             size_bytes: metadata.len(),
-            content: content_identity_for_file(path, &metadata),
+            content: content_identity_for_file(path, &metadata, blobs),
             shard_index: (group.paths.len() > 1).then_some(offset as u32 + 1),
             relationship: None,
         });
@@ -1607,7 +1621,7 @@ fn components_for_group(
             path: relative.to_path_buf(),
             role: ComponentRole::Projector,
             size_bytes: metadata.len(),
-            content: content_identity_for_file(projector, &metadata),
+            content: content_identity_for_file(projector, &metadata, blobs),
             shard_index: None,
             relationship: components.first().map(|model| {
                 magnitude_service_contracts::ComponentRelationship::ProjectorFor {
@@ -1814,14 +1828,17 @@ fn file_identity(path: &Path, metadata: &fs::Metadata) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn content_identity_for_file(path: &Path, metadata: &fs::Metadata) -> ContentIdentity {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let in_blob_store = canonical
-        .parent()
+fn content_identity_for_file(
+    path: &Path,
+    metadata: &fs::Metadata,
+    blobs: &RepositoryBlobs,
+) -> ContentIdentity {
+    let blob = blobs.resolve(path).ok().flatten();
+    let in_blob_store = blob.is_some();
+    let name = blob
+        .as_deref()
         .and_then(Path::file_name)
-        .and_then(|value| value.to_str())
-        == Some("blobs");
-    let name = canonical.file_name().and_then(|value| value.to_str());
+        .and_then(|value| value.to_str());
     if in_blob_store
         && let Some(value) = name.and_then(|value| value.strip_prefix("lfs-sha256-"))
         && value.len() == 64
@@ -2127,6 +2144,91 @@ mod tests {
             .join("0123456789abcdef");
         fs::create_dir_all(&snapshot).unwrap();
         (cache, snapshot)
+    }
+
+    /// Windows publishes snapshot entries as hard links, and the download assigns the entry id
+    /// before the snapshot exists. Removal must find that id and reclaim the blob.
+    #[tokio::test]
+    async fn hard_linked_catalog_package_is_listed_once_and_removed_with_its_blob() {
+        use magnitude_service_contracts::models::InstalledModelPackages as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let repository = "owner/model";
+        let commit = "commit";
+        let repository_root = store.join("hub").join(hf_repo_dir(repository));
+        let snapshot = repository_root.join("snapshots").join(commit);
+        let blobs = repository_root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let source = temporary.path().join("source.gguf");
+        write_minimal_gguf(&source);
+        let bytes = fs::read(&source).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        let blob = blobs.join(blob_key(&ContentIdentity::Sha256 {
+            value: digest.clone(),
+        }));
+        let package = ModelPackage {
+            id: ModelPackageId("package_catalog".to_owned()),
+            source: ModelPackageSource::HuggingFace {
+                repository: repository.to_owned(),
+                revision: commit.to_owned(),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId(format!("file_{digest}")),
+                path: PathBuf::from("model.gguf"),
+                role: ModelFileRole::Weights,
+                size_bytes: u64::try_from(bytes.len()).unwrap(),
+                tensor_storage_bytes: None,
+                sha256: digest,
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "unknown".to_owned(),
+                quantization_name: "unknown".to_owned(),
+                architecture: "unknown".to_owned(),
+                maximum_context_length: Some(4_096),
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        };
+        let download_time_id = inventory_entry_id(
+            "magnitude-cache",
+            &snapshot,
+            &content_id(&components_for_catalog_package(&package).unwrap()),
+        );
+        fs::rename(&source, &blob).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::hard_link(&blob, snapshot.join("model.gguf")).unwrap();
+
+        let mut config =
+            InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
+        config.catalog_models = vec![catalog_model(package.clone())];
+        let manager = ManagedModelStore::open(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let models = manager.list().await.unwrap();
+        assert_eq!(
+            models.len(),
+            1,
+            "a hard-linked snapshot must not add a discovered duplicate"
+        );
+        assert_eq!(models[0].id, download_time_id);
+
+        let installed = manager.list_installed().await.unwrap();
+        assert_eq!(installed.packages.len(), 1);
+        assert_eq!(
+            installed.packages[0].origin,
+            ModelPackageInstallationOrigin::Magnitude
+        );
+        let removed = manager
+            .remove_installed(&installed.packages[0].package.id)
+            .await
+            .unwrap();
+        assert!(removed.removed);
+        assert_eq!(removed.freed_bytes, u64::try_from(bytes.len()).unwrap());
+        assert!(!blob.exists());
+        assert!(!snapshot.join("model.gguf").exists());
+        assert!(manager.list().await.unwrap().is_empty());
     }
 
     #[tokio::test]

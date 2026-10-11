@@ -3257,9 +3257,10 @@ fn units_start_by_their_share_of_step_time() {
     );
 }
 
-/// A pre-fix cache can contain a choice that fits the point's one history
-/// span but exceeds Metal's shared-memory limit at a served span class.
-/// Reading that record must be a miss; a valid replacement keeps the key.
+/// A cache can contain a choice that exceeds Metal's shared-memory limit at
+/// a served span class, which the declaration no longer admits. Reading
+/// that record must fail without reopening the search; a valid replacement
+/// keeps the key.
 #[test]
 fn stored_attention_choice_must_admit_every_served_span_class() {
     use super::attention::{AttentionMix, AttentionPrefillK8V4Tuning};
@@ -3319,18 +3320,10 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         .with_param("SPLIT_GROUPS", 256)
         .with_param("DIRECT", 1)
         .with_param("COISSUE", 1);
-    assert!(case.stored_valid(&device, &invalid));
-    let kernel = case.entry().prepare(&device, &invalid).unwrap();
-    kernel.admits(&dimensions).unwrap();
-    let mut served = dimensions.clone();
-    served.insert("R".to_owned(), 64);
-    assert!(
-        kernel
-            .admits(&served)
-            .unwrap_err()
-            .to_string()
-            .contains("threadgroup bytes")
-    );
+    // The declaration charges the largest segment class, so it refuses the
+    // choice outright: four pairs need 33,328 threadgroup bytes there.
+    assert!(!case.stored_valid(&device, &invalid));
+    assert!(case.entry().prepare(&device, &invalid).is_err());
 
     let root = std::env::temp_dir().join(format!("magnitude-span-cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);

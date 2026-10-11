@@ -44,6 +44,8 @@ struct Script {
     hang: bool,
     /// Leading prompt tokens the completion reports as restored from cache.
     cached_input_tokens: u64,
+    /// `None` derives the termination from the output.
+    termination: Option<Termination>,
 }
 
 impl Script {
@@ -63,6 +65,7 @@ impl Script {
             failure: None,
             hang: false,
             cached_input_tokens: 0,
+            termination: None,
         }
     }
 
@@ -74,25 +77,23 @@ impl Script {
     }
 }
 
-fn completion(
-    output: &[(OutputEvent, Option<TimingSnapshot>)],
-    cached_input_tokens: u64,
-) -> Completion {
-    let tools = output
+fn completion(script: &Script) -> Completion {
+    let tools = script
+        .output
         .iter()
         .any(|(event, _)| matches!(event, OutputEvent::ToolCallFinished { .. }));
     Completion {
         usage: TokenUsage {
             input_tokens: 11,
-            cached_input_tokens,
+            cached_input_tokens: script.cached_input_tokens,
             output_tokens: 7,
             reasoning_output_tokens: 1,
         },
-        termination: if tools {
+        termination: script.termination.clone().unwrap_or(if tools {
             Termination::ToolCalls
         } else {
             Termination::Natural
-        },
+        }),
         timings: GenerationTimings {
             prompt_ms: 2.0,
             decode_ms: 3.0,
@@ -194,12 +195,9 @@ impl ModelInvocation for ScriptedInvocation {
                 observed.cancelled.store(true, Ordering::Release);
                 return;
             }
-            send(match script.failure {
+            send(match script.failure.clone() {
                 Some(error) => GenerationEvent::Failed(error),
-                None => GenerationEvent::Completed(completion(
-                    &script.output,
-                    script.cached_input_tokens,
-                )),
+                None => GenerationEvent::Completed(completion(&script)),
             })
             .await;
         });
@@ -2421,4 +2419,160 @@ async fn template_application_and_properties_are_host_only() {
     assert_eq!(body["template_capabilities"]["enable_thinking"], true);
     assert!(body.get("execution").is_none());
     assert_eq!(observed.invocations.load(Ordering::Relaxed), 0);
+}
+
+/// Generation that stopped at `max_tokens` inside a call's arguments: one
+/// complete call, then one cut off mid-arguments.
+fn cut_off_tool_call() -> Script {
+    let mut script = Script::output(vec![
+        OutputEvent::TextDelta("writing".into()),
+        OutputEvent::ToolCallStarted {
+            index: 0,
+            id: "call-1".into(),
+            name: "lookup".into(),
+        },
+        OutputEvent::ToolInputDelta {
+            index: 0,
+            fragment: "{}".into(),
+        },
+        OutputEvent::ToolCallFinished { index: 0 },
+        OutputEvent::ToolCallStarted {
+            index: 1,
+            id: "call-2".into(),
+            name: "write_file".into(),
+        },
+        OutputEvent::ToolInputDelta {
+            index: 1,
+            fragment: "{\"path\":\"story.txt\",\"content\":\"Once".into(),
+        },
+    ]);
+    script.termination = Some(Termination::OutputLimit);
+    script
+}
+
+/// A call cut off by the output limit once failed the non-streaming
+/// response with a 500 while the stream reported `tool_calls`. Both modes now
+/// end with a length termination, and the complete response holds only the
+/// calls that completed.
+#[tokio::test]
+async fn chat_ends_a_call_cut_off_by_the_output_limit_with_length_in_both_modes() {
+    let (status, body) = post_chat(
+        Scripted::new(cut_off_tool_call()),
+        json!({ "model": "test-model", "messages": [{"role": "user", "content": "hi"}] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let choice = &body["choices"][0];
+    assert_eq!(choice["finish_reason"], "length");
+    assert_eq!(choice["message"]["content"], "writing");
+    let calls = choice["message"]["tool_calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["id"], "call-1");
+
+    let (status, body) = post_chat(Scripted::new(cut_off_tool_call()), minimal_request()).await;
+    assert_eq!(status, StatusCode::OK);
+    let chunks = stream_json(&body);
+    let finishes = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["finish_reason"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(finishes, ["length"]);
+}
+
+#[tokio::test]
+async fn anthropic_ends_a_call_cut_off_by_the_output_limit_with_max_tokens_in_both_modes() {
+    let request = json!({
+        "model": "test-model", "max_tokens": 32,
+        "messages": [{ "role": "user", "content": "hi" }]
+    });
+    let reply = send(
+        app(Scripted::new(cut_off_tool_call())),
+        "/anthropic/v1/messages",
+        ANTHROPIC,
+        request.clone(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let body: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(body["stop_reason"], "max_tokens");
+    let kinds = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|block| block["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["text", "tool_use"]);
+    assert_eq!(body["content"][1]["id"], "call-1");
+
+    let mut streaming = request;
+    streaming["stream"] = json!(true);
+    let reply = send(
+        app(Scripted::new(cut_off_tool_call())),
+        "/anthropic/v1/messages",
+        ANTHROPIC,
+        streaming,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.body.matches("event: content_block_start").count(), 3);
+    assert_eq!(reply.body.matches("event: content_block_stop").count(), 3);
+    assert!(reply.body.contains("\"stop_reason\":\"max_tokens\""));
+    assert!(!reply.body.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn responses_end_a_call_cut_off_by_the_output_limit_incomplete_in_both_modes() {
+    let reply = send(
+        app(Scripted::new(cut_off_tool_call())),
+        "/v1/responses",
+        &[],
+        json!({ "model": "test-model", "input": "hi" }),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let complete: Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(complete["status"], "incomplete");
+    assert_eq!(complete["incomplete_details"]["reason"], "max_output_tokens");
+    let types = |output: &Value| {
+        output
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(types(&complete["output"]), ["message", "function_call"]);
+    assert_eq!(complete["output"][1]["call_id"], "call-1");
+
+    let mut stream = start_response(cut_off_tool_call()).await;
+    let mut done = Vec::new();
+    let mut terminal = Value::Null;
+    while let Some(event) = stream.events.recv().await {
+        match event["type"].as_str().unwrap() {
+            "response.output_item.done" => done.push(event["item"].clone()),
+            "response.function_call_arguments.done" => {
+                assert_eq!(event["output_index"], 1, "only the complete call is done");
+            }
+            "response.incomplete" => terminal = event["response"].clone(),
+            "response.completed" => panic!("a cut-off response is incomplete"),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        done.iter()
+            .map(|item| (item["type"].as_str().unwrap(), item["status"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        [
+            ("message", "completed"),
+            ("function_call", "completed"),
+            ("function_call", "incomplete"),
+        ]
+    );
+    assert_eq!(terminal["incomplete_details"]["reason"], "max_output_tokens");
+    assert_eq!(types(&terminal["output"]), types(&complete["output"]));
+    assert_eq!(
+        Value::Array(stream.concluded.await.unwrap()),
+        terminal["output"]
+    );
 }

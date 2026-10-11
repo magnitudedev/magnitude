@@ -1007,7 +1007,7 @@ fn coissue_prefill_configs(geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> 
         .into_iter()
         .filter(|&(qt, _)| (qt == 8) == (w == 512))
         .filter(|&(qt, heads)| {
-            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 64 * 16 <= 32768
+            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 65 * 64 + 16 <= 32768
         })
         .flat_map(|(qt, heads)| [1, 256].into_iter().map(move |split| (qt, heads, split)))
         .map(|(qt, heads, split)| {
@@ -1114,6 +1114,56 @@ fn metal_direct_prefill_retains_state_at_1024_rows() {
             }
         }
     }
+}
+
+/// Metal's COISSUE form admits only configurations whose attend launch fits
+/// the device's threadgroup memory at the largest segment class a graph is
+/// sealed for (64), not only at the one segment tuning measures: MiniCPM5's
+/// four pairs (QT 16, HEADS 2) need 33,328 bytes there, so it takes two.
+#[test]
+fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for geometry in [MINICPM5, QWEN, GEMMA_E4B_FULL] {
+        let w = geometry.w() as u64;
+        let keys = if w > 128 { 32 } else { 96 };
+        let windows = (w / 256).max(1);
+        let pair = 48 + 2 * (keys * 16 + 32) + 32 * w.min(256) + 2048 * (windows - 1);
+        for (qt, heads) in [(8, 1), (8, 2), (16, 1), (16, 2), (32, 1), (32, 2)] {
+            let config = [
+                ("QT", qt),
+                ("HEADS", heads),
+                ("SPLIT_GROUPS", 256),
+                ("DIRECT", 1),
+                ("COISSUE", 1),
+            ];
+            let admitted = attention_prefill_k8v4::native_for_device_with(
+                &device,
+                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &prefill_specialization(&device, geometry, &config),
+            )
+            .is_ok();
+            let bytes = 32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 65 * 64 + 16;
+            assert!(
+                !admitted || bytes <= 32768,
+                "w {w} g {} {config:?} is admitted but its attend launch needs {bytes} bytes at 64 segments",
+                geometry.g
+            );
+        }
+    }
+    let minicpm = [("QT", 16), ("HEADS", 2), ("SPLIT_GROUPS", 128), ("DIRECT", 1), ("COISSUE", 1)];
+    assert!(
+        attention_prefill_k8v4::native_for_device_with(
+            &device,
+            attention_prefill_k8v4::Elements { A: Element::bf16() },
+            &prefill_specialization(&device, MINICPM5, &minicpm),
+        )
+        .is_err()
+    );
 }
 
 /// The COISSUE form of a 512-column head: a pair per 256-column window, the
@@ -1309,10 +1359,10 @@ fn metal_form_agrees_with_the_default(
 
 /// A COISSUE threadgroup holds its launch's span schedule beside its pairs,
 /// so the memory an attend launch takes grows with the history spans of its
-/// class: four pairs of a 128-column head serve 32 spans and not the 64 of
-/// the largest span class a store seals. The kernel answers that from a
-/// call's dimensions alone, with the refusal the call would get: what tuning
-/// asks of a candidate at the served shapes its points do not take.
+/// class. The declaration admits a configuration only when it fits the
+/// largest span class a store seals, so one it admits (two pairs of a
+/// 128-column head) is admitted at every class, which the kernel answers
+/// from a call's dimensions alone.
 #[test]
 fn metal_coissue_prefill_admits_the_span_classes_its_threadgroup_holds() {
     let Some(device) = k8v4_devices()
@@ -1326,7 +1376,7 @@ fn metal_coissue_prefill_admits_the_span_classes_its_threadgroup_holds() {
         MINICPM5,
         &[
             ("QT", 16),
-            ("HEADS", 2),
+            ("HEADS", 1),
             ("SPLIT_GROUPS", 256),
             ("DIRECT", 1),
             ("COISSUE", 1),
@@ -1347,8 +1397,7 @@ fn metal_coissue_prefill_admits_the_span_classes_its_threadgroup_holds() {
     };
     at(1).unwrap();
     at(32).unwrap();
-    let refused = at(64).unwrap_err().to_string();
-    assert!(refused.contains("threadgroup bytes"), "{refused}");
+    at(64).unwrap();
 }
 
 /// Two requests in one batch over a store much larger than what they see:

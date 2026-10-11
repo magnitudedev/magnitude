@@ -657,7 +657,10 @@ pub(crate) async fn collect(
                 journal.push(&event).map_err(ServingError::Output)?
             }
             Some(GenerationEvent::Completed(completion)) => {
-                return Ok((journal.finish().map_err(ServingError::Output)?, completion));
+                let output = journal
+                    .finish(&completion.termination)
+                    .map_err(ServingError::Output)?;
+                return Ok((output, completion));
             }
             Some(GenerationEvent::Failed(error)) => return Err(error),
             None => return Err(ended_without_outcome()),

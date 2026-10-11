@@ -1,5 +1,8 @@
 #include "parsers.h"
 
+static const std::string MINICPM5_RAW_VALUE      = "raw-param-value";
+static const std::string MINICPM5_UNTHOUGHT_TEXT = "unthought-content";
+
 // MiniCPM5 format:
 // - Reasoning: <think>{reasoning}</think> (optional)
 // - Tool calls: <function name="foo"><param name="bar">value</param></function>
@@ -51,7 +54,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
 
         auto reasoning = p.eps();
         if (extract_reasoning) {
-            reasoning = p.optional(("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space());
+            reasoning = p.optional(p.rule("reasoning-block", ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space()));
         }
 
         // Response format parser
@@ -64,7 +67,8 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
             // </param>); capture the inner text only, excluding the CDATA markers.
             auto string_value = p.choice({
                 p.literal("<![CDATA[") + p.ac(p.tool_arg_string_value(p.until("]]>")) + p.literal("]]>"), "]]>") + p.tool_arg_close(p.literal("</param>")),
-                p.negate(p.literal("<![CDATA[")) + p.ac(p.tool_arg_string_value(p.until("</param>")) + p.tool_arg_close(p.literal("</param>")), "</param>")
+                p.gbnf(p.negate(p.literal("<![CDATA[")) + p.ac(p.tool_arg_string_value(p.until("</param>")) + p.tool_arg_close(p.literal("</param>")), "</param>"),
+                       MINICPM5_RAW_VALUE)
             });
 
             auto tool_choice = p.choice();
@@ -95,10 +99,12 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                     args = p.zero_or_more(p.choice(arg_rules) + p.space());
                 }
 
+                // Each argument owns the whitespace after it, so none precedes the
+                // close: two adjacent optional spaces would read the same text many ways.
                 auto tool_parser = p.tool(
                     p.tool_open(p.literal("<function name=\"") + p.tool_name(p.literal(name)) + p.literal("\">"))
                     << p.tool_args(args)
-                    << p.tool_close(p.literal("</function>")));
+                    + p.tool_close(p.literal("</function>")));
 
                 tool_choice |= p.rule("tool-" + name, tool_parser);
             });
@@ -110,9 +116,15 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
                 tool_calls = p.optional(tool_calls);
             }
 
-            auto content = p.text_before_calls(p.content(p.until("<function")), inputs.tool_choice);
+            auto content = p.text_before_calls(p.rule("content-text", p.content(p.until("<function"))), inputs.tool_choice);
+            auto preamble = reasoning + content;
+            if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+                // Text beginning with <think> reads as reasoning whenever it can, so
+                // content that no reasoning precedes never begins with it.
+                preamble = p.gbnf(preamble, "(reasoning-block content-text | " + MINICPM5_UNTHOUGHT_TEXT + ")");
+            }
 
-            return generation_prompt + reasoning + content + tool_calls + p.end();
+            return generation_prompt + preamble + tool_calls + p.end();
         }
 
         return generation_prompt + reasoning + p.content(p.rest()) + p.end();
@@ -124,6 +136,12 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
         data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
             parser.build_grammar(builder, data.grammar_lazy);
+            if (!has_response_format && has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+                unopened_text_grammar(builder, MINICPM5_RAW_VALUE, "<![CDATA[", "</param>", true);
+                if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+                    unopened_text_grammar(builder, MINICPM5_UNTHOUGHT_TEXT, "<think>", "<function", false);
+                }
+            }
         });
 
         data.grammar_triggers = {

@@ -66,15 +66,17 @@ fn minicpm5_answers_in_text_or_calls_under_auto() {
 
 #[test]
 fn lfm2_answers_in_text_or_calls_under_auto() {
-    // The generation prompt opens reasoning.
+    // The generation prompt opens reasoning, which closes before the turn
+    // ends: the parser reads text that opens with it as reasoning.
     let (text, call) = (
-        "Hello!",
+        "No tool needed.</think>Hello!",
         "<|tool_call_start|>[bash(command=\"ls\")]<|tool_call_end|>",
     );
     let reasoned = format!("List them.</think>{call}");
     assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, text));
-    assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, call));
     assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Auto, &reasoned));
+    assert!(!admits(LFM25, "<|startoftext|>", ToolChoice::Auto, "Hello!"));
+    assert!(!admits(LFM25, "<|startoftext|>", ToolChoice::Auto, call));
     assert!(!admits(LFM25, "<|startoftext|>", ToolChoice::Required, text));
     assert!(admits(LFM25, "<|startoftext|>", ToolChoice::Required, &reasoned));
 }

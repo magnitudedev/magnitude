@@ -10,6 +10,7 @@ import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
 import { verifyPluginContent } from "@magnitudedev/release/plugin-content"
 import type { HarnessCompanionPackage, HarnessCompanionState } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
+import { harnessCommand } from "../executable"
 import { updateJsonc, writeIfChanged } from "../shared"
 import { ConnectionTransaction } from "../transaction"
 import { writeFileAtomic } from "@magnitudedev/utils/atomic-file"
@@ -81,8 +82,8 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
     ? resolve(agentDir, "npm/node_modules", PI_COMPANION_PACKAGE_IDENTITY)
     : localPath(source, paths.piSettings)
   const command = (executable: string, action: "install" | "remove", source: PiPackageSource) => Effect.scoped(Effect.gen(function* () {
-    const process = yield* Command.make(executable, action, source.startsWith("npm:") ? source : localPath(source, paths.piSettings)).pipe(
-      Command.env({ PI_CODING_AGENT_DIR: agentDir }), Command.start,
+    const process = yield* harnessCommand(executable, [action, source.startsWith("npm:") ? source : localPath(source, paths.piSettings)]).pipe(
+      Effect.map(Command.env({ PI_CODING_AGENT_DIR: agentDir })), Effect.flatMap(Command.start),
     )
     const [exitCode, stdout, stderr] = yield* Effect.all([
       process.exitCode,
@@ -113,7 +114,7 @@ export const makePiCompanion = (paths: HarnessConnectionPaths, desiredSource: st
     }
     return yield* fs.exists(resolve(root, PI_COMPANION_EXTENSION_PATH))
   })
-  const verifyHost = (executable: string) => Command.make(executable, "--version").pipe(Command.string, Effect.timeout("10 seconds"), Effect.flatMap((version) =>
+  const verifyHost = (executable: string) => harnessCommand(executable, ["--version"]).pipe(Effect.flatMap(Command.string), Effect.timeout("10 seconds"), Effect.flatMap((version) =>
     satisfies(version.trim(), ">=0.83.0") ? Effect.void
       : Effect.fail(new PiPackageError({ message: `Magnitude for Pi requires Pi 0.83.0 or newer; found ${version.trim()}.` }))))
 
