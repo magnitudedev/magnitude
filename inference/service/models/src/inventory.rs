@@ -1014,7 +1014,7 @@ fn scan_managed(
     Ok(())
 }
 
-fn components_for_catalog_package(
+pub(crate) fn components_for_catalog_package(
     package: &ModelPackage,
 ) -> Result<Vec<ModelComponent>, InventoryError> {
     let paths = package
@@ -1092,7 +1092,7 @@ fn components_for_catalog_package(
         .collect()
 }
 
-fn catalog_components_present(
+pub(crate) fn catalog_components_present(
     snapshot: &Path,
     repository_root: &Path,
     components: &[ModelComponent],

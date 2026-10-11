@@ -6,12 +6,12 @@
 //! the fused cases' synthetic tables. The shared expert and latent
 //! projections are the dense cases over their own weight kinds.
 
-use super::routed::{decode_points, group, grouped_points, routes, RoutedShape};
+use super::routed::{RoutedShape, decode_points, group, grouped_points, routes};
 use super::{
-    row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
 };
-use crate::operators::routed::fused_graph::TILE_ROWS;
 use crate::GeneralRoutedBinding;
+use crate::operators::routed::fused_graph::TILE_ROWS;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
     routed_down, routed_experts, routed_experts_up, routed_gate_up, routed_scatter, routed_select,

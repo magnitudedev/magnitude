@@ -4,12 +4,12 @@
 
 pub(crate) mod graph;
 
-use super::{tail, PlanError, WeightPush};
+use super::{PlanError, WeightPush, tail};
 use crate::{AttentionBinding, AttentionShape};
 use magnitude_family_contracts::{
     Attention, AttentionGate, Decoder, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
-    HistoryReads, KeyValue, MediaRowAttention, Operator, OutputForm, Rotary, RotaryPair,
-    ValueNorm, ValueSource, WeightKind,
+    HistoryReads, KeyValue, MediaRowAttention, Operator, OutputForm, Rotary, RotaryPair, ValueNorm,
+    ValueSource, WeightKind,
 };
 use magnitude_state::KvCodec;
 use seismic::Element;
@@ -75,7 +75,9 @@ pub(crate) fn admit_media(decoder: &Decoder, vision: bool) -> Result<(), PlanErr
             continue;
         };
         let differ = || {
-            PlanError::Unsupported("attention layers of one history attending media rows differently")
+            PlanError::Unsupported(
+                "attention layers of one history attending media rows differently",
+            )
         };
         match &attention.key_value {
             KeyValue::Owned { domain, .. } => {
@@ -91,7 +93,9 @@ pub(crate) fn admit_media(decoder: &Decoder, vision: bool) -> Result<(), PlanErr
                     .find(|(candidate, _)| candidate == source)
                     .map(|(_, sublayer)| &sublayer.op)
                 else {
-                    return Err(PlanError::Topology("a Shared layer's source is not attention"));
+                    return Err(PlanError::Topology(
+                        "a Shared layer's source is not attention",
+                    ));
                 };
                 if owner.media_rows != attention.media_rows || *source >= index {
                     return Err(differ());
@@ -200,7 +204,10 @@ pub(crate) fn gate_function(attention: &Attention) -> i32 {
 /// The one epsilon of an attention operator's query, key and value norms,
 /// which the attention entries take as one argument. An operator without
 /// head norms uses its input norm's (never read).
-pub(crate) fn head_norm_epsilon(attention: &Attention, input_epsilon: f64) -> Result<f64, PlanError> {
+pub(crate) fn head_norm_epsilon(
+    attention: &Attention,
+    input_epsilon: f64,
+) -> Result<f64, PlanError> {
     let mut epsilons = Vec::new();
     if let HeadNorm::Rms(norm) = &attention.query_norm {
         epsilons.push(norm.epsilon);
@@ -305,7 +312,16 @@ pub(super) fn binding(
         value: segment(shape.value_rows() > 0, WeightKind::Value)?,
         output: lookup(WeightKind::AttentionOutput)?,
         activation,
-        history,
+        history: history
+            .spec(
+                activation
+                    .dtype()
+                    .ok_or(PlanError::Unsupported("attention activation dtype"))?,
+                shape.width as usize,
+                shape.width as usize,
+            )
+            .validate()
+            .map_err(|error| PlanError::InvalidDefinition(error.to_string()))?,
         tail: tail(output, &lookup)?,
     })
 }

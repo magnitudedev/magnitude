@@ -1,7 +1,6 @@
 // readout_features_rows: the final RMS normalization of the `out_rows` hidden
 // rows, published in the activation type. One threadgroup per output row.
 #include "lib/projection/projection.h"
-#include "lib/core/reduce.h"
 
 typedef element::Act activation;
 static_assert(activation::bytes == 2, "readout_features_rows requires a bf16 or f16 activation");
@@ -22,13 +21,7 @@ kernel void readout_features_rows(
     projection::Rms<activation, norm_element, projection::SelectedRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0,
         SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {out_rows}};
-    float squares = 0.0f;
-    for (uint i = thread_index; i < width; i += 256u) {
-        float v = in.norm_input(row, 0, i);
-        squares = metal::fma(v, v, squares);
-    }
-    const float total = reduce::group_sum<8>(squares, partials, sg, lane);
-    const float inverse = metal::rsqrt(total / float(width) + in.epsilon());
+    const float inverse = projection::normalization_inverse<256>(in, row, 0, partials, thread_index);
     device typename activation::storage *out = reinterpret_cast<device typename activation::storage *>(features);
     for (uint i = thread_index; i < width; i += 256u)
         out[ulong(row) * SEISMIC_RESULT_0_STRIDE_0 + ulong(i) * SEISMIC_RESULT_0_STRIDE_1] =

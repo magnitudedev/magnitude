@@ -366,6 +366,83 @@ impl DecodeStep {
     }
 }
 
+/// Semantic coefficient roles in the registry-owned affine decode. These do
+/// not name a physical plane or permit a caller to reinterpret storage bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum QuantizedComponent {
+    Code,
+    CodeValue,
+    ScaleCode,
+    BiasCode,
+    Scale,
+    Bias,
+    GroupSize,
+    CodeMin,
+    CodeMax,
+    ScaleFactor,
+    BiasFactor,
+    CoefficientCodeMax,
+    BiasPresent,
+}
+impl QuantizedComponent {
+    pub const ALL: [Self; 13] = [
+        Self::Code,
+        Self::CodeValue,
+        Self::ScaleCode,
+        Self::BiasCode,
+        Self::Scale,
+        Self::Bias,
+        Self::GroupSize,
+        Self::CodeMin,
+        Self::CodeMax,
+        Self::ScaleFactor,
+        Self::BiasFactor,
+        Self::CoefficientCodeMax,
+        Self::BiasPresent,
+    ];
+
+    pub fn requires_integer_code(self) -> bool {
+        matches!(self, Self::Code | Self::CodeMin | Self::CodeMax)
+    }
+    pub fn dtype(self) -> DType {
+        match self {
+            Self::Code
+            | Self::ScaleCode
+            | Self::BiasCode
+            | Self::GroupSize
+            | Self::CodeMin
+            | Self::CodeMax
+            | Self::CoefficientCodeMax
+            | Self::BiasPresent => DType::I32,
+            Self::CodeValue | Self::Scale | Self::Bias | Self::ScaleFactor | Self::BiasFactor => {
+                DType::F32
+            }
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Code => "code",
+            Self::CodeValue => "code_value",
+            Self::ScaleCode => "scale_code",
+            Self::BiasCode => "bias_code",
+            Self::Scale => "scale",
+            Self::Bias => "bias",
+            Self::GroupSize => "group_size",
+            Self::CodeMin => "code_min",
+            Self::CodeMax => "code_max",
+            Self::ScaleFactor => "scale_factor",
+            Self::BiasFactor => "bias_factor",
+            Self::CoefficientCodeMax => "coefficient_code_max",
+            Self::BiasPresent => "bias_present",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeComponent {
+    Temporary(DecodeTemp),
+    Constant(crate::reference_math::ReferenceScalar),
+}
+
 /// The registry-provided decode of one logical value of a representation:
 /// the planes it reads and the typed steps producing `output`. Encoders
 /// emit the steps mechanically; none reconstructs coefficient structure,
@@ -379,9 +456,85 @@ pub struct DecodeRecipe {
     steps: Vec<DecodeStep>,
     /// The temporary holding the decoded value.
     output: DecodeTemp,
+    integer_code: Option<DecodeTemp>,
+    code_value: DecodeTemp,
+    scale_code: Option<DecodeTemp>,
+    bias_code: Option<DecodeTemp>,
+    scale: DecodeTemp,
+    bias: Option<DecodeTemp>,
+    group: u32,
+    scale_factor: DecodeTemp,
+    bias_factor: Option<DecodeTemp>,
+    coefficient_code_max: i32,
 }
 
 impl DecodeRecipe {
+    /// Resolve a semantic role from the same recipe that decodes this value.
+    /// Floating-code formats intentionally have no integer-code role.
+    pub fn component(&self, role: QuantizedComponent) -> Option<DecodeComponent> {
+        match role {
+            QuantizedComponent::Code => self.integer_code.map(DecodeComponent::Temporary),
+            QuantizedComponent::CodeValue => Some(DecodeComponent::Temporary(self.code_value)),
+            QuantizedComponent::ScaleCode => Some(match self.scale_code {
+                Some(code) => DecodeComponent::Temporary(code),
+                None => DecodeComponent::Constant(crate::reference_math::ReferenceScalar::I32(1)),
+            }),
+            QuantizedComponent::BiasCode => Some(match self.bias_code {
+                Some(code) => DecodeComponent::Temporary(code),
+                None => DecodeComponent::Constant(crate::reference_math::ReferenceScalar::I32(
+                    i32::from(self.bias.is_some()),
+                )),
+            }),
+            QuantizedComponent::Scale => Some(DecodeComponent::Temporary(self.scale)),
+            QuantizedComponent::BiasPresent => Some(DecodeComponent::Constant(
+                crate::reference_math::ReferenceScalar::I32(i32::from(self.bias.is_some())),
+            )),
+            QuantizedComponent::ScaleFactor => Some(DecodeComponent::Temporary(self.scale_factor)),
+            QuantizedComponent::BiasFactor => Some(match self.bias_factor {
+                Some(temp) => DecodeComponent::Temporary(temp),
+                None => DecodeComponent::Constant(crate::reference_math::ReferenceScalar::F32(0)),
+            }),
+            QuantizedComponent::CoefficientCodeMax => Some(DecodeComponent::Constant(
+                crate::reference_math::ReferenceScalar::I32(self.coefficient_code_max),
+            )),
+            QuantizedComponent::Bias => Some(match self.bias {
+                Some(temp) => DecodeComponent::Temporary(temp),
+                None => DecodeComponent::Constant(crate::reference_math::ReferenceScalar::F32(0)),
+            }),
+            QuantizedComponent::GroupSize => Some(DecodeComponent::Constant(
+                crate::reference_math::ReferenceScalar::I32(
+                    self.group.try_into().expect("sealed group fits i32"),
+                ),
+            )),
+            QuantizedComponent::CodeMin | QuantizedComponent::CodeMax => {
+                let code = self.integer_code?;
+                let (bits, interpretation) = self
+                    .steps
+                    .iter()
+                    .find_map(|step| match step {
+                        DecodeStep::InterpretCode {
+                            into,
+                            bits,
+                            interpretation,
+                            ..
+                        } if *into == code => Some((*bits, interpretation)),
+                        _ => None,
+                    })
+                    .expect("integer code owns its interpretation");
+                let values = (0..(1u32 << bits)).map(|raw| interpretation.decode(raw, bits));
+                let value = if role == QuantizedComponent::CodeMin {
+                    values.min()
+                } else {
+                    values.max()
+                }
+                .expect("code domain nonempty");
+                Some(DecodeComponent::Constant(
+                    crate::reference_math::ReferenceScalar::I32(value),
+                ))
+            }
+        }
+    }
+
     pub fn planes(&self) -> &[PlaneSchema] {
         &self.planes
     }
@@ -535,13 +688,13 @@ impl RecipeBuilder<'_> {
         field: u32,
         bits: u32,
         interpretation: CodeInterpretation,
-    ) -> DecodeTemp {
+    ) -> (DecodeTemp, DecodeTemp, DecodeTemp) {
         let raw = self.read(PlaneField::Coefficients, field);
         let code = self.interpret(raw, bits, interpretation);
-        let code = self.to_f32(code);
+        let converted = self.to_f32(code);
         let factor = self.read(factor_plane, 0);
         let factor = self.to_f32(factor);
-        self.multiply(factor, code)
+        (self.multiply(factor, converted), factor, code)
     }
 }
 
@@ -921,60 +1074,72 @@ impl Repr {
             steps: Vec::new(),
         };
         let raw = recipe.read(PlaneField::Words, 0);
-        let code_value = match self.float_code {
-            Some(format) => recipe.float_code(raw, format),
+        let (code_value, integer_code) = match self.float_code {
+            Some(format) => (recipe.float_code(raw, format), None),
             None => {
                 let code = recipe.interpret(raw, self.bits, self.code.clone());
-                recipe.to_f32(code)
+                (recipe.to_f32(code), Some(code))
             }
         };
-        let (scale, bias) = match &self.coefficients {
-            Coefficients::Direct { bias, .. } => {
-                let scale = recipe.read(PlaneField::Scale, 0);
-                let scale = recipe.to_f32(scale);
-                let bias = if *bias {
-                    let bias = recipe.read(PlaneField::Bias, 0);
-                    Some(recipe.to_f32(bias))
-                } else {
-                    None
-                };
-                (scale, bias)
-            }
-            Coefficients::Hierarchical {
-                bits,
-                interpretation,
-                bias,
-                bias_sign,
-                ..
-            } => {
-                let scale = recipe.hierarchical_coefficient(
-                    PlaneField::ScaleFactor,
-                    0,
-                    *bits,
-                    interpretation.clone(),
-                );
-                let bias = if *bias {
-                    let product = recipe.hierarchical_coefficient(
-                        PlaneField::BiasFactor,
-                        1,
+        let mut scale_code = None;
+        let mut bias_code = None;
+        let (scale, bias, scale_factor, bias_factor, coefficient_code_max) =
+            match &self.coefficients {
+                Coefficients::Direct { bias, .. } => {
+                    let scale = recipe.read(PlaneField::Scale, 0);
+                    let scale = recipe.to_f32(scale);
+                    let bias = if *bias {
+                        let bias = recipe.read(PlaneField::Bias, 0);
+                        Some(recipe.to_f32(bias))
+                    } else {
+                        None
+                    };
+                    (scale, bias, scale, bias, 1)
+                }
+                Coefficients::Hierarchical {
+                    bits,
+                    interpretation,
+                    bias,
+                    bias_sign,
+                    ..
+                } => {
+                    let (scale, scale_factor, code) = recipe.hierarchical_coefficient(
+                        PlaneField::ScaleFactor,
+                        0,
                         *bits,
                         interpretation.clone(),
                     );
-                    Some(if *bias_sign < 0 {
-                        recipe.negate(product)
+                    scale_code = Some(code);
+                    let mut bias_factor = None;
+                    let bias = if *bias {
+                        let (product, factor, code) = recipe.hierarchical_coefficient(
+                            PlaneField::BiasFactor,
+                            1,
+                            *bits,
+                            interpretation.clone(),
+                        );
+                        bias_factor = Some(factor);
+                        bias_code = Some(code);
+                        Some(if *bias_sign < 0 {
+                            recipe.negate(product)
+                        } else {
+                            product
+                        })
                     } else {
-                        product
-                    })
-                } else {
-                    None
-                };
-                (scale, bias)
-            }
-            Coefficients::BlockFloat { format, .. } => {
-                let raw = recipe.read(PlaneField::BlockScale, 0);
-                (recipe.float_code(raw, *format), None)
-            }
-        };
+                        None
+                    };
+                    let maximum = (0..(1u32 << bits))
+                        .map(|raw| interpretation.decode(raw, *bits))
+                        .max()
+                        .expect("sealed coefficient domain nonempty");
+                    (scale, bias, scale_factor, bias_factor, maximum)
+                }
+                Coefficients::BlockFloat { format, .. } => {
+                    let raw = recipe.read(PlaneField::BlockScale, 0);
+                    let scale = recipe.float_code(raw, *format);
+                    (scale, None, scale, None, 1)
+                }
+            };
         let value = match bias {
             Some(bias) => recipe.multiply_add(scale, code_value, bias),
             None => recipe.multiply(scale, code_value),
@@ -1026,6 +1191,16 @@ impl Repr {
                 .expect("decode recipe has more than u32::MAX temporaries"),
             steps,
             output: output_temp,
+            integer_code,
+            code_value,
+            scale_code,
+            bias_code,
+            scale,
+            bias,
+            group: self.group,
+            scale_factor,
+            bias_factor,
+            coefficient_code_max,
         }
     }
 }

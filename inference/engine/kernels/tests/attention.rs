@@ -733,6 +733,7 @@ fn check_attention_slab_case(case: &Case, reused: bool) {
                         .with_param("MATRIX", matrix)
                         .with_param("STAGES", stages)
                         .with_param("COLUMNS", columns)
+                        .with_param("QREG", 0)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -947,6 +948,47 @@ fn prefill_timing_on(device: &Device) {
 fn qwen_geometry_speculative_decode_matches_host_model() {
     for device in devices() {
         qwen_geometry_speculative_decode_matches_host_model_on(&device);
+    }
+}
+
+/// Register-held queries reuse the operand stage region only after every
+/// query fragment is captured. Exercise empty partitions, padded query rows,
+/// and the long-history verification shape against the dense host model.
+#[test]
+#[ignore = "bounded CUDA register-query decode qualification"]
+fn cuda_register_query_decode_matches_host_model() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cuda)
+        .expect("CUDA qualification requires CUDA");
+    let geometry = Geometry { kv: 4, g: 6, p: 32, s: 192 };
+    let specialization = qwen_form(statics(geometry), geometry)
+        .with_param("PARTS", 12)
+        .with_param("WARPS", 4)
+        .with_param("SLICES", 1)
+        .with_param("MATRIX", 1)
+        .with_param("STAGES", 2)
+        .with_param("COLUMNS", 1)
+        .with_param("QREG", 1);
+    let kernel = decode_kernel(&device, &specialization);
+    for (rows, context) in [(1, 1), (8, 1), (8, 65536)] {
+        let case = Case::new(
+            geometry,
+            context as usize + rows,
+            1,
+            &speculative_rows(rows, context),
+            13,
+        );
+        let expected = case.expected();
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_decode(&kernel, &mut bound, &case);
+        check(
+            &format!("CUDA register-query decode {rows} rows context {context}"),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 

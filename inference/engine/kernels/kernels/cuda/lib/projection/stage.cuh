@@ -34,6 +34,21 @@ template <class E, class Rows> struct Plain {
     }
 };
 
+// A scalar source with independent row and column strides. It publishes
+// semantic Act into owned staging; it is never a direct tensor operand view.
+template <class E, class Rows> struct Strided {
+    const u8 *x;
+    u64 row_stride;
+    u64 column_stride;
+    Rows rows;
+    static constexpr bool STAGED = true;
+    static constexpr int FACTORS = 0;
+    __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
+    __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
+        return Act::round(element::at<E>(x, rows(m) * row_stride + k * column_stride));
+    }
+};
+
 // RMS normalization of an F32 residual: x = round_A(t * rsqrt(sum t^2 / K + eps) * w).
 template <class NORM, class Rows> struct Rms {
     const float *x;
@@ -68,14 +83,14 @@ template <class NORM, class Rows> struct Rms {
 // The prologue's row m as A into out[m * K .. m * K + K), formed by the whole
 // block: the staging launch (one block per row, global scratch) and a GEMV
 // block at M = 1 (its shared memory) both form rows with it.
-template <class Pro> __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out) {
-    static_assert(Pro::STAGED, "an input read in place is not formed");
+template <class Storage = Act, class Pro> __device__ __forceinline__ void form_row(const Pro &pro, u32 m, u64 K, u8 *out) {
+    static_assert(Storage::bytes == 2, "projection physical operands are 16-bit");
     __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
     __shared__ float scratch[32];
     pro.prepare_row(factors, m, scratch);
     __syncthreads();
     for (u64 k = threadIdx.x; k < K; k += blockDim.x)
-        element::put<Act>(out, m * K + k, pro.value(factors, m, k));
+        element::put<Storage>(out, m * K + k, pro.value(factors, m, k));
 }
 
 // int8 activations (the GEMM's INT8 candidate): rows quantized per 32-code
@@ -131,4 +146,3 @@ __device__ __forceinline__ void stage_row_s8(const Pro &pro, u32 m, u64 K, u8 *q
         groups[m * (K / 32) + group] = make_float2(d, d * (float)total);
     }
 }
-

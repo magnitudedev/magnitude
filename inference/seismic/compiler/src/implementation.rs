@@ -293,9 +293,10 @@ pub(crate) fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: u
             "{operation:?}({})",
             operands
                 .iter()
-                .map(|(dtype, value)| format!(
-                    "{dtype:?}:{}",
-                    expression_detail(arena, (*value).into(), depth - 1)
+                .map(|operand| format!(
+                    "{:?}:{}",
+                    operand.dtype(arena),
+                    expression_detail(arena, operand.expression(), depth - 1)
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -462,15 +463,15 @@ pub(crate) fn validate_universal_implementation<B: seismic_native_target::Target
                 .join(",")
         };
         return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                "post-native legality is not constructionally total over TargetDomain (target={:?} target_symbols=[{}], semantic={:?}, hard={:?} hard_detail={} hard_symbols=[{}], implication={:?})",
-                arena.view(AnyExpr::Bool(target_domain)),
-                symbol_summary(target_domain),
-                arena.view(AnyExpr::Bool(semantic_coverage)),
-                arena.view(AnyExpr::Bool(hard_constraints)),
-                expression_detail(arena, AnyExpr::Bool(hard_constraints), 8),
-                symbol_summary(hard_constraints),
-                arena.view(AnyExpr::Bool(total)),
-            )));
+            "post-native legality is not constructionally total over TargetDomain (target={:?} target_symbols=[{}], semantic={:?}, hard={:?} hard_detail={} hard_symbols=[{}], implication={:?})",
+            arena.view(AnyExpr::Bool(target_domain)),
+            symbol_summary(target_domain),
+            arena.view(AnyExpr::Bool(semantic_coverage)),
+            arena.view(AnyExpr::Bool(hard_constraints)),
+            expression_detail(arena, AnyExpr::Bool(hard_constraints), 8),
+            symbol_summary(hard_constraints),
+            arena.view(AnyExpr::Bool(total)),
+        )));
     }
     Ok(())
 }
@@ -1029,6 +1030,14 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
     }
     pub(crate) fn portable_publish(&mut self, value: SemanticValueId) -> ScalarPublication {
         self.inner.portable_publish(value)
+    }
+    /// A fresh natural host quantity slot of this construction.
+    pub(crate) fn portable_natural_slot(&mut self) -> seismic_ir::schedule::HostQuantitySlot {
+        self.inner
+            .state
+            .construction
+            .schedule_state()
+            .quantity_slot(self.inner.arena, HostQuantityKind::Natural)
     }
     pub(crate) fn portable_affine_view(
         &mut self,

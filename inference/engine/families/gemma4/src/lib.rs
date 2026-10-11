@@ -8,10 +8,12 @@
 //! history, layers whose values are their keys, per-layer inputs and routed
 //! experts.
 
+mod assistant;
 mod family;
 pub mod inputs;
 mod projector;
 
+pub use assistant::{inspect_assistant, ASSISTANT_ARCHITECTURE};
 pub use family::Gemma4Family;
 pub use projector::describe_projector;
 
@@ -199,6 +201,53 @@ fn rotary(
     })
 }
 
+/// The geometry of window layers: whole heads rotated at the window base,
+/// reading the last `attention.sliding_window` rows.
+fn window_geometry(m: &Metadata, media_rows: MediaRowAttention) -> Result<KindGeometry, Error> {
+    let width = m.integer("attention.key_length_swa")?;
+    if m.integer("attention.value_length_swa")? != width
+        || m.integer("rope.dimension_count_swa")? != width
+    {
+        return Err(invalid(
+            "Gemma window layers must rotate whole heads of equal key and value width",
+        ));
+    }
+    Ok(KindGeometry {
+        width,
+        rotary: rotary(width, m.positive_number("rope.freq_base_swa")?, width / 2, None)?,
+        domain: HistoryDomain::Window {
+            tokens: m.integer("attention.sliding_window")?,
+        },
+        media_rows,
+    })
+}
+
+/// The geometry of full layers, binding the stored rotary divisors.
+fn full_geometry(m: &Metadata, b: &mut Tensors) -> Result<KindGeometry, Error> {
+    let width = m.integer("attention.key_length")?;
+    if m.integer("attention.value_length")? != width
+        || m.integer("rope.dimension_count")? != width
+    {
+        return Err(invalid(
+            "Gemma full layers must span whole heads of equal key and value width",
+        ));
+    }
+    // The stored divisors encode the rotated fraction; the importer checks
+    // them against this table.
+    let divisors = b.bind("rope_freqs.weight", &[width / 2])?;
+    Ok(KindGeometry {
+        width,
+        rotary: rotary(
+            width,
+            m.positive_number("rope.freq_base")?,
+            width / 2 / FULL_ROTATED_PAIR_FRACTION,
+            Some(divisors),
+        )?,
+        domain: HistoryDomain::Token,
+        media_rows: MediaRowAttention::Causal,
+    })
+}
+
 /// Each layer's attention kind, from the per-layer window flags.
 fn layer_kinds(m: &Metadata, layers: u64) -> Result<Vec<LayerKind>, Error> {
     let flags = m
@@ -285,53 +334,13 @@ pub fn inspect_components(
         }),
     };
 
-    let window = {
-        let width = m.integer("attention.key_length_swa")?;
-        if m.integer("attention.value_length_swa")? != width
-            || m.integer("rope.dimension_count_swa")? != width
-        {
-            return Err(invalid(
-                "Gemma window layers must rotate whole heads of equal key and value width",
-            ));
-        }
-        KindGeometry {
-            width,
-            rotary: rotary(width, m.positive_number("rope.freq_base_swa")?, width / 2, None)?,
-            domain: HistoryDomain::Window {
-                tokens: m.integer("attention.sliding_window")?,
-            },
-            media_rows: window_media_rows(per_layer_width > 0),
-        }
-    };
+    let window = window_geometry(&m, window_media_rows(per_layer_width > 0))?;
 
     let mut b = Tensors::new(directory);
     let vocabulary = b.rows("token_embd.weight")?;
     let embedding = b.bind("token_embd.weight", &[vocabulary, hidden])?;
     let output_norm = b.bind("output_norm.weight", &[hidden])?;
-    let full = {
-        let width = m.integer("attention.key_length")?;
-        if m.integer("attention.value_length")? != width
-            || m.integer("rope.dimension_count")? != width
-        {
-            return Err(invalid(
-                "Gemma full layers must span whole heads of equal key and value width",
-            ));
-        }
-        // The stored divisors encode the rotated fraction; the importer
-        // checks them against this table.
-        let divisors = b.bind("rope_freqs.weight", &[width / 2])?;
-        KindGeometry {
-            width,
-            rotary: rotary(
-                width,
-                m.positive_number("rope.freq_base")?,
-                width / 2 / FULL_ROTATED_PAIR_FRACTION,
-                Some(divisors),
-            )?,
-            domain: HistoryDomain::Token,
-            media_rows: MediaRowAttention::Causal,
-        }
-    };
+    let full = full_geometry(&m, &mut b)?;
 
     let per_layer = if per_layer_width == 0 {
         None

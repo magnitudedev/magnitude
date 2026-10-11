@@ -128,7 +128,7 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                         BW: element(formats[3]),
                         A: Element::bf16(),
                     },
-                    &mapping.recurrent_params(statics_specialization(&[
+                    &mapping.projection_params(statics_specialization(&[
                         ("H", h),
                         ("NK", nk),
                         ("NV", nv),
@@ -210,7 +210,7 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                         VW: formats[2].resident(),
                         A: Element::bf16(),
                     },
-                    &mapping.attention_project_params(statics_specialization(&[
+                    &mapping.projection_params(statics_specialization(&[
                         ("D", d),
                         ("Q", query),
                         ("GR", 0),
@@ -278,7 +278,7 @@ fn cuda_attention_output_matches_host_model() {
                         A: Element::bf16(),
                         OW: format.resident(),
                     },
-                    &mapping.attention_output_params(statics_specialization(&[
+                    &mapping.projection_params(statics_specialization(&[
                         ("D", d),
                         ("Q", q),
                         ("W", w),
@@ -350,7 +350,7 @@ fn cuda_projection_block_timings() {
                     BW: Format::Q8.resident(),
                     A: Element::bf16(),
                 },
-                &mapping.recurrent_params(statics_specialization(&[
+                &mapping.projection_params(statics_specialization(&[
                     ("H", h),
                     ("NK", nk),
                     ("NV", nv),
@@ -384,7 +384,7 @@ fn cuda_projection_block_timings() {
                     A: Element::bf16(),
                     OW: Format::Q5K.resident(),
                 },
-                &mapping.attention_output_params(statics_specialization(&[
+                &mapping.projection_params(statics_specialization(&[
                     ("D", h),
                     ("Q", nv),
                     ("W", w),

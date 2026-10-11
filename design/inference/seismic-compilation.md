@@ -3,6 +3,7 @@ applies_to:
   - inference/seismic/**
   - inference/solver/**
   - inference/engine/**
+  - inference/docs/tuning.md
 ---
 
 # Seismic compilation
@@ -44,63 +45,93 @@ Native invocation reuses the checked entry contract and public tensor runtime bu
 `RefinedCandidateFamilies`, compiler kernel IR, `CandidateDomain`, `SelectionPolicy`, `ExecutableVariant`,
 `PreparedKernel`, or portable workflow artifacts. It has no solving, duration model, candidate
 selection, retry, or fallback. Its only search is tuning, fast enough to run at program
-preparation. Entry-wide declarations use a time-bounded local search of the author's declared parameter domain, minimizing one
-weighted device-measured cost (`Σ weight × median`) over the points it times. The consumer
-describes its points in ascending estimated cost and supplies their inputs through a source that
-the tuner asks for a point's inputs only when it needs the point, with the time building them may
-take; the source refuses a point whose building is predicted not to fit. A unit's search is
-advanced in steps, so that a consumer tuning several units decides which the next time goes to.
-A census admits only the required points (the cheapest point when none is) and returns the
-defaults' measurements, from which the consumer divides its time among units. Starting the
-search reuses those measurements and admits further points in order, running each point's
-reference and validating and measuring the defaults there, while that work stays within the
-plan's admission time, each point predicted from the previous one: its building and validation as
-measured, its invocations at the defaults' measured device time scaled by their cost ratio; it
-then measures the defaults and every form's start whatever the time, so every form has a
-measurement before any is searched further. Refining continues the search until an instant the
-consumer names, any number of times: what the search measured is kept, each step continues the
-same procedure over it, and the steps together measure what one uninterrupted search measures,
-in the same order. Concluding confirms the finalists found so far and validates the choice, so a
-search concluded after any step yields the best configuration confirmed by the same rules; the
-search reports what concluding will take, and a step ends when the time before the consumer's
-limit only covers it. One tuning call is a start, a refinement to the end of its allowance and a
-conclusion. A point
-the consumer marks required may take the plan's required time instead; when the required points
-cannot fit, the tuner keeps the defaults without searching (`Unaffordable`). A point not admitted
-is not timed and folds its weight into the largest admitted point of its class (or the largest
-admitted point). Every candidate must pass numerical validation at the timed points before
-repeated timing. A choice other than the defaults is then validated at the points not timed,
-whose inputs are built only for that; a choice that fails there, or whose validation there would
-not fit the allowance, gives way to the defaults, which must pass there too unless they are
-themselves the reference (a native-default reference, against which they pass by construction).
-Every chosen configuration passes at every point. A parameter read only by launches inactive at every timed point keeps its
-default: nothing measures it, and no validation runs its code.
-Each parameter's values are ordered numerically; neighbours differ by one step in one parameter. The search
-evaluates the defaults, one start per other value of each `form` parameter and any
-additional start configurations the consumer names. Each form start is the admissible configuration with that value nearest
-the defaults, unless the consumer supplies an admissible start for that form value; the hint then uses that form's first
-measurement slot. From the cheapest start of each form, cheapest form first, it repeatedly forms every
-unvisited neighbour of the current configuration as one parallel batch, measures each, and moves
-to the best while it improves by more than ε; a form's own defaults can be far from its best, and
-a single descent from the entry's defaults rarely crosses into another form. Then, at each local
-minimum, it restarts from the unvisited configuration farthest from everything visited. It stops when the space is
-exhausted, R consecutive restarts found nothing better, or its exploration time ends: the consumer's
-allowance less what confirming the finalists found so far (each estimated from its own measured
-samples at the timed points) and validating the choice at the untimed points (estimated from the last timed point) will
-cost. Time is checked before each
-configuration. Configurations the device cannot form or run cost +∞. Of the K cheapest
-configurations, those within 10% of the leader's cost (the spread at which confirmation already
-rejects a configuration's samples as unstable; farther behind, noise cannot reverse the ranking)
-and the defaults, the reference of the confirmed costs, are then re-measured with more samples across every timed point, alternating round by
-round, and ranked by those full-workload costs; the defaults rank first unless the leader beats
-them by δ. Defaults with no measured rival have nothing to rank against and are not re-measured.
-Given an evaluator's costs and where its time ends, the search is deterministic, so a recorded
-evaluator can replay it. Measurement is device time: a
+preparation; [native tuning](../../inference/docs/tuning.md) describes its lifecycle and ownership.
+Native tuning separates the immutable served numerical contract from a
+representative performance objective. Point weights are invocation demand; candidate cost is
+expected elapsed work `Σ demand × median`, normalized by the same canonical service. Row
+classes identify physical regions, not independent normalization scales. Missing measurements
+remain unknown; discovery never transfers their demand to a cheaper measured region.
+
+Each point separately declares its complete numerical witness vector and the invocation
+rotation representing its performance workload. The workload explicitly selects all witnesses
+or a nonempty, distinct, in-range subset. Reference execution and artifact qualification always
+observe the complete witness vector; discovery, candidate timing, keyed performance reuse and
+confirmation execute only the declared workload. Adversarial distributions of one attention
+history geometry therefore remain required witnesses without becoming repeated serving work.
+Genuine distinct layer/weight rotations remain performance invocations. Pending qualification
+quotes count full witnesses independently of the timed rotation; witness provenance does not
+change when the performance selection changes.
+
+Canonical defaults are formed within the first-load clock. The count walk performs no formation;
+zero-demand units form their defaults during the same timed preparation without constructing
+numerical inputs. Candidates are qualified on the
+device against the declaration's native default (the canonical kernel itself), which does not
+duplicate self-validation or manufacture empirical evidence. There is no portable or host
+reference. Formation (including canonical defaults), measurement and implementation selection
+share exactly one first-load allowance
+(60 seconds served; an explicit budget for evaluation). Later loads consume the final cached
+choice, including incomplete or unqualified default outcomes; they never reopen search or
+accumulate a tuning budget.
+
+Representative discovery is an explicit pending operation. Its selected points may include a
+zero-demand bootstrap for pricing; numerical `required` membership does not imply mandatory
+benchmarking. Unknown discovery receives a fair portion of the existing remaining minute.
+Once all selected representatives are measured, the objective is frozen. Bounded Run opening
+transports those exact default measurements and the prepared canonical artifact, performs
+cancellable planning, and evaluates no optional candidate.
+
+Ordinary and launch-factored declarations generate whole-artifact contender packets. The
+ordinary frontier follows the actual measured incumbent and consumer hints while retaining
+legal coupled-coordinate and disconnected-component coverage. Factored groups generate
+admissible whole specializations; combinations of winning groups are pending contenders,
+never artifacts created during finalization. One admitted packet attempts one whole artifact.
+Formation precedes measurement; a candidate's first observed execution checks every witness
+at its timed points. The ranked winner then covers every untimed served point before selection.
+Every numerical witness remains required, including zero-demand shapes. Inputs and reference
+pages for an untimed witness are constructed and released individually. Evidence and prepared artifacts
+are reused only for their exact identity; Allowance interruption leaves pending work within
+this load, rather than an execution failure, numerical exclusion or completed coverage.
+
+Runtime owns the next operation's complete wall-work forecast and its incremental terminal
+obligation. Completed formation, resident reference pages and exact-artifact evidence are
+omitted. Measured work, pending forecasts and prospective confirmation remain distinct;
+the allocator never recalibrates an already complete quote, multiplies it by cold startup
+ratios or adds program counts as a second price. Unknown quotes authorize discovery and
+planning only, never optional candidate execution. The scheduler admits work only when its
+quote plus existing and prospective terminal obligations fit the original deadline. It
+protects other units' held obligations in the runtime deadline; runtime protects its own
+obligation once. Noninterruptible operation estimates remain estimates, so receipts report
+actual elapsed time and cannot conceal overruns or extend the assigned deadline.
+
+Finalization confirms and ranks only retained whole artifacts, then checks the leader's
+remaining declared numerical witnesses. It forms no new specialization. Ordinary and factored paths use the same
+weighted finalist cohort and confirmation rules; reservation follows that cohort and the
+same physical point/key reuse as actual confirmation. It prices repeated placement and
+initialization per artifact, calibration and sample wall work per physical point/key, and
+observed device warm-up once for the cohort. These costs come from completed work at each
+point; device medians remain the performance objective rather than the wall-work price.
+The first rival reserves both confirmation
+and winner coverage; further rivals reuse that coverage reserve. Confirmation cannot spend the
+reserved coverage interval. Confirmation exhaustion preserves previous complete timing samples,
+but cannot waive a retained leader's remaining numerical witnesses. An empty or already
+completed witness set owes no new work, even after the measurement cutoff. If coverage does not fit,
+selection keeps the canonical default. CPU result
+assembly and publication are separately observed and reserved by the consumer; each unit's
+publication cutoff preserves the outstanding reserves of every other unit. Reference,
+formation, timing and independent full-scope validation have exclusive elapsed accounting.
+A declaration's native default remains an honest canonical fallback, not a fabricated
+empirical qualification.
+
+Given an evaluator's costs and where its time ends, frontier generation and ranking are
+deterministic, so recorded evidence can replay selection. Measurement is device time: a
 point's calls are placed once and calibrated so one sample covers a minimum device time. Each
 sample completes before the next is submitted, since a device queue overlaps independent work and
-back-to-back samples would each include the other's. A kernel's first pass pays its first-use costs
-and is never a sample; a later point's calibrating pass of the same kernel is one when it already
-covers a steady sample (2 ms), and a point whose sample is that long takes one sample rather than
+back-to-back samples would each include the other's. A point's first pass pays the first-use costs
+of what it is the first to run (launches no earlier point ran, scratch no earlier call touched) and
+is never a sample, whatever earlier points of the kernel ran: when a later point's calibrating pass
+counted as its sample, a token-packing GEMM whose packing launches first ran at 512 rows read 1.6×
+its time there on an M4 Pro, and the faster configuration lost its confirmation to its defaults.
+A point whose sample covers a steady 2 ms takes one sample rather than
 the requested count, because a sample's fixed jitter is then a small fraction of any ranking margin.
 A device idle for more than 20 ms since its last timed work (forming a batch of configurations
 idles it for tens to hundreds of milliseconds) runs at a lowered clock, which read a
@@ -114,10 +145,17 @@ execution from the same zeroed storage as a fresh call, so missing writes cannot
 preceding candidate's correct output. Reference execution, initialization, readback and
 comparison are outside the device timing interval. A cold execution remains calibration only;
 an already steady first sample is retained. A failing candidate is excluded immediately.
-The numerical reference is explicitly chosen by the caller: the required portable source
-construction under Exact with zero search, or the declaration default native specialization.
-There is no automatic fallback between references. Native-default agreement cannot detect
-shared implementation defects; neither kind of observation establishes compiler applicability. Native tuning applies the
+A launch's thread count and shared memory are checked against the formed function and the device
+at the dimensions of the call, and a point's inputs hold some dimensions at one value (a tuning
+batch's rows see one history span; a served launch's see up to the store's span class). The
+consumer therefore names the dimensions of the calls a unit serves at shapes its points do not
+take, and every configuration is checked at each of them as it is formed: one that cannot launch
+there is excluded before it is measured, and defaults that cannot are an error, as at a point.
+Native declarations carry no numerical associations or recipes; each candidate computes the
+attached portable function. The reference is the declaration's canonical native default on the
+same device, never a portable or host execution. Agreement with it cannot detect shared
+implementation defects and does not establish compiler applicability. Native
+tuning applies the
 caller's bounded or exact policy to every result and writable input subject using the compiler's
 comparison rules. Discrete state stays exact. Mutable cases provide initialization for equivalent
 pristine reference and validated candidate invocations; timing repetitions that follow are
@@ -125,15 +163,18 @@ batched without re-initialization, identically for every configuration. A case m
 leading rows each writable parameter's entry writes; validation then observes exactly those rows
 of it, and observes an undeclared writable parameter whole. Callers keep at least one case per
 tuned entry whole so writes outside the declared rows are rejected.
-The default receives the same validation as every candidate. The first fully passing candidate
-establishes the timing anchor; if none passes, tuning returns a failure with the observed exclusions.
-A default that failed validation or measurement cannot be selected as an implicit fallback;
-a default that passed both but whose timing re-measurement was unstable stays in the ranking,
+The default supplies the reference and timing anchor without self-qualification. Its failed
+formation or initial service measurement cannot be overridden by implicit fallback authority.
+A confirmation is unstable when its samples' relative spread, weighted as the objective weighs each
+point, exceeds 10%: a spread at one lightly weighted point moves the objective by that weight only
+(an 11% spread at a 49 µs point of fifteen once voided a verify attention configuration confirmed
+twice as fast at long context). Numerical validation stays required at every point.
+A default whose timing re-measurement was unstable stays in the ranking,
 costed at its fastest sample at each point (a time it reached; a sample cannot read faster than
 the kernel runs), so a confirmed leader replaces it only by beating it at its best by δ, and
 otherwise it remains the choice: timing noise is not a numerical verdict, against the default or
-for it. A default whose re-measurement failed outright remains the choice. The defaults' measurement and evidence from
-admitting the points carry into the search.
+for it. A default whose re-measurement failed outright remains the choice. The defaults'
+measurements and retained observations from admitting the points carry into the search.
 Seismic does not reuse stored results: the consumer keys and stores them, by what a result is
 valid for (device, implementation, numerical policy, served shapes), and names what case inputs
 are generated from, so reuse never reads them back. A timing key alone never establishes
@@ -142,7 +183,98 @@ A consumer may tune the same native entry for disjoint served workload classes a
 units, then bind each prepared choice into the corresponding exact graph class. Each unit has
 its own search identity, measurement points and validation; the prepared choices share the
 entry's checked invocation contract.
+The domains describe actual graph dispatch ownership, not every row count the entry could
+execute. When dedicated verification kernels own multirow classes, the base decode unit owns
+only single-row work. Workload pricing counts each physical served class once; a broader base
+domain must not duplicate the demand already assigned to its dedicated units.
 The distinct public handle makes direct-only use structural.
+Native tuning has one **allowance on the first load only**: 60 seconds when served, or an
+explicit budget chosen by evaluation. The budget is part of the stored result's identity, so a
+result tuned under one budget is never reused under another. Fresh tuning ignores stored tuning
+results while keeping compiled kernels, and an optional tuning trace records the search's events.
+The original clock starts with unit counting, including metadata and cached served-contract
+verification, and is never reset before canonical preparation. Admission,
+measurement, search, confirmation and optional component qualification share that allowance;
+no later load, calibration pass or persistent continuation adds tuning time. The first
+preparation retains its best evidenced legal choice. Every later load uses that valid cached
+choice without searching, regardless of whether the original bounded search exhausted its
+domain. A stop caused by the deadline describes unsearched scope; it is not an optimum claim.
+An unmeasured retained default is explicitly unqualified, never presented as measured evidence.
+
+Canonical native defaults are formed during required preparation inside the first-load clock,
+with no candidate formation, optimization sampling or selection. The default is the reference
+candidates are compared with; it is not qualified against itself.
+The same opened search retains exact case/reference/artifact witness provenance. Each
+qualification point releases its scratch and observations before the next; census rebuilds
+through the same factories and adopts only an exactly matching canonical verdict. Shared
+physical readout weights may persist by storage identity, not a pool of all ordinary cases. The
+native-default reference performs no duplicate self-validation. Deadline-only absence of optional candidates
+retains the declared or already qualified canonical choice; it does not report it unusable.
+The census measures the default's service cost and retains its first observed outputs without
+comparing that implementation with itself; its receipt is measured cost with `validated=false`
+and no numerical evidence. Every alternative candidate still requires empirical qualification.
+Default observations outside the timed workload are executed only when their comparison is
+needed. Retained observations are reused, not recomputed for each candidate.
+
+Composed execution choices join the same first-load allocation as native entries. Their count
+walk distinguishes cached final choices from uncached contenders. Their census prices the
+complete real-weight recipe, preparation and confirmation. Optional import and formation stay
+inside the existing minute. Before dependent qualification, the allocator concludes the actual
+ordinary native specializations on which the canonical recipe depends. The contender compares
+that finalized canonical recipe with its alternative, within its allocated hard deadline;
+census defaults never overwrite the selected ordinary implementation. This dependency-aware
+start precedes optional deep refinement and cannot rely on spare time after allocation.
+Incomplete or skipped qualification permanently retains the canonical choice. A cached true
+receipt must match the finalized canonical configuration identity; a mismatch downgrades to
+canonical without reopening search. The consumer owns receipt identity and retained programs.
+Every concluded choice, including fallback, is cache-only on later loads.
+
+Selection policy version 20 additionally identifies canonical safety preparation and fully
+deadline-cancellable domain projection; earlier version 19 identified the prior correction: one deadline through admission
+and confirmation, confirmation spends its reserved time, deadline-only failure preserves the
+already qualified measured cohort, and dependent recipes use finalized canonical choices.
+Older selection receipts are separate identities; compiled shader artifacts remain reusable
+through their ordinary content hashes. This is an algorithm change, never another budget for
+an existing identity.
+
+Point construction receives the lesser of its admission allowance and the actual remaining
+first-load deadline. Admissibility walks check cancellation even at rejected prefixes, and
+ordinary projected domains cannot materialize unbounded after their slot ends. Timing admission
+prices observed host submit/wait cost as well as calibrated device work; the device objective
+itself remains unchanged. Reference and candidate submissions recheck the same deadline after input reset or copying. Calibrated timing batches must fit their remaining allowance before submission; warm-up does not admit a known batch that exceeds it. Receipt/cache publication and selection finalization are also charged to the original minute.
+The allocator prices CPU result assembly and publication with a fixed latency allowance plus
+a receipt-volume allowance. The largest observed whole-publication latency supplies the fixed
+term; the fastest observed seconds per unit of owned receipt work supplies the volume term.
+A slow small publication can raise fixed latency without multiplying it by every larger
+receipt. Both terms come from the current load, with no time floor for unobserved work.
+Owned receipt work includes configuration and point cells, metadata strings, keyed values,
+sample vectors, and numerical evidence. Current ordinary/factored records and
+configured confirmation vectors determine the forecast; counting them does not clone results.
+Actual completed execution, reference, input-building and formation phase deltas are excluded
+from this CPU observation, so their existing conclusion reserve is not charged twice.
+Attempted phase work is recorded on every outcome, including deadline rejection.
+
+Canonical census witnesses bootstrap this observed rate before optional starts. Their real
+assembly, serialization and atomic publication consume the same minute; the separate census
+namespace is never loaded as a finalized selector choice. Publication is skipped when its
+observed cost cannot fit the remaining deadline. Cache-free preparation prices serialization
+without owing disk publication. Waiting fallback units and open searches both reserve their
+forecast receipt work, reducing optional search time rather than granting a terminal grace
+period. A fair census can retain partial costs without admitting every required witness;
+its allocated start may finish missing required admission only before that start's existing
+deadline. Optional admission keeps its existing share, and candidate search still requires
+complete required coverage. No missing scope grants time on another load.
+
+Interrupted slices may reuse observations only within the same preparation and deadline;
+stored results are final choices, never continuation inputs.
+Launch-selection coordinates are explicit boundaries even when they change scratch size or
+constrain a form's local parameters. Planning fixes each boundary assignment and simplifies
+its guards before projecting coupled local code domains. Mutually exclusive GEMV, tall and
+packed launches therefore remain separate components instead of a product joined through
+inactive constraints. Legal assembled configurations still satisfy the original full constraint
+and qualify the whole invocation; conditional projection preserves the exact legal local
+assignments. Domain traversal is lazy and cancellable even between legal configurations.
+
 Launch-scoped declarations use a factored search. The checked declaration gives each parameter
 its launch ownership, including explicit entry-parameter reads by kernels that are absent from
 launch geometry and activity conditions. Active launches, shared parameters and joint `where` restrictions
@@ -154,16 +286,35 @@ and group size), and takes each from a walk in which every parameter not coupled
 `where` is held at its default, so its time and memory follow the sizes of the groups and not
 their product. The tuner measures every candidate in each
 group at the points where that group contributes work, evaluates boundary parameters that move
-points between launches, then confirms each group's shortlisted candidates against its defaults
-before assembling one choice per group. An independent launch group outside the consumer's
+points between launches. Conditional scratch presence may follow the same boundary without
+coupling the launches; parameters in scratch byte extents remain coupled. Each boundary is
+completed with an admissible local witness: canonical local coordinates are preferred only
+when that boundary admits them. Residual guard-coupled coordinates may change to make the
+boundary legal, without freeing unrelated launch domains. Exploration and confirmation use
+that same boundary-specific baseline; a candidate assignment legal under another boundary
+is not a contender unless its assembled invocation satisfies the current boundary's full
+constraint. The tuner then confirms each group's shortlisted candidates against this baseline
+before assembling one choice per group. It then compares alternative launch boundaries with those
+chosen mappings held fixed, reserving the paired confirmations within the consumer's time limit. The same hard deadline bounds each candidate formation, validation rotation and warm-up/sample submission in factored conclusion; allowance exhaustion preserves the last evidenced choice and reports missing scope separately from numerical rejection.
+A ranking margin is relative to the points whose active launch keys differ; unchanged prefill or
+decode points cannot dilute a demonstrated improvement at the rows a boundary moves.
+An independent launch group outside the consumer's
 served points keeps its declared default. Only what is about to be measured is formed: a
 launch's code variants share one source, so the variants a chunk of candidates runs that no
 held program has are formed in one compile per launch and held, and the candidates assembled
 from them form nothing and supply their runtime geometry. Before refining a group, the leading
 boundary measures nearby admissible coordinate changes across active groups in round-robin order;
 a large first group cannot consume the refinement slice before later active groups have rivals.
-These starts and the first boundary's form starts are protected from the refinement slice, while
-remaining subject to the consumer's hard limit and conclusion reserve. Inactive groups keep their
+Ordinary coverage follows the best completely measured mode and its legal neighbors before
+canonical-default coordinate coverage, retaining every disconnected-component representative. After this coverage and immediate incumbent neighbors, refinement surveys legal configurations changing exactly two coordinates before the flat remainder. A coordinate may move to any declared value; the survey filters the existing admissible domain and adds neither a second domain nor a new tuning allowance.
+Confirmation and its reservation select the same weighted finalist cohort. Each new packet
+withholds its prospective confirmation before qualification and timing; finalization reserves
+price actual pending assemblies and omit already-qualified exact artifacts. A factored boundary
+that offers no measured improvement creates no confirmation or assembly obligation.
+These starts remain in the runtime portfolio until their atomic packet is admitted.
+Admission authorizes one complete optional packet under the original hard deadline and
+conclusion reserve; expiry of its forecast-sized scheduling slice during handoff does not
+revoke that admission. Discovery remains bounded by its allocated fair slice. Inactive groups keep their
 defaults; exact cost ties retain the seed mapping. A group's other candidates are formed and measured a chunk at a time, so a step can end
 between chunks; a later step uses the same order, takes what earlier steps measured and measures
 only what is missing.
@@ -312,7 +463,10 @@ Canonical upload tensors can be filled from a host reader in bounded chunks.
 An incomplete read leaves the tensor unpublished; the caller cannot bind it
 as a native input until the whole physical byte range has been written.
 A device's submission trace (measurement only, one active at a time) records every native
-submission's host encode interval and its device interval on one host clock. At launch detail
+submission's host encode interval and its device interval on one host clock. Both detail levels
+record evaluated launch geometry, inactive launch conditions, and repeat occurrence directly from
+the encoded dispatch. Submission detail therefore accounts for physical work without adding
+per-launch timestamps or changing the device work. At launch detail
 each launch is encoded in its own timestamped encoder (Metal) or between recorded stream events
 (CUDA), still within the same single submission; that attributes device time to entries but
 changes the device work, so launch-detail steps are never production timings.

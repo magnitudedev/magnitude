@@ -99,6 +99,10 @@ impl VulkanOpened {
         self.memory.set_limit(limit)
     }
 
+    pub(crate) fn restart_memory_high_water(&self) {
+        self.memory.restart_high_water()
+    }
+
     fn allocate_with(
         &self,
         bytes: u64,

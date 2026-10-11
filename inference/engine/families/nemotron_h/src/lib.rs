@@ -18,18 +18,19 @@ mod family;
 pub use family::NemotronHFamily;
 
 use magnitude_artifacts::{
-    gguf::{Directory, Value},
     PackageIdentity,
+    gguf::{Directory, Value},
 };
 use magnitude_family_common::{HeaderError, Metadata, Tensors};
 use magnitude_family_contracts::{
-    checked_product, ActivationDType, RouteNormalization, ActivationFunction, Attention, AttentionGate, Block, Decoder,
-    DefinitionError, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
-    FamilyId, FeedForwardUp, Head, HeadBlock, HeadNorm, HistoryDomain, HistoryReads,
-    ImportTransform, InputNorm, InputSemantics, KeyValue, LatentExperts, LayerNorm,
-    MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary,
-    RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert, SharedExpertGate,
-    StateSpace, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+    ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DefinitionError,
+    DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
+    FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory, HeadInput, HeadNorm,
+    HeadReadout, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics, KeyValue,
+    LatentExperts, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
+    ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
+    ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm, ValueSource,
+    VocabularyProjection, WeightDescriptor, checked_product,
 };
 use std::{error, fmt};
 
@@ -337,8 +338,7 @@ impl Geometry {
                     width,
                     down: binder
                         .bind(&format!("{prefix}ffn_latent_down.weight"), &[width, hidden])?,
-                    up: binder
-                        .bind(&format!("{prefix}ffn_latent_up.weight"), &[hidden, width])?,
+                    up: binder.bind(&format!("{prefix}ffn_latent_up.weight"), &[hidden, width])?,
                 })
             })
             .transpose()?;
@@ -349,11 +349,15 @@ impl Geometry {
                     intermediate: shared,
                     up: FeedForwardUp::Plain {
                         activation: ActivationFunction::ReluSquared,
-                        up: binder
-                            .bind_scaled(&format!("{prefix}ffn_up_shexp.weight"), &[shared, hidden])?,
+                        up: binder.bind_scaled(
+                            &format!("{prefix}ffn_up_shexp.weight"),
+                            &[shared, hidden],
+                        )?,
                     },
-                    down: binder
-                        .bind_scaled(&format!("{prefix}ffn_down_shexp.weight"), &[hidden, shared])?,
+                    down: binder.bind_scaled(
+                        &format!("{prefix}ffn_down_shexp.weight"),
+                        &[hidden, shared],
+                    )?,
                     gate: SharedExpertGate::None,
                 })
             })
@@ -495,7 +499,7 @@ pub fn inspect_components(
                 _ => {
                     return Err(metadata_error(
                         "Nemotron-H supports at most one shared expert",
-                    ))
+                    ));
                 }
             };
             Some(Experts {
@@ -579,9 +583,7 @@ pub fn inspect_components(
             softcap: None,
         },
     };
-    let inputs = InputSemantics {
-        coordinate_axes: 1,
-    };
+    let inputs = InputSemantics { coordinate_axes: 1 };
 
     if head_layers > 0 {
         let head = Head {
@@ -598,6 +600,8 @@ pub fn inspect_components(
                     head_block(&geometry, &mut binder, layer, kv_heads, intermediate, epsilon)
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            history: HeadHistory::Own,
+            component: HeadComponent::Target,
         };
         // Bound and checked, then deliberately not emitted (module docs).
         head.validate(&decoder, inputs.coordinate_axes)?;
@@ -642,10 +646,12 @@ fn head_block(
         epsilon: layer_norm_epsilon,
     });
     Ok(HeadBlock {
-        embedding_norm,
-        hidden_norm,
-        combine,
-        block: Block {
+        input: HeadInput::Combine {
+            embedding_norm,
+            hidden_norm,
+            combine,
+        },
+        blocks: vec![Block {
             sublayers: vec![
                 Sublayer {
                     input: InputNorm::Rms(attention_norm),
@@ -658,7 +664,9 @@ fn head_block(
                     output: OutputForm::Residual,
                 },
             ],
-        },
+        }],
         output_norm,
+        readout: HeadReadout::full(VocabularyProjection::Target),
+        chain: HeadChain::Output,
     })
 }

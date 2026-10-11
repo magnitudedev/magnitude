@@ -353,6 +353,15 @@ pub mod device {
         pub(crate) artifacts: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
         /// Native submission order and CUDA graph replays.
         pub(crate) native: crate::native::NativeQueue,
+        /// Kernels tuning chose and formed, handed to the serving
+        /// preparation of the same specialization so nothing is formed twice
+        /// (`NativePrepared::hand_off`). Taken on first use.
+        pub(crate) chosen: std::sync::Mutex<
+            std::collections::HashMap<
+                crate::native::NativeHandoffKey,
+                crate::native::NativeHandoff,
+            >,
+        >,
     }
     impl DeviceInner {
         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
@@ -363,6 +372,10 @@ pub mod device {
         }
         pub fn info(&self) -> &DeviceInfo {
             &self.info
+        }
+        /// How many native programs this device has formed.
+        pub fn programs_formed(&self) -> usize {
+            self.programs.formed()
         }
         pub fn capabilities(&self) -> &[String] {
             self.capabilities
@@ -429,6 +442,13 @@ pub mod device {
         pub fn tuning_identity(&self) -> String {
             format!("{};{}", self.info.name, self.kind.tuning_identity())
         }
+        /// Lend the device `workers` for the programs it forms off the
+        /// calling thread, or take them back (none). The device starts no
+        /// thread of its own: without workers it forms in turn on the
+        /// thread that asks.
+        pub fn staff(&self, workers: Option<Arc<seismic_native_target::workers::Workers>>) {
+            self.programs.staff(workers);
+        }
         /// Whether this opened device forms Metal tensor operations (the
         /// fact its native sources are formed under); false on every other
         /// backend. `DeviceInfo::forms_tensor_operations` answers the same
@@ -453,6 +473,10 @@ pub mod device {
         /// count against the limit; they are never charged twice.
         pub fn set_memory_limit(&self, limit: Option<u64>) {
             self.kind.set_memory_limit(limit)
+        }
+        /// Start [`MemoryUsage::high_water`] again from the current charge.
+        pub fn restart_memory_high_water(&self) {
+            self.kind.restart_memory_high_water()
         }
         pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
             self.kind.memory_status()
@@ -1477,6 +1501,14 @@ pub mod kernel {
         pub fn implementation(&self) -> &seismic_lang::checked::NativeImplementation {
             self.inner.implementation()
         }
+        /// Check the launches of a call whose dimensions are `dimensions`
+        /// against the formed functions and the device limits.
+        pub fn admits(
+            &self,
+            dimensions: &std::collections::BTreeMap<String, u64>,
+        ) -> Result<(), super::CallError> {
+            self.inner.admits(dimensions)
+        }
         /// Time calls cycling through `rotation` on the device.
         pub fn measure(
             &self,
@@ -1642,27 +1674,6 @@ pub mod kernel {
             Self {
                 arguments: Vec::new(),
             }
-        }
-        /// Preserve scalar arguments while replacing tensor bindings by ordinal.
-        pub(crate) fn map_tensors<E>(
-            &self,
-            mut map: impl FnMut(usize, &Arc<TensorInner>) -> Result<Arc<TensorInner>, E>,
-        ) -> Result<Self, E> {
-            Ok(Self {
-                arguments: self
-                    .arguments
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, argument)| match argument {
-                        EncodedArgument::Tensor(tensor) => {
-                            map(ordinal, tensor).map(EncodedArgument::Tensor)
-                        }
-                        EncodedArgument::Scalar(value) => {
-                            Ok(EncodedArgument::Scalar(value.clone()))
-                        }
-                    })
-                    .collect::<Result<_, _>>()?,
-            })
         }
         pub(crate) fn into_workflow(self) -> EncodedWorkflowArgs {
             let arguments = self
@@ -1862,7 +1873,7 @@ pub mod kernel {
                 seismic_lang::failure::SourceTermination::Failed(failure) => {
                     return Err(super::CallError::Execution(
                         seismic_compiler::errors::ExecutionError::DataCheckFailed(failure),
-                    ))
+                    ));
                 }
             };
             let values = outputs
@@ -2024,9 +2035,24 @@ pub mod kernel {
         device: &Arc<DeviceInner>,
         options: seismic_compiler::feedback::PreparationOptions,
     ) -> Result<PreparedAny, PrepareError> {
+        let logical = module
+            .entry(entry, &bindings)
+            .map_err(PrepareError::Source)?;
+        prepare_logical(logical, bindings, device, options)
+    }
+
+    /// Prepare an already checked computation through the ordinary compiler,
+    /// cache and device-admission path. Bound numerical recipes enter its
+    /// logical identity; they do not add invocation arguments or another cache.
+    pub(crate) fn prepare_logical(
+        logical: seismic_lang::entry::LogicalEntry,
+        bindings: ElementBindings,
+        device: &Arc<DeviceInner>,
+        options: seismic_compiler::feedback::PreparationOptions,
+    ) -> Result<PreparedAny, PrepareError> {
         device
             .kind
-            .prepare(module, entry, bindings, device, options)
+            .prepare(logical, bindings, device, options)
             .map(|inner| PreparedAny { inner })
     }
     pub fn call(kernel: &Arc<PreparedAny>, args: EncodedArgs) -> Result<DecodedResults, CallError> {

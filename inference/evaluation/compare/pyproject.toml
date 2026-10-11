@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-compare"
+version = "0.1.0"
+description = "Build against build (and engine against reference): quality and speed deltas"
+requires-python = ">=3.12"
+dependencies = [
+  "magnitude-fixtures",
+  "magnitude-references",
+  "magnitude-remote",
+  "numpy==2.5.3",
+]
+
+[project.scripts]
+magnitude-compare = "magnitude_compare.cli:main"
+
+[tool.ruff]
+extend = "../pyproject.toml"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_compare"]

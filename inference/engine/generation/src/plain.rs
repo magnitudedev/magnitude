@@ -17,9 +17,14 @@ impl Method for Plain {
     fn requires(&self) -> MethodRequirements {
         MethodRequirements {
             prefill_demand: Demand::NONE,
+            closing_demand: Demand::NONE,
             verify_demand: Demand::NONE,
             head: false,
         }
+    }
+
+    fn embeds_prompt_tokens(&self) -> bool {
+        false
     }
 
     fn proposals(&self) -> usize {
@@ -56,9 +61,9 @@ impl MethodState for PlainState {
         _: RequestId,
         _: &[TokenId],
         _: Option<TokenId>,
-        _: FeatureRef,
+        _: Option<FeatureRef>,
         _: usize,
-        _: usize,
+        _: Option<usize>,
         _: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
         Ok(MethodEffects::default())
@@ -105,6 +110,7 @@ mod tests {
             plain.requires(),
             MethodRequirements {
                 prefill_demand: Demand::NONE,
+                closing_demand: Demand::NONE,
                 verify_demand: Demand::NONE,
                 head: false,
             }

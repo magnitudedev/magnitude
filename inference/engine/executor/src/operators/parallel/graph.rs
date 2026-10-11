@@ -10,11 +10,11 @@ use super::DenseBesideRouted;
 use crate::native::ParallelKernels;
 use crate::operators::dense_ffn::graph::dimensions as dense_dimensions;
 use crate::operators::routed::graph::{
-    general_routed, CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum,
+    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, general_routed,
 };
-use crate::programs::graph::{draft::GraphDraft, GraphError};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::programs::native_target_graph::{WeightPort, weight};
 use crate::{GeneralRoutedShape, ModelLoadPlan, ParallelBinding};
 use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, moe_tail, project_rows};
@@ -126,8 +126,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 activation,
                 gate_scale: (&absent_scale).into(),
                 up_scale: (&absent_scale).into(),
-            },
-        )?
+            },        )?
         .value;
     let dense = graph
         .enqueue(
@@ -137,8 +136,7 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 source: (&product).into(),
                 weight: (&down).into(),
                 weight_scale: (&absent_scale).into(),
-            },
-        )?
+            },        )?
         .value;
     constants.push(out_rows);
     let routed = general_routed(
@@ -167,7 +165,6 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 norm: (&tail_norm).into(),
                 epsilon,
                 scale,
-            },
-        )?
+            },        )?
         .value)
 }

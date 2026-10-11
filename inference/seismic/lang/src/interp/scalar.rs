@@ -2,7 +2,7 @@
 //! typed payload bits; this module only performs the checked source promotions.
 use crate::intrinsics::MathOp;
 use crate::reference_math::{
-    evaluate as evaluate_recipe, scalar_recipe, ReferenceScalar, ScalarFailure, ScalarOp,
+    ReferenceScalar, ScalarFailure, ScalarOp, evaluate as evaluate_recipe, scalar_recipe,
 };
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::types::DType;

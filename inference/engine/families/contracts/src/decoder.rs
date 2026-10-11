@@ -757,6 +757,15 @@ impl Decoder {
         })
     }
 
+    /// The domain of the history the attention sublayer `index` reads: its
+    /// own, or that of the layer it shares.
+    pub fn history_domain(&self, index: SublayerIndex) -> Option<HistoryDomain> {
+        match &history_owner(&self.blocks, index)?.key_value {
+            KeyValue::Owned { domain, .. } => Some(*domain),
+            KeyValue::Shared { .. } => None,
+        }
+    }
+
     pub fn validate(&self, coordinate_axes: u8) -> Result<(), DefinitionError> {
         if [self.hidden, self.vocabulary, self.context_limit].contains(&0) {
             return Err(DefinitionError::new("invalid decoder dimensions"));
@@ -776,6 +785,7 @@ impl Decoder {
             hidden: self.hidden,
             coordinate_axes,
             per_layer: self.entry.per_layer.as_ref(),
+            shared_sources: None,
         };
         validate_blocks(&self.blocks, &context)?;
         validate_exit_norm(&self.exit.norm, self.hidden, "decoder output norm")?;
@@ -940,6 +950,26 @@ pub(crate) struct Context<'a> {
     pub hidden: u64,
     pub coordinate_axes: u8,
     pub per_layer: Option<&'a PerLayerEntry>,
+    /// The blocks a `KeyValue::Shared` source names when they are not the
+    /// validated blocks themselves: the target decoder's, for a draft head
+    /// reading target history. Every attention sublayer is then Shared.
+    pub shared_sources: Option<&'a [Block]>,
+}
+
+/// The owning attention sublayer a Shared reader of `source` in `blocks`
+/// reads: `source` itself, or the owner `source` shares.
+pub(crate) fn history_owner(blocks: &[Block], source: SublayerIndex) -> Option<&Attention> {
+    let attention = |index| {
+        sublayer(blocks, index).and_then(|sublayer| match &sublayer.op {
+            Operator::Attention(attention) => Some(attention.as_ref()),
+            _ => None,
+        })
+    };
+    match &attention(source)?.key_value {
+        KeyValue::Owned { .. } => attention(source),
+        KeyValue::Shared { source: owner } => attention(*owner)
+            .filter(|owner| matches!(owner.key_value, KeyValue::Owned { .. })),
+    }
 }
 
 pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(), DefinitionError> {
@@ -960,28 +990,40 @@ pub(crate) fn validate_blocks(blocks: &[Block], context: &Context) -> Result<(),
             }
         }
         if let Operator::Attention(attention) = &sublayer.op {
-            if let KeyValue::Shared { source } = &attention.key_value {
-                let owner = (*source < index)
+            let owner = match (&attention.key_value, context.shared_sources) {
+                (KeyValue::Owned { .. }, None) => continue,
+                (KeyValue::Owned { .. }, Some(_)) => {
+                    return Err(DefinitionError::new(
+                        "attention reading target history owns its own",
+                    ));
+                }
+                (KeyValue::Shared { source }, None) => (*source < index)
                     .then(|| self::sublayer(blocks, *source))
                     .flatten()
                     .and_then(|owner| match &owner.op {
-                        Operator::Attention(owner) => Some(owner),
+                        Operator::Attention(owner) => Some(owner.as_ref()),
                         _ => None,
                     })
                     .ok_or_else(|| {
                         DefinitionError::new(
                             "shared attention history names no earlier attention sublayer",
                         )
-                    })?;
-                if !matches!(owner.key_value, KeyValue::Owned { .. })
-                    || owner.kv_heads != attention.kv_heads
-                    || owner.width != attention.width
-                    || owner.rotary != attention.rotary
-                {
-                    return Err(DefinitionError::new(
-                        "shared attention history disagrees with its source layer",
-                    ));
-                }
+                    })?,
+                (KeyValue::Shared { source }, Some(target)) => history_owner(target, *source)
+                    .ok_or_else(|| {
+                        DefinitionError::new(
+                            "shared attention history names no target attention sublayer",
+                        )
+                    })?,
+            };
+            if !matches!(owner.key_value, KeyValue::Owned { .. })
+                || owner.kv_heads != attention.kv_heads
+                || owner.width != attention.width
+                || owner.rotary != attention.rotary
+            {
+                return Err(DefinitionError::new(
+                    "shared attention history disagrees with its source layer",
+                ));
             }
         }
     }

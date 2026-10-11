@@ -4,7 +4,7 @@
 //! `short_conv_rows` declares no parameters.
 
 use super::cases::projection_shape;
-use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
@@ -214,5 +214,5 @@ impl EntryTuning for ShortConvOutputTuning {
     generated_entry!(attention_output, this => attention_output::Elements {
         OW: this.binding.output,
         A: this.binding.activation,
-    }, rounded to this.binding.activation);
+    });
 }

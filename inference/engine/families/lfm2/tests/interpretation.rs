@@ -1,5 +1,5 @@
 //! Interpretation of every LFM2 catalog variant's real GGUF header
-//! (`inference/validation/results/catalog-headers/`).
+//! (`inference/catalog/headers/`).
 
 use magnitude_artifacts::{
     gguf::{Directory, Scalar, Value},

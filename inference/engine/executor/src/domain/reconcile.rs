@@ -18,6 +18,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let _ = self.abort(pending);
                 return Err("head decision differs from its committed entry rows".into());
             }
+            // A head that keeps no history committed nothing: the target
+            // state it read returned at physical completion.
+            if pending.advance.is_none() && self.head_reads_target() {
+                return Ok(());
+            }
             let advance = pending
                 .advance
                 .take()
@@ -39,7 +44,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if let (Outcome::Encode { features }, Some(image)) = (&pending.outcome, &pending.image)
             {
                 let Some(input) = self.input.get(&pending.request) else {
-                    return Err(DomainError::invariant("vision outcome has no admitted input"));
+                    return Err(DomainError::invariant(
+                        "vision outcome has no admitted input",
+                    ));
                 };
                 let Some(existing) = input.images.values().find(|slot| &slot.image == image) else {
                     return Err(DomainError::invariant(
@@ -105,6 +112,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 OwnedAdvanceResolution::Aborted(state) | OwnedAdvanceResolution::Committed(state),
             ) => {
                 self.target.insert(request, state);
+                let boundary = match &pending.outcome {
+                    Outcome::Forward { rows } => rows
+                        .last()
+                        .and_then(|row| row.features.as_ref())
+                        .and_then(FeatureRef::boundary)
+                        .cloned(),
+                    _ => None,
+                };
+                self.input
+                    .get_mut(&request)
+                    .expect("resident request has input")
+                    .boundary = boundary;
                 Ok(())
             }
             Err((state, error)) => {

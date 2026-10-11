@@ -1,10 +1,6 @@
-// gated_delta_project: RMS prologue over the F32 hidden rows, then one
-// segmented projection qkv | z | alpha | beta into the columns of the A-typed
-// result, each segment with its own representation. GEMV for M <= 16 (`gemv`
-// to 8 rows, `gemv16` beyond; at M = 1 the block forms the A row in shared
-// memory, else `stage` forms the A rows first), GEMM otherwise: `gemm_small`
-// to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged by
-// `stage_s8`), `gemm` beyond (A rows).
+// gated_delta_project: the shared projection producer publishes semantic Act rows
+// or explicitly selected matrix operands. GEMV retains semantic inputs;
+// small and large matrix row bands share the same operand eligibility.
 #define KERNEL_W0 SEISMIC_QKV_WEIGHT
 #define KERNEL_W1 SEISMIC_GATE_WEIGHT
 #define KERNEL_W2 SEISMIC_ALPHA_WEIGHT
@@ -77,7 +73,7 @@ __device__ __forceinline__ void project_gemv(const Pro &pro, projection::u8 *row
 
 // The segmented GEMM of one row band over the staged rows (A rows, or q8_1
 // rows with Q): block column `gemm_column` of qkv | z | alpha | beta.
-template <class Shape, bool Q>
+template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands>
 __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const void *groups, unsigned M,
                                              unsigned long long H, const unsigned long long (&rows)[4],
                                              const packets::W0 &w0, const packets::W1 &w1, const packets::W2 &w2,
@@ -90,40 +86,34 @@ __device__ __forceinline__ void project_gemm(const projection::u8 *staged, const
                                            projection::gemm_columns(rows[2]), projection::gemm_columns(rows[3])};
     switch (projection::locate_segment(column, columns)) {
     case 0:
-        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, column, rows[0], w0, projection::NoWeight{},
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, H, groups, M, H, column, rows[0], w0, projection::NoWeight{},
                                        out[0]);
         break;
     case 1:
-        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, column, rows[1], w1, projection::NoWeight{},
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, H, groups, M, H, column, rows[1], w1, projection::NoWeight{},
                                        out[1]);
         break;
     case 2:
-        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, column, rows[2], w2, projection::NoWeight{},
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, H, groups, M, H, column, rows[2], w2, projection::NoWeight{},
                                        out[2]);
         break;
     case 3:
-        projection::gemm_run<Shape, Q>(shared, staged, H, groups, M, H, column, rows[3], w3, projection::NoWeight{},
+        projection::gemm_run<Shape, Q, Operands>(shared, staged, H, groups, M, H, column, rows[3], w3, projection::NoWeight{},
                                        out[3]);
         break;
     }
 }
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void gated_delta_project_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
-    projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_M, SEISMIC_DIM_H, STAGING, GROUPS);
 }
 #endif
 
-#ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_STAGE_S8
-template <unsigned INT8>
-__global__ void gated_delta_project_stage_s8(SEISMIC_KERNEL_PARAMS) {
-    seismic_dependency_start();
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
-    projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
-}
-#endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMV
 template <unsigned KSPLIT>
@@ -146,22 +136,23 @@ __global__ void gated_delta_project_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM_SMALL
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void gated_delta_project_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
+    project_gemm<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows, WEIGHTS,
                                             out);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void gated_delta_project_gemm(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1, packets::W2, packets::W3>;
     const unsigned long long rows[4] = SEGMENT_ROWS;
     const Out out[4] = SEGMENT_OUT;
-    project_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
+    project_gemm<projection::LargeGemm<ROTATE>, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, rows,
                                                        WEIGHTS, out);
 }
 #endif

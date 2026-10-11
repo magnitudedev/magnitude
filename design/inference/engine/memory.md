@@ -106,7 +106,10 @@ The engine's allocation census reports the charge from its reconciliation agains
 (requests, cached prefixes and submitted work), each byte once: context is surplus, retained, live
 and in-flight state and request media; compute is the committed graph pools and prepared programs,
 plus any charge not attributed to a holder; auxiliary is optional component weights; model is
-target weights, bound constants and the pristine recurrent seed.
+target weights, bound constants and the pristine recurrent seed. Standalone feature storage,
+including an open drafter boundary, is counted once across all physical owners and submitted
+consumers. Weak census observations and generation obligations do not extend its lifetime;
+reclaim estimates exclude allocations still owned by a fork, retained prefix or submitted work.
 
 ## Bands
 
@@ -219,6 +222,15 @@ Window(n) (a history references its last `n` rows plus tentative rows) or Shared
 layers read a source layer's regions). A history slab contains fixed-offset regions for every
 component of its domain; a bank slab contains complete recurrent banks, whose bytes follow from
 their components (convolution windows, gated delta and F32 state-space states, and their tapes).
+A load resolves the selected history preset into a validated `CodecSpec` per attention
+binding. That descriptor owns each vector's code bitdepth, grouping, coefficient type,
+width and packing; the binding's semantic activation element owns preparation rounding.
+State allocation and every append/attention graph obtain plane extents from the same
+state descriptor. The executor translates affine plane extents into entry dimensions
+once; native consumers derive bitdepth/grouping from those dimensions and declare the
+representations their implementation covers. A native capability is not permission to
+change the load's representation. Tuning fixtures, resource estimates and semantic/cache
+bindings carry the same descriptor rather than separate K8/V4 byte formulas.
 Row numbers identify a slab of their domain and an offset within it. Every history span lies within
 one slab. Rows are placed in pages: a domain's page is the smallest multiple of 256 rows for which
 its span limit below is at most 63; a slab holds a whole number of pages, and a domain reserves a
@@ -228,7 +240,7 @@ only in place after its end within its last page, or as whole free pages (pages 
 referenced row), preferring the page that begins at its end; a fresh history takes the middle page
 of the largest run of free pages. Every page a history references is therefore complete except its
 first and last, so a history of `r` rows presents at most `ceil(r / page) + 1` spans, and a Shared
-reader also sees at most `ceil(advance / page) + 1` spans of rows appended within one advance. The
+reader or a causal target reader with compressed history also sees at most `ceil(advance / page) + 1` spans of rows appended within one advance. The
 domain's span limit is that bound at its row limit. It is exact, guaranteed for every placement
 path (growth, interleaved requests, forks, window release, rollback and Reclaim), and it is the
 limit graphs are sealed to and every launch is checked against: a launch class beyond it is

@@ -5,39 +5,39 @@
 //! the mixer, the feed-forward and the per-layer input in order.
 
 use super::attention::graph::{
-    attention, attention_weights, AttentionBlock, AttentionGraphEntries, CheckedAttentionEntries,
-    HistoryTilesPort,
+    AttentionBlock, AttentionGraphEntries, CheckedAttentionEntries, HistoryTilesPort, attention,
+    attention_weights,
 };
-use super::dense_ffn::graph::{dense, CheckedDenseEntries, DenseGraphEntries};
+use super::dense_ffn::graph::{CheckedDenseEntries, DenseGraphEntries, dense};
 use super::gated_delta::graph::{
-    recurrent, CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts,
-    RecurrentGraphEntries, RecurrentStatePorts,
+    CheckedRecurrentEntries, RecurrentBlock, RecurrentControlPorts, RecurrentGraphEntries,
+    RecurrentStatePorts, recurrent,
 };
-use super::parallel::graph::{parallel, CheckedParallelEntries, ParallelGraphEntries};
+use super::parallel::graph::{CheckedParallelEntries, ParallelGraphEntries, parallel};
 use super::per_layer::graph::{
-    per_layer as per_layer_graph, CheckedPerLayerEntries, PerLayerEntries, PerLayerWeights,
+    CheckedPerLayerEntries, PerLayerEntries, PerLayerWeights, per_layer as per_layer_graph,
 };
 use super::routed::fused_graph::{
     self as routed_graph, CheckedRoutedEntries, ExpertShape, RoutedGraphEntries,
 };
 use super::routed::graph::{
-    class_constants, general_routed, CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries,
-    RoutedSum,
+    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, class_constants,
+    general_routed,
 };
 use super::short_conv::graph::{
-    short_conv, CheckedShortConvEntries, ShortConvBlock, ShortConvGraphEntries,
+    CheckedShortConvEntries, ShortConvBlock, ShortConvGraphEntries, short_conv,
 };
 use super::state_space::graph::{
-    state_space, CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries,
+    CheckedStateSpaceEntries, StateSpaceBlock, StateSpaceGraphEntries, state_space,
 };
 use super::{
-    attention as attention_operator, bank_component_index, dense_ffn, post_norm_epsilon,
-    FeedForward, Mixer, PairedBlock,
+    FeedForward, Mixer, PairedBlock, attention as attention_operator, bank_component_index,
+    dense_ffn, post_norm_epsilon,
 };
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
-use crate::programs::graph::{draft::GraphDraft, GraphError};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{activation, weight, WeightPort};
+use crate::programs::native_target_graph::{WeightPort, activation, weight};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedShape, MixerProgramSlot, ModelLoadPlan, PerLayerBinding,
     ShortConvShape, StateResourcePlan, StateSpaceShape,
@@ -59,6 +59,23 @@ pub(crate) enum BlockStatePorts {
     /// The layer's recurrent bank components, consecutive in the store's
     /// component order (`operators::Mixer::bank_components`).
     Recurrent(Vec<NativePort>),
+}
+
+impl BlockStatePorts {
+    /// The ports, whichever state they are of.
+    pub(crate) fn ports(&self) -> &Vec<NativePort> {
+        match self {
+            Self::Attention(ports) | Self::Recurrent(ports) => ports,
+        }
+    }
+
+    /// Leave the ports' vector holding exactly them, so a prepared graph's
+    /// host heap follows from its topology.
+    pub(crate) fn shrink_to_fit(&mut self) {
+        match self {
+            Self::Attention(ports) | Self::Recurrent(ports) => ports.shrink_to_fit(),
+        }
+    }
 }
 
 impl From<RecurrentStatePorts> for BlockStatePorts {
@@ -211,8 +228,22 @@ pub(crate) fn checked_per_layer(
         .transpose()
 }
 
+/// Whose block a graph fragment builds: the scope of its weights, and the
+/// target layer whose history its attention mixer reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockLane {
+    /// A target decoder block: its own weights, its own history.
+    Target,
+    /// A block of a draft head reading the history of target block `source`
+    /// (`operators::SharedHead`).
+    Head { source: u32 },
+}
+
 /// Everything a block's sublayers are built from apart from their entries.
+/// `geometry` is the decoder the block belongs to: the target's, or a draft
+/// head's blocks at the head's width.
 pub(crate) struct BlockSublayers<'a> {
+    pub lane: BlockLane,
     pub paired: &'a PairedBlock<'a>,
     pub load: &'a ModelLoadPlan,
     pub geometry: &'a Decoder,
@@ -229,7 +260,19 @@ pub(crate) struct BlockSublayers<'a> {
 
 impl BlockSublayers<'_> {
     fn scope(&self, sublayer: u32) -> Result<WeightScope, String> {
-        Ok(WeightScope::TargetSublayer(self.index(sublayer)?))
+        let index = self.index(sublayer)?;
+        Ok(match self.lane {
+            BlockLane::Target => WeightScope::TargetSublayer(index),
+            BlockLane::Head { .. } => WeightScope::HeadSublayer(index),
+        })
+    }
+
+    /// The target layer whose history the block's attention reads.
+    fn history_layer(&self) -> Result<LayerRef, String> {
+        Ok(LayerRef::Target(match self.lane {
+            BlockLane::Target => self.index(0)?.block,
+            BlockLane::Head { source } => source,
+        }))
     }
 
     fn index(&self, sublayer: u32) -> Result<SublayerIndex, String> {
@@ -260,6 +303,7 @@ impl BlockSublayers<'_> {
             slots,
             listed,
             output_scales,
+            ..
         } = *self;
         let scope = self.scope(0)?;
         let epsilon = paired.epsilon() as f32;
@@ -281,7 +325,7 @@ impl BlockSublayers<'_> {
                 // layer its source's.
                 let history = state
                     .target_state()
-                    .layer_history(LayerRef::Target(self.index(0)?.block))
+                    .layer_history(self.history_layer()?)
                     .ok_or("attention block has no history domain")?
                     .store;
                 let (mixed, ports, controls) = attention(
@@ -310,6 +354,9 @@ impl BlockSublayers<'_> {
                         post_norm_scale: output_scales.mixer,
                         activation: activation(geometry),
                         inject_only: false,
+                        // A head's rows read target history and append
+                        // nowhere.
+                        causal_cache: self.lane == BlockLane::Target,
                     },
                 )?;
                 (

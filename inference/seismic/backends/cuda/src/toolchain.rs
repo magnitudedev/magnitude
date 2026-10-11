@@ -67,6 +67,18 @@ impl Toolchain for CudaToolchain {
         &self.identity
     }
 
+    /// A kept image naming every requested entry is loaded by the driver:
+    /// no compiler runs.
+    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool {
+        unpack(kept).is_some_and(|(names, _)| {
+            source.entries.iter().all(|entry| {
+                names
+                    .iter()
+                    .any(|(expression, _)| *expression == entry.symbol)
+            })
+        })
+    }
+
     fn compile(
         &self,
         source: &ProgramSource,

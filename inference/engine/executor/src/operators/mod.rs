@@ -18,14 +18,16 @@ pub(crate) mod short_conv;
 pub(crate) mod state_space;
 pub(crate) mod vision;
 
-use crate::error::PlanError;
 use crate::SublayerTail;
-use magnitude_family_contracts::{ShortConv, StateSpace};
+use crate::error::PlanError;
 use magnitude_family_contracts::{
-    Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, GatedDelta, Head, InputNorm,
-    ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, RoutedFfn, RouterInput,
-    Sublayer, SublayerIndex, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    Attention, Block, BranchOutput, Decoder, DenseFfn, ExitNorm, GatedDelta, Head, HeadBlock,
+    HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, InputNorm, KeyValue,
+    ModelDefinition, Operator, OutputForm, ProposalReadoutPolicy, ResidualForm, RmsNorm, RoutedFfn,
+    RouterInput, Sublayer, SublayerIndex, VocabularyProjection, WeightDescriptor, WeightKind,
+    WeightRole, WeightScope,
 };
+use magnitude_family_contracts::{ShortConv, StateSpace};
 use seismic::Element;
 
 /// An operator module's sink for the weights it binds, by semantic kind.
@@ -55,12 +57,15 @@ pub(crate) fn tail(
 pub(crate) fn decoder_weights(decoder: &Decoder) -> Vec<(WeightRole, &WeightDescriptor)> {
     let mut weights = Vec::new();
     for (index, sublayer) in decoder.sublayers() {
-        sublayer_weights(sublayer, WeightScope::TargetSublayer(index), &mut weights, |branch| {
-            WeightScope::TargetBranch {
+        sublayer_weights(
+            sublayer,
+            WeightScope::TargetSublayer(index),
+            &mut weights,
+            |branch| WeightScope::TargetBranch {
                 sublayer: index,
                 branch,
-            }
-        });
+            },
+        );
     }
     weights
 }
@@ -68,29 +73,205 @@ pub(crate) fn decoder_weights(decoder: &Decoder) -> Vec<(WeightRole, &WeightDesc
 /// Every weight of a draft head, in model order.
 pub(crate) fn head_weights(head: &Head) -> Result<Vec<(WeightRole, &WeightDescriptor)>, PlanError> {
     let mut weights = Vec::new();
+    // `WeightScope::HeadSublayer` counts the decoder blocks of every head
+    // block in order.
+    let mut decoder_block = 0u32;
     for (block, head_block) in head.blocks.iter().enumerate() {
         let block = u32::try_from(block).map_err(|_| PlanError::Arithmetic("head block index"))?;
         let scope = WeightScope::HeadBlock(block);
         let role = |kind| WeightRole { scope, kind };
-        weights.push((role(WeightKind::HeadEmbeddingNorm), &head_block.embedding_norm.weight));
-        weights.push((role(WeightKind::HeadHiddenNorm), &head_block.hidden_norm.weight));
-        weights.push((role(WeightKind::HeadCombine), &head_block.combine));
-        for (sublayer, value) in head_block.block.sublayers.iter().enumerate() {
-            let index = SublayerIndex {
-                block,
-                sublayer: u32::try_from(sublayer)
-                    .map_err(|_| PlanError::Arithmetic("head sublayer index"))?,
-            };
-            sublayer_weights(value, WeightScope::HeadSublayer(index), &mut weights, |branch| {
-                WeightScope::HeadBranch {
-                    sublayer: index,
-                    branch,
-                }
-            });
+        match &head_block.input {
+            HeadInput::Combine {
+                embedding_norm,
+                hidden_norm,
+                combine,
+            } => {
+                weights.push((role(WeightKind::HeadEmbeddingNorm), &embedding_norm.weight));
+                weights.push((role(WeightKind::HeadHiddenNorm), &hidden_norm.weight));
+                weights.push((role(WeightKind::HeadCombine), combine));
+            }
+            HeadInput::Projected { pre, .. } => {
+                weights.push((role(WeightKind::HeadInputProjection), pre));
+            }
         }
-        weights.push((role(WeightKind::OutputNorm), head_block.output_norm.weight()));
+        for value in &head_block.blocks {
+            for (sublayer, value) in value.sublayers.iter().enumerate() {
+                let index = SublayerIndex {
+                    block: decoder_block,
+                    sublayer: u32::try_from(sublayer)
+                        .map_err(|_| PlanError::Arithmetic("head sublayer index"))?,
+                };
+                sublayer_weights(
+                    value,
+                    WeightScope::HeadSublayer(index),
+                    &mut weights,
+                    |branch| WeightScope::HeadBranch {
+                        sublayer: index,
+                        branch,
+                    },
+                );
+            }
+            decoder_block = decoder_block
+                .checked_add(1)
+                .ok_or(PlanError::Arithmetic("head block index"))?;
+        }
+        weights.push((
+            role(WeightKind::OutputNorm),
+            head_block.output_norm.weight(),
+        ));
+        if let Some(table) = head_block.readout.own_table() {
+            weights.push((role(WeightKind::Output), table));
+        }
+        if let ProposalReadoutPolicy::Clustered { centroids, .. } = &head_block.readout.policy {
+            weights.push((role(WeightKind::OutputCentroids), centroids));
+        }
+        if let HeadChain::Projected { post } = &head_block.chain {
+            weights.push((role(WeightKind::HeadChainProjection), post));
+        }
     }
     Ok(weights)
+}
+
+/// A head block of the one draft head form this executor runs: embedded in
+/// the target, over the head's own history, combining the normalized target
+/// embedding and hidden row at the target's width into one decoder block,
+/// read out by the target's output projection and chained on its own
+/// normalized output.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbeddedHeadBlock<'a> {
+    pub embedding_norm: &'a RmsNorm,
+    pub hidden_norm: &'a RmsNorm,
+    pub block: &'a Block,
+}
+
+impl<'a> EmbeddedHeadBlock<'a> {
+    pub fn of(head: &Head, block: &'a HeadBlock) -> Result<Self, PlanError> {
+        match (
+            head.history,
+            head.component,
+            &block.input,
+            block.blocks.as_slice(),
+            &block.readout,
+            &block.chain,
+        ) {
+            (
+                HeadHistory::Own,
+                HeadComponent::Target,
+                HeadInput::Combine {
+                    embedding_norm,
+                    hidden_norm,
+                    ..
+                },
+                [block],
+                HeadReadout {
+                    projection: VocabularyProjection::Target,
+                    policy: ProposalReadoutPolicy::Full,
+                },
+                HeadChain::Output,
+            ) => Ok(Self {
+                embedding_norm,
+                hidden_norm,
+                block,
+            }),
+            _ => Err(PlanError::Unsupported("draft head form")),
+        }
+    }
+}
+
+/// The draft head forms this executor runs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HeadForm<'a> {
+    /// A head embedded in the target over its own history: every head block
+    /// is an [`EmbeddedHeadBlock`].
+    Embedded,
+    /// A head of its own width reading the target's history.
+    Shared(SharedHead<'a>),
+}
+
+/// A draft head that reads target history (`HeadHistory::Target`, stored in
+/// the draft component): one head block whose input is the target's scaled
+/// embedding beside a hidden row projected into the head's width, whose
+/// decoder blocks attend only the target's accepted history, which reads out
+/// through its own full-vocabulary table without a soft cap and chains
+/// through a projection back to the target's width.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedHead<'a> {
+    pub width: u64,
+    pub blocks: &'a [Block],
+    pub output_norm: &'a RmsNorm,
+    pub readout: &'a HeadReadout,
+}
+
+impl SharedHead<'_> {
+    /// The target sublayer whose history the head block `index` reads.
+    pub fn source(&self, index: usize) -> Result<SublayerIndex, PlanError> {
+        let block = self
+            .blocks
+            .get(index)
+            .ok_or(PlanError::Topology("draft head block index"))?;
+        match &paired_block(block)?.mixer {
+            Mixer::Attention(attention) => match &attention.key_value {
+                KeyValue::Shared { source } => Ok(*source),
+                KeyValue::Owned { .. } => Err(PlanError::Topology(
+                    "a head reading target history owns none",
+                )),
+            },
+            _ => Err(PlanError::Unsupported("draft head mixer")),
+        }
+    }
+}
+
+/// The form of `head` among those this executor runs.
+pub(crate) fn head_form<'a>(head: &'a Head, decoder: &Decoder) -> Result<HeadForm<'a>, PlanError> {
+    match head.history {
+        HeadHistory::Own => {
+            for block in &head.blocks {
+                EmbeddedHeadBlock::of(head, block)?;
+            }
+            Ok(HeadForm::Embedded)
+        }
+        HeadHistory::Target => {
+            let [block] = head.blocks.as_slice() else {
+                return Err(PlanError::Unsupported(
+                    "chained draft heads reading target history",
+                ));
+            };
+            match (
+                head.component,
+                &block.input,
+                &block.readout,
+                &block.chain,
+                &block.output_norm,
+            ) {
+                (
+                    HeadComponent::Draft,
+                    HeadInput::Projected {
+                        embedding_scale, ..
+                    },
+                    HeadReadout {
+                        projection: VocabularyProjection::Own { .. },
+                        policy: _,
+                    },
+                    HeadChain::Projected { .. },
+                    ExitNorm::Rms(output_norm),
+                ) => {
+                    // `embedding_rows` applies the target's entry transform.
+                    if *embedding_scale != decoder.entry.scale {
+                        return Err(PlanError::Unsupported(
+                            "a draft head scaling the target's embedding differently",
+                        ));
+                    }
+                    Ok(HeadForm::Shared(SharedHead {
+                        width: block.width(decoder),
+                        blocks: &block.blocks,
+                        output_norm,
+                        readout: &block.readout,
+                    }))
+                }
+                _ => Err(PlanError::Unsupported("draft head form")),
+            }
+        }
+    }
 }
 
 fn sublayer_weights<'a>(
@@ -114,7 +295,9 @@ fn sublayer_weights<'a>(
     }
     match &sublayer.output {
         OutputForm::Residual => {}
-        OutputForm::PostNorm(norm) => weights.push((role(scope, WeightKind::PostNorm), &norm.weight)),
+        OutputForm::PostNorm(norm) => {
+            weights.push((role(scope, WeightKind::PostNorm), &norm.weight))
+        }
         OutputForm::ScaledPostNorm { norm, layer_scale } => {
             weights.push((role(scope, WeightKind::PostNorm), &norm.weight));
             weights.push((role(scope, WeightKind::LayerScale), layer_scale));
@@ -265,9 +448,7 @@ impl Mixer<'_> {
     pub fn kind(&self) -> MixerKind {
         match self {
             Self::Attention(_) => MixerKind::Attention,
-            Self::GatedDelta(_) | Self::StateSpace(_) | Self::ShortConv(_) => {
-                MixerKind::Recurrent
-            }
+            Self::GatedDelta(_) | Self::StateSpace(_) | Self::ShortConv(_) => MixerKind::Recurrent,
         }
     }
 
@@ -358,15 +539,12 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     };
     for block in &decoder.blocks {
         let paired = paired_block(block)?;
-        if paired
-            .feed_forward
-            .is_some_and(|feed_forward| {
-                feed_forward
-                    .epsilons()
-                    .iter()
-                    .any(|epsilon| *epsilon != paired.epsilon())
-            })
-            || exit.epsilon != paired.epsilon()
+        if paired.feed_forward.is_some_and(|feed_forward| {
+            feed_forward
+                .epsilons()
+                .iter()
+                .any(|epsilon| *epsilon != paired.epsilon())
+        }) || exit.epsilon != paired.epsilon()
         {
             return Err(PlanError::Unsupported(
                 "normalization epsilons differing within a decoder",
@@ -374,19 +552,38 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
         }
     }
     if let Some(head) = definition.head.as_ref().filter(|_| head) {
-        for block in &head.blocks {
-            let paired = paired_block(&block.block)?;
+        let form = head_form(head, decoder)?;
+        if let HeadForm::Shared(shared) = form {
+            admit_shared_head(&shared)?;
+            // Its kernels are prepared with the decoder's one epsilon.
+            if shared.output_norm.epsilon != exit.epsilon {
+                return Err(PlanError::Unsupported(
+                    "a draft head normalizing with another epsilon than its target",
+                ));
+            }
+        }
+        for head_block in head
+            .blocks
+            .iter()
+            .filter(|_| matches!(form, HeadForm::Embedded))
+        {
+            let block = EmbeddedHeadBlock::of(head, head_block)?;
+            let paired = paired_block(block.block)?;
             if !matches!(paired.mixer, Mixer::Attention(_)) {
                 return Err(PlanError::Unsupported("draft head mixer"));
             }
             let Some(feed_forward) = paired.feed_forward else {
-                return Err(PlanError::Unsupported("draft head block without feed-forward"));
+                return Err(PlanError::Unsupported(
+                    "draft head block without feed-forward",
+                ));
             };
             if matches!(
                 feed_forward.op,
                 FeedForward::GeneralRouted(_) | FeedForward::Parallel(_)
             ) {
-                return Err(PlanError::Unsupported("draft head routed feed-forward form"));
+                return Err(PlanError::Unsupported(
+                    "draft head routed feed-forward form",
+                ));
             }
             if [paired.mixer_output, feed_forward.output]
                 .iter()
@@ -394,7 +591,7 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
             {
                 return Err(PlanError::Unsupported("draft head sublayer output form"));
             }
-            let ExitNorm::Rms(output) = &block.output_norm else {
+            let ExitNorm::Rms(output) = &head_block.output_norm else {
                 return Err(PlanError::Unsupported("draft head output normalization"));
             };
             if [
@@ -415,6 +612,34 @@ pub(crate) fn admit(definition: &ModelDefinition, head: bool) -> Result<(), Plan
     draft::admit(definition)
 }
 
+/// Admit a head reading target history: every block is a Shared attention
+/// followed by a dense feed-forward, under one normalization epsilon.
+fn admit_shared_head(head: &SharedHead) -> Result<(), PlanError> {
+    for (index, block) in head.blocks.iter().enumerate() {
+        let paired = paired_block(block)?;
+        head.source(index)?;
+        let Some(feed_forward) = paired.feed_forward else {
+            return Err(PlanError::Unsupported(
+                "draft head block without feed-forward",
+            ));
+        };
+        if !matches!(feed_forward.op, FeedForward::Dense(_)) || paired.per_layer.is_some() {
+            return Err(PlanError::Unsupported("draft head feed-forward form"));
+        }
+        if feed_forward
+            .epsilons()
+            .into_iter()
+            .chain([head.output_norm.epsilon])
+            .any(|epsilon| epsilon != paired.epsilon())
+        {
+            return Err(PlanError::Unsupported(
+                "normalization epsilons differing within a draft head",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The attention binding of a block whose mixer must be attention (a draft
 /// head's or a separate draft's); `lookup` resolves the planned element of a
 /// role in the mixer sublayer's scope.
@@ -426,9 +651,18 @@ pub(crate) fn attention_slot(
     history: magnitude_state::KvCodec,
 ) -> Result<crate::AttentionBinding, PlanError> {
     let Mixer::Attention(operator) = paired.mixer else {
-        return Err(PlanError::Unsupported("a draft block mixer other than attention"));
+        return Err(PlanError::Unsupported(
+            "a draft block mixer other than attention",
+        ));
     };
-    attention::binding(operator, paired.mixer_output, hidden, lookup, activation, history)
+    attention::binding(
+        operator,
+        paired.mixer_output,
+        hidden,
+        lookup,
+        activation,
+        history,
+    )
 }
 
 /// The dense binding of a feed-forward that must be dense (a separate
@@ -441,7 +675,9 @@ pub(crate) fn dense_slot(
     activation: Element,
 ) -> Result<crate::DenseBinding, PlanError> {
     let FeedForward::Dense(operator) = sublayer.op else {
-        return Err(PlanError::Unsupported("a draft feed-forward other than dense"));
+        return Err(PlanError::Unsupported(
+            "a draft feed-forward other than dense",
+        ));
     };
     dense_ffn::binding(operator, sublayer.output, lookup, scalable, activation)
 }
@@ -456,12 +692,24 @@ pub(crate) fn slot_matches(paired: &PairedBlock, slot: &crate::TargetBlockProgra
             | (MixerSlot::StateSpace(_), Mixer::StateSpace(_))
             | (MixerSlot::ShortConv(_), Mixer::ShortConv(_))
     ) && matches!(
-        (slot.feed_forward(), paired.feed_forward.map(|sublayer| sublayer.op)),
+        (
+            slot.feed_forward(),
+            paired.feed_forward.map(|sublayer| sublayer.op)
+        ),
         (None, None)
             | (Some(FeedForwardSlot::Dense(_)), Some(FeedForward::Dense(_)))
-            | (Some(FeedForwardSlot::Routed(_)), Some(FeedForward::Routed(_)))
-            | (Some(FeedForwardSlot::GeneralRouted(_)), Some(FeedForward::GeneralRouted(_)))
-            | (Some(FeedForwardSlot::Parallel(_)), Some(FeedForward::Parallel(_)))
+            | (
+                Some(FeedForwardSlot::Routed(_)),
+                Some(FeedForward::Routed(_))
+            )
+            | (
+                Some(FeedForwardSlot::GeneralRouted(_)),
+                Some(FeedForward::GeneralRouted(_))
+            )
+            | (
+                Some(FeedForwardSlot::Parallel(_)),
+                Some(FeedForward::Parallel(_))
+            )
     ) && slot.per_layer().is_some() == paired.per_layer.is_some()
 }
 
@@ -530,7 +778,9 @@ pub(crate) fn feed_forward_slot(
         )?),
         FeedForward::Parallel(branches) => {
             let WeightScope::TargetSublayer(index) = scope else {
-                return Err(PlanError::Unsupported("parallel branches outside the target"));
+                return Err(PlanError::Unsupported(
+                    "parallel branches outside the target",
+                ));
             };
             Slot::Parallel(parallel::binding(
                 branches,
@@ -555,7 +805,7 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
             return Err(PlanError::Unsupported(
                 "block other than one mixer, at most one feed-forward and at most one per-layer \
                  input sublayer",
-            ))
+            ));
         }
     };
     let per_layer = per_layer.map(per_layer::admit).transpose()?;
@@ -587,7 +837,9 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
     };
     // Post-norm tails exist for the attention and dense output projections.
     if !matches!(mixer_op, Mixer::Attention(_)) && mixer.output != OutputForm::Residual {
-        return Err(PlanError::Unsupported("sublayer post-norm after this operator"));
+        return Err(PlanError::Unsupported(
+            "sublayer post-norm after this operator",
+        ));
     }
     let feed_forward = feed_forward
         .map(|feed_forward| {
@@ -612,9 +864,10 @@ pub(crate) fn paired_block(block: &Block) -> Result<PairedBlock<'_>, PlanError> 
                 }
                 op => return Err(unsupported_operator(op, "feed-forward")),
             };
-            if !matches!(op, FeedForward::Dense(_)) && feed_forward.output != OutputForm::Residual
-            {
-                return Err(PlanError::Unsupported("sublayer post-norm after this operator"));
+            if !matches!(op, FeedForward::Dense(_)) && feed_forward.output != OutputForm::Residual {
+                return Err(PlanError::Unsupported(
+                    "sublayer post-norm after this operator",
+                ));
             }
             Ok(FeedForwardSublayer {
                 norm: Some(norm(&feed_forward.input)?),

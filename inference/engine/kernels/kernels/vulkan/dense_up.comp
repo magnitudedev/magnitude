@@ -81,7 +81,7 @@ projection_epilogue dense_up_output() {
 }
 
 projection_weights dense_up_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), UP_GEOMETRY, uint(SEISMIC_DIM_H), 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), UP_GEOMETRY, uint(SEISMIC_DIM_H), 0ul, 1ul);
 }
 
 void dense_up_gemv() {

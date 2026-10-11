@@ -1,3 +1,7 @@
+#define ATTENTION_AFFINE_HISTORY 1
+#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
+#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
+#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 // attention_decode_k8v4: split-KV decode attention over affine K8/V4 history.
 // The Vulkan form of `metal/attention_decode_k8v4.metal`: the partitioning,

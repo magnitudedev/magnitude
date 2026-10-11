@@ -2259,13 +2259,10 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures-util",
- "magnitude-artifacts",
- "magnitude-chat",
  "magnitude-engine",
  "magnitude-executor",
  "magnitude-serving",
  "magnitude-state",
- "seismic",
  "serde_json",
  "tokio",
  "tracing-subscriber",
@@ -2409,6 +2406,25 @@ dependencies = [
  "magnitude-generation",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "magnitude-harness"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "magnitude-chat",
+ "magnitude-engine",
+ "magnitude-executor",
+ "magnitude-family-contracts",
+ "magnitude-generation",
+ "magnitude-scheduler",
+ "magnitude-serving",
+ "magnitude-state",
+ "seismic",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -4138,6 +4154,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "opentelemetry 0.33.0",
+ "postcard",
  "seismic-compiler",
  "seismic-cpu",
  "seismic-cuda",

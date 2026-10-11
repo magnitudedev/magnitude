@@ -949,6 +949,11 @@ pub(crate) fn adapt_request(request: ChatCompletionRequest) -> Result<AdaptedCha
     })
 }
 
+/// Convert a completion request to the host input shared by rendering and counting.
+pub fn chat_input(request: ChatCompletionRequest) -> Result<ChatInput, ApiError> {
+    Ok(adapt_request(request)?.request.input)
+}
+
 fn finite_in(value: f32, range: std::ops::RangeInclusive<f32>) -> bool {
     value.is_finite() && range.contains(&value)
 }

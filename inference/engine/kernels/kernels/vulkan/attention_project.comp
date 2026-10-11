@@ -220,16 +220,16 @@ projection_prologue attention_project_input() {
 }
 
 projection_weights attention_project_query() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT), QUERY_GEOMETRY, PROJECT_K, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_QUERY_WEIGHT), QUERY_GEOMETRY, PROJECT_K, 0ul, 1ul);
 }
 projection_weights attention_project_gate() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, PROJECT_K, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, PROJECT_K, 0ul, 1ul);
 }
 projection_weights attention_project_key() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT), KEY_GEOMETRY, PROJECT_K, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_KEY_WEIGHT), KEY_GEOMETRY, PROJECT_K, 0ul, 1ul);
 }
 projection_weights attention_project_value() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), VALUE_GEOMETRY, PROJECT_K, 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_VALUE_WEIGHT), VALUE_GEOMETRY, PROJECT_K, 0ul, 1ul);
 }
 
 projection_epilogue attention_project_query_out() {

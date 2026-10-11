@@ -2,9 +2,9 @@
 //! PTX is emitted only after physical legality is frozen; this module does
 //! not choose algorithms, reinterpret storage, or reject a legal plan.
 
+use crate::Cuda;
 use crate::capability::CudaIntrinsic;
 use crate::profile::CudaFacts;
-use crate::Cuda;
 use seismic_ir::kernel::ops::*;
 use seismic_ir::kernel::{BlockId, Kernel};
 use seismic_ir::physical_target::{
@@ -1082,6 +1082,7 @@ impl<'a> Emitter<'a> {
         let destination = self.numeric_destination(dtype, &self.v(out));
         match op {
             MathOp::Sqrt => self.line(format!("sqrt.rn.f32 {}, {};", destination, argument)),
+            MathOp::Rint => self.line(format!("cvt.rni.f32.f32 {}, {};", destination, argument)),
             MathOp::Rsqrt => self.line(format!("rsqrt.approx.f32 {}, {};", destination, argument)),
             MathOp::Abs => self.line(format!("abs.f32 {}, {};", destination, argument)),
             MathOp::Exp => {
@@ -1089,6 +1090,7 @@ impl<'a> Emitter<'a> {
                 self.line(format!("mul.rn.f32 {scaled}, {}, 0f3fb8aa3b;", argument));
                 self.line(format!("ex2.approx.f32 {}, {scaled};", destination));
             }
+            MathOp::Exp2 => self.line(format!("ex2.approx.f32 {}, {};", destination, argument)),
             MathOp::Log => self.line(format!("lg2.approx.f32 {}, {};", destination, argument)),
             MathOp::Sin => self.line(format!("sin.approx.f32 {}, {};", destination, argument)),
             MathOp::Cos => self.line(format!("cos.approx.f32 {}, {};", destination, argument)),

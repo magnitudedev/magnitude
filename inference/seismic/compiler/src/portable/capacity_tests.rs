@@ -2,7 +2,11 @@
 //! reaches them. Their backing and geometry are the actual per-visit values,
 //! never a launch-local envelope over a declared or I32 domain.
 use super::*;
-use crate::candidate_domain::construct_candidate_domain;
+use crate::candidate_domain::{
+    construct_candidate_domain, BodyMapping, CandidateDomain, CapacityPending, CapacityReason,
+    ConstructionAllowance, ConstructionCoordinate, ConstructionPending, Materialization,
+};
+use crate::realization::demand_driven_tests::FakeTarget;
 use seismic_lang::checked::{check_source, SourceFile, SourceSet};
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::expr::Assignment;
@@ -17,7 +21,10 @@ enum Axis {
     Actual(seismic_lang::expr::NatExpr),
 }
 
-fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::PreparationError> {
+fn with_source_domain<R>(
+    source: &str,
+    inspect: impl FnOnce(CandidateDomain<'_, FakeTarget>) -> R,
+) -> Result<R, crate::errors::PreparationError> {
     let module = check_source(SourceSet::new(vec![SourceFile {
         path: "source-capacity.seismic".into(),
         text: source.into(),
@@ -47,39 +54,45 @@ fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::Prepa
     let device = seismic_native_target::DeviceDescription::new(description).unwrap();
     let registry = crate::realization::demand_driven_tests::registry();
     let domain = construct_candidate_domain(entry, &device, &registry, &PrecisionPolicy::Exact)?;
-    let parts = domain.into_parts();
-    let family = &parts.materialized.first().family;
-    assert!(
-        family
-            .local_allocations()
-            .into_locals()
-            .iter()
-            .all(Vec::is_empty),
-        "private tensors are not launch-local envelopes"
-    );
-    Ok(family
-        .global_allocations()
-        .allocations()
-        .iter()
-        .filter(|allocation| {
-            allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Reached
-        })
-        .map(|allocation| {
-            allocation
-                .geometry
-                .as_ref()
-                .expect("a reached tensor owns its geometry")
-                .extents
+    Ok(inspect(domain))
+}
+
+fn reached_geometry(source: &str) -> Result<Vec<Vec<Axis>>, crate::errors::PreparationError> {
+    with_source_domain(source, |domain| {
+        let parts = domain.into_parts();
+        let family = &parts.materialized.first().family;
+        assert!(
+            family
+                .local_allocations()
+                .into_locals()
                 .iter()
-                .map(
-                    |axis| match parts.arena.eval_nat_u64(*axis, &Assignment::new()) {
-                        Ok(value) => Axis::Fixed(value),
-                        Err(_) => Axis::Actual(*axis),
-                    },
-                )
-                .collect()
-        })
-        .collect())
+                .all(Vec::is_empty),
+            "private tensors are not launch-local envelopes"
+        );
+        family
+            .global_allocations()
+            .allocations()
+            .iter()
+            .filter(|allocation| {
+                allocation.acquisition == seismic_ir::storage::AllocationAcquisition::Reached
+            })
+            .map(|allocation| {
+                allocation
+                    .geometry
+                    .as_ref()
+                    .expect("a reached tensor owns its geometry")
+                    .extents
+                    .iter()
+                    .map(
+                        |axis| match parts.arena.eval_nat_u64(*axis, &Assignment::new()) {
+                            Ok(value) => Axis::Fixed(value),
+                            Err(_) => Axis::Actual(*axis),
+                        },
+                    )
+                    .collect()
+            })
+            .collect()
+    })
 }
 
 #[test]
@@ -167,5 +180,93 @@ fn probe(input: &tensor[8,2] i32, visible: &tensor[4,2] i32, out: &mut tensor[4]
             .iter()
             .any(|axes| matches!(axes.as_slice(), [Axis::Actual(_)])),
         "{geometry:?}"
+    );
+}
+
+/// These checks select the participant mapping explicitly. The universal
+/// Portable member executes mathematical quantities with its exact host cursor
+/// and must remain valid even when an Independent native member cannot form.
+fn independent_materialization(source: &str) -> Materialization {
+    with_source_domain(source, |mut domain| {
+        assert_eq!(
+            domain.constructed().count(),
+            1,
+            "universal host member formed"
+        );
+        let selection = domain
+            .root_selections()
+            .into_iter()
+            .find(|selection| selection.mapping == BodyMapping::Independent)
+            .expect("portable body exposes the independent mapping");
+        let state = domain
+            .advance(
+                &ConstructionCoordinate::root(selection),
+                ConstructionAllowance {
+                    work_units: 100_000,
+                    wall_time: std::time::Duration::from_secs(30),
+                },
+            )
+            .state;
+        if let Materialization::Pending(ConstructionPending::Capacity(pending)) = &state {
+            let reference = domain.reference();
+            let view = reference.view();
+            let function = view.program().function(pending.value.function());
+            let value = function.value(pending.value);
+            eprintln!("pending quantity {:?}: {value:#?}", pending.value);
+            if let ValueOrigin::Node(node) = value.origin {
+                let node = function.node(node);
+                eprintln!("quantity producer: {node:#?}");
+                if let SemanticNodeView::Primitive {
+                    primitive: PrimitiveId::Symbolic(expression),
+                    ..
+                } = node.view()
+                {
+                    eprintln!(
+                        "quantity expression: {:#?}",
+                        view.arena().view((*expression).into())
+                    );
+                }
+            }
+        }
+        state
+    })
+    .expect("exact universal host construction remains lawful")
+}
+
+#[test]
+fn declared_slice_width_materializes_supported_independent_quantities() {
+    let state = independent_materialization(
+        r#"fn probe(input: &tensor[8] i32, starts: &tensor[4] i32, out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let start = starts[i]
+        let view = input[start:start+2]
+        out[i] = view[0]
+"#,
+    );
+    assert!(
+        matches!(&state, Materialization::Ready(_)),
+        "actual independent state: {state:?}"
+    );
+}
+
+#[test]
+fn declared_slice_width_keeps_host_quantity_and_declines_independent_narrowing() {
+    let state = independent_materialization(
+        r#"fn probe(input: &tensor[8] i32, starts: &tensor[4] i32, width: index[4294967298], out: &mut tensor[4] i32):
+    parallel for i in 0..4:
+        let start = starts[i]
+        let view = input[start:start+i32(width)]
+        out[i] = view[0]
+"#,
+    );
+    assert!(
+        matches!(
+            &state,
+            Materialization::Pending(ConstructionPending::Capacity(CapacityPending {
+                reason: CapacityReason::NativeQuantityUnrepresentable,
+                ..
+            }))
+        ),
+        "actual independent state: {state:?}"
     );
 }

@@ -1,3 +1,7 @@
+#define ATTENTION_AFFINE_HISTORY 1
+#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
+#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
+#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
 #define ATTENTION_U SEISMIC_DIM_U
@@ -33,7 +37,9 @@
 static inline attention::history_window prefill_window(device float *partials, uint M, uint listed) {
     const uint tiles = (M + SEISMIC_TUNE_QT - 1) / SEISMIC_TUNE_QT * SEISMIC_DIM_KV * PREFILL_HEAD_GROUPS;
     const uint split = metal::max(1u, (SEISMIC_TUNE_SPLIT_GROUPS + tiles - 1) / tiles);
-    const uint most = ((M + 31) / 32) * SEISMIC_DIM_KV * ((SEISMIC_DIM_G + 15) / 16);
+    // Preserve the per-row history/state reserve beyond the 512-row grid.
+    // Shrinking it further can leave less space than the fold state needs.
+    const uint most = ((metal::min(M, 512u) + 31) / 32) * SEISMIC_DIM_KV * ((SEISMIC_DIM_G + 15) / 16);
     const uint charged = (512 + most - 1) / most;
     const uint taken = metal::min(split, metal::max(1u, charged / 2));
     return attention::history_window::in(partials, M, taken, charged, listed);

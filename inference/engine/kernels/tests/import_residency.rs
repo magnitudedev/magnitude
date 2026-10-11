@@ -188,7 +188,7 @@ fn exact_imports_match_the_gguf_reference_dequantization() {
 /// NVFP4) decode, in every layout, to exactly llama.cpp's reference
 /// dequantization (`dequantize_row_*` of ggml-quants.c at 18443257a30c) of 64
 /// blocks of `golden_bytes(.., 12345)` whose scale fields are made finite: the
-/// FNV-1a digests `validation/gguf_codec_reference.py --digests` prints (gguf-py
+/// FNV-1a digests `tests/support/gguf_codec_reference.py --digests` prints (gguf-py
 /// `quants.dequantize` gives the same values). Q5_1's `x0 * d + m` is rounded
 /// once, as C compilers contract it.
 #[test]
@@ -238,10 +238,10 @@ fn own_representation_imports_match_llama_cpp_dequantization() {
 /// Real tensors of released GGUF files (Gemma Q4_0, Nemotron Q5_0 / Q5_1 /
 /// MXFP4 / NVFP4) import, in every layout, to exactly the reference
 /// dequantization of their blocks. The dump comes from
-/// `validation/gguf_codec_reference.py --gguf <file> --dump <dir>`, named by
+/// `tests/support/gguf_codec_reference.py --gguf <file> --dump <dir>`, named by
 /// `CODEC_REAL_DIR`.
 #[test]
-#[ignore = "needs CODEC_REAL_DIR, a real-tensor dump of validation/gguf_codec_reference.py"]
+#[ignore = "needs CODEC_REAL_DIR, a real-tensor dump of tests/support/gguf_codec_reference.py"]
 fn real_gguf_tensors_import_as_the_reference_dequantizes() {
     let directory =
         std::path::PathBuf::from(std::env::var("CODEC_REAL_DIR").expect("CODEC_REAL_DIR"));

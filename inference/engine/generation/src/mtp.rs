@@ -10,17 +10,27 @@
 //! proposals on the device, in the drafter's form (MTP chains head rows, a
 //! DFlash draft reads one block).
 //!
-//! Prompt history needs no drafter transaction: the prompt knows the token
-//! after every chunk row, so a drafter with no rows pending has each prompt
-//! chunk's pairs entered on the device behind the chunk
-//! (`MethodState::priming_position`). Replayed and resumed history, whose
-//! state holds an open feature or pending pairs, is entered by drafter
-//! transactions after each chunk.
+//! A prompt chunk's complete pairs enter on the device behind the target.
+//! MTP keeps its final feature independently owned by executor state, so the
+//! next chunk supplies the successor token even when it resumes a prefix.
+//! Replayed history with host features or pending pairs enters through
+//! drafter transactions after each chunk.
+//!
+//! An MTP head that reads the target's history (an assistant drafter) keeps
+//! none: nothing is primed, so no prompt row (a media row included) ever
+//! enters it as a token. Its position is the target's, which only committed
+//! target rows move, and a draft is one transaction of the anchor alone with
+//! the target feature that selected it: the prompt's closing chunk's final
+//! feature, then each verification's last accepted row's. The head chains
+//! its proposals on the device over the target's committed history and
+//! writes nothing.
 
 use crate::{
-    DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
-    MethodRequirements, MethodState, Propose, Verification, method::PendingRows,
+    method::{OpenFeature, PendingRows},
+    DraftBudget, DraftCheckpoint, Method, MethodCheckpoint, MethodCheckpointError, MethodEffects,
+    MethodRequirements, MethodState, Propose, Verification,
 };
+use crate::{DraftHistory, DraftRoundState};
 use magnitude_executor::{
     Demand, DraftForm, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, HeadPhase, Operation,
     Outcome, RequestId, SelectSpec, TokenId,
@@ -30,10 +40,24 @@ use magnitude_executor::{
 pub struct Mtp {
     identity: String,
     proposals: usize,
+    drafter: Drafter,
+    budget: DraftBudget,
 }
 
 impl Mtp {
+    /// MTP with a head that keeps its own history: every committed row
+    /// enters it.
     pub fn new(artifact: impl AsRef<str>, proposals: usize) -> Result<Self, String> {
+        Self::with(artifact, proposals, Drafter::Mtp)
+    }
+
+    /// MTP with a head that reads the target's history and keeps none: a
+    /// draft needs only the anchor and the target feature that selected it.
+    pub fn reading_target(artifact: impl AsRef<str>, proposals: usize) -> Result<Self, String> {
+        Self::with(artifact, proposals, Drafter::TargetReadingMtp)
+    }
+
+    fn with(artifact: impl AsRef<str>, proposals: usize, drafter: Drafter) -> Result<Self, String> {
         let artifact = artifact.as_ref();
         if artifact.is_empty() || proposals == 0 || proposals > u8::MAX as usize {
             return Err("MTP identity and proposal width must be nonempty and bounded".into());
@@ -41,17 +65,45 @@ impl Mtp {
         Ok(Self {
             identity: format!("mtp:{artifact}:{proposals}"),
             proposals,
+            drafter,
+            budget: DraftBudget {
+                generated: proposals,
+                verified: proposals,
+            },
         })
+    }
+    /// Draft and verify `budget` each round; its generated width must fit
+    /// this load.
+    pub fn with_budget(mut self, budget: DraftBudget) -> Result<Self, String> {
+        budget.validate(self.proposals)?;
+        self.identity.push_str(&format!(":{budget:?}"));
+        self.budget = budget;
+        Ok(self)
     }
 }
 
 impl Method for Mtp {
+    fn priming_requires_successor(&self) -> bool {
+        self.drafter.keeps_history()
+    }
+    fn embeds_prompt_tokens(&self) -> bool {
+        self.drafter.keeps_history()
+    }
     fn identity(&self) -> &str {
         &self.identity
     }
     fn requires(&self) -> MethodRequirements {
+        // An embedded head enters every prompt row with its feature; a head
+        // reading the target's history needs only the feature that selected
+        // the first anchor.
+        let (prefill_demand, closing_demand) = if self.drafter.keeps_history() {
+            (Demand::FEATURES, Demand::NONE)
+        } else {
+            (Demand::NONE, Demand::FEATURES)
+        };
         MethodRequirements {
-            prefill_demand: Demand::FEATURES,
+            prefill_demand,
+            closing_demand,
             verify_demand: Demand::FEATURES,
             head: true,
         }
@@ -64,8 +116,9 @@ impl Method for Mtp {
         checkpoint: Option<&MethodCheckpoint>,
     ) -> Result<Box<dyn MethodState>, String> {
         Ok(Box::new(DrafterState::restore(
-            Drafter::Mtp,
+            self.drafter,
             self.proposals,
+            self.budget,
             checkpoint,
         )?))
     }
@@ -75,27 +128,38 @@ impl Method for Mtp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Drafter {
     Mtp,
+    /// An MTP head that reads the target's history and keeps none. Its
+    /// position is the target's: the anchor's row.
+    TargetReadingMtp,
     DFlash,
 }
 
 impl Drafter {
     fn form(self) -> DraftForm {
         match self {
-            Self::Mtp => DraftForm::Chained,
+            Self::Mtp | Self::TargetReadingMtp => DraftForm::Chained,
             Self::DFlash => DraftForm::Block,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
-            Self::Mtp => "MTP",
+            Self::Mtp | Self::TargetReadingMtp => "MTP",
             Self::DFlash => "DFlash",
+        }
+    }
+
+    /// Whether the drafter enters every committed row into its own history.
+    fn keeps_history(self) -> bool {
+        match self {
+            Self::Mtp | Self::DFlash => true,
+            Self::TargetReadingMtp => false,
         }
     }
 
     fn checkpoint(self, state: DraftCheckpoint) -> MethodCheckpoint {
         match self {
-            Self::Mtp => MethodCheckpoint::Mtp(state),
+            Self::Mtp | Self::TargetReadingMtp => MethodCheckpoint::Mtp(state),
             Self::DFlash => MethodCheckpoint::DFlash(state),
         }
     }
@@ -104,7 +168,7 @@ impl Drafter {
     /// cannot restore it.
     fn restored(self, checkpoint: &MethodCheckpoint) -> Option<&DraftCheckpoint> {
         match (self, checkpoint) {
-            (Self::Mtp, MethodCheckpoint::Mtp(state))
+            (Self::Mtp | Self::TargetReadingMtp, MethodCheckpoint::Mtp(state))
             | (Self::DFlash, MethodCheckpoint::DFlash(state)) => Some(state),
             _ => None,
         }
@@ -120,17 +184,19 @@ pub(crate) struct DrafterState {
     /// Complete pairs not yet entered; the last is the anchor.
     pending: Option<PendingRows>,
     /// A committed feature whose successor token is not known yet.
-    open: Option<FeatureRows>,
+    open: Option<OpenFeature>,
     /// The drafter transaction `propose` returned, until it reconciles.
     head: Option<Operation>,
     /// Reconciled proposals awaiting their verification.
     proposal: Option<Vec<TokenId>>,
+    budget: DraftBudget,
 }
 
 impl DrafterState {
     pub(crate) fn restore(
         drafter: Drafter,
         proposals: usize,
+        budget: DraftBudget,
         checkpoint: Option<&MethodCheckpoint>,
     ) -> Result<Self, String> {
         let checkpoint = match checkpoint {
@@ -146,6 +212,11 @@ impl DrafterState {
                 )
             })?,
         };
+        // A head reading the target's history retains nothing at a
+        // boundary: the next chunk's closing feature selects its anchor.
+        if !drafter.keeps_history() && (checkpoint.pending.is_some() || checkpoint.open.is_some()) {
+            return Err("a head reading the target's history restores no feature rows".into());
+        }
         Ok(Self {
             drafter,
             proposals,
@@ -154,6 +225,7 @@ impl DrafterState {
             open: checkpoint.open,
             head: None,
             proposal: None,
+            budget,
         })
     }
 
@@ -163,12 +235,66 @@ impl DrafterState {
         self.proposals + 1
     }
 
+    fn round_state(&self) -> DraftRoundState {
+        DraftRoundState::new(
+            if self.drafter.keeps_history() {
+                DraftHistory::Own
+            } else {
+                DraftHistory::Target
+            },
+            self.entry_bound(),
+            self.position,
+            self.pending
+                .as_ref()
+                .map_or(0, |pending| pending.tokens.len()),
+            self.open.is_some(),
+        )
+        .expect("drafter state preserves its method boundary")
+    }
+
     fn ensure_idle(&self) -> Result<(), String> {
         if self.head.is_some() || self.proposal.is_some() {
             return Err(format!(
                 "{} method already has unresolved work",
                 self.drafter.name()
             ));
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, rows: usize) -> Result<(), String> {
+        // Target-reading heads advance only at target commitment; their
+        // physical head transactions enter no rows.
+        self.position = self
+            .position
+            .checked_add(rows)
+            .ok_or_else(|| format!("{} drafter position exhausted", self.drafter.name()))?;
+        Ok(())
+    }
+
+    /// Enter a committed target chunk into a head reading the target's
+    /// history: nothing enters it, the chunk moves its position, and the
+    /// closing chunk's final feature selected `next`, the first anchor.
+    fn prime_reading(
+        &mut self,
+        tokens: &[TokenId],
+        next: Option<TokenId>,
+        features: Option<FeatureRef>,
+        primed: Option<usize>,
+        reader: &mut dyn FeatureReader,
+    ) -> Result<(), String> {
+        if primed.is_some() || tokens.is_empty() {
+            return Err("a head reading the target's history primes nothing".into());
+        }
+        self.ensure_idle()?;
+        self.pending = None;
+        self.open = None;
+        self.advance(tokens.len())?;
+        if let Some(next) = next {
+            let features =
+                features.ok_or("the chunk closing the prompt requires its final target feature")?;
+            let last = Self::read(reader, features, tokens.len() - 1, 1)?;
+            self.append(vec![next], last)?;
         }
         Ok(())
     }
@@ -202,15 +328,14 @@ impl DrafterState {
         keep: usize,
         phase: HeadPhase,
     ) -> Result<MethodEffects, String> {
-        let Some(pending) = self.pending.take() else {
+        let (call, _) = self.round_state().flushing(keep);
+        let Some(call) = call else {
             return Ok(MethodEffects::default());
         };
-        let rows = pending.tokens.len();
-        if rows <= keep {
-            self.pending = Some(pending);
-            return Ok(MethodEffects::default());
-        }
-        let entered = rows - keep;
+        let Some(pending) = self.pending.take() else {
+            unreachable!("a described head entry owns pending pairs");
+        };
+        let entered = call.entry_rows;
         let conditioning = pending
             .features
             .slice(0, entered)
@@ -229,7 +354,7 @@ impl DrafterState {
             phase,
             tokens: pending.tokens[..entered].to_vec(),
             conditioning,
-            position: self.position,
+            position: call.position,
             proposals: Vec::new(),
             form: self.drafter.form(),
         };
@@ -238,6 +363,20 @@ impl DrafterState {
         Ok(MethodEffects {
             operations: vec![operation],
         })
+    }
+
+    fn open_rows(reader: &mut dyn FeatureReader, open: OpenFeature) -> Result<FeatureRows, String> {
+        match open {
+            OpenFeature::Host(rows) => Ok(rows),
+            OpenFeature::Device(feature) => Self::read(
+                reader,
+                feature
+                    .upgrade()
+                    .ok_or("executor boundary feature is no longer resident")?,
+                0,
+                1,
+            ),
+        }
     }
 
     fn read(
@@ -257,8 +396,10 @@ impl MethodState for DrafterState {
     }
 
     fn priming_position(&self) -> Option<usize> {
-        (self.pending.is_none()
-            && self.open.is_none()
+        // A drafter without history has no entry to draft behind a chunk.
+        (self.drafter.keeps_history()
+            && self.pending.is_none()
+            && !matches!(self.open, Some(OpenFeature::Host(_)))
             && self.head.is_none()
             && self.proposal.is_none())
         .then_some(self.position)
@@ -269,16 +410,25 @@ impl MethodState for DrafterState {
         request: RequestId,
         tokens: &[TokenId],
         next: Option<TokenId>,
-        features: FeatureRef,
+        features: Option<FeatureRef>,
         draft_from: usize,
-        primed: usize,
+        primed: Option<usize>,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String> {
-        if primed > 0 {
-            // The chunk's entry was drafted behind it on the device: each
-            // prompt token with the feature of the row before it, through
-            // the chunk's last row when the prompt continues. A finishing
-            // chunk's last feature selected `next`: the first draft's anchor.
+        if !self.drafter.keeps_history() {
+            self.prime_reading(tokens, next, features, primed, reader)?;
+            return Ok(MethodEffects::default());
+        }
+        let features = features.ok_or_else(|| {
+            format!(
+                "{} priming requires the chunk's target features",
+                self.drafter.name()
+            )
+        })?;
+        if let Some(primed) = primed {
+            // The device entered complete causal pairs. MTP leaves the
+            // final feature open; a feature-only drafter may enter it now.
+            // A finishing chunk's last feature selects the draft anchor.
             if self.priming_position() != Some(self.position) || primed > tokens.len() {
                 return Err(format!(
                     "{} state cannot take a device-primed chunk",
@@ -289,7 +439,18 @@ impl MethodState for DrafterState {
                 .position
                 .checked_add(primed)
                 .ok_or_else(|| format!("{} drafter position exhausted", self.drafter.name()))?;
-            if let Some(next) = next {
+            self.open = None;
+            if self.drafter == Drafter::Mtp {
+                let boundary = features
+                    .boundary()
+                    .cloned()
+                    .ok_or("MTP priming requires an independently owned boundary feature")?;
+                if let Some(next) = next {
+                    self.append(vec![next], Self::read(reader, boundary, 0, 1)?)?;
+                } else {
+                    self.open = Some(OpenFeature::Device(boundary.downgrade()));
+                }
+            } else if let Some(next) = next {
                 let last = Self::read(reader, features, tokens.len() - 1, 1)?;
                 self.append(vec![next], last)?;
             }
@@ -306,7 +467,7 @@ impl MethodState for DrafterState {
         // The open feature selected this chunk's first token; each chunk
         // row's feature selected the token after it.
         if let Some(open) = self.open.take() {
-            self.append(vec![first], open)?;
+            self.append(vec![first], Self::open_rows(reader, open)?)?;
         }
         if !rest.is_empty() {
             self.append(
@@ -325,7 +486,7 @@ impl MethodState for DrafterState {
                 self.flush(request, 1, HeadPhase::Priming { draft_from })
             }
             None => {
-                self.open = Some(last);
+                self.open = Some(OpenFeature::Host(last));
                 self.flush(request, 0, HeadPhase::Priming { draft_from })
             }
         }
@@ -333,21 +494,41 @@ impl MethodState for DrafterState {
 
     fn propose(&mut self, request: RequestId, selects: &[SelectSpec]) -> Propose {
         if let Some(proposal) = self.proposal.as_ref() {
-            return Propose::Tokens(proposal[..proposal.len().min(selects.len())].to_vec());
+            // The budget's verified prefix is all a round offers the target.
+            let count = self
+                .budget
+                .verified
+                .min(proposal.len())
+                .min(selects.len());
+            return Propose::Tokens(proposal[..count].to_vec());
         }
-        let (Some(pending), None, false) = (&self.pending, &self.head, selects.is_empty()) else {
+        let (Some(pending), None, None, false) =
+            (&self.pending, &self.head, &self.open, selects.is_empty())
+        else {
             return Propose::Tokens(Vec::new());
         };
         if pending.tokens.len() > self.entry_bound() {
             return Propose::Tokens(Vec::new());
         }
+        // A round drafts its whole generated width or nothing.
+        let generated = self.budget.generated;
+        if generated == 0 || generated > selects.len() {
+            return Propose::Tokens(Vec::new());
+        }
+        let (Some(call), _) = self
+            .round_state()
+            .proposing(generated)
+            .expect("budgeted proposal fits the method boundary")
+        else {
+            unreachable!("positive proposal describes a head transaction");
+        };
         let operation = Operation::Head {
             request,
             phase: HeadPhase::Generation,
             tokens: pending.tokens.clone(),
             conditioning: pending.features.clone(),
-            position: self.position,
-            proposals: selects[..selects.len().min(self.proposals)].to_vec(),
+            position: call.position,
+            proposals: selects[..generated].to_vec(),
             form: self.drafter.form(),
         };
         if operation.validate().is_err() {
@@ -377,9 +558,10 @@ impl MethodState for DrafterState {
         if verification.inputs.is_empty() || accepted == 0 || accepted > verification.inputs.len() {
             return Err(format!("{name} verification prefix is invalid"));
         }
+        let transition = self.round_state().observed(accepted)?;
         // After a replay the last replayed row's feature selected the anchor.
         if let Some(open) = self.open.take() {
-            self.append(vec![verification.inputs[0]], open)?;
+            self.append(vec![verification.inputs[0]], Self::open_rows(reader, open)?)?;
         }
         if self
             .pending
@@ -391,18 +573,24 @@ impl MethodState for DrafterState {
                 "{name} pending anchor differs from the verified anchor"
             ));
         }
+        if !self.drafter.keeps_history() {
+            // The accepted rows moved the target; the last one's feature
+            // selected the next anchor.
+            let last = Self::read(reader, features, accepted - 1, 1)?;
+            self.pending = None;
+            self.position = transition.appended.position();
+            self.append(vec![verification.next], last)?;
+            debug_assert_eq!(self.round_state(), transition.appended);
+            return Ok(MethodEffects::default());
+        }
         // Committed row i's feature selected the token after it: the next
         // accepted input, or the round's successor after the last row.
         let rows = Self::read(reader, features, 0, accepted)?;
         let mut tokens = verification.inputs[1..accepted].to_vec();
         tokens.push(verification.next);
         self.append(tokens, rows)?;
-        let bound = self.entry_bound();
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.tokens.len() > bound)
-        {
+        debug_assert_eq!(self.round_state(), transition.appended);
+        if transition.maintenance.is_some() {
             return self.flush(request, 1, HeadPhase::Generation);
         }
         Ok(MethodEffects::default())
@@ -430,10 +618,11 @@ impl MethodState for DrafterState {
                 "{name} drafter outcome differs from its transaction"
             ));
         }
-        self.position = self
-            .position
-            .checked_add(tokens.len())
-            .ok_or_else(|| format!("{name} drafter position exhausted"))?;
+        // A drafter without history entered nothing: its position is the
+        // target's, which only committed target rows move.
+        if self.drafter.keeps_history() {
+            self.position = self.round_state().entered(tokens.len())?.position();
+        }
         if !proposals.is_empty() {
             self.pending = None;
             self.proposal = Some(
@@ -451,10 +640,38 @@ impl MethodState for DrafterState {
         if self.head.is_some() || self.proposal.is_some() {
             return Err(MethodCheckpointError::Unresolved);
         }
+        if !self.drafter.keeps_history() {
+            // The pending anchor is the sampled successor, outside the
+            // retained prefix; its request's next chunk selects its own.
+            return Ok(self.drafter.checkpoint(DraftCheckpoint {
+                position: self.position,
+                pending: None,
+                open: None,
+            }));
+        }
+        let mut pending = self.pending.clone();
+        let mut open = self.open.clone();
+        // The final pending token is the sampled successor, outside the
+        // retained target prefix. Export its feature without that token;
+        // each restored request supplies its own successor.
+        if open.is_none() {
+            if let Some(rows) = pending.take() {
+                let last = rows.tokens.len() - 1;
+                open = Some(OpenFeature::Host(
+                    rows.features.slice(last, 1).expect("pending row shape"),
+                ));
+                if last > 0 {
+                    pending = Some(PendingRows {
+                        tokens: rows.tokens[..last].to_vec(),
+                        features: rows.features.slice(0, last).expect("pending row shape"),
+                    });
+                }
+            }
+        }
         Ok(self.drafter.checkpoint(DraftCheckpoint {
             position: self.position,
-            pending: self.pending.clone(),
-            open: self.open.clone(),
+            pending,
+            open,
         }))
     }
 
@@ -471,7 +688,7 @@ impl MethodState for DrafterState {
             .pending
             .as_ref()
             .map_or(0, |rows| rows.features.bytes().len());
-        let open = self.open.as_ref().map_or(0, |rows| rows.bytes().len());
+        let open = self.open.as_ref().map_or(0, OpenFeature::host_bytes);
         (pending + open) as u64
     }
 }

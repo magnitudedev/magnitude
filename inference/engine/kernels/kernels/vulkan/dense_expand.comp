@@ -128,11 +128,11 @@ projection_epilogue dense_expand_output() {
 }
 
 projection_weights dense_expand_gate() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, uint(SEISMIC_DIM_H), 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_GATE_WEIGHT), GATE_GEOMETRY, uint(SEISMIC_DIM_H), 0ul, 1ul);
 }
 
 projection_weights dense_expand_up() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), UP_GEOMETRY, uint(SEISMIC_DIM_H), 0ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_UP_WEIGHT), UP_GEOMETRY, uint(SEISMIC_DIM_H), 0ul, 1ul);
 }
 
 void dense_expand_gemv() {

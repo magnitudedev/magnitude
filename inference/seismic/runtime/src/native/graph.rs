@@ -12,8 +12,9 @@
 //! alone, so per-run host work does not revalidate nodes.
 
 use super::{
-    merge_access, submit, word_bytes, CallLaunches, Dispatch, DispatchList, NativePrepared,
-    NativeSubmission, NativeTensorSpec, ScratchNeed, BUFFER_ALIGNMENT, SYNC_SCRATCH_BYTES,
+    merge_access, submit, word_bytes, CallLaunches, Dispatch, DispatchList, LaunchGeometry,
+    NativePrepared, NativeSubmission, NativeTensorSpec, ScratchNeed, BUFFER_ALIGNMENT,
+    SYNC_SCRATCH_BYTES,
 };
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{
@@ -26,13 +27,157 @@ use crate::driver::{write_zeros, Allocation};
 use crate::layout;
 use seismic_compiler::errors::{ExecutionError, InvocationError};
 use seismic_compiler::prepared::{ArgumentValue, DeviceIdentity, TensorDescriptor};
-use seismic_lang::entry::{AliasRule, ParameterKind, TensorAccess};
+use seismic_lang::checked::NativeImplementation;
+use seismic_lang::entry::{AliasRule, CallSchema, ParameterKind, TensorAccess};
 use seismic_lang::ids::RepresentationId;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 static NEXT_NATIVE_GRAPH: AtomicU64 = AtomicU64::new(1);
 const INPUT_NODE: u32 = u32::MAX;
+
+/// Host heap a structure holds: the bytes it asked the allocator for and in
+/// how many allocations. The allocator's own rounding and bookkeeping of
+/// each allocation are not part of `bytes`; `rounding` bounds them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostHeap {
+    pub bytes: u64,
+    pub allocations: u64,
+    /// The most the platform's allocator holds for these allocations beyond
+    /// `bytes` (`allocator_rounding`, summed). A bound on what a process
+    /// grows by beyond its requested bytes, not part of what is planned.
+    pub rounding: u64,
+}
+
+/// The most the platform's allocator holds for one allocation of `bytes`
+/// requested bytes beyond them, from its size classes.
+///
+/// macOS (libmalloc): a request is served in 16-byte quanta up to 1,008
+/// bytes, in 512-byte quanta up to 32 KiB, and in at most 32 KiB quanta
+/// beyond (its medium ranges; a larger one is rounded to pages, which are
+/// smaller).
+#[cfg(target_os = "macos")]
+fn allocator_rounding(bytes: u64) -> u64 {
+    match bytes {
+        0..=1008 => bytes.next_multiple_of(16).max(16) - bytes,
+        1009..=32_768 => bytes.next_multiple_of(512) - bytes,
+        _ => 32_768 - 1,
+    }
+}
+
+/// The most the platform's allocator holds for one allocation of `bytes`
+/// requested bytes beyond them, from its size classes.
+///
+/// glibc: a request below the mapping threshold is a chunk of the request
+/// and one size word, in 16-byte quanta and at least 32 bytes. From the
+/// threshold's least value (128 KiB) a request may be mapped alone: the
+/// request and two size words, rounded to a page.
+#[cfg(not(target_os = "macos"))]
+fn allocator_rounding(bytes: u64) -> u64 {
+    const MAPPING_THRESHOLD: u64 = 128 * 1024;
+    const PAGE: u64 = 4096;
+    let chunk = (bytes + 8).next_multiple_of(16).max(32) - bytes;
+    if bytes < MAPPING_THRESHOLD {
+        chunk
+    } else {
+        chunk.max((bytes + 16).next_multiple_of(PAGE) - bytes)
+    }
+}
+
+impl HostHeap {
+    /// One allocation of `elements` elements of `size` bytes; none when it
+    /// is empty.
+    pub fn hold(&mut self, elements: usize, size: usize) {
+        let bytes = elements
+            .checked_mul(size)
+            .expect("host allocation bytes overflow");
+        if bytes != 0 {
+            self.bytes += bytes as u64;
+            self.allocations += 1;
+            self.rounding += allocator_rounding(bytes as u64);
+        }
+    }
+
+    /// The heap of one allocation of `elements` elements of `size` bytes.
+    pub fn allocation(elements: usize, size: usize) -> Self {
+        let mut heap = Self::default();
+        heap.hold(elements, size);
+        heap
+    }
+
+    fn hold_vec<T>(&mut self, vector: &Vec<T>) {
+        self.hold(vector.capacity(), std::mem::size_of::<T>());
+    }
+
+    /// The heap of `count` structures that each hold `self`.
+    pub fn times(self, count: u64) -> Option<Self> {
+        Some(Self {
+            bytes: self.bytes.checked_mul(count)?,
+            allocations: self.allocations.checked_mul(count)?,
+            rounding: self.rounding.checked_mul(count)?,
+        })
+    }
+
+    pub fn plus(self, other: Self) -> Option<Self> {
+        Some(Self {
+            bytes: self.bytes.checked_add(other.bytes)?,
+            allocations: self.allocations.checked_add(other.allocations)?,
+            rounding: self.rounding.checked_add(other.rounding)?,
+        })
+    }
+}
+
+/// The lengths of one sealed node's vectors. Its entry's call schema and its
+/// backend's native declaration fix them, whatever the call's extents and
+/// the kernel's tuning: a graph's host heap is known from them before any
+/// kernel is formed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedNodeShape {
+    /// Buffers in ABI order: tensor parameters, tensor results, scratch.
+    buffers: usize,
+    /// Argument words.
+    words: usize,
+    /// Declared launches, active or not.
+    launches: usize,
+    /// Per pair of parameters the entry requires disjoint: each one's
+    /// ordinal and the bytes of its name.
+    disjoint: Vec<[(usize, usize); 2]>,
+}
+
+impl SealedNodeShape {
+    pub fn of(schema: &CallSchema, implementation: &NativeImplementation) -> Self {
+        let parameter = |id| {
+            let ordinal = schema
+                .parameters()
+                .iter()
+                .position(|parameter| parameter.id == id)
+                .expect("alias rule names a schema parameter");
+            (ordinal, schema.parameters()[ordinal].name.len())
+        };
+        Self {
+            buffers: sealed_buffers(schema, implementation),
+            words: super::abi::native_word_count(schema, implementation),
+            launches: implementation.launches.len(),
+            disjoint: schema
+                .aliases()
+                .iter()
+                .filter_map(|rule| match *rule {
+                    AliasRule::Disjoint(first, second) => {
+                        Some([parameter(first), parameter(second)])
+                    }
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The buffers a sealed node places: its entry's tensor parameters and
+/// results and its declaration's scratch, without the two slots the ABI adds
+/// for the argument words and the scalar results.
+fn sealed_buffers(schema: &CallSchema, implementation: &NativeImplementation) -> usize {
+    super::abi::buffer_slots(schema, implementation) - 2
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NativePort {
@@ -201,7 +346,7 @@ impl NativeGraphDraft {
         Ok(())
     }
 
-    pub fn seal(self) -> Result<NativeGraphPlan, CallError> {
+    pub fn seal(mut self) -> Result<NativeGraphPlan, CallError> {
         if self.nodes.is_empty() {
             return Err(CallError::Workflow(WorkflowError::Empty));
         }
@@ -211,9 +356,18 @@ impl NativeGraphDraft {
             &self.exports,
         )
         .map_err(CallError::Workflow)?;
+        // A sealed plan's vectors hold exactly their lengths, so its host
+        // heap follows from its topology (`NativeGraphPlan::host_heap`,
+        // `NativeGraphMetadataDraft::plan_heap`).
+        self.ports.shrink_to_fit();
+        for port in &mut self.ports {
+            port.extents.shrink_to_fit();
+            port.strides.shrink_to_fit();
+        }
+        self.exports.shrink_to_fit();
         let identity = self.identity;
         let device_identity = self.device.kind.identity();
-        let mut results: Vec<Vec<Option<NativeTensorSpec>>> = Vec::new();
+        let mut results: Vec<Vec<Option<NativeTensorSpec>>> = Vec::with_capacity(self.nodes.len());
         let mut planned = Vec::with_capacity(self.nodes.len());
         let mut shaped = Vec::with_capacity(self.nodes.len());
         for node in self.nodes {
@@ -251,6 +405,7 @@ impl NativeGraphDraft {
         {
             executable.seal_node(kernel, &arguments, shape, &planned.args, &storage, node);
         }
+        executable.disjoint.shrink_to_fit();
         Ok(NativeGraphPlan {
             identity,
             device: self.device,
@@ -275,6 +430,8 @@ pub struct NativeGraphMetadataDraft {
     identity: u64,
     ports: Vec<PortSpec>,
     nodes: Vec<PlannedNode>,
+    /// Per node, the lengths of its sealed form's vectors.
+    shapes: Vec<SealedNodeShape>,
     results: Vec<Vec<Option<NativeTensorSpec>>>,
     exports: Vec<WorkflowResultRef>,
 }
@@ -287,9 +444,28 @@ pub struct NativeGraphLayout {
     port_capacity: Vec<u64>,
     result_capacity: Vec<Vec<Option<u64>>>,
     scratch_capacity: Vec<Vec<ScratchNeed>>,
+    /// The host heap of a plan sealed into this layout
+    /// (`NativeGraphMetadataDraft::plan_heap` of the layout's topology).
+    plan_heap: HostHeap,
 }
 
 impl NativeGraphLayout {
+    /// The host heap of each plan sealed into this layout: every vector of
+    /// a sealed plan has a length the layout's topology fixes, so its
+    /// classes' plans hold the same heap. `NativeGraphPlan::host_heap` is
+    /// what a sealed plan holds.
+    pub fn plan_heap(&self) -> HostHeap {
+        self.plan_heap
+    }
+
+    /// The host heap of one static binding of a plan sealed into this
+    /// layout (`BoundNativeGraphPlan::host_heap` is what a binding holds):
+    /// a binding holds, for each port of the plan, the tensor bound to it
+    /// and whether it is external and checked.
+    pub fn bound_heap(&self) -> HostHeap {
+        bindings_heap(self.port_capacity.len())
+    }
+
     pub fn storage_bytes(&self) -> NativeGraphStorageBytes {
         NativeGraphStorageBytes {
             workspace: self.storage.scratch_bytes,
@@ -331,13 +507,9 @@ impl NativeGraphLayout {
                 .zip(&self.scratch_capacity)
                 .all(|(node, capacities)| {
                     node.scratch.len() == capacities.len()
-                        && node
-                            .scratch
-                            .iter()
-                            .zip(capacities)
-                            .all(|(need, capacity)| {
-                                need.sync == capacity.sync && need.bytes <= capacity.bytes
-                            })
+                        && node.scratch.iter().zip(capacities).all(|(need, capacity)| {
+                            need.sync == capacity.sync && need.bytes <= capacity.bytes
+                        })
                 });
         if !valid {
             return Err(WorkflowError::NativeGraphLayoutMismatch);
@@ -413,9 +585,71 @@ impl NativeGraphMetadataDraft {
             identity: NEXT_NATIVE_GRAPH.fetch_add(1, Ordering::Relaxed),
             ports: Vec::new(),
             nodes: Vec::new(),
+            shapes: Vec::new(),
             results: Vec::new(),
             exports: Vec::new(),
         }
+    }
+
+    /// The host heap of the plan this topology seals to
+    /// (`NativeGraphPlan::host_heap`), from the lengths of its vectors: the
+    /// plan in its shared allocation, its ports, each node's buffers, words
+    /// and launches, the external pairs a run checks disjoint, the result
+    /// specs, the exports and the placements.
+    pub fn plan_heap(&self) -> HostHeap {
+        use std::mem::size_of;
+        let mut heap = HostHeap::default();
+        heap.hold(1, SHARED_PLAN_BYTES);
+        heap.hold(self.ports.len(), size_of::<PortSpec>());
+        for port in &self.ports {
+            heap.hold(port.extents.len(), size_of::<u64>());
+            heap.hold(port.strides.len(), size_of::<u64>());
+        }
+        heap.hold(self.nodes.len(), size_of::<SealedNode>());
+        heap.hold(self.ports.len(), size_of::<bool>());
+        let mut disjoint = 0usize;
+        for (node, shape) in self.nodes.iter().zip(&self.shapes) {
+            heap.hold(shape.buffers, size_of::<Site>());
+            heap.hold(shape.buffers, size_of::<&'static str>());
+            heap.hold(shape.words, size_of::<u64>());
+            heap.hold(shape.words * size_of::<u64>(), size_of::<u8>());
+            heap.hold(shape.launches, size_of::<Option<LaunchGeometry>>());
+            // A pair is checked per run when both arguments are external
+            // ports, and different ones (`Executable::seal_node`).
+            let external = |ordinal: usize| {
+                argument_reference(&node.args.arguments()[ordinal])
+                    .filter(|reference| {
+                        reference.node == INPUT_NODE && !self.ports[reference.result as usize].local
+                    })
+                    .map(|reference| reference.result)
+            };
+            for [(first, first_name), (second, second_name)] in &shape.disjoint {
+                if let (Some(first), Some(second)) = (external(*first), external(*second)) {
+                    if first != second {
+                        disjoint += 1;
+                        heap.hold(*first_name, size_of::<u8>());
+                        heap.hold(*second_name, size_of::<u8>());
+                    }
+                }
+            }
+        }
+        heap.hold(disjoint, size_of::<(PortRange, PortRange)>());
+        heap.hold(
+            self.results.len(),
+            size_of::<Vec<Option<NativeTensorSpec>>>(),
+        );
+        heap.hold(self.results.len(), size_of::<Vec<Placement>>());
+        for row in &self.results {
+            heap.hold(row.len(), size_of::<Option<NativeTensorSpec>>());
+            heap.hold(row.len(), size_of::<Placement>());
+            for spec in row.iter().flatten() {
+                heap.hold(spec.extents.len(), size_of::<u64>());
+                heap.hold(spec.strides.len(), size_of::<u64>());
+            }
+        }
+        heap.hold(self.exports.len(), size_of::<WorkflowResultRef>());
+        heap.hold(self.ports.len(), size_of::<Option<Placement>>());
+        heap
     }
 
     pub fn port(
@@ -455,6 +689,7 @@ impl NativeGraphMetadataDraft {
         parameter_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         result_shapes: Vec<Option<(RepresentationId, Vec<u64>)>>,
         scratch: Vec<ScratchNeed>,
+        shape: SealedNodeShape,
     ) -> Result<PendingWorkflowResults, CallError> {
         let node = u32::try_from(self.nodes.len()).expect("native graph node ordinal exhausted");
         validate_node_references(self.identity, self.ports.len(), node, &args)
@@ -478,6 +713,7 @@ impl NativeGraphMetadataDraft {
             .collect::<Result<Vec<_>, CallError>>()?;
         let count = u32::try_from(results.len()).expect("native result ordinal exhausted");
         self.nodes.push(PlannedNode { args, scratch });
+        self.shapes.push(shape);
         self.results.push(results);
         Ok(PendingWorkflowResults::new(self.identity, node, count))
     }
@@ -594,7 +830,13 @@ impl NativeGraphMetadataDraft {
                 scratch,
             })
             .collect::<Vec<_>>();
-        Ok(make_layout(&ports, &nodes, &results, &self.exports))
+        Ok(make_layout(
+            &ports,
+            &nodes,
+            &results,
+            &self.exports,
+            self.plan_heap(),
+        ))
     }
 }
 
@@ -603,8 +845,10 @@ fn make_layout(
     nodes: &[PlannedNode],
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
+    plan_heap: HostHeap,
 ) -> NativeGraphLayout {
     NativeGraphLayout {
+        plan_heap,
         storage: plan_storage(ports, nodes, results, exports),
         signature: storage_signature(ports, nodes, results, exports),
         port_capacity: ports.iter().map(|port| port.byte_len).collect(),
@@ -989,8 +1233,9 @@ impl Executable {
         node: usize,
     ) {
         let schema = kernel.schema();
-        let mut sites = Vec::new();
-        let mut representations = Vec::new();
+        let buffers = sealed_buffers(schema, kernel.implementation());
+        let mut sites = Vec::with_capacity(buffers);
+        let mut representations = Vec::with_capacity(buffers);
         let mut external = vec![None; arguments.len()];
         for (ordinal, ((parameter, argument), value)) in schema
             .parameters()
@@ -1385,7 +1630,61 @@ pub struct NativeGraphPlan {
     upload_bytes: u64,
 }
 
+/// A plan in the shared allocation its holders keep it in: the plan and the
+/// allocation's two reference counts.
+const SHARED_PLAN_BYTES: usize =
+    std::mem::size_of::<NativeGraphPlan>() + 2 * std::mem::size_of::<usize>();
+
 impl NativeGraphPlan {
+    /// The host heap this plan holds: itself in its shared allocation and
+    /// every vector it owns, at the vector's capacity. Its kernels and its
+    /// device are shared with the prepared programs and are theirs; the
+    /// replays a CUDA or Vulkan device records of a plan's submissions
+    /// belong to the device's queue and exist only once the plan has run.
+    pub fn host_heap(&self) -> HostHeap {
+        let mut heap = HostHeap::default();
+        heap.hold(1, SHARED_PLAN_BYTES);
+        heap.hold_vec(&self.ports);
+        for port in &self.ports {
+            heap.hold_vec(&port.extents);
+            heap.hold_vec(&port.strides);
+        }
+        heap.hold_vec(&self.executable.nodes);
+        for node in &self.executable.nodes {
+            heap.hold_vec(&node.sites);
+            heap.hold_vec(&node.representations);
+            heap.hold_vec(&node.words);
+            heap.hold_vec(&node.word_bytes);
+            heap.hold_vec(&node.launches.geometry);
+        }
+        heap.hold_vec(&self.executable.external_writes);
+        heap.hold_vec(&self.executable.disjoint);
+        for (first, second) in &self.executable.disjoint {
+            heap.hold(first.parameter.capacity(), 1);
+            heap.hold(second.parameter.capacity(), 1);
+        }
+        heap.hold_vec(&self.results);
+        for row in &self.results {
+            heap.hold_vec(row);
+            for spec in row.iter().flatten() {
+                heap.hold_vec(&spec.extents);
+                heap.hold_vec(&spec.strides);
+            }
+        }
+        heap.hold_vec(&self.exports);
+        heap.hold_vec(&self.port_placements);
+        heap.hold_vec(&self.placements);
+        for row in &self.placements {
+            heap.hold_vec(row);
+        }
+        heap
+    }
+
+    /// The bytes of `host_heap`.
+    pub fn host_bytes(&self) -> u64 {
+        self.host_heap().bytes
+    }
+
     pub fn workspace_bytes(&self) -> u64 {
         self.scratch_bytes
     }
@@ -1556,6 +1855,27 @@ impl BoundNativeGraphPlan {
     pub fn bindings(&self) -> NativeGraphBindings {
         self.fixed.clone()
     }
+
+    /// The host heap this binding holds, at its vectors' capacities. The
+    /// plan it binds is shared and is its sealer's.
+    pub fn host_heap(&self) -> HostHeap {
+        let mut heap = HostHeap::default();
+        heap.hold_vec(&self.fixed.inputs);
+        heap.hold_vec(&self.fixed.external);
+        heap.hold_vec(&self.fixed.checked);
+        heap
+    }
+}
+
+/// The host heap of the bindings of a plan of `ports` ports
+/// (`NativeGraphPlan::bindings`).
+fn bindings_heap(ports: usize) -> HostHeap {
+    use std::mem::size_of;
+    let mut heap = HostHeap::default();
+    heap.hold(ports, size_of::<Option<Arc<TensorInner>>>());
+    heap.hold(ports, size_of::<bool>());
+    heap.hold(ports, size_of::<bool>());
+    heap
 }
 
 fn port_matches(device: &Arc<DeviceInner>, spec: &PortSpec, tensor: &Arc<TensorInner>) -> bool {
@@ -2374,7 +2694,7 @@ mod layout_certificate_tests {
     #[test]
     fn dominating_layout_accepts_smaller_exact_graph_and_rejects_larger_one() {
         let (ports, nodes, results) = class(16);
-        let certified = make_layout(&ports, &nodes, &results, &[]);
+        let certified = make_layout(&ports, &nodes, &results, &[], HostHeap::default());
         let charge = certified.storage_bytes();
         let (ports, nodes, results) = class(8);
         let exact = certified

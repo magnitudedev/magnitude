@@ -8,6 +8,7 @@
 
 use super::{AnyExpr, BinaryOp, ExprArena, IntExpr, NatExpr, NodeView, SymbolId, UnaryOp};
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 // ---------------------------------------------------------------------------
 // Transient normal form
 // ---------------------------------------------------------------------------
@@ -16,24 +17,53 @@ use std::collections::{BTreeMap, HashMap};
 pub(crate) enum Atom {
     Symbol(SymbolId),
     /// Euclidean quotient; positive-divisor rules require a proof below.
-    Quot(Box<Poly>, Box<Poly>),
+    Quot(Rc<Poly>, Rc<Poly>),
     /// Nonnegative Euclidean remainder; the divisor may be signed.
-    Rem(Box<Poly>, Box<Poly>),
+    Rem(Rc<Poly>, Rc<Poly>),
     /// A node outside the polynomial fragment, retaining its actual sort.
     Foreign(Foreign),
 }
 
-/// A foreign node keyed by its interned identity. Equal nodes are one key,
-/// so two normalizations of the same node agree.
-#[derive(Clone, Copy, Debug)]
+/// A foreign node keyed by the value it denotes. A node is its own identity,
+/// except an extremum, whose value is determined by its operands' normal
+/// forms: two `min`/`max` nodes over equal normal forms are one atom however
+/// their operands are spelled, so two normalizations of one value agree.
+#[derive(Clone, Debug)]
 pub(crate) struct Foreign {
     key: u64,
+    identity: ForeignIdentity,
+    /// One node denoting the atom's value.
     pub(crate) node: AnyExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ForeignIdentity {
+    Node,
+    /// `min` (`max == false`) or `max` of an unordered operand pair, in
+    /// normal-form order.
+    Extremum {
+        max: bool,
+        operands: Rc<(Poly, Poly)>,
+    },
 }
 
 impl PartialEq for Foreign {
     fn eq(&self, other: &Self) -> bool {
-        self.node == other.node
+        match (&self.identity, &other.identity) {
+            (ForeignIdentity::Node, ForeignIdentity::Node) => self.node == other.node,
+            (
+                ForeignIdentity::Extremum { max, operands },
+                ForeignIdentity::Extremum {
+                    max: other_max,
+                    operands: other_operands,
+                },
+            ) => {
+                max == other_max
+                    && self.key == other.key
+                    && (Rc::ptr_eq(operands, other_operands) || operands == other_operands)
+            }
+            _ => false,
+        }
     }
 }
 impl Eq for Foreign {}
@@ -44,28 +74,79 @@ impl PartialOrd for Foreign {
 }
 impl Ord for Foreign {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
         self.key
             .cmp(&other.key)
-            // A hash is an ordering accelerator, never identity. Arena-owned
-            // expression handles have a unique debug form (sort, owner,
-            // ordinal), which closes the otherwise-unsound collision case.
-            .then_with(|| format!("{:?}", self.node).cmp(&format!("{:?}", other.node)))
+            // A hash is an ordering accelerator, never identity.
+            .then_with(|| match (&self.identity, &other.identity) {
+                // Arena-owned expression handles have a unique debug form
+                // (sort, owner, ordinal), which closes the otherwise-unsound
+                // collision case. One node has one debug form, so equal nodes
+                // need not render it.
+                (ForeignIdentity::Node, ForeignIdentity::Node) => {
+                    if self.node == other.node {
+                        Ordering::Equal
+                    } else {
+                        format!("{:?}", self.node).cmp(&format!("{:?}", other.node))
+                    }
+                }
+                (ForeignIdentity::Node, ForeignIdentity::Extremum { .. }) => Ordering::Less,
+                (ForeignIdentity::Extremum { .. }, ForeignIdentity::Node) => Ordering::Greater,
+                (
+                    ForeignIdentity::Extremum { max, operands },
+                    ForeignIdentity::Extremum {
+                        max: other_max,
+                        operands: other_operands,
+                    },
+                ) => max.cmp(other_max).then_with(|| {
+                    if Rc::ptr_eq(operands, other_operands) {
+                        Ordering::Equal
+                    } else {
+                        operands.cmp(other_operands)
+                    }
+                }),
+            })
     }
 }
 impl std::hash::Hash for Foreign {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.node.hash(state);
+        // The key is a hash of exactly what equality compares.
+        self.key.hash(state);
     }
 }
 
 pub(crate) fn foreign(node: AnyExpr) -> Atom {
+    keyed_foreign(node, ForeignIdentity::Node)
+}
+
+fn keyed_foreign(node: AnyExpr, identity: ForeignIdentity) -> Atom {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    node.hash(&mut hasher);
+    match &identity {
+        ForeignIdentity::Node => node.hash(&mut hasher),
+        identity => identity.hash(&mut hasher),
+    }
     Atom::Foreign(Foreign {
         key: hasher.finish(),
+        identity,
         node,
     })
+}
+
+/// The extremum `node` of two normalized operands, keyed by their normal
+/// forms. An invalid operand form identifies nothing, so it keeps the node.
+fn extremum(node: AnyExpr, max: bool, lhs: Poly, rhs: Poly) -> Poly {
+    if !lhs.valid || !rhs.valid {
+        return opaque(node);
+    }
+    let operands = if lhs <= rhs { (lhs, rhs) } else { (rhs, lhs) };
+    Poly::atom(keyed_foreign(
+        node,
+        ForeignIdentity::Extremum {
+            max,
+            operands: Rc::new(operands),
+        },
+    ))
 }
 
 pub(crate) type Monomial = BTreeMap<Atom, u32>;
@@ -139,15 +220,22 @@ impl Poly {
         if c == 0 {
             return;
         }
-        let entry = self.terms.entry(m.clone()).or_insert(0);
-        let Some(sum) = entry.checked_add(c) else {
-            self.valid = false;
-            self.terms.clear();
-            return;
-        };
-        *entry = sum;
-        if *entry == 0 {
-            self.terms.remove(&m);
+        match self.terms.entry(m) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(c);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let Some(sum) = entry.get().checked_add(c) else {
+                    self.valid = false;
+                    self.terms.clear();
+                    return;
+                };
+                if sum == 0 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = sum;
+                }
+            }
         }
     }
 
@@ -186,7 +274,23 @@ impl Poly {
     }
 
     pub(crate) fn sub(&self, other: &Poly) -> Poly {
-        self.add(&other.neg())
+        let invalid = Poly {
+            terms: BTreeMap::new(),
+            valid: false,
+        };
+        if !self.valid || !other.valid {
+            return invalid;
+        }
+        let mut out = self.clone();
+        for (m, c) in &other.terms {
+            // Exactly `self + (-other)`: a coefficient without a negation
+            // invalidates the whole difference.
+            let Some(c) = c.checked_neg() else {
+                return invalid;
+            };
+            out.insert(m.clone(), c);
+        }
+        out
     }
 
     pub(crate) fn mul(&self, other: &Poly) -> Poly {
@@ -273,7 +377,7 @@ impl Poly {
         // numerator is this one, and the division is exact.
         if let Some(Atom::Quot(n, d)) = single_atom_of(den) {
             if *n == *self && n.divide_exactly(&d).is_some() {
-                return *d;
+                return Rc::unwrap_or_clone(d);
             }
         }
         // Pull out the part of the numerator that is an exact multiple of a
@@ -300,10 +404,7 @@ impl Poly {
                     if rest.as_constant() == Some(-1) {
                         return exact.sub(&Poly::constant(1));
                     }
-                    return exact.add(&Poly::atom(Atom::Quot(
-                        Box::new(rest),
-                        Box::new(den.clone()),
-                    )));
+                    return exact.add(&Poly::atom(Atom::Quot(Rc::new(rest), Rc::new(den.clone()))));
                 }
             }
         }
@@ -329,13 +430,10 @@ impl Poly {
                 if rest.is_zero() {
                     return exact;
                 }
-                return exact.add(&Poly::atom(Atom::Quot(
-                    Box::new(rest),
-                    Box::new(den.clone()),
-                )));
+                return exact.add(&Poly::atom(Atom::Quot(Rc::new(rest), Rc::new(den.clone()))));
             }
         }
-        Poly::atom(Atom::Quot(Box::new(self.clone()), Box::new(den.clone())))
+        Poly::atom(Atom::Quot(Rc::new(self.clone()), Rc::new(den.clone())))
     }
 
     /// `self / den` when the division is exact as polynomials.
@@ -405,6 +503,22 @@ impl Poly {
                 valid: false,
             };
         }
+        // Reducing an already-reduced value under the same positive
+        // modulus is redundant, including inside integer polynomial sums.
+        // This preserves exact signed/unsigned word-cast roundtrips.
+        if den.as_constant().is_some_and(|value| value > 0) {
+            let mut reduced = self.clone();
+            for atom in self.atoms() {
+                if let Atom::Rem(numerator, modulus) = &atom {
+                    if modulus.as_ref() == den {
+                        reduced = reduced.subst(&atom, numerator);
+                    }
+                }
+            }
+            if reduced != *self {
+                return reduced.rem(den);
+            }
+        }
         if let (Some(a), Some(b)) = (self.as_constant(), den.as_constant()) {
             if b != 0 {
                 return Poly::constant(a.rem_euclid(b));
@@ -424,10 +538,10 @@ impl Poly {
                 if rest.is_zero() {
                     return Poly::constant(0);
                 }
-                return Poly::atom(Atom::Rem(Box::new(rest), Box::new(den.clone())));
+                return Poly::atom(Atom::Rem(Rc::new(rest), Rc::new(den.clone())));
             }
         }
-        Poly::atom(Atom::Rem(Box::new(self.clone()), Box::new(den.clone())))
+        Poly::atom(Atom::Rem(Rc::new(self.clone()), Rc::new(den.clone())))
     }
 
     pub(crate) fn atoms(&self) -> Vec<Atom> {
@@ -452,6 +566,12 @@ impl Poly {
         }
         let mut out = Poly::default();
         for (m, c) in &self.terms {
+            // A monomial without `atom` is its own term: multiplying the
+            // coefficient by its unit atoms changes neither.
+            if !m.contains_key(atom) {
+                out.insert(m.clone(), *c);
+                continue;
+            }
             let mut term = Poly::constant(*c);
             for (a, k) in m {
                 let factor = if a == atom {
@@ -463,7 +583,15 @@ impl Poly {
                     term = term.mul(&factor);
                 }
             }
-            out = out.add(&term);
+            if !term.valid {
+                return Poly {
+                    terms: BTreeMap::new(),
+                    valid: false,
+                };
+            }
+            for (m, c) in term.terms {
+                out.insert(m, c);
+            }
         }
         out
     }
@@ -546,7 +674,24 @@ pub(crate) fn single_atom_of(s: &Poly) -> Option<Atom> {
 /// symbol-less encoding. Only sorts with a nonnegative value domain receive
 /// an implicit zero bound.
 pub(crate) fn normalize(arena: &ExprArena, node: AnyExpr) -> Poly {
-    normalize_shared(arena, node, &mut HashMap::new())
+    // A handle names one immutable node of one arena identity, so its normal
+    // form never changes. Bounded: past the limit the table restarts.
+    const LIMIT: usize = 1 << 18;
+    thread_local! {
+        static NORMAL: std::cell::RefCell<HashMap<AnyExpr, Poly>> = Default::default();
+    }
+    if let Some(known) = NORMAL.with(|normal| normal.borrow().get(&node).cloned()) {
+        return known;
+    }
+    let value = normalize_shared(arena, node, &mut HashMap::new());
+    NORMAL.with(|normal| {
+        let mut normal = normal.borrow_mut();
+        if normal.len() >= LIMIT {
+            normal.clear();
+        }
+        normal.insert(node, value.clone());
+    });
+    value
 }
 
 /// [`normalize`] with every shared subnode normalized once, so the cost is
@@ -585,12 +730,9 @@ fn normalize_shared(arena: &ExprArena, node: AnyExpr, memo: &mut HashMap<AnyExpr
                 BinaryOp::CeilDiv => l.add(&r).sub(&Poly::constant(1)).quot(&r),
                 // `align_up(a, u) = ((a + u - 1) / u) * u`.
                 BinaryOp::AlignUp => l.add(&r).sub(&Poly::constant(1)).quot(&r).mul(&r),
-                BinaryOp::Min
-                | BinaryOp::Max
-                | BinaryOp::And
-                | BinaryOp::Or
-                | BinaryOp::Implies
-                | BinaryOp::Iff => opaque(node),
+                BinaryOp::Min => extremum(node, false, l, r),
+                BinaryOp::Max => extremum(node, true, l, r),
+                BinaryOp::And | BinaryOp::Or | BinaryOp::Implies | BinaryOp::Iff => opaque(node),
             }
         }
         NodeView::Nary { op, operands } => match op {
@@ -767,6 +909,21 @@ pub(crate) fn natural_difference(arena: &mut ExprArena, a: NatExpr, b: NatExpr) 
         .then(|| intern_nat(arena, &difference))
 }
 
+/// `i` in the one normal form as a natural expression, when it is total and
+/// its normal form is rebuildable with nonnegative coefficients over natural
+/// atoms: its value is then a natural for every assignment, so the
+/// conversion's side condition `i >= 0` holds identically. A normal form
+/// with no conversion to remove keeps its authored structure.
+pub(crate) fn natural_integer(arena: &mut ExprArena, i: IntExpr) -> Option<NatExpr> {
+    if !arena.is_total(AnyExpr::Int(i)) {
+        return None;
+    }
+    let form = normalize(arena, AnyExpr::Int(i));
+    let natural = form.terms.values().all(|coefficient| *coefficient >= 0)
+        && form.atoms().iter().all(|atom| natural_atom(arena, atom));
+    (natural && rebuildable(arena, &form)).then(|| intern_nat(arena, &form))
+}
+
 /// Whether combining the operands merged or cancelled a term. Otherwise the
 /// constructor keeps today's node, so a sum with nothing to cancel keeps its
 /// authored structure.
@@ -786,9 +943,8 @@ pub(crate) fn integer_sum(
     if !arena.is_total(AnyExpr::Int(a)) || !arena.is_total(AnyExpr::Int(b)) {
         return None;
     }
-    let mut memo = HashMap::new();
-    let left = normalize_shared(arena, AnyExpr::Int(a), &mut memo);
-    let right = normalize_shared(arena, AnyExpr::Int(b), &mut memo);
+    let left = normalize(arena, AnyExpr::Int(a));
+    let right = normalize(arena, AnyExpr::Int(b));
     let sum = if negate_right {
         left.sub(&right)
     } else {

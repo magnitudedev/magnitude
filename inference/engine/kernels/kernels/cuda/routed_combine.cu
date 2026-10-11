@@ -37,19 +37,36 @@ struct CombineEpi {
     }
 };
 
-extern "C" __global__ void routed_combine_shared(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ROUTED_COMBINE_STAGE
+template <unsigned OPERAND>
+__global__ void routed_combine_stage(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    const projection::Plain<Act, projection::AllRows> source{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
+    projection::materialize_operand_row<Operands>(source, blockIdx.x, SEISMIC_DIM_H, SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
+}
+#endif
+
+#ifdef SEISMIC_FORMING_ROUTED_COMBINE_SHARED
+template <unsigned OPERAND>
+__global__ void routed_combine_shared(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_S))
         return;
-    const projection::SiluMul<Act> epi{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT), SEISMIC_DIM_S};
-    projection::gemm_segment<GShape>(reinterpret_cast<projection::u8 *>(dynamic_shared),
-                             projection::ActivationRows{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0},
+    const projection::Glu<typename Operands::Storage, Act> epi{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT), SEISMIC_DIM_S, 0};
+    projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+                             projection::ActivationRows{OPERAND == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
+                                 OPERAND == 1 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0},
                              (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_H, blockIdx.x, SEISMIC_DIM_S,
                              KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_GATE)),
                              KERNEL_W2_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_UP)), epi);
 }
+#endif
 
-extern "C" __global__ void routed_combine(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ROUTED_COMBINE
+template <unsigned OPERAND>
+__global__ void routed_combine(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
     extern __shared__ uint4 dynamic_shared[];
     if (blockIdx.x >= projection::gemm_columns(SEISMIC_DIM_H))
         return;
@@ -60,8 +77,9 @@ extern "C" __global__ void routed_combine(SEISMIC_KERNEL_PARAMS) {
                          reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_INVERSE)), SEISMIC_INVERSE_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_SCORES)), SEISMIC_SCORES_STRIDE_0,
                          reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT))};
-    projection::gemm_segment<GShape>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+    projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared),
                              projection::ActivationRows{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_SHARED_PRODUCT), SEISMIC_DIM_S},
                              (unsigned)SEISMIC_DIM_M, SEISMIC_DIM_S, blockIdx.x, SEISMIC_DIM_H,
                              KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_SHARED_DOWN)), projection::NoWeight{}, epi);
 }
+#endif

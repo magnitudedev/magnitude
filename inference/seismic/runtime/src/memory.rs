@@ -21,6 +21,10 @@ pub struct MemoryUsage {
     /// Bytes charged by every opened device in this process whose
     /// allocations reside in the same physical pool, including `charged`.
     pub pool_charged: u64,
+    /// The most `charged` has been since the device was opened or its mark
+    /// was last restarted ([`MemoryDomain::restart_high_water`]): what was
+    /// charged and released again in between is seen here and nowhere else.
+    pub high_water: u64,
 }
 
 /// Process-wide charges against one physical memory pool.
@@ -45,6 +49,7 @@ impl PoolLedger {
 struct MemoryState {
     charged: u64,
     limit: Option<u64>,
+    high_water: u64,
 }
 
 /// One opened device's accounting scope within its pool ledger. Lock order
@@ -61,8 +66,16 @@ impl MemoryDomain {
             state: Mutex::new(MemoryState {
                 charged: 0,
                 limit: None,
+                high_water: 0,
             }),
         })
+    }
+
+    /// Start the high-water mark again from what is charged now, so that
+    /// the next reading is of the work between the two.
+    pub(crate) fn restart_high_water(&self) {
+        let mut state = self.state();
+        state.high_water = state.charged;
     }
 
     fn state(&self) -> MutexGuard<'_, MemoryState> {
@@ -78,6 +91,7 @@ impl MemoryDomain {
             charged: state.charged,
             limit: state.limit,
             pool_charged,
+            high_water: state.high_water,
         }
     }
 
@@ -112,6 +126,7 @@ impl MemoryDomain {
         }
         *pool = pool_next;
         state.charged = next;
+        state.high_water = state.high_water.max(next);
         Ok(MemoryReservation {
             domain: self.clone(),
             remaining: bytes,
@@ -128,6 +143,21 @@ impl MemoryDomain {
         *pool = pool
             .checked_sub(bytes)
             .unwrap_or_else(|| panic!("{what} exceeded the pool accounting total"));
+    }
+
+    /// Charge `bytes` an allocation held before and holds again. This is the
+    /// return of a released part of a live allocation, not a reservation, so
+    /// it is never refused: like a falling limit, it can leave the device
+    /// above its limit, and every further reservation is then refused until
+    /// releases bring the charge back below it.
+    fn restore(&self, bytes: u64) {
+        let mut state = self.state();
+        let mut pool = self.pool.charged();
+        *pool = pool
+            .checked_add(bytes)
+            .expect("restored charge overflowed the pool accounting total");
+        state.charged += bytes;
+        state.high_water = state.high_water.max(state.charged);
     }
 }
 
@@ -200,6 +230,20 @@ impl MemoryCharge {
             .release(self.bytes - bytes, "in-place recommit release");
         self.bytes = bytes;
     }
+
+    /// Bring the charge to the `bytes` its allocation held before an
+    /// in-place recommit that was abandoned, once the backend has restored
+    /// that backing: abandoned growth releases what it added, and an
+    /// abandoned shrink takes back what it released (never refused; see
+    /// `MemoryDomain::restore`).
+    pub(crate) fn restore(&mut self, bytes: u64) {
+        if bytes <= self.bytes {
+            self.shrink(bytes);
+        } else {
+            self.domain.restore(bytes - self.bytes);
+            self.bytes = bytes;
+        }
+    }
 }
 
 impl Drop for MemoryCharge {
@@ -264,6 +308,32 @@ mod tests {
         assert_eq!(domain.usage().charged, 8);
         drop(charge);
         assert_eq!(domain.usage().charged, 0);
+    }
+
+    #[test]
+    fn restored_charge_takes_back_released_bytes_whatever_the_limit() {
+        let domain = domain();
+        domain.set_limit(Some(16));
+        let mut initial = domain.reserve(16).unwrap();
+        let mut charge = initial.take(16);
+        drop(initial);
+        charge.shrink(4);
+        // Another allocation spends what the shrink released.
+        let other = domain.reserve(12).unwrap();
+        charge.restore(16);
+        assert_eq!(charge.bytes(), 16);
+        assert_eq!(domain.usage().charged, 28);
+        assert_eq!(domain.usage().pool_charged, 28);
+        assert_eq!(domain.usage().high_water, 28);
+        assert!(domain.reserve(1).is_err());
+        drop(other);
+        assert_eq!(domain.usage().charged, 16);
+        // Restoring to fewer bytes releases the difference.
+        charge.restore(8);
+        assert_eq!(domain.usage().charged, 8);
+        drop(charge);
+        assert_eq!(domain.usage().charged, 0);
+        assert_eq!(domain.usage().pool_charged, 0);
     }
 
     #[test]

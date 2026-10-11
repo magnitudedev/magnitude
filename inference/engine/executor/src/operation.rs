@@ -261,13 +261,18 @@ pub enum Operation {
     },
 }
 
-/// A prompt chunk's drafter entry: `tokens[i]` pairs with the chunk's
-/// feature of row `i` (the row that selected it; the prompt knows every
-/// token, so the chunk's own rows condition it), committed to drafter state
-/// at `position` when the chunk commits. Entry rows never exceed the chunk's.
-/// The first draft anchors at `draft_from` (see [`HeadPhase::Priming`]).
+/// A prompt chunk's drafter entry, committed at `position` with the chunk.
+/// A successor-dependent entry pairs its first token with the previous
+/// boundary feature when one exists, followed by this chunk's complete
+/// pairs. A feature-only entry reads the current chunk directly. Entry rows
+/// never exceed the chunk's.
+/// `draft_from` is the earliest anchor this history must support, including a
+/// continuation from a retained prefix (see [`HeadPhase::Priming`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Priming {
+    /// Keep the last target feature independently, entering only token pairs
+    /// wholly inside the prefix. Chained MTP heads require this boundary.
+    pub boundary: bool,
     pub tokens: Vec<TokenId>,
     pub position: usize,
     pub draft_from: usize,
@@ -279,7 +284,7 @@ pub struct Priming {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadPhase {
     /// Entering committed history before drafting; the first draft block
-    /// will anchor at `draft_from` (the position after the primed history),
+    /// cannot anchor before `draft_from`, including after prefix reuse,
     /// so windowed draft histories never read rows before
     /// `draft_from + 1 - window`.
     Priming {
@@ -320,6 +325,8 @@ pub struct GroupKey {
     pub program_identity: ProgramIdentity,
     pub executable: ExecutableKind,
     pub commitment: CommittedClass,
+    /// Physical block width; unequal noncausal blocks cannot be padded together.
+    pub draft_width: Option<usize>,
 }
 
 impl Operation {
@@ -432,9 +439,13 @@ impl Operation {
                 }
                 validate_forward_select(*kind, tokens.len(), *demand, select)?;
                 if let Some(prime) = prime {
-                    if *kind != WorkKind::Prefill
+                    let closed_prefix = !prime.boundary
+                        || (prime.tokens == *tokens
+                            || (prime.position == 0 && prime.tokens == tokens[1..]));
+                    if !closed_prefix
+                        || *kind != WorkKind::Prefill
                         || !demand.contains(Demand::FEATURES)
-                        || prime.tokens.is_empty()
+                        || (prime.tokens.is_empty() && !prime.boundary)
                         || prime.tokens.len() > tokens.len()
                     {
                         return Err(OperationError::Priming);
@@ -556,7 +567,9 @@ impl fmt::Display for OperationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRows => formatter.write_str("operation requires at least one row"),
-            Self::PrimingHeadProposals => formatter.write_str("priming head cannot draft proposals"),
+            Self::PrimingHeadProposals => {
+                formatter.write_str("priming head cannot draft proposals")
+            }
             Self::Priming => formatter.write_str(
                 "a drafter entry primes a feature-demanding prompt chunk from at most its rows",
             ),

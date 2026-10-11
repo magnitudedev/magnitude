@@ -1,12 +1,14 @@
 //! Ordered checked-entry topology. A slot is the requirement and the recipe;
 //! there is no second kernel-key set or broad semantic coverage class here.
 
-use super::weights::{activation_dtype, ParallelBinding, PerLayerBinding, PerLayerEntryBinding};
+use super::weights::{
+    ParallelBinding, PerLayerBinding, PerLayerEntryBinding, activation_dtype,
+    planned_readout_recipe,
+};
 use super::{
-    planned_element, planned_scalable, AttentionBinding, DenseBinding, EmbeddingBinding,
-    FeaturesBinding, HeadBinding, HeadProjection, HostTablePlan, ReadoutBinding, ReadoutHead,
-    RecurrentBinding,
-    RoutedBinding, ScalableWeight, WeightPlan,
+    AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, HostTablePlan,
+    ReadoutBinding, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight, WeightPlan,
+    planned_element, planned_readout, planned_scalable,
 };
 use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
@@ -14,11 +16,12 @@ use crate::operators::short_conv::ShortConvBinding;
 use crate::operators::state_space::StateSpaceBinding;
 use crate::operators::vision::VisionKernel;
 use crate::operators::{
-    self, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
+    self, EmbeddedHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot,
+    paired_block,
 };
 use magnitude_family_contracts::{
-    DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition, SublayerIndex, TapPoint,
-    WeightKind, WeightScope,
+    DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition, ProposalReadoutPolicy,
+    SublayerIndex, TapPoint, TokenId, WeightKind, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{DType, Element};
@@ -214,8 +217,9 @@ pub struct DraftProgramPlan {
     /// The block's token table: the draft's own or the target's.
     embedding: EmbeddingBinding,
     output_norm: Element,
-    /// The target's vocabulary projection.
-    projection: Element,
+    /// The owned or target-shared vocabulary projection.
+    projection: ReadoutHead,
+    projection_scope: WeightScope,
     markov: Option<MarkovBinding>,
     dflash2: Option<Dflash2Binding>,
     activation: Element,
@@ -238,8 +242,12 @@ impl DraftProgramPlan {
         self.output_norm
     }
 
-    pub fn projection(&self) -> Element {
+    pub fn projection(&self) -> ReadoutHead {
         self.projection
+    }
+
+    pub fn projection_scope(&self) -> WeightScope {
+        self.projection_scope
     }
 
     pub fn markov(&self) -> Option<MarkovBinding> {
@@ -264,6 +272,38 @@ impl HeadProgramPlan {
     pub fn blocks(&self) -> &[HeadBinding] {
         &self.blocks
     }
+}
+
+/// A draft head reading target history (`operators::SharedHead`): its input
+/// is the target's embedding rows and a hidden row, each written into its
+/// half of the joined rows (`tap_rows`) and projected into the head's width
+/// (`project_rows`); its blocks are decoder block slots at that width whose
+/// attention reads target history planes; its normalized output reads out
+/// through its own table and projects back to the target's width for the
+/// next chained step.
+/// The physical centroid operand and model-owned canonical candidate policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusteredReadoutPlan {
+    pub centroids: ScalableWeight,
+    pub clusters: u64,
+    pub selected_clusters: u64,
+    pub token_order: Vec<TokenId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedHeadProgramPlan {
+    /// The head's residual width.
+    pub width: u64,
+    /// The target's token table.
+    pub embedding: EmbeddingBinding,
+    pub input: ScalableWeight,
+    pub blocks: Vec<TargetBlockProgramSlot>,
+    pub output_norm: Element,
+    /// The head's own vocabulary table.
+    pub projection: ReadoutHead,
+    pub clustered: Option<ClusteredReadoutPlan>,
+    pub chain: ScalableWeight,
+    pub activation: Element,
 }
 
 /// The distinct kernel specializations of the projector's vision program
@@ -305,6 +345,7 @@ pub struct ProgramPlan {
     imports: Vec<ImportProgramSlot>,
     target: TargetProgramPlan,
     head: Option<HeadProgramPlan>,
+    shared_head: Option<SharedHeadProgramPlan>,
     draft: Option<DraftProgramPlan>,
     vision: Option<VisionProgramPlan>,
     state: StateProgramPlan,
@@ -317,6 +358,7 @@ impl ProgramPlan {
         imports: Vec<ImportProgramSlot>,
         target: TargetProgramPlan,
         head: Option<HeadProgramPlan>,
+        shared_head: Option<SharedHeadProgramPlan>,
         draft: Option<DraftProgramPlan>,
         vision: Option<VisionProgramPlan>,
         state: StateProgramPlan,
@@ -339,7 +381,8 @@ impl ProgramPlan {
                 .iter()
                 .zip(&definition.decoder.blocks)
                 .any(|(slot, block)| {
-                    paired_block(block).map_or(true, |paired| !operators::slot_matches(&paired, slot))
+                    paired_block(block)
+                        .map_or(true, |paired| !operators::slot_matches(&paired, slot))
                 })
             || head.as_ref().is_some_and(|head| {
                 definition
@@ -347,6 +390,16 @@ impl ProgramPlan {
                     .as_ref()
                     .map(|description| description.blocks.len())
                     != Some(head.blocks.len())
+            })
+            || shared_head.as_ref().is_some_and(|shared| {
+                head.is_some()
+                    || definition.head.as_ref().map(|description| {
+                        description
+                            .blocks
+                            .iter()
+                            .map(|block| block.blocks.len())
+                            .sum::<usize>()
+                    }) != Some(shared.blocks.len())
             })
             || vision.is_some() != definition.vision.is_some()
         {
@@ -358,6 +411,7 @@ impl ProgramPlan {
             imports,
             target,
             head,
+            shared_head,
             draft,
             vision,
             state,
@@ -372,8 +426,19 @@ impl ProgramPlan {
         &self.target
     }
 
+    /// The embedded draft head's program, when it drafts.
     pub fn head(&self) -> Option<&HeadProgramPlan> {
         self.head.as_ref()
+    }
+
+    /// The program of a draft head reading target history, when it drafts.
+    pub fn shared_head(&self) -> Option<&SharedHeadProgramPlan> {
+        self.shared_head.as_ref()
+    }
+
+    /// Whether a draft head of either form drafts (MTP).
+    pub fn drafts_with_head(&self) -> bool {
+        self.head.is_some() || self.shared_head.is_some()
     }
 
     /// The separate draft's program, when it drafts.
@@ -396,12 +461,11 @@ pub(super) fn derive_program_plan(
     head: Option<&[WeightPlan]>,
     vision: Option<&[WeightPlan]>,
     host_tables: &[HostTablePlan],
+    readout_choices: &[super::ReadoutClassChoice],
     history: KvCodec,
 ) -> Result<ProgramPlan, PlanError> {
     operators::admit(definition, head.is_some())?;
-    let lookup = |weights: &[WeightPlan], scope, kind| {
-        planned_element(weights, scope, kind)
-    };
+    let lookup = |weights: &[WeightPlan], scope, kind| planned_element(weights, scope, kind);
     let mut seen_imports = HashSet::new();
     let mut imports = Vec::new();
     for (source, resident) in target
@@ -429,53 +493,55 @@ pub(super) fn derive_program_plan(
     let decoder = &definition.decoder;
     let mut blocks = Vec::with_capacity(decoder.blocks.len());
     for (index, block) in decoder.blocks.iter().enumerate() {
-        let index =
-            u32::try_from(index).map_err(|_| PlanError::Arithmetic("target block index exceeds u32"))?;
+        let index = u32::try_from(index)
+            .map_err(|_| PlanError::Arithmetic("target block index exceeds u32"))?;
         let paired = paired_block(block)?;
         let [mixer, feed_forward] = paired_scopes(index, WeightScope::TargetSublayer);
-        blocks.push(TargetBlockProgramSlot::new(
-            mixer_slot(
-                &paired,
-                decoder.hidden,
-                |kind| lookup(target, mixer, kind),
-                active_element,
-                history,
-            )?,
-            paired
-                .feed_forward
-                .map(|sublayer| {
-                    feed_forward_slot(
-                        &sublayer,
-                        decoder.hidden,
-                        feed_forward,
-                        |scope, kind| lookup(target, scope, kind),
-                        |scope, kind| planned_scalable(target, scope, kind),
-                        active_element,
-                    )
-                })
-                .transpose()?,
-        )
-        .with_per_layer(
-            paired
-                .per_layer
-                .map(|sublayer| {
-                    let scope = WeightScope::TargetSublayer(SublayerIndex {
-                        block: index,
-                        sublayer: 2,
-                    });
-                    let entry = decoder.entry.per_layer.as_ref().ok_or(PlanError::Topology(
-                        "a per-layer input sublayer without a per-layer entry",
-                    ))?;
-                    operators::per_layer::binding(
-                        sublayer,
-                        entry,
-                        decoder.hidden,
-                        |kind| lookup(target, scope, kind),
-                        active_element,
-                    )
-                })
-                .transpose()?,
-        ));
+        blocks.push(
+            TargetBlockProgramSlot::new(
+                mixer_slot(
+                    &paired,
+                    decoder.hidden,
+                    |kind| lookup(target, mixer, kind),
+                    active_element,
+                    history,
+                )?,
+                paired
+                    .feed_forward
+                    .map(|sublayer| {
+                        feed_forward_slot(
+                            &sublayer,
+                            decoder.hidden,
+                            feed_forward,
+                            |scope, kind| lookup(target, scope, kind),
+                            |scope, kind| planned_scalable(target, scope, kind),
+                            active_element,
+                        )
+                    })
+                    .transpose()?,
+            )
+            .with_per_layer(
+                paired
+                    .per_layer
+                    .map(|sublayer| {
+                        let scope = WeightScope::TargetSublayer(SublayerIndex {
+                            block: index,
+                            sublayer: 2,
+                        });
+                        let entry = decoder.entry.per_layer.as_ref().ok_or(PlanError::Topology(
+                            "a per-layer input sublayer without a per-layer entry",
+                        ))?;
+                        operators::per_layer::binding(
+                            sublayer,
+                            entry,
+                            decoder.hidden,
+                            |kind| lookup(target, scope, kind),
+                            active_element,
+                        )
+                    })
+                    .transpose()?,
+            ),
+        );
     }
     let per_layer_entry = decoder
         .entry
@@ -485,37 +551,36 @@ pub(super) fn derive_program_plan(
             let table = host_tables
                 .iter()
                 .find(|table| table.role.kind == WeightKind::PerLayerTable)
-                .ok_or(PlanError::Topology("a per-layer entry without its host table"))?;
+                .ok_or(PlanError::Topology(
+                    "a per-layer entry without its host table",
+                ))?;
             Ok::<_, PlanError>(PerLayerEntryBinding {
                 hidden: decoder.hidden,
                 layers: entry.layers,
                 width: entry.width,
                 table_source: table.source,
                 table: table.resident,
-                projection: lookup(target, WeightScope::Target, WeightKind::PerLayerModelProjection)?,
-                norm: lookup(target, WeightScope::Target, WeightKind::PerLayerProjectionNorm)?,
+                projection: lookup(
+                    target,
+                    WeightScope::Target,
+                    WeightKind::PerLayerModelProjection,
+                )?,
+                norm: lookup(
+                    target,
+                    WeightScope::Target,
+                    WeightKind::PerLayerProjectionNorm,
+                )?,
                 activation: active_element,
             })
         })
         .transpose()?;
-    let progressive = target.iter().any(|weight| {
-        matches!(weight.role.kind, WeightKind::OutputPlane(_)) && weight.role.scope == WeightScope::Target
-    });
-    let readout_head = if progressive {
-        ReadoutHead::Progressive
-    } else {
-        let output = planned_scalable(target, WeightScope::Target, WeightKind::Output)?;
-        ReadoutHead::Packed {
-            weight: output.element,
-            weight_scale: output.scale,
-        }
-    };
+    let readout_head = planned_readout_recipe(target, WeightScope::Target, readout_choices)?;
     let readout = ReadoutBinding {
         norm: lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
         head: readout_head,
         activation: active_element,
     };
-    // A selected separate draft is the drafter; an embedded head otherwise.
+    // A selected separate draft is the drafter; a draft head otherwise.
     let separate = head.and(definition.draft.as_ref());
     let taps = separate
         .map(|draft| {
@@ -546,19 +611,41 @@ pub(super) fn derive_program_plan(
             draft_program_plan(draft, decoder.hidden, target, weights, active_element)
         })
         .transpose()?;
+    // A selected head is embedded in the target or reads its history.
+    let head_form = match (head, separate, definition.head.as_ref()) {
+        (Some(_), None, Some(head)) => Some(operators::head_form(head, decoder)?),
+        (Some(_), None, None) => {
+            return Err(PlanError::Topology(
+                "head weights without a head definition",
+            ));
+        }
+        _ => None,
+    };
+    let shared_head_program = match (head, head_form) {
+        (Some(weights), Some(operators::HeadForm::Shared(shared))) => {
+            Some(shared_head_program_plan(
+                &shared,
+                embedding,
+                weights,
+                active_element,
+                readout_choices,
+                history,
+            )?)
+        }
+        _ => None,
+    };
     let head_program = head
-        .filter(|_| separate.is_none())
+        .filter(|_| matches!(head_form, Some(operators::HeadForm::Embedded)))
         .map(|weights| {
-            let head = definition
-                .head
-                .as_ref()
-                .ok_or(PlanError::Topology("head weights without a head definition"))?;
+            let head = definition.head.as_ref().ok_or(PlanError::Topology(
+                "head weights without a head definition",
+            ))?;
             let mut slots = Vec::with_capacity(head.depth());
             for (index, head_block) in head.blocks.iter().enumerate() {
                 let index = u32::try_from(index)
                     .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
                 let scope = WeightScope::HeadBlock(index);
-                let paired = paired_block(&head_block.block)?;
+                let paired = paired_block(EmbeddedHeadBlock::of(head, head_block)?.block)?;
                 let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
                 let attention = attention_slot(
                     &paired,
@@ -574,9 +661,9 @@ pub(super) fn derive_program_plan(
                     combine: lookup(weights, scope, WeightKind::HeadCombine)?,
                     attention,
                     feed_forward: feed_forward_slot(
-                        &paired
-                            .feed_forward
-                            .ok_or(PlanError::Unsupported("draft head block without feed-forward"))?,
+                        &paired.feed_forward.ok_or(PlanError::Unsupported(
+                            "draft head block without feed-forward",
+                        ))?,
                         decoder.hidden,
                         feed_forward,
                         |scope, kind| lookup(weights, scope, kind),
@@ -588,11 +675,11 @@ pub(super) fn derive_program_plan(
                         active_element,
                     )?,
                     output_norm: lookup(weights, scope, WeightKind::OutputNorm)?,
-                    projection: if progressive {
-                        HeadProjection::Progressive
-                    } else {
-                        HeadProjection::Packed(lookup(target, WeightScope::Target, WeightKind::Output)?)
-                    },
+                    projection: planned_readout_recipe(
+                        target,
+                        WeightScope::Target,
+                        readout_choices,
+                    )?,
                     activation: active_element,
                 });
             }
@@ -612,7 +699,7 @@ pub(super) fn derive_program_plan(
         _ => {
             return Err(PlanError::Topology(
                 "vision component and definition disagree",
-            ))
+            ));
         }
     };
     let state = StateProgramPlan::new(vec![
@@ -626,10 +713,78 @@ pub(super) fn derive_program_plan(
         imports,
         target_program,
         head_program,
+        shared_head_program,
         draft_program,
         vision_program,
         state,
     )
+}
+
+/// The program slots of a draft head reading target history, from its own
+/// weights (`weights`) and the target's token table. Its attention reads the
+/// target's history, so it binds the target's history codec.
+fn shared_head_program_plan(
+    head: &operators::SharedHead,
+    embedding: EmbeddingBinding,
+    weights: &[WeightPlan],
+    activation: Element,
+    readout_choices: &[super::ReadoutClassChoice],
+    history: KvCodec,
+) -> Result<SharedHeadProgramPlan, PlanError> {
+    let lookup = |scope, kind| planned_element(weights, scope, kind);
+    let scope = WeightScope::HeadBlock(0);
+    let mut blocks = Vec::with_capacity(head.blocks.len());
+    for (index, block) in head.blocks.iter().enumerate() {
+        let index = u32::try_from(index)
+            .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
+        let paired = paired_block(block)?;
+        let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
+        blocks.push(TargetBlockProgramSlot::new(
+            mixer_slot(
+                &paired,
+                head.width,
+                |kind| lookup(mixer, kind),
+                activation,
+                history,
+            )?,
+            paired
+                .feed_forward
+                .map(|sublayer| {
+                    feed_forward_slot(
+                        &sublayer,
+                        head.width,
+                        feed_forward,
+                        lookup,
+                        |scope, kind| planned_scalable(weights, scope, kind),
+                        activation,
+                    )
+                })
+                .transpose()?,
+        ));
+    }
+    Ok(SharedHeadProgramPlan {
+        width: head.width,
+        embedding,
+        input: planned_scalable(weights, scope, WeightKind::HeadInputProjection)?,
+        blocks,
+        output_norm: lookup(scope, WeightKind::OutputNorm)?,
+        projection: planned_readout_recipe(weights, scope, readout_choices)?,
+        clustered: match &head.readout.policy {
+            ProposalReadoutPolicy::Full => None,
+            ProposalReadoutPolicy::Clustered {
+                centroids,
+                token_order,
+                selected_clusters,
+            } => Some(ClusteredReadoutPlan {
+                centroids: planned_scalable(weights, scope, WeightKind::OutputCentroids)?,
+                clusters: centroids.shape[0],
+                selected_clusters: *selected_clusters,
+                token_order: token_order.clone(),
+            }),
+        },
+        chain: planned_scalable(weights, scope, WeightKind::HeadChainProjection)?,
+        activation,
+    })
 }
 
 /// The separate draft's program slots from its weights (`weights`, the
@@ -642,15 +797,13 @@ fn draft_program_plan(
     weights: &[WeightPlan],
     activation: Element,
 ) -> Result<DraftProgramPlan, PlanError> {
-    let lookup = |weights: &[WeightPlan], scope, kind| {
-        planned_element(weights, scope, kind)
-    };
+    let lookup = |weights: &[WeightPlan], scope, kind| planned_element(weights, scope, kind);
     let fusion_norm = lookup(target, WeightScope::Draft, WeightKind::DraftFusionNorm)?;
     let mut blocks = Vec::with_capacity(draft.blocks.len());
     for index in 0..draft.blocks.len() {
         let paired = operators::draft::draft_block(draft, index)?;
-        let block =
-            u32::try_from(index).map_err(|_| PlanError::Arithmetic("draft block index exceeds u32"))?;
+        let block = u32::try_from(index)
+            .map_err(|_| PlanError::Arithmetic("draft block index exceeds u32"))?;
         let [mixer, feed_forward] = paired_scopes(block, WeightScope::DraftSublayer);
         // Draft history is dense, as a draft head's is.
         let attention = attention_slot(
@@ -694,14 +847,25 @@ fn draft_program_plan(
                 DraftEmbedding::Target => {
                     lookup(target, WeightScope::Target, WeightKind::Embedding)?
                 }
-                DraftEmbedding::Own(_) => lookup(weights, WeightScope::Draft, WeightKind::Embedding)?,
+                DraftEmbedding::Own(_) => {
+                    lookup(weights, WeightScope::Draft, WeightKind::Embedding)?
+                }
             },
             activation,
         },
         output_norm: lookup(weights, WeightScope::Draft, WeightKind::OutputNorm)?,
         // The draft's head entry binds the projection's scale port as the
         // target readout does.
-        projection: planned_scalable(target, WeightScope::Target, WeightKind::Output)?.element,
+        projection: if draft.output.is_some() {
+            planned_readout(weights, WeightScope::Draft)?
+        } else {
+            planned_readout(target, WeightScope::Target)?
+        },
+        projection_scope: if draft.output.is_some() {
+            WeightScope::Draft
+        } else {
+            WeightScope::Target
+        },
         markov: match &draft.method {
             DraftMethod::DFlash | DraftMethod::DFlash2 { .. } => None,
             DraftMethod::DSpark { markov, .. } => Some(MarkovBinding {
@@ -734,7 +898,11 @@ fn draft_program_plan(
                     .collect::<Result<Vec<_>, PlanError>>()?,
                 selector: SelectorBinding {
                     hidden: lookup(weights, WeightScope::Draft, WeightKind::SelectorHidden)?,
-                    predecessor: lookup(weights, WeightScope::Draft, WeightKind::SelectorPredecessor)?,
+                    predecessor: lookup(
+                        weights,
+                        WeightScope::Draft,
+                        WeightKind::SelectorPredecessor,
+                    )?,
                     successor: lookup(weights, WeightScope::Draft, WeightKind::SelectorSuccessor)?,
                     rank: selector.rank,
                     top_k: selector.top_k,
@@ -749,5 +917,3 @@ fn draft_program_plan(
 fn paired_scopes(block: u32, scope: fn(SublayerIndex) -> WeightScope) -> [WeightScope; 2] {
     [0, 1].map(|sublayer| scope(SublayerIndex { block, sublayer }))
 }
-
-

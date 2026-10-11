@@ -32,7 +32,7 @@
 //! toolchain-predefined macro except `__CUDA_ARCH__`, which the CUDA skeleton
 //! defines for the configuration's architecture.
 
-use super::abi::{self, render_source, Dialect};
+use super::abi::{self, Dialect, render_source};
 use super::plan::{self, LaunchVariant};
 use seismic_lang::checked::{CheckedModule, EntryInfo, NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::ElementBindings;
@@ -225,10 +225,19 @@ impl Former {
             BackendName::Metal => {
                 let device = seismic_metal::DeviceHandle::system_default()
                     .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?;
-                let language = seismic_metal::profile::probe_language_version(&device)
-                    .ok_or_else(|| CoverageError::ToolchainUnavailable("no supported Metal language version".into()))?;
-                let tensor_ops = seismic_metal::toolchain::forms_tensor_operations(&device, language);
-                Ok(Self::Metal { device, language, tensor_ops })
+                let language =
+                    seismic_metal::profile::probe_language_version(&device).ok_or_else(|| {
+                        CoverageError::ToolchainUnavailable(
+                            "no supported Metal language version".into(),
+                        )
+                    })?;
+                let tensor_ops =
+                    seismic_metal::toolchain::forms_tensor_operations(&device, language);
+                Ok(Self::Metal {
+                    device,
+                    language,
+                    tensor_ops,
+                })
             }
             #[cfg(not(target_os = "macos"))]
             BackendName::Metal => Err(CoverageError::ToolchainUnavailable(
@@ -314,7 +323,12 @@ impl Former {
                 Ok(())
             }
             #[cfg(target_os = "macos")]
-            (Self::Metal { device, language, .. }, Configuration::Metal { .. }) => {
+            (
+                Self::Metal {
+                    device, language, ..
+                },
+                Configuration::Metal { .. },
+            ) => {
                 for program in programs {
                     seismic_metal::toolchain::form_functions(device, program, *language)?;
                 }
@@ -551,9 +565,10 @@ fn reached_markers(preprocessed: &str) -> BTreeSet<usize> {
 fn preprocess_vulkan(skeleton: &Skeleton, kernels: &[&str]) -> Result<Outcome, CoverageError> {
     let mut reached = BTreeSet::new();
     for kernel in kernels {
-        let text = seismic_vulkan::formation::preprocess(&skeleton.text, kernel).map_err(|error| {
-            CoverageError::Skeleton(format!("{error:?}\n--- skeleton ---\n{}", skeleton.text))
-        })?;
+        let text =
+            seismic_vulkan::formation::preprocess(&skeleton.text, kernel).map_err(|error| {
+                CoverageError::Skeleton(format!("{error:?}\n--- skeleton ---\n{}", skeleton.text))
+            })?;
         match outcome(&text) {
             Outcome::Rejected => return Ok(Outcome::Rejected),
             Outcome::Reached(markers) => reached.extend(markers),
@@ -587,7 +602,9 @@ fn preprocess_clang(skeletons: &[&str]) -> Result<Vec<Outcome>, CoverageError> {
         .args(&paths)
         .output()
         .map_err(|error| match error.kind() {
-            std::io::ErrorKind::NotFound => CoverageError::ToolchainUnavailable(format!("clang: {error}")),
+            std::io::ErrorKind::NotFound => {
+                CoverageError::ToolchainUnavailable(format!("clang: {error}"))
+            }
             _ => CoverageError::Skeleton(format!("clang: {error}")),
         })?;
     std::fs::remove_dir_all(&directory).ok();
@@ -641,9 +658,13 @@ struct Subject<'m> {
     /// Whether the entry monomorphizes at a binding, by binding.
     admitted: std::sync::Mutex<std::collections::HashMap<String, bool>>,
     /// Searched statics, by the statics fixed.
-    searched: std::sync::Mutex<std::collections::HashMap<Vec<(String, u64)>, Option<NativeSpecialization>>>,
+    searched: std::sync::Mutex<
+        std::collections::HashMap<Vec<(String, u64)>, Option<NativeSpecialization>>,
+    >,
     /// Admissible specializations, by statics.
-    specializations: std::sync::Mutex<std::collections::HashMap<NativeSpecialization, std::sync::Arc<Vec<NativeSpecialization>>>>,
+    specializations: std::sync::Mutex<
+        std::collections::HashMap<NativeSpecialization, std::sync::Arc<Vec<NativeSpecialization>>>,
+    >,
 }
 
 impl<'m> Subject<'m> {
@@ -681,7 +702,10 @@ impl<'m> Subject<'m> {
             .iter()
             .map(|(name, value)| ((*name).to_owned(), *value))
             .collect::<Vec<_>>();
-        let mut searched = self.searched.lock().expect("no thread panics holding the cache");
+        let mut searched = self
+            .searched
+            .lock()
+            .expect("no thread panics holding the cache");
         searched
             .entry(key)
             .or_insert_with(|| self.implementation.search_statics(fixed))
@@ -689,7 +713,10 @@ impl<'m> Subject<'m> {
     }
 
     /// The admissible specializations at `statics`, walked once.
-    fn admissible(&self, statics: &NativeSpecialization) -> std::sync::Arc<Vec<NativeSpecialization>> {
+    fn admissible(
+        &self,
+        statics: &NativeSpecialization,
+    ) -> std::sync::Arc<Vec<NativeSpecialization>> {
         let mut walked = self
             .specializations
             .lock()
@@ -811,7 +838,10 @@ impl<'m> Subject<'m> {
                 .bindings
                 .iter()
                 .map(|(name, representation)| {
-                    format!("{name}={}", registry::representation_info(representation).name)
+                    format!(
+                        "{name}={}",
+                        registry::representation_info(representation).name
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
@@ -970,7 +1000,12 @@ fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, Cover
             .flatten();
         skeletons
             .iter()
-            .map(|programs| programs.iter().map(|_| flat.next().expect("one outcome per skeleton")).collect())
+            .map(|programs| {
+                programs
+                    .iter()
+                    .map(|_| flat.next().expect("one outcome per skeleton"))
+                    .collect()
+            })
             .collect()
     };
     Ok(skeletons
@@ -1092,7 +1127,11 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
     // implemented and not rejected by the toolchain.
     let mut base = None;
     let mut choice = vec![0usize; subject.candidates.len()];
-    if subject.candidates.iter().all(|(_, candidates)| !candidates.is_empty()) {
+    if subject
+        .candidates
+        .iter()
+        .all(|(_, candidates)| !candidates.is_empty())
+    {
         loop {
             let bindings = subject.candidates.iter().zip(&choice).fold(
                 ElementBindings::new(),
@@ -1200,14 +1239,24 @@ fn form_values(
         .params
         .iter()
         .map(|parameter| (None, parameter))
-        .chain(implementation.launches.iter().enumerate().flat_map(
-            |(launch, declaration)| {
-                declaration.params.iter().map(move |parameter| (Some(launch), parameter))
-            },
-        ))
+        .chain(
+            implementation
+                .launches
+                .iter()
+                .enumerate()
+                .flat_map(|(launch, declaration)| {
+                    declaration
+                        .params
+                        .iter()
+                        .map(move |parameter| (Some(launch), parameter))
+                }),
+        )
         .filter(|(_, parameter)| parameter.form)
         .flat_map(|(launch, parameter)| {
-            parameter.values.iter().map(move |value| (launch, parameter.name.as_str(), *value))
+            parameter
+                .values
+                .iter()
+                .map(move |value| (launch, parameter.name.as_str(), *value))
         })
         .collect();
     let mut configurations = vec![base.configuration];
@@ -1319,7 +1368,9 @@ fn keep(
         if chosen.is_empty() {
             return Ok(kept);
         }
-        let formations = in_parallel(&chosen, |(candidate, _)| form_row(subject, former, candidate));
+        let formations = in_parallel(&chosen, |(candidate, _)| {
+            form_row(subject, former, candidate)
+        });
         let mut rejected = false;
         for ((candidate, reached), formation) in chosen.into_iter().zip(formations) {
             if search.record(subject, &candidate, formation) {
@@ -1425,16 +1476,18 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
         .min(items.len());
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(item) = items.get(index) else {
-                    return;
-                };
-                let result = work(item);
-                results
-                    .lock()
-                    .expect("no worker panics holding the lock")
-                    .push((index, result));
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        return;
+                    };
+                    let result = work(item);
+                    results
+                        .lock()
+                        .expect("no worker panics holding the lock")
+                        .push((index, result));
+                }
             });
         }
     });
@@ -1456,7 +1509,10 @@ fn gated<R>(work: impl FnOnce() -> R) -> R {
     });
     {
         let mut free = released
-            .wait_while(free.lock().expect("no thread panics holding the permits"), |free| *free == 0)
+            .wait_while(
+                free.lock().expect("no thread panics holding the permits"),
+                |free| *free == 0,
+            )
             .expect("no thread panics holding the permits");
         *free -= 1;
     }
@@ -1504,7 +1560,9 @@ pub enum RequestFailure {
 impl fmt::Display for RequestFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Inadmissible(reason) => write!(f, "statics outside the kernel's domain: {reason}"),
+            Self::Inadmissible(reason) => {
+                write!(f, "statics outside the kernel's domain: {reason}")
+            }
             Self::Unimplemented => f.write_str("the kernel rejects the binding"),
             Self::Formation(error) => write!(f, "formation failed: {error}"),
         }
@@ -1589,13 +1647,26 @@ mod tests {
         assert_eq!(
             skeleton.sites,
             vec![
-                GroupSite { file: "k.comp".into(), line: 1 },
-                GroupSite { file: "lib/x.glsl".into(), line: 1 },
-                GroupSite { file: "k.comp".into(), line: 3 },
+                GroupSite {
+                    file: "k.comp".into(),
+                    line: 1
+                },
+                GroupSite {
+                    file: "lib/x.glsl".into(),
+                    line: 1
+                },
+                GroupSite {
+                    file: "k.comp".into(),
+                    line: 3
+                },
             ]
         );
         assert_eq!(skeleton.rejecting, BTreeSet::from([1]));
-        assert!(skeleton.text.starts_with("#version 460\n#define A 1\n#if Q\n#endif\n#if A\n"));
+        assert!(
+            skeleton
+                .text
+                .starts_with("#version 460\n#define A 1\n#if Q\n#endif\n#if A\n")
+        );
         assert!(skeleton.text.ends_with("void main() {}\n"));
     }
 
