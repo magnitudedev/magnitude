@@ -1232,7 +1232,8 @@ pub mod tensor {
                 ));
             }
             let _guard = self.allocation.acquire(true);
-            let mut scratch = [0u8; 1024 * 1024];
+            // On the heap: a 1 MiB array would fill a whole Windows main-thread stack.
+            let mut scratch = vec![0u8; 1024 * 1024];
             let mut written = 0u64;
             while written < self.byte_len {
                 let count = usize::try_from((self.byte_len - written).min(scratch.len() as u64))
@@ -1463,6 +1464,39 @@ pub mod tensor {
                 byte_offset: self.byte_offset,
                 byte_len: self.byte_len,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod reader_tests {
+        use super::TensorInner;
+        use seismic_lang::registry;
+        use seismic_lang::types::DType;
+
+        /// A reader upload runs on a Windows main thread (1 MiB of stack) in a
+        /// model's Prepare; it must not need a stack of its own size.
+        #[test]
+        fn reader_upload_fits_a_small_thread_stack() {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(|| {
+                    let catalog = crate::devices::Catalog::discover().unwrap();
+                    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+                    let count = 3 * 1024 * 1024 / 4 + 5;
+                    let tensor = TensorInner::from_host(
+                        &device,
+                        registry::dense(DType::F32),
+                        &[count],
+                        &vec![0; count as usize * 4],
+                    )
+                    .unwrap();
+                    let bytes = (0..count * 4).map(|i| i as u8).collect::<Vec<_>>();
+                    tensor.write_from_reader(&mut bytes.as_slice()).unwrap();
+                    assert_eq!(tensor.read_to_host().unwrap(), bytes);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
         }
     }
 }
