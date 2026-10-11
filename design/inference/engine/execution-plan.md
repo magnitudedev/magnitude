@@ -67,7 +67,11 @@ error names the path and the backend.
 A load and a prepare-only job share this one preparation (device selection, planning, opening the
 device and preparing programs with the kernel cache), so both produce and look up identical tuning
 keys; the prepare-only job ends there, while a load continues with state planning, graph sealing,
-resource allocation, weight import and warm-up.
+resource allocation, weight import and warm-up. The prepare-only job forms every program the load
+that follows it prepares: each searched unit's canonical artifact and every entry without tuning
+parameters, concurrently and before its optional search; a promoted choice publishes its own
+artifact. That load therefore finds each program in the toolchain's store (and the driver's
+caches) rather than forming it, one entry at a time, itself.
 Native entries with declared tuning parameters are tuned on the opened device during this
 preparation, on the first preparation for each tuning key, whether by a load or by the prepare-only
 job that follows a catalog installation: each such entry registers a tuning case

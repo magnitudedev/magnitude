@@ -192,6 +192,7 @@ pub use weights::{TuningWeightSource, ZeroTuningWeights};
 pub(crate) use weights::{TuningWeights, weight_plan};
 
 use super::CatalogFailure;
+use super::specialization::{UntunedEntries, UntunedFormation};
 use crate::ModelLoadPlan;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
@@ -1140,6 +1141,13 @@ pub enum TuningEvent {
         began_seconds: f64,
         forming_seconds: f64,
         publishing_seconds: f64,
+    },
+    /// The mandatory phase formed the entries without tuning parameters
+    /// that the load after the search prepares, beside the units'
+    /// canonical programs: how many, and what forming them took in all.
+    Untuned {
+        programs: usize,
+        forming_seconds: f64,
     },
     /// A piece of a unit's optional work ran to its end: its forecast and
     /// what it took.
@@ -3503,6 +3511,21 @@ struct Staff<'a> {
     workers: Arc<seismic::Workers>,
 }
 
+/// One compile of the mandatory phase: a unit's canonical program (none
+/// once formed), or an entry without tuning parameters that the load after
+/// the search prepares.
+enum Mandatory<'a> {
+    Canonical(Option<seismic::Grounding>),
+    Untuned(UntunedFormation<'a>),
+}
+
+/// What one compile of the mandatory phase formed: a unit's canonical
+/// program, or what forming an untuned entry took.
+enum MandatoryFormed {
+    Canonical(Option<seismic::Grounded>),
+    Untuned(Result<Duration, CatalogFailure>),
+}
+
 impl<'a> Staff<'a> {
     fn of(device: &'a Device) -> Self {
         let workers = Arc::new(seismic::Workers::of_the_host());
@@ -3802,10 +3825,12 @@ impl<'a> Tuner<'a> {
 
     /// The mandatory phase: form every searching unit's canonical
     /// artifact, hand it to serving and publish the unit's record with it,
-    /// before any input is built or anything optional is started. From
-    /// here every unit serves a legal published choice; a failure here is
-    /// the only preparation failure of tuning.
-    pub fn census(mut self) -> Result<Self, CatalogFailure> {
+    /// before any input is built or anything optional is started, and form
+    /// the count's entries without tuning parameters (`untuned`) beside
+    /// them, for the load that follows. From here every unit serves a legal
+    /// published choice; a failure here is the only preparation failure of
+    /// tuning.
+    pub fn census(mut self, untuned: UntunedEntries<'a>) -> Result<Self, CatalogFailure> {
         let Phase::Count {
             launches,
             searching,
@@ -3828,10 +3853,12 @@ impl<'a> Tuner<'a> {
                 self.memory.footprint_ceiling_bytes = Some(room.device_bytes);
             }
         }
-        // The units' canonical programs compile together on the load's
-        // worker threads: a compile needs nothing of another unit or of
-        // the device's queue.
+        // The units' canonical programs and the untuned entries compile
+        // together on the load's worker threads: a compile needs nothing of
+        // another or of the device's queue. The canonical compiles come
+        // first, in the order of `searching`.
         let began = self.started.elapsed();
+        let untuned_programs = untuned.len();
         let groundings = searching
             .iter()
             .map(|key| {
@@ -3839,17 +3866,33 @@ impl<'a> Tuner<'a> {
                     .get_mut(key)
                     .expect("counted unit has its opened search")
                     .grounding()
-                    .map(std::sync::Mutex::new)
+                    .map(|grounding| std::sync::Mutex::new(Some(Mandatory::Canonical(grounding))))
                     .map_err(|error| unit_failure(key, error))
             })
+            .chain(
+                untuned
+                    .into_formations()
+                    .into_iter()
+                    .map(|formation| Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))),
+            )
             .collect::<Result<Vec<_>, _>>()?;
         let workers = self.workers();
-        let ground = |grounding: &std::sync::Mutex<Option<seismic::Grounding>>| {
-            grounding
+        let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
+            match compile
                 .lock()
-                .expect("a grounding is taken once")
+                .expect("a mandatory compile is taken once")
                 .take()
-                .map(seismic::Grounding::run)
+                .expect("a mandatory compile is formed once")
+            {
+                Mandatory::Canonical(grounding) => {
+                    MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
+                }
+                Mandatory::Untuned(formation) => {
+                    let began = Instant::now();
+                    let formed = formation();
+                    MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
+                }
+            }
         };
         // What the peak of the process's footprint rose by over compiles
         // that ran on `threads` threads with nothing else running, for
@@ -3914,7 +3957,24 @@ impl<'a> Tuner<'a> {
         if self.memory.host_ceiling_bytes.is_some() {
             self.memory.host_mandatory_bytes = self.memory.host_grown();
         }
+        let untuned = grounded.split_off(searching.len());
+        let mut untuned_forming = Duration::ZERO;
+        for formed in untuned {
+            let MandatoryFormed::Untuned(formed) = formed else {
+                unreachable!("the untuned compiles follow the canonical ones");
+            };
+            untuned_forming += formed?;
+        }
+        if untuned_programs > 0 {
+            self.context.observer.event(&TuningEvent::Untuned {
+                programs: untuned_programs,
+                forming_seconds: untuned_forming.as_secs_f64(),
+            });
+        }
         for (key, grounded) in searching.iter().zip(grounded) {
+            let MandatoryFormed::Canonical(grounded) = grounded else {
+                unreachable!("the canonical compiles come first");
+            };
             let forming = Instant::now();
             let formed = grounded
                 .as_ref()

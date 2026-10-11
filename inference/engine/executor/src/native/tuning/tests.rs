@@ -453,6 +453,56 @@ fn stored_cpu_choice_accepts_device_owned_parameters() {
     );
 }
 
+/// A search's count collects each entry without tuning parameters once, and
+/// its mandatory phase forms them beside the units' canonical programs and
+/// reports them, so the load after the search forms none of them itself.
+#[test]
+fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let mut spec = crate::native::specialization::Specializer::count_untuned(&device);
+    for (element, bindings) in [
+        (seismic::Element::bf16(), "A=bf16"),
+        (seismic::Element::u32(), "A=u32"),
+        (seismic::Element::bf16(), "A=bf16"),
+    ] {
+        let entry = magnitude_kernels::copy_rows::native_entry_with(
+            magnitude_kernels::copy_rows::Elements { A: element },
+        );
+        assert!(spec.fixed(bindings, &[], entry).unwrap().is_none());
+    }
+    let untuned = spec.into_untuned();
+    assert_eq!(untuned.len(), 2);
+    let (definition, load) = fixture_load();
+    let import = ImportKernels {
+        import_dense: HashMap::new(),
+        repack_weight: HashMap::new(),
+    };
+    let recorder = Recorder::default();
+    let tuner = Tuner::count(
+        &device,
+        TuningContext {
+            definition: &definition,
+            weights: &ZeroTuningWeights,
+            observer: &recorder,
+            cache: None,
+            numerical_profile: super::precision::ResolvedNumericalProfile::standard(),
+            settings: TuningSettings::STANDARD,
+        },
+        LIMITS,
+        TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
+        HashMap::new(),
+    );
+    let tuner = tuner.census(untuned).unwrap();
+    assert!(matches!(
+        recorder.0.borrow().as_slice(),
+        [TuningEvent::Untuned { programs: 2, .. }]
+    ));
+    assert!(tuner.search().unwrap().conclude().is_empty());
+}
+
 #[test]
 fn row_points_follow_the_shape_ladder_and_normalize_weights() {
     let points = row_points(LIMITS);
@@ -1536,7 +1586,7 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
         tuner.tune(&case, &implementation, &statics).unwrap();
         // The mandatory phase forms the canonical artifact and publishes
         // the unit's record before any input is built.
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         assert_eq!(case.formations.get(), 1);
         assert!(case.seen.borrow().is_empty());
         tuner.tune(&case, &implementation, &statics).unwrap();
@@ -1563,7 +1613,7 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
             fixture_invocations(&again, &statics, limits),
         );
         tuner.tune(&again, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(&again, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         let chosen = tuner.tune(&again, &implementation, &statics).unwrap();
@@ -1814,7 +1864,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
             fixture_invocations(&case, &statics, limits),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         // The mandatory phase published the canonical default's record.
         assert_eq!(stored.measured(), 0);
         tuner.tune(&case, &implementation, &statics).unwrap();
@@ -1927,7 +1977,7 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
         );
         // The recipe's mandatory work publishes the canonical choice it
         // serves until it is qualified: nothing is owed at the end.
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
         assert_eq!(*published.borrow(), [false]);
         // A publication that outlasts the whole budget fails nothing.
@@ -2056,7 +2106,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
     // The pinned unit serves its choice from the count on, and forms and
     // searches nothing.
     assert_eq!(tuner.choice(&dependency), Some(&defaults));
-    let mut tuner = tuner.census().unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert_eq!(case.formations.get(), 0);
     tuner.tune(&case, &implementation, &statics).unwrap();
     assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
@@ -2122,7 +2172,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
             fixture_invocations(&case, &statics, LIMITS),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(&case, &implementation, &statics).unwrap();
         let tuner = tuner.search().unwrap();
         assert!(
@@ -2194,7 +2244,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     // The mandatory phase forms the canonical artifact and builds nothing;
     // the walk after it still returns the defaults, now the published
     // choice.
-    let mut tuner = tuner.census().unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert_eq!(case.formations.get(), 1);
     assert_eq!(
         tuner.tune(&case, &implementation, &statics).unwrap(),
@@ -2390,7 +2440,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
             formed,
             "counting cached defaults cannot compile"
         );
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         let chosen = tuner.tune(case, &implementation, &statics).unwrap();
@@ -2607,7 +2657,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
             fixture_invocations(&case, &statics, limits),
         );
         tuner.tune(&case, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(&case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         let chosen = tuner.tune(&case, &implementation, &statics).unwrap();
@@ -2737,7 +2787,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
             fixture_invocations(case, &statics, limits),
         );
         tuner.tune(case, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         tuner.tune(case, &implementation, &statics).unwrap();
@@ -2828,7 +2878,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
         tuner.tune(case, &implementation, &statics).unwrap();
         assert_eq!(case.formations.get(), 0);
     }
-    let mut tuner = tuner.census().unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     for case in [&first, &last] {
         assert_eq!(case.formations.get(), 1);
         assert!(
@@ -2859,7 +2909,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
         invocations,
     );
     spent.tune(&last, &implementation, &statics).unwrap();
-    let mut spent = spent.census().unwrap();
+    let mut spent = spent.census(UntunedEntries::default()).unwrap();
     assert_eq!(last.formations.get(), 2);
     spent.tune(&last, &implementation, &statics).unwrap();
     let mut spent = spent.search().unwrap();
@@ -2939,7 +2989,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     // unit's discovery builds them, its weights among them. A weight that
     // cannot be imported is a defect, not a matter of time: it is a typed
     // failure of the load.
-    let mut tuner = tuner.census().unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     assert!(device.programs_formed() > formed);
     tuner.tune(&case, &implementation, &statics).unwrap();
     assert!(matches!(
@@ -2975,7 +3025,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     tuner.tune(&case, &implementation, &statics).unwrap();
     assert_eq!(device.programs_formed(), formed);
     assert!(tuner.tuned.is_empty());
-    let mut tuner = tuner.census().unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     let formed = device.programs_formed();
     tuner.tune(&case, &implementation, &statics).unwrap();
     tuner.tune(&case, &implementation, &statics).unwrap();
@@ -3216,7 +3266,7 @@ fn units_start_by_their_share_of_step_time() {
     );
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
-    let mut tuner = tuner.census().unwrap();
+    let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
     tuner.tune(&small, &implementation, &statics).unwrap();
     tuner.tune(&large, &implementation, &statics).unwrap();
     let mut tuner = tuner.search().unwrap();
@@ -3570,7 +3620,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
             invocations(&[case]),
         );
         tuner.tune(case, &implementation, &statics).unwrap();
-        let mut tuner = tuner.census().unwrap();
+        let mut tuner = tuner.census(UntunedEntries::default()).unwrap();
         tuner.tune(case, &implementation, &statics).unwrap();
         let mut tuner = tuner.search().unwrap();
         // The search is over: the published choice is read, nothing more.

@@ -264,8 +264,9 @@ impl NativePreparationCache {
 
     /// The search: every unit without a stored tuning record is searched on
     /// the device within the tuning budget and its record published. A count
-    /// walk finds those units and their launches; their mandatory phase
-    /// forms and publishes each one's canonical default; a census walk
+    /// walk finds those units and their launches, and the entries without
+    /// tuning parameters; the mandatory phase forms and publishes each
+    /// unit's canonical default and forms those entries; a census walk
     /// collects the units with optional work, which are then searched
     /// together within the tuning time left. Each walk's preparation ends
     /// with its walk: the tuner, which borrows the import kernels, passes on
@@ -300,7 +301,11 @@ impl NativePreparationCache {
             epsilon,
             &recipe_states,
         )?;
-        let counted = {
+        // The count also collects every entry without tuning parameters:
+        // the mandatory phase forms them with the units' canonical
+        // programs, so a load after the search forms nothing the search
+        // did not.
+        let (counted, untuned) = {
             let mut count = Preparation::new(
                 plan,
                 tuning.definition,
@@ -308,7 +313,7 @@ impl NativePreparationCache {
                 epsilon,
                 recipe_states.clone(),
                 Some(selection_limits),
-                Specializer::count(device),
+                Specializer::count_untuned(device),
                 Tuning::Tuner(
                     Tuner::count(
                         device,
@@ -322,7 +327,8 @@ impl NativePreparationCache {
             );
             count.graph_demand = Some(graph_demand.clone());
             count.walk(plan)?;
-            count.tuning.into_tuner()
+            let Preparation { spec, tuning, .. } = count;
+            (tuning.into_tuner(), spec.into_untuned())
         };
         let censused = {
             let mut census = Preparation::new(
@@ -333,7 +339,7 @@ impl NativePreparationCache {
                 recipe_states.clone(),
                 Some(selection_limits),
                 Specializer::count(device),
-                Tuning::Tuner(counted.census()?),
+                Tuning::Tuner(counted.census(untuned)?),
             );
             census.graph_demand = Some(graph_demand.clone());
             census.walk(plan)?;

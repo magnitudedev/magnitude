@@ -234,6 +234,14 @@ impl TuningTrace {
                 "forming_seconds": forming_seconds,
                 "publishing_seconds": publishing_seconds,
             }),
+            TuningEvent::Untuned {
+                programs,
+                forming_seconds,
+            } => json!({
+                "event": "untuned",
+                "programs": programs,
+                "forming_seconds": forming_seconds,
+            }),
             TuningEvent::Stage(stage) => json!({
                 "event": "stage",
                 "entry": stage.entry,

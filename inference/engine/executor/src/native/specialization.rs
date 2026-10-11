@@ -28,9 +28,59 @@ enum Mode<'a> {
     /// A tuning count or census walks the program through its tuner; it
     /// forms nothing and every entry comes back `None`.
     Count,
+    /// A search's count: as a count, and it collects every entry without
+    /// tuning parameters for the search to form ([`UntunedEntries`]).
+    CountUntuned(&'a Device, UntunedEntries<'a>),
     /// A listing names the request of every entry the walk would prepare,
     /// without a device; every entry comes back `None`.
     List(Vec<KernelRequest>),
+}
+
+/// The formation of one entry without tuning parameters, on any thread:
+/// its programs are formed as a load forms them and released.
+pub(super) type UntunedFormation<'a> = Box<dyn FnOnce() -> Result<(), CatalogFailure> + Send + 'a>;
+
+/// The entries without tuning parameters a search's count met, each request
+/// once. The search forms them with its units' canonical programs, so the
+/// load that follows it finds every program it prepares already formed
+/// (kept by the toolchain's store and the driver's caches) instead of
+/// forming them one at a time itself.
+#[derive(Default)]
+pub(super) struct UntunedEntries<'a> {
+    requests: std::collections::HashSet<KernelRequest>,
+    formations: Vec<UntunedFormation<'a>>,
+}
+
+impl<'a> UntunedEntries<'a> {
+    fn add<E: Entry>(
+        &mut self,
+        device: &'a Device,
+        entry: BoundEntry<E>,
+        bindings: &str,
+        specialization: NativeSpecialization,
+    ) {
+        if !self
+            .requests
+            .insert(entry.request(device.backend(), &specialization))
+        {
+            return;
+        }
+        let bindings = bindings.to_owned();
+        self.formations.push(Box::new(move || {
+            entry
+                .prepare(device, &specialization)
+                .map(drop)
+                .map_err(|error| failure(E::NAME, &bindings, error.to_string()))
+        }));
+    }
+
+    pub fn len(&self) -> usize {
+        self.formations.len()
+    }
+
+    pub fn into_formations(self) -> Vec<UntunedFormation<'a>> {
+        self.formations
+    }
 }
 
 /// What a walk consults for its tuned entries.
@@ -261,6 +311,27 @@ impl<'a> Specializer<'a> {
         }
     }
 
+    /// A specializer for a search's count of `device`'s programs: it forms
+    /// nothing, and collects every entry without tuning parameters
+    /// ([`Specializer::into_untuned`]).
+    pub fn count_untuned(device: &'a Device) -> Self {
+        Self {
+            backend: device.backend(),
+            tensor_operations: device.forms_tensor_operations(),
+            mode: Mode::CountUntuned(device, UntunedEntries::default()),
+        }
+    }
+
+    /// The entries without tuning parameters a search's count collected.
+    pub fn into_untuned(self) -> UntunedEntries<'a> {
+        match self.mode {
+            Mode::CountUntuned(_, untuned) => untuned,
+            Mode::Prepare(_) | Mode::Count | Mode::List(_) => {
+                panic!("only a search's count collects untuned entries")
+            }
+        }
+    }
+
     /// A specializer that lists the request of every entry, without a
     /// device: those of a device with every optional form, so the listing
     /// covers any device of the backend.
@@ -284,7 +355,9 @@ impl<'a> Specializer<'a> {
     pub fn into_requests(self) -> Vec<KernelRequest> {
         match self.mode {
             Mode::List(requests) => requests,
-            Mode::Prepare(_) | Mode::Count => panic!("only a listing names requests"),
+            Mode::Prepare(_) | Mode::Count | Mode::CountUntuned(..) => {
+                panic!("only a listing names requests")
+            }
         }
     }
 
@@ -316,7 +389,7 @@ impl<'a> Specializer<'a> {
                 .prepare(device, specialization)
                 .map(Some)
                 .map_err(|error| failure(E::NAME, bindings, error.to_string())),
-            Mode::Count => Ok(None),
+            Mode::Count | Mode::CountUntuned(..) => Ok(None),
             Mode::List(requests) => {
                 requests.push(entry.request(self.backend, specialization));
                 Ok(None)
@@ -341,6 +414,10 @@ impl<'a> Specializer<'a> {
             ));
         }
         let specialization = domain_statics(&implementation, E::NAME, bindings, values)?;
+        if let Mode::CountUntuned(device, untuned) = &mut self.mode {
+            untuned.add(*device, entry, bindings, specialization);
+            return Ok(None);
+        }
         self.form(entry, bindings, &specialization)
     }
 

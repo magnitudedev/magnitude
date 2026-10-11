@@ -992,6 +992,12 @@ impl TuningObserver for TuningReport {
             TuningEvent::Mandatory { .. }
             | TuningEvent::Stage(_)
             | TuningEvent::Published { .. } => {}
+            TuningEvent::Untuned {
+                programs,
+                forming_seconds,
+            } => eprintln!(
+                "magnitude-engine: formed {programs} untuned programs for the load in {forming_seconds:.2} s"
+            ),
             TuningEvent::Budget(budget) => {
                 eprintln!(
                     "magnitude-engine: tuning budget {:.2} s: {} pieces of work used {:.2} s, {:.2} s unused, {:.2} s over; {} offered pieces did not fit",
