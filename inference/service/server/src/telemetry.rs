@@ -179,6 +179,16 @@ pub fn http_request_span<B>(request: &Request<B>) -> Span {
     span
 }
 
+/// The engine worker's subscriber: events to standard error only, without colour, since
+/// the service records each line in its own log.
+pub fn init_worker() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .with_env_filter(runtime_filter())
+        .try_init();
+}
+
 fn stderr_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,

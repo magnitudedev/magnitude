@@ -85,10 +85,12 @@ fn main() -> anyhow::Result<()> {
     magnitude_executor::platform::relax_gpu_watchdog();
     let cli = Cli::parse();
     match cli.command {
-        // The engine worker owns standard output for its protocol: it installs no telemetry
-        // subscriber and runs no async runtime of the service's.
+        // The engine worker owns standard output for its protocol: it exports no telemetry and
+        // runs no async runtime of the service's. Its events go to standard error, which the
+        // service records in its log, at the level the launcher sets (`RUST_LOG`).
         Command::InferenceWorker => {
             worker_process::install_parent_watchdog()?;
+            telemetry::init_worker();
             std::process::exit(run_inference_worker());
         }
         command => tokio::runtime::Builder::new_multi_thread()
