@@ -3182,3 +3182,97 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     unit.perform(&mut source).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }
+
+/// A discovery whose inputs fit but whose measurement of the defaults the
+/// device's enforced memory limit refuses is not the unit's failure either:
+/// the point is priced at what the piece demanded and offered again, as a
+/// refused build is.
+#[test]
+fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
+    use seismic::{PointInputs, PointSource, PointSpec};
+
+    /// Points whose inputs are allocated on the device as they are built;
+    /// building `clamp` sets the device's limit to what is then charged, so
+    /// that only the measurement's own allocations are refused.
+    struct Clamping<'d> {
+        device: &'d Device,
+        n: u64,
+        clamp: Option<usize>,
+        kept: [Option<Tensor>; 2],
+    }
+    impl PointSource<'static, split_sum::Entry> for Clamping<'_> {
+        fn release(&mut self, point: usize) {
+            self.kept[point] = None;
+        }
+        fn points(&self) -> Vec<PointSpec> {
+            (0..2)
+                .map(|point| PointSpec {
+                    label: format!("p{point}"),
+                    weight: 1.,
+                    class: None,
+                    cost: (point + 1) as f64,
+                    census: true,
+                })
+                .collect()
+        }
+        fn build(&mut self, point: usize) -> Result<PointInputs<'static>, String> {
+            let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
+            self.kept[point] = Some(x.clone());
+            if self.clamp == Some(point) {
+                self.device
+                    .set_memory_limit(Some(self.device.memory_usage().charged));
+            }
+            Ok(seismic::point_inputs::<split_sum::Entry>(
+                vec![split_sum::Args { x: &x }],
+                seismic::WorkloadRotation::All,
+                None,
+                Default::default(),
+            ))
+        }
+    }
+
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 64;
+    let mut source = Clamping {
+        device: &device,
+        n,
+        clamp: None,
+        kept: [None, None],
+    };
+    let mut unit =
+        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+    unit.prepare_defaults(&mut source).unwrap();
+    let Strategy::Search(plan) = search() else {
+        unreachable!()
+    };
+    unit.plan(UnitPlan {
+        settings: plan.settings,
+        min_sample_seconds: 0.0002,
+        start: Vec::new(),
+    });
+    assert_eq!(unit.next().unwrap().stage, Stage::Discovery);
+    unit.perform(&mut source).unwrap();
+    source.clamp = Some(1);
+    let work = unit.next().unwrap();
+    assert_eq!(work.stage, Stage::Discovery);
+    let performed = unit
+        .perform(&mut source)
+        .expect("a refused measurement of the defaults is not the unit's failure");
+    assert_eq!(performed.stage, Stage::Discovery);
+    let work = unit.next().unwrap();
+    assert_eq!(
+        work.stage,
+        Stage::Discovery,
+        "the point is still undiscovered"
+    );
+    assert_eq!(work.footprint.unpriced, 0);
+    assert!(work.footprint.priced > 0);
+    // With room for it, the same point is discovered.
+    source.clamp = None;
+    device.set_memory_limit(None);
+    unit.perform(&mut source).unwrap();
+    assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
+}

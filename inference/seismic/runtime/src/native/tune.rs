@@ -4318,11 +4318,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
 
     /// Build the next discovery point and measure the defaults there; with
     /// the last, plan the search. False when the device's memory limit
-    /// refused the point's build ([`build_point`]): nothing was measured.
+    /// refused the point's build ([`build_point`]) or the measurement of its
+    /// defaults: nothing was measured, and the point is priced at what the
+    /// piece demanded.
     fn discover(&mut self, source: &mut dyn PointSource<'a>) -> Result<bool, TuneError> {
         let index = self
             .undiscovered()
             .expect("discovery has an unmeasured point");
+        let before = self.device.memory_usage();
         let building = Instant::now();
         let Some(inputs) = build_point(
             &self.device,
@@ -4364,7 +4367,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         let settings = self.planned().settings.clone();
         let measuring = Instant::now();
-        let defaults = self
+        let measured = self
             .measurer
             .as_mut()
             .expect("the measurer serves discovery until a search takes it")
@@ -4375,9 +4378,21 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 &options,
                 &settings,
                 None,
-            )
-            .map_err(TuneError::DefaultUnusable)?
-            .remove(0);
+            );
+        let defaults = match measured {
+            Ok(mut defaults) => defaults.remove(0),
+            // The point's inputs fit, but what measuring its defaults needs
+            // beside them does not: as a refused build, the point is priced
+            // at the piece's demand and offered again.
+            Err(exclusion) => match self.device.memory_usage().refused_demand {
+                Some(demand) if Some(demand) > before.refused_demand => {
+                    self.resident_bytes[index]
+                        .observe(demand.saturating_sub(before.charged) as f64);
+                    return Ok(false);
+                }
+                _ => return Err(TuneError::DefaultUnusable(exclusion)),
+            },
+        };
         let measured = measuring.elapsed().as_secs_f64();
         self.longest = self.longest.max(measured);
         self.time.measuring_seconds += measured;
