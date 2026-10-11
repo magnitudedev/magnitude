@@ -104,9 +104,14 @@ const exchange = <Q, QI, A, AI>(path: string, requestSchema: Schema.Schema<Q, QI
     }),
     client => Effect.sync(() => client.destroy()),
   )
+  // An owner that exits during the exchange resets the connection instead of ending it: like a
+  // clean close, it went away without replying. Malformed replies remain failures.
+  let reset = false
+  socket.on("error", error => { if ("code" in error && (error.code === "ECONNRESET" || error.code === "EPIPE")) reset = true })
+  const departed = <E>(error: E) => reset ? new ApplicationControlClosed() : error
   // Start reading before sending so immediate replies are retained by the stream.
-  const response = yield* receiveJsonLines(socket, replySchema).pipe(Stream.take(1), Stream.runHead, Effect.forkScoped)
-  yield* sendJsonLine(socket, requestSchema, request)
+  const response = yield* receiveJsonLines(socket, replySchema).pipe(Stream.take(1), Stream.runHead, Effect.mapError(departed), Effect.forkScoped)
+  yield* sendJsonLine(socket, requestSchema, request).pipe(Effect.mapError(departed))
   const value = yield* response.await.pipe(Effect.flatten)
   return yield* Option.match(value, { onNone: () => Effect.fail(new ApplicationControlClosed()), onSome: Effect.succeed })
 })).pipe(Effect.catchTag("JsonLineChannelFailed", error => Effect.fail(new ApplicationControlFailed({ message: error.message }))), Effect.timeoutFail({ duration: timeout, onTimeout: () => new ApplicationControlFailed({ message: "Application control request timed out" }) }))
