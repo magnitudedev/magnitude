@@ -253,7 +253,9 @@ model identity or operation state.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
 shared package work only when no other live occurrence depends on it. Package work whose
 cancellation was requested is never joined: a later occurrence admits new work, which waits for the
-cancelled work to release the repository and resumes from its checkpoint. A retry creates a new
+cancelled work to release the repository and resumes from its checkpoint. An occurrence fails when any
+of its packages fails; its other package work then stops under the same rule as cancellation, so a
+retry never joins work that belongs to the failed occurrence. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 

@@ -2150,6 +2150,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_bundle_stops_its_other_package_and_a_retry_admits_fresh_work() {
+        use crate::download_service::ManagedModelDownloads;
+        use magnitude_service_contracts::models::{
+            ModelDownloads, ServableModelBundle, SpeculativeDraftSource, SpeculativeMethod,
+            StartModelDownloadRequest,
+        };
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        let manager = Arc::new(
+            ManagedModelStore::open(config)
+                .await
+                .expect("model manager"),
+        );
+        let mut target = exact_package("target.gguf", b"target");
+        target.id = ModelPackageId("package_target".to_owned());
+        let mut draft = exact_package("draft.gguf", b"draft");
+        draft.id = ModelPackageId("package_draft".to_owned());
+        // Live package work for both packages, as while a bundle download is retrying: the
+        // bundle joins it, so nothing reaches the network.
+        let live = |package: &ModelPackage| {
+            Arc::new(DownloadOperation::new(ModelDownloadEvent::Resolving {
+                operation_id: format!("download_{}", package.id.0),
+                repository: "owner/repository".to_owned(),
+                revision: "a".repeat(40),
+            }))
+        };
+        let (target_work, draft_work) = (live(&target), live(&draft));
+        {
+            let mut operations = manager.operations.lock().await;
+            operations.insert(package_download_key(&target), Arc::clone(&target_work));
+            operations.insert(package_download_key(&draft), Arc::clone(&draft_work));
+        }
+        let downloads = ManagedModelDownloads::open(Arc::clone(&manager))
+            .await
+            .expect("model downloads");
+        let request = || StartModelDownloadRequest {
+            bundle: ServableModelBundle::SpeculativeDecoding {
+                target: target.clone(),
+                draft_source: SpeculativeDraftSource::Separate {
+                    draft: draft.clone(),
+                },
+                method: SpeculativeMethod::DSpark,
+            },
+        };
+        downloads.start(request()).await.expect("download");
+
+        // The drafter exhausts its retries first; the target is still retrying.
+        draft_work.sender.send_replace(ModelDownloadEvent::Failed {
+            operation_id: "download_package_draft".to_owned(),
+            model_id: None,
+            error: DownloadFailure::NetworkUnavailable,
+            completed_bytes: 0,
+            total_bytes: 5,
+            resumable: true,
+        });
+        manager
+            .operations
+            .lock()
+            .await
+            .remove(&package_download_key(&draft));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !target_work.is_cancelled() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            target_work.is_cancelled(),
+            "the failed download's other package work keeps running"
+        );
+
+        // Holding the repository lock keeps fresh work from reaching the network.
+        let repository_lock = acquire_exclusive_lock(&repository_lock_path(
+            &manager.config.root,
+            "owner/repository",
+        ))
+        .expect("repository lock");
+        downloads.start(request()).await.expect("retry");
+        let retried = Arc::clone(
+            manager
+                .operations
+                .lock()
+                .await
+                .get(&package_download_key(&target))
+                .expect("target work"),
+        );
+        assert!(
+            !Arc::ptr_eq(&retried, &target_work),
+            "the retry joined the failed download's package work"
+        );
+        assert!(!retried.is_cancelled());
+        drop(repository_lock);
+    }
+
+    #[tokio::test]
     async fn admission_after_cancellation_starts_a_new_operation_instead_of_joining_it() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = InventoryConfig::with_roots(
