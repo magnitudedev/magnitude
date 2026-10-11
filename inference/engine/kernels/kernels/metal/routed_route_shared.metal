@@ -12,6 +12,10 @@
 #define KERNEL_W2 SEISMIC_SHARED_UP
 #include "lib/routed/route.h"
 
+// The shared rows run `routed_expand`'s paired GEMV, which packs 16-bit
+// activations (`lib/routed/routed.h`); F32 activations take `routed_route`.
+static_assert(element::Act::bytes == 2, "routed_route_shared requires a bf16 or f16 activation element");
+
 kernel void routed_route_shared(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
