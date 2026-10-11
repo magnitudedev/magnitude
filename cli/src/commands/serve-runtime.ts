@@ -9,12 +9,13 @@ import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, 
 import { isDevelopmentBuild } from "../runtime/environment"
 import { runWindowsInstalledUpdate } from "../server/windows-startup-update"
 import { initializeServeUpdates, prepareServeStartup } from "../server/serve-updates"
+import { serveStopSignals } from "./serve-signals"
 
 export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   const stopped = yield* Deferred.make<void>()
   const effects = yield* Effect.runtime<never>()
   const stop = () => Runtime.runSync(effects)(Deferred.succeed(stopped, undefined))
-  const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM", "SIGBREAK"] as const : ["SIGINT", "SIGTERM", "SIGHUP"] as const
+  const signals = yield* serveStopSignals(process.platform)
   yield* Effect.acquireRelease(Effect.sync(() => { for (const signal of signals) process.on(signal, stop) }),
     () => Effect.sync(() => { for (const signal of signals) process.removeListener(signal, stop) }))
   const runtime: ApplicationRuntime = isDevelopmentBuild()

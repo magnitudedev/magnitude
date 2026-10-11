@@ -69,7 +69,7 @@ Use your agent's [configuration instructions](/api/network-access#configure-the-
 
 ## Keep the server running
 
-`magnitude serve` runs in the foreground. Ctrl+C stops it. An SSH terminal is not a persistent service; use a service manager to keep serving after disconnecting or restarting the machine.
+`magnitude serve` runs in the foreground. Ctrl+C stops it. An SSH terminal is not a persistent service; use a service manager to keep serving after disconnecting or restarting the machine. On Linux, `nohup magnitude serve &` also keeps serving after you disconnect, until the machine restarts; on macOS, closing the terminal stops the server.
 
 Opening Magnitude Desktop stops the foreground server and takes over serving.
 
