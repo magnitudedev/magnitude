@@ -308,7 +308,8 @@ requires OS confirmation or an explicit approval-required state. Windows registe
 the installed executable with `--background` and observes startup approval for its stable application
 identity. Command matching and approval must refer to that same per-user entry; a different entry
 for the executable cannot substitute for it. Executable paths containing spaces remain intact. Linux uses one user XDG
-autostart entry, honors desktop exclusions and disablement, and writes a Hidden override when disabled
+autostart entry, conditioned on the installed executable so sessions skip it after uninstallation,
+honors desktop exclusions and disablement, and writes a Hidden override when disabled
 so a lower-priority system entry cannot re-enable startup. No login adapter requests automatic OS
 restart after Quit. Native platform acceptance includes signed macOS login and Windows startup approval;
 filesystem simulation does not establish those guarantees.
