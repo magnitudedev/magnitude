@@ -159,6 +159,10 @@ fn resource_limits(
             admitted: max_launch_rows,
         });
     }
+    // A CPU launch completes during its submission, so a queued successor
+    // would run before the owner could apply a cancellation, stop or
+    // admission, and it overlaps nothing.
+    let lookahead = model.lookahead && backend != seismic::BackendName::Cpu;
     Ok(ResourceLimits {
         max_launch_rows,
         // Every request consumes at least one token in either phase. A
@@ -170,7 +174,7 @@ fn resource_limits(
         exported_logits_rows: model.exported_logits_rows,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: image_cells,
-        lookahead: model.lookahead,
+        lookahead,
     })
 }
 
@@ -238,6 +242,28 @@ mod tests {
                 admitted: 512,
             })
         );
+    }
+
+    #[test]
+    fn synchronous_cpu_launches_queue_no_lookahead() {
+        let model = ResolvedModelPolicy {
+            lookahead: true,
+            ..model(0)
+        };
+        for (backend, expected) in [
+            (seismic::BackendName::Cpu, false),
+            (seismic::BackendName::Metal, true),
+            (seismic::BackendName::Cuda, true),
+            (seismic::BackendName::Vulkan, true),
+        ] {
+            assert_eq!(
+                resource_limits(&service(512, 32), &model, 0, backend)
+                    .unwrap()
+                    .lookahead,
+                expected,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

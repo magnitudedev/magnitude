@@ -151,7 +151,9 @@ guarantees. The token bound applies with or without a duration target.
 
 Measure completed execution service, not asynchronous submission time or emitted
 token counts. Bounds are approximate at indivisible execution boundaries;
-bounded submission lookahead must preserve opportunities to reschedule.
+bounded submission lookahead must preserve opportunities to reschedule. The CPU backend completes
+a launch during its submission, so it queues no lookahead: a queued successor would run before the
+owner could apply a cancellation, stop or admission.
 Worker idleness follows the absence of execution service, not the absence of
 published tokens. Drafting or suspended verification is still forward progress.
 
