@@ -1,11 +1,11 @@
 {
   "bonsai-8b-q1": { "target": "48516770dd04643643e9f9019a2a349cf26c5dbd" },
   "deepseek-v4-flash": { "target": "fbbb5b93fb787c21338159b0af3318bb3f4d9768", "speculativeDraft": "fbbb5b93fb787c21338159b0af3318bb3f4d9768" },
-  "gemma-4-12b-it-qat": { "target": "980b060c40a8539ac159e0501a3e0f66a6365af3" },
-  "gemma-4-26b-a4b-it-qat": { "target": "7b92b5b28818151e8669af2e45e88d6086f490dd" },
-  "gemma-4-31b-it-qat": { "target": "43cc1aeb31adf47ec06a854507ce552cd9862e6f" },
-  "gemma-4-e2b-it-qat": { "target": "66a399f68ddd113b06dff02fca9523e55465d11d" },
-  "gemma-4-e4b-it-qat": { "target": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265" },
+  "gemma-4-12b-it-qat": { "target": "980b060c40a8539ac159e0501a3e0f66a6365af3", "speculativeDraft": "628fa4b14a6f0defce5f107f5770250e05b4e035" },
+  "gemma-4-26b-a4b-it-qat": { "target": "7b92b5b28818151e8669af2e45e88d6086f490dd", "speculativeDraft": "20d79f403bf11c19d71f6957e5c9600cedb28d19" },
+  "gemma-4-31b-it-qat": { "target": "43cc1aeb31adf47ec06a854507ce552cd9862e6f", "speculativeDraft": "c9bc80a3f8893739dd1453a98c69ffb696afb2c1" },
+  "gemma-4-e2b-it-qat": { "target": "66a399f68ddd113b06dff02fca9523e55465d11d", "speculativeDraft": "b162b6d707634cd9e985a65cfc8b1d3cc73b9fbb" },
+  "gemma-4-e4b-it-qat": { "target": "8c5a9e4fd5482e2be20fe0bf013b4c262a8f4265", "speculativeDraft": "ca8128d445bfaf9f2210f8c62d1c4986439ee4fb" },
   "glm-5.2": { "target": "abc55e72527792c6e77069c99b4cb7de16fa9f23" },
   "laguna-s-2.1": { "target": "750f92f90cf54159c4d7a610cb7b3e74498e75c6" },
   "lfm2.5-2.6b": {

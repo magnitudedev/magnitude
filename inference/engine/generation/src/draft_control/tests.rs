@@ -475,3 +475,37 @@ fn scoring_counts_what_a_full_verification_would_accept() {
         assert_eq!(controller.right(), expected);
     }
 }
+
+/// A chained head at 64k context (Gemma 4 E2B with its assistant, measured):
+/// every proposal is another head pass, and every verified row another pass
+/// of attention over the history.
+const CHAINED: Costs = Costs {
+    draft: |generated| 1.15 * generated as f64,
+    verify: |rows| match rows {
+        1 => 15.2,
+        2 => 19.2,
+        3..=4 => 27.1,
+        5..=8 => 43.0,
+        _ => 75.0,
+    },
+};
+
+#[test]
+fn a_chained_head_widens_again_when_the_text_turns_predictable() {
+    // New prose, then a passage repeated: as one 256-token request ends.
+    let stream = Stream::of(&[(400, UNPREDICTABLE), (400, PERFECT)]);
+    let run = adaptive(&stream, CHAINED, &warmed(&stream, CHAINED));
+    let narrow = run
+        .within(400..800)
+        .take_while(|(choice, _)| choice.verified < 3)
+        .count();
+    let rounds = run
+        .within(400..800)
+        .map(|(choice, committed)| format!("{}/{}/{}", choice.generated, choice.verified, committed))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        narrow <= 16,
+        "{narrow} rounds of perfect text before three proposals are verified: {rounds}"
+    );
+}

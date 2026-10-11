@@ -24,6 +24,9 @@ OUTPUT_CAPACITY = 256
 
 
 class Native(Adapter):
+    #: The benchmark's cache policy is disabled: no request reuses a retained prefix.
+    extensions = {"cache_prompt": False}
+
     def __init__(self, *args):
         super().__init__(*args)
         self.magnitude = self.options.magnitude

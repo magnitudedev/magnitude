@@ -19,15 +19,15 @@ configured artifact; `Best known method` intentionally contains no links.
 | Qwen3.8 Flash Next | MTP | None | — | — |
 | Qwen3.6 35B-A3B | DFlash | DFlash | Separate file, draft repo | [Qwen3.6-35B-A3B-DFlash-Q8_0.gguf](https://huggingface.co/magnitudedev/Qwen3.6-35B-A3B-DFlash-GGUF/blob/main/Qwen3.6-35B-A3B-DFlash-Q8_0.gguf) |
 | Muse Glimmer 30B | DFlash | DFlash | Separate file, draft repo | [dflash-kquant.gguf](https://huggingface.co/magnitudedev/Muse-Glimmer-30B-DFlash-GGUF/blob/main/dflash-kquant.gguf) |
-| Gemma 4 E2B | MTP | MTP | Separate file, target repo | [mtp-gemma-4-E2B-it.gguf](https://huggingface.co/unsloth/gemma-4-E2B-it-qat-GGUF/blob/main/mtp-gemma-4-E2B-it.gguf) |
-| Gemma 4 E4B | MTP | MTP | Separate file, target repo | [mtp-gemma-4-E4B-it.gguf](https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/blob/main/mtp-gemma-4-E4B-it.gguf) |
+| Gemma 4 E2B | MTP | MTP | Separate file, draft repo | [gemma-4-E2B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-E2B-it-qat-MTP-GGUF/blob/main/gemma-4-E2B-it-qat-MTP-Q4_0.gguf) |
+| Gemma 4 E4B | MTP | MTP | Separate file, draft repo | [gemma-4-E4B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-E4B-it-qat-MTP-GGUF/blob/main/gemma-4-E4B-it-qat-MTP-Q4_0.gguf) |
 | Liquid LFM2.5 2.6B | DSpark | DSpark | Separate file, draft repo | [LFM2.5-2.6B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/LFM2.5-2.6B-DSpark-GGUF/blob/main/LFM2.5-2.6B-DSpark-Q8_0.gguf) |
 | Liquid LFM2.5 8B-A1B | DSpark | DSpark | Separate file, draft repo | [LFM2.5-8B-A1B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF/blob/main/LFM2.5-8B-A1B-DSpark-Q8_0.gguf) |
 | MiniCPM5 2B | DSpark | DSpark | Separate file, draft repo | [MiniCPM5-2.6B-DSpark.gguf](https://huggingface.co/magnitudedev/MiniCPM5-2B-DSpark-GGUF/blob/main/MiniCPM5-2.6B-DSpark.gguf) |
 | Bonsai 8B 1-bit | None known | None | — | — |
-| Gemma 4 12B | MTP | MTP | Separate file, target repo | [mtp-gemma-4-12B-it.gguf](https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF/blob/main/mtp-gemma-4-12B-it.gguf) |
-| Gemma 4 26B-A4B | MTP | MTP | Separate file, target repo | [mtp-gemma-4-26B-A4B-it.gguf](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/blob/main/mtp-gemma-4-26B-A4B-it.gguf) |
-| Gemma 4 31B | MTP | MTP | Separate file, target repo | [mtp-gemma-4-31B-it.gguf](https://huggingface.co/unsloth/gemma-4-31B-it-qat-GGUF/blob/main/mtp-gemma-4-31B-it.gguf) |
+| Gemma 4 12B | MTP | MTP | Separate file, draft repo | [gemma-4-12B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-12B-it-qat-MTP-GGUF/blob/main/gemma-4-12B-it-qat-MTP-Q4_0.gguf) |
+| Gemma 4 26B-A4B | MTP | MTP | Separate file, draft repo | [gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-26B-A4B-it-qat-MTP-GGUF/blob/main/gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf) |
+| Gemma 4 31B | MTP | MTP | Separate file, draft repo | [gemma-4-31B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-31B-it-qat-MTP-GGUF/blob/main/gemma-4-31B-it-qat-MTP-Q4_0.gguf) |
 | Laguna S 2.1 118B-A8B | None known | None | — | — |
 | Qwen3.5 122B-A10B | MTP | None | — | — |
 | Nemotron 3 Super 120B-A12B | MTP | None | — | — |
@@ -39,7 +39,7 @@ configured artifact; `Best known method` intentionally contains no links.
 Update this table whenever a catalog model or its configured speculative method changes.
 
 Gemma 4 QAT targets use the matching Google QAT assistant, packaged as a separate
-`gemma4-assistant` GGUF beside the target. QAT and non-QAT assistants are distinct
+`gemma4-assistant` GGUF in its own draft repository. QAT and non-QAT assistants are distinct
 weight sets; model size and shape do not establish compatibility. All Gemma
 benchmarks must use this declared pairing. Other vision-capable models may use
 a compatible separate drafter; embedded MTP remains disabled for them. Projector

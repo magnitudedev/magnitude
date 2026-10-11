@@ -17,6 +17,7 @@ use magnitude_executor::{
     ReservedResources, TokenId, WorkKind,
 };
 use magnitude_family_contracts::HeadHistory;
+use seismic::{TraceDetail, host_seconds};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
@@ -26,6 +27,9 @@ pub struct DraftOptions {
     pub anchors: usize,
     /// Proposals per draft; the catalog drafter's own width when absent.
     pub proposals: Option<u8>,
+    /// Time each anchor's draft, its verification and one plain decode step
+    /// on the device, per submission (a diagnostic).
+    pub attribute: bool,
 }
 
 /// Draft at every fixture's anchors, writing one JSON line per anchor to
@@ -62,7 +66,7 @@ pub fn run(
     for fixture in rendered {
         let tokens = engine::tokens(&fixture.tokens);
         for anchor in anchors(fixture, draft.anchors) {
-            let outcome = draft_at(&mut engine, drafter, &tokens, anchor)?;
+            let outcome = draft_at(&mut engine, drafter, &tokens, anchor, draft.attribute)?;
             proposed += outcome.proposals.len();
             accepted += outcome.accepted;
             matched += outcome.matched;
@@ -74,6 +78,7 @@ pub fn run(
                 "target": outcome.target.iter().map(|token| token.0).collect::<Vec<_>>(),
                 "accepted": outcome.accepted,
                 "matched_fixture": outcome.matched,
+                "attribution": outcome.attribution,
             });
             serde_json::to_writer(&mut file, &record)
                 .map_err(|error| error.to_string())
@@ -117,6 +122,9 @@ struct Drafted {
     target: Vec<TokenId>,
     accepted: usize,
     matched: usize,
+    /// Device time by entry of the draft, the verification and a plain
+    /// decode step after it, when attributed.
+    attribution: Value,
 }
 
 /// Submit one drafter operation and reconcile `accepted` rows of it.
@@ -192,6 +200,7 @@ fn draft_at(
     drafter: Drafter,
     tokens: &[TokenId],
     anchor: usize,
+    attribute: bool,
 ) -> Result<Drafted, String> {
     let mut sequence = engine.open_sequence()?;
     // The target takes the committed tokens; every row's features condition
@@ -258,6 +267,27 @@ fn draft_at(
             .collect(),
         form: drafter.form,
     };
+    let trace = attribute
+        .then(|| engine.device().trace_submissions(TraceDetail::Submissions))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let phase = |start: f64| -> Result<Value, String> {
+        let Some(trace) = &trace else {
+            return Ok(Value::Null);
+        };
+        let end = host_seconds();
+        let submissions = trace.collect().map_err(|error| error.to_string())?;
+        let device = submissions
+            .iter()
+            .map(|submission| submission.device.1 - submission.device.0)
+            .sum::<f64>();
+        Ok(json!({
+            "wall_ms": (end - start) * 1e3,
+            "device_ms": device * 1e3,
+            "submissions": submissions.len(),
+        }))
+    };
+    let draft_start = host_seconds();
     let Outcome::Head { proposals } = head(engine, operation, 1)? else {
         return Err("a draft returns proposals".into());
     };
@@ -265,6 +295,7 @@ fn draft_at(
         .iter()
         .map(|selected| selected.token)
         .collect::<Vec<_>>();
+    let draft_phase = phase(draft_start)?;
     // The target verifies the anchor and the proposals greedily.
     let mut verified = vec![tokens[anchor]];
     verified.extend_from_slice(&proposals);
@@ -281,6 +312,7 @@ fn draft_at(
         committed: 1,
         prime: None,
     }];
+    let verify_start = host_seconds();
     let mut bindings = engine.bindings();
     let ReservedResources::Target(reservation) = engine
         .domain
@@ -322,6 +354,18 @@ fn draft_at(
             )
             .map_err(text)?;
     }
+    let verify_phase = phase(verify_start)?;
+    // One plain decode step from the accepted position, for comparison.
+    let plain_phase = if attribute {
+        sequence.position = anchor + accepted + 1;
+        let token = target[accepted];
+        let plain_start = host_seconds();
+        let operation = Engine::forward(&sequence, WorkKind::Decode, vec![token], Demand::SELECT);
+        engine.step(vec![operation], &mut [&mut sequence], None)?;
+        phase(plain_start)?
+    } else {
+        Value::Null
+    };
     let matched = proposals
         .iter()
         .zip(&tokens[anchor + 1..])
@@ -333,5 +377,6 @@ fn draft_at(
         target,
         accepted,
         matched,
+        attribution: json!({ "draft": draft_phase, "verify": verify_phase, "plain": plain_phase }),
     })
 }

@@ -158,6 +158,10 @@ enum Command {
         /// Proposals per draft; the drafter's own width when absent.
         #[arg(long)]
         proposals: Option<u8>,
+        /// Time each anchor's draft, verification and a plain decode step
+        /// on the device (a diagnostic).
+        #[arg(long)]
+        attribute: bool,
     },
     /// The added KL of a pinned tuning selection against the defaults (and
     /// references), alongside the trace's dimensionless precision measurements.
@@ -621,6 +625,7 @@ fn run(command: Command) -> Result<(), String> {
             context,
             anchors,
             proposals,
+            attribute,
         } => {
             let inputs = Inputs::read(&common, "harness.draft")?;
             let rendered = inputs.render(context)?;
@@ -629,7 +634,11 @@ fn run(command: Command) -> Result<(), String> {
             let (drafting, device) = draft::run(
                 &inputs.artifacts.artifacts,
                 &options,
-                &draft::DraftOptions { anchors, proposals },
+                &draft::DraftOptions {
+                    anchors,
+                    proposals,
+                    attribute,
+                },
                 &rendered,
                 &inputs.run.path("draft.jsonl"),
             )?;

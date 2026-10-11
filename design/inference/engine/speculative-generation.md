@@ -346,7 +346,11 @@ a round's time is its two launches. Three rules:
    round that loses a known time to the fastest budget. It goes to the wider
    width with the most to gain for that time, where the gain is that width's rate
    if every proposal were right. Looks take a fixed share of decode time, scaled
-   down where little can be gained.
+   down where little can be gained. A look is also taken on a run of rounds that
+   accepted everything they verified, which is what text that became predictable
+   looks like from a narrow width. The run that earns one halves when such a look
+   finds its block right and doubles when it finds it wrong, and the load carries
+   it from one request to the next.
 
 The controller runs no device work solely to learn: every round it causes
 commits tokens. An unmeasured launch is tried because its bound makes it the
@@ -365,7 +369,10 @@ separate launches.
   that width's rate once its launches are measured.
 - On text that changes, verification follows within the few rounds the depth
   means take to move, and generation within the rounds a width is kept or a look
-  takes to come.
+  takes to come. Text that turns predictable under a narrow width brings looks
+  round after round while they keep finding their blocks right; this is what
+  returns a chained head, whose deeper proposals each cost a pass and so stop
+  being drafted, to its wider widths.
 - Measuring a load's launches costs one round per width per context class.
 - The means, the kept rounds and the looks' share are fixed constants, not
   statistical guarantees. Acceptance that alternates faster than the means move
