@@ -484,6 +484,22 @@ describe("Codex inference gateway", () => {
       async () => new Response("unexpected"),
     )
     expect(oversized.status).toBe(413)
+
+    const mebibyte = 1024 * 1024
+    const frame = Bun.zstdCompressSync(new Uint8Array(mebibyte))
+    const expanding = Buffer.concat(
+      Array.from({ length: MAX_CODEX_ROUTING_BODY_BYTES / mebibyte + 1 }, () => frame),
+    )
+    const oversizedDecoded = await proxyCodexInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/v1/proxies/codex/responses", {
+        method: "POST",
+        headers: { "content-encoding": "zstd" },
+        body: Uint8Array.from(expanding).buffer,
+      }),
+      icn,
+      async () => new Response("unexpected"),
+    )
+    expect(oversizedDecoded.status).toBe(413)
   })
 
   test("rejects malformed, ambiguous, and empty local model selectors", async () => {
