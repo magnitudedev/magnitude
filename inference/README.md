@@ -18,9 +18,10 @@ remain preservation references.
 | --- | --- |
 | `engine/` | Reusable engine, model families, scheduler, serving, and headless CLI |
 | `service/` | HTTP service, contracts, catalog, assessment, and worker lifecycle |
-| `seismic/` | Language, compiler, runtime, native libraries, device backends, and hardware research |
+| `seismic/` | Language, compiler, runtime, native libraries, and device backends |
 | `catalog/` | Model catalog and planner inputs |
-| `evaluation/` | Fixtures, harness, references, serving bench, build comparison and remote runs |
+| `benchmarks/` | Session Bench and runtime adapters |
+| `validation/` | Independent numerical references and hardware qualification |
 
 ## Build and test
 

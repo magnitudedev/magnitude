@@ -1,0 +1,164 @@
+import re
+import shutil
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+
+from ..session_bench.models import file_hash
+from .base import Adapter, command
+
+
+# llama.cpp logs each per-sequence memory buffer as it allocates it (at
+# verbosity 4): the attention KV cache and, for hybrid models, the recurrent
+# state. Their sizes are what one slot of the configured context holds.
+STATE_BUFFER = re.compile(r"\b(KV|RS) buffer size = +([0-9.]+) MiB")
+
+
+class LlamaCpp(Adapter):
+    extensions = {"cache_prompt": False}
+
+    async def memory_observation(self, engine):
+        kv = recurrent = 0.0
+        for kind, mib in STATE_BUFFER.findall(engine.log.read_text(errors="replace")):
+            if kind == "KV":
+                kv += float(mib)
+            else:
+                recurrent += float(mib)
+        if kv == 0 and recurrent == 0:
+            return None
+        return {
+            "state": {
+                "kv_bytes": round(kv * 1024 * 1024),
+                "recurrent_bytes": round(recurrent * 1024 * 1024),
+            }
+        }
+
+    async def prepare(self):
+        executable = (
+            str(self.options.llama.binary)
+            if self.options.llama.binary
+            else shutil.which("llama-server")
+        )
+        if not executable:
+            raise ValueError("upstream llama-server is required on PATH for --engine llama.cpp")
+        if not Path(executable).is_file():
+            raise ValueError(f"llama-server executable does not exist: {executable}")
+        self.executable = executable
+        self.identity = {"executable": executable, "sha256": file_hash(Path(executable))}
+        if self.options.llama.draft is not None:
+            self.identity["draft"] = {
+                "path": str(self.options.llama.draft),
+                "sha256": file_hash(self.options.llama.draft),
+            }
+        self.identity["version"] = await command(
+            [self.executable, "--version"],
+            self.root,
+            self.store.path / "logs" / "llama-version.log",
+        )
+
+    def verify(self):
+        super().verify()
+        if file_hash(Path(self.executable)) != self.identity["sha256"]:
+            raise ValueError("llama-server changed after preparation")
+        if self.options.llama.draft is not None and file_hash(
+            self.options.llama.draft
+        ) != self.identity["draft"]["sha256"]:
+            raise ValueError("llama.cpp draft changed after preparation")
+
+    def argv(self, port, context, parallel, directory):
+        return [
+            self.executable,
+            "--model",
+            str(self.artifact.path),
+            "--alias",
+            self.served_model(),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--ctx-size",
+            str(context * parallel),
+            "--parallel",
+            str(parallel),
+            "--n-gpu-layers",
+            str(self.options.llama.gpu_layers),
+            *(
+                [
+                    "--model-draft",
+                    str(self.options.llama.draft),
+                    "--spec-type",
+                    f"draft-{self.options.llama.draft_method}",
+                    "--spec-draft-n-max",
+                    str(self.options.llama.draft_proposals),
+                    "--n-gpu-layers-draft",
+                    str(self.options.llama.gpu_layers),
+                ]
+                if self.options.llama.draft is not None
+                else []
+            ),
+            "--jinja",
+            "--flash-attn",
+            "on",
+            "--cont-batching",
+            "--cache-type-k",
+            self.options.llama.cache_type_k,
+            "--cache-type-v",
+            self.options.llama.cache_type_v,
+            "--no-cache-prompt",
+            "--cache-ram",
+            "0",
+            "--offline",
+            "--no-context-shift",
+            "--log-verbosity",
+            "4",
+        ]
+
+    def ready_path(self):
+        return "/props"
+
+    def verify_ready(self, data, context, parallel):
+        if data.get("total_slots") != parallel:
+            raise ValueError("llama.cpp slot capacity differs from the requested capacity")
+        settings = data.get("default_generation_settings", {})
+        if settings.get("n_ctx") != context:
+            raise ValueError(
+                f"llama.cpp per-slot context is {settings.get('n_ctx')}, expected {context}"
+            )
+
+    async def prompt_counts(self, plan):
+        async with self.launch(
+            self.provisional_capacity(plan), plan.parallel_sequences, "prepare"
+        ) as engine:
+            return await self.render_counts(plan, engine)
+
+    @asynccontextmanager
+    async def context_counter(self):
+        # Rendering/tokenization does not evaluate prompts or require a 64K KV allocation.
+        async with self.launch(
+            min(4096, self.artifact.context_limit), 1, "fixture-prepare"
+        ) as engine:
+
+            async def count(context):
+                return (await self.render_counts(self.context_plan(context), engine))[
+                    "fixture-sizing"
+                ]
+
+            yield count
+
+    async def render_counts(self, plan, engine):
+        counts = {}
+        async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+            for request in plan.prepared_requests:
+                response = await client.post(
+                    engine.endpoint + "/apply-template", json=request.body(engine.model)
+                )
+                response.raise_for_status()
+                prompt = response.json()["prompt"]
+                response = await client.post(
+                    engine.endpoint + "/tokenize",
+                    json={"content": prompt, "add_special": True, "parse_special": True},
+                )
+                response.raise_for_status()
+                counts[request.id] = len(response.json()["tokens"])
+        return counts

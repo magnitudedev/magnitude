@@ -3,8 +3,8 @@
 //! store, then one block `[anchor, mask, …]` drafts the proposals.
 
 use super::*;
-use crate::DraftForm;
 use crate::batching::BlockSlot;
+use crate::DraftForm;
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// The draft rows of one transaction. Entry row `i` sits at head

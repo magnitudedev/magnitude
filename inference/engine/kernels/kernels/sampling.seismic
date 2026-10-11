@@ -8,70 +8,6 @@
 # order. Rows are shaped in place: every stage after the first reads only the
 # values the first wrote, so a row's logits are read once, by the stage that
 # replaces them. The portable body is the semantic oracle.
-# The order of a non-NaN f32 as an unsigned key: a < b exactly when
-# ordered_key(a) < ordered_key(b), and -0.0 and 0.0 share one key.
-fn ordered_key(value: f32) -> u32:
-    let bits = bitcast_u32(value + 0.0)
-    let mut key = bits ^ u32(2147483648)
-    if bits >= u32(2147483648):
-        key = u32(4294967295) - bits
-    return key
-
-# The least key with fewer than `count` keys strictly above it (a binary
-# search over the 32-bit key space). A key of zero is above no key.
-fn count_boundary[V](keys: &tensor[V] u32, count: i32) -> u32:
-    let mut low = u32(0)
-    let mut high = u32(4294967295)
-    for step in 0..32:
-        if low < high:
-            let middle = low + (high - low) / u32(2)
-            let mut greater = i32(0)
-            for other in 0..V:
-                if keys[other] > middle:
-                    greater = greater + 1
-            if greater < count:
-                high = middle
-            else:
-                low = middle + u32(1)
-    return low
-
-# The least key whose strictly greater mass, summed in index order, is below
-# `limit` (the largest key when none is).
-fn mass_boundary[V](keys: &tensor[V] u32, masses: &tensor[V] f32, limit: f32) -> u32:
-    let mut low = u32(0)
-    let mut high = u32(4294967295)
-    for step in 0..32:
-        if low < high:
-            let middle = low + (high - low) / u32(2)
-            let mut above = f32(0.0)
-            for other in 0..V:
-                if keys[other] > middle:
-                    above = above + masses[other]
-            if above < limit:
-                high = middle
-            else:
-                low = middle + u32(1)
-    return low
-
-# The least index i whose mass before it (greater key, or key `boundary` and
-# index below i), summed in index order, reaches `limit`; V + 1 when none.
-fn tie_cutoff[V](keys: &tensor[V] u32, masses: &tensor[V] f32, boundary: u32, limit: f32) -> i32:
-    let mut begin = i32(0)
-    let mut end = i32(V) + 1
-    for step in 0..33:
-        if begin < end:
-            let middle = begin + (end - begin) / 2
-            let mut before = f32(0.0)
-            for other in 0..V:
-                let key = keys[other]
-                if key > boundary or (key == boundary and i32(other) < middle):
-                    before = before + masses[other]
-            if before >= limit:
-                end = middle
-            else:
-                begin = middle + 1
-    return begin
-
 fn shape_rows[Sx, V, Hn](logits: &mut tensor[Sx, V] f32,
     mask: &tensor[Sx, (V + 31) / 32] u32, constrained: &tensor[Sx] i32,
     params: &tensor[Sx, 8] f32, history: &tensor[Sx, Hn] i32):
@@ -111,26 +47,15 @@ fn shape_rows[Sx, V, Hn](logits: &mut tensor[Sx, V] f32,
             for token in 0..V:
                 logits[row, token] = penalized[token]
         else:
-            # Top-k removes a token when at least top_k values are strictly
-            # greater (NaN is greater than nothing and nothing is greater
-            # than NaN). That count falls as the value rises, so the kept
-            # NaN-free tokens are those whose order key reaches the least key
-            # with fewer than top_k greater values. Every NaN-free order key
-            # is above zero, so a NaN takes key zero and is counted by none.
-            let mut tempered_keys = tensor[V] u32
             for token in 0..V:
-                let value = tempered[token] / temperature
-                tempered[token] = value
-                tempered_keys[token] = u32(0)
-                if value == value:
-                    tempered_keys[token] = ordered_key(value)
-            let mut kept_from = u32(0)
-            if top_k > 0:
-                kept_from = count_boundary(tempered_keys, top_k)
+                tempered[token] = tempered[token] / temperature
             for token in 0..V:
-                let value = tempered[token]
-                topk[token] = value
-                if top_k > 0 and value == value and tempered_keys[token] < kept_from:
+                let mut greater = i32(0)
+                for other in 0..V:
+                    if tempered[other] > tempered[token]:
+                        greater = greater + 1
+                topk[token] = tempered[token]
+                if top_k > 0 and greater >= top_k:
                     topk[token] = -inf
             let maximum = reduce(topk, 0, max)
             for token in 0..V:
@@ -139,45 +64,14 @@ fn shape_rows[Sx, V, Hn](logits: &mut tensor[Sx, V] f32,
                     minp[token] = -inf
             let shifted = exp(minp - reduce(minp, 0, max))
             let denominator = reduce(shifted, 0, sum)
-            let mut masses = tensor[V] f32
-            let mut keys = tensor[V] u32
-            let mut degenerate = i32(0)
             for token in 0..V:
-                let mass = shifted[token] / denominator
-                masses[token] = mass
-                keys[token] = ordered_key(minp[token])
-                if mass != mass:
-                    degenerate = 1
-            # Top-p removes a token when the mass ordered before it (greater
-            # value, or equal value and lower index), summed in index order,
-            # reaches top_p. When every mass is a number at least zero, that
-            # sum only grows along the order, so the removed tokens are a
-            # suffix of it: find the least key whose strictly greater mass is
-            # below top_p (`boundary`), then the first index among that key's
-            # ties whose preceding mass reaches top_p (`first`).
-            let mut boundary = u32(0)
-            let mut first = i32(0)
-            if top_p < 1.0 and degenerate == 0:
-                boundary = mass_boundary(keys, masses, top_p)
-                first = tie_cutoff(keys, masses, boundary, top_p)
-            for token in 0..V:
+                let mut preceding = f32(0.0)
+                for other in 0..V:
+                    if minp[other] > minp[token] or (minp[other] == minp[token] and other < token):
+                        preceding = preceding + shifted[other] / denominator
                 logits[row, token] = minp[token]
-                if top_p < 1.0:
-                    if degenerate == 0:
-                        # Nothing precedes the first token, so a cutoff of
-                        # zero or less removes every token.
-                        let key = keys[token]
-                        if f32(0.0) >= top_p or key < boundary or (key == boundary and i32(token) >= first):
-                            logits[row, token] = -inf
-                    else:
-                        # A non-number mass: the ordered sum is formed as
-                        # stated.
-                        let mut preceding = f32(0.0)
-                        for other in 0..V:
-                            if minp[other] > minp[token] or (minp[other] == minp[token] and other < token):
-                                preceding = preceding + masses[other]
-                        if preceding >= top_p:
-                            logits[row, token] = -inf
+                if top_p < 1.0 and preceding >= top_p:
+                    logits[row, token] = -inf
 
 # Native Metal: the vocabulary of each row is split into PARTS contiguous
 # partitions. prepare applies the constraint mask, penalties and temperature; three count/select

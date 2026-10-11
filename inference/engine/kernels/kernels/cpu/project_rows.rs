@@ -11,7 +11,7 @@ fn project_rows_stage<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u
     let k = cx.dim_k() as usize;
     // SAFETY: each work item writes its own row of the scratch.
     let staged = unsafe { cx.scratch_staged().slice_mut::<f32>(4 * row * k, k) };
-    projection::stage::<E::A>(cx.arg_source().row([row, 0]), staged);
+    cx.arg_source().decode_row(row, staged);
     if cx.param_int8() == 1 {
         let blocks = seismic::cpu::quant::blocks(k);
         // SAFETY: this work item owns the corresponding quantized row.

@@ -90,12 +90,6 @@ impl Toolchain for VulkanToolchain {
         &self.identity
     }
 
-    /// Kept SPIR-V of every requested entry that validates is used as it
-    /// is: no compiler runs. The device still creates each pipeline.
-    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool {
-        self.load(source, kept).is_some()
-    }
-
     fn compile(
         &self,
         source: &ProgramSource,

@@ -25,7 +25,6 @@ members = [
   "engine/templates",
   "engine/serving",
   "engine/cli",
-  "evaluation/harness",
   "service/contracts",
   "service/utils",
   "service/models",
@@ -158,10 +157,3 @@ opt-level = 3
 
 [profile.release]
 debug = 1
-
-# The language checker also runs as a build dependency while packaging native
-# kernels. Cargo otherwise compiles build dependencies at opt-level 0 even in
-# release, making symbolic source checking substantially slower than its tests.
-# Keep this host checker optimized without changing native kernel arithmetic.
-[profile.release.package.seismic-lang]
-opt-level = 3

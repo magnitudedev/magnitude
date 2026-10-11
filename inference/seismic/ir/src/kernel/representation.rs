@@ -12,26 +12,9 @@ pub(super) fn read<B: PhysicalDialect>(
     place: PlaceEntry,
     indices: &[PortableValue],
 ) -> PortableValue {
-    read_component(builder, place, indices, None)
-}
-
-pub(super) fn read_component<B: PhysicalDialect>(
-    builder: &mut PortableBuilder<'_, B>,
-    place: PlaceEntry,
-    indices: &[PortableValue],
-    component: Option<registry::QuantizedComponent>,
-) -> PortableValue {
     let info = registry::representation_info(place.representation);
     let recipe = registry::decode_recipe(place.representation, info.decoded)
         .expect("registered packed representation has a decode sequence");
-    if let Some(registry::DecodeComponent::Constant(value)) =
-        component.and_then(|role| recipe.component(role))
-    {
-        return builder.constant(
-            super::ops::ConstantValue::from_scalar(value),
-            ValueType::Scalar(value.dtype()),
-        );
-    }
     let mut values = Vec::with_capacity(recipe.temporary_count());
     for step in recipe.steps() {
         let get = |temp| values[recipe.ordinal(temp)];
@@ -75,19 +58,7 @@ pub(super) fn read_component<B: PhysicalDialect>(
         assert_eq!(value.ty, ValueType::Scalar(recipe.dtype(step.defines())));
         values.push(value);
     }
-    match component {
-        None => values[recipe.ordinal(recipe.output())],
-        Some(role) => match recipe
-            .component(role)
-            .expect("checked representation supports role")
-        {
-            registry::DecodeComponent::Temporary(temp) => values[recipe.ordinal(temp)],
-            registry::DecodeComponent::Constant(value) => builder.constant(
-                super::ops::ConstantValue::from_scalar(value),
-                ValueType::Scalar(value.dtype()),
-            ),
-        },
-    }
+    values[recipe.ordinal(recipe.output())]
 }
 
 #[cfg(test)]

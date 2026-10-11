@@ -1,29 +1,25 @@
 //! Typed callable numerical programs and their submission lifecycle.
 
 pub(crate) mod graph;
-pub(crate) mod invocation_demand;
 pub(crate) mod native_constants;
 pub(crate) mod native_draft;
 pub(crate) mod native_drafter;
 pub(crate) mod native_head;
 pub(crate) mod native_import;
-pub(crate) mod native_shared_head;
 pub(crate) mod native_state;
 pub(crate) mod native_target;
 pub(crate) mod native_target_graph;
 pub(crate) mod native_vision;
 mod submission;
 
-pub use graph::GraphError;
 pub use graph::readout::PreparedTargetReadoutGraphs;
+pub use graph::GraphError;
 pub use native_draft::PreparedDraftGraphs;
 pub use native_drafter::PreparedDrafterGraphs;
 pub use native_head::PreparedHeadGraphs;
 pub use native_state::PreparedStateCopyGraphs;
 pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};
-pub use native_target_graph::{
-    PlannedSealedGraphs, PreparedTargetGraphs, SealReport, SealedGraphsHeap,
-};
+pub use native_target_graph::{PreparedTargetGraphs, SealReport};
 pub use native_vision::PreparedVisionGraphs;
 pub use submission::{
     CompletedWork, DeviceSubmission, ProgramSubmission, ReadySubmission, SubmittedHead,

@@ -224,7 +224,7 @@ impl MetalSubmission {
         // the input before the infallible native commit; no uncommitted command
         // can reach a normal failure path between registration and commit.
         self.pending.push(PendingCommand { command, words });
-        crate::pooled(|| self.pending.last().unwrap().command.commit());
+        self.pending.last().unwrap().command.commit();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -304,50 +304,45 @@ impl MetalSubmission {
         let participant = scratch_buffer(scratch.allocation(LaunchLocalKind::Participant), env);
         let registers = scratch_buffer(scratch.allocation(LaunchLocalKind::Register), env);
 
-        let command = crate::pooled(|| {
-            let command = self.device.queue().commandBuffer().ok_or_else(|| {
-                ExecutionError::SubmissionFailed("Metal could not create a command buffer".into())
-            })?;
-            let encoder = command.computeCommandEncoder().ok_or_else(|| {
-                ExecutionError::SubmissionFailed("Metal could not create a compute encoder".into())
-            })?;
-            encoder.setComputePipelineState(&kernel.state);
-            for (index, (buffer, offset)) in resolved.iter().enumerate() {
-                unsafe {
-                    encoder.setBuffer_offset_atIndex(Some(buffer.raw()), *offset as usize, index)
-                }
-            }
-            let first_aux = bindings.len();
-            unsafe {
-                encoder.setBuffer_offset_atIndex(
-                    Some(word_table.buffer.raw()),
-                    word_table.bytes.start as usize,
-                    first_aux,
-                );
-                encoder.setBuffer_offset_atIndex(
-                    Some(results.buffer.raw()),
-                    results.base_offset as usize,
-                    first_aux + 1,
-                );
-                set_optional_buffer(&encoder, participant, first_aux + 2);
-                set_optional_buffer(&encoder, registers, first_aux + 3);
-                encoder.setThreadgroupMemoryLength_atIndex(total_values[0] as usize, 0);
-            }
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(
-                MTLSize {
-                    width: grid[0] as usize,
-                    height: grid[1] as usize,
-                    depth: grid[2] as usize,
-                },
-                MTLSize {
-                    width: workgroup[0] as usize,
-                    height: workgroup[1] as usize,
-                    depth: workgroup[2] as usize,
-                },
-            );
-            encoder.endEncoding();
-            Ok::<_, ExecutionError>(command)
+        let command = self.device.queue().commandBuffer().ok_or_else(|| {
+            ExecutionError::SubmissionFailed("Metal could not create a command buffer".into())
         })?;
+        let encoder = command.computeCommandEncoder().ok_or_else(|| {
+            ExecutionError::SubmissionFailed("Metal could not create a compute encoder".into())
+        })?;
+        encoder.setComputePipelineState(&kernel.state);
+        for (index, (buffer, offset)) in resolved.iter().enumerate() {
+            unsafe { encoder.setBuffer_offset_atIndex(Some(buffer.raw()), *offset as usize, index) }
+        }
+        let first_aux = bindings.len();
+        unsafe {
+            encoder.setBuffer_offset_atIndex(
+                Some(word_table.buffer.raw()),
+                word_table.bytes.start as usize,
+                first_aux,
+            );
+            encoder.setBuffer_offset_atIndex(
+                Some(results.buffer.raw()),
+                results.base_offset as usize,
+                first_aux + 1,
+            );
+            set_optional_buffer(&encoder, participant, first_aux + 2);
+            set_optional_buffer(&encoder, registers, first_aux + 3);
+            encoder.setThreadgroupMemoryLength_atIndex(total_values[0] as usize, 0);
+        }
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(
+            MTLSize {
+                width: grid[0] as usize,
+                height: grid[1] as usize,
+                depth: grid[2] as usize,
+            },
+            MTLSize {
+                width: workgroup[0] as usize,
+                height: workgroup[1] as usize,
+                depth: workgroup[2] as usize,
+            },
+        );
+        encoder.endEncoding();
         self.commit(command, word_table);
         if !result_slots.is_empty() {
             self.synchronize()?;
@@ -419,16 +414,14 @@ impl MetalSubmission {
 }
 
 fn complete_command(command: &ProtocolObject<dyn MTLCommandBuffer>) -> Result<(), ExecutionError> {
-    crate::pooled(|| {
-        command.waitUntilCompleted();
-        if let Some(error) = command.error() {
-            Err(ExecutionError::SynchronizationFailed(
-                error.localizedDescription().to_string(),
-            ))
-        } else {
-            Ok(())
-        }
-    })
+    command.waitUntilCompleted();
+    if let Some(error) = command.error() {
+        Err(ExecutionError::SynchronizationFailed(
+            error.localizedDescription().to_string(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn complete_pending(pending: &mut Vec<PendingCommand>) -> Result<(), ExecutionError> {

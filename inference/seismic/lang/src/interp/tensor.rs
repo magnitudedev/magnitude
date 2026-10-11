@@ -1,6 +1,6 @@
 //! Host storage used by the semantic oracle.
 
-use crate::reference_math::{ReferenceScalar, float_literal};
+use crate::reference_math::{float_literal, ReferenceScalar};
 
 use crate::ids::RepresentationId;
 use crate::registry::{self, DecodeStep, PlaneEncoding, RepresentationKind};
@@ -164,30 +164,6 @@ impl TensorData {
         Ok((0..count).map(|index| self.read(index)).collect())
     }
 
-    /// One registry decode component of every element, in row-major order.
-    pub fn components(&self, role: registry::QuantizedComponent) -> Result<Vec<f64>, String> {
-        let Self::Encoded {
-            representation,
-            shape,
-            bytes,
-        } = self
-        else {
-            return Err("decode components exist only for packed representations".into());
-        };
-        let recipe = registry::decode_recipe(
-            *representation,
-            registry::representation_info(*representation).decoded,
-        )
-        .ok_or("the representation has no decode recipe")?;
-        if recipe.component(role).is_none() {
-            return Err(format!("the representation has no `{}` component", role.name()));
-        }
-        let count: usize = shape.iter().product();
-        Ok((0..count)
-            .map(|flat| decode(*representation, shape, bytes, flat, Some(role)).to_f64())
-            .collect())
-    }
-
     pub(super) fn read(&self, flat: usize) -> f64 {
         self.read_scalar(flat).to_f64()
     }
@@ -208,24 +184,8 @@ impl TensorData {
                 representation,
                 shape,
                 bytes,
-            } => decode(*representation, shape, bytes, flat, None),
+            } => decode(*representation, shape, bytes, flat),
         }
-    }
-
-    pub(super) fn read_component(
-        &self,
-        flat: usize,
-        role: registry::QuantizedComponent,
-    ) -> ReferenceScalar {
-        let Self::Encoded {
-            representation,
-            shape,
-            bytes,
-        } = self
-        else {
-            unreachable!("checked component needs encoded storage")
-        };
-        decode(*representation, shape, bytes, flat, Some(role))
     }
 
     pub(super) fn write(&mut self, flat: usize, value: ReferenceScalar) {
@@ -349,15 +309,8 @@ fn decode(
     shape: &[usize],
     bytes: &[u8],
     flat: usize,
-    component: Option<registry::QuantizedComponent>,
 ) -> ReferenceScalar {
     let info = registry::representation_info(representation);
-    if let Some(registry::DecodeComponent::Constant(value)) = component.and_then(|role| {
-        registry::decode_recipe(representation, info.decoded)
-            .and_then(|recipe| recipe.component(role))
-    }) {
-        return value;
-    }
     let storage = match &info.kind {
         RepresentationKind::Packed(layout) => PlaneStorage::Packet {
             layout,
@@ -457,16 +410,7 @@ fn decode(
         let into = step.defines();
         temporaries[recipe.ordinal(into)] = value;
     }
-    match component {
-        None => temporaries[recipe.ordinal(recipe.output())],
-        Some(role) => match recipe
-            .component(role)
-            .expect("checked representation supports role")
-        {
-            registry::DecodeComponent::Temporary(temp) => temporaries[recipe.ordinal(temp)],
-            registry::DecodeComponent::Constant(value) => value,
-        },
-    }
+    temporaries[recipe.ordinal(recipe.output())]
 }
 
 /// Where the packet-form planes of one packed tensor live: interleaved per

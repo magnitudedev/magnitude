@@ -1585,13 +1585,10 @@ fn native_grouped_experts_match_host_reference_at_catalog_shapes() {
                 |shape: &[usize]| i32_tensor(device, shape, &vec![-9; shape.iter().product()]);
             let (mut counts, mut native_order, mut native_inverse, mut native_table) =
                 (fill(&[e]), fill(&[b, TILE]), fill(&[m, k]), fill(&[b]));
-            // Vulkan tunes the group's parts; Metal and CUDA derive them from E.
-            let group = match device.backend() {
-                seismic::BackendName::Cpu => seismic::NativeSpecialization::new(),
-                seismic::BackendName::Vulkan => {
-                    specialization(device, &[("E", e), ("K", k)], &[("PARTS", 4)])
-                }
-                _ => specialization(device, &[("E", e), ("K", k)], &[]),
+            let group = if is_cpu(device) {
+                seismic::NativeSpecialization::new()
+            } else {
+                specialization(device, &[("E", e), ("K", k)], &[("PARTS", 4)])
             };
             routed_group::native_for_device(device, &group)
                 .unwrap()

@@ -32,17 +32,15 @@ impl DeviceHandle {
     /// Cheap enumeration of unopened physical Metal devices. This performs no
     /// queue creation, native compilation, or profiling.
     pub fn discover() -> Vec<Self> {
-        crate::pooled(|| {
-            MTLCopyAllDevices()
-                .into_iter()
-                .map(|device| Self { device })
-                .collect()
-        })
+        MTLCopyAllDevices()
+            .into_iter()
+            .map(|device| Self { device })
+            .collect()
     }
 
     /// The system default Metal device.
     pub fn system_default() -> Result<Self, TargetError> {
-        let device = crate::pooled(|| MTLCreateSystemDefaultDevice())
+        let device = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| TargetError::DeviceUnavailable("no Metal device".into()))?;
         Ok(Self { device })
     }
@@ -52,7 +50,7 @@ impl DeviceHandle {
     }
 
     pub fn name(&self) -> String {
-        crate::pooled(|| self.device.name().to_string())
+        self.device.name().to_string()
     }
 
     /// `MTLDevice.maxBufferLength`: the single-allocation limit. It is neither
@@ -116,10 +114,8 @@ unsafe impl Sync for WiredAllocation {}
 impl WiredAllocation {
     fn wire(residency: &ResidencySet, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
         let set = residency.lock().expect("Metal residency lock poisoned");
-        crate::pooled(|| {
-            set.addAllocation(ProtocolObject::from_ref(&**buffer));
-            set.commit();
-        });
+        set.addAllocation(ProtocolObject::from_ref(&**buffer));
+        set.commit();
         Self {
             residency: residency.clone(),
             buffer: buffer.clone(),
@@ -130,10 +126,8 @@ impl WiredAllocation {
 impl Drop for WiredAllocation {
     fn drop(&mut self) {
         let set = self.residency.lock().expect("Metal residency lock poisoned");
-        crate::pooled(|| {
-            set.removeAllocation(ProtocolObject::from_ref(&*self.buffer));
-            set.commit();
-        });
+        set.removeAllocation(ProtocolObject::from_ref(&*self.buffer));
+        set.commit();
     }
 }
 
@@ -221,10 +215,6 @@ unsafe impl Sync for MetalDevice {}
 
 impl MetalDevice {
     pub fn open(handle: DeviceHandle) -> Result<Self, TargetError> {
-        crate::pooled(|| Self::form(handle))
-    }
-
-    fn form(handle: DeviceHandle) -> Result<Self, TargetError> {
         // Compilation is shared by every native entry formed on this device.
         // Metal defaults to a small compiler pool; allow the system to scale
         // compilation concurrency to the machine before forming any kernels.
@@ -263,14 +253,13 @@ impl MetalDevice {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
-        let buffer = crate::pooled(|| {
-            self.handle
-                .raw()
-                .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
-        })
-        .ok_or_else(|| {
-            ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
-        })?;
+        let buffer = self
+            .handle
+            .raw()
+            .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
+            })?;
         let wired = WiredAllocation::wire(&self.residency, &buffer);
         Ok(MetalBuffer {
             buffer,
@@ -308,7 +297,7 @@ impl MetalDevice {
                 "Metal host mapping exceeds maximum buffer length".into(),
             ));
         }
-        let buffer = crate::pooled(|| unsafe {
+        let buffer = unsafe {
             self.handle
                 .raw()
                 .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -317,7 +306,7 @@ impl MetalDevice {
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
-        })
+        }
         .ok_or_else(|| {
             ExecutionError::AllocationFailed("Metal refused a read-only host mapping".into())
         })?;

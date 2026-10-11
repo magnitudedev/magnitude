@@ -1,7 +1,7 @@
 //! The native kernels a load prepares, derived from its plan without a
 //! device.
 
-use crate::native::{TuningLimits, kernel_requests};
+use crate::native::{kernel_requests, TuningLimits};
 use crate::{BackendPlan, CatalogError};
 use magnitude_family_contracts::ModelDefinition;
 use seismic::KernelRequest;

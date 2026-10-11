@@ -14,7 +14,7 @@ mod scalar;
 mod tensor;
 pub mod value;
 
-pub use tensor::{TensorData, round_to};
+pub use tensor::{round_to, TensorData};
 pub use value::Value;
 
 /// Host reference of a registered representation conversion: the canonical
@@ -629,7 +629,7 @@ impl<'a> Interpreter<'a> {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
-    use crate::checked::{SourceFile, SourceSet, check_source};
+    use crate::checked::{check_source, SourceFile, SourceSet};
     use crate::entry::ElementBindings;
     fn entry(source: &str) -> LogicalEntry {
         let module = check_source(SourceSet::new(vec![SourceFile {
@@ -644,95 +644,6 @@ mod budget_tests {
             )
             .unwrap()
     }
-    #[test]
-    fn checked_rounding_and_bitcast_preserve_their_separate_contracts() {
-        let source = "fn probe() -> (f32, u32, f32):\n    return rint(-0.5), bitcast_u32(bitcast_f32(u32(2139095041))), rint(2.5)\n";
-        let logical = entry(source);
-        let outcome = Interpreter::new(&logical).run(&[]).unwrap();
-        let values = outcome
-            .results()
-            .map(|result| match result.value() {
-                OutcomeValue::Scalar(value) => value,
-                _ => panic!("scalar results"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            values,
-            [
-                ReferenceScalar::F32(0x80000000),
-                ReferenceScalar::U32(0x7f800001),
-                ReferenceScalar::F32(2f32.to_bits())
-            ]
-        );
-        for source in [
-            "fn probe(x: i32) -> f32:\n    return bitcast_f32(x)\n",
-            "fn probe(x: f16) -> u32:\n    return bitcast_u32(x)\n",
-        ] {
-            assert!(
-                check_source(SourceSet::new(vec![SourceFile {
-                    path: "invalid-bitcast.seismic".into(),
-                    text: source.into(),
-                }]))
-                .is_err()
-            );
-        }
-    }
-
-    #[test]
-    fn logical_quantized_components_share_the_owned_decode_recipe() {
-        let logical = entry(
-            "fn probe(x: &tensor[1, 32] q4g32s) -> (i32, i32, f32, f32, i32, i32, i32, f32):\n    return quantized_code(x, 0, 0), quantized_code(x, 0, 1), quantized_scale(x, 0, 0), quantized_bias(x, 0, 0), quantized_group_size(x, 0, 0), quantized_code_min(x, 0, 0), quantized_code_max(x, 0, 0), f32(x[0, 0])\n",
-        );
-        // One canonical q4g32s packet: 16 code bytes, the f16 scale, and
-        // padding to the packet's 4-byte alignment.
-        let mut bytes = vec![0xf0; 20];
-        bytes[16..18].copy_from_slice(&0x3800u16.to_le_bytes());
-        bytes[18..].fill(0);
-        let mut interpreter = Interpreter::new(&logical);
-        let tensor = interpreter.add_tensor(
-            TensorData::encoded(
-                crate::registry::representation("q4g32s").unwrap(),
-                vec![1, 32],
-                bytes,
-            )
-            .unwrap(),
-        );
-        let outcome = interpreter.run(&[Arg::Tensor(tensor)]).unwrap();
-        let values = outcome
-            .results()
-            .map(|result| match result.value() {
-                OutcomeValue::Scalar(value) => value,
-                _ => panic!("scalar result"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            values,
-            [
-                ReferenceScalar::I32(-8),
-                ReferenceScalar::I32(7),
-                ReferenceScalar::F32(0.5f32.to_bits()),
-                ReferenceScalar::F32(0),
-                ReferenceScalar::I32(32),
-                ReferenceScalar::I32(-8),
-                ReferenceScalar::I32(7),
-                ReferenceScalar::F32((-4f32).to_bits())
-            ]
-        );
-        let module = check_source(SourceSet::new(vec![SourceFile {
-            path: "invalid-component.seismic".into(),
-            text: "fn probe(x: &tensor[1] f32) -> i32:\n    return quantized_code(x, 0)\n".into(),
-        }]))
-        .unwrap();
-        assert!(
-            module
-                .entry(
-                    module.entry_named("probe").unwrap(),
-                    &ElementBindings::default()
-                )
-                .is_err()
-        );
-    }
-
     /// C1-19: a quantity converts to a float by one RNE rounding of the
     /// mathematical integer.
     #[test]
@@ -764,9 +675,7 @@ mod budget_tests {
 
     #[test]
     fn large_allocation_stops_before_materializing_elements() {
-        let entry = entry(
-            "fn probe() -> tensor[1000000000] f32:\n    let mut output = tensor[1000000000] f32\n    parallel for i in 0..1000000000:\n        output[i] = 1.0\n    return output\n",
-        );
+        let entry = entry("fn probe() -> tensor[1000000000] f32:\n    let mut output = tensor[1000000000] f32\n    parallel for i in 0..1000000000:\n        output[i] = 1.0\n    return output\n");
         assert!(matches!(
             Interpreter::new(&entry).run_bounded(&[], 128),
             Err(OracleError::WorkLimit { limit: 128 })
@@ -791,9 +700,7 @@ mod budget_tests {
     #[test]
     fn outcome_owns_backing_after_entry_is_gone_without_copying_input() {
         let (outcome, address) = {
-            let entry = entry(
-                "fn probe[N,W](x: &tensor[N,W] f32) -> tensor[W] f32:\n    let mut row = to_owned(x[0])\n    for j in 0..W:\n        row[j] = row[j] + 1.0\n    return row\n",
-            );
+            let entry=entry("fn probe[N,W](x: &tensor[N,W] f32) -> tensor[W] f32:\n    let mut row = to_owned(x[0])\n    for j in 0..W:\n        row[j] = row[j] + 1.0\n    return row\n");
             let tensor = TensorData::dense(DType::F32, vec![2, 3], vec![1., 2., 3., 4., 5., 6.]);
             let address = match &tensor {
                 TensorData::Dense { bytes, .. } => bytes.as_ptr(),
@@ -864,9 +771,7 @@ mod budget_tests {
 
     #[test]
     fn associations_follow_executed_helpers_and_not_inactive_branches() {
-        let entry = entry(
-            "fn helper[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe[N](x: &tensor[N] f32, enabled: bool) -> f32:\n    let mut result = 0.0\n    if enabled:\n        result = helper(x)\n    return result\n",
-        );
+        let entry=entry("fn helper[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe[N](x: &tensor[N] f32, enabled: bool) -> f32:\n    let mut result = 0.0\n    if enabled:\n        result = helper(x)\n    return result\n");
         for enabled in [false, true] {
             let mut interpreter = Interpreter::new(&entry);
             let index =
@@ -882,9 +787,7 @@ mod budget_tests {
     }
     #[test]
     fn final_mutated_input_and_snapshot_are_owned_together() {
-        let entry = entry(
-            "fn probe[N](x: &mut tensor[N] f32) -> tensor[N] f32:\n    let snapshot = to_owned(x)\n    for i in 0..N:\n        x[i] = x[i] + 1.0\n    return snapshot\n",
-        );
+        let entry=entry("fn probe[N](x: &mut tensor[N] f32) -> tensor[N] f32:\n    let snapshot = to_owned(x)\n    for i in 0..N:\n        x[i] = x[i] + 1.0\n    return snapshot\n");
         let mut interpreter = Interpreter::new(&entry);
         let index = interpreter.add_tensor(TensorData::dense(DType::F32, vec![2], vec![2., 3.]));
         let outcome = interpreter.run(&[Arg::Tensor(index)]).unwrap();
@@ -900,9 +803,7 @@ mod budget_tests {
     }
     #[test]
     fn shared_arguments_keep_one_backing_and_repeated_associations_stay_bounded() {
-        let entry = entry(
-            "fn helper[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe[N](x: &tensor[N] f32, y: &tensor[N] f32, times: range[N]) -> f32:\n    let mut result = 0.0\n    for i in times:\n        result = helper(x) + helper(y)\n    return result\n",
-        );
+        let entry=entry("fn helper[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe[N](x: &tensor[N] f32, y: &tensor[N] f32, times: range[N]) -> f32:\n    let mut result = 0.0\n    for i in times:\n        result = helper(x) + helper(y)\n    return result\n");
         let mut counts = Vec::new();
         for times in [2, 2, 2] {
             let mut interpreter = Interpreter::new(&entry);
@@ -930,9 +831,7 @@ mod budget_tests {
     }
     #[test]
     fn range_loops_preserve_actual_endpoints_and_executed_associations() {
-        let entry = entry(
-            "fn helper(x: &tensor[4] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe(x: &tensor[4] f32, times: range[4]) -> f32:\n    let mut result = 0.0\n    for i in times:\n        result = result + x[i] + helper(x)\n    return result\n",
-        );
+        let entry = entry("fn helper(x: &tensor[4] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe(x: &tensor[4] f32, times: range[4]) -> f32:\n    let mut result = 0.0\n    for i in times:\n        result = result + x[i] + helper(x)\n    return result\n");
         for (start, end, expected) in [
             (0, 0, 0.0),
             (2, 2, 0.0),
@@ -964,9 +863,7 @@ mod budget_tests {
 
     #[test]
     fn statically_empty_loop_does_not_collect_body_associations() {
-        let entry = entry(
-            "fn helper[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe[N](x: &tensor[N] f32) -> f32:\n    let mut result = 0.0\n    for i in 0..0:\n        result = helper(x)\n    return result\n",
-        );
+        let entry=entry("fn helper[N](x: &tensor[N] f32) -> f32:\n    return reduce(x, 0, sum, unordered=true)\n\nfn probe[N](x: &tensor[N] f32) -> f32:\n    let mut result = 0.0\n    for i in 0..0:\n        result = helper(x)\n    return result\n");
         let mut interpreter = Interpreter::new(&entry);
         let index = interpreter.add_tensor(TensorData::dense(DType::F32, vec![2], vec![1., 2.]));
         let outcome = interpreter.run(&[Arg::Tensor(index)]).unwrap();
@@ -988,9 +885,7 @@ mod budget_tests {
     }
     #[test]
     fn narrow_payloads_survive_helpers_views_and_scalar_publication() {
-        let entry = entry(
-            "fn keep(x: f16) -> f16:\n    return x\n\nfn probe(x: &tensor[2] f16) -> tensor[2] f16:\n    let mut result = to_owned(x)\n    result[0] = keep(x[0])\n    result[1] = abs(x[1])\n    return result\n",
-        );
+        let entry = entry("fn keep(x: f16) -> f16:\n    return x\n\nfn probe(x: &tensor[2] f16) -> tensor[2] f16:\n    let mut result = to_owned(x)\n    result[0] = keep(x[0])\n    result[1] = abs(x[1])\n    return result\n");
         let bytes = [0xfc01u16, 0xfc01]
             .into_iter()
             .flat_map(u16::to_le_bytes)
@@ -1021,9 +916,7 @@ mod budget_tests {
     }
     #[test]
     fn natural_argument_and_result_transport_retains_the_upper_sign_bit() {
-        let entry = entry(
-            "fn keep[N](shape: &tensor[0, N] f32, x: index[N]) -> index[N]:\n    return x\n\nfn probe[N](shape: &tensor[0, N] f32, x: index[N]) -> index[N]:\n    return keep(shape, x)\n",
-        );
+        let entry = entry("fn keep[N](shape: &tensor[0, N] f32, x: index[N]) -> index[N]:\n    return x\n\nfn probe[N](shape: &tensor[0, N] f32, x: index[N]) -> index[N]:\n    return keep(shape, x)\n");
         let value = (1u64 << 63) + 17;
         let mut interpreter = Interpreter::new(&entry);
         // A zero-element tensor supplies a full-width natural shape binding without

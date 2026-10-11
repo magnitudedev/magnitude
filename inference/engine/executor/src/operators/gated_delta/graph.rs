@@ -8,11 +8,11 @@
 //! tables select which version (bank and tape rows) each slot reads and which
 //! bank it publishes to.
 
-use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::graph::{draft::GraphDraft, GraphError};
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
-    ModelLoadPlan, RecurrentBinding, StateResourcePlan,
     native::{RecurrentKernels, RecurrentStepKernels},
+    ModelLoadPlan, RecurrentBinding, StateResourcePlan,
 };
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -291,7 +291,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     alpha_weight: (&alpha_weight).into(),
                     beta_weight: (&beta_weight).into(),
                     epsilon: block.epsilon,
-                },            )
+                },
+            )
             .map(|projection| projection.value)
     };
     let dimensions = [
@@ -340,7 +341,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     epsilon: block.epsilon,
                     grouped: block.grouped,
                     slab_banks: block.slab_banks,
-                },            )?
+                },
+            )?
             .value
     } else {
         match kernels.step {
@@ -368,42 +370,45 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                             epsilon: block.epsilon,
                             grouped: block.grouped,
                             slab_banks: block.slab_banks,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             RecurrentStepEntries::Convolved { project, step } => {
                 // The projection launch convolves and publishes the successor
                 // windows; the step advances from its convolved channels.
-                let projected = graph.enqueue(
-                    project,
-                    &[
-                        ("M", block.rows),
-                        ("B", block.slots),
-                        ("S", banks),
-                        ("H", block.hidden),
-                        ("NK", block.key_heads),
-                        ("NV", block.value_heads),
-                        ("W", block.width),
-                        ("C", block.convolution_width),
-                        ("T", tape_rows),
-                    ],
-                    gated_delta_project_convolved::WorkflowArgs {
-                        hidden: hidden.into(),
-                        input_norm: (&input_norm).into(),
-                        qkv_weight: (&qkv_weight).into(),
-                        gate_weight: (&gate_weight).into(),
-                        alpha_weight: (&alpha_weight).into(),
-                        beta_weight: (&beta_weight).into(),
-                        convolution: (&convolution).into(),
-                        segments: controls.segments.tensor().into(),
-                        stop: controls.stop.tensor().into(),
-                        previous_bank: controls.previous_bank.tensor().into(),
-                        previous_tape: controls.previous_tape.tensor().into(),
-                        following_bank: controls.following_bank.tensor().into(),
-                        window: window.tensor_mut().into(),
-                        epsilon: block.epsilon,
-                        slab_banks: block.slab_banks,
-                    },                )?;
+                let projected = graph
+                    .enqueue(
+                        project,
+                        &[
+                            ("M", block.rows),
+                            ("B", block.slots),
+                            ("S", banks),
+                            ("H", block.hidden),
+                            ("NK", block.key_heads),
+                            ("NV", block.value_heads),
+                            ("W", block.width),
+                            ("C", block.convolution_width),
+                            ("T", tape_rows),
+                        ],
+                        gated_delta_project_convolved::WorkflowArgs {
+                            hidden: hidden.into(),
+                            input_norm: (&input_norm).into(),
+                            qkv_weight: (&qkv_weight).into(),
+                            gate_weight: (&gate_weight).into(),
+                            alpha_weight: (&alpha_weight).into(),
+                            beta_weight: (&beta_weight).into(),
+                            convolution: (&convolution).into(),
+                            segments: controls.segments.tensor().into(),
+                            stop: controls.stop.tensor().into(),
+                            previous_bank: controls.previous_bank.tensor().into(),
+                            previous_tape: controls.previous_tape.tensor().into(),
+                            following_bank: controls.following_bank.tensor().into(),
+                            window: window.tensor_mut().into(),
+                            epsilon: block.epsilon,
+                            slab_banks: block.slab_banks,
+                        },
+                    )?;
                 graph
                     .enqueue(
                         step,
@@ -433,7 +438,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                             epsilon: block.epsilon,
                             grouped: block.grouped,
                             slab_banks: block.slab_banks,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
         }
@@ -451,7 +457,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
-            },        )?
+            },
+        )?
         .value;
     Ok((
         output,

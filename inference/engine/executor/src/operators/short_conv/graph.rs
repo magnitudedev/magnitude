@@ -6,10 +6,10 @@
 //! window alone.
 
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
-use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::graph::{draft::GraphDraft, GraphError};
+use crate::programs::native_target_graph::{weight, WeightPort};
 use crate::{
-    ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, native::ShortConvKernels,
+    native::ShortConvKernels, ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan,
 };
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
@@ -120,11 +120,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     let projection = graph
         .enqueue(
             kernels.project,
-            &[
-                shape.project_dimensions(block.rows).as_slice(),
-                &[("BS", 0), ("CS", 0), ("XS", 0)],
-            ]
-            .concat(),
+            &[shape.project_dimensions(block.rows).as_slice(), &[("BS", 0), ("CS", 0), ("XS", 0)]].concat(),
             short_conv_project::WorkflowArgs {
                 residual: hidden.into(),
                 norm: (&input_norm).into(),
@@ -135,7 +131,8 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 b_scale: weight_scale.into(),
                 c_scale: weight_scale.into(),
                 x_scale: weight_scale.into(),
-            },        )?
+            },
+        )?
         .value;
     let dimensions = shape.rows_dimensions(block.rows, block.slots, banks, tape_rows);
     let input = |graph: &mut G, name: &str| graph.input_for(kernels.rows, name, &dimensions);
@@ -160,7 +157,8 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 following_bank: controls.following_bank.tensor().into(),
                 window: window.tensor_mut().into(),
                 slab_banks: block.slab_banks,
-            },        )?
+            },
+        )?
         .value;
     // One output head of every channel.
     let gated = gated.reshape(&[block.rows, 1, shape.channels]);
@@ -172,7 +170,8 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
-            },        )?
+            },
+        )?
         .value;
     Ok((output, window, controls))
 }
@@ -181,13 +180,13 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
-        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
-        source_element,
+        resident_layout, source_element, ComponentSelection, ExecutionPath,
+        FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity,
+        ResourceLimits, ResourcePlanner,
     };
     use magnitude_artifacts::{
-        ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
         gguf::{Encoding, TensorDescriptor},
+        ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
@@ -195,7 +194,8 @@ mod tests {
         HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
         KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm,
         Rotary, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
-        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
+        WeightDescriptor,
     };
     use magnitude_state::KvCodec;
     use seismic::BackendName;
@@ -363,7 +363,9 @@ mod tests {
         let definition = ModelDefinition {
             family: FamilyId("lfm2-shaped".into()),
             artifact_identity: identity,
-            inputs: InputSemantics { coordinate_axes: 1 },
+            inputs: InputSemantics {
+                coordinate_axes: 1,
+            },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: HIDDEN,
@@ -480,10 +482,7 @@ mod tests {
                 magnitude_state::KvCodec::Dense,
             )
             .unwrap();
-            assert!(
-                demand.streamed_bytes > 0 && demand.launches > 0,
-                "{backend:?}"
-            );
+            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
         }
     }
 }

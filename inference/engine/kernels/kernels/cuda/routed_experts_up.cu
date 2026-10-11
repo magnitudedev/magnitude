@@ -14,17 +14,6 @@
 using GShape = projection::GemmShape<32, 2, 4, 3>;
 using element::Act;
 
-// Convert each semantic normalized row once; all routed groups reuse it.
-#ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_STAGE
-template <unsigned OPERAND>
-__global__ void routed_experts_up_stage(SEISMIC_KERNEL_PARAMS) {
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
-    const projection::Plain<Act, projection::AllRows> source{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, projection::AllRows{}};
-    projection::materialize_operand_row<Operands>(source, blockIdx.x, SEISMIC_DIM_H,
-        SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED));
-}
-#endif
-
 // The expert of grouped block `block` (-1 for an unused block).
 #define ROUTED_BLOCK_EXPERT(block) \
     (reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_BLOCKS))[(block) * SEISMIC_BLOCKS_STRIDE_0])
@@ -32,10 +21,7 @@ __global__ void routed_experts_up_stage(SEISMIC_KERNEL_PARAMS) {
 #define ROUTED_BLOCK_ORDER(block) \
     (reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_ORDER)) + (block) * SEISMIC_ORDER_STRIDE_0)
 
-#ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_EXPAND
-template <unsigned OPERAND>
-__global__ void routed_experts_up_expand(SEISMIC_KERNEL_PARAMS) {
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+extern "C" __global__ void routed_experts_up_expand(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     const projection::u64 block = blockIdx.z;
     const int expert = ROUTED_BLOCK_EXPERT(block);
@@ -47,24 +33,19 @@ __global__ void routed_experts_up_expand(SEISMIC_KERNEL_PARAMS) {
         return;
     const projection::u64 rows = block * SEISMIC_DIM_T;
     const auto epi = projection::scaling<true>::wrap(
-        projection::Activated<typename Operands::Storage, Act>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
+        projection::Activated<Act>{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
                                    SEISMIC_DIM_F, (int)SEISMIC_PARAM_ACTIVATION},
         projection::scale_factor(SEISMIC_PTR(SEISMIC_BUFFER_UP_SCALE), SEISMIC_DIM_E,
                                  SEISMIC_UP_SCALE_STRIDE_0, (projection::u64)expert), 1.0f);
-    const routed::GroupedRows source{OPERAND == 1 ? SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_STAGED) : SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED),
-                                     OPERAND == 1 ? SEISMIC_DIM_H : SEISMIC_NORMALIZED_STRIDE_0, order,
+    const routed::GroupedRows source{SEISMIC_PTR(SEISMIC_BUFFER_NORMALIZED), SEISMIC_NORMALIZED_STRIDE_0, order,
                                      SEISMIC_ORDER_STRIDE_1};
-    projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
+    projection::gemm_segment<GShape>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_H,
                                      blockIdx.x, SEISMIC_DIM_F,
                                      KERNEL_W0_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_UP), expert),
                                      projection::NoWeight{}, epi);
 }
-#endif
 
-#ifdef SEISMIC_FORMING_ROUTED_EXPERTS_UP_DOWN
-template <unsigned OPERAND>
-__global__ void routed_experts_up_down(SEISMIC_KERNEL_PARAMS) {
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
+extern "C" __global__ void routed_experts_up_down(SEISMIC_KERNEL_PARAMS) {
     extern __shared__ uint4 dynamic_shared[];
     const projection::u64 block = blockIdx.z;
     const int expert = ROUTED_BLOCK_EXPERT(block);
@@ -79,9 +60,8 @@ __global__ void routed_experts_up_down(SEISMIC_KERNEL_PARAMS) {
                                      SEISMIC_RESULT_0_STRIDE_1, 0};
     const projection::ActivationRows source{SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_PRODUCT) + rows * SEISMIC_DIM_F * 2,
                                             SEISMIC_DIM_F};
-    projection::gemm_segment<GShape, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
+    projection::gemm_segment<GShape>(reinterpret_cast<projection::u8 *>(dynamic_shared), source, live, SEISMIC_DIM_F,
                                      blockIdx.x, SEISMIC_DIM_H,
                                      KERNEL_W1_MATRIX(SEISMIC_PTR(SEISMIC_BUFFER_EXPERT_DOWN), expert),
                                      projection::NoWeight{}, epi);
 }
-#endif

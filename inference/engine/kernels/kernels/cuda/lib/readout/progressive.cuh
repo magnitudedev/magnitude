@@ -16,12 +16,6 @@
 #include "../projection/projection.cuh"
 #include "../core/gumbel.cuh"
 
-#define PROGRESSIVE_LOW_PLANES unsigned(SEISMIC_DIM_P)
-#define PROGRESSIVE_HALF_BITS (PROGRESSIVE_LOW_PLANES + 1u)
-#define PROGRESSIVE_OFFSET (1u << (2u * PROGRESSIVE_HALF_BITS - 1u))
-#define PROGRESSIVE_COARSE_SCALE (1u << PROGRESSIVE_HALF_BITS)
-#define PROGRESSIVE_COARSE_BIAS (0.5f * float(PROGRESSIVE_COARSE_SCALE - 1u) - float(PROGRESSIVE_OFFSET))
-
 #define PROGRESSIVE_ROWS 8u
 #define PROGRESSIVE_CHUNK 1024u
 #define PROGRESSIVE_MARGIN 3.814697265625e-06f
@@ -58,7 +52,7 @@ template <int J> __device__ __forceinline__ float byte(u32 word, float bias) {
 }
 
 constexpr float UNSIGNED = 8388608.0f;  // 2^23
-constexpr float SIGNED = 8388608.0f + float(PROGRESSIVE_OFFSET);    // 2^23 + 128
+constexpr float SIGNED = 8388736.0f;    // 2^23 + 128
 
 // The 32 activations of one group, as pairs (2p, 2p + 1).
 struct X {
@@ -112,10 +106,10 @@ __device__ __forceinline__ Codes exact_codes(const Group &group) {
     Codes codes;
 #pragma unroll
     for (u32 q = 0; q < 4; ++q) {
-        const u32 low = (quarter(group.bit3, q) << PROGRESSIVE_LOW_PLANES) | (quarter(group.rest0, q) << (PROGRESSIVE_LOW_PLANES - 1u)) |
+        const u32 low = (quarter(group.bit3, q) << 3) | (quarter(group.rest0, q) << 2) |
                         (quarter(group.rest1, q) << 1) | quarter(group.rest2, q);
-        decode<true>(((high[q] & 0x0f0f0f0fu) << PROGRESSIVE_HALF_BITS) | (low & 0x0f0f0f0fu),
-                     ((high[q] & 0xf0f0f0f0u) >> (4u - PROGRESSIVE_HALF_BITS)) | ((low >> 4) & 0x0f0f0f0fu), q, codes);
+        decode<true>(((high[q] & 0x0f0f0f0fu) << 4) | (low & 0x0f0f0f0fu),
+                     (high[q] & 0xf0f0f0f0u) | ((low >> 4) & 0x0f0f0f0fu), q, codes);
     }
     return codes;
 }
@@ -180,11 +174,6 @@ struct Selection {
     u64 mask_row, mask_word;
     const int *constrained;
     u64 constrained_stride;
-    float softcap;
-
-    __device__ __forceinline__ float transform(float logit) const {
-        return softcap > 0.0f ? functions::softcap(softcap, logit) : logit;
-    }
 
     __device__ __forceinline__ bool competes(u32 m, u32 v) const {
         return constrained[m * constrained_stride] == 0 ||
@@ -192,7 +181,7 @@ struct Selection {
     }
     __device__ __forceinline__ float divisor(u32 m) const { return temperature[m * temperature_stride]; }
     __device__ __forceinline__ float score(u32 m, u32 v, float logit) const {
-        return __fadd_rn(__fdiv_rn(transform(logit), divisor(m)), gumbel::noise(v, draws + m * draw_row, draw_word));
+        return __fadd_rn(__fdiv_rn(logit, divisor(m)), gumbel::noise(v, draws + m * draw_row, draw_word));
     }
     __device__ __forceinline__ bool survives(u32 m, u32 v, float logit, float reach, float threshold) const {
         if (!(logit > -infinity()) || !competes(m, v))
@@ -273,15 +262,7 @@ struct Planes {
     u64 scale_stride;
 
     __device__ __forceinline__ uint4 high(u32 v, u32 g) const {
-        if constexpr (PROGRESSIVE_LOW_PLANES == 3u)
-            return *reinterpret_cast<const uint4 *>(top + v * top_stride + 4u * g);
-        const uint2 words = *reinterpret_cast<const uint2 *>(top + v * top_stride + 2u * g);
-        const u32 packed[2] = {words.x, words.y};
-        u32 high[4] = {};
-#pragma unroll
-        for (u32 k = 0; k < 32u; ++k)
-            high[k / 8u] |= ((packed[k / 16u] >> (2u * (k % 16u))) & 3u) << (4u * (k % 8u));
-        return make_uint4(high[0], high[1], high[2], high[3]);
+        return *reinterpret_cast<const uint4 *>(top + v * top_stride + 4u * g);
     }
     __device__ __forceinline__ float scale(u32 v, u32 g) const {
         return seismic_f16_to_f32(scales[v * scale_stride + g]);
@@ -289,7 +270,7 @@ struct Planes {
     __device__ __forceinline__ u32 third(u32 v, u32 g) const { return bit3[v * bit3_stride + g]; }
     __device__ __forceinline__ Group group(u32 v, u32 g) const {
         const u32 *low = rest + v * rest_row + g * rest_group;
-        return Group{high(v, g), third(v, g), low[0], PROGRESSIVE_LOW_PLANES == 3u ? low[rest_plane] : 0u, PROGRESSIVE_LOW_PLANES == 3u ? low[2 * rest_plane] : 0u, scale(v, g)};
+        return Group{high(v, g), third(v, g), low[0], low[rest_plane], low[2 * rest_plane], scale(v, g)};
     }
 };
 
@@ -363,8 +344,8 @@ __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, con
                 if constexpr (EXACT) {
                     acc[r][m] = __fadd_rn(acc[r][m], exact(group[r].scale, codes, x));
                 } else {
-                    const float view = seismic_fma_rn(float(PROGRESSIVE_COARSE_SCALE), codes_dot(codes, x),
-                                                      __fmul_rn(PROGRESSIVE_COARSE_BIAS, sums[m * 32 + lane]));
+                    const float view = seismic_fma_rn(16.0f, codes_dot(codes, x),
+                                                      __fmul_rn(-120.5f, sums[m * 32 + lane]));
                     acc[r][m] = seismic_fma_rn(group[r].scale, view, acc[r][m]);
                 }
             }
@@ -380,7 +361,7 @@ __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, con
             const float logit = warp_sum(acc[r][m]);
             if (v >= vocabulary || lane != m)
                 continue;
-            logits[m * logit_row + v * logit_col] = EXACT ? selection.transform(logit) : logit;
+            logits[m * logit_row + v * logit_col] = logit;
             if (!EXACT && selection.competes(m, v)) {
                 // A score is its noise-free score plus noise of at most
                 // PROGRESSIVE_NOISE: a row that cannot reach the threshold so
@@ -388,7 +369,7 @@ __device__ __forceinline__ void scan(const u8 *features, u64 feature_stride, con
                 const float lower =
                     __fsub_rn(logit, __fmul_rn(radius[v * radius_stride], lengths[m * length_stride]));
                 const u32 best = *reinterpret_cast<volatile const u32 *>(&lowest[m]);
-                if (best == 0u || __fdiv_rn(selection.transform(lower), selection.divisor(m)) + PROGRESSIVE_NOISE >= value_of(best))
+                if (best == 0u || __fdiv_rn(lower, selection.divisor(m)) + PROGRESSIVE_NOISE >= value_of(best))
                     atomicMax(&lowest[m], key(selection.score(m, v, lower)));
             }
         }
@@ -450,7 +431,7 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
                         for (u32 p = 0; p < 4; ++p)
                             sum = __fadd_rn(sum, __fadd_rn(x.pair[4 * q + p].x, x.pair[4 * q + p].y));
                     }
-                    acc = seismic_fma_rn(planes.scale(v, g), seismic_fma_rn(float(1u << PROGRESSIVE_LOW_PLANES), dot, __fmul_rn(-float(1u << (PROGRESSIVE_LOW_PLANES - 1u)), sum)), acc);
+                    acc = seismic_fma_rn(planes.scale(v, g), seismic_fma_rn(8.0f, dot, __fmul_rn(-4.0f, sum)), acc);
                 } else {
                     const Group group = planes.group(v, g);
                     acc = __fadd_rn(acc, exact(group.scale, exact_codes(group), x));
@@ -460,7 +441,7 @@ __device__ __forceinline__ void gather(const u8 *features, u64 feature_stride, c
             if (lane != 0)
                 continue;
             const float logit = REFINE ? __fadd_rn(coarse[m * coarse_row + v * coarse_col], acc) : acc;
-            out[m * out_row + v * out_col] = REFINE ? logit : selection.transform(logit);
+            out[m * out_row + v * out_col] = logit;
             if (REFINE && selection.competes(m, v))
                 atomicMax(&lowest[m],
                           key(selection.score(m, v, __fsub_rn(logit, __fmul_rn(radius_next[v * radius_stride],

@@ -3,14 +3,14 @@ use super::{
     ProgramPlan,
 };
 use crate::error::PlanError;
-use crate::{ExecutionPath, operators};
+use crate::{operators, ExecutionPath};
 use magnitude_artifacts::{
-    ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest,
     gguf::{Encoding, TensorDescriptor},
+    ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest,
 };
 use magnitude_family_contracts::{
-    ActivationDType, HeadComponent, ImportTransform, ModelDefinition, ProgressiveCodeDepth,
-    ProgressivePlane, VisionDescription, WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    ActivationDType, ImportTransform, ModelDefinition, ProgressivePlane, VisionDescription,
+    WeightDescriptor, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{BackendName, DType, Element, Layout};
@@ -54,15 +54,7 @@ impl WeightPlan {
     /// progressive plane): the device holds them as uploaded, with no import
     /// entry.
     pub fn placed_on_host(&self) -> bool {
-        self.progressive_depth().is_some()
-    }
-
-    /// The source code depth retained by a progressive placement.
-    pub(crate) fn progressive_depth(&self) -> Option<ProgressiveCodeDepth> {
-        match self.descriptor.transforms[..] {
-            [ImportTransform::Progressive { depth, .. }] => Some(depth),
-            _ => None,
-        }
+        matches!(self.descriptor.transforms[..], [ImportTransform::Progressive(_)])
     }
 
     /// Every resident byte of the weight: its representation and its scale.
@@ -234,10 +226,7 @@ impl AttentionShape {
 
     /// Cache publication has no query-head or gate geometry.
     pub fn append_statics(&self) -> Vec<(&'static str, u64)> {
-        self.mix_statics()
-            .into_iter()
-            .filter(|(name, _)| !matches!(*name, "G" | "I" | "U"))
-            .collect()
+        self.mix_statics().into_iter().filter(|(name, _)| !matches!(*name, "G" | "I" | "U")).collect()
     }
 
     /// The fused entries' dimensions for `rows` rows over `history_rows`
@@ -282,7 +271,7 @@ pub struct AttentionBinding {
     pub output: Element,
     pub activation: Element,
     /// How the block's history planes encode keys and values.
-    pub history: magnitude_state::CodecSpec,
+    pub history: KvCodec,
     pub tail: SublayerTail,
 }
 
@@ -294,10 +283,7 @@ pub enum SublayerTail {
     Residual,
     /// `(residual + RMS(projection)·norm)·scale`, the norm weight's element;
     /// `scaled` when the scale is the layer's output scale (else 1).
-    PostNorm {
-        norm: Element,
-        scaled: bool,
-    },
+    PostNorm { norm: Element, scaled: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -326,8 +312,6 @@ pub struct DenseBinding {
     pub up: Element,
     pub down: Element,
     pub activation: Element,
-    /// The semantic activation code of the expansion (functions.seismic).
-    pub function: i32,
     pub tail: SublayerTail,
     pub scales: DenseScales,
 }
@@ -368,7 +352,6 @@ pub struct DenseBranchBinding {
     pub up: Element,
     pub down: Element,
     pub activation: Element,
-    pub function: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -403,26 +386,8 @@ pub enum ReadoutHead {
     /// The output projection's resident element and the extent of its
     /// accumulator-scale port.
     Packed { weight: Element, weight_scale: u64 },
-    /// Canonical packed projection plus cost-qualified bounded classes.
-    Qualified { weight: Element, weight_scale: u64 },
-}
-
-impl ReadoutHead {
-    pub fn packed(self) -> ScalableWeight {
-        match self {
-            Self::Packed {
-                weight,
-                weight_scale,
-            }
-            | Self::Qualified {
-                weight,
-                weight_scale,
-            } => ScalableWeight {
-                element: weight,
-                scale: weight_scale,
-            },
-        }
-    }
+    /// Its progressive planes (`ModelLoadPlan::with_progressive_head`).
+    Progressive,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -440,77 +405,17 @@ pub struct HeadBinding {
     pub attention: AttentionBinding,
     pub feed_forward: FeedForwardProgramSlot,
     pub output_norm: Element,
-    pub projection: ReadoutHead,
+    pub projection: HeadProjection,
     pub activation: Element,
 }
 
-/// Completed first-load physical choice of one reader of a projection scope.
-/// The scope is stored as its views; the reader's listed selected-row classes
-/// use bounded readout, and its other classes, and the scope's other
-/// readers, the views' full pass.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadoutClassChoice {
-    pub scope: WeightScope,
-    pub norm_scope: WeightScope,
-    pub prepared: bool,
-    pub rows: Vec<u64>,
-}
-
-/// What a load is planned to hold in host RAM at its most, by what holds
-/// it. Each term is derived from what is planned; what a load holds on the
-/// host that no term here names (its prepared kernels and their records,
-/// its domain's bookkeeping) is outside the plan, so the sum is at most the
-/// load's host peak.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HostPeak {
-    /// The host-resident gathered tables.
-    pub tables: u64,
-    /// The largest weight the host prepares or places, held whole while it
-    /// is imported ([`ModelLoadPlan::host_staging_peak_bytes`]).
-    pub staging: u64,
-    /// The sealed graphs' plans, held from sealing on.
-    pub sealed_graphs: u64,
-    /// The sealed graphs' bound instances, made when the domain is
-    /// allocated, after the import.
-    pub bound_graphs: u64,
-}
-
-impl HostPeak {
-    /// What a load holds on the host that no term names, by holder. Each
-    /// is real growth of a load that whatever is held to the planned peak
-    /// is not given: a search refused for bytes names them, so that what
-    /// its ceiling lacks can be read against what would supply it.
-    pub const UNPLANNED: &'static [&'static str] = &[
-        "prepared kernels: loaded modules, their records and receipts",
-        "sealing span beyond its planned terms: readout graphs, head, draft, shared-head and \
-         vision graphs, and what certification leaves live",
-        "bindings of the readout, head, draft, shared-head and vision graphs",
-        "graph pools and residency bookkeeping",
-        "warm-up",
-        "allocator rounding of every planned block",
-    ];
-
-    /// The planned host peak. Graphs are sealed before the import begins
-    /// and bound after it ends, so the tables and the sealed plans are held
-    /// with the staged weight during the import and with the bound
-    /// instances after it: the larger of the two.
-    pub fn bytes(&self) -> Result<u64, String> {
-        self.tables
-            .checked_add(self.process_bytes()?)
-            .ok_or_else(|| "planned host peak overflows".to_owned())
-    }
-
-    /// The part of the planned host peak that is the load process's own
-    /// memory: everything but the tables. A host table is read by row from
-    /// its artifact (`HostTable` holds the file and an offset), so its
-    /// bytes are the system's cache of that file, a claim on system RAM
-    /// that no process's footprint counts. What a process may hold and
-    /// stay under the load is this.
-    pub fn process_bytes(&self) -> Result<u64, String> {
-        self.sealed_graphs
-            .checked_add(self.staging.max(self.bound_graphs))
-            .ok_or_else(|| "planned host peak overflows".to_owned())
-    }
+/// How a draft head projects onto the target's output head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HeadProjection {
+    /// The output projection's resident element.
+    Packed(Element),
+    /// Its progressive planes (`ModelLoadPlan::with_progressive_head`).
+    Progressive,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -520,24 +425,6 @@ pub struct ModelLoadPlan {
     pub(super) vision: Option<Vec<WeightPlan>>,
     /// The target's host-resident gathered tables.
     pub(super) host_tables: Vec<HostTablePlan>,
-    /// Optional lossless readout views used only for first-load qualification.
-    /// They are not resident requirements until a served class selects them.
-    pub(super) readout_candidates: Vec<WeightPlan>,
-    pub(super) readout_choices: Vec<ReadoutClassChoice>,
-    /// The output projections of the scopes stored as planes
-    /// ([`ModelLoadPlan::finalize_readout`]): planned, so bindings that name
-    /// them stand and their demand is derived, and not placed. A weight has
-    /// one stored form.
-    pub(super) unplaced_output: Vec<WeightPlan>,
-}
-
-/// Whether a readout scope's weights are planned with the head component's.
-fn head_component_scope(scope: WeightScope) -> Result<bool, String> {
-    match scope {
-        WeightScope::Target => Ok(false),
-        WeightScope::HeadBlock(_) | WeightScope::Draft => Ok(true),
-        _ => Err("qualified readout representation has an unsupported scope".into()),
-    }
 }
 
 impl ModelLoadPlan {
@@ -551,34 +438,6 @@ impl ModelLoadPlan {
             total
                 .checked_add(table.bytes)
                 .ok_or_else(|| "host table bytes overflow".to_owned())
-        })
-    }
-
-    /// The most of one target weight's import the host holds at once. A
-    /// weight uploaded as stored never lies on the host whole: its upload
-    /// is the device's (or a view of the mapped artifact), written through
-    /// a block. A weight the host prepares (transformed or dequantized) or
-    /// places itself (a progressive plane) is held on the host in its
-    /// upload representation before it is written. Imports are serialized,
-    /// so the peak is the largest such weight.
-    pub fn host_staging_peak_bytes(&self) -> u64 {
-        self.target
-            .iter()
-            .filter(|weight| weight.host_prepared() || weight.placed_on_host())
-            .map(|weight| weight.source_bytes)
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// What the load holds in host RAM at its most, by what holds it, given
-    /// the host bytes of its sealed graphs' plans and of their bound
-    /// instances.
-    pub fn host_peak(&self, sealed_graphs: u64, bound_graphs: u64) -> Result<HostPeak, String> {
-        Ok(HostPeak {
-            tables: self.host_table_bytes()?,
-            staging: self.host_staging_peak_bytes(),
-            sealed_graphs,
-            bound_graphs,
         })
     }
 
@@ -696,27 +555,12 @@ impl ModelLoadPlan {
         definition: &ModelDefinition,
         history: KvCodec,
     ) -> Result<ProgramPlan, PlanError> {
-        // Bindings name an output projection whether or not it is placed.
-        let planned = |placed: &[WeightPlan], head: bool| {
-            placed
-                .iter()
-                .chain(
-                    self.unplaced_output
-                        .iter()
-                        .filter(|weight| head_component_scope(weight.role.scope) == Ok(head)),
-                )
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let target = planned(&self.target, false);
-        let head = self.head.as_deref().map(|head| planned(head, true));
         super::programs::derive_program_plan(
             definition,
-            &target,
-            head.as_deref(),
+            &self.target,
+            self.head.as_deref(),
             self.vision.as_deref(),
             &self.host_tables,
-            &self.readout_choices,
             history,
         )
     }
@@ -836,18 +680,16 @@ impl ModelLoadPlan {
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
-        for (role, descriptor) in
-            std::iter::once((target_role(WeightKind::Embedding), &decoder.entry.embedding))
-                .chain(per_layer_weights)
-                .chain(operators::decoder_weights(decoder))
-                .chain([
-                    (
-                        target_role(WeightKind::OutputNorm),
-                        decoder.exit.norm.weight(),
-                    ),
-                    (target_role(WeightKind::Output), &decoder.exit.output),
-                ])
-        {
+        for (role, descriptor) in std::iter::once((
+            target_role(WeightKind::Embedding),
+            &decoder.entry.embedding,
+        ))
+        .chain(per_layer_weights)
+        .chain(operators::decoder_weights(decoder))
+        .chain([
+            (target_role(WeightKind::OutputNorm), decoder.exit.norm.weight()),
+            (target_role(WeightKind::Output), &decoder.exit.output),
+        ]) {
             push_weight(
                 &mut target,
                 target_tensors,
@@ -871,12 +713,7 @@ impl ModelLoadPlan {
         // An optional draft can remain in the opened package after semantic
         // admission rejected it. Only an admitted definition requires its
         // component; an unbound artifact contributes no weights to Plain.
-        // A draft head may be stored in the draft component too.
-        let separate_head = definition
-            .head
-            .as_ref()
-            .is_some_and(|head| head.component == HeadComponent::Draft);
-        if (definition.draft.is_some() || separate_head) && draft.is_none() {
+        if definition.draft.is_some() && draft.is_none() {
             return Err("draft component and draft definition disagree".into());
         }
         if selection.vision && definition.vision.is_none() {
@@ -901,25 +738,12 @@ impl ModelLoadPlan {
         };
         let head = match (selection.head, &definition.head, &definition.draft, draft) {
             (false, ..) => None,
-            (true, Some(head), None, draft) => {
-                let (tensors, component) = match (head.component, draft) {
-                    (HeadComponent::Target, _) => (target_tensors, target_component),
-                    (HeadComponent::Draft, Some((identity, tensors))) => (
-                        tensors,
-                        ArtifactComponent {
-                            kind: ArtifactComponentKind::Draft,
-                            identity,
-                        },
-                    ),
-                    (HeadComponent::Draft, None) => {
-                        return Err("the selected drafter has no component".into());
-                    }
-                };
+            (true, Some(head), None, _) => {
                 let mut plans = Vec::new();
                 push_all(
                     &mut plans,
-                    tensors,
-                    component,
+                    target_tensors,
+                    target_component,
                     operators::head_weights(head).map_err(|error| error.to_string())?,
                 )?;
                 Some(plans)
@@ -975,205 +799,76 @@ impl ModelLoadPlan {
             head,
             vision,
             host_tables,
-            readout_candidates: Vec::new(),
-            readout_choices: Vec::new(),
-            unplaced_output: Vec::new(),
         })
     }
 
-    /// Offer lossless bounded-selection views of the target's output
-    /// projection where every reader of it can read them at no loss: a Q8_0
-    /// projection without a soft cap. Indexed policies require the
-    /// canonical table, and a separate drafter that projects through the
-    /// target's projection has no kernel for the views, so there the
-    /// projection keeps its packed form, as does a head's own projection. A
-    /// view becomes resident, in place of the packed projection, only after
-    /// whole-recipe class-cost qualification.
-    pub fn with_readout_candidates(mut self, definition: &ModelDefinition) -> Result<Self, String> {
-        let mut indexed = HashSet::new();
-        if let Some(head) = &definition.head {
-            for (index, block) in head.blocks.iter().enumerate() {
-                if matches!(
-                    &block.readout.policy,
-                    magnitude_family_contracts::ProposalReadoutPolicy::Clustered { .. }
-                ) {
-                    let scope = match &block.readout.projection {
-                        magnitude_family_contracts::VocabularyProjection::Target => {
-                            WeightScope::Target
-                        }
-                        magnitude_family_contracts::VocabularyProjection::Own { .. } => {
-                            WeightScope::HeadBlock(
-                                u32::try_from(index).map_err(|_| "head block index exceeds u32")?,
-                            )
-                        }
-                    };
-                    indexed.insert(scope);
-                }
-            }
-        }
-        let select = |weights: &[WeightPlan]| -> Result<Vec<WeightPlan>, String> {
-            let mut views = Vec::with_capacity(weights.len());
-            for weight in weights {
-                // The views' full pass serves every row the bounded levels
-                // do not. It is measured against the packed projection's
-                // only for Q8_0 projections without a soft cap, so only
-                // those are offered.
-                let depth = (Some(weight.source) == source_element(Encoding::Q8_0))
-                    .then_some(ProgressiveCodeDepth::Eight);
-                let admitted = weight.role.kind == WeightKind::Output
-                    && weight.role.scope == WeightScope::Target
-                    && definition
-                        .decoder
-                        .exit
-                        .softcap
-                        .is_none_or(|cap| cap == 0.0)
-                    && !indexed.contains(&weight.role.scope)
-                    && weight.scale.is_none()
-                    && weight.descriptor.transforms.is_empty()
-                    && weight.upload == weight.source
-                    && weight.shape.len() == 2
-                    && weight.shape[1].is_multiple_of(32);
-                let Some(depth) = depth.filter(|_| admitted) else {
-                    continue;
-                };
-                for plane in ProgressivePlane::ALL {
-                    let descriptor = WeightDescriptor {
-                        transforms: vec![ImportTransform::Progressive { plane, depth }],
-                        ..weight.descriptor.clone()
-                    };
-                    let shape = descriptor
-                        .transformed_shape(&weight.shape)
-                        .map_err(|error| error.to_string())?;
-                    let element = crate::progressive::element(plane);
-                    views.push(WeightPlan {
-                        role: WeightRole {
-                            scope: weight.role.scope,
-                            kind: WeightKind::OutputPlane(plane),
-                        },
-                        component: weight.component,
-                        source: weight.source,
-                        upload: element,
-                        resident: element,
-                        source_bytes: representation_bytes(element, &shape)?,
-                        resident_bytes: representation_bytes(element, &shape)?,
-                        descriptor: WeightDescriptor {
-                            shape: shape.clone(),
-                            ..descriptor
-                        },
-                        shape,
-                        scale: None,
-                    });
-                }
-            }
-            Ok(views)
-        };
-        let drafter_reads_target = definition
-            .draft
-            .as_ref()
-            .is_some_and(|draft| draft.output.is_none())
-            && self
-                .target
-                .iter()
-                .any(|weight| weight.role.scope == WeightScope::Draft);
-        self.readout_candidates = if drafter_reads_target {
-            Vec::new()
-        } else {
-            select(&self.target)?
-        };
-        Ok(self)
-    }
-
-    /// Commit completed physical choices before resource admission. A scope
-    /// in which any reader selected a class is stored as its views: they are
-    /// placed, and its packed projection is planned and not placed
-    /// (`unplaced_output`), so every reader of the scope reads the views.
-    /// Unselected transient views are discarded.
-    pub fn finalize_readout(mut self, choices: &[ReadoutClassChoice]) -> Result<Self, String> {
-        if !self.readout_choices.is_empty() && self.readout_choices == choices {
-            return Ok(self);
-        }
-        let mut scopes = HashSet::new();
-        let mut recipes = HashSet::new();
-        for choice in choices {
-            if choice.rows.is_empty() || choice.rows.iter().any(|&rows| rows == 0) {
-                return Err("a retained readout view needs nonzero selected-row classes".into());
-            }
-            if !recipes.insert((choice.scope, choice.norm_scope, choice.prepared)) {
-                return Err("readout choices duplicate a semantic recipe".into());
-            }
-            scopes.insert(choice.scope);
-            if !ProgressivePlane::ALL.into_iter().all(|plane| {
-                self.readout_candidates.iter().any(|weight| {
-                    weight.role
-                        == WeightRole {
-                            scope: choice.scope,
-                            kind: WeightKind::OutputPlane(plane),
-                        }
-                })
-            }) {
-                return Err(
-                    "readout choice has no complete qualified candidate representation".into(),
-                );
-            }
-        }
-        for candidate in std::mem::take(&mut self.readout_candidates) {
-            if !scopes.contains(&candidate.role.scope) {
-                continue;
-            }
-            if head_component_scope(candidate.role.scope)? {
-                self.head
-                    .as_mut()
-                    .ok_or("qualified head representation has no head component")?
-                    .push(candidate);
-            } else {
-                self.target.push(candidate);
-            }
-        }
-        for scope in scopes {
-            let output = WeightRole {
-                scope,
-                kind: WeightKind::Output,
-            };
-            let placed = if head_component_scope(scope)? {
-                self.head
-                    .as_mut()
-                    .ok_or("qualified head representation has no head component")?
-            } else {
-                &mut self.target
-            };
-            let index = placed
-                .iter()
-                .position(|weight| weight.role == output)
-                .ok_or("a selected readout scope has no output projection")?;
-            self.unplaced_output.push(placed.remove(index));
-        }
-        self.readout_choices = choices.to_vec();
-        Ok(self)
-    }
-
-    /// The output projection of `scope` as planned, placed or not.
-    pub(crate) fn planned_output(&self, scope: WeightScope) -> Option<&WeightPlan> {
+    /// Place the output projection in progressive planes
+    /// (`ImportTransform::Progressive`, `WeightKind::OutputPlane`), replacing
+    /// it, when the head admits them: a Q8_0 matrix of whole groups, imported
+    /// as stored without transforms or a second-level scale, a decoder
+    /// without a logit softcap, and no selected drafter (a drafter projects
+    /// through the stored head). Otherwise the plan is unchanged.
+    pub fn with_progressive_head(mut self, definition: &ModelDefinition) -> Result<Self, String> {
         let role = WeightRole {
-            scope,
+            scope: WeightScope::Target,
             kind: WeightKind::Output,
         };
-        self.weights()
-            .chain(self.unplaced_output.iter())
-            .find(|weight| weight.role == role)
-    }
-
-    pub fn readout_choices(&self) -> &[ReadoutClassChoice] {
-        &self.readout_choices
-    }
-
-    pub(crate) fn readout_candidates(&self) -> &[WeightPlan] {
-        &self.readout_candidates
-    }
-
-    /// Preparation may import optional views under its transient budget; final
-    /// residency, assessment and ordinary graphs use only `weights()`.
-    pub(crate) fn qualification_weights(&self) -> impl Iterator<Item = &WeightPlan> {
-        self.weights().chain(self.readout_candidates.iter())
+        let index = self
+            .target
+            .iter()
+            .position(|weight| weight.role == role)
+            .ok_or("the plan has no output projection")?;
+        let output = &self.target[index];
+        // A draft head projects onto the planes too; a separate draft's
+        // readouts read the packed output projection.
+        let drafts = self
+            .target
+            .iter()
+            .any(|weight| weight.role.scope == WeightScope::Draft);
+        let admitted = !drafts
+            && output.scale.is_none()
+            && output.descriptor.transforms.is_empty()
+            && output.upload == output.source
+            && Some(output.source) == source_element(Encoding::Q8_0)
+            && output.shape.len() == 2
+            && output.shape[1].is_multiple_of(32)
+            && definition.decoder.exit.softcap.is_none_or(|cap| cap == 0.0);
+        if !admitted {
+            return Ok(self);
+        }
+        let planes = ProgressivePlane::ALL
+            .into_iter()
+            .map(|plane| {
+                let descriptor = WeightDescriptor {
+                    transforms: vec![ImportTransform::Progressive(plane)],
+                    ..output.descriptor.clone()
+                };
+                let shape = descriptor
+                    .transformed_shape(&output.shape)
+                    .map_err(|error| error.to_string())?;
+                let element = crate::progressive::element(plane);
+                Ok(WeightPlan {
+                    role: WeightRole {
+                        scope: WeightScope::Target,
+                        kind: WeightKind::OutputPlane(plane),
+                    },
+                    component: output.component,
+                    source: output.source,
+                    upload: element,
+                    resident: element,
+                    source_bytes: representation_bytes(element, &shape)?,
+                    resident_bytes: representation_bytes(element, &shape)?,
+                    descriptor: WeightDescriptor {
+                        shape: shape.clone(),
+                        ..descriptor
+                    },
+                    shape,
+                    scale: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.target.splice(index..=index, planes);
+        Ok(self)
     }
 
     pub fn weights(&self) -> impl Iterator<Item = &WeightPlan> {
@@ -1272,12 +967,7 @@ fn host_table(
     let stored = inventory
         .iter()
         .find(|tensor| tensor.name == descriptor.name)
-        .ok_or_else(|| {
-            format!(
-                "host table {:?} is absent from its component",
-                descriptor.name
-            )
-        })?;
+        .ok_or_else(|| format!("host table {:?} is absent from its component", descriptor.name))?;
     if !descriptor.transforms.is_empty() || stored.shape != descriptor.shape {
         return Err(format!(
             "host table {:?} must be the stored matrix itself",
@@ -1289,8 +979,8 @@ fn host_table(
     };
     let source = source_element(stored.encoding)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
-    let resident =
-        resident_element(stored.encoding, form.activation, form.layout).ok_or_else(|| {
+    let resident = resident_element(stored.encoding, form.activation, form.layout)
+        .ok_or_else(|| {
             format!(
                 "{:?} has no resident form in the `{}` layout",
                 stored.encoding,
@@ -1362,7 +1052,9 @@ fn push_weight(
     // vision kernels read dense weights only. The host dequantizes them
     // exactly to F32 and the device rounds once to the activation dtype.
     let (upload, resident) = match (role.kind, stored_dense) {
-        (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
+        (WeightKind::Vision(_), None) => {
+            (Element::f32(), Element::dense(form.activation))
+        }
         _ => (
             source,
             resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
@@ -1435,7 +1127,7 @@ fn weight_scale(
                 "second-level scale {tensor:?} scales {:?}, which is not a matrix or a stack of \
                  matrices",
                 descriptor.name
-            ));
+            ))
         }
     };
     let [extent] = stored.shape[..] else {
@@ -1503,51 +1195,6 @@ pub(super) fn planned_element(
 }
 
 /// The planned form of a role an entry binds with an accumulator-scale port.
-pub(super) fn planned_readout(
-    weights: &[WeightPlan],
-    scope: WeightScope,
-) -> Result<ReadoutHead, crate::PlanError> {
-    let weight = planned_scalable(weights, scope, WeightKind::Output)?;
-    Ok(ReadoutHead::Packed {
-        weight: weight.element,
-        weight_scale: weight.scale,
-    })
-}
-
-pub(super) fn planned_readout_recipe(
-    weights: &[WeightPlan],
-    scope: WeightScope,
-    choices: &[ReadoutClassChoice],
-) -> Result<ReadoutHead, crate::PlanError> {
-    let packed = planned_readout(weights, scope)?;
-    // Every reader of a scope stored as views reads them, whichever of the
-    // scope's readers selected a class.
-    if !choices
-        .iter()
-        .any(|choice| choice.scope == scope && !choice.rows.is_empty())
-    {
-        return Ok(packed);
-    }
-    if !ProgressivePlane::ALL.into_iter().all(|plane| {
-        weights.iter().any(|weight| {
-            weight.role
-                == WeightRole {
-                    scope,
-                    kind: WeightKind::OutputPlane(plane),
-                }
-        })
-    }) {
-        return Err(PlanError::Topology(
-            "qualified readout has no complete resident view",
-        ));
-    }
-    let weight = packed.packed();
-    Ok(ReadoutHead::Qualified {
-        weight: weight.element,
-        weight_scale: weight.scale,
-    })
-}
-
 pub(super) fn planned_scalable(
     plans: &[WeightPlan],
     scope: WeightScope,
@@ -1640,37 +1287,6 @@ fn representation_bytes(element: Element, shape: &[u64]) -> Result<u64, String> 
     element
         .canonical_byte_len(shape)
         .map_err(|error| format!("{} shape {shape:?}: {error}", element.name()))
-}
-
-#[cfg(test)]
-mod host_peak_tests {
-    use super::*;
-
-    /// The staged weight and the bound graph instances are never held
-    /// together (graphs are bound after the import), so the peak takes the
-    /// larger with the tables and the sealed plans, not their sum.
-    #[test]
-    fn the_planned_host_peak_is_its_terms_as_the_load_holds_them() {
-        let peak = |staging, bound_graphs| HostPeak {
-            tables: 100,
-            staging,
-            sealed_graphs: 500,
-            bound_graphs,
-        };
-        assert_eq!(peak(300, 200).bytes().unwrap(), 100 + 500 + 300);
-        assert_eq!(peak(0, 200).bytes().unwrap(), 100 + 500 + 200);
-        // The tables are the system's cache of the artifact, not the
-        // process's memory.
-        assert_eq!(peak(300, 200).process_bytes().unwrap(), 500 + 300);
-        assert!(
-            HostPeak {
-                tables: u64::MAX,
-                ..peak(1, 1)
-            }
-            .bytes()
-            .is_err()
-        );
-    }
 }
 
 #[cfg(test)]

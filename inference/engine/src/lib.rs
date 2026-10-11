@@ -8,7 +8,7 @@ pub mod chat;
 pub mod composition;
 pub mod error;
 mod execution;
-pub use execution::{build_native_domain, load_native_domain, LoadAttempt};
+pub use execution::build_native_domain;
 pub mod families;
 pub mod generation;
 pub mod host;

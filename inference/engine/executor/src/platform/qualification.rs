@@ -1,7 +1,7 @@
 use super::policy::{
-    DomainRole, MemoryPolicyError, MemoryReserves, fit_capacities, refresh_device_ceiling,
+    fit_capacities, refresh_device_ceiling, DomainRole, MemoryPolicyError, MemoryReserves,
 };
-use super::selection::{DeviceRequest, SelectionError, select};
+use super::selection::{select, DeviceRequest, SelectionError};
 use crate::{CatalogError, ExecutionPath};
 use seismic::{
     ArtifactStore, Device, DeviceCatalog, DeviceInfo, DeviceOptions, DeviceSelector,
@@ -39,21 +39,11 @@ pub struct SelectedDevice {
 pub struct OpenedPlatform {
     selector: DeviceSelector,
     device: Device,
-    /// What the engine might still claim in each of the device's memory
-    /// domains when it was opened.
-    room: crate::TuningRoom,
 }
 
 impl OpenedPlatform {
     pub fn device(&self) -> &Device {
         &self.device
-    }
-
-    /// What a search on this device is held to: what the platform let the
-    /// engine claim in each memory domain when the device was opened, its
-    /// observed availability above the planning reserve.
-    pub fn tuning_room(&self) -> crate::TuningRoom {
-        self.room
     }
 
     pub fn selector(&self) -> DeviceSelector {
@@ -143,24 +133,8 @@ pub fn open_selected(
             },
         )
         .map_err(PlatformError::Open)?;
-    let readings = refresh_device_ceiling(catalog, &device, &config.reserves)
-        .map_err(PlatformError::Memory)?;
-    let claimable = |role| {
-        readings
-            .iter()
-            .find(|reading| reading.role == role)
-            .map(|reading| reading.ceiling_bytes)
-    };
-    let room = crate::TuningRoom {
-        device_bytes: claimable(DomainRole::Allocation)
-            .expect("the readings include the allocation domain"),
-        host_bytes: claimable(DomainRole::Staging),
-    };
-    Ok(OpenedPlatform {
-        selector,
-        device,
-        room,
-    })
+    refresh_device_ceiling(catalog, &device, &config.reserves).map_err(PlatformError::Memory)?;
+    Ok(OpenedPlatform { selector, device })
 }
 
 fn enforce_phase_one(path: ExecutionPath) -> Result<(), PlatformError> {

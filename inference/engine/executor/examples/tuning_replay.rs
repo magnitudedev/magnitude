@@ -1,5 +1,5 @@
 //! Replay the production tuning search against a directory of survey records
-//! (`magnitude-harness --tuning-survey DIR`) and print the report (tuning spec
+//! (`forward_bench --tuning-survey DIR`) and print the report (tuning spec
 //! §E2/§E3). Development only.
 //!
 //! `cargo run --release -p magnitude-executor --features tuning-survey

@@ -1,8 +1,8 @@
 use super::super::*;
 use super::*;
 use crate::ReadoutHead;
-use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
 use magnitude_family_contracts::ProgressivePlane;
+use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_target(&self, device: &Device) -> Result<(), CatalogFailure> {
@@ -199,8 +199,8 @@ impl<'a> QualificationView<'a> {
                 .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
                 .value;
             let gated = match &kernels.step {
-                RecurrentStepKernels::Step(step) => {
-                    step.call(gated_delta_step::Args {
+                RecurrentStepKernels::Step(step) => step
+                    .call(gated_delta_step::Args {
                         projection: &projection,
                         convolution: &convolution,
                         rate: &rate,
@@ -220,8 +220,7 @@ impl<'a> QualificationView<'a> {
                         slab_banks: 2,
                     })
                     .map_err(|error| qualification_dynamic("gated_delta_step", &label, error))?
-                    .value
-                }
+                    .value,
                 RecurrentStepKernels::Convolved { project, step } => {
                     let projected = project
                         .call(gated_delta_project_convolved::Args {
@@ -316,7 +315,13 @@ impl<'a> QualificationView<'a> {
                 continue;
             };
             if qualified.insert(binding) {
-                qualify_state_space(device, kernels, binding, &hidden_residual, &hidden_values)?;
+                qualify_state_space(
+                    device,
+                    kernels,
+                    binding,
+                    &hidden_residual,
+                    &hidden_values,
+                )?;
             }
         }
 
@@ -394,18 +399,16 @@ impl<'a> QualificationView<'a> {
                 .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
             let result = match (&kernels.output, binding.tail) {
-                (SublayerOutput::Residual(output), SublayerTail::Residual) => {
-                    output
-                        .call(dense_output::Args {
-                            residual: &hidden_residual,
-                            product: &product,
-                            down_weight: &down,
-                            out_rows: &out_rows,
-                            down_scale: &scale(binding.scales.down)?,
-                        })
-                        .map_err(|error| qualification_dynamic("dense_output", &label, error))?
-                        .value
-                }
+                (SublayerOutput::Residual(output), SublayerTail::Residual) => output
+                    .call(dense_output::Args {
+                        residual: &hidden_residual,
+                        product: &product,
+                        down_weight: &down,
+                        out_rows: &out_rows,
+                        down_scale: &scale(binding.scales.down)?,
+                    })
+                    .map_err(|error| qualification_dynamic("dense_output", &label, error))?
+                    .value,
                 (SublayerOutput::PostNorm(tail), SublayerTail::PostNorm { norm, .. }) => {
                     qualify_post_norm(
                         device,
@@ -423,7 +426,7 @@ impl<'a> QualificationView<'a> {
                         "dense_output",
                         &label,
                         "dense output entries disagree with the binding's tail",
-                    ));
+                    ))
                 }
             };
             require_f32_values(&result, &hidden_values, "dense_output", &label)?;
@@ -509,45 +512,16 @@ impl<'a> QualificationView<'a> {
                 .value;
             require_finite_nonzero(&features, "readout_features_rows", &label)?;
             let vocabulary = self.geometry.vocabulary;
-            let readout = match &self.programs.target.readout.head {
-                ReadoutHeadKernels::Qualified {
-                    packed,
-                    progressive,
-                    ..
-                } => {
-                    qualify_progressive(
-                        device,
-                        progressive,
-                        &hidden_residual,
-                        &norm,
-                        &out_rows,
-                        (vocabulary, hidden),
-                        "target_readout",
-                        &label,
-                    )?;
-                    packed.as_ref()
-                }
-                readout => readout,
-            };
-            match (readout, binding.head) {
+            match (&self.programs.target.readout.head, binding.head) {
                 (
                     ReadoutHeadKernels::Packed { head, selected },
                     ReadoutHead::Packed {
                         weight: element,
                         weight_scale,
-                    }
-                    | ReadoutHead::Qualified {
-                        weight: element,
-                        weight_scale,
                     },
                 ) => {
-                    let weight = semantic_zeros(
-                        device,
-                        element,
-                        &[vocabulary, hidden],
-                        "target_readout",
-                        &label,
-                    )?;
+                    let weight =
+                        semantic_zeros(device, element, &[vocabulary, hidden], "target_readout", &label)?;
                     let logits = head
                         .call(readout_head_rows::Args {
                             hidden: &hidden_residual,
@@ -584,12 +558,24 @@ impl<'a> QualificationView<'a> {
                         .value;
                     require_zero_result(&selected_result, "readout_selected_rows", &label)?;
                 }
+                (ReadoutHeadKernels::Progressive(kernels), ReadoutHead::Progressive) => {
+                    qualify_progressive(
+                        device,
+                        kernels,
+                        &hidden_residual,
+                        &norm,
+                        &out_rows,
+                        (vocabulary, hidden),
+                        "target_readout",
+                        &label,
+                    )?;
+                }
                 _ => {
                     return Err(qualification_dynamic(
                         "target_readout",
                         &label,
                         "the prepared head differs from the planned head",
-                    ));
+                    ))
                 }
             }
         }
@@ -863,8 +849,7 @@ fn qualify_general_routed(
         shape.intermediate,
         shape.expert_hidden,
     );
-    let zeros =
-        |element: Element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
+    let zeros = |element: Element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     macro_rules! failed {
         ($name:literal) => {
             |error| qualification_dynamic($name, &label, error)
@@ -897,42 +882,38 @@ fn qualify_general_routed(
             (Some((expansion, output)), Some((s, expansion_shape)), Some((gate, up, down))) => {
                 let up = zeros(up, &[s, h])?;
                 let product = match (expansion, gate) {
-                    (DenseExpansionKernel::Gated(kernel), Some(gate)) => {
-                        kernel
-                            .call(dense_expand::Args {
-                                residual: &residual,
-                                norm: &norm,
-                                gate_weight: &zeros(gate, &[s, h])?,
-                                up_weight: &up,
-                                out_rows: &out_rows,
-                                eps: 1.0e-5,
-                                activation: expansion_shape.activation,
-                                gate_scale: &scale(scales.shared.gate)?,
-                                up_scale: &scale(scales.shared.up)?,
-                            })
-                            .map_err(failed!("dense_expand"))?
-                            .value
-                    }
-                    (DenseExpansionKernel::Plain(kernel), None) => {
-                        kernel
-                            .call(dense_up::Args {
-                                residual: &residual,
-                                norm: &norm,
-                                up_weight: &up,
-                                out_rows: &out_rows,
-                                eps: 1.0e-5,
-                                activation: expansion_shape.activation,
-                                up_scale: &scale(scales.shared.up)?,
-                            })
-                            .map_err(failed!("dense_up"))?
-                            .value
-                    }
+                    (DenseExpansionKernel::Gated(kernel), Some(gate)) => kernel
+                        .call(dense_expand::Args {
+                            residual: &residual,
+                            norm: &norm,
+                            gate_weight: &zeros(gate, &[s, h])?,
+                            up_weight: &up,
+                            out_rows: &out_rows,
+                            eps: 1.0e-5,
+                            activation: expansion_shape.activation,
+                            gate_scale: &scale(scales.shared.gate)?,
+                            up_scale: &scale(scales.shared.up)?,
+                        })
+                        .map_err(failed!("dense_expand"))?
+                        .value,
+                    (DenseExpansionKernel::Plain(kernel), None) => kernel
+                        .call(dense_up::Args {
+                            residual: &residual,
+                            norm: &norm,
+                            up_weight: &up,
+                            out_rows: &out_rows,
+                            eps: 1.0e-5,
+                            activation: expansion_shape.activation,
+                            up_scale: &scale(scales.shared.up)?,
+                        })
+                        .map_err(failed!("dense_up"))?
+                        .value,
                     _ => {
                         return Err(qualification_dynamic(
                             "dense_output",
                             &label,
                             "shared expert entries disagree with the binding",
-                        ));
+                        ))
                     }
                 };
                 output
@@ -952,7 +933,7 @@ fn qualify_general_routed(
                     "dense_output",
                     &label,
                     "shared expert entries disagree with the binding",
-                ));
+                ))
             }
         };
         let mut routes = zeros(Element::i32(), &[rows, k])?;
@@ -994,30 +975,26 @@ fn qualify_general_routed(
         let first = zeros(Element::i32(), &[rows, k])?;
         let routed = if rows <= DECODE_ROWS {
             let product = match &kernels.experts {
-                ExpertKernels::Gated { decode, .. } => {
-                    decode
-                        .call(routed_gate_up::Args {
-                            normalized: &input,
-                            routes: &first,
-                            expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
-                            expert_up: &expert_up,
-                            activation: shape.experts_expansion.activation,
-                        })
-                        .map_err(failed!("routed_gate_up"))?
-                        .value
-                }
-                ExpertKernels::Plain { decode, .. } => {
-                    decode
-                        .call(routed_up::Args {
-                            normalized: &input,
-                            routes: &first,
-                            expert_up: &expert_up,
-                            up_scale: &up_scale,
-                            activation: shape.experts_expansion.activation,
-                        })
-                        .map_err(failed!("routed_up"))?
-                        .value
-                }
+                ExpertKernels::Gated { decode, .. } => decode
+                    .call(routed_gate_up::Args {
+                        normalized: &input,
+                        routes: &first,
+                        expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
+                        expert_up: &expert_up,
+                        activation: shape.experts_expansion.activation,
+                    })
+                    .map_err(failed!("routed_gate_up"))?
+                    .value,
+                ExpertKernels::Plain { decode, .. } => decode
+                    .call(routed_up::Args {
+                        normalized: &input,
+                        routes: &first,
+                        expert_up: &expert_up,
+                        up_scale: &up_scale,
+                        activation: shape.experts_expansion.activation,
+                    })
+                    .map_err(failed!("routed_up"))?
+                    .value,
             };
             kernels
                 .down
@@ -1047,34 +1024,30 @@ fn qualify_general_routed(
                 })
                 .map_err(failed!("routed_group"))?;
             let expert_output = match &kernels.experts {
-                ExpertKernels::Gated { grouped, .. } => {
-                    grouped
-                        .call(routed_experts::Args {
-                            normalized: &input,
-                            order: &order,
-                            blocks: &block_experts,
-                            expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
-                            expert_up: &expert_up,
-                            expert_down: &expert_down,
-                            activation: shape.experts_expansion.activation,
-                        })
-                        .map_err(failed!("routed_experts"))?
-                        .value
-                }
-                ExpertKernels::Plain { grouped, .. } => {
-                    grouped
-                        .call(routed_experts_up::Args {
-                            normalized: &input,
-                            order: &order,
-                            blocks: &block_experts,
-                            expert_up: &expert_up,
-                            expert_down: &expert_down,
-                            up_scale: &up_scale,
-                            activation: shape.experts_expansion.activation,
-                        })
-                        .map_err(failed!("routed_experts_up"))?
-                        .value
-                }
+                ExpertKernels::Gated { grouped, .. } => grouped
+                    .call(routed_experts::Args {
+                        normalized: &input,
+                        order: &order,
+                        blocks: &block_experts,
+                        expert_gate: expert_gate.as_ref().unwrap_or(&expert_up),
+                        expert_up: &expert_up,
+                        expert_down: &expert_down,
+                        activation: shape.experts_expansion.activation,
+                    })
+                    .map_err(failed!("routed_experts"))?
+                    .value,
+                ExpertKernels::Plain { grouped, .. } => grouped
+                    .call(routed_experts_up::Args {
+                        normalized: &input,
+                        order: &order,
+                        blocks: &block_experts,
+                        expert_up: &expert_up,
+                        expert_down: &expert_down,
+                        up_scale: &up_scale,
+                        activation: shape.experts_expansion.activation,
+                    })
+                    .map_err(failed!("routed_experts_up"))?
+                    .value,
             };
             kernels
                 .scatter
@@ -1088,18 +1061,16 @@ fn qualify_general_routed(
                 .value
         };
         let result = match (&kernels.latent, binding.latent) {
-            (Some((_, up_kernel)), Some((_, up))) => {
-                up_kernel
-                    .call(dense_output::Args {
-                        residual: &base,
-                        product: &routed,
-                        down_weight: &zeros(up, &[h, x])?,
-                        out_rows: &out_rows,
-                        down_scale: &scale(scales.latent.1)?,
-                    })
-                    .map_err(failed!("dense_output"))?
-                    .value
-            }
+            (Some((_, up_kernel)), Some((_, up))) => up_kernel
+                .call(dense_output::Args {
+                    residual: &base,
+                    product: &routed,
+                    down_weight: &zeros(up, &[h, x])?,
+                    out_rows: &out_rows,
+                    down_scale: &scale(scales.latent.1)?,
+                })
+                .map_err(failed!("dense_output"))?
+                .value,
             _ => routed,
         };
         require_f32_values(&result, &values, "routed_down", &label)?;
@@ -1210,10 +1181,7 @@ fn qualify_state_space(
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, entry, &label);
     let f32 = Element::f32();
     let norm = zeros(binding.norm, &[shape.hidden])?;
-    let projection_weight = zeros(
-        binding.projection,
-        &[shape.projection_width(), shape.hidden],
-    )?;
+    let projection_weight = zeros(binding.projection, &[shape.projection_width(), shape.hidden])?;
     let empty = projection_weight
         .slice_leading(0, 0)
         .map_err(|error| qualification_dynamic(entry, &label, error))?;
@@ -1222,10 +1190,7 @@ fn qualify_state_space(
     let rate = zeros(f32, &[shape.heads])?;
     let time_bias = zeros(f32, &[shape.heads])?;
     let skip = zeros(f32, &[shape.heads])?;
-    let state_norm = zeros(
-        f32,
-        &[shape.norm_groups(), shape.norm_heads, shape.head_width],
-    )?;
+    let state_norm = zeros(f32, &[shape.norm_groups(), shape.norm_heads, shape.head_width])?;
     let output = zeros(binding.output, &[shape.hidden, shape.inner()])?;
     let segments = semantic_i32(device, &[2, 2], &[0, 1, 1, 1], entry, &label)?;
     let stop = semantic_i32(device, &[1], &[1], entry, &label)?;
@@ -1365,9 +1330,9 @@ impl QualificationView<'_> {
             let projected = kernels
                 .project
                 .call(project_rows::Args {
-                    source: &rounded
-                        .reshape(&[1, hidden])
-                        .map_err(|error| qualification_dynamic("project_rows", &label, error))?,
+                    source: &rounded.reshape(&[1, hidden]).map_err(|error| {
+                        qualification_dynamic("project_rows", &label, error)
+                    })?,
                     weight: &projection,
                     weight_scale: &absent_scale,
                 })
@@ -1381,18 +1346,14 @@ impl QualificationView<'_> {
                 &label,
             )?;
             let table = match &kernels.table {
-                TableConversion::Dense(kernel) => {
-                    kernel
-                        .call(import_dense::Args { source: &source })
-                        .map_err(|error| qualification_dynamic("import_dense", &label, error))?
-                        .value
-                }
-                TableConversion::Repack(kernel) => {
-                    kernel
-                        .call(repack_weight::Args { source: &source })
-                        .map_err(|error| qualification_dynamic("repack_weight", &label, error))?
-                        .value
-                }
+                TableConversion::Dense(kernel) => kernel
+                    .call(import_dense::Args { source: &source })
+                    .map_err(|error| qualification_dynamic("import_dense", &label, error))?
+                    .value,
+                TableConversion::Repack(kernel) => kernel
+                    .call(repack_weight::Args { source: &source })
+                    .map_err(|error| qualification_dynamic("repack_weight", &label, error))?
+                    .value,
             };
             let norm = semantic_zeros(
                 device,
@@ -1447,13 +1408,8 @@ impl QualificationView<'_> {
                 ));
             };
             let (layers, width) = (binding.layers, binding.width);
-            let gate = semantic_zeros(
-                device,
-                binding.gate,
-                &[width, hidden],
-                "per_layer_gate",
-                &label,
-            )?;
+            let gate =
+                semantic_zeros(device, binding.gate, &[width, hidden], "per_layer_gate", &label)?;
             let inputs = semantic_zeros(
                 device,
                 Element::f32(),
@@ -1511,33 +1467,23 @@ pub(super) fn qualify_progressive(
     label: &str,
 ) -> Result<(), CatalogFailure> {
     let label = label.to_owned();
-    let depth = match kernels.top.specialization().statics().get("P") {
-        Some(1) => magnitude_family_contracts::ProgressiveCodeDepth::Four,
-        Some(3) => magnitude_family_contracts::ProgressiveCodeDepth::Eight,
-        _ => {
-            return Err(CatalogFailure::Preparation {
-                entry: context,
-                bindings: label.clone(),
-                outcome: "progressive code depth is absent".into(),
-            });
-        }
-    };
     let plane = |plane: ProgressivePlane| {
         semantic_zeros(
             device,
             crate::progressive::element(plane),
-            &plane.shape(vocabulary, hidden, depth),
+            &plane.shape(vocabulary, hidden),
             context,
             &label,
         )
     };
     let top = plane(ProgressivePlane::Top)?;
-    let bit3 = plane(ProgressivePlane::Next)?;
+    let bit3 = plane(ProgressivePlane::Bit3)?;
     let rest = plane(ProgressivePlane::Rest)?;
     let scales = plane(ProgressivePlane::Scales)?;
     let radius = plane(ProgressivePlane::Radius)?;
     let draws = semantic_zeros(device, Element::u32(), &[1, 6], context, &label)?;
-    let temperature = semantic_ones(device, Element::f32(), &[1], context, &label)?;
+    let temperature =
+        semantic_ones(device, Element::f32(), &[1], context, &label)?;
     let mask = semantic_zeros(
         device,
         Element::u32(),
@@ -1545,11 +1491,11 @@ pub(super) fn qualify_progressive(
         context,
         &label,
     )?;
-    let constrained = semantic_i32(device, &[1], &[0], context, &label)?;
+    let constrained =
+        semantic_i32(device, &[1], &[0], context, &label)?;
     let first = kernels
         .top
         .call(readout_top_rows::Args {
-            softcap: 0.0,
             hidden: hidden_residual,
             norm,
             top: &top,
@@ -1569,7 +1515,6 @@ pub(super) fn qualify_progressive(
     let second = kernels
         .refine
         .call(readout_refine_rows::Args {
-            softcap: 0.0,
             features: &first.r2,
             top: &top,
             bit3: &bit3,
@@ -1584,12 +1529,13 @@ pub(super) fn qualify_progressive(
             mask: &mask,
             constrained: &constrained,
         })
-        .map_err(|error| qualification_dynamic("readout_refine_rows", &label, error))?;
+        .map_err(|error| {
+            qualification_dynamic("readout_refine_rows", &label, error)
+        })?;
     require_zero_result(&second.r0, "readout_refine_rows", &label)?;
     let exact = kernels
         .exact
         .call(readout_exact_rows::Args {
-            softcap: 0.0,
             features: &first.r2,
             top: &top,
             bit3: &bit3,
@@ -1610,7 +1556,6 @@ pub(super) fn qualify_progressive(
     let planes = kernels
         .planes
         .call(readout_planes_rows::Args {
-            softcap: 0.0,
             hidden: hidden_residual,
             norm,
             top: &top,

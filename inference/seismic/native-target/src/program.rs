@@ -68,13 +68,6 @@ pub trait Toolchain: Send + Sync {
 
     fn identity(&self) -> &ToolchainIdentity;
 
-    /// Whether `kept`, what this toolchain kept for `source`'s text, makes
-    /// [`Toolchain::compile`] of `source` run no compiler of this
-    /// toolchain's own: the kept artifact holds every requested entry. A
-    /// toolchain that keeps no compiled bytes says what its kept bytes do
-    /// establish.
-    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool;
-
     /// The program of `source`'s entries. `cache`, when given, holds what
     /// this toolchain kept for the same source text; a toolchain that keeps
     /// nothing ignores it.

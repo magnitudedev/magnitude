@@ -15,9 +15,6 @@ store coalesces logically adjacent spans within one slab, and batching preserves
 so no span crosses a slab. The span class limit is the largest span bound of the loaded store's
 history domains, each `ceil(row limit / rows per slab) + 16` (see
 [state transactions](state-transactions.md)).
-Causal target rows using a compressed cache include their earlier reserved destinations in
-visible history after ordered cache preparation; their own row remains dense fresh input.
-Declared bidirectional media and separate draft blocks retain their own fresh-row semantics.
 Its row tables are the only upload source;
 programs encode each graph's inputs from them directly, with no separate packed control image.
 Selection masks are shared with their producer rather than copied into the batch, and an
@@ -27,17 +24,11 @@ Execution joins a validated batch with owned state advances, conditioning, works
 leases into one opaque launch. Its constructor checks only cross-domain facts: resource identity,
 slot-to-advance cardinality and row alignment, conditioning references, and planned lease class.
 Programs accept the launch as one value and retain it in their submission until completion.
-A successor-dependent head's device entry can join one independently owned prior feature with
-the leading features of the current target chunk. The join uses planned head scratch and
-preserves activation storage exactly; it does not read the features through the host.
 A program whose attention graphs have a class that lists history row tiles derives the list from the
 batch's visible spans per history domain (`magnitude_batching::history_tiles`: distinct, ascending,
 `-1` padded 256-row tiles) and selects the smallest such class the list fits; a launch whose rows see
 more tiles than the largest runs the class that lists none. The choice changes neither admission nor
-the batch. Listing classes begin at one tile and increase geometrically through the legal
-per-request bound. Selecting the smallest fitting class keeps capacity below twice the active
-tile count even for short and sliding histories; a fixed minimum class must not force extra
-history rounds on a smaller active extent.
+the batch.
 
 Head feature projection is a distinct checked launch because it consumes retained features and
 selection controls without advancing sequence state. Its requests, feature extents, domain,

@@ -22,8 +22,6 @@ The invocation domain is the source contract intersected with external target re
 
 The entry's invocation contract derives parameter binding and dimension inference from its actual schema. Shape inference solves observed integer equations and then checks the original equations on their defined domains. It rejects inconsistent or inexact observations rather than guessing a dimension.
 
-Internal calls own a complete dimension plan constructed with their explicit bindings already known. Unobservable recipe dimensions require explicit bindings; those bindings can also make an otherwise ambiguous tensor-axis inversion unique. Lowering evaluates bindings and arguments once and replays that same call plan. A function declaration does not create an implicit external value for a private dimension: external entry construction still requires every remaining public dimension to be uniquely inferable from input extents.
-
 ## Values, bounds and availability
 
 An index parameter introduces an actual natural value. A range parameter introduces actual endpoints. `RangeStart` and `RangeEnd` project those bindings; `0 <= start <= end <= N` constrains them. It never substitutes `0` and `N` for supplied endpoints.
@@ -37,7 +35,6 @@ division, comparison or shift semantics. A literal adopts its resolved operand c
 I32 default applies. A saved I32 local remains a word even when later consumed as a quantity.
 Symbolic projections describe the actual typed result, including wrapping and conversion, or are
 absent; they never substitute unbounded operand algebra for a word result.
-Integer min/max evaluates both operands once. Two exact quantities produce an exact quantity; a fixed-width integer operand paired with a quantity chooses word arithmetic, with the quantity converted before comparison as in ordinary binary operations.
 
 Exact host evaluation preserves arbitrary-size intermediates. Physical quantities use bound-sized
 signed magnitude limbs in ordinary complete values and storage; native address/publication words

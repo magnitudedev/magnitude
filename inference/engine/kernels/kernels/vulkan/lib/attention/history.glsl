@@ -11,28 +11,27 @@
 // else a power-of-two part of a word shared with its neighbours (W is a power
 // of two); its columns lie in one group, shared by HISTORY_GROUP / E lanes.
 //
-// `attention_history` names an entry's history buffers. Its sealed descriptor
-// selects Dense or affine at compilation, with no independent form flag.
+// `attention_history` names an entry's history buffers; its `affine` field is
+// a compile-time constant at every construction, so the driver folds the form
+// switches (the projection library's convention).
 //
 // This file is independent of any entry ABI.
 #include "attention.glsl"
 #include "flash.glsl"
 
-#ifdef ATTENTION_AFFINE_HISTORY
-#define HISTORY_KEY_BITS (32u * uint(ATTENTION_KEY_CODE_WORDS) / ATTENTION_W)
-#define HISTORY_VALUE_BITS (32u * uint(ATTENTION_VALUE_CODE_WORDS) / ATTENTION_W)
+#define HISTORY_KEY_BITS 8u
+#define HISTORY_VALUE_BITS 4u
 // Columns per (scale, zero) pair: the codec's group (model-state
 // `AFFINE_GROUP`); the (scale, zero) pairs per vector; the lanes sharing one.
-#define HISTORY_GROUP (2u * ATTENTION_W / uint(ATTENTION_KEY_COEFFICIENTS))
+#define HISTORY_GROUP 32u
 #define HISTORY_PAIRS (ATTENTION_W / HISTORY_GROUP)
 #define HISTORY_PAIR_LANES (HISTORY_GROUP / ATTENTION_E)
 // The words a lane's codes of one vector span (keys, the wider codes): two
 // up to W = 256, four at W = 512.
 #define HISTORY_LANE_WORDS (ATTENTION_E > 8u ? ATTENTION_E / 4u : 2u)
 
-
-#endif
 struct attention_history {
+    bool affine;
     uint64_t key;                 // dense: [T, KV, W] A; affine: key codes
     uint64_t value;               // dense: [T, KV, W] A; affine: value codes
     uint64_t key_coefficients;    // affine: [T, KV, 2 * HISTORY_PAIRS] f16
@@ -41,16 +40,13 @@ struct attention_history {
 };
 
 attention_history attention_dense_history(uint64_t key, uint64_t value) {
-    return attention_history(key, value, 0ul, 0ul, SEISMIC_PARAM_SLAB_ROWS);
+    return attention_history(false, key, value, 0ul, 0ul, SEISMIC_PARAM_SLAB_ROWS);
 }
 
-#ifdef ATTENTION_AFFINE_HISTORY
 attention_history attention_affine_history(uint64_t key_codes, uint64_t key_coefficients, uint64_t value_codes,
     uint64_t value_coefficients) {
-    return attention_history(key_codes, value_codes, key_coefficients, value_coefficients, SEISMIC_PARAM_SLAB_ROWS);
+    return attention_history(true, key_codes, value_codes, key_coefficients, value_coefficients, SEISMIC_PARAM_SLAB_ROWS);
 }
-#endif
-
 
 uint64_t history_address(uint64_t table, uint64_t row, uint64_t slab_rows, uint64_t row_bytes,
     uint64_t head_bytes, uint kv_head) {
@@ -60,7 +56,6 @@ uint64_t history_address(uint64_t table, uint64_t row, uint64_t slab_rows, uint6
 // ---------------------------------------------------------------------------
 // The affine codec.
 
-#ifdef ATTENTION_AFFINE_HISTORY
 uint history_levels(const uint b) { return (1u << b) - 1u; }
 uint history_row_words(const uint b) { return ATTENTION_W * b / 32u; }
 
@@ -152,20 +147,18 @@ void history_encode(const uint b, float x[ATTENTION_E], uint64_t row, uint64_t c
             element_pack2(ELEMENT_F16, scale, zero));
 }
 
-
-#endif
 // ---------------------------------------------------------------------------
 // Appending one row (the subgroup's E columns per lane) at history row
 // `destination`: the key (prepared, already rounded to A) or the value.
 void history_append(attention_history h, const bool is_key, int destination, uint kv_head, uint lane,
     float x[ATTENTION_E]) {
-#ifndef ATTENTION_AFFINE_HISTORY
+    if (!h.affine) {
         const uint64_t head_bytes = uint64_t(ATTENTION_W) * ELEMENT_BYTES(ELEMENT_ACT);
         const uint64_t address = history_address(is_key ? h.key : h.value, uint64_t(destination),
             h.slab_rows, uint64_t(ATTENTION_KV) * head_bytes, head_bytes, kv_head);
         attention_append(address, 0, 0u, lane, x);
-#else
-
+        return;
+    }
     const uint b = is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS;
     const uint64_t code_bytes = uint64_t(history_row_words(b)) * 4ul;
     const uint64_t pair_bytes = uint64_t(HISTORY_PAIRS) * 4ul;
@@ -173,8 +166,6 @@ void history_append(attention_history h, const bool is_key, int destination, uin
             uint64_t(ATTENTION_KV) * code_bytes, code_bytes, kv_head),
         history_address(is_key ? h.key_coefficients : h.value_coefficients, uint64_t(destination), h.slab_rows,
             uint64_t(ATTENTION_KV) * pair_bytes, pair_bytes, kv_head), lane);
-
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -185,11 +176,11 @@ void history_append(attention_history h, const bool is_key, int destination, uin
 // 8-bit keys up to a code step). Every invocation of the workgroup takes part.
 void history_stage(attention_history h, const bool is_key, int first, int end, uint kv_head, uint column,
     const uint w, uint base) {
-#ifndef ATTENTION_AFFINE_HISTORY
+    if (!h.affine) {
         flash_stage_slab(ELEMENT_ACT, is_key ? h.key : h.value, h.slab_rows, ATTENTION_KV * ATTENTION_W,
             kv_head * ATTENTION_W + column, w, first, end, base);
-#else
-
+        return;
+    }
     const uint b = is_key ? HISTORY_KEY_BITS : HISTORY_VALUE_BITS;
     const uint64_t codes = is_key ? h.key : h.value;
     const uint64_t coefficients = is_key ? h.key_coefficients : h.value_coefficients;
@@ -221,12 +212,9 @@ void history_stage(attention_history h, const bool is_key, int first, int end, u
         }
         seismic_shared_uvec4[(base + k * flash_pitch(w) + staged) / 8u] = bits;
     }
-
-#endif
 }
 
 // ---------------------------------------------------------------------------
-#ifdef ATTENTION_AFFINE_HISTORY
 // The keywise form (`attention_keywise_*`) over affine history, a batch of up
 // to ATTENTION_KEYS keys at a time. Lane t's score of key t is, per group,
 // scale * (q . code) + zero * sum(q) over the whole width; each lane decodes
@@ -489,5 +477,3 @@ void history_absorb_affine(const uint n, float q[ATTENTION_HEADS][ATTENTION_E], 
         }
     }
 }
-
-#endif

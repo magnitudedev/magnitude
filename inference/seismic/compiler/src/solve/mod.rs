@@ -210,8 +210,8 @@ mod internals {
     };
     use magnitude_solver::{Algorithm, Limits, Options, Outcome, Policy, Search};
     use seismic_lang::expr::{
-        AnyExpr, BinaryOp, CmpOp, EvalError, NaryOp, NodeView, SymbolSort, UnaryOp,
-        compiled::CompiledDecisionPredicate,
+        compiled::CompiledDecisionPredicate, AnyExpr, BinaryOp, CmpOp, EvalError, NaryOp, NodeView,
+        SymbolSort, UnaryOp,
     };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Arc;
@@ -317,11 +317,11 @@ mod internals {
             for symbol in self.arena.free_symbols(AnyExpr::Duration(objective)) {
                 match self.arena.symbol_kind(symbol) {
                     SymbolKind::CallDimension(_) | SymbolKind::CallScalar(_) => {
-                        return Err(UnsupportedObjective::InvocationDependent);
+                        return Err(UnsupportedObjective::InvocationDependent)
                     }
                     SymbolKind::Decision(_) if declared.contains(&symbol) => {}
                     SymbolKind::Decision(_) => {
-                        return Err(UnsupportedObjective::UndeclaredDecision);
+                        return Err(UnsupportedObjective::UndeclaredDecision)
                     }
                     _ => return Err(UnsupportedObjective::NonAffine),
                 }
@@ -396,7 +396,7 @@ mod internals {
                         | SymbolKind::TemplateDimension(_)
                         | SymbolKind::LoopBinder(_)
                         | SymbolKind::ScheduleSlot(_)
-                        | SymbolKind::CheckerVariable(_) => {
+                        | SymbolKind::ProofVariable(_) => {
                             panic!("planning expression contains a non-planning symbol")
                         }
                     }

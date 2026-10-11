@@ -55,14 +55,6 @@ pub fn host_seconds() -> f64 {
     }
 }
 
-/// Evaluated physical geometry of a traced launch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TracedLaunchGeometry {
-    pub workgroups: [u64; 3],
-    pub threads_per_workgroup: [u64; 3],
-    pub shared_bytes: u64,
-}
-
 /// One launch of a traced submission.
 #[derive(Clone, Debug)]
 pub struct TracedLaunch {
@@ -70,13 +62,7 @@ pub struct TracedLaunch {
     pub entry: String,
     /// Index of the launch within its call (multi-launch entries).
     pub launch: usize,
-    /// Zero-based occurrence of this launch within its call's repeat block.
-    /// Nonrepeated launches have occurrence zero.
-    pub occurrence: usize,
-    /// Evaluated geometry; `None` when the launch condition is inactive.
-    /// Available at both submission and launch detail.
-    pub geometry: Option<TracedLaunchGeometry>,
-    /// Device interval; `None` without launch timing or for an empty launch.
+    /// Device interval; `None` for an empty launch.
     pub device: Option<(f64, f64)>,
 }
 
@@ -95,7 +81,7 @@ pub struct TracedSubmission {
 
 struct Pending {
     route: Arc<RouteSubmission>,
-    labels: Vec<TracedLaunch>,
+    labels: Vec<(String, usize)>,
     encode_start: f64,
     committed: f64,
 }
@@ -140,7 +126,7 @@ impl TraceSink {
     pub(super) fn record(
         &self,
         route: Arc<RouteSubmission>,
-        labels: Vec<TracedLaunch>,
+        labels: Vec<(String, usize)>,
         encode_start: f64,
         committed: f64,
     ) {
@@ -275,9 +261,10 @@ impl SubmissionTrace {
             .labels
             .into_iter()
             .enumerate()
-            .map(|(index, mut launch)| {
-                launch.device = intervals.as_ref().and_then(|intervals| intervals[index]);
-                launch
+            .map(|(index, (entry, launch))| TracedLaunch {
+                entry,
+                launch,
+                device: intervals.as_ref().and_then(|intervals| intervals[index]),
             })
             .collect();
         Ok(TracedSubmission {

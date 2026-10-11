@@ -41,7 +41,7 @@ impl HistoryGeometry {
 /// A history takes rows only in place after its end within its last page, or
 /// as whole free pages, so every page it references is complete except its
 /// first and last. It therefore presents at most `ceil(row_limit / page) + 1`
-/// spans, plus `ceil(appended_rows / page) + 1` for rows a Shared or causal compressed target reader sees
+/// spans, plus `ceil(appended_rows / page) + 1` for rows a Shared reader sees
 /// appended within an advance. Pages are the smallest multiple of
 /// [`SLAB_ROW_TILE`] keeping that at most [`MAX_HISTORY_SPANS`]; a slab holds
 /// as many whole pages as fit [`SLAB_BYTE_TARGET`], and at least one.

@@ -545,12 +545,9 @@ pub(crate) fn classify_catalog(error: CatalogError) -> PlanOutcome {
                 statics,
             })
         }
-        // A load that stops unprepared is taken as its own outcome before
-        // any failure is classified; one that reaches here was not asked for.
         CatalogFailure::Preparation { .. }
         | CatalogFailure::Tuning { .. }
-        | CatalogFailure::Qualification { .. }
-        | CatalogFailure::Unprepared { .. } => PlanOutcome::Internal(error.to_string()),
+        | CatalogFailure::Qualification { .. } => PlanOutcome::Internal(error.to_string()),
     }
 }
 

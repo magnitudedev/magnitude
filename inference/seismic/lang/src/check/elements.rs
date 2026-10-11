@@ -27,18 +27,6 @@ impl ElementUseSet {
         }
     }
 
-    pub(crate) fn component_read(
-        &mut self,
-        element: &Elem,
-        component: crate::registry::QuantizedComponent,
-    ) {
-        if let Elem::Param(parameter) = element {
-            let uses = self.entry(parameter);
-            uses.component_read = true;
-            uses.integer_code_read |= component.requires_integer_code();
-        }
-    }
-
     /// A write, allocation, installation, result leaf or `&mut` parameter of
     /// `T` storage.
     pub(crate) fn stored(&mut self, element: &Elem) {
@@ -85,8 +73,6 @@ impl ElementUseSet {
             };
             let uses = self.entry(own);
             uses.decoded_read |= parameter.uses.decoded_read;
-            uses.component_read |= parameter.uses.component_read;
-            uses.integer_code_read |= parameter.uses.integer_code_read;
             uses.stored |= parameter.uses.stored;
             uses.conversion_source |= parameter.uses.conversion_source;
             uses.partial_copy |= parameter.uses.partial_copy;

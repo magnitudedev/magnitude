@@ -9,8 +9,9 @@ applies_to:
   - packages/providers/src/custom-endpoint/**
   - packages/providers/src/magnitude/**
   - packages/icn/src/provider/**
-  - inference/evaluation/bench/src/magnitude_bench/client.py
-  - inference/evaluation/bench/src/magnitude_bench/requests.py
+  - packages/inference-benchmark/**
+  - inference/benchmarks/src/magnitude_benchmarks/session_bench/sessions.py
+  - inference/benchmarks/src/magnitude_benchmarks/session_bench/client.py
 ---
 
 # Native Chat Completions
@@ -77,11 +78,11 @@ ICN-owned and never enters `ResponseStreamEvent`. The inference benchmark is a
 direct wire client: it may add benchmark-owned JSON extensions, but validates and canonicalizes the
 complete request through the native request Schema before fetch.
 
-The Python evaluation serving benchmark is a separate direct wire client. It sends fixture
-conversations, canonicalizes JSON before submission, and rejects adapter extensions that replace
-standard request fields. It does not import the TypeScript builder or participate in
-provider-client ownership. Its streaming evidence and validation requirements are defined by
-`design/inference/evaluation.md`.
+The Python `session-bench` developer tool is a separate direct wire client. It constructs its fixed
+request policy from Pydantic-validated session inputs, canonicalizes JSON before both preparation
+and submission, and rejects adapter extensions that replace standard request fields. It does not
+import the TypeScript builder or participate in provider-client ownership. Its streaming evidence
+and validation requirements are defined by `design/inference/session-bench.md`.
 
 ## Responses
 

@@ -1,6 +1,6 @@
 use super::super::*;
 use super::*;
-use crate::ReadoutHead;
+use crate::HeadProjection;
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_head(&self, device: &Device) -> Result<(), CatalogFailure> {
@@ -8,7 +8,10 @@ impl<'a> QualificationView<'a> {
         let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
             return Ok(());
         };
-        let (hidden, vocabulary) = (self.geometry.hidden, self.geometry.vocabulary);
+        let (hidden, vocabulary) = (
+            self.geometry.hidden,
+            self.geometry.vocabulary,
+        );
         for (index, (&binding, block)) in head_plan.blocks().iter().zip(&head.blocks).enumerate() {
             let label = format!("{binding:?}");
             // The head block's feed-forward sublayer.
@@ -139,7 +142,7 @@ impl<'a> QualificationView<'a> {
                         "head",
                         &label,
                         "feed-forward binding and attestation disagree",
-                    ));
+                    ))
                 }
             };
             require_finite_nonzero_f32(&advanced, "head_feed_forward", &label)?;
@@ -155,15 +158,23 @@ impl<'a> QualificationView<'a> {
                 })
                 .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
-            let logits = match &block.logits {
-                ProjectionKernels::Qualified {
-                    packed,
-                    progressive,
-                    ..
-                } => {
+            match (&block.logits, binding.projection) {
+                (HeadLogitsKernels::Packed(kernel), HeadProjection::Packed(element)) => {
+                    let projection =
+                        semantic_pattern(device, element, &[vocabulary, hidden], "head", &label)?;
+                    let logits = kernel
+                        .call(head_logits_rows::Args {
+                            features: &projected_features,
+                            weight: &projection,
+                        })
+                        .map_err(|error| qualification_dynamic("head_logits_rows", &label, error))?
+                        .value;
+                    require_finite_nonzero_f32(&logits, "head_logits_rows", &label)?;
+                }
+                (HeadLogitsKernels::Progressive(kernels), HeadProjection::Progressive) => {
                     super::target::qualify_progressive(
                         device,
-                        progressive,
+                        kernels,
                         &advanced,
                         &output_norm,
                         &out_rows,
@@ -171,58 +182,13 @@ impl<'a> QualificationView<'a> {
                         "head",
                         &label,
                     )?;
-                    packed.as_ref()
-                }
-                logits => logits,
-            };
-            match (logits, binding.projection) {
-                (
-                    ProjectionKernels::PreparedPacked(kernel),
-                    ReadoutHead::Packed {
-                        weight: element,
-                        weight_scale,
-                    }
-                    | ReadoutHead::Qualified {
-                        weight: element,
-                        weight_scale,
-                    },
-                ) => {
-                    let projection =
-                        semantic_pattern(device, element, &[vocabulary, hidden], "head", &label)?;
-                    let token_rows = semantic_zeros(
-                        device,
-                        Element::i32(),
-                        &[out_rows.extents()[0], 0, vocabulary],
-                        "head",
-                        &label,
-                    )?;
-                    let scale = semantic_ones(
-                        device,
-                        Element::f32(),
-                        &[u64::from(weight_scale)],
-                        "head",
-                        &label,
-                    )?;
-                    let logits = kernel
-                        .call(readout_project_rows::Args {
-                            features: &projected_features,
-                            weight: &projection,
-                            token_rows: &token_rows,
-                            weight_scale: &scale,
-                            softcap: 0.0,
-                        })
-                        .map_err(|error| {
-                            qualification_dynamic("readout_project_rows", &label, error)
-                        })?
-                        .value;
-                    require_finite_nonzero_f32(&logits, "readout_project_rows", &label)?;
                 }
                 _ => {
                     return Err(qualification_dynamic(
                         "head",
                         &label,
                         "the prepared projection differs from the planned projection",
-                    ));
+                    ))
                 }
             }
         }

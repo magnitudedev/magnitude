@@ -49,13 +49,12 @@ fn plain_owner(
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 0,
-            numerical_profile: None,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -309,13 +308,12 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(4),
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 0,
-            numerical_profile: None,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: ServiceLimits {
@@ -337,11 +335,6 @@ fn mtp_head_charge_releases_and_reloads_after_idle() {
     let charge = |domain: &magnitude_executor::ExecutorDomain| {
         domain.resources().device().memory_usage().charged
     };
-    // Startup warms the optional head. Measure the unloaded baseline so both
-    // cycles exercise the same lazy rebind and release lifecycle.
-    domain
-        .release_idle_optional_components(&mut bindings)
-        .unwrap();
     let baseline = charge(&domain);
     let mut first_cycle = None;
 
@@ -440,13 +433,12 @@ fn concurrent_mtp_first_head_bind_reconciles_memory() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(4),
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 0,
-            numerical_profile: None,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -534,13 +526,12 @@ fn admission_reclaims_under_a_real_process_limit() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 0,
-            numerical_profile: None,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: limits.clone(),
@@ -784,13 +775,12 @@ fn reclaim_band_releases_then_unloads_under_a_real_process_limit() {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
             method: ModelMethod::Plain,
             mtp_proposals: None,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 0,
-            numerical_profile: None,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: limits.clone(),

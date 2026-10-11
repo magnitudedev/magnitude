@@ -120,9 +120,8 @@ pub struct Row {
 /// A row's history in one history domain.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowHistory {
-    /// Prepared history ranges this row reads: accepted history and, for
-    /// compressed causal target attention, earlier reserved destinations.
-    /// Each range stays within one slab.
+    /// Accepted-history ranges of the domain this row reads. Each range stays
+    /// within one slab.
     pub visible: Vec<[i32; 2]>,
     /// The first row of its slot, by offset in the slot, whose fresh history
     /// this row reads: 0 unless the domain's window starts inside the slot.

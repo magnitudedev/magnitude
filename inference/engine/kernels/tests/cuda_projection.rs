@@ -5,8 +5,8 @@
 //! CUDA device.
 
 use magnitude_kernels::{
-    dense_expand, dense_output, embedding_rows, readout_features_rows, readout_head_rows,
-    readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
+    dense_expand, dense_output, embedding_rows, head_logits_rows, readout_features_rows,
+    readout_head_rows, readout_selected_rows, sample_rows, shape_rows,
 };
 mod cuda_common;
 
@@ -107,7 +107,7 @@ fn expand_kernel(
             UW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.projection_params(
+        &mapping.dense_expand_params(
             NativeSpecialization::new()
                 .with_static("H", case.h as u64)
                 .with_static("F", case.f as u64)
@@ -131,7 +131,7 @@ fn output_kernel(
             DW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.projection_params(
+        &mapping.dense_output_params(
             NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)
@@ -411,15 +411,6 @@ fn cuda_gemm_row_bands_match_host_model() {
     }
 }
 
-/// What these tests hold a tuned configuration to against its default: 8
-/// rounding steps of the `bf16` activations, the engine's standard α.
-fn tuning_requirement() -> seismic::NumericalRequirement {
-    seismic::NumericalRequirement::RoundingSteps {
-        alpha: 8.,
-        activation: Some(seismic::DType::BF16),
-    }
-}
-
 #[test]
 #[ignore]
 fn cuda_dense_expand_scoped_tuning_is_factored() {
@@ -450,7 +441,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![dense_expand::Args {
                 residual,
                 norm: &norm,
@@ -468,9 +459,15 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
-            error_rate: 0.05,
+            improvement: 0.01,
+            restarts: 2,
+            confirmed: 3,
+            default_margin: 0.02,
+            samples: 5,
+            confirmation_samples: 5,
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
@@ -490,13 +487,19 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         },
         &statics,
         points,
-        tuning_requirement(),
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
-        seismic::TuningMethod::Search { complete: true, .. }
+        seismic::TuningMethod::Factored { complete: true, .. }
     ));
     assert_eq!(result.rejections().count(), 0);
     println!(
@@ -542,7 +545,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
                 weight: 1.0,
                 class: None,
                 cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
+                required: false,
                 rotation: vec![dense_output::Args {
                     residual,
                     product,
@@ -557,9 +560,15 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-
+        admission: std::time::Duration::from_secs(600),
+        required: std::time::Duration::from_secs(600),
         settings: seismic::SearchSettings {
-            error_rate: 0.05,
+            improvement: 0.01,
+            restarts: 2,
+            confirmed: 3,
+            default_margin: 0.02,
+            samples: 5,
+            confirmation_samples: 5,
         },
         min_sample_seconds: 0.001,
         start: Vec::new(),
@@ -576,13 +585,19 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         },
         &statics,
         points,
-        tuning_requirement(),
+        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.01).unwrap(),
+            relative: seismic::precision::Limit::new(0.05).unwrap(),
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
         search,
+        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
-        seismic::TuningMethod::Search { complete: true, .. }
+        seismic::TuningMethod::Factored { complete: true, .. }
     ));
     assert_eq!(result.rejections().count(), 0);
     println!(
@@ -626,7 +641,7 @@ fn cuda_dense_weights_match_host_model() {
                     A: bf16,
                 },
                 &mapping
-                    .projection_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
+                    .dense_expand_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
             )
             .unwrap()
             .call(dense_expand::Args {
@@ -666,7 +681,7 @@ fn cuda_dense_weights_match_host_model() {
             let result = dense_output::native_for_device_with(
                 &device,
                 dense_output::Elements { DW: bf16, A: bf16 },
-                &mapping.projection_params(statics.with_static("DS", 0)),
+                &mapping.dense_output_params(statics.with_static("DS", 0)),
             )
             .unwrap()
             .call(dense_output::Args {
@@ -719,7 +734,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                     UW: format.resident(),
                     A: Element::bf16(),
                 },
-                &mapping.projection_params(
+                &mapping.dense_expand_params(
                     NativeSpecialization::new()
                         .with_static("H", h as u64)
                         .with_static("F", f as u64)
@@ -883,21 +898,16 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             .iter()
             .map(|value| value * 0.001 + 1e-5)
             .collect::<Vec<_>>();
-        for _form in [0] {
+        for ksplit in [2, 4] {
             let specialization = NativeSpecialization::new()
                 .with_static("V", v as u64)
                 .with_static("D", d as u64)
-                .with_static("S", v as u64)
-                .with_static("I", 0)
-                .with_static("WS", 0)
-                .with_param("OPERAND", 0)
-                .with_launch_param(1, "KSPLIT", 4)
-                .with_launch_param(2, "KSPLIT", 4)
-                .with_launch_param(4, "ROTATE", 2)
-                .with_launch_param(5, "KSPLIT", 4);
-            let kernel = readout_project_rows::native_for_device_with(
+                .with_launch_param(0, "KSPLIT", ksplit)
+                .with_launch_param(1, "KSPLIT", ksplit)
+                .with_launch_param(3, "ROTATE", 2);
+            let kernel = head_logits_rows::native_for_device_with(
                 &device,
-                readout_project_rows::Elements {
+                head_logits_rows::Elements {
                     A: Element::bf16(),
                     OW: Format::Q6K.resident(),
                 },
@@ -905,66 +915,17 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             )
             .unwrap();
             let logits = kernel
-                .call(readout_project_rows::Args {
+                .call(head_logits_rows::Args {
                     features: &bf16_tensor(&device, &[rows as u64, d as u64], &features),
                     weight: &head.tensor,
-                    token_rows: &Tensor::zeros(
-                        &device,
-                        Element::i32(),
-                        &[rows as u64, 0, v as u64],
-                    )
-                    .unwrap(),
-                    weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
-                    softcap: 0.0,
                 })
                 .unwrap()
                 .value;
             check(
-                &format!("prepared projection rows={rows}"),
+                &format!("head_logits rows={rows} ksplit={ksplit}"),
                 &read_f32(&logits),
                 &expected,
                 &tolerance,
-            );
-            let columns = 5;
-            let ids = (0..rows)
-                .flat_map(|row| [((row * 19) % v) as i32, 8, 15, 16, (v - 1) as i32])
-                .collect::<Vec<_>>();
-            let indexed = readout_project_rows::native_for_device_with(
-                &device,
-                readout_project_rows::Elements {
-                    A: Element::bf16(),
-                    OW: Format::Q6K.resident(),
-                },
-                &specialization
-                    .with_static("S", columns as u64)
-                    .with_static("I", 1),
-            )
-            .unwrap()
-            .call(readout_project_rows::Args {
-                features: &bf16_tensor(&device, &[rows as u64, d as u64], &features),
-                weight: &head.tensor,
-                token_rows: &i32_tensor(&device, &[rows as u64, 1, columns as u64], &ids),
-                weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
-                softcap: 0.0,
-            })
-            .unwrap()
-            .value;
-            let selected = ids
-                .iter()
-                .enumerate()
-                .map(|(index, id)| index / columns * v + *id as usize)
-                .collect::<Vec<_>>();
-            check(
-                &format!("prepared indexed packed projection rows={rows}"),
-                &read_f32(&indexed),
-                &selected
-                    .iter()
-                    .map(|index| expected[*index])
-                    .collect::<Vec<_>>(),
-                &selected
-                    .iter()
-                    .map(|index| tolerance[*index])
-                    .collect::<Vec<_>>(),
             );
         }
     }

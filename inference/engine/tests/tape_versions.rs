@@ -37,13 +37,12 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             draft: None,
         },
         model: ModelPolicy {
-            draft_budget: None,
             method: ModelMethod::Mtp,
             mtp_proposals: Some(PROPOSALS),
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows: 64,
-            numerical_profile: None,
+            error_classes: Vec::new(),
         },
         context_tokens: Some(1024),
         service: ServiceLimits {

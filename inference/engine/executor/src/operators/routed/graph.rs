@@ -5,11 +5,13 @@
 //! optional latent up projection. Row tables, the selection bias and scales
 //! a model lacks and a latent sum's zero base are graph constants.
 
-use super::fused_graph::{TILE_ROWS, decodes, grouped_blocks};
-use crate::native::{DenseExpansionKernel, ExpertKernels, GeneralRoutedKernels};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use super::fused_graph::{decodes, grouped_blocks, TILE_ROWS};
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, resident_scale, scaled_weight, weight};
+use crate::programs::native_target_graph::{
+    resident_scale, scaled_weight, weight, WeightPort,
+};
+use crate::native::{DenseExpansionKernel, ExpertKernels, GeneralRoutedKernels};
 use crate::{GeneralRoutedBinding, GeneralRoutedShape, ModelLoadPlan};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -64,12 +66,8 @@ impl<'a> From<&'a GeneralRoutedKernels> for GeneralRoutedGraphEntries<'a, Native
         Self {
             select: &kernels.select,
             experts: match &kernels.experts {
-                ExpertKernels::Gated { decode, grouped } => {
-                    ExpertEntries::Gated { decode, grouped }
-                }
-                ExpertKernels::Plain { decode, grouped } => {
-                    ExpertEntries::Plain { decode, grouped }
-                }
+                ExpertKernels::Gated { decode, grouped } => ExpertEntries::Gated { decode, grouped },
+                ExpertKernels::Plain { decode, grouped } => ExpertEntries::Plain { decode, grouped },
             },
             down: &kernels.down,
             group: &kernels.group,
@@ -284,7 +282,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     let expert_scale = match (expert_scale, expert_down_scale) {
         (Some(scale), None) | (None, Some(scale)) => scale,
         (Some(_), Some(_)) => {
-            return Err("stored expert scales beside a scaled expert down weight".into());
+            return Err("stored expert scales beside a scaled expert down weight".into())
         }
         (None, None) => {
             let constant = GraphConstant::f32(graph, &vec![1.0; experts])?;
@@ -332,12 +330,7 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
     let base = match (entries.shared, &shared_weights) {
         (Some((expansion, output)), Some((gate, up, down))) => {
             let (features, _) = shape.shared.ok_or("shared expert shape is absent")?;
-            let dimensions = [
-                ("M", rows),
-                ("O", rows),
-                ("H", shape.hidden),
-                ("F", features),
-            ];
+            let dimensions = [("M", rows), ("O", rows), ("H", shape.hidden), ("F", features)];
             let activation = shape
                 .shared
                 .map(|(_, expansion)| expansion.activation)
@@ -347,11 +340,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     graph
                         .enqueue(
                             entry,
-                            &[
-                                dimensions.as_slice(),
-                                &[("GS", gate.extent), ("US", up.extent)],
-                            ]
-                            .concat(),
+                            &[dimensions.as_slice(), &[("GS", gate.extent), ("US", up.extent)]]
+                                .concat(),
                             dense_expand::WorkflowArgs {
                                 residual: residual.into(),
                                 norm: (&norm).into(),
@@ -362,7 +352,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 activation,
                                 gate_scale: (&gate.scale).into(),
                                 up_scale: (&up.scale).into(),
-                            },                        )?
+                            },
+                        )?
                         .value
                 }
                 (ExpansionEntry::Plain(entry), None) => {
@@ -378,7 +369,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 eps: epsilon,
                                 activation,
                                 up_scale: (&up.scale).into(),
-                            },                        )?
+                            },
+                        )?
                         .value
                 }
                 _ => return Err("shared expert entries disagree with its weights".into()),
@@ -393,7 +385,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         down_weight: (&down.weight).into(),
                         out_rows: (&row_table()?).into(),
                         down_scale: (&down.scale).into(),
-                    },                )?
+                    },
+                )?
                 .value
         }
         (None, None) => root,
@@ -421,7 +414,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 normalization: shape.normalization,
                 normalization_epsilon: f32::from_bits(shape.normalization_epsilon),
                 scale: f32::from_bits(shape.scale),
-            },        )?
+            },
+        )?
         .value;
 
     // A latent operator's experts act on the projected-down input and sum
@@ -441,7 +435,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         source: (&normalized).into(),
                         weight: (&down.weight).into(),
                         weight_scale: (&down.scale).into(),
-                    },                )?
+                    },
+                )?
                 .value;
             let zeros = GraphConstant::zeros_for_class(graph, rows, shape.expert_hidden, "M")?;
             Some((projected, zeros, up_entry, up))
@@ -468,7 +463,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             expert_gate: gate.into(),
                             expert_up: (&expert_up).into(),
                             activation,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             (ExpertEntries::Plain { decode, .. }, None) => {
@@ -485,7 +481,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 .ok_or("up-only experts without up scales")?
                                 .into(),
                             activation,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             _ => return Err("expert entries disagree with its weights".into()),
@@ -500,7 +497,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     routes: routes.tensor().into(),
                     weights: route_weights.tensor().into(),
                     expert_down: (&expert_down).into(),
-                },            )?
+                },
+            )?
             .value
     } else {
         let blocks = grouped_blocks(rows, shape.experts, shape.selected)?;
@@ -524,7 +522,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                 order: order.tensor_mut().into(),
                 inverse: inverse.tensor_mut().into(),
                 blocks: block_experts.tensor_mut().into(),
-            },        )?;
+            },
+        )?;
         let grouped = [
             ("M", rows),
             ("H", shape.expert_hidden),
@@ -547,7 +546,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                             expert_up: (&expert_up).into(),
                             expert_down: (&expert_down).into(),
                             activation,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             (ExpertEntries::Plain { grouped: entry, .. }, None) => {
@@ -566,7 +566,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                                 .ok_or("up-only experts without up scales")?
                                 .into(),
                             activation,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             _ => return Err("expert entries disagree with its weights".into()),
@@ -586,7 +587,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                     expert_output: (&expert_output).into(),
                     inverse: inverse.tensor().into(),
                     weights: route_weights.tensor().into(),
-                },            )?
+                },
+            )?
             .value
     };
     let output = match latent {
@@ -607,7 +609,8 @@ pub(crate) fn general_routed<'a, G: GraphDraft + 'a>(
                         down_weight: (&up.weight).into(),
                         out_rows: (&row_table()?).into(),
                         down_scale: (&up.scale).into(),
-                    },                )?
+                    },
+                )?
                 .value;
             constants.push(zeros);
             output

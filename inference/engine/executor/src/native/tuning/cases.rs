@@ -3,7 +3,7 @@
 //! shapes and model geometry, and builds every argument set from real
 //! resident weights of distinct layers plus case-owned activations.
 
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
+use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output, dense_up};
 use seismic::{Element, Tensor};
@@ -26,7 +26,7 @@ pub(crate) fn projection_shape(
                 return Err(format!(
                     "layers sharing one specialization disagree on {kind:?}: {expected:?} vs {:?}",
                     (rows, columns)
-                ));
+                ))
             }
             Some(_) => {}
         }
@@ -106,12 +106,11 @@ impl EntryTuning for DenseExpandTuning {
 
     fn bindings(&self) -> String {
         format!(
-            "NW={},GW={},UW={},A={},function={}",
+            "NW={},GW={},UW={},A={}",
             self.norm.name(),
             self.gate.name(),
             self.up.name(),
-            self.activation.name(),
-            self.function
+            self.activation.name()
         )
     }
 
@@ -214,11 +213,10 @@ impl EntryTuning for DenseUpTuning {
 
     fn bindings(&self) -> String {
         format!(
-            "NW={},UW={},A={},function={}",
+            "NW={},UW={},A={}",
             self.norm.name(),
             self.up.name(),
-            self.activation.name(),
-            self.function
+            self.activation.name()
         )
     }
 
@@ -374,5 +372,5 @@ impl EntryTuning for DenseOutputTuning {
         }
     }
 
-    generated_entry!(dense_output, this => this.elements());
+    generated_entry!(dense_output, this => this.elements(), rounded to this.activation);
 }

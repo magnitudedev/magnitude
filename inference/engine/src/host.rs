@@ -7,10 +7,7 @@
 use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel};
 use crate::families;
 use crate::options::InputModalities;
-use magnitude_artifacts::{
-    gguf::{Directory, Value},
-    ImageProcessor, InputLayout, Package, TokenId,
-};
+use magnitude_artifacts::{gguf::Directory, ImageProcessor, InputLayout, Package, TokenId};
 use magnitude_chat::{
     artifacts::{gguf_byte_bpe, gguf_templates},
     request::ImageInput,
@@ -21,7 +18,7 @@ use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, MarkerTokens, ModelDefinition, ModelFamily,
     PreparedModelInput, TokenPlan,
 };
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 /// The package's chat and input semantics: tokenizer, templates, media
 /// processor and the recognized family's input adapter.
@@ -30,7 +27,7 @@ pub struct HostArtifacts {
     family: &'static dyn ModelFamily,
     /// The definition at the served context bound.
     definition: ModelDefinition,
-    draft_unavailable: Option<DraftUnavailable>,
+    draft_unavailable: Option<magnitude_family_dflash::Error>,
     /// The same definition at the artifact's declared capability, for
     /// host-only sizing (counting).
     declared: ModelDefinition,
@@ -62,59 +59,16 @@ impl MarkerTokens for TokenizerMarkers<'_> {
     }
 }
 
+/// An opened package's family and declared definition: the recognized
+/// target family's definition, with the package's separate draft bound
+/// against it (the target family maps the draft's tapped layers onto its
+/// sublayers). Reads no tokenizer or template.
 /// Host admission retains optional-component failures outside the numerical model.
 pub struct AdmittedDefinition {
     pub definition: ModelDefinition,
-    pub draft_unavailable: Option<DraftUnavailable>,
+    pub draft_unavailable: Option<magnitude_family_dflash::Error>,
 }
 
-impl AdmittedDefinition {
-    fn bound(definition: ModelDefinition) -> Self {
-        Self {
-            definition,
-            draft_unavailable: None,
-        }
-    }
-
-    fn without(declared: ModelDefinition, reason: DraftUnavailable) -> Self {
-        Self {
-            definition: declared,
-            draft_unavailable: Some(reason),
-        }
-    }
-}
-
-/// Why a package's separate draft is not bound: the drafter family its
-/// `general.architecture` names could not interpret it against the target,
-/// or it names none. The target serves without it.
-#[derive(Clone, Debug, PartialEq)]
-pub enum DraftUnavailable {
-    /// A DFlash-family block drafter (`dflash`).
-    Block(magnitude_family_dflash::Error),
-    /// A Gemma 4 assistant (`gemma4-assistant`) that is not a draft head of
-    /// this target.
-    Assistant(magnitude_family_gemma4::Error),
-    /// An architecture no drafter family interprets.
-    Architecture(Option<String>),
-}
-
-impl fmt::Display for DraftUnavailable {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Block(error) => write!(formatter, "DFlash draft: {error}"),
-            Self::Assistant(error) => write!(formatter, "Gemma assistant draft: {error}"),
-            Self::Architecture(Some(architecture)) => write!(
-                formatter,
-                "draft GGUF architecture {architecture:?} names no drafter family"
-            ),
-            Self::Architecture(None) => formatter.write_str("draft has no GGUF architecture"),
-        }
-    }
-}
-
-/// An opened package's family and declared definition: the recognized
-/// target family's definition, with the package's separate draft bound
-/// against it (`bind_draft`). Reads no tokenizer or template.
 pub fn package_definition(
     package: &Package,
 ) -> Result<(&'static dyn ModelFamily, AdmittedDefinition), ResolveError> {
@@ -139,45 +93,31 @@ pub fn package_definition(
 
 /// Bind an optional draft after target interpretation has succeeded. A draft
 /// failure cannot hide a target failure or change target numerical semantics.
-/// The draft's own `general.architecture` names the family that interprets
-/// it: a block drafter's tapped layers the target family maps onto its
-/// sublayers; a Gemma assistant is a draft head reading its target's history.
-/// A payload-backed load and a header-only assessment bind the same draft.
 pub fn bind_draft(
     family: &dyn ModelFamily,
     declared: ModelDefinition,
     draft: Option<&Directory>,
 ) -> AdmittedDefinition {
     let Some(draft) = draft else {
-        return AdmittedDefinition::bound(declared);
+        return AdmittedDefinition {
+            definition: declared,
+            draft_unavailable: None,
+        };
     };
-    match draft.value("general.architecture").and_then(Value::string) {
-        Some(magnitude_family_dflash::ARCHITECTURE) => {
-            match magnitude_family_dflash::inspect(draft, &declared, &|layer| {
-                family.layer_entry(&declared, layer)
-            }) {
-                Ok(draft) => AdmittedDefinition::bound(ModelDefinition {
-                    draft: Some(draft),
-                    ..declared
-                }),
-                Err(error) => AdmittedDefinition::without(declared, DraftUnavailable::Block(error)),
-            }
-        }
-        Some(magnitude_family_gemma4::ASSISTANT_ARCHITECTURE) => {
-            match magnitude_family_gemma4::inspect_assistant(draft, &declared) {
-                Ok(head) => AdmittedDefinition::bound(ModelDefinition {
-                    head: Some(head),
-                    ..declared
-                }),
-                Err(error) => {
-                    AdmittedDefinition::without(declared, DraftUnavailable::Assistant(error))
-                }
-            }
-        }
-        architecture => AdmittedDefinition::without(
-            declared,
-            DraftUnavailable::Architecture(architecture.map(str::to_owned)),
-        ),
+    match magnitude_family_dflash::inspect(draft, &declared, &|layer| {
+        family.layer_entry(&declared, layer)
+    }) {
+        Ok(draft) => AdmittedDefinition {
+            definition: ModelDefinition {
+                draft: Some(draft),
+                ..declared
+            },
+            draft_unavailable: None,
+        },
+        Err(reason) => AdmittedDefinition {
+            definition: declared,
+            draft_unavailable: Some(reason),
+        },
     }
 }
 
@@ -282,7 +222,7 @@ impl HostArtifacts {
         &self.definition
     }
 
-    pub(crate) fn draft_unavailable(&self) -> Option<&DraftUnavailable> {
+    pub(crate) fn draft_unavailable(&self) -> Option<&magnitude_family_dflash::Error> {
         self.draft_unavailable.as_ref()
     }
 
@@ -420,9 +360,7 @@ mod tests {
         assert_eq!(missing.definition, target);
         assert_eq!(
             missing.draft_unavailable,
-            Some(DraftUnavailable::Block(
-                magnitude_family_dflash::Error::MissingCausality
-            ))
+            Some(magnitude_family_dflash::Error::MissingCausality)
         );
         directory.metadata.push(Metadata {
             name: "dflash.attention.causal".into(),
@@ -432,9 +370,7 @@ mod tests {
         assert_eq!(invalid.definition, target);
         assert!(matches!(
             invalid.draft_unavailable,
-            Some(DraftUnavailable::Block(
-                magnitude_family_dflash::Error::Metadata { .. }
-            ))
+            Some(magnitude_family_dflash::Error::Metadata { .. })
         ));
         directory.metadata.last_mut().unwrap().value = Value::Array(
             vec![true, true, true, true, true, false]
@@ -446,68 +382,6 @@ mod tests {
         assert!(admitted.draft_unavailable.is_none());
         assert!(admitted.definition.draft.is_some());
         assert_eq!(admitted.definition.decoder, target.decoder);
-    }
-
-    #[test]
-    fn a_draft_is_interpreted_by_the_family_its_architecture_names() {
-        use magnitude_artifacts::{
-            gguf::{Scalar, Value},
-            ArtifactIdentity, PackageIdentity,
-        };
-        use magnitude_family_common::headers;
-        let identity = PackageIdentity {
-            target: ArtifactIdentity([7; 32]),
-            projector: None,
-        };
-        let qwen = magnitude_family_qwen35::Qwen35Family;
-        let target = qwen
-            .inspect(
-                &headers::directory("qwen3.6-35b-a3b__target-gguf_q4.json"),
-                None,
-                identity,
-            )
-            .unwrap();
-        // A Gemma assistant reaches the assistant family, which names why it
-        // is not a draft of this target; the target is kept whole.
-        let mut assistant = headers::directory("qwen3.6-35b-a3b__draft.json");
-        headers::set(
-            &mut assistant,
-            "general.architecture",
-            Value::Scalar(Scalar::String(
-                magnitude_family_gemma4::ASSISTANT_ARCHITECTURE.into(),
-            )),
-        );
-        let admitted = bind_draft(&qwen, target.clone(), Some(&assistant));
-        assert_eq!(admitted.definition, target);
-        let Some(DraftUnavailable::Assistant(error)) = &admitted.draft_unavailable else {
-            panic!("an assistant is interpreted as one: {:?}", admitted.draft_unavailable);
-        };
-        assert!(error.to_string().contains("drafts for a Gemma 4 target"));
-        // A Gemma target's assistant failure is the assistant's, not DFlash's.
-        let gemma = magnitude_family_gemma4::Gemma4Family;
-        let gemma_target = gemma
-            .inspect(
-                &headers::directory("gemma-4-12b-it-qat__target-gguf_q4.json"),
-                None,
-                identity,
-            )
-            .unwrap();
-        let admitted = bind_draft(&gemma, gemma_target.clone(), Some(&assistant));
-        assert_eq!(admitted.definition, gemma_target);
-        assert!(matches!(
-            admitted.draft_unavailable,
-            Some(DraftUnavailable::Assistant(_))
-        ));
-        let mut unknown = assistant;
-        headers::set(
-            &mut unknown,
-            "general.architecture",
-            Value::Scalar(Scalar::String("eagle3".into())),
-        );
-        assert_eq!(
-            bind_draft(&gemma, gemma_target, Some(&unknown)).draft_unavailable,
-            Some(DraftUnavailable::Architecture(Some("eagle3".into())))
-        );
     }
 
     #[test]

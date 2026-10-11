@@ -743,7 +743,6 @@ fn cuda_matrix_configurations(
                 ("MATRIX", 1),
                 ("STAGES", stages),
                 ("COLUMNS", columns),
-                ("QREG", 0),
             ]
         })
         .collect()
@@ -855,7 +854,6 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                     ("MATRIX", 0),
                     ("STAGES", 2),
                     ("COLUMNS", 1),
-                    ("QREG", 0),
                 ],
                 vec![
                     ("PARTS", 48),
@@ -864,7 +862,6 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
                     ("MATRIX", 0),
                     ("STAGES", 2),
                     ("COLUMNS", 1),
-                    ("QREG", 0),
                 ],
             ];
             configurations.extend(cuda_matrix_configurations(
@@ -1799,7 +1796,6 @@ fn timing_configurations(device: &Device, form: Form) -> Vec<Vec<(&'static str, 
                             ("MATRIX", 0),
                             ("STAGES", 2),
                             ("COLUMNS", 1),
-                            ("QREG", 0),
                         ]);
                     }
                 }

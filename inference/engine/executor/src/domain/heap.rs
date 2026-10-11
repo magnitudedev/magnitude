@@ -90,8 +90,8 @@ pub fn require_normal(
     device: &Device,
     reserves: &MemoryReserves,
 ) -> Result<(), ClaimRefusal> {
-    let readings =
-        crate::platform::observe_domains(catalog, device, reserves).map_err(ClaimRefusal::Blind)?;
+    let readings = crate::platform::observe_domains(catalog, device, reserves)
+        .map_err(ClaimRefusal::Blind)?;
     reclaiming(&readings).map_or(Ok(()), Err)
 }
 
@@ -203,9 +203,8 @@ impl DeviceHeap {
             // The heap's band is the readings' band, so some reading is in
             // Reclaim.
             MemoryAction::Wait => {
-                return Err(
-                    reclaiming(&readings).expect("a Reclaim band has a domain in the Reclaim band")
-                );
+                return Err(reclaiming(&readings)
+                    .expect("a Reclaim band has a domain in the Reclaim band"));
             }
             MemoryAction::Grant { bytes } if bytes >= required => {}
             MemoryAction::Grant { bytes: available } | MemoryAction::Reject { available, .. } => {
@@ -214,7 +213,7 @@ impl DeviceHeap {
                     constraint: allocation.constraint,
                     required,
                     available,
-                });
+                })
             }
         }
         // A host-backed device has no staging domain: its staged bytes are
@@ -407,10 +406,7 @@ mod tests {
         assert_eq!(heap.host_table_bytes(), 0);
         heap.hold_host_table(ceiling / 2).unwrap();
         assert_eq!(heap.host_table_bytes(), ceiling / 2);
-        assert!(
-            heap.heap().standing().unwrap().observation.available_bytes
-                <= ceiling - ceiling / 2 + ceiling / 8
-        );
+        assert!(heap.heap().standing().unwrap().observation.available_bytes <= ceiling - ceiling / 2 + ceiling / 8);
         assert!(matches!(
             heap.check(ceiling / 4 * 3, 0),
             Err(ClaimRefusal::Deficit {

@@ -1,5 +1,5 @@
 // Ordered cache publication before causal target attention.
-use lib::attention::attention::{self, Form};
+use lib::attention::attention::{self, Form, KEY_BITS, VALUE_BITS};
 use seismic::cpu::slab::SlabTensor;
 
 fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
@@ -54,13 +54,13 @@ fn attention_append_k8v4<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
             unsafe {
                 attention::affine_encode(
                     &keys[head * w..][..w],
-                    (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    KEY_BITS,
                     key_codes.row_mut([destination, head, 0]),
                     key_coefficients.row_mut([destination, head, 0]),
                 );
                 attention::affine_encode(
                     &values[head * w..][..w],
-                    (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    VALUE_BITS,
                     value_codes.row_mut([destination, head, 0]),
                     value_coefficients.row_mut([destination, head, 0]),
                 );

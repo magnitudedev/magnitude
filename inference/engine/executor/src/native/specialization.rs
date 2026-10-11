@@ -7,8 +7,8 @@
 //! can have: the kernels crate's build proves it, so preparation never meets
 //! a missing one.
 
+use super::tuning::{EntryTuning, ModelInputs, Tuner};
 use super::CatalogFailure;
-use super::tuning::{ComposedContender, EntryTuning, ModelInputs, Tuner};
 use seismic::{
     BackendName, BoundEntry, Device, Entry, KernelRequest, NativeImplementation, NativeKernel,
     NativeSpecialization, NativeSpecializationError,
@@ -34,160 +34,25 @@ enum Mode<'a> {
 }
 
 /// What a walk consults for its tuned entries.
-pub(super) type InvocationDemand = std::collections::HashMap<
-    super::tuning::TuningKey,
-    crate::programs::invocation_demand::InvocationCounts,
->;
-
 pub(super) enum Tuning<'a> {
     /// A preparation's tuner, in its count, census or search phase.
     Tuner(Tuner<'a>),
     /// A listing's model: its entries' static values, and nothing to tune.
     Listing(ModelInputs<'a>),
-    /// Metadata-only call-site collection, before any search is opened. It
-    /// walks the same preparation as the tuner, under the same settings, so
-    /// every key it records is the key the tuner later looks up.
-    Demand {
-        model: ModelInputs<'a>,
-        device: &'a Device,
-        settings: super::tuning::TuningSettings,
-        invocations: InvocationDemand,
-        current: crate::programs::invocation_demand::InvocationForecast,
-        repeat_case: bool,
-    },
 }
 
 impl<'a> Tuning<'a> {
-    pub fn demand(
-        model: ModelInputs<'a>,
-        device: &'a Device,
-        settings: super::tuning::TuningSettings,
-    ) -> Self {
-        Self::Demand {
-            model,
-            device,
-            settings,
-            invocations: InvocationDemand::new(),
-            current: Default::default(),
-            repeat_case: true,
-        }
-    }
-    pub fn set_invocations(
-        &mut self,
-        current: crate::programs::invocation_demand::InvocationForecast,
-        repeat_case: bool,
-    ) {
-        if let Self::Demand {
-            current: active,
-            repeat_case: repeat,
-            ..
-        } = self
-        {
-            *active = current;
-            *repeat = repeat_case;
-        }
-    }
-    pub fn into_invocations(self) -> InvocationDemand {
-        match self {
-            Self::Demand { invocations, .. } => invocations,
-            _ => panic!("only a demand walk collects invocations"),
-        }
-    }
-
-    pub fn dependency<T: EntryTuning>(
-        &self,
-        case: &T,
-    ) -> Result<Option<super::tuning::TuningKey>, CatalogFailure> {
-        let Some(device) = self.device() else {
-            return Ok(None);
-        };
-        let entry = <T::Entry as Entry>::NAME;
-        let bindings = case.bindings();
-        let implementation =
-            seismic::generated::native_implementation_for_backend::<T::Entry>(device.backend())
-                .map_err(|error| failure(entry, &bindings, error.to_string()))?
-                .ok_or_else(|| failure(entry, &bindings, "native implementation absent".into()))?;
-        let values = case
-            .statics(&self.model())
-            .map_err(|error| failure(entry, &bindings, error))?;
-        let fixed = domain_statics(&implementation, entry, &bindings, &values)?;
-        Ok(Some((entry, bindings, fixed.statics().clone())))
-    }
-
-    pub fn choice(&self, key: &super::tuning::TuningKey) -> Option<&NativeSpecialization> {
-        match self {
-            Self::Tuner(tuner) => tuner.choice(key),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
-    pub fn cache(&self) -> Option<&'a crate::kernel_cache::KernelCache> {
-        match self {
-            Self::Tuner(tuner) => tuner.cache(),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
-    /// The cache whose stored tuning results this preparation reads: none for
-    /// a fresh preparation, which only replaces them.
-    pub fn stored_results(&self) -> Option<&'a crate::kernel_cache::KernelCache> {
-        match self {
-            Self::Tuner(tuner) => tuner.cache().filter(|_| !tuner.settings().fresh),
-            Self::Listing(_) | Self::Demand { .. } => None,
-        }
-    }
-    pub fn settings(&self) -> Option<super::tuning::TuningSettings> {
-        match self {
-            Self::Tuner(tuner) => Some(tuner.settings()),
-            Self::Demand { settings, .. } => Some(*settings),
-            Self::Listing(_) => None,
-        }
-    }
-    pub fn device(&self) -> Option<&'a Device> {
-        match self {
-            Self::Tuner(tuner) => Some(tuner.device()),
-            Self::Demand { device, .. } => Some(device),
-            Self::Listing(_) => None,
-        }
-    }
-
-    pub fn register_composed(
-        &mut self,
-        contender: Box<dyn ComposedContender<'a> + 'a>,
-        rows: u64,
-    ) -> Result<Option<bool>, CatalogFailure> {
-        match self {
-            Self::Tuner(tuner) => tuner.register_composed(contender),
-            Self::Demand {
-                invocations,
-                current,
-                ..
-            } => {
-                invocations
-                    .entry((
-                        contender.label(),
-                        contender.key(),
-                        std::collections::BTreeMap::new(),
-                    ))
-                    .or_default()
-                    .add(&current.represented(|logical| {
-                        (logical > rows / 2 && logical <= rows).then_some(rows)
-                    }));
-                Ok(None)
-            }
-            Self::Listing(_) => Ok(None),
-        }
-    }
-
     pub fn model(&self) -> ModelInputs<'a> {
         match self {
             Self::Tuner(tuner) => tuner.model(),
-            Self::Listing(model) | Self::Demand { model, .. } => *model,
+            Self::Listing(model) => *model,
         }
     }
 
     pub fn into_tuner(self) -> Tuner<'a> {
         match self {
             Self::Tuner(tuner) => tuner,
-            Self::Listing(_) | Self::Demand { .. } => panic!("a metadata walk has no tuner"),
+            Self::Listing(_) => panic!("a listing walk has no tuner"),
         }
     }
 }
@@ -360,32 +225,9 @@ impl<'a> Specializer<'a> {
             .statics(&tuning.model())
             .map_err(|outcome| failure(entry, &bindings, outcome))?;
         let fixed = domain_statics(&implementation, entry, &bindings, &values)?;
-        let tuning_model = tuning.model();
         let specialization = match tuning {
             Tuning::Tuner(tuner) if implementation.has_tuning_parameters() => {
                 tuner.tune(case, &implementation, &fixed)?
-            }
-            Tuning::Demand {
-                invocations,
-                current,
-                repeat_case,
-                ..
-            } => {
-                let mut representatives = case
-                    .points(tuning_model.limits)
-                    .into_iter()
-                    .map(|point| point.rows)
-                    .collect::<Vec<_>>();
-                representatives.sort_unstable();
-                representatives.dedup();
-                let calls = current
-                    .represented(|rows| case.invocation_rows(rows, &representatives))
-                    .scaled(if *repeat_case { case.launches() } else { 1 });
-                invocations
-                    .entry((entry, bindings.clone(), fixed.statics().clone()))
-                    .or_default()
-                    .add(&calls);
-                fixed
             }
             Tuning::Tuner(_) | Tuning::Listing(_) => fixed,
         };
@@ -427,14 +269,12 @@ mod tests {
                 .map(|(name, value)| (name.to_owned(), value))
                 .to_vec()
         );
-        assert!(
-            domain_statics(
-                &implementation,
-                "routed_output",
-                "A=bf16",
-                &[("H", 256), ("K", 2), ("F", 512), ("S", 256)],
-            )
-            .is_ok()
-        );
+        assert!(domain_statics(
+            &implementation,
+            "routed_output",
+            "A=bf16",
+            &[("H", 256), ("K", 2), ("F", 512), ("S", 256)],
+        )
+        .is_ok());
     }
 }

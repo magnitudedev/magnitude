@@ -1,6 +1,11 @@
-// dense_expand: the shared projection producer publishes semantic Act rows
-// or explicitly selected matrix operands. GEMV retains semantic inputs;
-// small and large matrix row bands share the same operand eligibility.
+// dense_expand: RMS prologue over the `out_rows` rows of the F32
+// residual, paired gate/up projection, act(gate) * up epilogue (`activation`:
+// SiLU or GELU-tanh). GEMV for
+// O <= 16 (`gemv` to 8 rows, `gemv16` beyond; at O = 1 the block forms the A
+// row in shared memory, else `stage` forms the A rows first), GEMM otherwise:
+// `gemm_small` to 64 rows (A rows, or the INT8 candidate's q8_1 rows staged
+// by `stage_s8`), `gemm` beyond (A rows). The declaration launches one of
+// them.
 #define KERNEL_W0 SEISMIC_GATE_WEIGHT
 #define KERNEL_W1 SEISMIC_UP_WEIGHT
 #include "lib/projection/projection.cuh"
@@ -41,27 +46,31 @@ __device__ __forceinline__ void expand_gemv(const Pro &pro, projection::u8 *row,
 }
 
 // The GEMM of one row band over the staged rows (A rows, or q8_1 rows with Q).
-template <class Shape, bool Q, class Operands = projection::SemanticGemmOperands>
+template <class Shape, bool Q>
 __device__ __forceinline__ void expand_gemm(const projection::u8 *staged, const void *groups, unsigned M,
                                             unsigned long long H, unsigned long long F, const packets::W0 &gate,
                                             const packets::W1 &up, const Epi &epi) {
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();
     if (column < projection::gemm_columns(F))
-        projection::gemm_run<Shape, Q, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, H, groups, M, H,
+        projection::gemm_run<Shape, Q>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, H, groups, M, H,
                                        column, F, gate, up, epi);
 }
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_STAGE
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8>
 __global__ void dense_expand_stage(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
-    using Operands = typename projection::GemmOperands<OPERAND>::type;
-    projection::stage_projection_row<S8, Operands>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_H, STAGING, GROUPS);
+    projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
 }
 #endif
 
-
+#ifdef SEISMIC_FORMING_DENSE_EXPAND_STAGE_S8
+template <unsigned INT8>
+__global__ void dense_expand_stage_s8(SEISMIC_KERNEL_PARAMS) {
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
+    projection::stage_row<S8>(PROLOGUE, blockIdx.x, SEISMIC_DIM_H, STAGING, GROUPS);
+}
+#endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMV
 template <unsigned KSPLIT>
@@ -81,19 +90,18 @@ __global__ void dense_expand_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM_SMALL
-template <unsigned INT8, unsigned OPERAND>
+template <unsigned INT8>
 __global__ void dense_expand_gemm_small(SEISMIC_KERNEL_PARAMS) {
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
-    expand_gemm<projection::SmallGemm, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
+    expand_gemm<projection::SmallGemm, S8>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H, SEISMIC_DIM_F, GATE,
                                            UP, EPILOGUE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_GEMM
-template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
+template <unsigned ROTATE>
 __global__ void dense_expand_gemm(SEISMIC_KERNEL_PARAMS) {
-    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0, packets::W1>;
-    expand_gemm<projection::LargeGemm<ROTATE>, S8, typename projection::GemmOperands<OPERAND>::type>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
+    expand_gemm<projection::LargeGemm<ROTATE>, false>(STAGING, GROUPS, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_H,
                                                       SEISMIC_DIM_F, GATE, UP, EPILOGUE);
 }
 #endif

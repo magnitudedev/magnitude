@@ -2,21 +2,22 @@
 
 use super::*;
 use crate::{
-    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
-    ResourceAllocator, ResourceCapacity, ResourceLimits, ResourcePlanner, TargetLaunchCore,
     completion::CompletionWake,
     platform,
     programs::{
-        CompletedHeadWork, CompletedVisionWork, CompletedWork, ProgramSubmission, ReadySubmission,
+        CompletedHeadWork, CompletedStateWork, CompletedVisionWork, CompletedWork,
+        ProgramSubmission, ReadySubmission,
     },
+    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
+    ResourceAllocator, ResourceCapacity, ResourceLimits, ResourcePlanner, TargetLaunchCore,
 };
 use magnitude_artifacts::PackageManifest;
 use magnitude_family_contracts::FamilyId;
 use magnitude_state::{KvCodec, ShrinkPolicy};
 use std::marker::PhantomData;
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 
 /// The planning fixture's model (the smallest geometry every native kernel
@@ -51,14 +52,12 @@ fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
         8192,
         vec![HistoryDomainPlan {
             layout: HistoryDomainLayout::Token {
-                components: vec![
-                    ComponentDescriptor::new(
-                        LayerRef::Target(0),
-                        CodecSpec::dense(seismic::DType::F32, 4096, 4096),
-                        1,
-                    )
-                    .unwrap(),
-                ],
+                components: vec![ComponentDescriptor::new(
+                    LayerRef::Target(0),
+                    CodecSpec::dense(seismic::DType::F32, 4096, 4096),
+                    1,
+                )
+                .unwrap()],
             },
             logical_rows: 8192,
         }],
@@ -74,19 +73,15 @@ fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
 }
 
 fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) -> Option<Fixture> {
-    fixture_on(control, lookahead, head, platform::DeviceRequest::Automatic)
-}
-
-fn fixture_on(
-    control: Option<PendingControl>,
-    lookahead: bool,
-    head: bool,
-    device_request: platform::DeviceRequest,
-) -> Option<Fixture> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     let reserves = platform::MemoryReserves::standard();
-    let selected =
-        platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves).ok()?;
+    let selected = platform::select_device(
+        &catalog,
+        ExecutionPath::Native,
+        platform::DeviceRequest::Automatic,
+        &reserves,
+    )
+    .ok()?;
     let device = Rc::new(
         catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
@@ -139,10 +134,8 @@ fn fixture_on(
             weights: &crate::ZeroTuningWeights,
             observer: &crate::UnreportedTuning,
             cache: None,
-            numerical_profile: crate::ResolvedNumericalProfile::standard(),
-            settings: crate::TuningSettings::STANDARD,
+            error_classes: &crate::NO_ERROR_CLASSES,
         },
-        crate::UnpreparedUnits::ServeDefaults,
     )
     .unwrap();
     let target_graphs = programs
@@ -153,7 +146,6 @@ fn fixture_on(
             &state,
             draft.programs().target(),
             limits,
-            &seismic::Workers::new(1),
         )
         .unwrap();
     let target_readout_graphs = programs
@@ -164,10 +156,11 @@ fn fixture_on(
             &device,
             draft.load(),
             &definition,
-            draft.programs(),
-            &state,
+            draft.programs().vision(),
+            state.target_state(),
+            state.head_state(),
             limits,
-            PlannedMethod::Plain,
+            0,
         )
         .unwrap();
     let resources_plan = ResourcePlanner::plan_with_state(
@@ -235,12 +228,7 @@ fn open<F: ProgramFamily>(
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    assert!(
-        domain
-            .open_state(bindings, request, None)
-            .unwrap()
-            .is_empty()
-    );
+    assert!(domain.open_state(bindings, request, None).unwrap().is_empty());
 }
 
 #[derive(Default)]
@@ -265,11 +253,11 @@ impl PendingControl {
 struct PendingCompletion(PendingControl);
 impl Completion for PendingCompletion {
     fn is_complete(&self) -> bool {
-        self.0.0.lock().unwrap().result.is_some()
+        self.0 .0.lock().unwrap().result.is_some()
     }
     fn result(&mut self) -> Result<(), crate::DeviceError> {
         self.0
-            .0
+             .0
             .lock()
             .unwrap()
             .result
@@ -278,7 +266,7 @@ impl Completion for PendingCompletion {
     }
     fn notify(&mut self, wake: CompletionWake) {
         let wake = {
-            let mut state = self.0.0.lock().unwrap();
+            let mut state = self.0 .0.lock().unwrap();
             if state.result.is_some() {
                 Some(wake)
             } else {
@@ -340,47 +328,9 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
     }
 }
 
-type HeadTestWork = PendingSubmission<
-    crate::HeadLaunchCore,
-    (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
-    Option<crate::GraphOutputTensor>,
->;
-
-enum ControlledHeadSubmission {
-    Failure(PendingFailureSubmission<CompletedHeadWork>),
-    Work(HeadTestWork),
-}
-
-impl From<PendingFailureSubmission<CompletedHeadWork>> for ControlledHeadSubmission {
-    fn from(value: PendingFailureSubmission<CompletedHeadWork>) -> Self {
-        Self::Failure(value)
-    }
-}
-
-impl ProgramSubmission for ControlledHeadSubmission {
-    type CompletedWork = CompletedHeadWork;
-
-    fn completion(&mut self) -> &mut dyn Completion {
-        match self {
-            Self::Failure(work) => work.completion(),
-            Self::Work(work) => work.completion(),
-        }
-    }
-
-    fn finish(self) -> Result<Self::CompletedWork, crate::DeviceError> {
-        match self {
-            Self::Failure(work) => work.finish(),
-            Self::Work(work) => work.finish(),
-        }
-    }
-}
-
-impl crate::programs::SubmittedHead for ControlledHeadSubmission {
+impl crate::programs::SubmittedHead for PendingFailureSubmission<CompletedHeadWork> {
     fn launch(&self) -> &crate::HeadLaunchCore {
-        match self {
-            Self::Failure(_) => panic!("failure-only head has no launch"),
-            Self::Work(work) => &work.core,
-        }
+        unreachable!("controlled fixture submits no head launch")
     }
 }
 
@@ -438,10 +388,9 @@ impl TestFamily {
 }
 impl ProgramFamily for TestFamily {
     type TargetSubmission = TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
-    type HeadSubmission = ControlledHeadSubmission;
+    type HeadSubmission = PendingFailureSubmission<CompletedHeadWork>;
     type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
-    type StateSubmission =
-        ReadySubmission<crate::StateLaunchCore, crate::NativeGraphWorkspaceLease, ()>;
+    type StateSubmission = PendingFailureSubmission<CompletedStateWork>;
     fn bind_head(&mut self, _: crate::ResidentHead, _: &ModelDefinition) -> Result<(), String> {
         Ok(())
     }
@@ -472,7 +421,6 @@ impl ProgramFamily for TestFamily {
             core,
             (),
             crate::TargetOutput {
-                boundary: None,
                 readout: None,
                 commits: crate::CommitSpan {
                     first: now,
@@ -495,12 +443,9 @@ impl ProgramFamily for TestFamily {
     }
     fn submit_state(
         &mut self,
-        launch: ValidatedStateLaunch,
+        _: ValidatedStateLaunch,
     ) -> Result<Self::StateSubmission, (crate::SubmitError, ValidatedStateLaunch)> {
-        // Like target work, this fixture models ownership and completion only.
-        // Numerical copy correctness is qualified by native state tests.
-        let (core, workspace) = launch.into_submission_parts();
-        Ok(ReadySubmission::new(core, workspace, ()))
+        panic!("controlled fixture does not submit state work")
     }
 }
 
@@ -577,11 +522,9 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let (pending, _) = finish_one(&mut domain, flight);
-    assert!(
-        domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-            .is_ok()
-    );
+    assert!(domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .is_ok());
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
@@ -603,10 +546,7 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
         rows: head.free_rows(history) + 1,
     }];
     domain.provision_open(&mut bindings).unwrap();
-    assert!(
-        bindings.lookahead.is_none(),
-        "the growing entry orphaned the lookahead"
-    );
+    assert!(bindings.lookahead.is_none(), "the growing entry orphaned the lookahead");
     domain
         .grant_state_growth(&mut bindings, true, &demand, 0)
         .unwrap();
@@ -649,10 +589,7 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
         Err(DomainError::Input(detail)) if detail == "head component is disabled" => {}
         Err(error) => panic!("provisioning drafter work failed: {error}"),
     }
-    assert!(
-        bindings.lookahead.is_none(),
-        "drafter work resolved the lookahead"
-    );
+    assert!(bindings.lookahead.is_none(), "drafter work resolved the lookahead");
     assert!(domain.target[&request].blocked_tails().is_empty());
 }
 
@@ -665,15 +602,16 @@ fn in_place_rows_reserve_without_a_free_page() {
     };
     let request = RequestId(10);
     open(&mut domain, &mut bindings, request);
-    let accept =
-        |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings<TestFamily>, position| {
-            let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
-            let (pending, bindings) = finish_one(domain, flight);
-            domain
-                .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-                .unwrap();
-            bindings
-        };
+    let accept = |domain: &mut ExecutorDomain<TestFamily>,
+                  bindings: StateBindings<TestFamily>,
+                  position| {
+        let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+        let (pending, bindings) = finish_one(domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        bindings
+    };
     let mut bindings = accept(&mut domain, bindings, 0);
     // Hold every other page of the backed slabs with one-row histories.
     let store = domain.target_store.clone();
@@ -693,54 +631,10 @@ fn in_place_rows_reserve_without_a_free_page() {
     for position in 1..4 {
         bindings = accept(&mut domain, bindings, position);
     }
-    assert!(
-        store
-            .history_domains()
-            .all(|history| store.free_rows(history) == 0)
-    );
+    assert!(store
+        .history_domains()
+        .all(|history| store.free_rows(history) == 0));
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 4);
-}
-
-/// Continuing a checkpoint relocates a tail another request extended. The
-/// reservation must describe the new layout rather than demand a second page.
-#[test]
-fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
-    let source = RequestId(71);
-    open(&mut domain, &mut bindings, source);
-    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
-    let (pending, mut bindings) = finish_one(&mut domain, flight);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-        .unwrap();
-    let checkpoint = domain.resume_state(source).unwrap();
-    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 1)]);
-    let (pending, returned) = finish_one(&mut domain, flight);
-    bindings = returned;
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-        .unwrap();
-    let copy = RequestId(72);
-    domain
-        .install_input(copy, PreparedModelInput::continuation_only())
-        .unwrap();
-    domain
-        .open_state(&mut bindings, copy, Some(&checkpoint))
-        .unwrap();
-    assert!(!domain.target[&copy].blocked_tails().is_empty());
-    let operations = [forward(copy, 1)];
-    let before = domain.requirements(&bindings, &operations).unwrap();
-    assert!(before.state_demand.iter().any(|demand| demand.rows > 0));
-    let reservation = domain.reserve(&mut bindings, &operations).unwrap();
-    assert!(
-        reservation
-            .requirements
-            .state_demand
-            .iter()
-            .all(|demand| demand.rows == 0)
-    );
 }
 
 /// A cancelled completed request aborts and the bindings return; a device
@@ -773,11 +667,8 @@ fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_b
     };
     let failed_request = RequestId(3);
     open(&mut failed_domain, &mut bindings, failed_request);
-    let flight = submit_reserved_target(
-        &mut failed_domain,
-        bindings,
-        vec![forward(failed_request, 0)],
-    );
+    let flight =
+        submit_reserved_target(&mut failed_domain, bindings, vec![forward(failed_request, 0)]);
     failed.resolve(Err(crate::DeviceError::Execution(
         "injected target failure".into(),
     )));
@@ -850,7 +741,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
     let mut head = HeadFlight {
         requests: Vec::new(),
         steps: 0,
-        submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()).into(),
+        submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()),
         started: Instant::now(),
         launch_trace: None,
         bindings,
@@ -996,8 +887,8 @@ fn vision_definition() -> ModelDefinition {
 /// media row.
 fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInput {
     use magnitude_artifacts::{
-        BoundaryRule, InputLayout, InputSpan,
         media::{DType, PreparedTensor},
+        BoundaryRule, InputLayout, InputSpan,
     };
     use magnitude_family_contracts::{PreparedVisionInput, TokenPlan, VisionSpatialControls};
     let definition = vision_definition();
@@ -1255,327 +1146,4 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
     };
     assert_eq!((*row, *start, *count), (1, 0, 1));
     assert!(*source == features);
-}
-
-/// Publishing target output must not synchronously wait for head completion.
-/// Its second flight keeps the completion wake and preserves device failures.
-#[test]
-fn deferred_priming_keeps_pending_completion_and_reports_device_failure() {
-    let Some((domain, bindings)) = fixture(None) else {
-        return;
-    };
-    let control = PendingControl::default();
-    let mut flight = PrimingCompletionFlight {
-        work: PrimingFlight {
-            request: RequestId(88),
-            submission: PendingFailureSubmission::new(control.clone()).into(),
-            continuation: None,
-        },
-        target_end: 1,
-        bindings,
-        started: Instant::now(),
-    };
-    assert!(!flight.completion().is_complete());
-    let woke = Arc::new(AtomicBool::new(false));
-    let observed = woke.clone();
-    flight.completion().notify(CompletionWake::new(move || {
-        observed.store(true, Ordering::SeqCst);
-    }));
-    assert!(!woke.load(Ordering::SeqCst));
-    control.resolve(Err(crate::DeviceError::Execution(
-        "deferred entry failed".into(),
-    )));
-    assert!(woke.load(Ordering::SeqCst));
-    assert!(flight.completion().is_complete());
-    let mut domain = domain;
-    assert!(matches!(
-        domain.finish_priming(flight),
-        Err(DomainError::Device(_))
-    ));
-}
-
-/// Form real owned state advances and a checked head launch, with controlled
-/// completion instead of numerical kernels. This fixture borrows the plain
-/// model's readout pool for the head's leases; no graph consumes those buffers.
-/// The target has two final prompt rows and the head has their one known
-/// successor. The scheduler's final-prompt detection is outside this fixture.
-fn target_with_pending_priming(
-    request: RequestId,
-) -> (
-    ExecutorDomain<TestFamily>,
-    TargetFlight<TestFamily>,
-    PendingControl,
-) {
-    let (mut domain, mut bindings) = fixture_on(
-        None,
-        false,
-        true,
-        platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
-    )
-    .expect("deferred priming ownership tests require the CPU fixture");
-    open(&mut domain, &mut bindings, request);
-    let mut operation = prefill(request, 0);
-    if let Operation::Forward {
-        tokens, committed, ..
-    } = &mut operation
-    {
-        tokens.push(TokenId(2));
-        *committed = 2;
-    }
-    // Target submission precedes its head submission, just as in production.
-    // This controlled target is already ready and has returned its workspace.
-    let mut flight = submit_reserved_target(&mut domain, bindings, vec![operation]);
-    let advance = TentativeAdvance::Accepted(
-        OwnedStateAdvance::begin(domain.head.remove(&request).unwrap(), 1)
-            .ok()
-            .unwrap(),
-    );
-    let slot = domain
-        .head_slot(request, &[TokenId(2)], 0, &[], &advance, 0)
-        .unwrap();
-    let batch = crate::batching::ValidatedHeadBatch::from_slots(
-        &[slot],
-        domain.definition.decoder.vocabulary as usize,
-        domain.head_class_limits().unwrap(),
-    )
-    .unwrap();
-    let row_bytes = domain.head_conditioning_bytes();
-    let conditioning = FeatureRows::new(vec![0u8; row_bytes].into(), 1).unwrap();
-    let pool = domain.resources.target_readout_graph();
-    let inputs = crate::HeadLaunchInputs::new(
-        batch,
-        vec![advance],
-        crate::HeadConditioning::Rows(vec![conditioning]),
-        true,
-        pool.acquire_workspace().unwrap(),
-        pool.acquire_output().unwrap(),
-    );
-    let launch = ValidatedHeadLaunch::new(
-        inputs,
-        domain.head_store.as_ref().unwrap(),
-        domain.resource_identity(),
-        row_bytes,
-    )
-    .unwrap_or_else(|(_, error)| panic!("controlled head launch: {error}"));
-    let (core, workspace, output) = launch.into_submission_parts();
-    let control = PendingControl::default();
-    let head = ControlledHeadSubmission::Work(PendingSubmission {
-        completion: PendingCompletion(control.clone()),
-        core,
-        workspace: (workspace, output),
-        output: None,
-    });
-    assert!(flight.work.priming.is_none());
-    flight.work.priming = Some(PrimingFlight {
-        request,
-        submission: head,
-        continuation: None,
-    });
-    (domain, flight, control)
-}
-
-fn publish_before_priming(
-    domain: &mut ExecutorDomain<TestFamily>,
-    flight: TargetFlight<TestFamily>,
-) -> (PendingOperationOutcome, PrimingCompletionFlight<TestFamily>) {
-    let (outcomes, continuation) = domain.finish_target_for_publication(flight, true).unwrap();
-    let [pending] = outcomes
-        .try_into()
-        .unwrap_or_else(|_| panic!("one target outcome"));
-    let TargetContinuation::Priming(mut priming) = continuation else {
-        panic!("the pending head must retain the binding right");
-    };
-    assert!(!priming.completion().is_complete());
-    (pending, priming)
-}
-
-#[test]
-fn deferred_priming_commits_after_target_publication_and_releases_leases() {
-    let request = RequestId(93);
-    let (mut domain, flight, control) = target_with_pending_priming(request);
-    let held_outputs = domain.resources.target_readout_graph().available_output();
-    let (pending, mut priming) = publish_before_priming(&mut domain, flight);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
-        .unwrap();
-    assert_eq!(domain.target[&request].position(), 2);
-    assert!(!domain.head.contains_key(&request));
-    assert!(
-        domain.resume_state(request).is_err(),
-        "no half-resolved checkpoint"
-    );
-    assert!(
-        domain.release_state(&[request]).is_err(),
-        "no eviction before head completion"
-    );
-    assert_eq!(
-        domain.resources.target_readout_graph().available_output(),
-        held_outputs
-    );
-    let woke = Arc::new(AtomicBool::new(false));
-    let observed = woke.clone();
-    priming.completion().notify(CompletionWake::new(move || {
-        observed.store(true, Ordering::SeqCst);
-    }));
-    control.resolve(Ok(()));
-    assert!(woke.load(Ordering::SeqCst));
-    let (finished, _, mut bindings) = domain.finish_priming(priming).unwrap();
-    assert_eq!(finished, request);
-    let checkpoint = domain.resume_state(request).unwrap();
-    assert_eq!(checkpoint.target.position(), 2);
-    assert_eq!(checkpoint.head.as_ref().unwrap().position(), 1);
-    assert_eq!(
-        domain.resources.target_readout_graph().available_output(),
-        held_outputs + 1
-    );
-    // The returned binding right is usable only after the second flight ends.
-    domain.provision_open(&mut bindings).unwrap();
-    domain.close(request).unwrap();
-}
-
-#[test]
-fn deferred_priming_aborts_when_its_target_chunk_is_rejected() {
-    let request = RequestId(94);
-    let (mut domain, flight, control) = target_with_pending_priming(request);
-    let (pending, priming) = publish_before_priming(&mut domain, flight);
-    domain.abort(pending).unwrap();
-    assert_eq!(domain.target[&request].position(), 0);
-    assert!(domain.resume_state(request).is_err());
-    control.resolve(Ok(()));
-    let (_, _, bindings) = domain.finish_priming(priming).unwrap();
-    let checkpoint = domain.resume_state(request).unwrap();
-    assert_eq!(checkpoint.target.position(), 0);
-    assert_eq!(checkpoint.head.as_ref().unwrap().position(), 0);
-    // Aborting releases the tentative rows and leaves the target reusable.
-    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
-    let (pending, _) = finish_one(&mut domain, flight);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-        .unwrap();
-    domain.close(request).unwrap();
-}
-
-/// Cancellation at the executor boundary must wait to close resident state.
-/// The scheduler's cancel control itself is not exercised by this domain test.
-#[test]
-fn deferred_priming_prevents_cancelled_request_retirement_until_completion() {
-    let request = RequestId(95);
-    let (mut domain, flight, control) = target_with_pending_priming(request);
-    let (pending, priming) = publish_before_priming(&mut domain, flight);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
-        .unwrap();
-    assert_eq!(
-        domain.close(request).unwrap_err(),
-        "request has unresolved work"
-    );
-    assert!(domain.input.contains_key(&request));
-    assert_eq!(domain.target[&request].position(), 2);
-    control.resolve(Ok(()));
-    let (_, _, mut bindings) = domain.finish_priming(priming).unwrap();
-    domain.close(request).unwrap();
-    assert!(!domain.input.contains_key(&request));
-    assert!(!domain.target.contains_key(&request));
-    assert!(!domain.head.contains_key(&request));
-    // Retirement leaves both stores usable by a different request.
-    let next = RequestId(96);
-    open(&mut domain, &mut bindings, next);
-    let fresh = domain.resume_state(next).unwrap();
-    assert_eq!(fresh.target.position(), 0);
-    assert_eq!(fresh.head.as_ref().unwrap().position(), 0);
-    domain.close(next).unwrap();
-}
-
-#[test]
-fn boundary_features_commit_fork_and_abort_with_numerical_state() {
-    let Some((mut domain, mut bindings)) = fixture(None) else {
-        return;
-    };
-    let request = RequestId(91);
-    open(&mut domain, &mut bindings, request);
-    let first = domain.allocate_boundary().unwrap();
-    let attach = |pending: &mut PendingOperationOutcome, boundary: &FeatureRef| {
-        let aggregate =
-            FeatureRef::logical(boundary.domain().clone(), 1, boundary.allocation().width())
-                .unwrap()
-                .with_boundary(boundary.clone())
-                .unwrap();
-        pending.outcome = Outcome::Forward {
-            rows: vec![RowResult {
-                features: Some(aggregate),
-                ..RowResult::default()
-            }],
-        };
-    };
-    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
-    let (mut pending, mut bindings) = finish_one(&mut domain, flight);
-    attach(&mut pending, &first);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-        .unwrap();
-    let checkpoint = domain.resume_state(request).unwrap();
-    assert!(
-        checkpoint
-            .boundary
-            .as_ref()
-            .unwrap()
-            .same_allocation(&first)
-    );
-    let fork = RequestId(92);
-    domain
-        .install_input(fork, PreparedModelInput::continuation_only())
-        .unwrap();
-    domain
-        .open_state(&mut bindings, fork, Some(&checkpoint))
-        .unwrap();
-    domain.release_state(&[request]).unwrap();
-    assert!(domain.input[&request].boundary.is_none());
-    assert!(
-        domain.input[&fork]
-            .boundary
-            .as_ref()
-            .unwrap()
-            .same_allocation(&first)
-    );
-    let second = domain.allocate_boundary().unwrap();
-    for invalid in [false, true] {
-        let flight = submit_reserved_target(&mut domain, bindings, vec![forward(fork, 1)]);
-        let (mut pending, returned) = finish_one(&mut domain, flight);
-        bindings = returned;
-        attach(&mut pending, &second);
-        if invalid {
-            assert!(
-                domain
-                    .reconcile(pending, PhysicalDecision { accepted_rows: 0 })
-                    .is_err()
-            );
-        } else {
-            domain.abort(pending).unwrap();
-        }
-        let restored = domain.resume_state(fork).unwrap();
-        assert_eq!(restored.position(), 1);
-        assert!(restored.boundary.as_ref().unwrap().same_allocation(&first));
-    }
-    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(fork, 1)]);
-    let (mut pending, _) = finish_one(&mut domain, flight);
-    attach(&mut pending, &second);
-    domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-        .unwrap();
-    assert!(
-        domain
-            .resume_state(fork)
-            .unwrap()
-            .boundary
-            .as_ref()
-            .unwrap()
-            .same_allocation(&second)
-    );
-    assert!(
-        checkpoint
-            .boundary
-            .as_ref()
-            .unwrap()
-            .same_allocation(&first)
-    );
 }

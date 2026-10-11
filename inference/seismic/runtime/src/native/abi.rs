@@ -13,8 +13,8 @@ use seismic_lang::checked::{NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
 };
-use seismic_lang::expr::SymbolValue;
 use seismic_lang::expr::compiled::InvocationValues;
+use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
@@ -806,7 +806,7 @@ fn render_code_interpretation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{SourceFile, SourceSet, check_source};
+    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
     use seismic_lang::registry::BackendName;
 
     const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8])\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";

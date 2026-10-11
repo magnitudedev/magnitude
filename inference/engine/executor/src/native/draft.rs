@@ -2,8 +2,9 @@ use super::{AttentionKernels, DenseKernels};
 use crate::{AttentionBinding, DenseBinding};
 use magnitude_family_contracts::WeightKind;
 use magnitude_kernels::{
-    dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step,
-    draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows, shape_rows, widen_rows,
+    dense_output, draft_confidence, draft_convolve_input, draft_convolve_residual,
+    draft_gated_rows, draft_path_step, draft_top_k, embedding_rows, project_rows,
+    readout_features_rows, readout_head_rows, sample_rows, shape_rows, widen_rows,
 };
 use seismic::{Element, NativeKernel};
 use std::collections::HashMap;
@@ -20,7 +21,7 @@ pub struct DraftKernels {
     pub(super) embedding: Option<NativeKernel<embedding_rows::Entry>>,
     /// The output norm and the target's vocabulary projection of the
     /// proposing rows.
-    pub(super) head: Option<super::ProjectionKernels>,
+    pub(super) head: Option<NativeKernel<readout_head_rows::Entry>>,
     /// Token selection over the readout vocabulary.
     pub(super) shape: Option<NativeKernel<shape_rows::Entry>>,
     pub(super) sample: Option<NativeKernel<sample_rows::Entry>>,
@@ -62,11 +63,14 @@ pub struct DraftBlockKernels {
 }
 
 /// DSpark's chain: the Markov memory of the previous token, its projection
-/// onto the slot logits. The fixed zero confidence threshold needs no kernel.
+/// onto the slot logits, and the slot's confidence over its output-normed
+/// row.
 #[derive(Clone, Debug)]
 pub struct MarkovKernels {
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub projection: NativeKernel<dense_output::Entry>,
+    pub features: NativeKernel<readout_features_rows::Entry>,
+    pub confidence: NativeKernel<draft_confidence::Entry>,
 }
 
 /// One DFlash2 draft layer's unfused entries, in graph order: the attention

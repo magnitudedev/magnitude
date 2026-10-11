@@ -9,6 +9,7 @@ applies_to:
   - packages/agent/src/window/inbox/render.ts
   - packages/release/src/**
   - packages/acn-dashboard/src/**
+  - packages/inference-benchmark*/src/**
 ---
 
 # User-facing byte units

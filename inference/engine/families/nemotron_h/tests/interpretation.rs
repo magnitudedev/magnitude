@@ -1,7 +1,7 @@
 //! Interpretation of every catalog Nemotron-H header, plus negative cases.
 //!
 //! The headers are the metadata and full tensor directories of the locked
-//! catalog files (`inference/catalog/headers`).
+//! catalog files (`inference/validation/results/catalog-headers`).
 
 use magnitude_artifacts::{
     gguf::{Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},

@@ -2,7 +2,6 @@
 //! holds the domain's [`StateBindings`] until its finish returns them.
 
 use super::*;
-use crate::programs::SubmittedTarget;
 
 pub struct VisionFlight<F: ProgramFamily = NativeFamily> {
     pub(super) request: RequestId,
@@ -37,8 +36,8 @@ impl<F: ProgramFamily> HeadFlight<F> {
 }
 
 /// A prompt chunk's drafter entry, drafted on the device behind its target
-/// flight, conditioned by the flight's feature output. Only completion may
-/// resolve its head advance; a final target token may publish earlier.
+/// flight, conditioned by the flight's feature output. It commits with the
+/// chunk.
 pub(super) struct PrimingFlight<H> {
     pub(super) request: RequestId,
     pub(super) submission: H,
@@ -114,37 +113,4 @@ pub(super) fn decode_selected(bytes: &[u8]) -> Result<Vec<Selected>, String> {
         })
         .collect::<Result<Vec<_>, &str>>()
         .map_err(str::to_owned)
-}
-
-/// The binding right returns only after every submitted use is complete.
-pub enum TargetContinuation<F: ProgramFamily> {
-    Ready(StateBindings<F>),
-    Priming(PrimingCompletionFlight<F>),
-}
-
-/// A final prompt entry finishing after the first token was published.
-/// The binding right stays here, so neither lane can be checkpointed,
-/// evicted, or reused before the head advance resolves.
-pub struct PrimingCompletionFlight<F: ProgramFamily> {
-    pub(super) work: PrimingFlight<F::HeadSubmission>,
-    pub(super) target_end: usize,
-    pub(super) bindings: StateBindings<F>,
-    pub(super) started: Instant,
-}
-
-impl<F: ProgramFamily> PrimingCompletionFlight<F> {
-    pub fn completion(&mut self) -> &mut dyn Completion {
-        self.work.submission.completion()
-    }
-}
-
-impl<F: ProgramFamily> TargetFlight<F> {
-    /// Separate entry completion when the caller publishes this final
-    /// chunk's target result before waiting for drafter history.
-    pub(super) fn detach_priming(&mut self) -> Option<(PrimingFlight<F::HeadSubmission>, usize)> {
-        let work = self.work.priming.take()?;
-        let advances = self.work.submission.launch().advances();
-        let target = &advances[0];
-        Some((work, target.position() + target.rows()))
-    }
 }

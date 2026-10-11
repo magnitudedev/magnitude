@@ -82,9 +82,6 @@ pub enum PreparationError {
     UniversalClosure(String),
     /// Mandatory source construction awaits an implemented semantic/storage requirement.
     UnfinishedConstruction(crate::candidate_domain::ConstructionPending),
-    /// The preparation's deadline passed before it finished. Nothing it
-    /// had constructed was published.
-    Expired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,7 +242,6 @@ impl fmt::Display for PreparationError {
             Self::Planning(e) => write!(f, "planning failed: {e}"),
             Self::UnfinishedConstruction(reason) => write!(f, "source reservation construction is unfinished: {reason:?}"),
             Self::UniversalClosure(s) => write!(f, "universal implementation is not total: {s}"),
-            Self::Expired => write!(f, "preparation's deadline passed before it finished"),
         }
     }
 }

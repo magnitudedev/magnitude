@@ -8,17 +8,17 @@ use crate::batching::{
 };
 use crate::memory::{HoldingClass, HoldingId, MemoryHeap};
 use crate::platform::{DomainReading, DomainRole};
-use crate::programs::ProgramSubmission;
 use crate::programs::graph::readout;
+use crate::programs::ProgramSubmission;
 use crate::{
     AllocatedResources, AttestedPrograms, CapacityError, Completion, ComponentLoader,
     ExecutionPlan, FeatureReader, FeatureRef, FeatureRows, FeatureSpan, GraphOutputTensor,
     GroupKey, HeadConditioning, HeadLaunchInputs, ImageRef, NativeGraphOutputLease,
     NativeGraphWorkspaceLease, Operation, Outcome, PoolClass, Priming, ProgramIdentity, RequestId,
     ResidentHead, ResidentVision, ResourceDomain, ResourceDomainId, ResourceKind, RowResult,
-    SelectSpec, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs, TargetTokens, TokenId,
-    ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch,
-    VisionLaunchInputs, WorkKind,
+    SelectSpec, Selected, StateLaunchInputs, StateWork, TargetLaunchInputs, TokenId,
+    TargetTokens, ValidatedHeadLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
+    ValidatedVisionLaunch, VisionLaunchInputs, WorkKind,
 };
 use magnitude_family_contracts::{ModelDefinition, PreparedModelInput};
 use magnitude_state::{
@@ -44,15 +44,13 @@ mod vision;
 mod domain_tests;
 
 pub use family::{NativeFamily, ProgramFamily};
-pub use heap::{ClaimRefusal, DeviceHeap, require_normal};
-pub use in_flight::{
-    HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
-};
-use in_flight::{PrimingFlight, TargetWork, decode_selected};
+pub use heap::{require_normal, ClaimRefusal, DeviceHeap};
+use in_flight::{decode_selected, PrimingFlight, TargetWork};
+pub use in_flight::{HeadFlight, TargetFlight, VisionFlight};
 pub use ownership::OpenRequirements;
 pub use state::MemoryChargeReconciliation;
+pub(crate) use target::accepted_history;
 pub use target::TargetHostTiming;
-pub(crate) use target::{AppendedRuns, accepted_history, cached_causal_domain};
 
 use std::{
     cell::RefCell,
@@ -368,21 +366,9 @@ pub enum ReservedResources {
     Head(
         NativeGraphWorkspaceLease,
         NativeGraphOutputLease,
-        HeadReservation,
+        Vec<OwnedStateAdvance>,
     ),
     Vision(NativeGraphWorkspaceLease, NativeGraphOutputLease),
-}
-
-/// The numerical state a head reservation moves into its flight, one entry
-/// per operation.
-pub enum HeadReservation {
-    /// Advances of the head's own store.
-    Advances(Vec<OwnedStateAdvance>),
-    /// For a head that keeps no history: each request's accepted target
-    /// state. The flight reads its history and returns it unchanged at
-    /// physical completion; while it is held the request has no other target
-    /// work, checkpoint or close, exactly as for an in-flight advance.
-    TargetReads(Vec<SequenceState>),
 }
 
 /// Complete target capacity is owned before launch construction. Decoder
@@ -395,7 +381,6 @@ pub enum TargetGraphReservation {
 }
 
 pub struct TargetLaunchReservation {
-    boundary: Option<FeatureRef>,
     advances: Vec<OwnedStateAdvance>,
     graph_workspace: NativeGraphWorkspaceLease,
     graph_outputs: [NativeGraphOutputLease; 2],
@@ -433,7 +418,6 @@ struct RequestInput {
     input: PreparedModelInput,
     images: BTreeMap<String, InputImage>,
     resident: bool,
-    boundary: Option<FeatureRef>,
 }
 
 /// Everything needed to make a request resident at a position without
@@ -444,7 +428,6 @@ pub struct ResumeState {
     target: StateCheckpoint,
     head: Option<StateCheckpoint>,
     features: BTreeMap<String, FeatureRef>,
-    boundary: Option<FeatureRef>,
 }
 
 impl ResumeState {
@@ -525,13 +508,7 @@ impl ExecutorDomain<NativeFamily> {
         {
             return Err("component loaders differ from enabled model components".into());
         }
-        // A draft head reading the target's history keeps no state arena.
-        let keeps_history = definition.draft.is_some()
-            || definition
-                .head
-                .as_ref()
-                .is_some_and(|head| head.history == magnitude_family_contracts::HeadHistory::Own);
-        if head_state.is_some() != (head_loader.is_some() && keeps_history) {
+        if head_loader.is_some() != head_state.is_some() {
             return Err("head state arena differs from enabled head component".into());
         }
         let family = NativeFamily::new(programs, resident, definition.decoder.clone())?;
@@ -560,29 +537,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// The head (drafter) launches graphs were sealed for: the launch row
-    /// bound and the span limit of the store its rows read (the head's own,
-    /// or the target's for a head that keeps none).
+    /// bound and the head store's span limit.
     fn head_class_limits(&self) -> Result<crate::batching::ClassLimits, DomainError> {
-        let store = match &self.head_store {
-            Some(store) => store,
-            None if self.head_reads_target() => &self.target_store,
-            None => return Err(DomainError::invariant("a head launch without a head store")),
-        };
+        let store = self
+            .head_store
+            .as_ref()
+            .ok_or_else(|| DomainError::invariant("a head launch without a head store"))?;
         Ok(crate::batching::ClassLimits {
             rows: self.execution.policy().limits().max_launch_rows,
             segments: store.max_span_limit(),
         })
-    }
-
-    /// Whether the load's drafter is a head that keeps no history and reads
-    /// each request's accepted target history instead (`HeadHistory::Target`).
-    pub(super) fn head_reads_target(&self) -> bool {
-        self.head_store.is_none()
-            && self
-                .definition
-                .head
-                .as_ref()
-                .is_some_and(|head| head.history == magnitude_family_contracts::HeadHistory::Target)
     }
 
     /// Return every byte that remains resident as part of the model's static
@@ -868,11 +832,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ..
             } = operation
             {
-                if self.head_reads_target() {
-                    return Err(DomainError::invariant(
-                        "a head reading target history keeps no history to prime",
-                    ));
-                }
                 if operations.len() != 1 {
                     return Err(DomainError::Input(
                         "a primed prompt chunk launches alone".into(),
@@ -886,40 +845,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         "drafter entry position differs from accepted drafter state".into(),
                     ));
                 }
-                if prime.boundary {
-                    let Operation::Forward {
-                        position, tokens, ..
-                    } = operation
-                    else {
-                        unreachable!()
-                    };
-                    if prime.position != position.saturating_sub(1)
-                        || prime.tokens.as_slice()
-                            != if *position == 0 {
-                                &tokens[1..]
-                            } else {
-                                &tokens[..]
-                            }
-                        || self
-                            .input
-                            .get(request)
-                            .and_then(|input| input.boundary.as_ref())
-                            .is_some()
-                            != (*position > 0)
-                    {
-                        return Err(DomainError::Input(
-                            "boundary priming differs from the accepted target prefix".into(),
-                        ));
-                    }
-                }
                 priming_demand.extend(state.demands(prime.tokens.len()));
-                priming_banks += usize::from(!prime.tokens.is_empty());
+                priming_banks += 1;
             }
         }
-        // A head that keeps no history reads each request's accepted target
-        // state, which its flight holds unchanged: it reserves no rows or
-        // banks.
-        let reads_target = lane == ReservationLane::Head && self.head_reads_target();
         let (pool, state_demand, successor_banks) = match lane {
             ReservationLane::Target | ReservationLane::Head => {
                 let mut rows = 0usize;
@@ -929,21 +858,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 let mut seen = BTreeSet::new();
                 for operation in operations {
                     operation.validate().map_err(|error| error.to_string())?;
-                    if let Operation::Head {
-                        form: crate::DraftForm::Block,
-                        proposals,
-                        ..
-                    } = operation
-                    {
-                        if !proposals.is_empty()
-                            && usize::from(self.execution.policy().method().block_proposals())
-                                != proposals.len()
-                        {
-                            return Err(DomainError::Input(
-                                "draft width was not prepared by this load".into(),
-                            ));
-                        }
-                    }
                     if !seen.insert(operation.request()) {
                         return Err(DomainError::Input("reservation repeats a request".into()));
                     }
@@ -953,29 +867,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     demand |= operation.demand();
                     let state = match lane {
                         ReservationLane::Target => self.target.get(&operation.request()),
-                        ReservationLane::Head if reads_target => {
-                            self.target.get(&operation.request())
-                        }
                         ReservationLane::Head => self.head.get(&operation.request()),
                         _ => unreachable!(),
                     }
                     .ok_or_else(|| DomainError::Input("reservation request is not idle".into()))?;
-                    if reads_target
-                        && !matches!(
-                            operation,
-                            Operation::Head {
-                                phase: crate::HeadPhase::Generation,
-                                tokens,
-                                proposals,
-                                form: crate::DraftForm::Chained,
-                                ..
-                            } if tokens.len() == 1 && !proposals.is_empty()
-                        )
-                    {
-                        return Err(DomainError::invariant(
-                            "a head reading target history drafts proposals from one anchor row",
-                        ));
-                    }
                     let position = match operation {
                         Operation::Forward { position, .. } | Operation::Head { position, .. } => {
                             *position
@@ -987,9 +882,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             "reservation position differs from accepted state".into(),
                         ));
                     }
-                    if !reads_target {
-                        state_demand.extend(state.demands(operation.row_count()));
-                    }
+                    state_demand.extend(state.demands(operation.row_count()));
                     // Speculative target rows are recorded on the recurrent
                     // tape, which holds the planned draft rows.
                     if lane == ReservationLane::Target
@@ -1049,7 +942,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         PoolClass::Head(class)
                     },
                     state_demand,
-                    if reads_target { 0 } else { operations.len() },
+                    operations.len(),
                 )
             }
             ReservationLane::Vision => {
@@ -1199,9 +1092,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         } else {
             Some(&self.target_store)
         };
-        // A head reading target history reserved no rows or banks.
-        let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
-        if requirements.lane != ReservationLane::Vision && !reads_target {
+        if requirements.lane != ReservationLane::Vision {
             let store = store.expect("head requirements require a head store");
             holds(store, &requirements.state_demand)?;
             let banks = store.available_banks();
@@ -1265,9 +1156,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // component import. Provisioning grants the physical growth peak
         // through the heap before any backing allocation.
         self.provision(bindings, operations)?;
-        // Provisioning may relocate a shared tail into a fresh page. Recompute
-        // row demand against that layout: the next append can now fit in place.
-        let requirements = self.requirements(bindings, operations)?;
         self.sync_static_holding().map_err(DomainError::Input)?;
         // The import and binding of an unbound component run under one heap
         // claim for their peak, released once Seismic's charge reflects them.
@@ -1292,24 +1180,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.sync_optional_holding().map_err(DomainError::Input)?;
         self.can_reserve(&requirements)
             .map_err(DomainError::Capacity)?;
-        let reads_target = requirements.lane == ReservationLane::Head && self.head_reads_target();
         let invariant = |detail: &str, error: CapacityError| {
             DomainError::invariant(format!(
                 "{detail} changed after availability check: {error}"
             ))
-        };
-        let boundary = if operations.iter().any(|op| {
-            matches!(
-                op,
-                Operation::Forward {
-                    prime: Some(Priming { boundary: true, .. }),
-                    ..
-                }
-            )
-        }) {
-            Some(self.allocate_boundary()?)
-        } else {
-            None
         };
         let resources = match requirements.lane {
             ReservationLane::Target => {
@@ -1339,7 +1213,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     readout_workspace,
                     readout_output,
                     priming: None,
-                    boundary,
                 }))
             }
             ReservationLane::Head => {
@@ -1351,11 +1224,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     graph
                         .acquire_output()
                         .map_err(|error| invariant("head graph output", error))?,
-                    if reads_target {
-                        HeadReservation::TargetReads(Vec::with_capacity(operations.len()))
-                    } else {
-                        HeadReservation::Advances(Vec::with_capacity(operations.len()))
-                    },
+                    Vec::with_capacity(operations.len()),
                 )
             }
             ReservationLane::Vision => {
@@ -1378,41 +1247,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     advances, priming, ..
                 },
             )) => {
-                if let [
-                    Operation::Forward {
-                        request,
-                        prime: Some(prime),
-                        ..
-                    },
-                ] = operations
+                if let [Operation::Forward {
+                    request,
+                    prime: Some(prime),
+                    ..
+                }] = operations
                 {
-                    if !prime.tokens.is_empty() {
-                        let graph = self.resources.head_graph().expect("checked head graph");
-                        let graph_workspace = graph
-                            .acquire_workspace()
-                            .map_err(|error| invariant("drafter entry workspace", error))?;
-                        let graph_output = graph
-                            .acquire_output()
-                            .map_err(|error| invariant("drafter entry output", error))?;
-                        let state = self
-                            .head
-                            .remove(request)
-                            .expect("reservation preflight established drafter ownership");
-                        let rows = prime.tokens.len();
-                        match OwnedStateAdvance::begin_speculative(state, rows, rows) {
-                            Ok(advance) => {
-                                *priming = Some(PrimingReservation {
-                                    advance,
-                                    graph_workspace,
-                                    graph_output,
-                                })
-                            }
-                            Err((state, error)) => {
-                                self.head.insert(*request, state);
-                                return Err(DomainError::invariant(format!(
-                                    "drafter state capacity changed after availability check: {error}"
-                                )));
-                            }
+                    let graph = self.resources.head_graph().expect("checked head graph");
+                    let graph_workspace = graph
+                        .acquire_workspace()
+                        .map_err(|error| invariant("drafter entry workspace", error))?;
+                    let graph_output = graph
+                        .acquire_output()
+                        .map_err(|error| invariant("drafter entry output", error))?;
+                    let state = self
+                        .head
+                        .remove(request)
+                        .expect("reservation preflight established drafter ownership");
+                    let rows = prime.tokens.len();
+                    match OwnedStateAdvance::begin_speculative(state, rows, rows) {
+                        Ok(advance) => {
+                            *priming = Some(PrimingReservation {
+                                advance,
+                                graph_workspace,
+                                graph_output,
+                            })
+                        }
+                        Err((state, error)) => {
+                            self.head.insert(*request, state);
+                            return Err(DomainError::invariant(format!(
+                                "drafter state capacity changed after availability check: {error}"
+                            )));
                         }
                     }
                 }
@@ -1443,16 +1308,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     }
                 }
             }
-            ReservedResources::Head(_, _, HeadReservation::TargetReads(states)) => {
-                for operation in operations {
-                    states.push(
-                        self.target
-                            .remove(&operation.request())
-                            .expect("reservation preflight established target ownership"),
-                    );
-                }
-            }
-            ReservedResources::Head(_, _, HeadReservation::Advances(advances)) => {
+            ReservedResources::Head(_, _, advances) => {
                 for operation in operations {
                     let request = operation.request();
                     let state = self
@@ -1560,14 +1416,6 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             program_identity: self.lane_identities[lane].clone(),
             executable,
             commitment: operation.commitment(),
-            draft_width: match operation {
-                Operation::Head {
-                    form: crate::DraftForm::Block,
-                    proposals,
-                    ..
-                } => Some(proposals.len()),
-                _ => None,
-            },
         }
     }
 

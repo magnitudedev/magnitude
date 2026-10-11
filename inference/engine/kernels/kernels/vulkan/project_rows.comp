@@ -80,7 +80,7 @@ projection_epilogue project_rows_output() {
 }
 
 projection_weights project_rows_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), WEIGHT_GEOMETRY, uint(SEISMIC_DIM_K), 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), WEIGHT_GEOMETRY, uint(SEISMIC_DIM_K), 0ul);
 }
 
 void project_rows_gemv() {

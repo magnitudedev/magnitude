@@ -61,10 +61,7 @@ control, and is the one stop signal the host reads.
 **Pipeline.** Idle, between flights and holding the binding right; or InFlight, one group on the
 device whose flight holds the binding right until completion returns it. In Idle the owner selects
 a round and submits its groups in order. Completion reconciles the group, queues its follow-up
-operations in the round and continues it; an exhausted round returns to Idle. A final prompt
-chunk may publish its accepted token at target completion and continue as its outstanding
-drafter-entry flight. This second completion holds the binding right, remains responsive to
-controls, and resolves head state before the round finishes. The pipeline waits
+operations in the round and continues it; an exhausted round returns to Idle. The pipeline waits
 on nothing but its flight: one request's shortage or one slow consumer never stops the others.
 
 **Request states.** A request has one state in one place: the owner's table, or the current round

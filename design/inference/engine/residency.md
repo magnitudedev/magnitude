@@ -49,22 +49,15 @@ accumulator through an accumulator-scale port; no import or family folds it into
 A missing or misshapen scale, a scaled weight dequantized for dense-only kernels, and a scaled
 weight bound by an entry without a scale port are refused at plan time, so the model is
 `Unsupported` rather than failing on a device.
-The canonical output projection retains its packed representation. Eligible Q4_0 and Q8_0
-sources can also provide lossless bounded-selection views, as five
-`ImportTransform::Progressive` planes: the coarse half of the offset codes, their next bit,
-remaining bits, group scales, and outward-rounded view radii. The code depth remains explicit;
-the radii cover the coefficient-view distance and both projections' F32 rounding. Each view is a
-separate physical storage identity, while semantic users of the same view share its allocation.
-Candidate views are transient preparation inputs, not baseline resident requirements. A completed
-first-load composed qualification selects the bounded recipe only for measured selected-row
-classes of the exact projection/norm/prepared-feature recipe. It shares the existing one-minute
-allocation with entry tuning; an unfinished or unmeasured choice remains packed permanently for
-that cache identity. Later loads reuse the completed choice and do not continue searching.
-Before admission the load plan retains planes only for selected recipes and drops unused
-candidates. Packed and retained planes are charged together through ordinary resource planning;
-optional views cannot make an otherwise admitted packed model fail to load. The host places
-planes directly from the stored rows. Host placement takes no import entry or mapped import
-window. All-logits and indexed projections use canonical packed storage.
+A progressive head replaces the stored Q8_0 head by its five planes (`ImportTransform::Progressive`,
+each its own `WeightKind::OutputPlane` weight): the offset-binary codes' bits 7..4, bit 3 and bits
+2..0, the group scales, and per row the radii of its 4- and 5-bit views (`[V, 2]`, so every
+plane's leading rows are a draft head's draft-vocabulary rows; in F32 rounded up, the
+Euclidean distance between the row and its view plus `4 · K · 2⁻²⁴ · |w|₂`, which covers both
+projections' F32 rounding). The planes hold the head's values bit for bit, so the head's resident
+bytes are unchanged and the radii add `8 · V` bytes. The host places each plane from the stored
+rows and the device holds the placed bytes as they are: a host-placed weight takes no import entry
+and joins no mapped import window. A draft head binds the target's resident planes, imported once.
 
 Each import takes an immutable artifact source and validates its exact WeightPlan. On Metal,
 component weights are visited in source-file order. Consecutive whole tensors whose combined
@@ -84,14 +77,6 @@ store so tied embedding and output weights retain their exact resident tensors; 
 owns an isolated projector store. A separate draft (DFlash, DSpark, DFlash2) is the head lane's drafter: its
 fusion weights are target weights (every target step fuses the draft's taps), imported with the
 target from the draft component, and its loader imports the rest of the draft component through
-the inherited target store. Vocabulary projection ownership and model-defined proposal candidate policy are independent.
-A trained cluster policy binds its centroid projection, canonical token ordering and selected
-cluster count; execution preserves that policy without approximating target readout. Readout
-representation eligibility follows required operations rather than artifact ownership.
-An owned draft output projection is planned and charged
-to the draft component and imported from that artifact; a borrowed projection reuses
-the target allocation. Both bind the same readout entry and resident output field. Every preload reads each weight from the component that stores it. A draft head stored in the draft component (`HeadComponent::Draft`) is planned, charged and
-imported from that component like a separate draft's own weights, while its token embedding is the
-target's resident table.
+the inherited target store. Every preload reads each weight from the component that stores it.
 Numerical stages receive loaders rather than shared mutable
 cache access. No warm token path prepares or searches for an import kernel.

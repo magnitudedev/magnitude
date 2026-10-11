@@ -61,23 +61,6 @@ use seismic_ir::metal::MetalIntrinsic;
 /// this string and with it every cache identity (§15.1).
 pub const BACKEND_REVISION: &str = "seismic-metal-v11";
 
-/// Run `work`, which calls into Metal or Foundation, and release what
-/// those calls autoreleased when it returns.
-///
-/// Metal and Foundation hand back objects they have autoreleased: they
-/// live until the calling thread's innermost autorelease pool is drained.
-/// No thread of this process has a pool of its own (it has no run loop),
-/// so without one here they live until the thread exits, and the thread
-/// that submits serving's work never does. Measured on an M4 Max
-/// (2026-10-09): a submission (command buffer, encoder, commit, wait) left
-/// 180 bytes each on a thread with no pool, growing without bound, and
-/// none with one; a program compile left 22 KiB. Every entry of this
-/// backend that calls into Metal or Foundation therefore runs in a pool.
-/// Objects the work returns retained outlive the pool.
-pub(crate) fn pooled<R>(work: impl FnOnce() -> R) -> R {
-    objc2::rc::autoreleasepool(|_| work())
-}
-
 /// The Metal backend.
 #[derive(Debug)]
 pub struct Metal;
@@ -188,7 +171,7 @@ impl seismic_native_target::NativeCompiler<Metal> for MetalNativeCompiler {
         kernel: &seismic_ir::kernel::Kernel<Metal>,
         layout: &seismic_ir::physical_target::KernelEmissionLayout,
     ) -> Result<Self::Candidate, NativeCompilationError> {
-        pooled(|| compile::compile_kernel(context, target, kernel, layout))
+        compile::compile_kernel(context, target, kernel, layout)
     }
     fn reflect(
         &self,

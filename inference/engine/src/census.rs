@@ -81,7 +81,7 @@ impl AllocationCensus {
         let context_bytes = [
             state(charge.target_state).ok_or_else(overflow)?,
             head_state,
-            charge.owned_features,
+            charge.owned_media,
             charge.external_pins,
         ]
         .into_iter()

@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const VERSION: &str = "seismic-scalar-reference-bits-v4";
+pub const VERSION: &str = "seismic-scalar-reference-bits-v3";
 
 /// Operation identities describe source semantics, never physical approximations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -35,8 +35,6 @@ pub enum ScalarOp {
     Unary(ast::UnaryOp),
     Math(MathOp),
     Cast(DType),
-    /// Exact payload transport between F32 and U32.
-    Bitcast(DType),
     /// A signed 64-bit two's-complement integer, given as the U32 words
     /// `(low, high)`, rounded once to nearest-even in the float dtype. It equals
     /// `integer_to_float` for every value in `[-2^63, 2^63)`.
@@ -52,7 +50,6 @@ pub fn scalar_operation(primitive: &crate::intrinsics::PrimitiveId) -> Option<Sc
         PrimitiveId::Binary(op) => ScalarOp::Binary(*op),
         PrimitiveId::Math(op) => ScalarOp::Math(*op),
         PrimitiveId::Cast(dtype) => ScalarOp::Cast(*dtype),
-        PrimitiveId::Bitcast(dtype) => ScalarOp::Bitcast(*dtype),
         _ => return None,
     })
 }
@@ -631,7 +628,6 @@ fn transcendental(b: &Recipe, op: MathOp, input: V) -> V {
     let x = b.cast(input, F32_TY);
     let result = match op {
         MathOp::Exp => exp(b, x),
-        MathOp::Exp2 => exp2(b, x),
         MathOp::Log => log(b, x),
         MathOp::Sin => primitive::sine_or_cosine(b, x, false),
         MathOp::Cos => primitive::sine_or_cosine(b, x, true),
@@ -668,47 +664,6 @@ pub fn digest() -> [u8; 32] {
         hash.update(include_bytes!("reference_math.rs"));
         hash.finalize().into()
     })
-}
-
-// Base-two exponential has its own range reduction. Its source recipe does
-// not first round the entire x*ln(2), which would lose the exact integer scale.
-// The bounded fraction uses the existing F32 exponential recipe; power-of-two
-// scaling and exceptional values are constructed from owned payload operations.
-fn exp2(b: &Recipe, x: V) -> V {
-    let bits = b.fbits(x);
-    let magnitude = b.bit(BitOp::And, bits, b.u(0x7fffffff));
-    let nan = b.cmp(CmpOp::Gt, magnitude, b.u(0x7f800000));
-    let overflow = b.cmp(CmpOp::Ge, x, b.f(128f32.to_bits()));
-    let underflow = b.cmp(CmpOp::Le, x, b.f((-150f32).to_bits()));
-    let safe = b.select(b.or(nan, b.or(overflow, underflow)), b.f(0), x);
-    let rounded = primitive::operation(b, ScalarOp::Math(MathOp::Rint), &[safe]);
-    let k = b.cast(rounded, I32_TY);
-    let fraction = b.bin(BinaryOp::Sub, safe, rounded);
-    let hi = b.bin(BinaryOp::Mul, fraction, b.f(0x3f317200));
-    let lo = b.bin(BinaryOp::Mul, fraction, b.f(0x35bfbe8e));
-    let y = exp(b, b.bin(BinaryOp::Add, hi, lo));
-    let deep = b.cmp(CmpOp::Lt, k, b.i(-126));
-    let top = b.cmp(CmpOp::Eq, k, b.i(128));
-    let scale_k = b.select(top, b.i(127), k);
-    let field = b.bin(
-        BinaryOp::Add,
-        scale_k,
-        b.select(deep, b.i(127 + 24), b.i(127)),
-    );
-    let scale = b.from_bits(b.bit(BitOp::Shl, b.cast(field, U32_TY), b.u(23)));
-    let result = b.bin(BinaryOp::Mul, y, scale);
-    let result = b.select(deep, b.bin(BinaryOp::Mul, result, b.f(0x33800000)), result);
-    let result = b.select(
-        top,
-        b.bin(BinaryOp::Mul, result, b.f(2f32.to_bits())),
-        result,
-    );
-    let result = b.select(
-        overflow,
-        b.f(0x7f800000),
-        b.select(underflow, b.f(0), result),
-    );
-    b.select(nan, b.f(0x7fc00000), result)
 }
 
 // Sun/FreeBSD e_expf.c, expressed with explicit f32 operations and bit-built
@@ -924,87 +879,6 @@ mod tests {
             bits
         }
     }
-    #[test]
-    fn base_two_exponential_keeps_integer_scale_and_exceptional_values() {
-        let compute = |bits| {
-            apply(ScalarOp::Math(MathOp::Exp2), &[ReferenceScalar::F32(bits)])
-                .unwrap()
-                .bits()
-        };
-        for exponent in -149i32..=127 {
-            let expected = if exponent < -126 {
-                1u32 << (exponent + 149)
-            } else {
-                ((exponent + 127) as u32) << 23
-            };
-            assert_eq!(compute((exponent as f32).to_bits()), expected);
-        }
-        for (input, output) in [
-            (-150f32, 0u32),
-            (128f32, 0x7f800000),
-            (f32::INFINITY, 0x7f800000),
-            (f32::NEG_INFINITY, 0),
-        ] {
-            assert_eq!(compute(input.to_bits()), output);
-        }
-        assert_eq!(compute(0x7f800001), 0x7fc00000);
-        // Both signs of zero map to exactly one.
-        assert_eq!(compute(0), 1f32.to_bits());
-        assert_eq!(compute(0x80000000), 1f32.to_bits());
-    }
-
-    #[test]
-    fn integral_rounding_and_payload_reinterpretation_are_distinct() {
-        let round = |x: f32| {
-            apply(
-                ScalarOp::Math(MathOp::Rint),
-                &[ReferenceScalar::F32(x.to_bits())],
-            )
-            .unwrap()
-            .bits()
-        };
-        for (x, y) in [
-            (0.5, 0.0),
-            (1.5, 2.0),
-            (2.5, 2.0),
-            (3.5, 4.0),
-            (-0.5, -0.0),
-            (-1.5, -2.0),
-            (-2.5, -2.0),
-        ] {
-            assert_eq!(round(x), (y as f32).to_bits());
-        }
-        assert_eq!(round(f32::from_bits(1)), 0);
-        assert_eq!(round(f32::from_bits(0x80000001)), 0x80000000);
-        assert_eq!(round(f32::INFINITY), f32::INFINITY.to_bits());
-        assert_eq!(round(f32::NEG_INFINITY), f32::NEG_INFINITY.to_bits());
-        assert_eq!(round(f32::from_bits(0x7f800001)), 0x7fc00000);
-        // Reinterpretation transports payloads, including signaling NaNs; a
-        // numeric cast or arithmetic operation would destroy this distinction.
-        for bits in [0, 0x80000000, 1, 0x7f800001, 0x7fc01234, 0xffffffff] {
-            let value =
-                apply(ScalarOp::Bitcast(DType::F32), &[ReferenceScalar::U32(bits)]).unwrap();
-            assert_eq!(value.bits(), bits);
-            assert_eq!(
-                apply(ScalarOp::Bitcast(DType::U32), &[value]).unwrap(),
-                ReferenceScalar::U32(bits)
-            );
-        }
-        for dtype in [DType::F16, DType::BF16] {
-            for (x, expected) in [(0.5f32, 0.0f32), (1.5, 2.0), (-0.5, -0.0)] {
-                let input =
-                    apply(ScalarOp::Cast(dtype), &[ReferenceScalar::F32(x.to_bits())]).unwrap();
-                let result = apply(ScalarOp::Math(MathOp::Rint), &[input]).unwrap();
-                let expected = apply(
-                    ScalarOp::Cast(dtype),
-                    &[ReferenceScalar::F32(expected.to_bits())],
-                )
-                .unwrap();
-                assert_eq!(result, expected);
-            }
-        }
-    }
-
     #[test]
     fn literal_quantization_rounds_once_from_parsed_f64() {
         assert_eq!(

@@ -84,11 +84,7 @@ declaration names the exact projector path in that repository. Package construct
 validation are one operation: an image target requires an exact projector component and a typed
 relationship to the package weights. Native assessment establishes whether MTMD recognizes image
 input. Primary-weight metadata and projector presence alone never establish runnable image
-capability. A missing, ambiguous, or incompatible projector fails generation. Embedded MTP
-combined with a projector is rejected: its head embeds every prompt token and cannot enter
-media rows. A separately packaged Gemma QAT assistant reads the target's history, media rows
-included, and is admitted only with its matching target and validated composed capability.
-Generation independently refuses a token-embedding drafter for a request with media spans.
+capability. A missing, ambiguous, incompatible, or MTP-combined projector fails generation.
 Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft
 file in the target or another repository. Every package source is locked.
 
@@ -239,12 +235,6 @@ Admission validates each package in the requested bundle against the current mat
 record and that package's current exact file evidence. It does not await inventory-wide filesystem
 reconciliation. Global reconciliation remains the discovery path for external filesystem changes;
 it is never a prerequisite for acknowledging a known catalog download.
-
-Development tooling acquires one catalog model outside ICN through the catalog tool, into an explicit model store. It uses the same per-variant resolution at locked commits and the same download and verification path as the service:
-- it fetches only missing or invalid files;
-- it reports the resolved target, the catalog's drafter (embedded or separate) and the projector, each with its hash.
-
-It creates no installation occurrence and never touches a product store implicitly.
 
 The catalog installation occurrence retains `ModelId`, aggregates bounded progress, and has one
 terminal outcome. ACN observes and addresses that occurrence by `CatalogInstallationOperationId`.

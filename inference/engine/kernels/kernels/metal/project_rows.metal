@@ -48,7 +48,7 @@ kernel void project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_BATCH
-template <uint BATCH_ROWS, uint BATCH_PARTS>
+template <uint BATCH_ROWS>
 kernel void project_rows_batch(PROJECT_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -56,12 +56,6 @@ kernel void project_rows_batch(PROJECT_ROWS_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     PROJECT_ROWS_OPERANDS;
-    if constexpr (projection::matrix_form<packets::W0>::symmetric32) {
-        projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w,
-            uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane);
-        return;
-    }
-    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_N)) return;
     projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(in, out, w,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane);
 }

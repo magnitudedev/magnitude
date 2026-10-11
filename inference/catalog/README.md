@@ -15,13 +15,7 @@ context from its GGUF metadata, which is the context the engine resolves, serves
 ```sh
 cargo run --release -p magnitude-service-catalog-tool -- update-lock ...   # advance the commit map
 cargo run --release -p magnitude-service-catalog-tool -- build-bundle ...  # build the header bundle
-cargo run --release -p magnitude-service-catalog-tool -- acquire --model qwen3.5-4b:gguf:q4 --model-store DIR
 ```
-
-`acquire` resolves one catalog model at its locked revisions, downloads into a managed model store
-only the target, drafter and projector files that are missing, verifies them through the service's
-own download path, and prints their absolute paths and SHA-256 digests as JSON (the evaluation
-model-reference contract). Evaluation tools obtain models only through it.
 
 Generation resolves the pinned repositories and writes `model-planner-inputs.bundle`: the exact GGUF
 header (every byte through the aligned tensor-data offset) of every package component, which is

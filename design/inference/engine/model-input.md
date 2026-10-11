@@ -40,9 +40,7 @@ declared scheme selects one implemented profile, and an unimplemented scheme or 
 tokenizer metadata is an unsupported representation. Implicit sequence-start insertion is such a
 fact. A tokenizer that begins every sequence with its BOS applies it exactly once: a prompt whose
 rendered text already begins with the BOS (templates that render it) is not given a second one.
-End-of-generation and never-generated tokens are likewise tokenizer facts. Declared
-additional EOS identities join the stop set after integer and vocabulary-bound
-validation; they do not alter ordinary text encoding.
+End-of-generation and never-generated tokens are likewise tokenizer facts.
 
 Generic execution validates shapes and bounds against the model definition and consumes the
 prepared contract. It does not repeat family-specific spatial derivation or infer semantic meaning
@@ -57,40 +55,6 @@ windows. Its GGUF `dflash.attention.causal` is either BOOL (broadcast to all dra
 layers) or ARRAY<BOOL> with exactly one element per layer. No sliding-window or
 model-name heuristic supplies omitted semantics. Interpretation normalizes this
 once to per-layer block attention; execution consumes only that normalized model.
-History reach is likewise a declared draft fact: a sliding layer reads its
-`attention.sliding_window`, and a full layer reads at most `dflash.context_length`
-tokens back, the longest sequence the draft was trained on. A full layer is a window
-of that length, never a history beyond the draft's training. Injection may skip only
-layers narrower than the draft's widest history, which still reads every row they drop.
-Draft input embedding scale and final projection softcap are explicit draft facts.
-Absent declarations mean raw embeddings and raw logits, independently of target
-transforms. A declared positive softcap applies to the vocabulary projection before
-any draft-specific additive bias; zero disables it. Nonfinite or invalid scales
-are rejected. Converter-inferred values require upstream semantic evidence; target
-architecture alone does not establish a drafter transform. An optional `output.weight`
-(and its encoding-required scale) declares an owned projection over the full target
-vocabulary and hidden width. Absence shares the target projection; equal dimensions
-do not establish training compatibility between those projections.
-
-A Gemma 4 assistant (`gemma4-assistant`) is interpreted against its Gemma 4 target as
-that target's draft head, stored in the draft component and keeping no history of its
-own. Every assistant layer is a prediction layer whose attention reads target history
-(`shared_kv_layers` equals `block_count` equals `nextn_predict_layers`): a window layer
-the target's second-to-last layer, a full layer its last, as the published checkpoint
-was trained. The history domain each layer was trained with (its window, or every row)
-must equal the domain the source target layer keeps, and its head count and width and
-rotary must equal the owner's; any disagreement rejects the pair rather than reading a
-different history. `embedding_length_out` must equal the target's width. The head's
-own width comes from `embedding_length`. Its input is the target's token embedding,
-scaled as the target scales it, beside the target's normalized output row, projected
-into its width; its normalized output reads out through its own full-vocabulary token
-table with no soft cap, and its post projection returns it to the target's width as
-the next chained step's conditioning row. QAT and non-QAT assistants share shapes, so
-shape agreement is necessary but never proof of a matched pair; the catalog pins it.
-A Gemma 4 target's last `shared_kv_layers` layers are interpreted as Shared history
-domains reading an earlier owning layer of their kind; the definition carries nothing
-else about them, and execution derives from those domains alone which blocks need run
-only over the rows a step reads (`execution-plan.md`, the stateless tail).
 
 ## Acceptance criteria
 

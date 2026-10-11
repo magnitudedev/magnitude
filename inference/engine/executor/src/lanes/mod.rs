@@ -4,10 +4,7 @@ mod state;
 mod target;
 mod vision;
 
-pub use head::{
-    HeadConditioning, HeadLaunchCore, HeadLaunchInputs, TargetHistoryRead, TargetReads,
-    ValidatedHeadLaunch,
-};
+pub use head::{HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ValidatedHeadLaunch};
 pub use import::{ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot, ValidatedImportLaunch};
 pub use state::{StateLaunchCore, StateLaunchInputs, StateWork, ValidatedStateLaunch};
 pub use target::{

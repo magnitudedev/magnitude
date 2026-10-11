@@ -33,18 +33,15 @@ use magnitude_family_contracts::{
 };
 use std::{error, fmt};
 
-/// The GGUF architecture of a DFlash-family block drafter.
-pub const ARCHITECTURE: &str = "dflash";
+const ARCHITECTURE: &str = "dflash";
 const PREFIX: &str = "dflash.";
 
 /// Every admitted `dflash.*` key; any other key names a feature this family
 /// does not admit.
-const ADMITTED_KEYS: [&str; 30] = [
+const ADMITTED_KEYS: [&str; 28] = [
     "block_count",
     "context_length",
     "embedding_length",
-    "embedding_scale",
-    "final_logit_softcapping",
     "feed_forward_length",
     "attention.head_count",
     "attention.head_count_kv",
@@ -85,10 +82,9 @@ const CONTAINER_NAMESPACES: [&str; 4] = ["general.", "tokenizer.", "quantize.", 
 
 const MASK_TOKEN: &str = "tokenizer.ggml.mask_token_id";
 
-/// Draft-wide roles. Reduced vocabulary (`d2t`) is not admitted.
-const GLOBAL_ROLES: [&str; 14] = [
-    "output.weight",
-    "output.scale",
+/// Draft-wide roles. A draft's own vocabulary projection and a reduced
+/// vocabulary (`d2t`) are not admitted.
+const GLOBAL_ROLES: [&str; 12] = [
     "fc.weight",
     "fc.scale",
     "enc.output_norm.weight",
@@ -355,9 +351,7 @@ pub fn inspect(
     let m = Metadata::new(directory, ARCHITECTURE, &ADMITTED_KEYS)?;
     let decoder = &target.decoder;
     let block_count = m.integer("block_count")?;
-    // The longest sequence the draft was trained on: no layer reads further
-    // back than it (a full layer's history is a window of that length).
-    let context_length = m.integer("context_length")?;
+    m.integer("context_length")?;
     let hidden = m.integer("embedding_length")?;
     let intermediate = m.integer("feed_forward_length")?;
     let heads = m.integer("attention.head_count")?;
@@ -409,7 +403,7 @@ pub fn inspect(
     }
 
     let (domains, block_attention): (Vec<_>, Vec<_>) =
-        layer_attention(&m, block_count, context_length)?.into_iter().unzip();
+        layer_attention(&m, block_count)?.into_iter().unzip();
     let rotary = rotary_table(&m, width)?;
     let query_rows = product(&[heads, width])?;
     let key_rows = product(&[kv_heads, width])?;
@@ -428,11 +422,6 @@ pub fn inspect(
         DraftEmbedding::Own(binder.bind_scaled("token_embd.weight", &[decoder.vocabulary, hidden])?)
     } else {
         DraftEmbedding::Target
-    };
-    let output = if binder.contains("output.weight") {
-        Some(binder.bind_scaled("output.weight", &[decoder.vocabulary, hidden])?)
-    } else {
-        None
     };
     let blocks = domains
         .into_iter()
@@ -560,12 +549,9 @@ pub fn inspect(
         fusion,
         fusion_norm,
         embedding,
-        output,
-        embedding_scale: m.optional_positive_number("embedding_scale")?.unwrap_or(1.0),
         blocks,
         block_attention,
         output_norm,
-        logit_softcap: m.optional_number("final_logit_softcapping")?.filter(|cap| *cap != 0.0),
         block_size,
         mask_token,
         layout,
@@ -636,13 +622,9 @@ fn dflash2_method(
 
 /// History windows and block causality are independent checkpoint properties.
 /// Causality must be explicit: one BOOL broadcasts, ARRAY<BOOL> names each layer.
-/// A sliding layer reads its declared window; a full layer reads at most the
-/// draft's trained context (`context_length`), never further back than any
-/// sequence it learned from.
 fn layer_attention(
     m: &Metadata<'_>,
     block_count: u64,
-    context_length: u64,
 ) -> Result<Vec<(HistoryDomain, BlockAttention)>, Error> {
     let window = m.optional_integer("attention.sliding_window")?;
     let causal = match m.value("attention.causal") {
@@ -671,9 +653,7 @@ fn layer_attention(
                         expected: "present for sliding layers",
                     })
                 }
-                (false, _) => HistoryDomain::Window {
-                    tokens: context_length,
-                },
+                (false, _) => HistoryDomain::Token,
             };
             let attention = match causal {
                 true => BlockAttention::Causal,

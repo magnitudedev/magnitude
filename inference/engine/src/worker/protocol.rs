@@ -15,7 +15,6 @@ use crate::census::{AllocationCensus, MemoryDomain};
 use crate::error::{LoadError, RequestError, UnloadCause};
 use crate::options::{ExecutionManifest, ReadyInfo};
 use magnitude_chat::ConstraintPlan;
-use magnitude_executor::UnpreparedUnits;
 use magnitude_family_contracts::PreparedModelInput;
 use magnitude_generation::{DetailedUsage, FinishReason, Options, OutputToken};
 use magnitude_scheduler::prefix_cache::PrefixRetention;
@@ -69,18 +68,9 @@ pub struct Admission {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum HostMessage {
     Hello { build: EngineBuild },
-    /// Load `manifest`'s model and serve it. A load never searches: each
-    /// tuning unit is prepared from its stored record. At a unit the kernel
-    /// cache has no record for, the load does what `unprepared` says: it
-    /// places nothing, answers `Unprepared` and exits, or it prepares the
-    /// unit at its canonical default and goes on.
-    Load {
-        manifest: ExecutionManifest,
-        unprepared: UnpreparedUnits,
-    },
-    /// Search the tuning units of `manifest`'s model the kernel cache has no
-    /// record for, on the device its load selects, publishing each record;
-    /// then exit without loading the model. The only search there is.
+    Load { manifest: ExecutionManifest },
+    /// Prepare `manifest`'s programs on its device, tuning what the kernel
+    /// cache lacks, then exit without loading the model.
     Prepare { manifest: ExecutionManifest },
     Admit(Admission),
     /// The host's consumer drained `batches` output batches.
@@ -99,9 +89,9 @@ pub enum HostMessage {
 pub enum LoadProgress {
     /// Device selection, planning, opening the device and program preparation.
     Preparing,
-    /// Tuning kernels for the device. Reported only by a Prepare that searches, never by a
-    /// load: `total` is the tuning time in milliseconds and `completed` the milliseconds
-    /// spent. It starts at zero when the census begins; tuning may finish before `total`.
+    /// Tuning kernels for the device. Reported only when this load searches: `total` is the
+    /// tuning time in milliseconds and `completed` the milliseconds spent. It starts at zero
+    /// when the census begins; tuning may finish before `total`.
     Tuning { completed: u64, total: u64 },
     /// Target weight import, in resident bytes. It starts at zero before any import.
     ImportingWeights { completed_bytes: u64, total_bytes: u64 },
@@ -169,9 +159,6 @@ pub enum WorkerMessage {
     Ready { ready: ReadyInfo },
     /// A `Prepare` finished; the worker exits after this message.
     Prepared,
-    /// A `Load` asked to report tuning units without a stored record met
-    /// one and placed nothing; the worker exits after this message.
-    Unprepared,
     LoadFailed { error: LoadError },
     Admitted { request_id: HostRequestId },
     AdmissionRefused { request_id: HostRequestId, error: RequestError },

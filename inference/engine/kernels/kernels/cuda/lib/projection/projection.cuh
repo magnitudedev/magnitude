@@ -7,13 +7,11 @@
 // representation group (32 codes for q4k/q5k/q8/iq4, 16 for q6k; iq4 codes
 // enter as their exact table values) accumulates in
 // F32 from zero and is folded as acc += scale * P - bias * sum(x), the
-// group-factored form. GEMM: SCALED_GEMM representations also retain exact
-// codes and fold each group's F32 partial output with its decoded coefficient.
-// Other packed representations form round_A(code * scale - bias) from F32
-// coefficient arithmetic and accumulate those operands in F32. Dense weights
-// enter as their operand values. The GEMM's INT8 candidate quantizes activation
-// rows (`int8_activations`): see `QuantizedRows`. Reductions across K run in a
-// fixed order. A row's GEMV
+// group-factored form. GEMM: weights are dequantized to A per value,
+// round_A(code * round_A(scale) - round_A(bias)) (a rounding of 2^-9 relative
+// in bf16, far below the formats' own quantization step), and accumulate in
+// F32 without a per-group fold. The GEMM's INT8 candidate: see
+// `QuantizedRows`. Reductions across K run in a fixed order. A row's GEMV
 // result does not depend on M (every activation row is its own MMA column),
 // so rows 1..GEMV_ROWS of one request match M = 1 bit for bit.
 //
@@ -45,10 +43,10 @@
 // `SmallGemm` up to SMALL_GEMM_ROWS (64-row tiles, the INT8 candidate) and
 // `LargeGemm` beyond (128-row tiles, the 16-bit path, its copies issued by a
 // rotating set of warps: the launches' tuning parameter ROTATE). Entries with
-// few output columns also split it over K up to SPLIT_ROWS rows. The current
-// row schedule uses small tiles through 64 rows, large tiles beyond, and splits
-// few-column entries through 128 rows. Numerical-class admission is separate
-// from this schedule; a row count does not grant activation quantization.
+// few output columns also split it over K up to SPLIT_ROWS rows. Measured on
+// GB10 for every K1 entry (17 to 512 rows, both operand paths, split 1/2/4):
+// up to 64 rows want the small tiles, beyond them the large ones, and the
+// few-column entries the split up to 128 rows.
 #include "../core/activation.cuh"
 #include "../core/functions.cuh"
 #include <seismic/packets.cuh>
@@ -67,26 +65,6 @@ typedef element::Act Act;
 
 static_assert(Act::bytes == 2, "the CUDA projection family requires a bf16 or f16 activation element");
 using Op = typename packets::OperandOf<Act>::type;
-
-// Semantic Act owns prologue/epilogue rounding. A physical operand policy owns
-// reusable row storage and the tensor operands; choosing it is a separate
-// numerical transformation, never permission inferred from the row schedule.
-struct SemanticGemmOperands {
-    using Storage = Act;
-    using Operand = Op;
-    static constexpr bool EXACT_CODES = true;
-    static constexpr bool MATERIALIZE = false;
-};
-struct F16GemmOperands {
-    using Storage = element::F16;
-    using Operand = packets::OpF16;
-    static constexpr bool EXACT_CODES = false;
-    static constexpr bool MATERIALIZE = true;
-};
-template <unsigned Representation> struct GemmOperands;
-template <> struct GemmOperands<0> { using type = SemanticGemmOperands; };
-template <> struct GemmOperands<1> { using type = F16GemmOperands; };
-
 
 // The largest row count the GEMV serves; larger counts run the GEMM.
 constexpr u32 GEMV_ROWS = 16;
@@ -170,16 +148,12 @@ template <class E> struct SiluMul {
 // Activation-generic GLU (paired), `function` a `functions::` code (SiLU
 // gives SiluMul's bits):
 // out[m, n] = round(round_A(act(round_A(gate))) * round_A(up)).
-template <class E, class Publication = E> struct Glu {
+template <class E> struct Glu {
     u8 *out;
     u64 stride;
     int function;
     __device__ __forceinline__ float value(float gate, float up) const {
-        const float product = Act::round(functions::activate(function, Act::round(gate))) * Act::round(up);
-        if constexpr (Same<E, Publication>::value)
-            return product;
-        else
-            return Publication::round(product);
+        return Act::round(functions::activate(function, Act::round(gate))) * Act::round(up);
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float gate, float up) const {
         element::put<E>(out, m * stride + n, value(gate, up));
@@ -191,16 +165,12 @@ template <class E, class Publication = E> struct Glu {
 
 // A plain activated projection (up-only feed-forward, ReLU²):
 // out[m, n] = round(act(round_A(projection))).
-template <class E, class Publication = E> struct Activated {
+template <class E> struct Activated {
     u8 *out;
     u64 stride;
     int function;
     __device__ __forceinline__ float value(float projected) const {
-        const float activated = functions::activate(function, Act::round(projected));
-        if constexpr (Same<E, Publication>::value)
-            return activated;
-        else
-            return Publication::round(activated);
+        return functions::activate(function, Act::round(projected));
     }
     __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
         element::put<E>(out, m * stride + n, value(projected));
@@ -543,8 +513,7 @@ template <class Pro> __device__ __forceinline__ auto after_dependency(const Pro 
 // superblock's first k-block (or of the share's first). Each warp decodes its
 // own rows' coefficients of every k-block into its area (16 B per row per
 // stream).
-template <int BM_, int WM_, int WN_, int STAGES_, bool ORDERED_ = false, int ROTATE_ = 1, int SPAN_ = 1>
-struct GemmShape {
+template <int BM_, int WM_, int WN_, int STAGES_, bool ORDERED_ = false, int ROTATE_ = 1> struct GemmShape {
     static constexpr int BM = BM_;
     static constexpr int WM = WM_;
     static constexpr int WN = WN_;
@@ -557,12 +526,6 @@ struct GemmShape {
     static constexpr int ROTATE = ROTATE_;
     static constexpr int LOADERS = THREADS / ROTATE;
     static_assert(WARPS % ROTATE == 0 && BM * 8 % LOADERS == 0, "loader sets of whole warps and chunks");
-    // K-blocks staged together (`gemm_segment`): a span's consecutive stages
-    // are issued at once, its weight copies interleaved so that one warp copy
-    // covers a row's codes of all SPAN k-blocks.
-    static constexpr int SPAN = SPAN_;
-    static_assert(SPAN == 1 || (ROTATE == 1 && STAGES % SPAN == 0 && STAGES / SPAN >= 2),
-                  "a spanned pipeline rotates whole spans through at least two span slots");
     static constexpr int MI = BM / WM / 16; // m16 tiles per warp
     static constexpr int NJ = 8 / WN;       // weight tiles per warp
     static_assert(MI * 16 * WM == BM && NJ * WN == 8, "warp tiling covers the block tile");
@@ -674,29 +637,6 @@ __device__ __forceinline__ void gemm_load_codes(const W &w, u64 tile0, u64 tiles
     }
 }
 
-// One stream's codes of k-blocks [kblock, kblock + count) (count <= SPAN)
-// into the stages at codes, codes + STAGE, ...: chunk c of the span copies
-// k-block c % SPAN, so the SPAN copies of one chunk position (a row's
-// consecutive codes in the row-major packed layouts) are issued by adjacent
-// lanes of one warp copy. Measured on GB10: one warp copy's 32 contiguous
-// bytes per row (a q4 k-block) stream from memory at 108 GB/s, 64 bytes at
-// 205 GB/s, 128 bytes at 231 GB/s, whatever the number of copies in flight.
-template <class W, int STRIDE, int TILE, int SPAN, int STAGE>
-__device__ __forceinline__ void gemm_load_codes_span(const W &w, u64 tile0, u64 tiles, u64 kblock, u64 count,
-                                                     u8 *codes, u32 first) {
-    for (int c = first; c < SPAN * 8 * W::CHUNKS; c += STRIDE) {
-        const u64 d = c % SPAN;
-        if (d >= count)
-            continue;
-        const int position = c / SPAN;
-        const u64 j = position / W::CHUNKS;
-        const u32 q = position % W::CHUNKS;
-        const bool valid = tile0 + j < tiles;
-        seismic_cp_async_16_zfill(codes + d * STAGE + j * TILE + q * 16,
-                                  w.chunk_source(valid ? tile0 + j : tile0, kblock + d, q), valid ? 16u : 0u);
-    }
-}
-
 // One stream's part of a record buffer: the coefficient records (RECORD bytes
 // per row) of superblock `superblock` of the rows of tiles [tile0, tile0 + 8),
 // zero past `tiles` and for words of k-blocks at or past `kblocks` (a partial
@@ -747,10 +687,9 @@ template <class W> __device__ __forceinline__ float2 gemm_coefficient(const floa
 
 // The A pair of two codes (an exact A pair, as `decode` forms it) of one row:
 // round_A(code * scale - bias) per half, from F32 arithmetic.
-template <class Operand = Op>
 __device__ __forceinline__ u32 dequantize_pair(u32 codes, float2 coefficient) {
-    const float2 pair = Operand::unpack(codes);
-    return Operand::pack(seismic_fma_rn(pair.x, coefficient.x, coefficient.y),
+    const float2 pair = Op::unpack(codes);
+    return Op::pack(seismic_fma_rn(pair.x, coefficient.x, coefficient.y),
                     seismic_fma_rn(pair.y, coefficient.x, coefficient.y));
 }
 
@@ -841,20 +780,19 @@ __device__ __forceinline__ void gemm_publish(const float (&acc)[2][NJ][MI][2][4]
 // activation sum formed by the same MMA against an all-ones operand. Its
 // weights are then never rounded to A, whose 8-bit mantissa (bf16) would
 // otherwise round every dequantized weight.
-template <class Shape, class Operands = SemanticGemmOperands, class W>
+template <class Shape, class W>
 __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const W &w, const typename W::Raw &raw,
                                                const float *coefficients, int j_tile, int half,
                                                const u32 a[2][Shape::MI][4]) {
-    using Operand = typename Operands::Operand;
     const u32 g = (threadIdx.x % 32) / 4;
     constexpr int STEPS = W::GROUP / 16;
-    if constexpr (W::SCALED_GEMM && Operands::EXACT_CODES) {
+    if constexpr (W::SCALED_GEMM) {
         const u32 t = threadIdx.x % 4;
-        const u32 ones[2] = {Operand::ONES, Operand::ONES};
+        const u32 ones[2] = {Op::ONES, Op::ONES};
         u32 r[2][4];
 #pragma unroll
         for (int local = 0; local < 2; ++local)
-            w.template decode<Operand>(raw, 2 * half + local, r[local]);
+            w.template decode<Op>(raw, 2 * half + local, r[local]);
         // One partial product per coefficient group: both steps of the half
         // for 32-code groups, each step for 16-code groups.
         constexpr int FOLDS = 2 / STEPS;
@@ -878,10 +816,10 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
                 for (int local = fold * STEPS; local < (fold + 1) * STEPS; ++local) {
                     const u32 b0[2] = {r[local][0], r[local][2]};
                     const u32 b1[2] = {r[local][1], r[local][3]};
-                    Operand::mma(p[0], a[local][mi], b0);
-                    Operand::mma(p[1], a[local][mi], b1);
+                    Op::mma(p[0], a[local][mi], b0);
+                    Op::mma(p[1], a[local][mi], b1);
                     if constexpr (W::BIAS)
-                        Operand::mma(s, a[local][mi], ones);
+                        Op::mma(s, a[local][mi], ones);
                 }
 #pragma unroll
                 for (int h = 0; h < 2; ++h)
@@ -900,22 +838,22 @@ __device__ __forceinline__ void gemm_tile_half(float acc[Shape::MI][2][4], const
         const int step = 2 * half + local;
         // Registers 0 and 2 hold row g of the tile, 1 and 3 row g + 8.
         u32 r[4];
-        w.template decode<Operand>(raw, step, r);
+        w.template decode<Op>(raw, step, r);
         // Dense weights decode to their operand values directly.
         if constexpr (!W::DENSE) {
             const float2 low = gemm_coefficient<W>(coefficients, j_tile * 16 + g, step / STEPS);
             const float2 high = gemm_coefficient<W>(coefficients, j_tile * 16 + g + 8, step / STEPS);
-            r[0] = dequantize_pair<Operand>(r[0], low);
-            r[2] = dequantize_pair<Operand>(r[2], low);
-            r[1] = dequantize_pair<Operand>(r[1], high);
-            r[3] = dequantize_pair<Operand>(r[3], high);
+            r[0] = dequantize_pair(r[0], low);
+            r[2] = dequantize_pair(r[2], low);
+            r[1] = dequantize_pair(r[1], high);
+            r[3] = dequantize_pair(r[3], high);
         }
         const u32 b0[2] = {r[0], r[2]};
         const u32 b1[2] = {r[1], r[3]};
 #pragma unroll
         for (int mi = 0; mi < Shape::MI; ++mi) {
-            Operand::mma(acc[mi][0], a[local][mi], b0);
-            Operand::mma(acc[mi][1], a[local][mi], b1);
+            Op::mma(acc[mi][0], a[local][mi], b0);
+            Op::mma(acc[mi][1], a[local][mi], b1);
         }
     }
 }
@@ -981,26 +919,6 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
                                                         first);
         }
     }
-    // The weights of the share's k-blocks [index, index + count) into stages
-    // s, s + 1, ... (`gemm_load_codes_span`), and the records of each
-    // superblock that starts among them (or of the share's first).
-    template <int STRIDE, int SPAN> __device__ __forceinline__ void load_span(int s, u64 index, u64 count,
-                                                                             u32 first) const {
-        const u64 kb = kbegin + index;
-        gemm_load_codes_span<WA, STRIDE, TILE_A, SPAN, STAGE>(wa, tile0, tiles, kb, count, stage(s) + ROWS, first);
-        if constexpr (PAIR)
-            gemm_load_codes_span<WB, STRIDE, TILE_B, SPAN, STAGE>(wb, tile0, tiles, kb, count,
-                                                                  stage(s) + ROWS + 8 * TILE_A, first);
-        for (u64 d = 0; d < count; ++d) {
-            if (index + d != 0 && (kb + d) % 4 != 0)
-                continue;
-            u8 *buffer = shared + RECORDS + (kb + d) / 4 % 2 * BUFFER;
-            gemm_load_records<WA, STRIDE, RECORD_A>(wa, tile0, tiles, (kb + d) / 4, ktotal, buffer, first);
-            if constexpr (PAIR)
-                gemm_load_records<WB, STRIDE, RECORD_B>(wb, tile0, tiles, (kb + d) / 4, ktotal,
-                                                        buffer + 128 * RECORD_A, first);
-        }
-    }
     __device__ __forceinline__ void decode(u64 index, u32 warp, u32 first) const {
         const u64 kb = kbegin + index;
         gemm_decode_coefficients<WA, Shape::NJ, RECORD_A>(wa, records(kb, 0), first, kb, area(warp, 0));
@@ -1013,7 +931,7 @@ template <class Shape, class WA, class WB, bool S8> struct GemmWeights {
 // `stage`) into its accumulators: the warp decodes its rows' coefficients,
 // then per 32-code half multiplies the half's two k16 steps of activation
 // fragments by its tiles' dequantized weight fragments.
-template <class Shape, class Operands = SemanticGemmOperands, class Weights>
+template <class Shape, class Weights>
 __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::MI][2][4], const Weights &weights,
                                               int stage, u64 index, u32 warp, u32 lane) {
     constexpr int PITCH = Shape::template A_PITCH<false>;
@@ -1048,9 +966,9 @@ __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::
             }
 #pragma unroll
         for (int j = 0; j < NJ; ++j) {
-            gemm_tile_half<Shape, Operands>(acc[0][j], weights.wa, raw_a[j], coefficients_a, j, half, a);
+            gemm_tile_half<Shape>(acc[0][j], weights.wa, raw_a[j], coefficients_a, j, half, a);
             if constexpr (Weights::PAIR)
-                gemm_tile_half<Shape, Operands>(acc[1][j], weights.wb, raw_b[j], coefficients_b, j, half, a);
+                gemm_tile_half<Shape>(acc[1][j], weights.wb, raw_b[j], coefficients_b, j, half, a);
         }
     }
 }
@@ -1061,7 +979,7 @@ __device__ __forceinline__ void gemm_multiply(float (&acc)[2][Shape::NJ][Shape::
 // of `parts` (split-K: the epilogue is then a `PartialStore` and
 // `split_finalize` applies the real one). Rows at or past M read zeros; a warp
 // whose rows all lie there decodes and multiplies nothing.
-template <class Shape, class Operands = SemanticGemmOperands, class Rows, class WA, class WB, class Epi>
+template <class Shape, class Rows, class WA, class WB, class Epi>
 __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32 M, u64 K, u64 nblock, u64 rows,
                                              const WA &wa, const WB &wb, const Epi &epi, u64 part = 0,
                                              u64 parts = 1) {
@@ -1127,64 +1045,21 @@ __device__ __forceinline__ void gemm_segment(u8 *shared, const Rows &source, u32
                     for (int e = 0; e < 4; ++e)
                         acc[s][j][mi][h][e] = 0.0f;
 
-    if constexpr (Shape::SPAN == 1) {
 #pragma unroll
-        for (int s = 0; s < Shape::STAGES - 1; ++s) {
-            if ((u64)s < kblocks)
-                load(s, s);
-            seismic_cp_async_commit();
-        }
-        for (u64 kb = 0; kb < kblocks; ++kb) {
-            seismic_cp_async_wait<Shape::STAGES - 2>();
-            __syncthreads();
-            const u64 next = kb + Shape::STAGES - 1;
-            if (next < kblocks)
-                load((int)(next % Shape::STAGES), next);
-            seismic_cp_async_commit();
-            if (active)
-                gemm_multiply<Shape, Operands>(acc, weights, (int)(kb % Shape::STAGES), kb, warp, lane);
-        }
-    } else {
-        // Spans of SPAN k-blocks rotate through STAGES / SPAN span slots: the
-        // span `slots - 1` ahead is issued while one span is multiplied.
-        constexpr int SPAN = Shape::SPAN;
-        constexpr int SLOTS = Shape::STAGES / SPAN;
-        const u64 spans = (kblocks + SPAN - 1) / SPAN;
-        auto load_span = [&](int slot, u64 span) {
-            const u64 index = span * SPAN;
-            const u64 count = min((u64)SPAN, kblocks - index);
-            for (u64 d = 0; d < count; ++d) {
-                u8 *base = weights.stage(slot * SPAN + (int)d);
-#pragma unroll
-                for (int i = 0; i < CHUNKS; ++i) {
-                    const int c = (int)loader + i * LOADERS;
-                    seismic_cp_async_16_zfill(base + (c / 8) * PITCH + (c % 8) * 16,
-                                              chunk[i] + (kbegin + index + d) * 128, valid[i] ? 16u : 0u);
-                }
-            }
-            weights.template load_span<LOADERS, SPAN>(slot * SPAN, index, count, loader);
-        };
-#pragma unroll
-        for (int s = 0; s < SLOTS - 1; ++s) {
-            if ((u64)s < spans)
-                load_span(s, s);
-            seismic_cp_async_commit();
-        }
-        for (u64 span = 0; span < spans; ++span) {
-            seismic_cp_async_wait<SLOTS - 2>();
-            __syncthreads();
-            const u64 next = span + SLOTS - 1;
-            if (next < spans)
-                load_span((int)(next % SLOTS), next);
-            seismic_cp_async_commit();
-            if (active)
-#pragma unroll
-                for (int d = 0; d < SPAN; ++d) {
-                    const u64 kb = span * SPAN + d;
-                    if (kb < kblocks)
-                        gemm_multiply<Shape, Operands>(acc, weights, (int)(span % SLOTS) * SPAN + d, kb, warp, lane);
-                }
-        }
+    for (int s = 0; s < Shape::STAGES - 1; ++s) {
+        if ((u64)s < kblocks)
+            load(s, s);
+        seismic_cp_async_commit();
+    }
+    for (u64 kb = 0; kb < kblocks; ++kb) {
+        seismic_cp_async_wait<Shape::STAGES - 2>();
+        __syncthreads();
+        const u64 next = kb + Shape::STAGES - 1;
+        if (next < kblocks)
+            load((int)(next % Shape::STAGES), next);
+        seismic_cp_async_commit();
+        if (active)
+            gemm_multiply<Shape>(acc, weights, (int)(kb % Shape::STAGES), kb, warp, lane);
     }
     seismic_cp_async_wait<0>();
     gemm_publish(acc, m0 + wm * (MI * 16), tile0 + wn * NJ, M, rows, epi);
@@ -1369,38 +1244,25 @@ __device__ __forceinline__ void gemm_segment_s8(u8 *shared, const QuantizedRows 
 }
 
 // ---------------------------------------------------------------------------
-// Operand eligibility is independent of row scheduling. GEMV reads semantic
-// Act; either matrix tile band can consume exact semantic operands, explicitly
-// admitted S8 activations, or a separately admitted materialized F16 operand
-// view. The common producer owns the selected representation and its group
-// metadata. S8 multiplies packed codes, so dense weights retain the semantic
-// path rather than silently quantizing their activations.
+// Operand paths of an entry. The GEMV and the large-band GEMM run the 16-bit
+// path; the small-band GEMM runs it or, with S8, the INT8 candidate (q8_1
+// activations and s8 MMAs). The staging launches (one block per row) write
+// the rows a launch does not read in place: `_stage` the prologue's A rows (a
+// prologue that is not read in place, M > 1: K A elements per row in
+// `staged`), `_stage_s8` the INT8 candidate's q8_1 rows (K bytes per row in
+// `staged`, the (d, d * sum q) groups in `groups`).
+// Whether the INT8 candidate applies to an entry's weights: it multiplies
+// q8_1 activations with packed codes, so with any dense weight INT8 has no
+// effect: the GEMM runs the 16-bit path, and `_stage_s8` stages what that
+// path reads.
 template <class... W> constexpr bool quantizable = (!W::DENSE && ...);
 
-// A selected materialized operand view owns its storage even when its type
-// equals semantic Act. Its producer must write every row; in-place eligibility
-// of the semantic source cannot turn that write into a no-op.
-template <class Operands, class Pro>
-__device__ __forceinline__ void materialize_operand_row(const Pro &pro, u32 m, u64 K, u8 *staged) {
-    form_row<typename Operands::Storage>(pro, m, K, staged);
-}
-
-// One producer contract for every row schedule. GEMV retains semantic Act;
-// either matrix tile band reads the selected representation. Plain semantic
-// sources remain in place, while an owned physical view is always produced.
-template <bool S8, class Operands, class Pro>
-__device__ __forceinline__ void stage_projection_row(const Pro &pro, u32 m, u32 rows, u64 K,
-                                                     u8 *staged, void *groups) {
-    static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
-                  "activation quantization and coefficient conversion are distinct policies");
-    if (rows <= GEMV_ROWS) {
-        if constexpr (Pro::STAGED)
-            form_row(pro, m, K, staged);
-    } else if constexpr (S8) {
+template <bool S8, class Pro>
+__device__ __forceinline__ void stage_row(const Pro &pro, u32 m, u64 K, u8 *staged, void *groups) {
+    if constexpr (S8)
         stage_row_s8(pro, m, K, staged, reinterpret_cast<float2 *>(groups));
-    } else if constexpr (Pro::STAGED || Operands::MATERIALIZE) {
-        materialize_operand_row<Operands>(pro, m, K, staged);
-    }
+    else if constexpr (Pro::STAGED)
+        form_row(pro, m, K, staged);
 }
 
 // The GEMV activation source. A prologue read in place is its own source.
@@ -1434,17 +1296,15 @@ __device__ __forceinline__ auto source_after_dependency(const Pro &pro, u8 *row,
 // One GEMM block on either path: `act` is the A rows (row stride
 // `act_stride`) for the 16-bit path or the staged s8 rows (with their
 // `groups`) for S8.
-template <class Shape, bool S8, class Operands = SemanticGemmOperands, class WA, class WB, class Epi>
+template <class Shape, bool S8, class WA, class WB, class Epi>
 __device__ __forceinline__ void gemm_run(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                          u64 K, u64 nblock, u64 rows, const WA &wa, const WB &wb, const Epi &epi,
                                          u64 part = 0, u64 parts = 1) {
-    static_assert(!S8 || Same<Operands, SemanticGemmOperands>::value,
-                  "quantized activation GEMM requires the semantic operand policy");
     if constexpr (S8)
         gemm_segment_s8<Shape>(shared, QuantizedRows{act, K, reinterpret_cast<const float2 *>(groups)}, M, K, nblock,
                                rows, wa, wb, epi, part, parts);
     else
-        gemm_segment<Shape, Operands>(shared, ActivationRows{act, act_stride}, M, K, nblock, rows, wa, wb, epi, part, parts);
+        gemm_segment<Shape>(shared, ActivationRows{act, act_stride}, M, K, nblock, rows, wa, wb, epi, part, parts);
 }
 
 // Block columns of a segment of `rows` rows.
@@ -1500,15 +1360,15 @@ __device__ __forceinline__ void split_finalize(const float *partials, u64 parts,
 // share's partials when the launch is split (grid z = SPLIT shares up to
 // SPLIT_ROWS rows, summed by the finalize launch), else published through
 // `epi`.
-template <class Shape, bool S8, class Operands = SemanticGemmOperands, class W, class Epi>
+template <class Shape, bool S8, class W, class Epi>
 __device__ __forceinline__ void gemm_run_split(u8 *shared, const u8 *act, u64 act_stride, const void *groups, u32 M,
                                                u64 K, u64 nblock, u64 rows, const W &w, const Epi &epi,
                                                float *partials) {
     if (gridDim.z > 1)
-        gemm_run<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
+        gemm_run<Shape, S8>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{},
                             PartialStore<1>{partials, M, rows, 0, blockIdx.z}, blockIdx.z, gridDim.z);
     else
-        gemm_run<Shape, S8, Operands>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{}, epi);
+        gemm_run<Shape, S8>(shared, act, act_stride, groups, M, K, nblock, rows, w, NoWeight{}, epi);
 }
 
 } // namespace projection

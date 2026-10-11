@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn exact_quantity_arithmetic_is_bound_exactly_and_its_word_cast_is_reached() {
+fn reached_quantity_arithmetic_and_word_cast_share_the_source_schedule() {
     use crate::candidate_domain::construct_candidate_domain;
     use crate::realization::demand_driven_tests::registry;
     use seismic_ir::schedule::{HostValueDestination, HostValueExpr, ScheduleStep};
@@ -34,30 +34,43 @@ fn exact_quantity_arithmetic_is_bound_exactly_and_its_word_cast_is_reached() {
         .read_materialized(&domain.general_construction())
         .unwrap();
     let steps = candidate.candidate().schedule().steps();
-    // An exact quantity over invocation values is its own immutable binding:
-    // no schedule slot holds it, and the word cast evaluates it exactly.
-    assert!(!steps
+    assert!(steps
         .iter()
         .any(|step| matches!(step, ScheduleStep::EvaluateHost(value)
         if matches!(value.value, HostValueExpr::Integer(_)))));
+    assert!(steps
+        .iter()
+        .any(|step| matches!(step, ScheduleStep::EvaluateHost(value)
+        if matches!(value.value, HostValueExpr::Word { dtype: DType::I32, .. }))));
     let mut values = Assignment::new();
     values.bind(input, SymbolValue::Nat(999_999_999u64.into()));
+    let mut exact = None;
     let mut word = None;
     for step in steps {
         let ScheduleStep::EvaluateHost(evaluation) = step else {
             continue;
         };
-        if let (
-            HostValueExpr::Word {
-                dtype: DType::I32,
-                value,
-            },
-            HostValueDestination::Native(_),
-        ) = (evaluation.value, evaluation.to)
-        {
-            word = Some(domain.arena().eval_int(value, &values).unwrap());
+        let (value, destination) = (evaluation.value, evaluation.to);
+        match (value, destination) {
+            (HostValueExpr::Integer(expression), HostValueDestination::Quantity(slot)) => {
+                let value = domain.arena().eval_int(expression, &values).unwrap();
+                exact = Some(value.clone());
+                values.bind(slot.symbol(), SymbolValue::Int(value));
+            }
+            (
+                HostValueExpr::Word {
+                    dtype: DType::I32,
+                    value,
+                },
+                HostValueDestination::Native(_),
+            ) => {
+                word = Some(domain.arena().eval_int(value, &values).unwrap());
+            }
+            _ => {}
         }
     }
+    let exact = exact.expect("source arithmetic published its reached exact value");
+    assert!(exact > u64::MAX.into());
     assert_eq!(word, Some(((999_999_999u128).pow(3) as u32 as i32).into()));
 }
 

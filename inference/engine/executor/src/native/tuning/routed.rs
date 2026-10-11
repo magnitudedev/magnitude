@@ -12,10 +12,10 @@
 //! argument set owns those tables as case state.
 
 use super::{
-    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
-    served_row_points,
+    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
+    TuningLimits,
 };
-use crate::operators::routed::fused_graph::{DECODE_ROWS, TILE_ROWS, grouped_blocks};
+use crate::operators::routed::fused_graph::{grouped_blocks, DECODE_ROWS, TILE_ROWS};
 use magnitude_family_contracts::{Operator, RouteNormalization, WeightKind, WeightScope};
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,

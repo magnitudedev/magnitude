@@ -5,20 +5,22 @@
 //! path, and owns the sole cache of resulting device tensors.
 
 use crate::domain::ClaimRefusal;
-use crate::programs::ProgramSubmission;
 use crate::programs::native_import::NativeImportProgram;
+use crate::programs::ProgramSubmission;
 use crate::resources::ImportWindow;
+use crate::{resident_element, source_element};
 use crate::{
     AllocationError, ExecutionPlan, ImportLaunchInputs, ImportProgram, InvariantError,
     ResidentWeightSlot, ResourceAllocator, ResourceDomainId, SubmitError, ValidatedImportLaunch,
     WeightPlan, WeightStorageIdentity,
 };
-use crate::{resident_element, source_element};
 use magnitude_artifacts::{
-    Error as ArtifactError, FileSource,
     gguf::{Encoding, GgufArtifact},
+    Error as ArtifactError, FileSource,
 };
-use magnitude_family_contracts::{WeightDescriptor, WeightRole};
+use magnitude_family_contracts::{
+    WeightDescriptor, WeightKind, WeightRole, WeightScope,
+};
 use seismic::{DType, Device, Element, NativeTensorBatch, Tensor, TraceDetail, TracedSubmission};
 use std::{
     cell::RefCell,
@@ -342,11 +344,7 @@ impl ResidencyStore {
 
     /// Cache a completed import, counting it toward the import in progress.
     /// The weight is resident either way; a refusal stops the import after it.
-    fn publish(
-        &mut self,
-        key: ResidencyKey,
-        weight: ResidentWeight,
-    ) -> Result<(), WeightImportError> {
+    fn publish(&mut self, key: ResidencyKey, weight: ResidentWeight) -> Result<(), WeightImportError> {
         let storage_bytes = weight.storage_bytes();
         self.resident.insert(key, weight);
         if let Some(progress) = &mut self.import_progress {
@@ -390,12 +388,15 @@ impl ResidencyStore {
         self.mapped_import
     }
 
-    /// The imported physical view selected for an explicit semantic weight role.
-    pub(crate) fn planned(&self, role: WeightRole) -> Option<&WeightPlan> {
-        self.execution
-            .load()
-            .weights()
-            .find(|weight| weight.role == role)
+    /// The admitted plan of the target weight with `kind`, when the plan has one.
+    pub(crate) fn planned_target(&self, kind: WeightKind) -> Option<&WeightPlan> {
+        self.execution.load().target().iter().find(|weight| {
+            weight.role
+                == WeightRole {
+                    scope: WeightScope::Target,
+                    kind,
+                }
+        })
     }
 
     /// Imports a plane of a progressive weight (`ImportTransform::Progressive`):
@@ -685,7 +686,7 @@ impl ResidencyStore {
                 ArtifactComponentKind::Target => target.push(weight.clone()),
                 ArtifactComponentKind::Draft => draft.push(weight.clone()),
                 ArtifactComponentKind::Projector => {
-                    return Err(invalid("a target or draft load plans a projector weight"));
+                    return Err(invalid("a target or draft load plans a projector weight"))
                 }
             }
         }
@@ -1079,7 +1080,9 @@ impl ComponentLoader<crate::ResidentHead> {
         package: std::sync::Arc<magnitude_artifacts::Package>,
     ) -> Result<Self, WeightImportError> {
         if definition.head.is_none() && definition.draft.is_none() {
-            return Err(invalid("the model definition enables no drafter"));
+            return Err(invalid(
+                "the model definition enables no drafter",
+            ));
         }
         Ok(Self::new(
             store,

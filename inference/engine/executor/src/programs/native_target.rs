@@ -3,22 +3,22 @@
 //! and the returned submission owns the launch until completion is observed.
 
 use super::{
-    DeviceSubmission, TargetProgram,
     graph::readout::{
-        BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind, certifies, shapes, write_selection,
+        certifies, shapes, write_selection, BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind,
     },
     native_target_graph::{BoundTargetGraphs, EntryTokens},
+    DeviceSubmission, TargetProgram,
 };
 use crate::operators::block::{BlockControlPorts, BlockStatePorts};
 use crate::{
-    ConditioningRef, ConditioningSlice, DeviceError, GraphOutputTensor, InvariantError,
-    NativeGraphOutputLease, NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease,
-    TargetGraphWorkspaceLease, TargetLaunchCore, TargetLaunchWorkspace, TargetTokens,
-    ValidatedTargetLaunch, completion::CompletionWaiter, native::AttestedState,
+    completion::CompletionWaiter, native::AttestedState, ConditioningRef, ConditioningSlice,
+    DeviceError, GraphOutputTensor, InvariantError, NativeGraphOutputLease,
+    NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease, TargetGraphWorkspaceLease,
+    TargetLaunchCore, TargetLaunchWorkspace, TargetTokens, ValidatedTargetLaunch,
 };
 use magnitude_batching::{Demand, TargetBatchUpload};
 use magnitude_family_contracts::Decoder;
-use magnitude_kernels::{conditioning_overlay, feature_copy};
+use magnitude_kernels::conditioning_overlay;
 use magnitude_state::LayerRef;
 use seismic::{
     Device, Element, NativeGraphCompletion, NativeGraphOutputs, NativeGraphPlan,
@@ -44,16 +44,6 @@ fn token_rows(tokens: &[i32]) -> Vec<u8> {
         .iter()
         .flat_map(|token| [*token, 0])
         .flat_map(|value| value.to_le_bytes())
-        .collect()
-}
-
-/// A launch's encoded visible spans, `segments` a row, with each row's
-/// padded to `padded` spans by empty ones.
-fn padded_spans(visible: &[u8], segments: u64, padded: u64) -> Vec<u8> {
-    let (row, padded) = (segments as usize * 8, padded as usize * 8);
-    visible
-        .chunks_exact(row)
-        .flat_map(|spans| spans.iter().copied().chain(std::iter::repeat_n(0, padded - row)))
         .collect()
 }
 
@@ -154,7 +144,6 @@ pub struct NativeTargetProgram {
     readout_graphs: Rc<BoundTargetReadoutGraphs>,
     /// Overlay plans by row count, sealed on first use.
     overlays: Rc<RefCell<BTreeMap<u64, OverlayGraph>>>,
-    boundary_copy: Rc<RefCell<Option<OverlayGraph>>>,
     waiter: CompletionWaiter,
     trace: TargetTrace,
 }
@@ -180,7 +169,6 @@ pub struct CommitSpan {
 
 /// A target step's readout and the commit span of its device work.
 pub struct TargetOutput {
-    pub boundary: Option<crate::FeatureRef>,
     pub readout: Option<TargetReadoutGraphResult>,
     pub commits: CommitSpan,
 }
@@ -266,18 +254,14 @@ impl NativeTargetProgram {
             graphs: Rc::new(graphs),
             readout_graphs: Rc::new(readout_graphs),
             overlays: Rc::new(RefCell::new(BTreeMap::new())),
-            boundary_copy: Rc::default(),
             waiter,
             trace: TargetTrace::from_environment(),
         })
     }
 
-    /// The readout over `hidden`, the step's final rows from batch row
-    /// `window.first` on (`RowWindow`).
     fn graph_readout(
         &self,
         batch: &TargetBatchUpload<'_>,
-        window: RowWindow,
         hidden: &Tensor,
         workspace: &mut NativeGraphWorkspaceLease,
         mut output: NativeGraphOutputLease,
@@ -339,10 +323,7 @@ impl NativeTargetProgram {
         // samples or takes its largest admitted logit at a temperature at
         // most, none reads its logits, and nothing else projects.
         let certified = actual_projected == actual_selected
-            && self
-                .readout_graphs
-                .prepared
-                .certifies(projected_class as u64)
+            && projected_class as u64 <= self.readout_graphs.prepared.certified_rows()
             && !selection_reads_logits
             && batch.shaping[..actual_selected].iter().all(certifies);
         let kind = if actual_selected > 0 {
@@ -356,7 +337,7 @@ impl NativeTargetProgram {
             ReadoutKind::Features
         };
         let class = ReadoutClass {
-            rows: window.rows,
+            rows: batch.class.rows() as u64,
             outputs: output_class as u64,
             projected: projected_class as u64,
             selected: selected_class as u64,
@@ -377,9 +358,7 @@ impl NativeTargetProgram {
             bindings.set(&ports.taps, tap_rows).map_err(device)?;
         }
         let mut out_rows = vec![0_i32; output_class];
-        for (index, &row) in batch.out_rows.iter().enumerate() {
-            out_rows[index] = window.row(row)?;
-        }
+        out_rows[..actual_outputs].copy_from_slice(batch.out_rows);
         active
             .write_input(&graph.out_rows, &i32_bytes(&out_rows))
             .map_err(device)?;
@@ -387,12 +366,10 @@ impl NativeTargetProgram {
             // The head gathers the hidden rows of the projected outputs.
             let mut rows = vec![0_i32; projected_class];
             for (index, &output_index) in projected_output_rows.iter().enumerate() {
-                rows[index] = window.row(
-                    *batch
-                        .out_rows
-                        .get(output_index)
-                        .ok_or_else(|| invalid("projected output row exceeds output rows"))?,
-                )?;
+                rows[index] = *batch
+                    .out_rows
+                    .get(output_index)
+                    .ok_or_else(|| invalid("projected output row exceeds output rows"))?;
             }
             active
                 .write_input(port, &i32_bytes(&rows))
@@ -448,44 +425,6 @@ impl NativeTargetProgram {
             .ok_or_else(|| invalid("a tapped graph has no bound draft input rows"))?
             .slice_leading(0, rows)
             .map_err(device)
-    }
-
-    fn boundary_copy(&self) -> Result<OverlayGraph, SubmitError> {
-        if let Some(graph) = self.boundary_copy.borrow().as_ref() {
-            return Ok(graph.clone());
-        }
-        let element = Element::dense(crate::planning::activation_dtype(
-            self.geometry.activation_dtype,
-        ));
-        let mut graph = self.device.native_graph();
-        let source = graph
-            .port(element, &[1, self.geometry.hidden])
-            .map_err(device)?;
-        let mut destination = graph
-            .port(element, &[1, self.geometry.hidden])
-            .map_err(device)?;
-        graph
-            .enqueue(
-                &self.state.feature_copy,
-                feature_copy::WorkflowArgs {
-                    input: source.tensor().into(),
-                    out: destination.tensor_mut().into(),
-                },
-            )
-            .map_err(device)?;
-        let plan = graph.seal().map_err(device)?;
-        if plan.workspace_bytes() != 0 || plan.output_bytes() != 0 || plan.upload_bytes() != 0 {
-            return Err(invalid(
-                "boundary capture unexpectedly requires graph storage",
-            ));
-        }
-        let graph = OverlayGraph {
-            plan,
-            source,
-            destination,
-        };
-        *self.boundary_copy.borrow_mut() = Some(graph.clone());
-        Ok(graph)
     }
 
     fn overlay(&self, rows: u64) -> Result<OverlayGraph, SubmitError> {
@@ -547,9 +486,7 @@ impl NativeTargetProgram {
         };
         let (graph, bound, per_layer) = entry.map_err(invalid)?;
         let TargetTokens::Host = tokens else {
-            return Err(invalid(
-                "a per-layer entry gathers table rows by host tokens",
-            ));
+            return Err(invalid("a per-layer entry gathers table rows by host tokens"));
         };
         let media_row = self
             .geometry
@@ -587,7 +524,9 @@ impl NativeTargetProgram {
             .map_err(device)?;
         let mut bindings = bound.bindings();
         bindings.set(&graph.ports.hidden, hidden).map_err(device)?;
-        bindings.set(&graph.ports.rows, &inputs).map_err(device)?;
+        bindings
+            .set(&graph.ports.rows, &inputs)
+            .map_err(device)?;
         let ready = active
             .attach(bindings, graph.plan.new_outputs().map_err(device)?)
             .map_err(device)?;
@@ -746,8 +685,7 @@ impl NativeTargetProgram {
             .map_err(|_| invalid("segment class exceeds u64"))?;
         let slots = u64::try_from(batch.actual_slots)
             .map_err(|_| invalid("request slot class exceeds u64"))?;
-        let mut controls = GraphControls::new(batch)?;
-        let mut window = RowWindow::whole(rows);
+        let controls = GraphControls::new(batch)?;
         let mut hidden = entry_outputs
             .exported(&entry.hidden)
             .ok_or_else(|| invalid("target embedding hidden was not exported"))?;
@@ -772,7 +710,7 @@ impl NativeTargetProgram {
                 .map_err(device)?;
             submitter.queue(ready)?;
         }
-        let mut per_layer_rows = self.queue_per_layer_entry(
+        let per_layer_rows = self.queue_per_layer_entry(
             batch,
             tokens,
             rows,
@@ -792,52 +730,8 @@ impl NativeTargetProgram {
                 batch.out_rows.len(),
                 batch.select_rows.len()
             );
-            for (domain, history) in controls.histories.iter().enumerate() {
-                let spans = history
-                    .visible
-                    .chunks_exact(8)
-                    .map(|span| {
-                        let bound =
-                            |at: usize| i32::from_le_bytes([span[at], span[at + 1], span[at + 2], span[at + 3]]);
-                        (bound(0), bound(4))
-                    })
-                    .collect::<Vec<_>>();
-                // Every row of a decode launch; a prefill launch's first
-                // and last.
-                let per_row = spans.chunks((segments as usize).max(1)).collect::<Vec<_>>();
-                let shown = match per_row.len() {
-                    0..=16 => per_row,
-                    rows => vec![per_row[0], per_row[rows - 1]],
-                };
-                eprintln!(
-                    "target batch history domain={domain} segments={segments} spans={shown:?}"
-                );
-            }
         }
-        // Blocks whose outputs the step reads; the last one's output feeds
-        // the readout.
-        let mut executed = self.geometry.blocks.len();
         for index in 0..self.geometry.blocks.len() {
-            if index == self.graphs.prepared.stateless_tail() {
-                // From here no block publishes state: run the rest over the
-                // rows the readout consumes, or not at all without any.
-                match RowWindow::consumed(batch.out_rows, rows)? {
-                    None => {
-                        executed = index;
-                        break;
-                    }
-                    Some(tail) if tail.rows < rows => {
-                        hidden = tail.slice(&hidden)?;
-                        per_layer_rows = per_layer_rows
-                            .map(|inputs| tail.slice(&inputs))
-                            .transpose()?;
-                        controls = controls.window(rows, tail);
-                        window = tail;
-                    }
-                    Some(_) => {}
-                }
-            }
-            let rows = window.rows;
             let block_started = self.trace.blocks.then(Instant::now);
             // A block with listing classes lists the history row tiles the
             // launch's rows see in the smallest class that holds them; a
@@ -857,17 +751,11 @@ impl NativeTargetProgram {
                     )
                     .map(|bytes| (tiles, bytes))
                 });
-            // A listing class may be sealed for more segments than the
-            // launch has: its rows' spans are then padded with empty ones.
-            let block_segments = match &listed_tiles {
-                Some(_) => self.graphs.prepared.listed_segments(index, segments),
-                None => segments,
-            };
             let (graph, bound) = self
                 .graphs
                 .block(
                     rows,
-                    block_segments,
+                    segments,
                     slots,
                     listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
                     index,
@@ -889,7 +777,7 @@ impl NativeTargetProgram {
                 (None, _) => {}
                 (Some(port), Some(inputs)) => bindings.set(port, inputs).map_err(device)?,
                 (Some(_), None) => {
-                    return Err(invalid("a per-layer block graph has no per-layer rows"));
+                    return Err(invalid("a per-layer block graph has no per-layer rows"))
                 }
             }
             if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
@@ -936,14 +824,9 @@ impl NativeTargetProgram {
                     active
                         .write_input(coordinates, &controls.coordinates)
                         .map_err(device)?;
-                    match block_segments == segments {
-                        true => active.write_input(visible, &history_controls.visible),
-                        false => active.write_input(
-                            visible,
-                            &padded_spans(&history_controls.visible, segments, block_segments),
-                        ),
-                    }
-                    .map_err(device)?;
+                    active
+                        .write_input(visible, &history_controls.visible)
+                        .map_err(device)?;
                     active
                         .write_input(fresh, &history_controls.fresh)
                         .map_err(device)?;
@@ -951,14 +834,14 @@ impl NativeTargetProgram {
                         .write_input(destinations, &history_controls.destinations)
                         .map_err(device)?;
                     match (history_tiles, &listed_tiles) {
-                        (Some(tiles), Some((_, bytes))) => {
-                            active.write_input(&tiles.port, bytes).map_err(device)?
-                        }
+                        (Some(tiles), Some((_, bytes))) => active
+                            .write_input(&tiles.port, bytes)
+                            .map_err(device)?,
                         (None, None) => {}
                         _ => {
                             return Err(invalid(
                                 "the block's graph class and its history tile list disagree",
-                            ));
+                            ))
                         }
                     }
                 }
@@ -1029,42 +912,13 @@ impl NativeTargetProgram {
             }
         }
         let (readout_workspace, readout_output) = readout;
-        let result = self.graph_readout(
-            batch,
-            window,
-            &hidden,
-            readout_workspace,
-            readout_output,
-            submitter,
-        )?;
-        if let Some(boundary) = state.0.boundary() {
-            let features = &result
-                .as_ref()
-                .ok_or_else(|| invalid("boundary capture has no features"))?
-                .features;
-            let row = batch.actual_rows - 1;
-            let source = features
-                .tensor()
-                .slice_leading(row as u64, row as u64 + 1)
-                .map_err(device)?;
-            let destination = boundary.allocation().tensor().map_err(device)?;
-            let copy = self.boundary_copy()?;
-            let mut bindings = copy.plan.bindings();
-            bindings.set(&copy.source, &source).map_err(device)?;
-            bindings
-                .set(&copy.destination, destination)
-                .map_err(device)?;
-            let mut slot = copy.plan.new_slot().map_err(device)?;
-            let ready = slot
-                .attach(bindings, copy.plan.new_outputs().map_err(device)?)
-                .map_err(device)?;
-            submitter.queue(ready)?;
-        }
+        let result =
+            self.graph_readout(batch, &hidden, readout_workspace, readout_output, submitter)?;
         let last_commit = Instant::now();
         // Every consumer of the final hidden rows is queued, so its output
         // slot returns to the lease; the device queue orders any reuse.
         drop(hidden);
-        let last = executed % 2;
+        let last = self.geometry.blocks.len() % 2;
         graph_outputs[last]
             .recycle(
                 pending[last]
@@ -1079,68 +933,6 @@ impl NativeTargetProgram {
                 last: last_commit,
             },
         ))
-    }
-}
-
-/// The batch rows a step's blocks run over: `rows` rows (a row class) from
-/// batch row `first`. Every block before the stateless tail runs the whole
-/// batch; the tail runs the smallest window that holds the rows the readout
-/// consumes. A row's computation in a block reads only its own hidden,
-/// per-layer and control rows and the history, so a window's rows compute
-/// what they would in the whole batch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RowWindow {
-    first: u64,
-    rows: u64,
-}
-
-impl RowWindow {
-    fn whole(rows: u64) -> Self {
-        Self { first: 0, rows }
-    }
-
-    /// The window of the row class covering `out_rows` within a batch of
-    /// `rows` rows, placed at their first row unless that would pass the
-    /// batch's end. `None` when no row is consumed.
-    fn consumed(out_rows: &[i32], rows: u64) -> Result<Option<Self>, SubmitError> {
-        let row = |row: &i32| {
-            u64::try_from(*row)
-                .ok()
-                .filter(|row| *row < rows)
-                .ok_or_else(|| invalid("readout row lies outside the batch"))
-        };
-        let rows_read = out_rows.iter().map(row).collect::<Result<Vec<_>, _>>()?;
-        let (Some(&first), Some(&last)) = (rows_read.iter().min(), rows_read.iter().max()) else {
-            return Ok(None);
-        };
-        let class = magnitude_batching::row_class((last - first + 1) as usize)
-            .ok_or_else(|| invalid("consumed rows have no row class"))? as u64;
-        Ok(Some(Self {
-            first: first.min(rows - class),
-            rows: class,
-        }))
-    }
-
-    /// The window's rows of a tensor over the batch rows.
-    fn slice(self, rows: &Tensor) -> Result<Tensor, SubmitError> {
-        rows.slice_leading(self.first, self.first + self.rows)
-            .map_err(device)
-    }
-
-    /// Batch row `row` as a row of the window.
-    fn row(self, row: i32) -> Result<i32, SubmitError> {
-        u64::try_from(row)
-            .ok()
-            .and_then(|row| row.checked_sub(self.first))
-            .filter(|row| *row < self.rows)
-            .map(|row| row as i32)
-            .ok_or_else(|| invalid("readout row lies outside the step's row window"))
-    }
-
-    /// The window's rows of a per-row host table over `batch_rows` rows.
-    fn rows_of(self, table: &[u8], batch_rows: u64) -> Vec<u8> {
-        let stride = table.len() / batch_rows as usize;
-        table[self.first as usize * stride..(self.first + self.rows) as usize * stride].to_vec()
     }
 }
 
@@ -1167,25 +959,6 @@ struct HistoryControls {
 }
 
 impl GraphControls {
-    /// The per-row controls of `window`'s rows, of controls over
-    /// `batch_rows` rows. The per-slot recurrent controls stay whole: only
-    /// attention blocks run a window (`stateless_tail`).
-    fn window(self, batch_rows: u64, window: RowWindow) -> Self {
-        Self {
-            coordinates: window.rows_of(&self.coordinates, batch_rows),
-            histories: self
-                .histories
-                .iter()
-                .map(|history| HistoryControls {
-                    visible: window.rows_of(&history.visible, batch_rows),
-                    fresh: window.rows_of(&history.fresh, batch_rows),
-                    destinations: window.rows_of(&history.destinations, batch_rows),
-                })
-                .collect(),
-            ..self
-        }
-    }
-
     fn new(batch: &TargetBatchUpload<'_>) -> Result<Self, SubmitError> {
         let rows = batch.class.rows();
         let segments = batch.class.segments();
@@ -1203,10 +976,7 @@ impl GraphControls {
                 history.visible.len() != rows
                     || history.fresh.len() != rows
                     || history.destinations.len() != rows
-                    || history
-                        .visible
-                        .iter()
-                        .any(|ranges| ranges.len() != segments)
+                    || history.visible.iter().any(|ranges| ranges.len() != segments)
             })
         {
             return Err(invalid(
@@ -1282,64 +1052,14 @@ impl TargetProgram for NativeTargetProgram {
             Err(error) => return Err((error, launch)),
         };
         let (core, workspace) = launch.into_submission_parts();
-        let boundary = core.boundary().cloned();
         Ok(DeviceSubmission::new(
             self.waiter.completion(queued.completions),
             core,
             workspace,
             TargetOutput {
-                boundary,
                 readout: queued.readout,
                 commits: queued.commits,
             },
         ))
-    }
-}
-
-#[cfg(test)]
-mod row_window_tests {
-    use super::RowWindow;
-
-    #[test]
-    fn an_unread_step_runs_no_tail() {
-        assert_eq!(RowWindow::consumed(&[], 512).unwrap(), None);
-    }
-
-    #[test]
-    fn the_window_is_the_row_class_covering_the_consumed_rows() {
-        // A prompt chunk's last row.
-        let last = RowWindow::consumed(&[511], 512).unwrap().unwrap();
-        assert_eq!(
-            last,
-            RowWindow {
-                first: 511,
-                rows: 1
-            }
-        );
-        assert_eq!(last.row(511).unwrap(), 0);
-        assert!(last.row(510).is_err());
-        // Rows spanning 11 rows take the 16-row class, kept inside the batch.
-        let spread = RowWindow::consumed(&[500, 510, 505], 512).unwrap().unwrap();
-        assert_eq!(
-            spread,
-            RowWindow {
-                first: 496,
-                rows: 16
-            }
-        );
-        assert_eq!(spread.row(510).unwrap(), 14);
-        // Rows across the batch keep the whole batch.
-        assert_eq!(
-            RowWindow::consumed(&[0, 511], 512).unwrap().unwrap(),
-            RowWindow::whole(512)
-        );
-        assert!(RowWindow::consumed(&[512], 512).is_err());
-    }
-
-    #[test]
-    fn a_window_takes_its_rows_of_a_host_table() {
-        let table = (0..8u8).flat_map(|row| [row, row]).collect::<Vec<_>>();
-        let window = RowWindow { first: 4, rows: 2 };
-        assert_eq!(window.rows_of(&table, 8), vec![4, 4, 5, 5]);
     }
 }

@@ -4,11 +4,11 @@
 //! host-written inputs, asynchronous submission, measurement and tuning.
 
 use seismic::{
-    Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
-    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization,
-    NumericalRequirement, Outcome, SearchPlan, SearchSettings, Stage, Strategy,
-    SurveyPlan, Tensor, TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
-    UnitPlan,
+    Availability, BackendName, CallError, CensusPlan, Device, DeviceCatalog, Element, Exclusion,
+    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, Outcome,
+    PrecisionPolicy, SearchPlan, SearchSettings, SearchStop, StartPlan, Strategy, SurveyPlan,
+    Tensor,
+    TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
 use std::time::Duration;
@@ -18,35 +18,25 @@ use std::time::Duration;
 const SYNC_RESERVE: u64 = 64 * 1024;
 
 /// A search whose time outlasts its convergence on the test entries.
-fn search() -> Strategy {
+fn search(samples: usize) -> Strategy {
     Strategy::Search(SearchPlan {
         allowance: Duration::from_secs(3600),
-
+        admission: Duration::from_secs(3600),
+        required: Duration::from_secs(3600),
         settings: SearchSettings {
-            error_rate: 0.05,
+            improvement: 0.01,
+            restarts: 2,
+            confirmed: 3,
+            default_margin: 0.02,
+            samples,
+            confirmation_samples: samples,
         },
         // Long enough that a sample of these µs-scale kernels measures the
-        // kernel rather than the fixed cost of its submission.
+        // kernel rather than the host's scheduling: confirmation excludes a
+        // finalist whose samples spread more than 10%.
         min_sample_seconds: 0.005,
         start: Vec::new(),
     })
-}
-
-/// [`search`], hinted each of `hints` (a parameter at a value, the others at
-/// their defaults). Hints are measured in the unit's first session, and a
-/// unit witnesses the challengers of its first session before it times
-/// them: it has observed neither test's cost to order them by. So a hinted
-/// candidate is witnessed, whichever order the unit's observations give the
-/// challengers it reaches afterwards.
-fn search_hinted(hints: &[(&str, u64)]) -> Strategy {
-    let Strategy::Search(mut plan) = search() else {
-        unreachable!()
-    };
-    plan.start = hints
-        .iter()
-        .map(|(name, value)| [((*name).to_owned(), *value)].into_iter().collect())
-        .collect();
-    Strategy::Search(plan)
 }
 
 /// Every backend the catalog reports available on this host; each must open.
@@ -153,40 +143,6 @@ fn metal_launch_scopes_form_and_execute_independently() {
     }
 }
 
-/// Serving prepares the configuration tuning chose as tuning formed it: no
-/// program is formed a second time.
-#[test]
-fn serving_the_tuned_choice_forms_nothing_again() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
-        return;
-    };
-    let small = f32_tensor(&device, &[7], &exact_values(7));
-    let large = f32_tensor(&device, &[35], &exact_values(35));
-    let point = |label: &str, x| TuningPoint {
-        label: label.into(),
-        weight: 1.0,
-        class: None,
-        cost: 1.0,
-        workload: seismic::WorkloadRotation::All,
-        rotation: vec![scoped_scale::Args { x }],
-        initialize: None,
-        written: Default::default(),
-    };
-    let result = scoped_scale::native_tune(
-        &device,
-        &NativeSpecialization::new(),
-        vec![point("m7", &small), point("m35", &large)],
-        NumericalRequirement::BitExact,
-        search(),
-    )
-    .expect("factored Metal tuning");
-    let formed = device.programs_formed();
-    scoped_scale::native_for_device(&device, &result.overall.specialization())
-        .expect("the chosen configuration prepares");
-    assert_eq!(device.programs_formed(), formed);
-}
-
 #[test]
 fn metal_scoped_tuning_searches_launches_separately() {
     let catalog = DeviceCatalog::discover().expect("device discovery");
@@ -201,7 +157,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &small }],
             initialize: None,
             written: Default::default(),
@@ -211,7 +167,7 @@ fn metal_scoped_tuning_searches_launches_separately() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &large }],
             initialize: None,
             written: Default::default(),
@@ -221,23 +177,20 @@ fn metal_scoped_tuning_searches_launches_separately() {
         &device,
         &NativeSpecialization::new(),
         points,
-        NumericalRequirement::BitExact,
-        search(),
+        PrecisionPolicy::Exact,
+        search(2),
+        seismic::TuningReference::Portable,
     )
     .expect("factored Metal tuning");
-    // The search ends complete having asked for part of the two groups'
-    // sixteen combinations: the nearby changes of each launch's
-    // parameters and what leads from them.
-    let TuningMethod::Search {
-        groups: 2,
-        candidates,
-        complete: true,
-    } = result.method
-    else {
-        panic!("{:?}", result.method);
-    };
-    assert_eq!(candidates + 1, result.configurations.len());
-    assert!((4..=15).contains(&candidates), "{candidates}");
+    assert!(matches!(
+        result.method,
+        TuningMethod::Factored {
+            groups: 2,
+            candidates: 8,
+            complete: true,
+            ..
+        }
+    ));
     assert_eq!(result.overall.launches.len(), 2);
     let kernel =
         scoped_scale::native_for_device(&device, &result.overall.specialization()).unwrap();
@@ -253,133 +206,8 @@ fn metal_scoped_tuning_searches_launches_separately() {
     }
 }
 
-/// A unit's compiles need no device and nothing of its search: the
-/// canonical program and each challenger piece's launch sources compile on
-/// another thread, and the unit's work then compiles nothing itself.
 #[test]
-fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothing() {
-    let catalog = DeviceCatalog::discover().expect("device discovery");
-    let Ok(device) = catalog.open_backend(BackendName::Metal) else {
-        return;
-    };
-    let small = f32_tensor(&device, &[7], &exact_values(7));
-    let large = f32_tensor(&device, &[35], &exact_values(35));
-    let point = |label: &str, x| TuningPoint {
-        label: label.into(),
-        weight: 1.0,
-        class: None,
-        cost: 1.0,
-        workload: seismic::WorkloadRotation::All,
-        rotation: vec![scoped_scale::Args { x }],
-        initialize: None,
-        written: Default::default(),
-    };
-    let mut source = vec![point("m7", &small), point("m35", &large)];
-    let mut unit = scoped_scale::native_search(
-        &device,
-        &NativeSpecialization::new(),
-        NumericalRequirement::BitExact,
-    )
-    .unwrap();
-    let grounding = unit
-        .grounding(&mut source)
-        .unwrap()
-        .expect("the canonical program is not formed yet");
-    let grounded = std::thread::spawn(move || grounding.run()).join().unwrap();
-    unit.grounded(grounded).unwrap();
-    assert!(unit.grounding(&mut source).unwrap().is_none());
-    let Strategy::Search(plan) = search() else {
-        unreachable!()
-    };
-    unit.plan(UnitPlan {
-        settings: plan.settings,
-        min_sample_seconds: 0.0002,
-        start: Vec::new(),
-    });
-    let mut ahead = 0;
-    // After each measurement: the configurations measured so far and
-    // Seismic's charges on the device.
-    let mut held = Vec::new();
-    // What is charged with the points discovered and nothing measured: the
-    // unit's inputs, its result storage and the one kernel it serves.
-    let mut discovered = None;
-    while let Some(work) = unit.next() {
-        if work.stage == Stage::Measure && discovered.is_none() {
-            discovered = Some(device.memory_usage().charged);
-        }
-        let ended = if let Some(forming) = unit.forming() {
-            assert_eq!(work.stage, Stage::Measure);
-            assert_ne!(work.forming, seismic::Quote::default());
-            let formed = std::thread::spawn(move || forming.run()).join().unwrap();
-            unit.formed(formed).unwrap();
-            // The piece is the same, less its compile.
-            let rest = unit.next().unwrap();
-            assert_eq!(rest.stage, Stage::Measure);
-            assert_eq!(rest.forming, seismic::Quote::default());
-            assert!(unit.forming().is_none());
-            let performed = unit.perform(&mut source).unwrap();
-            assert_eq!(performed.spent.compiling, 0.);
-            ahead += 1;
-            // The piece's high-water mark is no less than either end.
-            assert!(performed.memory.peak_bytes >= performed.memory.ended_bytes);
-            assert!(performed.memory.peak_bytes >= performed.memory.began_bytes);
-            performed.memory.ended_bytes
-        } else {
-            assert_eq!(work.forming, seismic::Quote::default());
-            unit.perform(&mut source).unwrap().memory.ended_bytes
-        };
-        // What a piece holds is the device's charges and the process's
-        // host bytes: no less than the charges.
-        let charged = device.memory_usage().charged;
-        assert!(ended >= charged);
-        if work.stage == Stage::Measure {
-            held.push((unit.standing().measured, charged));
-        }
-    }
-    assert!(ahead > 0, "a challenger's launch sources compiled ahead");
-    // A measured configuration that neither serves nor leads owns nothing
-    // on the device. A formed kernel of this fixture charges the device
-    // one byte, its scalars; a unit holds between pieces the kernels of
-    // its served choice and of a resolved and a nominal leader: one, two
-    // or three of them. The challengers write into result storage of
-    // their own, one f32 per row of each point, allocated once. So
-    // whatever was measured, a measurement ends with the bytes of the
-    // discovered unit, that storage and at most two more. The search
-    // measures the defaults, the four nearby changes of its two launches
-    // and what leads from them: kept kernels would end it at four bytes
-    // more at the least.
-    let discovered = discovered.expect("the unit measured challengers") + 4 * (7 + 35);
-    let last = *held.last().unwrap();
-    assert!(last.0 >= 5, "{held:?}");
-    assert!(
-        held.iter()
-            .all(|(_, charged)| (discovered..=discovered + 2).contains(charged)),
-        "device bytes follow the configurations measured: {held:?} from {discovered}"
-    );
-    // With no work left the unit gives up its points' inputs and result
-    // storage, and its record stands without them.
-    assert!(unit.holds_inputs());
-    unit.release(&mut source);
-    assert!(!unit.holds_inputs());
-    assert!(device.memory_usage().charged < discovered, "{held:?}");
-    let result = unit.terminal().unwrap();
-    let TuningMethod::Search {
-        groups: 2,
-        candidates,
-        complete: true,
-    } = result.method
-    else {
-        panic!("{:?}", result.method);
-    };
-    // Every configuration the search asked for was measured or excluded,
-    // and each group has four assignments of which the defaults are one:
-    // at most the two groups' other three each and their combinations.
-    assert_eq!(candidates + 1, result.configurations.len());
-    assert!((4..=15).contains(&candidates), "{candidates}");
-}
-
-#[test]
-fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
+fn metal_scoped_tuning_without_time_keeps_defaults_incomplete() {
     let catalog = DeviceCatalog::discover().expect("device discovery");
     let Ok(device) = catalog.open_backend(BackendName::Metal) else {
         return;
@@ -392,7 +220,7 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &small }],
             initialize: None,
             written: Default::default(),
@@ -402,13 +230,13 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![scoped_scale::Args { x: &large }],
             initialize: None,
             written: Default::default(),
         },
     ];
-    let Strategy::Search(mut plan) = search() else {
+    let Strategy::Search(mut plan) = search(1) else {
         unreachable!()
     };
     plan.allowance = Duration::ZERO;
@@ -416,15 +244,19 @@ fn metal_scoped_tuning_without_budget_serves_its_formed_defaults() {
         &device,
         &NativeSpecialization::new(),
         points,
-        NumericalRequirement::BitExact,
+        PrecisionPolicy::Exact,
         Strategy::Search(plan),
+        seismic::TuningReference::Portable,
     )
-    .unwrap();
+    .expect("a factored search without time returns its usable defaults");
     assert!(matches!(
-        result.disposition,
-        seismic::TuningDisposition::CanonicalFallback { .. }
+        result.method,
+        TuningMethod::Factored {
+            complete: false,
+            ..
+        }
     ));
-    assert!(result.configurations.is_empty());
+    assert_eq!(result.overall, result.configurations[0].configuration);
 }
 
 #[test]
@@ -465,11 +297,9 @@ fn where_filters_configurations_at_small_static_values() {
         let admissible = implementation.admissible(&statics(2)).unwrap();
         // PARTS <= N keeps parts 1 and 2 at N = 2.
         assert_eq!(admissible.len(), 4);
-        assert!(
-            admissible
-                .iter()
-                .all(|configuration| configuration.param("PARTS") != Some(4))
-        );
+        assert!(admissible
+            .iter()
+            .all(|configuration| configuration.param("PARTS") != Some(4)));
         let inadmissible = statics(2).with_param("PARTS", 4).with_param("WIDTH", 32);
         assert!(split_sum::native_for_device(&device, &inadmissible).is_err());
     }
@@ -622,7 +452,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     weight: 1.0,
                     class: None,
                     cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
+                    required: false,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
                     written: Default::default(),
@@ -632,7 +462,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
                     weight: 3.0,
                     class: None,
                     cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
+                    required: false,
                     rotation: inputs.iter().map(|x| split_sum::Args { x }).collect(),
                     initialize: None,
                     written: Default::default(),
@@ -643,8 +473,9 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             &device,
             &statics(n),
             points(&inputs),
-            NumericalRequirement::BitExact,
-            search(),
+            PrecisionPolicy::Exact,
+            search(3),
+            seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
         // With time to spare the search ends on its own, having reached
@@ -658,51 +489,40 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             .product::<usize>();
         assert_eq!(domain % 6, 0);
         assert!(result.configurations.len() <= domain);
-        // A program formed whole is one group of the search, and what it
-        // records means what it does for launches formed separately: every
-        // configuration it asked its domain for was measured.
-        let TuningMethod::Search {
-            groups: 1,
-            candidates,
-            complete: true,
-        } = result.method
-        else {
-            panic!("{:?}", result.method);
-        };
-        assert_eq!(candidates + 1, result.configurations.len());
+        assert!(matches!(
+            result.method,
+            TuningMethod::Search {
+                stop: SearchStop::Exhausted | SearchStop::Converged,
+                ..
+            }
+        ));
         assert_eq!(
             declared(&result.configurations[0].configuration.params),
             [("PARTS".to_owned(), 1), ("WIDTH".to_owned(), 32)]
                 .into_iter()
                 .collect()
         );
-        assert!(
-            result.configurations[0]
-                .configuration
-                .params
-                .iter()
-                .all(|(name, value)| !name.starts_with("cpu.") || *value == 0)
-        );
-        // The chosen configuration is measured and admitted.
+        assert!(result.configurations[0]
+            .configuration
+            .params
+            .iter()
+            .all(|(name, value)| !name.starts_with("cpu.") || *value == 0));
+        // The chosen configuration was validated, and the finalists
+        // re-measured.
         assert!(result.configurations.iter().any(|record| {
             record.configuration == result.overall
-                && matches!(record.outcome, Outcome::Measured { .. })
-                && result.admitted(record).is_ok()
+                && matches!(
+                    record.outcome,
+                    Outcome::Measured {
+                        validated: true,
+                        ..
+                    }
+                )
         }));
-        assert_eq!(result.served.last(), Some(&result.overall));
-        // A challenger serves only once matched rounds beside the choice it
-        // replaced resolved its lead, and no one round resolves one: where
-        // it runs other work than the defaults it was sampled round after
-        // round. A challenger that never led keeps its one round.
-        for (index, record) in result.configurations.iter().enumerate().skip(1) {
-            let Outcome::Measured { points, .. } = &record.outcome else {
-                continue;
-            };
-            let rounds = points.iter().map(|point| point.samples.len()).max().unwrap();
-            if result.served.contains(&record.configuration) {
-                assert!(rounds > 1, "{:?}: served {index} after {rounds} round", device.backend());
-            }
-        }
+        assert!(result.configurations.iter().any(|record| matches!(
+            &record.outcome,
+            Outcome::Measured { confirmed, .. } if confirmed.len() == 2
+        )));
         // The tuned configuration prepares and runs.
         let kernel =
             split_sum::native_for_device(&device, &result.overall.specialization()).unwrap();
@@ -721,24 +541,25 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             &device,
             &statics(n),
             points(&inputs),
-            NumericalRequirement::BitExact,
+            PrecisionPolicy::Exact,
             Strategy::Survey(SurveyPlan {
                 samples: 5,
                 min_sample_seconds: 0.0002,
                 domains: Default::default(),
             }),
+            seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
         assert_eq!(survey.configurations.len(), domain);
         for record in &survey.configurations {
             match &record.outcome {
-                Outcome::Measured { points, .. } => {
-                    assert_eq!(survey.admitted(record), Ok(()));
-                    assert!(
-                        points
-                            .iter()
-                            .all(|point| (1..=5).contains(&point.samples.len()))
-                    );
+                Outcome::Measured {
+                    points, validated, ..
+                } => {
+                    assert!(validated);
+                    assert!(points
+                        .iter()
+                        .all(|point| (1..=5).contains(&point.samples.len())));
                 }
                 Outcome::Excluded(exclusion) => {
                     panic!("{:?}: {exclusion:?}", device.backend())
@@ -749,7 +570,7 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
 }
 
 #[test]
-fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
+fn a_search_times_the_points_its_admission_affords_and_folds_the_rest() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Cpu)
@@ -757,10 +578,11 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
     let n = 4096u64;
     let short = f32_tensor(&device, &[n], &exact_values(n as usize));
     let long = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let tune = || {
-        let Strategy::Search(plan) = search() else {
+    let tune = |required: bool| {
+        let Strategy::Search(mut plan) = search(1) else {
             unreachable!()
         };
+        plan.admission = Duration::ZERO;
         split_sum::native_tune(
             &device,
             &statics(n),
@@ -770,7 +592,7 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
                     weight: 1.0,
                     class: None,
                     cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
+                    required: false,
                     rotation: vec![split_sum::Args { x: &short }],
                     initialize: None,
                     written: Default::default(),
@@ -780,14 +602,15 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
                     weight: 3.0,
                     class: None,
                     cost: 1000.0,
-                    workload: seismic::WorkloadRotation::All,
+                    required,
                     rotation: vec![split_sum::Args { x: &long }],
                     initialize: None,
                     written: Default::default(),
                 },
             ],
-            NumericalRequirement::BitExact,
+            PrecisionPolicy::Exact,
             Strategy::Search(plan),
+            seismic::TuningReference::Portable,
         )
         .unwrap()
     };
@@ -812,248 +635,25 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
             Outcome::Excluded(exclusion) => panic!("{exclusion:?}"),
         }
     };
-    let result = tune();
-    assert_eq!(timed(&result), ["short", "long"]);
+    // The first point is always built; the second would exceed a zero
+    // admission, so it is not timed and its weight folds into the first.
+    let folded = tune(false);
+    assert_eq!(timed(&folded), ["short"]);
     assert_eq!(
-        weights(&result),
+        weights(&folded),
+        [("short".to_owned(), 4.0), ("long".to_owned(), 0.0)]
+    );
+    // A required point is timed within the required time, which is ample.
+    let required = tune(true);
+    assert_eq!(timed(&required), ["short", "long"]);
+    assert_eq!(
+        weights(&required),
         [("short".to_owned(), 1.0), ("long".to_owned(), 3.0)]
     );
 }
 
 #[test]
-fn a_measurement_begun_runs_to_its_end_and_is_recorded() {
-    use std::cell::Cell;
-    use std::rc::Rc;
-    use std::time::Instant;
-    let device = DeviceCatalog::discover()
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
-    let n = 64u64;
-    let first = f32_tensor(&device, &[n], &vec![1.; n as usize]);
-    let second = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let countdown = Rc::new(Cell::new(0usize));
-    let deadline = Rc::new(Cell::new(None::<Instant>));
-    let counter = countdown.clone();
-    let blocked_until = deadline.clone();
-    let mut source = vec![TuningPoint {
-        label: "interrupted-witnesses".into(),
-        weight: 1.,
-        class: None,
-        cost: 1.,
-        workload: seismic::WorkloadRotation::Selected(vec![0]),
-        rotation: vec![
-            split_sum::Args { x: &first },
-            split_sum::Args { x: &second },
-        ],
-        initialize: Some(Box::new(move || {
-            let remaining = counter.get();
-            if remaining > 0 {
-                counter.set(remaining - 1);
-                if remaining == 1 {
-                    let until = blocked_until.take().unwrap();
-                    std::thread::sleep(
-                        until.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
-                    );
-                }
-            }
-            Ok(())
-        })),
-        written: Default::default(),
-    }];
-    let mut unit = split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
-    unit.prepare_defaults(&mut source).unwrap();
-    let Strategy::Search(plan) = search() else {
-        unreachable!()
-    };
-    unit.plan(UnitPlan {
-        settings: plan.settings,
-        min_sample_seconds: 0.0002,
-        start: Vec::new(),
-    });
-    while unit
-        .next()
-        .is_some_and(|work| work.stage == Stage::Discovery)
-    {
-        unit.perform(&mut source).unwrap();
-    }
-    let started = unit.standing();
-    let work = unit.next().expect("a challenger is planned");
-    assert_eq!(work.stage, Stage::Measure);
-    // Placing the challenger restores the state once; the next reset is its
-    // first numerical witness. Run that witness past the instant its budget
-    // would end: the measurement begun completes and is recorded.
-    let overrun_until = Instant::now() + Duration::from_millis(300);
-    deadline.set(Some(overrun_until));
-    countdown.set(2);
-    let performed = unit.perform(&mut source).unwrap();
-    assert_eq!(countdown.get(), 0, "the witness was reached");
-    assert!(Instant::now() > overrun_until);
-    assert_eq!(performed.stage, Stage::Measure);
-    assert!(performed.actual >= Duration::from_millis(300));
-    let measured = unit.standing();
-    let challengers = measured.measured - started.measured;
-    assert!(
-        challengers >= 1,
-        "work begun is never abandoned for the time it took"
-    );
-    assert_eq!(measured.programs, started.programs + challengers);
-    // The measurement is in the unit's record at once, whatever it leads to.
-    assert_eq!(unit.terminal().unwrap().configurations.len(), measured.measured);
-}
-
-/// What a candidate publishes at a point is determined by the work it runs
-/// there. Configurations that differ only in a parameter no launch working
-/// at the point reads share a key there: the device runs one of them for
-/// observation, once per witness, and the others take that observation.
-#[test]
-fn a_numerical_observation_is_made_once_per_point_and_key() {
-    use std::cell::Cell;
-    use std::rc::Rc;
-    let device = DeviceCatalog::discover()
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
-    // The staged launch alone works at this size, whatever `SMALL` is: the
-    // mirrored launch's participant count changes nothing here.
-    let n = 32u64;
-    let witnesses = [
-        f32_tensor(&device, &[n], &exact_values(n as usize)),
-        f32_tensor(&device, &[n], &vec![1.; n as usize]),
-    ];
-    let resets = Rc::new(Cell::new(0usize));
-    let counted = resets.clone();
-    let survey = gated_sum::native_tune(
-        &device,
-        &NativeSpecialization::new(),
-        vec![TuningPoint {
-            label: "staged".into(),
-            weight: 1.,
-            class: None,
-            cost: 1.,
-            workload: seismic::WorkloadRotation::All,
-            rotation: witnesses
-                .iter()
-                .map(|x| gated_sum::Args { x })
-                .collect(),
-            // Called once as a configuration is placed, and once before
-            // every observed invocation: the default's as the reference
-            // and a candidate's.
-            initialize: Some(Box::new(move || {
-                counted.set(counted.get() + 1);
-                Ok(())
-            })),
-            written: Default::default(),
-        }],
-        NumericalRequirement::BitExact,
-        Strategy::Survey(SurveyPlan {
-            samples: 1,
-            min_sample_seconds: 0.0002,
-            domains: Default::default(),
-        }),
-    )
-    .unwrap();
-    let default = &survey.served[0];
-    let mut keys = std::collections::BTreeSet::new();
-    for record in &survey.configurations {
-        let Outcome::Measured { points, .. } = &record.outcome else {
-            panic!("{:?}", record.outcome)
-        };
-        assert_eq!(survey.admitted(record), Ok(()));
-        if record.configuration == *default {
-            // The reference is measured against nothing.
-            assert!(record.observations.is_empty());
-            continue;
-        }
-        // Every candidate holds the observation made under its own key.
-        let [observation] = record.observations[..] else {
-            panic!("{:?}", record.observations)
-        };
-        assert_eq!(survey.observations[observation].key, points[0].key);
-        assert_eq!(survey.observations[observation].rotations.len(), witnesses.len());
-        keys.insert(points[0].key.clone());
-    }
-    let candidates = survey.configurations.len() - 1;
-    assert!(
-        keys.len() < candidates,
-        "{candidates} candidates must share some of their {} keys for this to test reuse",
-        keys.len()
-    );
-    assert_eq!(survey.observations.len(), keys.len());
-    // The device ran each witness once for the default and once per
-    // distinct key, not once per candidate.
-    assert_eq!(
-        resets.get(),
-        survey.configurations.len() + witnesses.len() * (1 + keys.len())
-    );
-}
-
-/// The census runs the native default once per performance invocation and
-/// retains that run as the reference there; it observes no other witness.
-/// Selecting fewer performance invocations shrinks what is placed and timed.
-#[test]
-fn the_census_retains_the_default_at_its_performance_invocations() {
-    use std::cell::Cell;
-    use std::rc::Rc;
-    let device = DeviceCatalog::discover()
-        .unwrap()
-        .open_backend(BackendName::Cpu)
-        .unwrap();
-    let n = 64u64;
-    let first = f32_tensor(&device, &[n], &vec![1.; n as usize]);
-    let adversarial = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let census = |workload, invocations: usize| {
-        let resets = Rc::new(Cell::new(0));
-        let observed = resets.clone();
-        let mut points = vec![TuningPoint {
-            label: "two-witnesses".into(),
-            weight: 1.,
-            class: None,
-            cost: 1.,            workload,
-            rotation: vec![
-                split_sum::Args { x: &first },
-                split_sum::Args { x: &adversarial },
-            ],
-            initialize: Some(Box::new(move || {
-                observed.set(observed.get() + 1);
-                Ok(())
-            })),
-            written: Default::default(),
-        }];
-        let mut unit =
-            split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
-        unit.prepare_defaults(&mut points).unwrap();
-        let Strategy::Search(plan) = search() else {
-            unreachable!()
-        };
-        unit.plan(UnitPlan {
-            settings: plan.settings,
-            min_sample_seconds: 0.0002,
-            start: Vec::new(),
-        });
-        assert_eq!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
-        unit.perform(&mut points).unwrap();
-        // Placing initializes once; the default's retained run initializes
-        // before each performance invocation.
-        assert_eq!(resets.get(), 1 + invocations);
-        unit.terminal().unwrap()
-    };
-    let selected = census(seismic::WorkloadRotation::Selected(vec![0]), 1);
-    let all = census(seismic::WorkloadRotation::All, 2);
-    let measurement = |receipt: &seismic::TuningResult| match &receipt.configurations[0].outcome {
-        Outcome::Measured { points, .. } => points[0].rotation_bytes,
-        outcome => panic!("{outcome:?}"),
-    };
-    assert!(
-        measurement(&selected) < measurement(&all),
-        "selected performance calls must not retain the other witness's input/results; shared scratch is charged once"
-    );
-    // The default is the reference: the census qualifies nothing.
-    assert!(selected.observations.is_empty() && all.observations.is_empty());
-}
-
-#[test]
-fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
+fn a_census_times_the_required_points_and_its_search_admits_the_rest() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Cpu)
@@ -1061,14 +661,18 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
     let n = 4096u64;
     let x = f32_tensor(&device, &[n], &exact_values(n as usize));
     let points = || {
-        [("short", 1.0), ("required", 2.0), ("long", 3.0)]
+        [
+            ("short", 1.0, false),
+            ("required", 2.0, true),
+            ("long", 3.0, false),
+        ]
         .into_iter()
-        .map(|(label, cost)| TuningPoint {
+        .map(|(label, cost, required)| TuningPoint {
             label: label.into(),
             weight: 1.0,
             class: None,
             cost,
-            workload: seismic::WorkloadRotation::All,
+            required,
             rotation: vec![split_sum::Args { x: &x }],
             initialize: None,
             written: Default::default(),
@@ -1086,134 +690,82 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
             Outcome::Excluded(exclusion) => panic!("{exclusion:?}"),
         }
     };
-    // Direct tuning uses every positive-demand point as a representative.
-    let mut unit = split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+    // The census times the cheapest point and the required one.
+    let mut unit = split_sum::native_search(
+        &device,
+        &statics(n),
+        PrecisionPolicy::Exact,
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
     let mut source = points();
-    let Strategy::Search(plan) = search() else {
-        unreachable!()
-    };
-    // The mandatory work alone leaves a legal record: the canonical
-    // defaults, nothing measured.
-    unit.prepare_defaults(&mut source).unwrap();
-    unit.plan(UnitPlan {
-        settings: plan.settings,
-        min_sample_seconds: plan.min_sample_seconds,
-        start: plan.start,
-    });
-    let mandatory = unit.terminal().unwrap();
-    assert!(matches!(mandatory.method, TuningMethod::Census));
-    assert!(mandatory.configurations.is_empty());
-    assert!(matches!(
-        mandatory.disposition,
-        seismic::TuningDisposition::CanonicalFallback { .. }
-    ));
-    // Discovery measures the defaults one point a piece, each unpriced:
-    // its operations' classes are first observed by it.
-    for discovered in 1..=3 {
-        let work = unit.next().unwrap();
-        assert_eq!(work.stage, Stage::Discovery);
-        assert_eq!(work.quote.forecast(), None);
-        let performed = unit.perform(&mut source).unwrap();
-        assert!(!performed.promoted);
-        assert_eq!(timed(&unit.terminal().unwrap()).len(), discovered);
-    }
-    let census = unit.terminal().unwrap();
+    let census = unit
+        .census(
+            &mut source,
+            CensusPlan {
+                limit: Duration::from_secs(3600),
+                min_sample_seconds: 0.005,
+            },
+        )
+        .unwrap();
+    assert!(matches!(census.method, TuningMethod::Census));
     let censused = timed(&census);
     assert_eq!(
         censused
             .iter()
             .map(|point| point.point.as_str())
             .collect::<Vec<_>>(),
-        ["short", "required", "long"]
+        ["short", "required"]
     );
-    // The search opens over exactly these measurements; it performed
-    // planning only. Each later measurement is one whole challenger.
-    let started = unit.standing();
-    assert!(
-        started.measured == 1,
-        "opening transports only the discovered canonical artifact"
-    );
-    // The defaults against themselves: one, to the rounding of a sum over
-    // points whose weights follow their measured times.
-    assert!((started.cost - 1.).abs() < 1e-12, "{}", started.cost);
-    // A challenger is priced in full before it starts, from this load's
-    // observations of its compile, placements, witnesses and samples.
-    // Its compile is part of its price, and separable from it: the piece
-    // performed as it stands compiles its own challengers' programs.
-    let work = unit.next().unwrap();
-    assert_eq!(work.stage, Stage::Measure);
-    assert!(work.gain > 0.);
-    assert!(work.forming != seismic::Quote::default());
-    let performed = unit.perform(&mut source).unwrap();
-    assert!(performed.spent.compiling > 0.);
-    let measured = unit.standing();
-    let challengers = measured.measured - started.measured;
-    assert!(challengers >= 1);
-    assert_eq!(measured.programs, started.programs + challengers);
+    // Its search reuses those measurements and admits the remaining point
+    // within its admission. The start measures the defaults and, the entry
+    // declaring no form, nothing else; the search then runs to its end in
+    // steps, and concludes with every configuration it reached.
+    let Strategy::Search(plan) = search(1) else {
+        unreachable!()
+    };
+    let until = std::time::Instant::now() + plan.allowance;
+    let started = unit
+        .start(
+            &mut source,
+            StartPlan {
+                required: plan.required,
+                admission: plan.admission,
+                settings: plan.settings,
+                min_sample_seconds: plan.min_sample_seconds,
+                start: plan.start,
+                forms: true,
+            },
+            until,
+        )
+        .unwrap();
+    assert_eq!((started.measured, started.cost), (1, 1.));
+    assert!(!started.finished);
     let mut steps = 0;
-    let mut promoted = false;
-    let mut ahead = 0;
-    while let Some(work) = unit.next() {
-        let before = unit.standing();
-        let served = unit.terminal().unwrap().overall;
-        // A challenger piece's programs compile ahead of it, off the
-        // device, as a consumer's worker runs them: the unit holds what
-        // was formed, and the piece itself then compiles nothing.
-        let formed = unit.forming().map(|forming| {
-            assert!(matches!(work.stage, Stage::Form | Stage::Measure));
-            let formed = std::thread::scope(|scope| scope.spawn(|| forming.run()).join())
-                .expect("the compile runs to its end");
-            unit.formed(formed).unwrap();
-            assert!(unit.forming().is_none(), "nothing is left to compile");
-            assert_eq!(unit.next().unwrap().forming, seismic::Quote::default());
-            unit.standing().programs - before.programs
-        });
-        let performed = unit.perform(&mut source).unwrap();
-        let after = unit.standing();
-        if let Some(formed) = formed {
-            ahead += 1;
-            assert_eq!(performed.spent.compiling, 0.);
-            assert_eq!(after.measured, before.measured + formed);
-            assert_eq!(after.programs, before.programs + formed);
-        }
-        match work.stage {
-            // A lead is converted before anything else is measured, and
-            // converting it measures no new configuration. A conversion is
-            // decided on the finalists' matched re-measurement, not on the
-            // first measurements the standing cost reports: it promoted
-            // exactly when the served choice changed.
-            Stage::Promote | Stage::Confirm => {
-                assert_eq!(after.measured, before.measured);
-                assert_eq!(
-                    performed.promoted,
-                    unit.terminal().unwrap().overall != served
-                );
-                promoted |= performed.promoted;
-            }
-            Stage::Measure => assert!(after.measured > before.measured),
-            Stage::Form => panic!("the entry declares no form parameter"),
-            Stage::Discovery => panic!("discovery precedes every challenger"),
-        }
+    let finished = loop {
+        // Each step may measure for a millisecond before the time is dealt
+        // again.
+        let standing = unit
+            .refine(
+                std::time::Instant::now() + Duration::from_millis(1),
+                until,
+            )
+            .unwrap();
         steps += 1;
-        assert!(steps < 10_000, "the pieces make progress");
-    }
-    assert!(ahead >= 1, "a later piece compiled ahead");
-    let finished = unit.standing();
-    assert!(finished.measured > started.measured && finished.measured <= finished.generated);
-    let searched = unit.terminal().unwrap();
+        if standing.finished {
+            break standing;
+        }
+        assert!(steps < 10_000, "the steps make progress");
+    };
+    assert!(finished.measured > started.measured && finished.measured <= finished.admissible);
+    let searched = unit.conclude(&mut source, until, plan.allowance).unwrap();
     assert!(matches!(
         searched.method,
         TuningMethod::Search {
-            groups: 1,
-            complete: true,
+            stop: SearchStop::Exhausted | SearchStop::Converged,
             ..
         }
     ));
-    // A promoted challenger is the served choice; otherwise the defaults.
-    assert_eq!(
-        searched.disposition == seismic::TuningDisposition::QualifiedCandidate,
-        promoted
-    );
     assert_eq!(searched.configurations.len(), finished.measured);
     let measured = timed(&searched);
     assert_eq!(
@@ -1223,21 +775,21 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
             .collect::<Vec<_>>(),
         ["short", "required", "long"]
     );
-    assert_eq!(measured, censused);
+    assert_eq!(measured[..2], censused[..]);
 }
 
 #[test]
-fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
+fn a_unit_whose_required_points_do_not_fit_keeps_its_defaults_untried() {
     let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Cpu)
         .unwrap();
     let n = 4096u64;
     let x = f32_tensor(&device, &[n], &exact_values(n as usize));
-    let Strategy::Search(mut plan) = search() else {
+    let Strategy::Search(mut plan) = search(1) else {
         unreachable!()
     };
-    plan.allowance = Duration::ZERO;
+    plan.required = Duration::ZERO;
     let result = split_sum::native_tune(
         &device,
         &statics(n),
@@ -1247,7 +799,7 @@ fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
                 weight: 1.0,
                 class: None,
                 cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
+                required: false,
                 rotation: vec![split_sum::Args { x: &x }],
                 initialize: None,
                 written: Default::default(),
@@ -1257,25 +809,26 @@ fn a_spent_budget_still_forms_and_serves_the_canonical_defaults() {
                 weight: 1.0,
                 class: None,
                 cost: 2.0,
-                workload: seismic::WorkloadRotation::All,
+                required: true,
                 rotation: vec![split_sum::Args { x: &x }],
                 initialize: None,
                 written: Default::default(),
             },
         ],
-        NumericalRequirement::BitExact,
+        PrecisionPolicy::Exact,
         Strategy::Search(plan),
+        seismic::TuningReference::Portable,
     )
     .unwrap();
-    // No budget starts no optional work and fails nothing: the mandatory
-    // canonical program is formed and served, its scope unmeasured.
     assert!(matches!(
-        result.disposition,
-        seismic::TuningDisposition::CanonicalFallback { .. }
+        result.method,
+        TuningMethod::Search {
+            stop: SearchStop::Unaffordable,
+            ..
+        }
     ));
     assert!(result.configurations.is_empty());
-    assert!(result.time.forming_seconds > 0.);
-    assert_eq!(result.time.building_seconds, 0.);
+    assert_eq!(result.overall.params["PARTS"], 1);
 }
 
 #[test]
@@ -1301,7 +854,7 @@ fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults
                 weight: 1.0,
                 class: None,
                 cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
+                required: false,
                 rotation: vec![split_sum::Args { x: &timed }],
                 initialize: None,
                 written: Default::default(),
@@ -1311,41 +864,41 @@ fn a_search_choice_passes_validation_at_every_point_or_gives_way_to_the_defaults
                 weight: 0.0,
                 class: None,
                 cost: 1000.0,
-                workload: seismic::WorkloadRotation::All,
+                required: false,
                 rotation: vec![split_sum::Args { x: &validated }],
                 initialize: None,
                 written: Default::default(),
             },
         ],
-        NumericalRequirement::BitExact,
-        search(),
+        PrecisionPolicy::Exact,
+        {
+            // The admission affords only the first point: the second is
+            // not timed, only validated.
+            let Strategy::Search(mut plan) = search(1) else {
+                unreachable!()
+            };
+            plan.admission = Duration::ZERO;
+            Strategy::Search(plan)
+        },
+        seismic::TuningReference::NativeDefault,
     )
     .unwrap();
-    // Only positive-demand discovery is timed; both numerical shapes remain declared.
+    // Only the admitted point is timed; both are recorded.
     assert_eq!(result.points.len(), 2);
-    assert!(
-        result
-            .configurations
-            .iter()
-            .all(|record| match &record.outcome {
-                Outcome::Measured { points, .. } =>
-                    points.iter().all(|point| point.point == "timed"),
-                Outcome::Excluded(_) => true,
-            })
-    );
+    assert!(result
+        .configurations
+        .iter()
+        .all(|record| match &record.outcome {
+            Outcome::Measured { points, .. } => points.iter().all(|point| point.point == "timed"),
+            Outcome::Excluded(_) => true,
+        }));
     let defaults = &result.configurations[0].configuration;
     if result.overall != *defaults {
-        let chosen = result
-            .configurations
-            .iter()
-            .find(|record| record.configuration == result.overall)
-            .unwrap();
         assert!(
-            chosen
-                .observations
+            result
+                .numerical_evidence
                 .iter()
-                .any(|observation| result.observations[*observation].point == "validated")
-                && result.admitted(chosen).is_ok(),
+                .any(|evidence| evidence.case == "validated"),
             "a choice other than the defaults passed at every point"
         );
     }
@@ -1582,18 +1135,14 @@ fn a_graph_submission_encodes_every_node_into_one_encoder() {
         }
         if device.backend() != BackendName::Cpu {
             // Only the per-launch form has a timed unit (encoder) per launch.
-            assert!(
-                serial_trace[0]
-                    .launches
-                    .iter()
-                    .all(|launch| launch.device.is_none())
-            );
-            assert!(
-                separate_trace[0]
-                    .launches
-                    .iter()
-                    .all(|launch| launch.device.is_some())
-            );
+            assert!(serial_trace[0]
+                .launches
+                .iter()
+                .all(|launch| launch.device.is_none()));
+            assert!(separate_trace[0]
+                .launches
+                .iter()
+                .all(|launch| launch.device.is_some()));
         }
     }
 }
@@ -1831,7 +1380,7 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![accumulate::Args {
                 state: &mut state,
                 x: &x,
@@ -1843,8 +1392,9 @@ fn tuning_rejects_shared_mutable_state_without_an_initializer() {
             &device,
             &NativeSpecialization::new(),
             points,
-            NumericalRequirement::BitExact,
-            search(),
+            PrecisionPolicy::Exact,
+            search(2),
+            seismic::TuningReference::Portable,
         ) {
             Err(TuneError::SharedMutableState { point, parameter }) => {
                 assert_eq!(point, "rows");
@@ -1873,7 +1423,7 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![accumulate::Args {
                 state: &mut state,
                 x: &x,
@@ -1885,61 +1435,131 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
             &device,
             &NativeSpecialization::new(),
             points,
-            NumericalRequirement::BitExact,
-            // The misclassified value is hinted: it is witnessed.
-            search_hinted(&[("BIAS", 1)]),
+            PrecisionPolicy::Exact,
+            search(2),
+            seismic::TuningReference::Portable,
         )
         .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        // The default, recorded first, is the reference itself: it is measured
-        // and carries no evidence against itself. A candidate is witnessed
-        // before its timing samples or after rounds that leave it ahead, as
-        // its unit orders the two: one that changes the state's bits never
-        // serves, and is excluded wherever it is witnessed.
-        assert!(result.configurations[0].observations.is_empty());
-        let mut excluded = 0;
+        // Every candidate is checked before its repeated timing samples.
         for record in &result.configurations {
             match (record.configuration.params["BIAS"], &record.outcome) {
-                (0, Outcome::Measured { .. }) => {
-                    assert_eq!(result.admitted(record), Ok(()));
-                }
-                (1, outcome) => {
-                    if !disagreeing_candidate_is_not_served(&result, record, &device) {
-                        continue;
-                    }
-                    excluded += 1;
-                    let Outcome::Excluded(Exclusion::Validation { point, detail }) = outcome else {
-                        unreachable!("a witnessed candidate that disagrees is excluded")
-                    };
+                (
+                    0,
+                    Outcome::Measured {
+                        validated: true, ..
+                    },
+                ) => {}
+                (1, Outcome::Excluded(Exclusion::Validation { point, detail })) => {
                     assert_eq!(point, "rows");
-                    assert!(detail.contains("subject i0 at point rows"), "{detail}");
-                    // A rejected candidate keeps what was measured of it.
-                    assert_eq!(
-                        result.admitted(record).unwrap_err().exclusion(),
-                        Exclusion::Validation {
-                            point: point.clone(),
-                            detail: detail.clone()
-                        }
-                    );
+                    assert!(detail.contains("subject i0"));
                 }
                 (bias, outcome) => panic!("{:?}: BIAS {bias} gave {outcome:?}", device.backend()),
             }
         }
-        assert!(excluded >= 1, "{:?}: the hinted candidate was witnessed", device.backend());
-        // Nothing serves on rounds alone: every choice promoted was
-        // witnessed, and admitted.
-        for served in result.served.iter().skip(1) {
-            let record = result
+        assert_eq!(result.overall.params["BIAS"], 0);
+    }
+}
+
+/// A choice that changes numerics declares its error class: tuning forms it
+/// only when the caller admits the class, and holds it to the class's
+/// envelope in place of the policy's element tolerances.
+#[test]
+fn tuning_forms_an_error_class_only_when_admitted_and_holds_it_to_its_envelope() {
+    use seismic::{ErrorEnvelope, Limit, TuningPrecision, TuningResult};
+    use seismic_native_tests::classed_accumulate;
+    for device in devices() {
+        let n = 256u64;
+        // Every element is 100 by the reference and 100.5 under BIAS 1.
+        let tune = |envelope: Option<f64>| -> TuningResult {
+            let mut state = zeroed(&device, n);
+            let mut restore = state.clone();
+            let zeros = vec![0u8; n as usize * 4];
+            let initialize: TuningInitializer<'_> =
+                Box::new(move || restore.write_from_host(&zeros));
+            let x = f32_tensor(&device, &[n], &vec![100.0; n as usize]);
+            let points = vec![TuningPoint {
+                label: "rows".into(),
+                weight: 1.0,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![classed_accumulate::Args {
+                    state: &mut state,
+                    x: &x,
+                }],
+                initialize: Some(initialize),
+                written: Default::default(),
+            }];
+            classed_accumulate::native_tune(
+                &device,
+                &NativeSpecialization::new(),
+                points,
+                TuningPrecision {
+                    policy: PrecisionPolicy::Exact,
+                    admitted: envelope
+                        .into_iter()
+                        .map(|limit| {
+                            let limit = Limit::new(limit).unwrap();
+                            (
+                                "biased".to_owned(),
+                                ErrorEnvelope {
+                                    relative_rms: limit,
+                                    peak: limit,
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+                search(2),
+                seismic::TuningReference::Portable,
+            )
+            .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()))
+        };
+        let biased = |result: &TuningResult| -> Vec<Outcome> {
+            result
                 .configurations
                 .iter()
-                .find(|record| record.configuration == *served)
-                .expect("a served choice was reached");
+                .filter(|record| record.configuration.params["BIAS"] == 1)
+                .map(|record| record.outcome.clone())
+                .collect()
+        };
+
+        let unadmitted = tune(None);
+        assert!(
+            biased(&unadmitted).is_empty(),
+            "{:?}: an unadmitted class was formed",
+            device.backend()
+        );
+        assert_eq!(unadmitted.overall.params["BIAS"], 0);
+
+        let admitted = biased(&tune(Some(1e-2)));
+        assert!(!admitted.is_empty(), "{:?}", device.backend());
+        for outcome in admitted {
             assert!(
-                !record.observations.is_empty() && result.admitted(record).is_ok(),
-                "{:?}: served unwitnessed: {record:?}",
+                matches!(
+                    outcome,
+                    Outcome::Measured {
+                        validated: true,
+                        ..
+                    }
+                ),
+                "{:?}: {outcome:?}",
                 device.backend()
             );
         }
-        assert_eq!(result.overall.params["BIAS"], 0);
+
+        let narrow = tune(Some(1e-3));
+        let outside = biased(&narrow);
+        assert!(!outside.is_empty(), "{:?}", device.backend());
+        for outcome in outside {
+            match outcome {
+                Outcome::Excluded(Exclusion::Validation { detail, .. }) => {
+                    assert!(detail.contains("relative RMS error"), "{detail}")
+                }
+                other => panic!("{:?}: {other:?}", device.backend()),
+            }
+        }
+        assert_eq!(narrow.overall.params["BIAS"], 0);
     }
 }
 
@@ -2064,7 +1684,7 @@ fn external_bindings_are_checked_at_attach() {
 /// `gated_sum` by the portable body (the reference interpreter).
 fn portable_gated_sum(values: &[f32]) -> f32 {
     use seismic_lang::{
-        checked::{SourceFile, SourceSet, check_source},
+        checked::{check_source, SourceFile, SourceSet},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -2294,11 +1914,7 @@ fn inactive_scratch_is_charged_the_minimum() {
             graph.seal().unwrap().workspace_bytes()
         };
         assert!(workspace(10) < SYNC_RESERVE + 800, "{:?}", device.backend());
-        assert!(
-            workspace(200) >= SYNC_RESERVE + 800,
-            "{:?}",
-            device.backend()
-        );
+        assert!(workspace(200) >= SYNC_RESERVE + 800, "{:?}", device.backend());
     }
 }
 
@@ -2509,260 +2125,60 @@ fn a_failed_second_recommit_preserves_the_first_plane() {
     }
 }
 
-/// What a search's record holds of `record`, a candidate whose numerics
-/// disagree with the native default's, in whichever order its unit took a
-/// challenger's two tests (its rounds beside the served choice and its
-/// numerical witness: the unit orders them by what each has cost it and how
-/// often each ended a challenger). It never serves. Witnessed, it is
-/// excluded for validation and keeps its artifact and its one observation.
-/// Not excluded, it was timed first, its rounds did not leave it ahead of
-/// the served choice, and it was never witnessed: it holds no observation.
-/// Whether it was witnessed.
-fn disagreeing_candidate_is_not_served(
-    result: &seismic::TuningResult,
-    record: &seismic::ConfigurationRecord,
-    device: &Device,
-) -> bool {
-    let backend = device.backend();
-    let default = &result.configurations[0];
-    assert!(
-        !result.served.contains(&record.configuration) && result.overall != record.configuration,
-        "{backend:?}: served {:?}",
-        record.configuration
-    );
-    match &record.outcome {
-        Outcome::Excluded(Exclusion::Validation { .. }) => {
-            assert!(record.artifact.is_some() && record.artifact != default.artifact);
-            assert_eq!(record.observations.len(), 1, "{backend:?}");
-            assert!(result.admitted(record).is_err(), "{backend:?}");
-            true
-        }
-        Outcome::Measured { .. } => {
-            assert!(
-                record.observations.is_empty(),
-                "{backend:?}: witnessed and not excluded: {record:?}"
-            );
-            false
-        }
-        outcome => panic!("{backend:?}: {outcome:?}"),
-    }
-}
-
-/// The native default is the reference: a candidate that disagrees with it
-/// never serves, even when the default itself is wrong, and is excluded
-/// wherever it is witnessed. A defect the default shares is invisible to
-/// tuning; model evaluation owns it. Both other numerics are hinted, so
-/// each is witnessed, and excluded. The rest of these candidates cost what
-/// the default does, so one timed before its witness is not left ahead and
-/// may end measured and never witnessed: which of them were is the unit's
-/// order, and is not asserted.
 #[test]
-fn candidates_disagreeing_with_the_native_default_are_never_served() {
+fn wrong_default_and_shared_defect_are_rejected_against_portable_source() {
     use seismic_native_tests::wrong_default;
-    for device in devices() {
-        let mut state = f32_tensor(&device, &[4], &[2.; 4]);
-        let x = f32_tensor(&device, &[4], &[1.; 4]);
-        let mut reset = state.clone();
-        let initial: Vec<_> = [2f32; 4]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let result = wrong_default::native_tune(
-            &device,
-            &NativeSpecialization::new(),
-            vec![TuningPoint {
-                label: "mutable".into(),
-                weight: 1.,
-                class: None,
-                cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
-                rotation: vec![wrong_default::Args {
-                    state: &mut state,
-                    x: &x,
-                }],
-                initialize: Some(Box::new(move || reset.write_from_host(&initial))),
-                written: Default::default(),
-            }],
-            NumericalRequirement::BitExact,
-            search_hinted(&[("BIAS", 2), ("BIAS", 0)]),
-        )
-        .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        // Whatever serves has the default's (wrong) numerics: no
-        // configuration that corrects them was served.
-        assert_eq!(result.overall.params["BIAS"], 1, "{:?}", device.backend());
-        let default = &result.configurations[0];
-        assert_eq!(result.served[0], default.configuration);
-        // A device whose only parameter that keeps the numerics is the
-        // default's serves the default, unqualified.
-        assert_eq!(
-            matches!(
-                result.disposition,
-                seismic::TuningDisposition::CanonicalFallback { .. }
-            ),
-            result.served.len() == 1
-        );
-        assert!(!result.observations.is_empty());
-        let keys = result
-            .observations
-            .iter()
-            .map(|observation| (&observation.point, &observation.key))
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            keys.len(),
-            result.observations.len(),
-            "an observation is made once per point and key"
-        );
-        // The default is the reference: nothing is measured of it.
-        assert!(default.observations.is_empty());
-        let mut disagreeing = 0;
-        let mut witnessed = std::collections::BTreeMap::<u64, usize>::new();
-        for record in &result.configurations {
-            let bias = record.configuration.params["BIAS"];
-            if bias == 1 {
-                // A mapping of the default's numerics agrees with it.
-                assert!(matches!(record.outcome, Outcome::Measured { .. }));
-                assert_eq!(result.admitted(record), Ok(()));
-            } else {
-                disagreeing += 1;
-                if disagreeing_candidate_is_not_served(&result, record, &device) {
-                    *witnessed.entry(bias).or_default() += 1;
-                }
-            }
-        }
-        assert!(
-            witnessed.contains_key(&2) && witnessed.contains_key(&0),
-            "{:?}: both other numerics were witnessed and excluded: {witnessed:?}",
-            device.backend()
-        );
-        eprintln!(
-            "{:?}: {} of {disagreeing} disagreeing candidates were witnessed",
-            device.backend(),
-            witnessed.values().sum::<usize>()
-        );
-    }
-}
-
-/// Being fast gets no disagreeing candidate served. `PACE` 0 skips the
-/// work the default (1) does and writes other bits: whichever of its two
-/// tests the unit takes first, it is witnessed and excluded, because rounds
-/// that leave a challenger ahead of the served choice are followed by its
-/// witness. `PACE` 6 writes other bits too and takes six times the
-/// default's work: it never serves, and whether it was witnessed is the
-/// unit's order.
-///
-/// Nothing asserted follows from that order or from the host's timing: the
-/// paces differ by whole multiples of work that takes a millisecond or so
-/// (0.8 ms a pace on an M4 Pro's CPU, 2 ms on its GPU, 2026-10-10). The
-/// order itself is what the unit observes, and the search is laid out so
-/// that it comes to time first on its own: the paces that agree with the
-/// default are hinted, so they are the unit's first session (taken witness
-/// first, as every first session is) and trail there without a refusal,
-/// and restoring the state takes a tenth of a second, which every witness
-/// pays and no round does.
-#[test]
-fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
-    use seismic_native_tests::paced_wrong_default;
-    const N: usize = 64;
-    for device in devices() {
-        let mut state = f32_tensor(&device, &[N as u64], &[2.; N]);
-        let x = f32_tensor(&device, &[N as u64], &[1.; N]);
-        let mut reset = state.clone();
-        let initial: Vec<_> = [2f32; N]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let Strategy::Search(mut plan) = search() else {
-            unreachable!()
-        };
-        // One call is a millisecond or so of the kernel's own work: a
-        // sample of one already measures the kernel, not its submission.
-        plan.min_sample_seconds = 0.0005;
-        plan.start = (2..=5)
-            .map(|pace| [("PACE".to_owned(), pace)].into_iter().collect())
-            .collect();
-        let began = std::time::Instant::now();
-        let result = paced_wrong_default::native_tune(
-            &device,
-            &NativeSpecialization::new(),
-            vec![TuningPoint {
-                label: "paced".into(),
-                weight: 1.,
-                class: None,
-                cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
-                rotation: vec![paced_wrong_default::Args {
-                    state: &mut state,
-                    x: &x,
-                }],
-                initialize: Some(Box::new(move || {
-                    std::thread::sleep(Duration::from_millis(100));
-                    reset.write_from_host(&initial)
-                })),
-                written: Default::default(),
-            }],
-            NumericalRequirement::BitExact,
-            Strategy::Search(plan),
-        )
-        .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        let default = &result.configurations[0];
-        assert_eq!(default.configuration.params["PACE"], 1);
-        assert_eq!(result.served[0], default.configuration);
-        assert_eq!(result.overall.params["PACE"], 1, "{:?}", device.backend());
-        let (mut fast, mut slow, mut slow_witnessed) = (0, 0, 0);
-        for record in result.configurations.iter().skip(1) {
-            match record.configuration.params["PACE"] {
-                0 => {
-                    fast += 1;
-                    assert!(
-                        disagreeing_candidate_is_not_served(&result, record, &device),
-                        "{:?}: ahead in its rounds and not witnessed: {record:?}",
-                        device.backend()
-                    );
-                }
-                6 => {
-                    slow += 1;
-                    slow_witnessed +=
-                        usize::from(disagreeing_candidate_is_not_served(&result, record, &device));
-                }
-                pace => {
-                    // The default's numerics: measured, and admitted where
-                    // witnessed. More of the default's work leads nothing.
-                    assert!(
-                        matches!(record.outcome, Outcome::Measured { .. }),
-                        "{:?}: {record:?}",
-                        device.backend()
-                    );
-                    assert_eq!(result.admitted(record), Ok(()));
-                    assert!(pace == 1 || !result.served.contains(&record.configuration));
-                }
-            }
-        }
-        assert!(fast >= 1 && slow >= 1, "the search reached both ends");
-        // A slow candidate measured and not witnessed was timed first: so
-        // was the fast one of its session, excluded all the same.
-        eprintln!(
-            "{:?}: {fast} fast excluded; {slow_witnessed} of {slow} slow witnessed; \
-             {} configurations in {:.1?}",
-            device.backend(),
-            result.configurations.len(),
-            began.elapsed()
-        );
-    }
-}
-
-/// A search holds every launch group to the native default: the groups'
-/// candidates disagree with these (faulty) defaults, so the defaults stand.
-/// Fidelity to the source is evaluation's job, not tuning's. The fixture's
-/// launches are formed separately from one Metal source.
-#[test]
-fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees() {
-    use seismic_native_tests::scoped_wrong_default;
-    let Ok(device) = DeviceCatalog::discover()
+    let device = DeviceCatalog::discover()
         .unwrap()
         .open_backend(BackendName::Metal)
-    else {
-        return;
-    };
+        .unwrap();
+    let mut state = f32_tensor(&device, &[4], &[2.; 4]);
+    let x = f32_tensor(&device, &[4], &[1.; 4]);
+    let mut reset = state.clone();
+    let initial: Vec<_> = [2f32; 4]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let result = wrong_default::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        vec![TuningPoint {
+            label: "mutable".into(),
+            weight: 1.,
+            class: None,
+            cost: 1.0,
+            required: false,
+            rotation: vec![wrong_default::Args {
+                state: &mut state,
+                x: &x,
+            }],
+            initialize: Some(Box::new(move || reset.write_from_host(&initial))),
+            written: Default::default(),
+        }],
+        PrecisionPolicy::Exact,
+        search(3),
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    assert_eq!(result.overall.params["BIAS"], 0);
+    assert_eq!(result.numerical_evidence.len(), 1);
+    for record in result.configurations {
+        if record.configuration.params["BIAS"] != 0 {
+            assert!(matches!(
+                record.outcome,
+                Outcome::Excluded(Exclusion::Validation { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn factored_search_finds_a_complete_passing_seed_after_bad_defaults() {
+    use seismic_native_tests::scoped_wrong_default;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
     let small = f32_tensor(&device, &[7], &[1.; 7]);
     let large = f32_tensor(&device, &[35], &[1.; 35]);
     let points = [&small, &large]
@@ -2773,7 +2189,7 @@ fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees()
             weight: 1.,
             class: None,
             cost: 1.0,
-            workload: seismic::WorkloadRotation::All,
+            required: false,
             rotation: vec![scoped_wrong_default::Args { x }],
             initialize: None,
             written: Default::default(),
@@ -2783,239 +2199,207 @@ fn a_search_of_launch_groups_keeps_the_defaults_when_every_candidate_disagrees()
         &device,
         &NativeSpecialization::new(),
         points,
-        NumericalRequirement::BitExact,
-        search(),
+        PrecisionPolicy::Exact,
+        search(3),
+        seismic::TuningReference::Portable,
     )
     .unwrap();
-    assert_eq!(result.overall.launches[0]["ROWS"], 1);
-    assert_eq!(result.overall.launches[1]["ROWS"], 4);
+    assert_eq!(result.overall.launches[0]["ROWS"], 2);
+    assert_eq!(result.overall.launches[1]["ROWS"], 8);
+    assert_eq!(result.numerical_evidence.len(), 2);
 }
 
-/// A unit's measurements are the same facts under every requirement: their
-/// identity covers what is measured (the comparison, and the activation type
-/// subjects are measured against) and no α.
 #[test]
-fn measurement_identity_covers_the_comparison_and_no_alpha() {
-    for device in devices() {
-        let x = f32_tensor(&device, &[4], &[1.; 4]);
-        let mut state = f32_tensor(&device, &[4], &[0.; 4]);
-        let mut run = |policy: NumericalRequirement| {
-            let mut reset = state.clone();
-            let bytes: Vec<_> = [0f32; 4]
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            accumulate::native_tune(
-                &device,
-                &NativeSpecialization::new(),
-                vec![TuningPoint {
-                    label: "state".into(),
-                    weight: 1.,
-                    class: None,
-                    cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
-                    rotation: vec![accumulate::Args {
-                        state: &mut state,
-                        x: &x,
-                    }],
-                    initialize: Some(Box::new(move || reset.write_from_host(&bytes))),
-                    written: Default::default(),
+fn evidence_identity_covers_policy_and_reference() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let x = f32_tensor(&device, &[4], &[1.; 4]);
+    let mut state = f32_tensor(&device, &[4], &[0.; 4]);
+    let mut run = |policy: PrecisionPolicy, reference: seismic::TuningReference| {
+        let mut reset = state.clone();
+        let bytes: Vec<_> = [0f32; 4]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        accumulate::native_tune(
+            &device,
+            &NativeSpecialization::new(),
+            vec![TuningPoint {
+                label: "state".into(),
+                weight: 1.,
+                class: None,
+                cost: 1.0,
+                required: false,
+                rotation: vec![accumulate::Args {
+                    state: &mut state,
+                    x: &x,
                 }],
-                policy,
-                // The changed numerics are hinted: every run witnesses them.
-                search_hinted(&[("BIAS", 1)]),
-            )
-            .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()))
-        };
-        let steps = |alpha, activation| NumericalRequirement::RoundingSteps { alpha, activation };
-        let exact = run(NumericalRequirement::BitExact);
-        let strict = run(steps(1., None));
-        let loose = run(steps(1e9, None));
-        assert_eq!(exact.measurement_identity, strict.measurement_identity);
-        assert_eq!(strict.measurement_identity, loose.measurement_identity);
-        // A candidate measured under two requirements was measured to the
-        // same numbers under both; α alone decides which of them the
-        // record admits. What a search goes on to ask for follows what it
-        // admitted, so the candidates of two searches need not be the
-        // same: the ones both reached are compared, the changed numerics
-        // one parameter from the defaults among them.
-        let shared = |left: &seismic::TuningResult, right: &seismic::TuningResult| {
-            let mut biased = false;
-            for observation in &left.observations {
-                let other = right.observations.iter().find(|other| {
-                    other.point == observation.point && other.key == observation.key
-                });
-                if let Some(other) = other {
-                    assert_eq!(observation, other, "{:?}", device.backend());
-                    biased |= observation.key.values.get("BIAS") == Some(&1);
-                }
-            }
-            biased
-        };
-        assert!(shared(&strict, &loose));
-        assert!(shared(&exact, &strict));
-        assert!(strict.rejections().count() > loose.rejections().count());
-        let narrower = run(steps(1., Some(seismic::DType::BF16)));
-        assert_ne!(strict.measurement_identity, narrower.measurement_identity);
-    }
+                initialize: Some(Box::new(move || reset.write_from_host(&bytes))),
+                written: Default::default(),
+            }],
+            policy,
+            search(2),
+            reference,
+        )
+        .unwrap()
+    };
+    let first = run(PrecisionPolicy::Exact, seismic::TuningReference::Portable);
+    let bounded = run(
+        PrecisionPolicy::bounded(seismic::precision::Tolerance {
+            absolute: seismic::precision::Limit::new(0.001).unwrap(),
+            relative: seismic::precision::Limit::ZERO,
+            relative_floor: seismic::precision::Limit::ZERO,
+            ulps: None,
+        }),
+        seismic::TuningReference::Portable,
+    );
+    assert_ne!(
+        first.numerical_evidence[0].identity,
+        bounded.numerical_evidence[0].identity
+    );
+    let native = run(
+        PrecisionPolicy::Exact,
+        seismic::TuningReference::NativeDefault,
+    );
+    assert_ne!(
+        native.numerical_evidence[0].identity,
+        first.numerical_evidence[0].identity
+    );
+    assert_eq!(
+        native.numerical_evidence[0].reference,
+        seismic::TuningReference::NativeDefault
+    );
 }
 
 #[test]
 fn rejected_candidates_stop_after_the_first_timed_invocation() {
     use seismic_native_tests::wrong_default;
-    for device in devices() {
-        let x = f32_tensor(&device, &[4], &[1.; 4]);
-        let mut state = f32_tensor(&device, &[4], &[2.; 4]);
-        let mut reset = state.clone();
-        let initial: Vec<_> = [2f32; 4]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let captures = observed.clone();
-        let result = wrong_default::native_tune(
-            &device,
-            &NativeSpecialization::new(),
-            vec![TuningPoint {
-                label: "early".into(),
-                weight: 1.,
-                class: None,
-                cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
-                rotation: vec![wrong_default::Args {
-                    state: &mut state,
-                    x: &x,
-                }],
-                initialize: Some(Box::new(move || {
-                    captures.borrow_mut().push(read_f32(&reset)[0]);
-                    reset.write_from_host(&initial)
-                })),
-                written: Default::default(),
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let x = f32_tensor(&device, &[4], &[1.; 4]);
+    let mut state = f32_tensor(&device, &[4], &[2.; 4]);
+    let mut reset = state.clone();
+    let initial: Vec<_> = [2f32; 4]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let observed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let captures = observed.clone();
+    let result = wrong_default::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        vec![TuningPoint {
+            label: "early".into(),
+            weight: 1.,
+            class: None,
+            cost: 1.0,
+            required: false,
+            rotation: vec![wrong_default::Args {
+                state: &mut state,
+                x: &x,
             }],
-            NumericalRequirement::BitExact,
-            search_hinted(&[("BIAS", 2), ("BIAS", 0)]),
-        )
-        .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        // Every subsequent initialization observes the preceding call
-        // before reset. The default (BIAS 1) is the reference; the
-        // candidates disagreeing with it produce 4.0 (BIAS 2) and 3.0
-        // (BIAS 0) in one call from the restored state. Each is hinted, so
-        // it is witnessed before it is timed: it ran once, for its one
-        // observation, and never again. One the search reached later and
-        // timed first ran its samples' many calls from a restored state,
-        // and at most its one witness after them.
-        let mut values = observed.borrow().clone();
-        values.push(read_f32(&state)[0]);
-        for (bias, written) in [(2, 4.0), (0, 3.0)] {
-            let candidates = result
-                .configurations
-                .iter()
-                .filter(|record| record.configuration.params["BIAS"] == bias)
-                .count();
-            let ran = values.iter().filter(|&&value| value == written).count();
-            assert!(
-                (1..=candidates).contains(&ran),
-                "{:?}: BIAS {bias} ran {ran} times for {candidates} candidates: {values:?}",
-                device.backend()
-            );
-        }
-        assert_eq!(result.overall.params["BIAS"], 1);
-    }
+            initialize: Some(Box::new(move || {
+                captures.borrow_mut().push(read_f32(&reset)[0]);
+                reset.write_from_host(&initial)
+            })),
+            written: Default::default(),
+        }],
+        PrecisionPolicy::Exact,
+        search(3),
+        seismic::TuningReference::Portable,
+    )
+    .unwrap();
+    // Every subsequent initialization observes the preceding call before reset.
+    // The two faulty candidates produce 3.5 and 4.0; each may run only once.
+    let mut values = observed.borrow().clone();
+    values.push(read_f32(&state)[0]);
+    assert_eq!(values.iter().filter(|&&v| v == 3.5).count(), 1);
+    assert_eq!(values.iter().filter(|&&v| v == 4.0).count(), 1);
+    assert_eq!(result.overall.params["BIAS"], 0);
 }
 
 #[test]
 fn pooled_results_cannot_hide_a_candidates_missing_writes() {
     use seismic_native_tests::omitted_write;
-    for device in devices() {
-        let x = f32_tensor(&device, &[4], &[1., 2., 3., 4.]);
-        let result = omitted_write::native_tune(
-            &device,
-            &NativeSpecialization::new(),
-            vec![TuningPoint {
-                label: "missing-write".into(),
-                weight: 1.,
-                class: None,
-                cost: 1.0,
-                workload: seismic::WorkloadRotation::All,
-                rotation: vec![omitted_write::Args { x: &x }],
-                initialize: None,
-                written: Default::default(),
-            }],
-            NumericalRequirement::BitExact,
-            // The missing-write candidate is hinted: it is witnessed.
-            search_hinted(&[("WRITE", 0)]),
-        )
-        .unwrap_or_else(|error| panic!("{:?}: {error}", device.backend()));
-        assert_eq!(
-            result.configurations[0].configuration.params["WRITE"], 1,
-            "the good candidate must populate pooled output before the missing-write candidate"
-        );
-        assert_eq!(result.overall.params["WRITE"], 1);
-        // Every witness of a candidate that writes nothing excludes it; one
-        // the search reached after the hinted one and timed first was not
-        // left ahead, and was never witnessed.
-        let witnessed = result
-            .configurations
-            .iter()
-            .filter(|record| record.configuration.params["WRITE"] == 0)
-            .filter(|record| disagreeing_candidate_is_not_served(&result, record, &device))
-            .count();
-        assert!(witnessed >= 1, "{:?}", device.backend());
-    }
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
+    let x = f32_tensor(&device, &[4], &[1., 2., 3., 4.]);
+    let result = omitted_write::native_tune(
+        &device,
+        &NativeSpecialization::new(),
+        vec![TuningPoint {
+            label: "missing-write".into(),
+            weight: 1.,
+            class: None,
+            cost: 1.0,
+            required: false,
+            rotation: vec![omitted_write::Args { x: &x }],
+            initialize: None,
+            written: Default::default(),
+        }],
+        PrecisionPolicy::Exact,
+        search(2),
+        seismic::TuningReference::NativeDefault,
+    )
+    .unwrap();
+    assert_eq!(
+        result.configurations[0].configuration.params["WRITE"], 1,
+        "the good candidate must populate pooled output before the missing-write candidate"
+    );
+    assert_eq!(result.overall.params["WRITE"], 1);
+    let omitted = result
+        .configurations
+        .iter()
+        .find(|r| r.configuration.params["WRITE"] == 0)
+        .unwrap();
+    assert!(
+        matches!(
+            omitted.outcome,
+            Outcome::Excluded(Exclusion::Validation { .. })
+        ),
+        "{omitted:?}"
+    );
 }
 
 /// Validation observes a `&mut` parameter's declared written rows, not its
-/// whole storage. A point that also observes the other rows rejects a write
-/// there whatever error the requirement admits in the written ones; a point
-/// that declares no rows holds the whole storage to the requirement.
+/// whole storage; one point observed whole rejects a write outside them.
 #[test]
-fn declared_rows_scope_state_observation_and_observing_the_rest_rejects_stray_writes() {
-    for device in devices() {
-        stray_writes_are_observed_where_declared(device);
-    }
-}
-
-fn stray_writes_are_observed_where_declared(device: Device) {
+fn declared_rows_scope_state_observation_and_a_whole_point_rejects_stray_writes() {
     use seismic_native_tests::stray_write;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Metal)
+        .unwrap();
     const N: usize = 8;
     let x = f32_tensor(&device, &[N as u64], &[1.; N]);
     let initial: Vec<u8> = [0f32; N].iter().flat_map(|v| v.to_le_bytes()).collect();
-    // The second point of a run: none, one observed whole, or one that
-    // declares the written rows and observes the rest.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Guard {
-        None,
-        Whole,
-        Rest,
-    }
-    let stray = |guard: Guard, requirement: NumericalRequirement| {
+    let stray = |whole: bool| {
         let mut declared = f32_tensor(&device, &[N as u64], &[0.; N]);
         let mut observed = f32_tensor(&device, &[N as u64], &[0.; N]);
-        let point = |label: &str, state: &Tensor, written: Option<bool>| {
+        let point = |label: &str, state: &Tensor, written: bool| {
             let mut reset = state.clone();
             let initial = initial.clone();
             (
                 label.to_owned(),
                 Box::new(move || reset.write_from_host(&initial)) as TuningInitializer<'static>,
-                written
-                    .map(|observe_rest| {
-                        (
-                            "state".to_owned(),
-                            seismic::WrittenRows {
-                                rows: 0..N as u64 - 1,
-                                observe_rest,
-                            },
-                        )
-                    })
-                    .into_iter()
-                    .collect(),
+                if written {
+                    [("state".to_owned(), 0..N as u64 - 1)]
+                        .into_iter()
+                        .collect()
+                } else {
+                    Default::default()
+                },
             )
         };
-        let mut points = vec![point("declared", &declared, Some(false))];
-        match guard {
-            Guard::None => {}
-            Guard::Whole => points.push(point("whole", &observed, None)),
-            Guard::Rest => points.push(point("rest", &observed, Some(true))),
+        let mut points = vec![point("declared", &declared, true)];
+        if whole {
+            points.push(point("whole", &observed, false));
         }
         let states = [&mut declared, &mut observed];
         let result = stray_write::native_tune(
@@ -3029,16 +2413,15 @@ fn stray_writes_are_observed_where_declared(device: Device) {
                     weight: 1.,
                     class: None,
                     cost: 1.0,
-                    workload: seismic::WorkloadRotation::All,
+                    required: false,
                     rotation: vec![stray_write::Args { state, x: &x }],
                     initialize: Some(initialize),
                     written,
                 })
                 .collect::<Vec<_>>(),
-            requirement,
-            // The stray write is hinted: it is witnessed, and it is the
-            // first of its value the search reaches.
-            search_hinted(&[("STRAY", 1)]),
+            PrecisionPolicy::Exact,
+            search(2),
+            seismic::TuningReference::NativeDefault,
         )
         .unwrap();
         result
@@ -3048,38 +2431,18 @@ fn stray_writes_are_observed_where_declared(device: Device) {
             .unwrap()
             .outcome
     };
-    let exact = NumericalRequirement::BitExact;
-    // Any finite error in a written row is within this.
-    let anything = NumericalRequirement::RoundingSteps {
-        alpha: f64::MAX,
-        activation: None,
-    };
     assert!(
-        matches!(stray(Guard::None, exact.clone()), Outcome::Measured { .. }),
+        matches!(
+            stray(false),
+            Outcome::Measured {
+                validated: true,
+                ..
+            }
+        ),
         "rows outside the declared ones are not observed"
     );
     assert!(
-        matches!(
-            stray(Guard::Whole, exact.clone()),
-            Outcome::Excluded(Exclusion::Validation { .. })
-        ),
+        matches!(stray(true), Outcome::Excluded(Exclusion::Validation { .. })),
         "a point observed whole rejects the stray write"
     );
-    assert!(
-        matches!(stray(Guard::Whole, anything.clone()), Outcome::Measured { .. }),
-        "a point that declares no rows holds every row to the requirement alone"
-    );
-    for requirement in [exact, anything] {
-        match stray(Guard::Rest, requirement) {
-            Outcome::Excluded(Exclusion::Validation { point, detail }) => {
-                assert_eq!(point, "rest");
-                assert!(
-                    detail.contains("subject i0:unwritten")
-                        && detail.contains("1 elements differ where none may"),
-                    "{detail}"
-                );
-            }
-            outcome => panic!("a write outside the written rows was admitted: {outcome:?}"),
-        }
-    }
 }

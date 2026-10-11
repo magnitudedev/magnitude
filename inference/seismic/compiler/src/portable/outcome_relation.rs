@@ -95,7 +95,7 @@ impl Analysis<'_> {
                 Value::Scalar(self.expression(expression.into(), &HashMap::new())?)
             }
             Bound::Scalar(ScalarBinding::Quantity(_)) => {
-                return Err("exact host quantity comparison is not an alternative-analysis rule");
+                return Err("exact host quantity comparison is not an alternative-analysis rule")
             }
             Bound::Range { start, end } => {
                 Value::Range(self.input(*start)?.scalar()?, self.input(*end)?.scalar()?)
@@ -118,7 +118,7 @@ impl Analysis<'_> {
                 )
             }
             Bound::Tensor(TensorRealization::Computed(_)) => {
-                return Err("deferred tensor input relation is unfinished");
+                return Err("deferred tensor input relation is unfinished")
             }
         })
     }
@@ -194,22 +194,6 @@ impl Analysis<'_> {
                                 }
                             }
                             Value::Scalar(self.expression((*expression).into(), &operands)?)
-                        }
-
-                        PrimitiveId::QuantizedComponentRead { component, .. } => {
-                            let Value::Tensor(view) = operands[0] else {
-                                return Err("source component read has no stored place");
-                            };
-                            let coordinates = inputs[1..]
-                                .iter()
-                                .map(|index| self.source_coordinate(function, values, *index))
-                                .collect::<Result<Vec<_>>>()?;
-                            Value::Scalar(self.source_tensor_component(
-                                view,
-                                &coordinates,
-                                state,
-                                Some(*component),
-                            )?)
                         }
 
                         PrimitiveId::Select => Value::Scalar(self.terms.select(
@@ -619,7 +603,7 @@ impl Analysis<'_> {
                 Bound::Scalar(ScalarBinding::Quantity(_)) => {
                     return Err(
                         "exact host quantity comparison is not an alternative-analysis rule",
-                    );
+                    )
                 }
                 Bound::Range { start, end } => Value::Range(
                     value(analysis, *start, slots)?.scalar()?,
@@ -754,7 +738,7 @@ pub(crate) fn derive<B: seismic_native_target::TargetFamily>(
                 _ => {
                     return Err(
                         "write address/order or failure-prefix equivalence is not established",
-                    );
+                    )
                 }
             }
         }
@@ -905,9 +889,7 @@ mod tests {
             analyze_mapped(later, Some(BodyMapping::Independent)),
             DerivedOutcome::Pending(_)
         ));
-        let authored = format!(
-            "{map}\nlower probe(input: &tensor[4] f32, out: &mut tensor[4] f32) for cpu:\n    parallel for i in 0..4:\n        out[i] = input[i] + 2.0\n"
-        );
+        let authored = format!("{map}\nlower probe(input: &tensor[4] f32, out: &mut tensor[4] f32) for cpu:\n    parallel for i in 0..4:\n        out[i] = input[i] + 2.0\n");
         assert_ne!(
             analyze_mapped(&authored, Some(BodyMapping::Authored)),
             DerivedOutcome::Exact
@@ -929,94 +911,37 @@ mod tests {
 
     #[test]
     fn ordered_scalar_recurrence_uses_a_symbolic_header_and_actual_backedge() {
-        assert_eq!(
-            analyze(
-                "fn probe(a: f32, b: f32) -> f32:\n    let mut total = a\n    for i in 0..3:\n        total = fma(total, b, a)\n    return total\n",
-                false
-            ),
-            DerivedOutcome::Exact
-        );
+        assert_eq!(analyze("fn probe(a: f32, b: f32) -> f32:\n    let mut total = a\n    for i in 0..3:\n        total = fma(total, b, a)\n    return total\n", false), DerivedOutcome::Exact);
     }
 
     #[test]
     fn q4g64_fields_and_bf16_activations_follow_ordered_f32_fma_reference() {
-        assert_eq!(
-            analyze(
-                "fn probe(a: &tensor[128] bf16, w: &tensor[128] q4g64) -> f32:\n    let first = fma(f32(a[63]), w[63], 0.0)\n    return fma(f32(a[64]), w[64], first)\n",
-                false
-            ),
-            DerivedOutcome::Exact
-        );
+        assert_eq!(analyze("fn probe(a: &tensor[128] bf16, w: &tensor[128] q4g64) -> f32:\n    let first = fma(f32(a[63]), w[63], 0.0)\n    return fma(f32(a[64]), w[64], first)\n",false), DerivedOutcome::Exact);
     }
 
     #[test]
     fn authored_labels_neither_establish_nor_prevent_exact_scalar_equivalence() {
-        assert_eq!(
-            analyze(
-                "fn probe(a: f32, b: f32) -> f32:\n    return a + b\n\nlower probe(a: f32, b: f32) -> f32 for cpu:\n    return a + b\n",
-                true
-            ),
-            DerivedOutcome::Exact
-        );
-        assert_eq!(
-            analyze(
-                "fn probe(a: f32, b: f32) -> f32:\n    return a + b\n\nlower probe(a: f32, b: f32) -> f32 for cpu:\n    return a - b\n",
-                true
-            ),
-            DerivedOutcome::DiscreteProvenFloatingUnbounded
-        );
-        assert!(matches!(
-            analyze(
-                "fn probe(a: u32) -> u32:\n    return a\n\nlower probe(a: u32) -> u32 for cpu:\n    return 3\n",
-                true
-            ),
-            DerivedOutcome::Pending(_)
-        ));
+        assert_eq!(analyze("fn probe(a: f32, b: f32) -> f32:\n    return a + b\n\nlower probe(a: f32, b: f32) -> f32 for cpu:\n    return a + b\n", true), DerivedOutcome::Exact);
+        assert_eq!(analyze("fn probe(a: f32, b: f32) -> f32:\n    return a + b\n\nlower probe(a: f32, b: f32) -> f32 for cpu:\n    return a - b\n", true), DerivedOutcome::DiscreteProvenFloatingUnbounded);
+        assert!(matches!(analyze("fn probe(a: u32) -> u32:\n    return a\n\nlower probe(a: u32) -> u32 for cpu:\n    return 3\n", true), DerivedOutcome::Pending(_)));
     }
 
     #[test]
     fn unit_helpers_compare_actual_ordered_writes_including_addresses() {
-        assert_eq!(
-            analyze(
-                "fn write(out: &mut tensor[2] f32, value: f32):\n    out[0] = value\n\nfn probe(out: &mut tensor[2] f32):\n    write(out, 3.0)\n    write(out, 7.0)\n",
-                false
-            ),
-            DerivedOutcome::Exact
-        );
-        assert_eq!(
-            analyze(
-                "fn probe(out: &mut tensor[2] f32):\n    out[0] = 3.0\n\nlower probe(out: &mut tensor[2] f32) for cpu:\n    out[0] = 7.0\n",
-                true
-            ),
-            DerivedOutcome::DiscreteProvenFloatingUnbounded
-        );
-        assert!(matches!(
-            analyze(
-                "fn probe(out: &mut tensor[2] f32):\n    out[0] = 3.0\n\nlower probe(out: &mut tensor[2] f32) for cpu:\n    out[1] = 3.0\n",
-                true
-            ),
-            DerivedOutcome::Pending(_)
-        ));
+        assert_eq!(analyze("fn write(out: &mut tensor[2] f32, value: f32):\n    out[0] = value\n\nfn probe(out: &mut tensor[2] f32):\n    write(out, 3.0)\n    write(out, 7.0)\n", false), DerivedOutcome::Exact);
+        assert_eq!(analyze("fn probe(out: &mut tensor[2] f32):\n    out[0] = 3.0\n\nlower probe(out: &mut tensor[2] f32) for cpu:\n    out[0] = 7.0\n", true), DerivedOutcome::DiscreteProvenFloatingUnbounded);
+        assert!(matches!(analyze("fn probe(out: &mut tensor[2] f32):\n    out[0] = 3.0\n\nlower probe(out: &mut tensor[2] f32) for cpu:\n    out[1] = 3.0\n", true), DerivedOutcome::Pending(_)));
     }
 
     #[test]
     fn actual_failure_continuation_retains_prior_writes_and_source_cause_order() {
         let source = "fn probe(out: &mut tensor[1] f32, numerator: i32, divisor: i32) -> i32:\n    out[0] = 7.0\n    let value = numerator / divisor\n    out[0] = 9.0\n    return value\n";
         assert_eq!(analyze(source, false), DerivedOutcome::Exact);
-        let altered = format!(
-            "{source}\nlower probe(out: &mut tensor[1] f32, numerator: i32, divisor: i32) -> i32 for cpu:\n    let value = numerator / divisor\n    out[0] = 7.0\n    out[0] = 9.0\n    return value\n"
-        );
+        let altered = format!("{source}\nlower probe(out: &mut tensor[1] f32, numerator: i32, divisor: i32) -> i32 for cpu:\n    let value = numerator / divisor\n    out[0] = 7.0\n    out[0] = 9.0\n    return value\n");
         assert!(matches!(
             analyze(&altered, true),
             DerivedOutcome::Pending(_)
         ));
-        assert_eq!(
-            analyze(
-                "fn write(out: &mut tensor[1] f32, divisor: i32):\n    out[0] = 7.0\n    let result = 1 / divisor\n    out[0] = f32(result)\n\nfn probe(out: &mut tensor[1] f32, divisor: i32):\n    write(out, divisor)\n",
-                false
-            ),
-            DerivedOutcome::Exact,
-            "effect-only imported call preserves actual prior writes and failure"
-        );
+        assert_eq!(analyze("fn write(out: &mut tensor[1] f32, divisor: i32):\n    out[0] = 7.0\n    let result = 1 / divisor\n    out[0] = f32(result)\n\nfn probe(out: &mut tensor[1] f32, divisor: i32):\n    write(out, divisor)\n",false),DerivedOutcome::Exact,"effect-only imported call preserves actual prior writes and failure");
     }
 }

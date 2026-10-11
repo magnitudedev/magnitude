@@ -205,16 +205,12 @@ fn reached_private_allocation_preserves_prefix(source: &str) {
 
 #[test]
 fn cpu_reached_private_allocation_does_not_reserve_unvisited_loop_envelope() {
-    reached_private_allocation_preserves_prefix(
-        "fn main(out: &mut tensor[1] i32, divisor: i32):\n    for i in 0..65536:\n        let mut scratch = tensor[i+1] i32\n        scratch[0] = 7\n        out[0] = scratch[0]\n        let quotient = 1 / divisor\n        out[0] = quotient\n",
-    );
+    reached_private_allocation_preserves_prefix("fn main(out: &mut tensor[1] i32, divisor: i32):\n    for i in 0..65536:\n        let mut scratch = tensor[i+1] i32\n        scratch[0] = 7\n        out[0] = scratch[0]\n        let quotient = 1 / divisor\n        out[0] = quotient\n");
 }
 
 #[test]
 fn cpu_reached_private_allocation_skips_backing_after_source_failure() {
-    reached_private_allocation_preserves_prefix(
-        "fn main(out: &mut tensor[1] i32, divisor: i32):\n    let mut first = tensor[1] i32\n    first[0] = 7\n    out[0] = first[0]\n    let quotient = 1 / divisor\n    let mut later = tensor[65536] i32\n    later[0] = quotient\n    out[0] = later[0]\n",
-    );
+    reached_private_allocation_preserves_prefix("fn main(out: &mut tensor[1] i32, divisor: i32):\n    let mut first = tensor[1] i32\n    first[0] = 7\n    out[0] = first[0]\n    let quotient = 1 / divisor\n    let mut later = tensor[65536] i32\n    later[0] = quotient\n    out[0] = later[0]\n");
 }
 
 // These exercise the required schedule placement. Native-segment local

@@ -5,7 +5,6 @@ applies_to:
   - inference/engine/state/**
   - inference/engine/src/execution.rs
   - inference/engine/src/planning.rs
-  - inference/docs/tuning.md
 ---
 
 # Numerical execution plan
@@ -16,10 +15,6 @@ program slots, method capabilities, service policy, and all device resources. Th
 topology is both the complete requirement set and the construction recipe. Program construction
 attests every exact slot and returns typed callable groups; execution never queries a handle map or
 coarse coverage class after readiness.
-An optional drafter rejected during semantic admission may remain in the opened package.
-Its unbound artifact contributes no weights or residency to the plain execution plan; an admitted
-drafter definition still requires its matching component.
-
 Metadata-only model assessment derives resident weight bytes and slab-rounded history and recurrent
 bank bytes from this same model load plan and state layout, for a one-conversation workload at the
 lesser of supported context and 100,000 tokens. It does not read weight payloads or open a device.
@@ -82,9 +77,12 @@ selection-row classes up to the selection bound for the readout, each retaining 
 share; the prefill chunk classes divide theirs by the octaves of prompt length each serves, the
 largest launch's class holding every octave from its rows to the served context, since a longer
 prompt is prefilled in launches of that many rows), rotations over real resident weights of distinct layers for weight-streaming decode rows,
-control tables packed by the batch builder. Every tuned entry applies the load's single α policy
-to each floating result and writable-state subject through the derived error-ratio admission rule.
-Production preparation forms the declaration default native specialization as its fallback artifact without creating numerical evidence. Production tuning compares each candidate on the device against the declaration's native default, the canonical kernel itself, under the admission limits below; fidelity to the portable checked body and model-level quality are evaluation's job. There is no portable or host-CPU reference. Reference observations and fidelity qualification share the original first-load allowance. Startup qualification remains a local empirical check, not a portable semantic proof or whole-model quality qualification. Every alternative candidate must pass the witnesses of each timed point before continued performance sampling; the selected winner must also pass every untimed case. An unmeasured fallback, including a terminal zero-demand unit, remains explicitly unqualified. A qualified terminal candidate requires the selected artifact's completed native-default evidence for every immutable case, including untimed cases. An explicit canonical-fallback disposition instead pins the actual formed declaration default; cold and warm loads can use it without claiming numerical qualification. Reuse resolves that same default and checks both specialization and artifact identity plus the served contract. Missing evidence never implicitly creates fallback authority. A known rejected default cannot be used as fallback. Unqualified fallback measurements never supply admitted service forecasts, and neither fallback reuse nor failure reopens the tuning allowance. Zero-demand reuse performs no numerical work. The first suitable timed
+control tables packed by the batch builder. Every tuned entry uses a bounded precision policy,
+with explicit floating result and writable-state subject limits shared with the compiler policy
+representation. Production tuning uses the declaration default native specialization as its
+reference. This checks candidate agreement with the baseline, not independent agreement with
+source semantics; kernel and model regressions must detect shared defects. Every candidate, including the
+default, must pass every case before continued performance sampling. The first suitable timed
 execution supplies its validation outputs. Integer, Boolean and packed-code state remains exact.
 Every tensor an entry writes in place is case-owned, and its case declares the rows the entry
 writes; real serving state is never bound. Those rows are restored before each reference and
@@ -93,7 +91,7 @@ rest is input the entry only reads, so no long history is re-uploaded or read ba
 One case per unit, the one with the least state, restores and compares its state whole, so a
 write outside the declared rows is rejected. Timed passes after a
 candidate's validated invocation are batched and run on the state they leave, the same way for
-every configuration, so timing never pays a host reset per invocation. Numerical witness sets and performance rotations are distinct: all declared witness cases qualify the artifact, while only the declared workload rotation contributes sampling and confirmation cost. Input variation used for numerical coverage does not imply independent memory streams; real weight-stream rotations remain part of the performance workload. An expired validation is incomplete work within this load, never a cached rejection or a further-load allowance. Matching evidence from earlier in the same search can be
+every configuration, so timing never pays a host reset per invocation. Matching evidence from earlier in the same search can be
 reused, but timing equivalence alone is not numerical evidence. Whole-model numerical and raw
 output/parser regressions are development and release qualification, not another startup gate or
 a search over kernel combinations. Local bounded policies do not claim a mathematical bound on
@@ -103,113 +101,91 @@ engine-side default parameter values. An entry prepared again with identical ele
 and static values reuses the load's first tuning result; its rotations already span the weights
 of several layers. Disjoint row-class workloads may prepare distinct configurations of the same
 entry contract; each is tuned and validated on the classes it serves, and the exact graph class
-binds its prepared configuration.
-Row partitions follow a native form's supported geometry rather than a model identity. In
-particular, an affine Metal form that shares a history tile across four rows has a distinct
-four-row objective throughout its supported head geometry; shorter and wider row bands cannot
-displace that choice. The partition changes neither the served numerical contract nor the
-first-load allowance.
-Entry-wide
-declarations are tuned during one first-load tuning allowance (60 s per preparation when
-served, on any device; evaluation may set an explicit budget, which keys the stored result). Counting identifies units, served geometry, launch frequency and final stored
-choices without forming programs. Canonical programs required by a fresh load form inside
-the same allowance, including zero-demand units; their formation is reported separately.
-Census, representative discovery, candidate planning,
-optional formation, qualification, timing, confirmation and receipt publication otherwise use
-this one allowance. No independent optimizer or later load adds time.
-
-The served numerical contract and the timed performance objective are distinct. The former
-contains every declared row/history/ownership domain and remains immutable. Candidate eligibility
-requires exact-artifact numerical witnesses throughout that contract, including zero-demand and
-untimed points. The formed canonical default remains an explicitly distinguished unqualified fallback;
-its usability does not qualify an approximate alternative or establish artifact fidelity or model quality.
-
-The workload is declared from 137,170 turns of 1,631 hosted-provider coding-agent sessions
-(2026-10-07): new prompt tokens outnumber decoded tokens about 32 to 1; large prefill launches dominate
-prompt service, and single-row, verification and concurrent launches contribute decode service.
-The load-owned execution graph supplies invocation counts at its logical operator call sites,
-independently of weight ownership. Reusing a target output table in an assistant does not turn
-that assistant call into a target call. The same preparation walk collects a complete map of
-logical native specializations before opening searches; physical binding groups rotate their
-weights separately from this call map. Identical specializations aggregate actual call-site
-multiplicity once.
-
-The plan distinguishes finite action support from frequency. Its speculative forecast is an
-explicit bounded action envelope: a chained action with G generated tokens invokes the head
-G times and verifies G+1 target rows once; a block drafter runs its generated block once.
-Alternative widths contribute maxima within an owned representative class, not invented
-probabilities or simultaneous actions. Target prefix and plain-decode demand remain present;
-heads with their own history also retain prefix priming, while shared-history heads do not
-acquire fictitious priming. Entry-owned row bands map logical calls to their representatives
-and reject calls outside that entry's support. The hosted history forecast remains a performance
-approximation independent of these call counts.
-
-Point weights are invocation demand, not a second latency surrogate. A candidate's objective is
-elapsed service under that declared forecast (demand times measured device latency), relative to
-the reference's service under the same demand. Unit scheduling uses the same service evidence
-and positive point weights for its conditional mean history; numerical-only witnesses do not
-contribute service. A unit with no invocation demand still prepares its canonical default inside
-the first-load clock, publishes that explicitly unqualified terminal choice, and receives no
-numerical census or candidate search.
-Invocation forecasts are first-load allocation inputs, never cache identities. A later request,
-adaptive action, or demand change consumes frozen choices and cannot reopen tuning or obtain
-another minute. Attention history
-sampling represents the declared mean history through neighboring points and clamps to a layer's
-physical window; this interpolation is a performance approximation, not a universal cost bound.
-The declared longest history remains part of numerical scope even when it carries no sampled
-demand. A full-context domain is not capped by the sampling ladder.
-
-Representative discovery precedes opening a candidate frontier. It begins with an affordable
-region bootstrap and measures the workload representatives, rather than requiring the most
-expensive endpoint as the first informative sample. The timed cohort is then frozen: retained
-candidates are never compared across different point cohorts. An unfinished discovery remains
-pending within the original load and does not become a measured zero-cost workload. Canonical
-measurements discovered after census refresh scheduling priority; concluding a dependency retains
-that evidence. Missing measurements are reported explicitly when time expires.
-
-The runtime owns candidate generation, artifact qualification, retained measurements and complete
-pending-work quotes. The allocator owns admission, elapsed charging and deadlines. A quote states
-complete pending execution and any incremental terminal obligation admitting it can create.
-Completed artifact witnesses and formed programs are removed from pending work rather than
-charged again. The allocator does not independently calibrate a runtime quote or price program
-formation. Quotes refresh after every step or canonical dependency seal.
-
-Unknown execution is an explicit bootstrap/discovery state. It receives a bounded fair share of
-currently available time among pending discovery units while terminal publication remains held.
-That share is an allowance, not a fabricated latency estimate. An unknown quote cannot authorize
-an optional performance candidate. Known candidate work is admitted only when execution, current
-terminal obligations and the added obligation fit. An admitted optional transaction executes once under the hard deadline and terminal guards;
-its forecast-sized scheduling slice is not a second admission deadline after adapter overhead.
-Its execution interval is not shortened by subtracting its own estimate a second time. Runtime hard deadlines protect other units' reserves;
-the runtime guards its own conclusion, and the adapter guards receipt publication.
-
-Ordinary and factored search produce complete prepared candidate artifacts during exploration.
-Factoring reuses keyed point measurements and generates assembled whole specializations; it does
-not introduce another winner or finalization authority. The measured incumbent's legal neighbors
-lead useful refinement while representatives of disconnected admissible components remain
-reachable. Numerical allowance expiration leaves incomplete witnesses pending within this load;
-actual numerical or execution rejection is retained as a verdict.
-
-Finalization confirms and ranks only retained whole candidates using the same deterministic
-weighted cohort and evidence as search. It does not assemble unseen artifacts or reserve work for
-hypothetical group combinations. Reserves derive from actual candidate obligations. The first
-rival adds one winner-coverage reserve, held separately from confirmation; further rivals do not
-each reserve another copy. Earlier timing samples may survive expired confirmation, but a retained
-leader still needs complete numerical coverage before it replaces the default. Canonical
-prerequisites are validated as a finite acyclic dependency relation before scheduling. Sealing a
-prerequisite publishes its final artifact and ends its exploration; dependent alternatives are
-qualified and repriced against that artifact, not a provisional default.
-
-Deadline checks apply before each interruptible operation and between submissions. A reference
-call is a call of the canonical kernel, priced by its measured service. Other admitted quotes remain forecasts; submission granularity bounds their
-risk, and receipts report actual overruns honestly. A reserve
-never grants extra time. At the end of the allowance every unit saves its terminal choice,
-including a limited or unmeasured default. Later loads consume that choice without reopening
-search. A terminal choice that fails its same-key served contract is a preparation error,
-not a cache miss granting another search. Served maps include the codec-derived plane
-dimensions used by actual attention graphs. Incomplete evidence and negative dependent outcomes grant no further allowance.
-
-Shared history planes live
+binds its prepared configuration. Entry-wide
+declarations are tuned within a fixed tuning time (60 s per preparation, on any device), in three
+walks of the program. A count finds the model's tuning units (entry, element bindings, static
+values and served workload), their launches per step and which have a stored result; nothing is
+formed or measured. The tuning time starts with the census, which measures each unit that will
+search at the points every candidate must pass (its cheapest point when none must), the fixed
+cost of searching it, within the tuning time left. Keeping a unit's defaults costs nothing and is
+always valid (they are the validation reference), so every other piece of work starts only when
+its predicted cost fits. The unit's points are built and measured in ascending estimated cost
+(rows, and for attention each row's rows plus visible history): a point's inputs are built only
+when it is admitted (weight imports and generated activations each predicted from their size and
+the rates measured so far, and refused when they would not fit), then its reference runs and the
+defaults are validated and measured there. Each point is predicted from the last admitted one:
+its building and validation as measured, its invocations at the defaults' measured device time
+scaled by cost. Every point of at most 8 rows (the decode range, where implementations'
+row-dependent code paths differ) is required: a unit whose required points do not fit keeps its
+defaults without searching. Beyond those rows the census also times each unit at the costliest
+point it serves of the short chunks (16 and 32 rows) and of the prefill chunks (64 to 512 rows):
+the most rows, and for attention the longest history. Such a point is not required; one that does
+not fit is left for the unit's start. The census keeps the inputs it built and the unit's opened
+search. Its measurements give each unit's share of step time: every row class holds its share of
+the step, split among the units serving it by launches per step times the defaults' mean time at
+the timed points that stand for the class (its own where the census timed them, else the
+costliest timed of its group), so the prefill classes weigh on the units that serve them and a
+unit serving only chunks holds its part of them. The units are then searched together, before the walk that prepares them. Tuning happens
+in this one tuning time: a stored result is used as it is by every later load, however far its
+search got. Only a unit that was started stores a result: a unit never started was not searched,
+so nothing is stored for it and the next load searches it. The time is planned before it is spent, so that tuning ends inside it because the
+planned work fits; everything between the census and the last walk counts against it, planning
+and formation as well as measurement. Breadth comes before depth. Each unit is first started,
+largest share first: it admits further points while they fit a tenth of its share of the tuning
+time (a point not admitted is not timed and folds its weight into the largest admitted point of
+its history class), and measures its defaults and every form's start, so no unit and no form is
+left unmeasured because another unit was searched to exhaustion. Each unit estimates its start
+from its census (the defaults' pass over its points, its forms, the programs they need); the
+plan prices a program at what forming one has taken so far in this preparation, so a cold
+pipeline cache is seen after the first start, and scales the units' estimates by how the starts
+so far compared with theirs. Its conclusion is estimated as what the start leaves to confirm: the
+defaults and the form starts it measures (one rival where it has none; never more than the
+finalists a conclusion confirms), each at the defaults' measured sample. Rivals found later are
+covered by the reserve the started search states, so a unit whose defaults are slow is not
+refused its start for a confirmation of configurations as slow as they. A unit gets its form starts while they fit together with a
+defaults-only start and the conclusion of every unit after it, else a defaults-only start while
+that fits (it is then refined first, before any slice is dealt by weight, and that step measures
+its form starts), else it waits; the
+plan is made again before each start and reported with what each start took. A unit that waits
+is not dropped: before every later step the plan is made again for the units waiting, largest
+share first, and such a unit is started as soon as its start fits, because the starts since have
+shown what a start costs against its estimate or because a conclusion has given back what it left
+of its reserve; having received nothing, it is then refined before the others. Only a unit whose
+start never fit keeps its defaults unmeasured. The time left is
+dealt in half-second slices among the units whose searches have not ended, by the step time each
+still takes: a unit's share of step time times its best cost so far relative to its defaults.
+What one of a unit's measurements costs takes no part, so a unit whose measurements are slow
+gets its share of the time and fewer measurements in it. Each slice
+goes to the unit that with it will have received the least time per unit of that weight (so no
+round of first slices is dealt whatever the shares), so the units' time
+follows it, an overrun is charged to the unit that made it, and the time of a search that ends
+goes to the rest. A unit's reserve for its conclusion bounds it and is not what it takes: when
+the time left only covers the reserves of the units not yet concluded, the unit that has received
+the most for its weight is concluded, what its conclusion left of its reserve is dealt to the
+others, and they are refined on, until the last is concluded with only its own reserve left. A
+slice is dealt while what a unit cannot interrupt (the longest a refinement of any unit has run
+past its slice) still fits before the reserves; the step that measures a unit's form
+starts is held to the plan's price of them and does not count as such a slice. A unit below a twentieth of step time confirms its finalists with three
+samples. A unit's steps together measure what one uninterrupted search of it measures, in the
+same order, and a unit forms only the programs of the configurations it is about to measure. A
+launch-scoped unit's search is coarse to fine: with its form starts it measures the base of every
+value of the parameters that choose which launch serves which rows (the defaults' mapping under
+that value, at the rows the value moves), then refines the launches' mappings under the value
+whose base is cheapest, then under the next; every value so measured stays ranked by what was
+measured under it, and a search that ends early concludes on the best of them all.
+Every candidate is validated at the timed points. Refinement ends when the time left covers
+only concluding the started units: confirming each one's finalists (the defaults and the
+cheapest candidates within noise of the leader, each predicted from its own measured samples)
+and validating its choice at the points it did not time (predicted from the last admitted
+point). Each unit then holds the best configuration it confirmed; a unit whose search ends
+earlier is concluded at once. Under the plan lies a guarantee: every step is given the instant
+by which it must return with what it has, and checks it before each point it admits and each
+configuration it forms. A step that reaches that instant, or ends after it, is a failure of the
+plan and is reported as one; what cannot be interrupted is one compile of a chunk's programs and
+that chunk's measurement, which bounds how far past the tuning time tuning can end. The inputs of the points a unit did
+not time are built only to validate a choice other than the defaults; a
+choice that fails there, or whose validation there would not fit, gives way to the defaults:
+every chosen configuration passes validation at every served point. Shared history planes live
 for the whole tuning, so units reading the same history build it once. A launch-scoped declaration admits its points the same
 way, and its factored search runs within the same window. A slower device or build tunes fewer
 points, candidates and units, never longer; each unit's report gives its budget and its time.
@@ -219,67 +195,61 @@ the device's artifact store, one directory per toolchain namespace, and one tuni
 tuning key. The key is a digest over what a stored result is valid for: the tuning version, the
 device and toolchain identity (Metal OS build; CUDA driver and NVRTC release), the unit, the
 implementation digest (declaration and rendered source, never the directory they were built
-from), the precision policy, the explicit load budget, and the labels of
+from), the precision policy, the admitted error classes the entry declares with their envelopes
+(none for an entry that declares none, so
+admitting a class retunes only the entries that have it), and the labels of
 the served shapes its choice was validated at. How it was searched is not part of the key (search
 settings, tuning time, budget shares, workload weights, the points timed), so improving the
 search never invalidates a result that is still correct. The tuning version changes only with the
 maintainers' approval, when tuning has improved enough to justify retuning every model, or when
 stored results can no longer be read. Every search that ends is stored, so a hit prepares the
-stored choice with no measuring, validation or input construction: its key pins
-everything that validation depended on. A stored choice is still checked against what is not
-measured: the declaration's domain and, for a unit that serves shapes its points do not take, that
-its formed kernel launches at every one of them. A tuning point's rows are one request's, so they
-see one history span, while a served launch's rows see up to the store's span class (the next
-power of two above `MAX_HISTORY_SPANS`), and the fused attention entries' launches take group
-memory per span. Those units name every point's rows at every span class up to it, and the search
-excludes a candidate that cannot launch there as it is formed. A parsed terminal result that fails either
-check is an explicit preparation error; its choice cannot reopen search under the same key. Tuning inputs are generated test data and resident
+stored choice with no forming, measuring, validation or input construction: its key pins
+everything that validation depended on. Tuning inputs are generated test data and resident
 weights, not a fixed corpus, so numerical evidence is identified by the case's structure, policy
 and reference rather than by input bytes.
 Persisted numerical policies and search weights round-trip exactly; serialization must not
 change eligibility or invalidate an otherwise identical objective.
-Keys are content addresses for that structural and policy identity. Each unit's terminal result,
-including an unmeasured default, is published atomically as selection concludes. Incomplete
-search scope does not serialize a continuation or authorize more work on a later load. An
-unreadable record cannot authorize a nondefault choice; a parsed same-identity result that fails
-the served contract is a preparation error, not a search restart. Stored candidate measurements
-retain their configuration, point, comparison and coverage identities separately from the policy
-that selected a winner. A changed α can reselect without execution only among candidates whose
-retained evidence completes the required scope. Stored results are local measurements; nothing
-is shipped. Tuning progress (milliseconds of the tuning time spent, reported when the census
-begins and after each step of a unit; nothing when every unit is stored), retained search scope
-and stop reason, total tuning time and how many units were searched or stored are reported before
+Keys are content addresses for that structural and policy identity. Each unit's result is stored
+as soon as its search completes, so a preparation stopped before it finishes keeps the units it
+completed and a later preparation searches only the rest. Writes go through a
+temporary file renamed into place; an entry that cannot be read or parsed, or whose configuration
+the implementation does not admit, is a miss and is rewritten; opening the cache evicts the least
+recently used entries beyond its capacity. Stored results are local measurements; nothing is
+shipped. Tuning progress (milliseconds of the tuning time spent, reported when the census
+begins and after each step of a unit; nothing when every unit is stored), how far each searched
+unit's search got (reported, not stored), total tuning time and how many units were searched or stored are reported before
 readiness, or before a prepare-only job reports that it is prepared. The load also reports its
 target weight import in resident bytes; no tuning or
 preparation occurs after readiness. Two development
-measurement tools, enabled only by the evaluation harness and never by a served engine, change this:
+measurement tools, enabled only by the forward bench and never by a served engine, change this:
 the executor's `pinned-tuning` build feature records the configuration chosen per entry (entry,
 bindings, static values) and replays exactly those configurations in a later run, so two runs can
 be compared bit for bit; its `tuning-survey` feature replaces the search of the named entries by a
 survey that forms, measures and validates every admissible configuration and writes every sample,
 so a search's choices can be judged against the whole space.
 
-Numerical eligibility and speed ranking have separate authorities. The [native tuner](../../../inference/docs/tuning.md)
-retains the default's outputs per measured point; each candidate's initialized execution supplies
-both timing and error observations on identical inputs. Every nondefault candidate uses the
-same rule: the error ratio must not exceed the load's α. The profile
-carries only α; there are no declared deviation classes or separate defect-admission threshold.
-Rounding-scale comparisons are inspection signals, not selection authority. The leader must
-also pass every remaining required witness, with its coverage reserved inside the allowance.
-If it fails, another retained contender can be checked only while that work fits; incomplete
-coverage retains the actual canonical default. The [precision system](../../../inference/docs/precision.md)
-defines the error model and the relations evaluation measures. Neither local agreement nor the policy
-alone establishes whole-model quality; independent same-artifact evaluation remains required.
-
-The tuner admits the actual native artifact against the native default and ranks admissible artifacts on the serving workload. Agreement with the default checks native agreement, not fidelity to the portable checked body or shared defects. Development closure must separately exercise an independent checked portable body at representative geometries before claiming that relationship. Compiler assessment, empirical native agreement and whole-model quality evidence remain distinct; see [Numerical precision](../seismic-numerical-precision.md).
-
-Concrete optional computations retain their physical behavior. INT8 activation projections on Metal's gate/up and down projections
+Numerics are speed first within one qualified tolerance. The only numerical requirement is the
+precision gate: every kernel candidate, for every shape class it serves, is qualified per layer
+against an F32 reference forward and end to end by logit top-1 agreement, mean KL divergence and
+its tail against an external F32 reference forward of the same artifact (its weights dequantized
+once to F32; no activation quantization). Reduced-precision activations, packed weights
+dequantized inside a kernel to the activation element, changed accumulation order, and explicit
+fast math functions are admitted on any backend when they pass. The gate is model-level and runs
+outside the load: tuning times one entry on generated inputs and cannot measure it. A kernel form
+whose error exceeds the per-dtype tolerances against its entry's default declares an error class,
+and the engine keeps one envelope per class (the form's measured per-entry error with room for
+the tuning inputs). A model's qualification admits classes; the host names the admitted classes
+in the model policy at load, none by default, and a name no kernel declares is refused. Tuning
+forms a configuration of an error class only when the class is admitted, and validates it against
+the default under the class's envelope, so a defective kernel still fails while the form's
+expected error passes. The first class is `int8_activations`: Metal's gate/up and down projections
 past 64 rows, on tensor operations with Q4_K or Q8_0 weights, quantize each activation row to int8
 per 32 columns in a pre-pass and multiply the weights' stored codes on the int8 tensor operation,
 folding each 32-column block under its activation and weight scales; the weights stay exact, and
 every other weight format or device runs the exact form in the same launches. Its transient
 scratch is the int8 operand with its scales and block sums (rows x K x 1.2 bytes) and the weights'
-decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. Paired-token projections on Metal's gate/up and down projections, the plain projection of post-norm
+decoded block scales and biases (weight rows x K / 32 x 6 bytes), per call. The second class is
+`int8_token_packing`: Metal's gate/up and down projections, the plain projection of post-norm
 sublayer outputs, the recurrent projection's qkv and z segments, the attention projection's
 segments and the attention output projection past 64 rows, with Q4_K, Q5_K, Q6_K or q4g32s (GGUF
 Q4_0) weights on devices without tensor operations, round each activation row to
@@ -292,15 +262,11 @@ held over one power of two per row (applied to the F32 result) so that no input 
 fold. The segments of one entry share one operand, coded under the tightest of their formats'
 bounds; a segment whose format needs another column order runs the staged exact form. The weights
 stay exact and the pair's top sum is exact; its low sum carries the accumulator's rounding, so a
-row's result depends on the row it is packed with: the complete computation is row-dependent. Its transient
+row's result depends on the row it is packed with: the class is row-dependent. Its transient
 scratch is the packed operand with the rows' scales and code sums (rows x K x 2.1 bytes) and the
 weights' block scales and biases (weight rows x K / 32 x 4 bytes), per call; other weight formats,
-and devices with tensor operations, run the staged exact form in a launch of their own. Direct and coissued attention and the CPU's activation-quantized projection implementations are ordinary automatic backend candidates under the entry's comparison policy. Backend scheduling and registered physical representation facts select them without an extra feature profile; their numerical qualification against the native default remains mandatory. Reassociated rounded projection is also a normal candidate.
-
-Paired-token projection is an ordinary automatic tuning candidate, admitted by the same measured
-error-ratio rule as other forms. Native representation and device guards determine where it is
-legal, and every selected artifact retains its complete numerical qualification obligations.
-A result may depend on its
+and devices with tensor operations, run the staged exact form in a launch of their own. Without an admitted
+class a row's result never depends on peer rows' values; a form that makes it depend on them is its own error class. A result may depend on its
 launch's shape class and prepared configuration, and different shape classes agree within the
 gate's tolerance, not bit for bit. Speculative verification is therefore statistically, not exactly, equivalent to
 plain decoding; acceptance over the logits a verification produced remains exact.
@@ -332,11 +298,8 @@ combinations of the class dimensions it reads, never across whole graphs. It pla
 capacities once and certifies fixed offsets that production reuses for every exact class of the
 regime. A class whose topology or checked size exceeds its certified layout fails preparation.
 The family charge takes independent workspace, output, and upload maxima across the certified
-layouts and counts each distinct bound constant once. Zero bases remain symbolic while assessing
-and sealing classes; neither stage materializes a host matrix per class. Binding allocates one
-zero-filled device tensor per distinct element and shape, with the same byte charge and storage
-identity as an explicit all-zero constant. A checked contract that cannot be evaluated fails
-assessment rather than producing a fit estimate.
+layouts and counts each distinct bound constant once. A checked contract that cannot be evaluated
+fails assessment rather than producing a fit estimate.
 Each activation holds a fixed set of host-upload regions, allocated and charged with it: one
 per graph run its lease keeps in flight at once (a target step queues its embedding entry and
 every block before any completes). Upload regions are host-visible (CUDA: mapped pinned host
@@ -422,50 +385,26 @@ have: a diagnostic load declares the rows it exports, exports the logits of ever
 class, and selects only unshaped, since shaping must not rewrite logits it exports. The head and
 separate draft keep their vocabulary logits as graph locals too, their drafting classes bounded
 by the selection bound.
-A readout always retains its canonical packed projection. Backends may offer lossless progressive
-views of eligible Q4_0 or Q8_0 matrices as optional physical capabilities. Eligibility alone never
-selects them. The packed projection retains the ordinary tuner's finalized configuration in every
-class. Optional qualification depends on that choice concluding first within the same first-load
-tuning minute; a default projection may price its census but cannot substitute for the finalized
-canonical in qualification or serving. Whole-recipe qualification compares that packed
-projection and selection against Top→Refine→Exact and selection, using the same normalization,
-score transforms, masks and noise. Only complete, numerically certified classes with a measured
-cost improvement select the progressive recipe. A class choice identifies the projection scope,
-normalization scope and whether its canonical input was already prepared. Consumers sharing a
-physical table do not share qualification when those semantics differ. Plane residency is merged
-by projection scope; graph class selection uses the exact consumer recipe. Missing or unfinished
-evidence selects packed; full-logit and indexed policies use packed. Later loads consume the saved class choices without
-additional profiling. Their evidence binds the exact finalized packed specialization; a changed
-canonical choice falls back to packed without reopening qualification. The progressive levels preserve every row whose exact score could win:
-top codes establish a lower-bound threshold, refinement tightens it, and the exact pass scores
-survivors while marking other rows −∞.
-Before resource admission, planning finalizes these choices: canonical packed storage remains,
-optional planes become resident only when a served class selects them, and the program and graph
-resource plans are derived again from the retained capabilities. Transient candidate imports
-belong to the tuning authority and never silently become resident bindings. Physical candidate
-weights and row-independent fixed programs are prepared once per exact storage and program
-identity within that preparation; row classes share those resources while keeping independent
-activations, numerical evidence and qualification. The admitted plan is
-immutable, accounts for every retained plane, and is the sole import and resource authority.
-Optional views must fit the same checked assessment charge and stable allocation capacity as the
-load. When their added charge does not fit, finalization keeps the canonical plan and drops the
-optional callable handles before forming graphs; this grants no new measurement or search time.
-Live allocation still requires the ordinary heap claims.
-A draft head stored in the draft component that keeps no history (`HeadHistory::Target`, the
-Gemma 4 assistant) is a separate program family of the head lane, not a variant of the embedded
-head's graphs. It has its own residual width, decoder blocks of Shared attention plus dense
-feed-forward, an own full-vocabulary readout table without a soft cap, and pre/post projections at
-the target's width (`HeadInputProjection`, `HeadChainProjection`). One sealed graph per slot class,
-step count and shaping runs a whole transaction: each pass gathers the target's scaled embedding of
-its token and joins it with the conditioning row (the target's final feature, then the previous
-pass's normalized output projected back to the target's width), projects into the head's width, runs
-the blocks with each attention bound to the planes of the target layer it reads (resolved through
-the target's own sharing), normalizes, projects the whole vocabulary through the head's table and
-selects with the target's selection entries. Every pass is one row per slot at the anchor's
-position that sees exactly the request's accepted target rows of every stored domain and appends
-nowhere. Its decoder-block entries are prepared by binding beside the target's; its graph family,
-bound constants and class workspace are charged in header assessment. Such a head plans no head
-state store.
+On a backend that declares the progressive head readout
+(Metal, CUDA), a plan whose head admits it (a transform-free Q8_0 matrix of whole 32-value groups
+without a second-level scale, under no logit softcap, with no separate draft) holds the head in
+progressive planes (residency): every projecting class reads the head through the planes
+(`readout_planes_rows`, the exact logits), and served loads also have certified selection
+graphs, which serve every step whose selected rows, up to the backend's certified bound (one on
+Metal, whose batched projection is arithmetic-bound, four on CUDA), are all unpenalized and uncut
+(a temperature at most). Their levels score a row as the sampler does (`logit / temperature`
+plus the row's own Gumbel noise, masks applied): `readout_top_rows` projects every vocabulary row
+onto the codes' top four bits and keeps per row the largest lower-bound score as its threshold;
+`readout_refine_rows` adds bit 3 to the rows whose upper-bound score reaches it and raises the
+threshold; `readout_exact_rows` projects the remaining rows exactly and writes −∞ elsewhere (Metal's
+top level and full pass are the projection library's GEMV, batched GEMV and GEMM over the
+views' packets). Every row whose exact score can be the largest survives
+each level, so the selection is the full readout's, while the head's low bits are read only for
+the survivors (about 54% of the head's bytes on real text). An MTP draft head projects the planes'
+full vocabulary: its drafting classes up to the certified bound run the certified
+levels over them and the rest the full pass; a certified class serves every drafting row whatever
+its shaping, since only verification decides what is emitted. MTP verification rows select
+through the target's certified classes like any other step.
 A separate draft (DFlash, DSpark, DFlash2) conditions on target taps instead of the final features. A
 tapped block's workflow rounds the residual entering it, entering its feed-forward, or leaving it
 (the exit tap is the last block's output) into that tap's column block of a draft-input buffer
@@ -473,62 +412,35 @@ the bound target workflows own (charged with their bound constants); the
 readout's demanded feature rows are then the draft's fusion (one projection of the concatenated
 taps) rather than the normalized final rows. The draft runs as the head lane's drafter, one sealed
 workflow per class and transaction: each draft layer's attention appends the entry rows' context
-keys and values (the fusion norm as its input norm). Context injection has a distinct
-projection binding with absent query and gate segments, so it allocates and computes only
-K/V outputs. It selects the cache codec's append-only entry when forming the graph; that
-entry accepts only cache-publication inputs, with no query, gate, visibility, attention result
-or attention/merge launches. Its K/V arithmetic is the ordinary projection and publication
-arithmetic; when
-drafting, one pass over each slot's block reads its domain's accepted and injected
-rows plus fresh block rows according to explicit per-layer causal or bidirectional
-attention. Sliding windows independently bound history and fresh rows, using strict
-position distance less than the normalized window size. Layout metadata determines
-whether proposal selection begins at the anchor row or the first mask row. The draft's owned or target-shared vocabulary projection and selection
-read the proposing rows over the full target vocabulary. A reduced vocabulary requires an
+keys and values (the fusion norm as its input norm, each row attending only itself); when
+drafting, one non-causal pass over each slot's block `[anchor, mask, …]` reads its domain's
+accepted and injected rows plus the whole slot block, and the target's vocabulary projection and
+selection read the proposing rows over the full target vocabulary. A reduced vocabulary requires an
 artifact-declared projection and token mapping; token frequency is never a vocabulary boundary.
-Separate drafts read raw embedding rows with only their explicitly declared input
-scale. They use their bound vocabulary projection without inheriting the target's
-logit scale or softcap. A draft-declared softcap is applied in the readout epilogue
-before its own selection bias; absent metadata preserves raw logits. DSpark then chains its slots through the Markov bias.
-Its fixed service confidence threshold is zero, so confidence cannot decline a
-proposal; preparation and graph formation omit confidence evaluation and the
-normalized features used only by that evaluation. DFlash2 runs every block-pass sublayer unfused:
+DSpark then chains its slots through the Markov bias and
+declines a proposal below its confidence threshold. DFlash2 runs every block-pass sublayer unfused:
 the normed rows project to per-row coefficients of a grouped causal convolution that restarts at
 each slot's block, its first half feeds the operator's plain projections and its second half
 convolves the operator's output before the residual add; its proposing rows keep their top-k
 logits, and one ordered step per proposal selects each slot's candidate from the predecessor and
 successor codebooks, the anchor preceding the first. Its proposals are that greedy path for
 greedy and sampled requests alike (the target's verification decides acceptance). Context
-injection is the same for every variant. A draft graph class records its physical
-proposal count; the selected class computes exactly that block size. Verification may
-consume a shorter prefix independently. Graphs are prepared before readiness, never
-compiled per round, and their resources participate in the same assessment as load.
-Unequal physical block widths form separate execution groups because padding can
-change noncausal predictions. Block rows append nowhere.
-The planned separate-draft method records the sorted, distinct positive generated
-proposal counts its configured policy may choose. Only those physical block
-sizes are prepared, with a singleton for the default fixed width; verification
-prefix choices add no block graph classes. A short output grant selects an
-eligible configured action or plain decoding, never an unprepared physical size.
-Entry/catch-up capacity remains bounded by the load's proposal cap, since the
-previous action can have accepted more tokens than the current action generates.
+injection is the same for every variant. The block always has the draft's trained width;
+a load's proposal width selects its leading proposing rows. Block rows append nowhere.
 Conditioning overlays are Seismic workflows with only external ports, sealed once per overlaid row
 count and never per request. A step with conditioning queues, after its embedding entry, one
 overlay run per contiguous range, binding the source span and the matching row view of the
 embedding output; the device queue orders them before the first block. Overlays add no scratch or
 result storage; the embedding result remains under its original output lease.
-Causal target attention uses the cache representation for every earlier row and the dense
-prepared key/value for the query's own row. Moving an earlier row between the current batch and
-committed history must not change its codec representation. Host visibility includes earlier
-reserved destinations when the target cache is compressed; publication of those destinations
-completes before attention reads them. Prefill already separates preparation from attention;
-multi-row decode uses an ordered append phase and suppresses its fused append. Single-row decode
-keeps its existing fused append. Media rows with declared bidirectional attention retain their
-dense fresh span, and separate drafters retain their declared block semantics.
-History and recurrent state ports bind slab address tables, with each slab retained and ordered
-as a used resource until submitted work completes. Every visible span is slab-contained. No
-attention launch concurrently appends a row it reads through a visible span; a preceding ordered
-preparation may publish reserved rows for that launch. Preparation does not commit tentative state.
+State-only draft priming uses an attention projection binding with static zero query and gate segments, followed by a cache-publication entry. That entry binds only key/value preparation, rotary coordinates, destinations and history planes; it has no query, gate, visibility, attention result or attention/merge launch. Its K/V arithmetic matches ordinary projection and publication. MTP heads retain a distinct priming projection specialization; preparation and resource accounting own that handle alongside ordinary attention.
+
+The fused attention entry appends each row's key and value at its destination while other rows read
+history. History and recurrent state ports bind slab address tables, with each slab retained and
+ordered as a used resource until submitted work completes. The entry resolves one slab base per
+slab-contained part of a visible span (a span may cross slab edges), one per destination row, or
+one per recurrent bank; its inner loops retain their direct component layout. This is ordered by construction: destinations are freshly reserved rows,
+so no row of the batch sees one through its visible spans, and fresh rows are read from the batch's
+own projections.
 An attention sublayer is one segmented query | gate | key | value projection, the fused entry and
 the output projection, whatever its form: each optional part of the operator (interleaved or
 separate gate, own keys and values, head norms, value norm, rotated pairs) is a static axis of
@@ -545,16 +457,7 @@ Vulkan), and prefill scores whole heads but accumulates outputs one 256-column
 window per pass, so a wide form is a specialization of the same entries. Few kv heads over long
 history are parallelized across the history, never across a different graph: decode splits a row's
 keys into tuned partitions, and prefill may split a tile's history keys across tuned partition
-groups whose partial softmax states merge in fixed order in a second launch. Metal affine matrix
-decode also declares row/head/column tiling: a threadgroup owns up to eight global query heads
-and two query rows, with two column slices per row. Head bands publish disjoint global heads into
-the same partition ABI, and only band zero appends fresh history for its kv head. Query storage
-and the cooperatively staged K/V tile alias across barrier-protected lifetimes; partial-score
-exchange occupies a separate region after K and V. Source memory predicates determine physical
-eligibility. The associated checked computation binds the partial-score slice order; native MMA
-and subgroup reductions still require fidelity comparison against that computation, rather than
-an assumption of bitwise identity. The tuner must qualify and measure this family within the
-original first-load allowance before selecting it. Metal's prefill also
+groups whose partial softmax states merge in fixed order in a second launch. Metal's prefill also
 declares a direct form, a tuned specialization of the same entries: a simdgroup keeps its queries in
 tensor-operation registers and reads key and value tiles as device tensor operands, so nothing is
 staged; K8/V4 history is first decoded into F16, with the staged decode's arithmetic, so both forms
@@ -580,25 +483,15 @@ window: each pair scores and produces its own window's columns and the two score
 row group add their partial scores, so the head's work is two 256-column heads' (the staged form
 walks its keys once per output window, forming the whole head's scores each time and decoding the
 history in every threadgroup). A prefill attention graph over K8/V4 history therefore comes in
-classes that list tiles (powers of two from the smallest class its decoded-history form declares up
-to one request's worth, the domain's span limit in pages: 16 tiles for a form that decodes into a
-window, whose launches do nothing different below it, and one tile for a form whose scratch and
-launches follow the class) and one that lists none; all hold the same workspace, the listing classes admit the forms
-that read decoded history, and the other admits only the forms that read history in place. Metal's decoded-history workspace retains enough storage per query row for its fold state and one
-history round at every admitted launch class; increasing the query grid cannot consume that
-reserve or make its window geometry negative. CUDA may instead stage the unique listed history
-pages into operation-local F16 operands once, with a row-validity union mask that excludes gaps,
-partial pages and unallocated rows. Each consumer row maps independently to that compact scratch,
-retaining the original source-slab tile boundaries, per-query visibility, fresh operands and
-softmax sequence. Its descriptor/mask, decode, prepare, attend and merge launches are one candidate
-transaction; all scratch is heap-charged and the original in-place families remain available.
-A launch takes the smallest listing class that holds the tiles its rows together see (so it
+classes that list tiles (powers of two from 16 up to one request's worth, the domain's span limit
+in pages) and one that lists none; all hold the same workspace, the listing classes admit the forms
+that read decoded history, and the other admits only the forms that read history in place. A
+launch takes the smallest listing class that holds the tiles its rows together see (so it
 dispatches at most twice the rounds it needs; a round with nothing to do returns at once) and the
 class that lists none when they exceed the largest; listing and unlisted kernels tune separately.
 A device that has no form reading decoded history for the graph's heads has only the class that
 lists none, which spares it tuning and forming kernels no form of which it can select: Metal has
-one on tensor operations, and on simdgroup matrices for 128-, 256- and 512-column heads; CUDA
-has F16 operand staging for the affine entry's32-,64-,128-,256- and512-column heads
+one on tensor operations, and on simdgroup matrices for 128-, 256- and 512-column heads
 (`planning::reads_decoded_history`). The tensor operations fact is the device's own probe
 (`DeviceInfo::forms_tensor_operations` before it is opened, which planning and assessment read;
 graph preparation fails if the opened device disagrees).
@@ -626,17 +519,6 @@ copy state between banks, or bind padded request state. Workflow activations cov
 submitted concurrency, and retained outputs cover submitted and live request owners. The target's
 residual stream between block graphs is one device pair, returned at the end of each submission:
 every reader of it is queued in that submission and the device runs the next launch after it.
-The target's stateless tail is the longest run of trailing blocks that publish no state:
-attention blocks that read another layer's history (a Shared domain, which they never append
-to) and write no draft taps. Preparation derives it from the plan, never from the family; a
-model whose last block keeps history, a recurrent bank or a tap has none. A tail row's output
-reaches nothing but later tail blocks and the readout, so a step runs the tail over the window
-of the smallest row class that holds the rows its readout consumes (its feature, projected and
-selected rows), placed at the first of them, with the window's rows of the residual, per-layer
-rows and controls, and its readout reads that window; a step that reads no row stops before
-the tail. The window's graphs are the sealed classes of its row count, so the tail adds no class.
-A prompt chunk of a KV-shared model (Gemma 4 E2B and E4B) thus runs the tail over its last row
-or not at all, while a drafter that reads every row's features keeps the whole batch.
 Vision holds no activation or output until a request encodes an image, and it is outside the
 shared workspace arena. Each image cell class has its own layout and storage: an encode claims an
 activation (its own workspace and upload regions) and an output slot of its image's class under the
@@ -696,24 +578,8 @@ generation transitions, or publication.
   prepared workflow's complete tensor contracts and reports its exact storage charge.
 - Recurrent state is read and published in place by the block's checked entries for the exact
   active request slots; no bank is copied, and no entry writes an accepted bank or the zero seed.
-- No block of the stateless tail runs a row its step's readout does not consume.
 - Every persistent, workspace, output, retention, and startup-peak byte traces to the plan.
 - Ready and pending submissions drive one executor lifecycle, and no round is submitted before
   its predecessor's output is reconciled.
 - The same service owner accepts either family without lane-specific path branches or erased submissions.
 - Finished work retains all state needed for exactly one reconciliation.
-
-Load warmup exercises one target row and, when drafting is enabled, its state-only
-priming row before publishing readiness. This imports and binds the enabled drafter
-component during load rather than delaying the first request. Both numerical advances
-are aborted afterward; the request leaves no accepted state. Optional components may
-still be released under the ordinary memory policy and rebound when needed.
-
-Dense expansion bindings include the semantic activation function as well as
-operand representations and expansion width. Layers with different nonlinear
-consumers cannot share one preparation/qualification group merely because
-weights have the same shape. Native preparation reads that bound function for
-both a dense sublayer and a dense branch beside routing; tuning uses the same
-function that serving calls. The tuning identity includes the function for
-paired and up-only expansion, so numerical evidence for SiLU cannot be reused
-for GELU-tanh or another consumer.

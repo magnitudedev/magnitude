@@ -10,7 +10,7 @@
 //! accumulator.
 
 use magnitude_artifacts::gguf::Encoding;
-use magnitude_family_contracts::{ImportTransform, ProgressiveCodeDepth, WeightDescriptor};
+use magnitude_family_contracts::{ImportTransform, WeightDescriptor};
 use seismic::Element;
 
 /// Whether the importer can apply `descriptor`'s transforms to a tensor
@@ -32,13 +32,13 @@ pub(crate) fn admit(
                 return Err(format!(
                     "{:?}: element rows of a packed vector cannot be selected",
                     descriptor.name
-                ));
+                ))
             }
             ImportTransform::Scale { .. } if encoding != Encoding::F32 => {
                 return Err(format!(
                     "{:?}: a scale is exact only on F32 storage, not {encoding:?}",
                     descriptor.name
-                ));
+                ))
             }
             ImportTransform::ScaleByTensor { tensor }
                 if descriptor
@@ -57,19 +57,15 @@ pub(crate) fn admit(
                     "{:?}: second-level scale tensor {tensor:?} must be the weight's only scale \
                      of its matrices",
                     descriptor.name
-                ));
+                ))
             }
-            ImportTransform::Progressive { depth, .. }
-                if !matches!(
-                    (depth, encoding),
-                    (ProgressiveCodeDepth::Four, Encoding::Q4_0)
-                        | (ProgressiveCodeDepth::Eight, Encoding::Q8_0)
-                ) || descriptor.transforms.len() != 1 =>
+            ImportTransform::Progressive(_)
+                if encoding != Encoding::Q8_0 || descriptor.transforms.len() != 1 =>
             {
                 return Err(format!(
-                    "{:?}: a progressive plane must match its Q4_0 or Q8_0 source depth and be its only transform",
+                    "{:?}: a progressive plane is the only transform of a Q8_0 matrix",
                     descriptor.name
-                ));
+                ))
             }
             _ => {}
         }
@@ -138,11 +134,11 @@ pub(crate) fn apply(
             }
             // Resident beside the weight, not applied to its bytes.
             ImportTransform::ScaleByTensor { .. } => {}
-            ImportTransform::Progressive { .. } => {
+            ImportTransform::Progressive(_) => {
                 return Err(format!(
                     "{:?}: a progressive plane is placed by `upload_bytes`",
                     descriptor.name
-                ));
+                ))
             }
         }
     }
@@ -162,54 +158,28 @@ pub(crate) fn upload_bytes(
     upload: Element,
     bytes: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
-    if let [ImportTransform::Progressive { plane, depth }] = descriptor.transforms[..] {
-        let [rows, columns] = stored else {
-            return Err(format!(
-                "{:?}: a progressive plane places a matrix",
-                descriptor.name
-            ));
+    if let [ImportTransform::Progressive(plane)] = descriptor.transforms[..] {
+        let (&[rows, columns], Some(Encoding::Q8_0)) = (stored, encoding) else {
+            return Err(format!("{:?}: a progressive plane places a Q8_0 matrix", descriptor.name));
         };
-        if !matches!(
-            (depth, encoding),
-            (ProgressiveCodeDepth::Four, Some(Encoding::Q4_0))
-                | (ProgressiveCodeDepth::Eight, Some(Encoding::Q8_0))
-        ) {
-            return Err(format!(
-                "{:?}: progressive code depth differs from source",
-                descriptor.name
-            ));
-        }
-        return Ok(crate::progressive::plane(
-            plane,
-            &bytes,
-            to_usize(*rows)?,
-            to_usize(*columns)?,
-            depth.bits(),
-        ));
+        return Ok(crate::progressive::plane(plane, &bytes, to_usize(rows)?, to_usize(columns)?));
     }
     let transformed = apply(descriptor, stored, source, bytes)?;
     if upload == source {
         return Ok(transformed);
     }
-    let encoding = encoding.ok_or_else(|| {
-        format!(
-            "{:?}: a dequantized weight is stored dense",
-            descriptor.name
-        )
-    })?;
+    let encoding = encoding
+        .ok_or_else(|| format!("{:?}: a dequantized weight is stored dense", descriptor.name))?;
     dequantize(encoding, source, &descriptor.shape, &transformed)
 }
 
 /// The stored tensor holding `descriptor`'s second-level scale, when it has
 /// one (at most one, [`admit`]).
 pub(crate) fn scale_tensor(descriptor: &WeightDescriptor) -> Option<&str> {
-    descriptor
-        .transforms
-        .iter()
-        .find_map(|transform| match transform {
-            ImportTransform::ScaleByTensor { tensor } => Some(tensor.as_str()),
-            _ => None,
-        })
+    descriptor.transforms.iter().find_map(|transform| match transform {
+        ImportTransform::ScaleByTensor { tensor } => Some(tensor.as_str()),
+        _ => None,
+    })
 }
 
 /// How a tensor's bytes divide into the rows its transforms address.
@@ -291,10 +261,7 @@ mod tests {
     }
 
     fn f32s(values: &[f32]) -> Vec<u8> {
-        values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect()
+        values.iter().flat_map(|value| value.to_le_bytes()).collect()
     }
 
     #[test]
@@ -314,7 +281,9 @@ mod tests {
         let stored = [4, 32];
         let weight = descriptor(
             &[4, 32],
-            vec![ImportTransform::PermuteRows { order: vec![1, 0] }],
+            vec![ImportTransform::PermuteRows {
+                order: vec![1, 0],
+            }],
         );
         let q8 = Element::named("gguf_q8_0").unwrap();
         admit(&weight, &stored, Encoding::Q8_0).unwrap();

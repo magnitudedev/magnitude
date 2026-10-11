@@ -5,11 +5,11 @@
 //! advances every row binds the identity table as a graph constant, so no run
 //! uploads it.
 
-use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
-use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
+use crate::programs::graph::{draft::GraphDraft, GraphError};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, scaled_weight, weight};
-use crate::{DenseBinding, ModelLoadPlan, SublayerTail, native::DenseKernels};
+use crate::programs::native_target_graph::{scaled_weight, weight, WeightPort};
+use crate::{native::DenseKernels, DenseBinding, ModelLoadPlan, SublayerTail};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{dense_expand, dense_output};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
@@ -107,23 +107,9 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
 ) -> Result<WorkflowTensor, GraphError> {
     let dimensions = dimensions(load, scope, rows)?;
     let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
-    let gate = scaled_weight(
-        graph,
-        load,
-        scope,
-        WeightKind::DenseGate,
-        weights,
-        constants,
-    )?;
+    let gate = scaled_weight(graph, load, scope, WeightKind::DenseGate, weights, constants)?;
     let up = scaled_weight(graph, load, scope, WeightKind::DenseUp, weights, constants)?;
-    let down = scaled_weight(
-        graph,
-        load,
-        scope,
-        WeightKind::DenseDown,
-        weights,
-        constants,
-    )?;
+    let down = scaled_weight(graph, load, scope, WeightKind::DenseDown, weights, constants)?;
     let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
     let expand_dimensions = [
         dimensions.as_slice(),
@@ -145,7 +131,8 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                 activation,
                 gate_scale: (&gate.scale).into(),
                 up_scale: (&up.scale).into(),
-            },        )?
+            },
+        )?
         .value;
     let output = match kernels.output {
         TailEntries::Residual(output) => {
@@ -159,7 +146,8 @@ pub(crate) fn dense<'a, G: GraphDraft + 'a>(
                         down_weight: (&down.weight).into(),
                         out_rows: out_rows.port().tensor().into(),
                         down_scale: (&down.scale).into(),
-                    },                )?
+                    },
+                )?
                 .value
         }
         TailEntries::PostNorm(entries) => {

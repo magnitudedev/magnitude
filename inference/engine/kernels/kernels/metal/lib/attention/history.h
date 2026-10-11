@@ -1,4 +1,3 @@
-#ifdef ATTENTION_AFFINE_HISTORY
 // history shared attention mechanisms; included at the original declaration point.
 // ---------------------------------------------------------------------------
 // Affine K8/V4 history (`attention_*_k8v4`). A (history row, kv head)
@@ -11,11 +10,11 @@
 // GROUP / E neighbouring lanes.
 // ---------------------------------------------------------------------------
 
-#define ATTENTION_KEY_BITS (32 * ATTENTION_KEY_CODE_WORDS / ATTENTION_W)
-#define ATTENTION_VALUE_BITS (32 * ATTENTION_VALUE_CODE_WORDS / ATTENTION_W)
+#define ATTENTION_KEY_BITS 8
+#define ATTENTION_VALUE_BITS 4
 // Columns per (scale, zero) pair: the codec's group (model-state
 // `AFFINE_GROUP`).
-#define ATTENTION_GROUP (2 * ATTENTION_W / ATTENTION_KEY_COEFFICIENTS)
+#define ATTENTION_GROUP 32
 
 template <uint B>
 struct lane_codes {
@@ -211,5 +210,3 @@ inline void absorb_affine(thread const float (&q)[G][ATTENTION_E],
     }
 }
 
-
-#endif

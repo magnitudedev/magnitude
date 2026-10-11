@@ -327,28 +327,68 @@ impl Mapping {
         spec.with_param("KSPLIT", self.ksplit)
             .with_param("INT8", self.int8)
     }
-    /// Shared producer/GEMV/small-GEMM/large-GEMM schedule: arithmetic
-    /// representation is independent of the row tile chosen by the schedule.
-    pub fn projection_params(
+    /// Dense expansion owns KSPLIT on its two GEMV launches and ROTATE on its
+    /// GEMM.
+    pub fn dense_expand_params(
         self,
         spec: seismic::NativeSpecialization,
     ) -> seismic::NativeSpecialization {
         spec.with_param("INT8", self.int8)
-            .with_param("OPERAND", 0)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(3, "KSPLIT", self.ksplit)
+            .with_launch_param(5, "ROTATE", self.rotate)
+    }
+    /// Dense output owns KSPLIT on its two GEMV launches and ROTATE on its
+    /// GEMM.
+    pub fn dense_output_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
             .with_launch_param(1, "KSPLIT", self.ksplit)
             .with_launch_param(2, "KSPLIT", self.ksplit)
             .with_launch_param(4, "ROTATE", self.rotate)
+    }
+    /// Attention output owns KSPLIT on its two GEMV launches and ROTATE on
+    /// its GEMM.
+    pub fn attention_output_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_launch_param(1, "KSPLIT", self.ksplit)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(4, "ROTATE", self.rotate)
+    }
+    /// Attention projection owns KSPLIT on its two GEMV launches and ROTATE
+    /// on its GEMM.
+    pub fn attention_project_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        spec.with_param("INT8", self.int8)
+            .with_launch_param(2, "KSPLIT", self.ksplit)
+            .with_launch_param(3, "KSPLIT", self.ksplit)
+            .with_launch_param(5, "ROTATE", self.rotate)
+    }
+    /// The recurrent projection shares the attention projection's GEMV and
+    /// GEMM launch indices.
+    pub fn recurrent_params(
+        self,
+        spec: seismic::NativeSpecialization,
+    ) -> seismic::NativeSpecialization {
+        self.attention_project_params(spec)
     }
     /// Readout head GEMVs own KSPLIT on launches 1 and 2, its GEMM ROTATE.
     pub fn head_params(self, spec: seismic::NativeSpecialization) -> seismic::NativeSpecialization {
-        spec.with_param("OPERAND", 0)
-            .with_launch_param(1, "KSPLIT", self.ksplit)
+        spec.with_launch_param(1, "KSPLIT", self.ksplit)
             .with_launch_param(2, "KSPLIT", self.ksplit)
             .with_launch_param(4, "ROTATE", self.rotate)
     }
-    /// Whether `rows` rows use quantized activation operands in a matrix band.
+    /// Whether `rows` rows run the INT8 path (only the small-band GEMM has
+    /// one).
     pub fn quantizes(self, rows: usize) -> bool {
-        self.int8 == 1 && rows > GEMV_ROWS
+        self.int8 == 1 && rows > GEMV_ROWS && rows <= SMALL_GEMM_ROWS
     }
 }
 

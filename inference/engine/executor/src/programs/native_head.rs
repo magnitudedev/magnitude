@@ -11,40 +11,42 @@
 //! rows' K/V history, the only thing a later draft reads of them.
 
 use super::{DeviceSubmission, HeadProgram};
-use crate::operators::{self, EmbeddedHeadBlock, Mixer, paired_block};
+use crate::operators::{self, paired_block, Mixer};
 use crate::{
-    DeviceError, FeedForwardProgramSlot, GraphOutputTensor, HeadBinding, HeadLaunchCore,
-    InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease,
-    ResidentHead, ResidentOutput, ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
     completion::CompletionWaiter,
-    native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock},
+    native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock, HeadLogitsKernels},
     operators::attention::graph::{
-        self as attention_graph, AttentionBlock, AttentionGraphEntries, CheckedAttentionEntries,
-        attention_weights,
+        self as attention_graph, attention_weights, AttentionBlock, AttentionGraphEntries,
+        CheckedAttentionEntries,
     },
     operators::dense_ffn::graph::{
-        CheckedDenseEntries, DenseGraphEntries, dimensions as dense_dimensions,
+        dimensions as dense_dimensions, CheckedDenseEntries, DenseGraphEntries,
     },
     operators::output::TailEntries,
     operators::routed::fused_graph::{self as routed, CheckedRoutedEntries, RoutedGraphEntries},
     programs::{
+        graph::readout::{self, shapes, SelectionPorts},
         graph::RowForm,
-        graph::readout::{self, SelectionPorts, shapes},
-        graph::{GraphError, draft::GraphDraft},
+        graph::{draft::GraphDraft, GraphError},
         native_constants::{
-            CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
-            distinct_storage_bytes,
+            distinct_storage_bytes, CheckedGraphFamilyResources, CheckedGraphResources,
+            ConstantTensors, GraphConstant,
         },
         native_target_graph::{WeightPart, WeightPort},
     },
+    DeviceError, FeedForwardProgramSlot, GraphOutputTensor, HeadBinding, HeadLaunchCore,
+    HeadProjection, InvariantError, ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease,
+    ResidentHead, ResidentOutput, ResidentWeight, ResourceLimits, SubmitError, ValidatedHeadLaunch,
 };
-use magnitude_batching::{TargetBatchUpload, row_class};
+use magnitude_batching::{row_class, TargetBatchUpload};
 use magnitude_family_contracts::{
-    ActivationDType, Decoder, ProgressivePlane, SublayerIndex, WeightKind, WeightRole, WeightScope,
+    ActivationDType, Decoder, HeadBlock, ProgressivePlane, SublayerIndex, WeightKind, WeightRole,
+    WeightScope,
 };
 use magnitude_kernels::{
-    attention_project, dense_expand, dense_output, draft_rows, feature_copy, readout_features_rows,
-    sample_rows, shape_rows,
+    attention_project,
+    dense_expand, dense_output, draft_rows, head_logits_rows, readout_features_rows, sample_rows,
+    shape_rows,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -93,7 +95,6 @@ pub(crate) struct HeadGraphClass {
     /// target feature output on the device (a prompt chunk's entry run
     /// behind the chunk) rather than host-written rows.
     pub device: bool,
-    pub prefix: bool,
 }
 
 /// The admitted head classes used by both prepared formation and metadata
@@ -140,7 +141,6 @@ pub(crate) fn head_graph_classes(
                 steps: 0,
                 shaped: false,
                 device: false,
-                prefix: false,
             });
         }
         classes.push(HeadGraphClass {
@@ -152,11 +152,6 @@ pub(crate) fn head_graph_classes(
             steps: 0,
             shaped: false,
             device: true,
-            prefix: false,
-        });
-        classes.push(HeadGraphClass {
-            prefix: true,
-            ..*classes.last().unwrap()
         });
     }
     // Drafting passes project the draft vocabulary per slot: their slots are
@@ -186,7 +181,6 @@ pub(crate) fn head_graph_classes(
                         steps,
                         shaped,
                         device: false,
-                        prefix: false,
                     });
                 }
             }
@@ -208,14 +202,19 @@ struct PassPorts {
 
 struct HeadGraphEntries<'a, G: GraphDraft + 'a> {
     input: G::Binding<'a, draft_rows::Entry>,
-    copy: G::Binding<'a, feature_copy::Entry>,
     attention: AttentionGraphEntries<'a, G>,
     priming_project: G::Binding<'a, attention_project::Entry>,
     feed_forward: HeadFeedForwardEntries<'a, G>,
     features: G::Binding<'a, readout_features_rows::Entry>,
-    logits: readout::ProjectionEntries<'a, G>,
+    logits: HeadLogitsEntries<'a, G>,
     shape: G::Binding<'a, shape_rows::Entry>,
     sample: G::Binding<'a, sample_rows::Entry>,
+}
+
+/// The head's projection entries, by its `HeadProjection`.
+enum HeadLogitsEntries<'a, G: GraphDraft + 'a> {
+    Packed(G::Binding<'a, head_logits_rows::Entry>),
+    Progressive(readout::ProgressiveEntries<'a, G>),
 }
 
 enum HeadFeedForwardEntries<'a, G: GraphDraft + 'a> {
@@ -227,7 +226,6 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
     fn prepared(block: &'a AttestedHeadBlock, head: &'a AttestedHead) -> Result<Self, String> {
         Ok(Self {
             input: &block.input,
-            copy: &head.feature_copy,
             attention: (&block.attention).into(),
             priming_project: &block.priming_project,
             feed_forward: match &block.feed_forward {
@@ -239,11 +237,21 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
                 }
                 // `operators::admit` keeps draft heads on the fused form.
                 AttestedFeedForward::GeneralRouted(_) | AttestedFeedForward::Parallel(_) => {
-                    return Err("draft head routed feed-forward form".into());
+                    return Err("draft head routed feed-forward form".into())
                 }
             },
             features: &block.features,
-            logits: readout::ProjectionEntries::prepared(&block.logits),
+            logits: match &block.logits {
+                HeadLogitsKernels::Packed(kernel) => HeadLogitsEntries::Packed(kernel),
+                HeadLogitsKernels::Progressive(kernels) => {
+                    HeadLogitsEntries::Progressive(readout::ProgressiveEntries {
+                        top: &kernels.top,
+                        refine: &kernels.refine,
+                        exact: &kernels.exact,
+                        planes: &kernels.planes,
+                    })
+                }
+            },
             shape: &head.shape,
             sample: &head.sample,
         })
@@ -251,13 +259,22 @@ impl<'a> HeadGraphEntries<'a, NativeGraph> {
 }
 
 struct CheckedHeadEntries {
-    copy: [(&'static str, Element); 1],
     input: [(&'static str, Element); 5],
     attention: CheckedAttentionEntries,
     feed_forward: CheckedHeadFeedForwardEntries,
     features: [(&'static str, Element); 2],
-    logits: readout::CheckedProjectionEntries,
+    logits: CheckedHeadLogits,
     selection: [(&'static str, Element); 0],
+}
+
+/// The checked bindings of the head's projection entries.
+enum CheckedHeadLogits {
+    Packed([(&'static str, Element); 2]),
+    /// The normed entries' (top, planes) and the later levels'.
+    Progressive {
+        normed: [(&'static str, Element); 2],
+        level: [(&'static str, Element); 1],
+    },
 }
 
 enum CheckedHeadFeedForwardEntries {
@@ -268,7 +285,6 @@ enum CheckedHeadFeedForwardEntries {
 impl CheckedHeadEntries {
     fn new(binding: HeadBinding, backend: BackendName) -> Result<Self, String> {
         Ok(Self {
-            copy: [("A", binding.activation)],
             input: [
                 ("EW", binding.embedding_table),
                 ("A", binding.activation),
@@ -286,16 +302,19 @@ impl CheckedHeadEntries {
                 ),
                 // `operators::admit` keeps draft heads on the fused form.
                 FeedForwardProgramSlot::GeneralRouted(_) | FeedForwardProgramSlot::Parallel(_) => {
-                    return Err("draft head routed feed-forward form".into());
+                    return Err("draft head routed feed-forward form".into())
                 }
             },
             features: [("NW", binding.output_norm), ("A", binding.activation)],
-            logits: readout::CheckedProjectionEntries::new(
-                binding.projection,
-                binding.output_norm,
-                binding.activation,
-                true,
-            ),
+            logits: match binding.projection {
+                HeadProjection::Packed(weight) => {
+                    CheckedHeadLogits::Packed([("OW", weight), ("A", binding.activation)])
+                }
+                HeadProjection::Progressive => CheckedHeadLogits::Progressive {
+                    normed: [("NW", binding.output_norm), ("A", binding.activation)],
+                    level: [("A", binding.activation)],
+                },
+            },
             selection: [],
         })
     }
@@ -303,7 +322,6 @@ impl CheckedHeadEntries {
     fn entries(&self) -> Result<HeadGraphEntries<'_, NativeGraphMetadata>, String> {
         Ok(HeadGraphEntries {
             input: &self.input,
-            copy: &self.copy,
             attention: self.attention.entries()?,
             priming_project: self.attention.entries()?.project,
             feed_forward: match &self.feed_forward {
@@ -315,7 +333,17 @@ impl CheckedHeadEntries {
                 }
             },
             features: &self.features,
-            logits: self.logits.entries(),
+            logits: match &self.logits {
+                CheckedHeadLogits::Packed(elements) => HeadLogitsEntries::Packed(&elements[..]),
+                CheckedHeadLogits::Progressive { normed, level } => {
+                    HeadLogitsEntries::Progressive(readout::ProgressiveEntries {
+                        top: &normed[..],
+                        refine: &level[..],
+                        exact: &level[..],
+                        planes: &normed[..],
+                    })
+                }
+            },
             shape: &self.selection,
             sample: &self.selection,
         })
@@ -325,8 +353,7 @@ impl CheckedHeadEntries {
 struct HeadGraphParts<P> {
     plan: P,
     tokens: NativePort,
-    conditioning: Option<NativePort>,
-    previous: Option<NativePort>,
+    conditioning: NativePort,
     /// Each slot's last entry row, read by the entry pass's features; absent
     /// from a causal-only graph, which reads no features.
     out_rows: Option<NativePort>,
@@ -334,7 +361,7 @@ struct HeadGraphParts<P> {
     constants: Vec<GraphConstant>,
     weights: Vec<(WeightPort, NativePort)>,
     /// The complete output head, when drafting.
-    projection: Option<readout::ProjectionPorts>,
+    projection: Option<HeadProjectionPorts>,
     /// Selections `[steps * slots, 2]` when drafting; otherwise the entry
     /// rows' block input, exported so the graph has a result.
     output: WorkflowTensor,
@@ -351,7 +378,6 @@ impl<P> HeadGraphParts<P> {
             plan: map(self.plan)?,
             tokens: self.tokens,
             conditioning: self.conditioning,
-            previous: self.previous,
             out_rows: self.out_rows,
             passes: self.passes,
             constants: self.constants,
@@ -395,28 +421,27 @@ fn planned_weight<G: GraphDraft>(
     Ok(tensor)
 }
 
+/// The ports of the head's projection onto the draft vocabulary.
+enum HeadProjectionPorts {
+    /// The complete output projection.
+    Packed(NativePort),
+    /// The complete planes (the radii only when certified).
+    Progressive(Vec<(ProgressivePlane, NativePort)>),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn head_graph_topology<'a, G: GraphDraft + 'a>(
     graph: G,
     entries: HeadGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     geometry: &Decoder,
-    head: EmbeddedHeadBlock<'_>,
+    head: &HeadBlock,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
     backend: BackendName,
 ) -> Result<HeadGraphParts<G::Plan>, GraphError> {
-    head_graph_draft(
-        graph,
-        entries,
-        load,
-        geometry,
-        head,
-        feed_forward,
-        class,
-        backend,
-    )?
-    .map_plan(|graph| graph.seal())
+    head_graph_draft(graph, entries, load, geometry, head, feed_forward, class, backend)?
+        .map_plan(|graph| graph.seal())
 }
 
 /// A head graph's passes. A progressive projection certifies its drafting
@@ -429,7 +454,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     entries: HeadGraphEntries<'a, G>,
     load: &ModelLoadPlan,
     geometry: &Decoder,
-    head: EmbeddedHeadBlock<'_>,
+    head: &HeadBlock,
     feed_forward: FeedForwardProgramSlot,
     class: HeadGraphClass,
     backend: BackendName,
@@ -445,7 +470,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     }
     let hidden = geometry.hidden;
     let vocabulary = geometry.vocabulary;
-    let paired = paired_block(head.block).map_err(|error| error.to_string())?;
+    let paired = paired_block(&head.block).map_err(|error| error.to_string())?;
     let Mixer::Attention(attention) = paired.mixer else {
         return Err("draft head block must attend".into());
     };
@@ -482,29 +507,45 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     // and binds none of the weights after it.
     let inject_only = class.steps == 0;
     // Draft head sublayers add their outputs to the residual (admission).
-    let attention_weights =
-        attention_weights(&attention_shape, attention, !inject_only, false, |kind| {
-            planned_weight(
-                &mut graph,
-                load,
-                WeightRole {
-                    scope: attention_scope,
-                    kind,
-                },
-                &mut weights,
-            )
-        })?;
+    let attention_weights = attention_weights(&attention_shape, attention, !inject_only, false, |kind| {
+        planned_weight(
+            &mut graph,
+            load,
+            WeightRole {
+                scope: attention_scope,
+                kind,
+            },
+            &mut weights,
+        )
+    })?;
     let output_norm = if inject_only {
         None
     } else {
         Some(weight!(head, WeightKind::OutputNorm))
     };
-    let certified = readout::HeadPlans::for_recipe(load, WeightScope::Target, head, true)?
-        .certifies(class.slots, backend);
+    let certified = class.slots <= readout::certified_rows(backend);
     let projection = (class.steps > 0)
-        .then(|| {
-            readout::HeadPlans::for_recipe(load, WeightScope::Target, head, true)?
-                .ports(&mut graph, certified)
+        .then(|| -> Result<_, GraphError> {
+            Ok(match readout::HeadPlans::of(load)? {
+                readout::HeadPlans::Packed(plan) => {
+                    HeadProjectionPorts::Packed(graph.port(plan.resident, &[vocabulary, hidden])?)
+                }
+                readout::HeadPlans::Progressive(_) => HeadProjectionPorts::Progressive(
+                    ProgressivePlane::ALL
+                        .into_iter()
+                        .filter(|plane| certified || *plane != ProgressivePlane::Radius)
+                        .map(|plane| {
+                            Ok((
+                                plane,
+                                graph.port(
+                                    crate::progressive::element(plane),
+                                    &plane.shape(vocabulary, hidden),
+                                )?,
+                            ))
+                        })
+                        .collect::<Result<_, GraphError>>()?,
+                ),
+            })
         })
         .transpose()?;
 
@@ -513,59 +554,16 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let tokens = graph.input_for(entries.input, "tokens", &entry_dims)?;
     // The host writes the entry rows' conditioning, or a device-conditioned
     // class binds the leading rows of its chunk's target features.
-    let conditioning = if class.prefix && class.entry_rows == 1 {
-        None
-    } else if class.device {
-        Some(graph.port_with_class_extent(
+    let conditioning = if class.device {
+        graph.port_with_class_extent(
             activation(geometry.activation_dtype),
             &[class.entry_rows, hidden],
             0,
             "head_entry_rows",
-        )?)
+        )?
     } else {
-        Some(graph.input_for(entries.input, "conditioning", &entry_dims)?)
+        graph.input_for(entries.input, "conditioning", &entry_dims)?
     };
-    let prefix_conditioning = if class.prefix {
-        Some(graph.port(activation(geometry.activation_dtype), &[1, hidden])?)
-    } else {
-        None
-    };
-    let assembled = if let Some(previous) = &prefix_conditioning {
-        let mut rows = graph.local_for(
-            entries.copy,
-            "out",
-            &[("M", class.entry_rows), ("D", hidden)],
-        )?;
-        let mut first = rows.tensor_mut().slice_leading(0, 1);
-        graph.set_class_scope(None);
-        graph.enqueue(
-            entries.copy,
-            &[("M", 1), ("D", hidden)],
-            feature_copy::WorkflowArgs {
-                input: previous.tensor().into(),
-                out: (&mut first).into(),
-            },        )?;
-        if class.entry_rows > 1 {
-            graph.set_class_scope(Some("head-entry-tail"));
-            let source = conditioning
-                .as_ref()
-                .unwrap()
-                .tensor()
-                .slice_leading(0, class.entry_rows - 1);
-            let mut tail = rows.tensor_mut().slice_leading(1, class.entry_rows);
-            graph.enqueue(
-                entries.copy,
-                &[("M", class.entry_rows - 1), ("D", hidden)],
-                feature_copy::WorkflowArgs {
-                    input: (&source).into(),
-                    out: (&mut tail).into(),
-                },            )?;
-        }
-        Some(rows)
-    } else {
-        None
-    };
-    graph.set_class_scope(Some("head-entry"));
     let out_rows = if inject_only {
         None
     } else {
@@ -608,17 +606,13 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         draft_rows::WorkflowArgs {
                             tokens: tokens.tensor().into(),
                             table: (&table).into(),
-                            conditioning: assembled
-                                .as_ref()
-                                .or(conditioning.as_ref())
-                                .unwrap()
-                                .tensor()
-                                .into(),
+                            conditioning: conditioning.tensor().into(),
                             embedding_norm: (&embedding_norm).into(),
                             hidden_norm: (&hidden_norm).into(),
                             combine: (&combine).into(),
                             epsilon,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             Some(features) => {
@@ -639,18 +633,15 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             hidden_norm: (&hidden_norm).into(),
                             combine: (&combine).into(),
                             epsilon,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
         };
         let (attended, state, controls) = attention_graph::attention(
             &mut graph,
             AttentionGraphEntries {
-                project: if inject_only {
-                    entries.priming_project
-                } else {
-                    entries.attention.project
-                },
+                project: if inject_only { entries.priming_project } else { entries.attention.project },
                 ..entries.attention
             },
             &attention_weights,
@@ -671,7 +662,6 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 post_norm_scale: 1.0,
                 activation: activation(geometry.activation_dtype),
                 inject_only,
-                causal_cache: false,
             },
         )?;
         let (Some(output_norm), Some(out_rows)) = (&output_norm, &out_rows) else {
@@ -681,7 +671,6 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 plan: graph,
                 tokens,
                 conditioning,
-                previous: prefix_conditioning,
                 out_rows: None,
                 passes: vec![PassPorts {
                     coordinates: controls.coordinates,
@@ -734,7 +723,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                                 .ok_or("dense scale is absent")?
                                 .into(),
                             up_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
-                        },                    )?
+                        },
+                    )?
                     .value;
                 let TailEntries::Residual(dense_output) = entries.output else {
                     return Err("draft head feed-forward has a post-norm tail".into());
@@ -752,7 +742,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                                 .as_ref()
                                 .ok_or("dense scale is absent")?
                                 .into(),
-                        },                    )?
+                        },
+                    )?
                     .value;
                 constants.push(dense_rows);
                 graph.set_class_scope((pass == 0).then_some("head-entry"));
@@ -799,7 +790,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         .map_or(out_rows.tensor(), |rows| rows.port().tensor())
                         .into(),
                     epsilon,
-                },            )?
+                },
+            )?
             .value;
         graph.set_class_scope(None);
         let pass_rows = chained_rows
@@ -809,38 +801,61 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         constants.extend(chained_rows);
         let selection = match (&projection, selections.as_mut()) {
             (Some(projection), Some(selections)) => {
-                let projection_entries = entries.logits.borrowed();
-                let input = match projection {
-                    readout::ProjectionPorts::Packed { .. } => {
-                        readout::ReadoutInput::PreparedFeatures {
-                            features: &features,
-                            canonical_rows: None,
-                        }
+                let (mut logits, inputs) = match (projection, &entries.logits) {
+                    (HeadProjectionPorts::Packed(weight), HeadLogitsEntries::Packed(entry)) => {
+                        let logits = graph
+                            .enqueue(
+                                *entry,
+                                &[("O", class.slots), ("V", vocabulary), ("D", hidden)],
+                                head_logits_rows::WorkflowArgs {
+                                    features: (&features).into(),
+                                    weight: weight.tensor().into(),
+                                },
+                            )?
+                            .value;
+                        (logits, None)
                     }
-                    readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
-                        hidden: &advanced,
-                        norm: output_norm,
-                        out_rows: &pass_rows,
-                        epsilon,
-                    },
+                    (
+                        HeadProjectionPorts::Progressive(ports),
+                        HeadLogitsEntries::Progressive(levels),
+                    ) => {
+                        let plane = |plane: ProgressivePlane| {
+                            ports
+                                .iter()
+                                .find(|(placed, _)| *placed == plane)
+                                .map(|(_, port)| port.tensor())
+                        };
+                        let missing = || "head projection plane is absent".to_owned();
+                        readout::progressive_projection(
+                            &mut graph,
+                            readout::ProgressiveEntries {
+                                top: levels.top,
+                                refine: levels.refine,
+                                exact: levels.exact,
+                                planes: levels.planes,
+                            },
+                            entries.sample,
+                            readout::ProgressivePorts {
+                                top: plane(ProgressivePlane::Top).ok_or_else(missing)?,
+                                bit3: plane(ProgressivePlane::Bit3).ok_or_else(missing)?,
+                                rest: plane(ProgressivePlane::Rest).ok_or_else(missing)?,
+                                scales: plane(ProgressivePlane::Scales).ok_or_else(missing)?,
+                                radius: plane(ProgressivePlane::Radius),
+                            },
+                            readout::ProgressiveRows {
+                                hidden: &advanced,
+                                norm: output_norm,
+                                out_rows: &pass_rows,
+                                rows,
+                                projected: class.slots,
+                                selected: class.slots,
+                            },
+                            (vocabulary, hidden),
+                            epsilon,
+                        )?
+                    }
+                    _ => return Err("head projection entries and plan disagree".into()),
                 };
-                let (mut logits, inputs) = readout::project_readout(
-                    &mut graph,
-                    projection_entries,
-                    projection,
-                    input,
-                    readout::ProjectionGeometry {
-                        rows,
-                        projected: class.slots,
-                        selected: class.slots,
-                        vocabulary,
-                        hidden,
-                        columns: vocabulary,
-                    },
-                    0.0,
-                    Some(entries.sample),
-                    &mut constants,
-                )?;
                 let mut result = selections
                     .tensor()
                     .slice_leading(pass * class.slots, (pass + 1) * class.slots);
@@ -889,7 +904,6 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         plan: graph,
         tokens,
         conditioning,
-        previous: prefix_conditioning,
         out_rows: Some(out_rows.ok_or_else(|| "head graph has no entry pass".to_owned())?),
         passes,
         constants,
@@ -903,7 +917,7 @@ pub(crate) fn checked_head_family_storage(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
-    head: EmbeddedHeadBlock<'_>,
+    head: &HeadBlock,
     binding: HeadBinding,
     classes: impl IntoIterator<Item = HeadGraphClass>,
 ) -> Result<CheckedGraphResources, GraphError> {
@@ -916,7 +930,7 @@ fn certify_head_family(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
-    head: EmbeddedHeadBlock<'_>,
+    head: &HeadBlock,
     binding: HeadBinding,
     classes: &[HeadGraphClass],
 ) -> Result<
@@ -930,10 +944,9 @@ fn certify_head_family(
     let mut family = CheckedGraphFamilyResources::new();
     let mut layouts = BTreeMap::new();
     // Every field but the entry row count fixes the graph's structure; the
-    // entry pass also distinguishes a prefix with a current-chunk tail
-    // from a single previous row, independently of attention row forms.
+    // entry pass branches only through the row form of its row count.
     let mut groups: BTreeMap<
-        (u64, u64, bool, bool, bool, bool, u64, u32, u64, RowForm),
+        (u64, u64, bool, bool, u64, u32, u64, RowForm),
         Vec<HeadGraphClass>,
     > = BTreeMap::new();
     for &class in classes {
@@ -946,8 +959,6 @@ fn certify_head_family(
                 class.steps,
                 class.shaped,
                 class.device,
-                class.prefix,
-                class.prefix && class.entry_rows > 1,
                 class.history_rows,
                 class.slab_rows,
                 class.segments,
@@ -968,10 +979,7 @@ fn certify_head_family(
             largest,
             backend,
         )?;
-        let template = draft
-            .plan
-            .seal_template()
-            .map_err(|error| GraphError::from(error).context(format!("head class {largest:?}")))?;
+        let template = draft.plan.seal_template()?;
         family.include(
             NativeGraphStorageBytes {
                 workspace: 0,
@@ -984,12 +992,9 @@ fn certify_head_family(
             .iter()
             .map(|class| {
                 let rows = [class.entry_rows];
-                let mut slice = NativeGraphClassSlice::new()
+                let slice = NativeGraphClassSlice::new()
                     .dimension("head_entry_rows", rows)
                     .scoped("head-entry", "M", rows);
-                if class.prefix && class.entry_rows > 1 {
-                    slice = slice.scoped("head-entry-tail", "M", [class.entry_rows - 1]);
-                }
                 if class.steps == 0 {
                     return Ok::<_, String>(slice);
                 }
@@ -999,7 +1004,7 @@ fn certify_head_family(
                         .scoped("head-entry-dense", "O", rows),
                     FeedForwardProgramSlot::GeneralRouted(_)
                     | FeedForwardProgramSlot::Parallel(_) => {
-                        return Err("draft head routed feed-forward form".into());
+                        return Err("draft head routed feed-forward form".into())
                     }
                     FeedForwardProgramSlot::Routed(_) if routed::decodes(class.entry_rows) => slice,
                     FeedForwardProgramSlot::Routed(shape) => slice.scoped(
@@ -1038,7 +1043,7 @@ pub(crate) fn verify_head_family_certificates(
     backend: BackendName,
     load: &ModelLoadPlan,
     geometry: &Decoder,
-    head: EmbeddedHeadBlock<'_>,
+    head: &HeadBlock,
     binding: HeadBinding,
     classes: &[HeadGraphClass],
 ) -> Result<(), GraphError> {
@@ -1080,7 +1085,7 @@ impl PreparedHeadGraphs {
         kernels: &AttestedHead,
         load: &ModelLoadPlan,
         geometry: &Decoder,
-        head: EmbeddedHeadBlock<'_>,
+        head: &HeadBlock,
         classes: impl IntoIterator<Item = HeadGraphClass>,
     ) -> Result<Self, SubmitError> {
         let classes = classes.into_iter().collect::<Vec<_>>();
@@ -1133,7 +1138,7 @@ impl PreparedHeadGraphs {
         kernels: &AttestedHead,
         load: &ModelLoadPlan,
         geometry: &Decoder,
-        head: EmbeddedHeadBlock<'_>,
+        head: &HeadBlock,
         class: HeadGraphClass,
         layout: &NativeGraphLayout,
     ) -> Result<PreparedHeadGraph, SubmitError> {
@@ -1175,14 +1180,11 @@ impl PreparedHeadGraphs {
         resident: &ResidentHead,
     ) -> Result<BoundHeadGraphs, SubmitError> {
         let mut uploaded = ConstantTensors::new(resident.embedding.tensor().device());
-        let absent_scale =
-            Tensor::zeros(&resident.embedding.tensor().device(), Element::f32(), &[0])
-                .map_err(device)?;
         let projection = match &resident.output {
             ResidentOutput::Packed(weight) => vec![(None, weight.tensor())],
-            ResidentOutput::Progressive(progressive) => ProgressivePlane::ALL
+            ResidentOutput::Progressive(planes) => ProgressivePlane::ALL
                 .into_iter()
-                .map(|plane| (Some(plane), progressive.plane(plane).tensor()))
+                .map(|plane| (Some(plane), planes.plane(plane).tensor()))
                 .collect(),
         };
         let projected = |plane: Option<ProgressivePlane>| -> Result<&Tensor, SubmitError> {
@@ -1209,18 +1211,8 @@ impl PreparedHeadGraphs {
                 .chain(constants.iter().map(|(port, tensor)| Ok((*port, tensor))))
                 .chain(match &graph.projection {
                     None => Vec::new(),
-                    Some(readout::ProjectionPorts::Packed { weight, scale, .. }) => {
-                        let ResidentOutput::Packed(output) = &resident.output else {
-                            return Err(invalid(
-                                "the head projection and the resident output head disagree",
-                            ));
-                        };
-                        vec![
-                            projected(None).map(|tensor| (weight, tensor)),
-                            Ok((scale, output.scale().unwrap_or(&absent_scale))),
-                        ]
-                    }
-                    Some(readout::ProjectionPorts::Progressive { planes: ports, .. }) => ports
+                    Some(HeadProjectionPorts::Packed(port)) => vec![projected(None).map(|tensor| (port, tensor))],
+                    Some(HeadProjectionPorts::Progressive(ports)) => ports
                         .iter()
                         .map(|(plane, port)| projected(Some(*plane)).map(|tensor| (port, tensor)))
                         .collect(),
@@ -1421,17 +1413,7 @@ impl NativeHeadProgram {
             segments: self.graphs.segments()?,
             steps: steps as u64,
             shaped,
-            device: matches!(
-                core.conditioning(),
-                crate::HeadConditioning::Features { .. }
-            ),
-            prefix: matches!(
-                core.conditioning(),
-                crate::HeadConditioning::Features {
-                    previous: Some(_),
-                    ..
-                }
-            ),
+            device: matches!(core.conditioning(), crate::HeadConditioning::Features(_)),
         };
         let (graph, bound) = self.graphs.class(class)?;
         if graph.passes.len() != chain.len() + 1 {
@@ -1466,33 +1448,17 @@ impl NativeHeadProgram {
                 }
                 conditioning.resize(entry_rows * row_bytes, 0);
                 active
-                    .write_input(
-                        graph
-                            .conditioning
-                            .as_ref()
-                            .ok_or_else(|| invalid("host conditioning port is absent"))?,
-                        &conditioning,
-                    )
+                    .write_input(&graph.conditioning, &conditioning)
                     .map_err(device)?;
             }
             // The target features' leading class rows; rows past the entry
             // rows condition padding rows, which append nowhere.
-            crate::HeadConditioning::Features {
-                current: features,
-                previous,
-            } => {
-                if let (Some(port), Some(previous)) = (&graph.previous, previous) {
-                    bindings
-                        .set(port, previous.allocation().tensor().map_err(device)?)
-                        .map_err(device)?;
-                }
-                if let Some(port) = &graph.conditioning {
-                    let features = features
-                        .tensor()
-                        .slice_leading(0, entry_rows as u64)
-                        .map_err(|error| invalid(format!("head conditioning features: {error}")))?;
-                    bindings.set(port, &features).map_err(device)?;
-                }
+            crate::HeadConditioning::Features(features) => {
+                let features = features
+                    .tensor()
+                    .slice_leading(0, entry_rows as u64)
+                    .map_err(|error| invalid(format!("head conditioning features: {error}")))?;
+                bindings.set(&graph.conditioning, &features).map_err(device)?;
             }
         }
         active
@@ -1526,9 +1492,7 @@ impl NativeHeadProgram {
                 .write_input(&ports.coordinates, &controls.coordinates)
                 .map_err(device)?;
             if let Some(visible) = &ports.visible {
-                active
-                    .write_input(visible, &controls.visible)
-                    .map_err(device)?;
+                active.write_input(visible, &controls.visible).map_err(device)?;
             }
             if let Some(fresh) = &ports.fresh {
                 active.write_input(fresh, &controls.fresh).map_err(device)?;

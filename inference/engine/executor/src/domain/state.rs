@@ -14,7 +14,7 @@ pub struct MemoryChargeReconciliation {
     pub target_state: StateHoldingCensus,
     pub head_state: Option<StateHoldingCensus>,
     pub graph_pools: u64,
-    pub owned_features: u64,
+    pub owned_media: u64,
     pub target_weights: u64,
     pub optional_weights: u64,
     pub prepared_programs: u64,
@@ -30,25 +30,6 @@ impl MemoryChargeReconciliation {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
-    pub(super) fn allocate_boundary(&mut self) -> Result<FeatureRef, DomainError> {
-        let width = self.definition.decoder.hidden;
-        let element = crate::planning::activation_dtype(self.definition.decoder.activation_dtype);
-        let bytes = width
-            .checked_mul(self.definition.decoder.activation_dtype.bytes() as u64)
-            .ok_or_else(|| DomainError::invariant("boundary feature size overflows"))?;
-        let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
-        let tensor = Tensor::zeros(
-            self.domain.device(),
-            seismic::Element::dense(element),
-            &[1, width],
-        );
-        self.release_claim(claim);
-        let tensor = tensor.map_err(|error| DomainError::Input(error.to_string()))?;
-        self.domain
-            .publish_features(tensor)
-            .map_err(|error| DomainError::Input(error.to_string()))
-    }
-
     /// Shrink compactions of the target and head stores.
     pub fn state_compactions(
         &self,
@@ -99,10 +80,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .checked_add(head_state.map_or(0, StateHoldingCensus::total))
             .ok_or("state charge sum overflows")?;
         let graph_pools = self.resources.committed_bytes()?;
-        let owned_features = self
-            .domain
-            .owned_feature_bytes()
-            .map_err(|error| error.to_string())?;
+        let owned_media = self.owned_media_bytes(retained)?;
         let target_weights = self.family.target_weight_bytes()?;
         // The head loader inherits the target cache so tied weights are
         // represented by the same allocation. Vision has its own cache.
@@ -143,7 +121,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .ok_or("external pin charge overflows")?;
         let classified = state
             .checked_add(graph_pools)
-            .and_then(|bytes| bytes.checked_add(owned_features))
+            .and_then(|bytes| bytes.checked_add(owned_media))
             .and_then(|bytes| bytes.checked_add(target_weights))
             .and_then(|bytes| bytes.checked_add(optional_weights))
             .and_then(|bytes| bytes.checked_add(prepared_programs))
@@ -159,7 +137,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             target_state,
             head_state,
             graph_pools,
-            owned_features,
+            owned_media,
             target_weights,
             optional_weights,
             prepared_programs,
@@ -167,6 +145,41 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             external_pins,
             unattributed,
         })
+    }
+
+    /// Count each standalone feature allocation once across request inputs
+    /// and retained resume states. Graph-backed features already belong to a
+    /// sealed output arena in `graph_pools` and must not be counted again.
+    fn owned_media_bytes(&self, retained: &[&ResumeState]) -> Result<u64, String> {
+        let features = self
+            .input
+            .values()
+            .flat_map(|input| {
+                input
+                    .images
+                    .values()
+                    .filter_map(|image| image.features.as_ref())
+            })
+            .chain(retained.iter().flat_map(|state| state.features.values()));
+        let mut seen: Vec<&Tensor> = Vec::new();
+        let mut bytes = 0u64;
+        for feature in features {
+            if feature.allocation().is_graph_backed() {
+                continue;
+            }
+            let tensor = feature
+                .allocation()
+                .tensor()
+                .map_err(|error| error.to_string())?;
+            if seen.iter().any(|other| other.shares_allocation(tensor)) {
+                continue;
+            }
+            bytes = bytes
+                .checked_add(tensor.storage_bytes())
+                .ok_or("owned media charge overflows")?;
+            seen.push(tensor);
+        }
+        Ok(bytes)
     }
 
     /// Account for each state arena from resident requests, retained resume
@@ -478,7 +491,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                             ))
                         ) =>
                 {
-                    continue;
+                    continue
                 }
                 Err(error) => return Err(error.into()),
             }

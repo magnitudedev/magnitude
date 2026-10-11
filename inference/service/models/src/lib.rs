@@ -2,7 +2,6 @@
 
 mod cache;
 mod catalog;
-mod catalog_acquisition;
 mod catalog_affiliations;
 mod catalog_installations;
 mod catalog_models;
@@ -30,7 +29,6 @@ pub use catalog::{
     ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
     model_catalog_lock,
 };
-pub use catalog_acquisition::{AcquiredCatalogModel, AcquiredDrafter, AcquiredFile};
 pub use catalog_installations::ManagedCatalogInstallations;
 pub use catalog_models::{CatalogRemovalPlan, ManagedCatalogModels};
 pub use discovered_models::ManagedDiscoveredModels;

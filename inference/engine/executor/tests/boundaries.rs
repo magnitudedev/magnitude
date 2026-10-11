@@ -1,40 +1,9 @@
-use std::{path::PathBuf, process::Command};
+use std::{fs, path::PathBuf};
 
 #[test]
 fn manifest_keeps_the_executor_below_model_and_product_layers() {
-    // Cargo resolves dependency tables, target conditions and renamed packages for us.
-    // Model families used only by numerical fixtures do not create a production edge.
-    let output = Command::new(env!("CARGO"))
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--no-deps",
-            "--offline",
-            "--locked",
-        ])
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-        .output()
-        .expect("read Cargo dependency metadata");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let package = metadata["packages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|package| package["name"] == env!("CARGO_PKG_NAME"))
-        .unwrap();
-    let dependencies: Vec<_> = package["dependencies"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|dependency| dependency["kind"] != "dev")
-        .map(|dependency| dependency["name"].as_str().unwrap())
-        .collect();
+    let manifest =
+        fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
     for forbidden in [
         "magnitude-chat",
         "magnitude-generation",
@@ -43,12 +12,12 @@ fn manifest_keeps_the_executor_below_model_and_product_layers() {
         "magnitude-templates",
     ] {
         assert!(
-            !dependencies.contains(&forbidden),
+            !manifest.contains(forbidden),
             "executor must not depend on {forbidden}"
         );
     }
-    assert!(dependencies.contains(&"magnitude-batching"));
-    assert!(dependencies.contains(&"magnitude-artifacts"));
-    assert!(dependencies.contains(&"magnitude-family-contracts"));
-    assert!(dependencies.contains(&"magnitude-kernels"));
+    assert!(manifest.contains("magnitude-batching"));
+    assert!(manifest.contains("magnitude-artifacts"));
+    assert!(manifest.contains("magnitude-family-contracts"));
+    assert!(manifest.contains("magnitude-kernels"));
 }

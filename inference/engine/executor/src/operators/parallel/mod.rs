@@ -5,7 +5,7 @@
 
 pub(crate) mod graph;
 
-use super::{PlanError, dense_ffn, routed, tail};
+use super::{dense_ffn, routed, tail, PlanError};
 use crate::{DenseBranchBinding, ParallelBinding, SublayerTail};
 use magnitude_family_contracts::{
     Branch, BranchOutput, DenseFfn, InputNorm, Operator, OutputForm, RmsNorm, RoutedFfn,
@@ -123,9 +123,7 @@ pub(super) fn binding(
         lookup(WeightScope::TargetSublayer(sublayer), kind)
     })?
     else {
-        return Err(PlanError::Unsupported(
-            "parallel branches without a post-norm tail",
-        ));
+        return Err(PlanError::Unsupported("parallel branches without a post-norm tail"));
     };
     if [dense, routed]
         .into_iter()
@@ -142,7 +140,6 @@ pub(super) fn binding(
         hidden,
         dense: DenseBranchBinding {
             features: branches.dense.intermediate,
-            function: super::dense_ffn::activation_code(branches.dense.up.activation()),
             norm: lookup(dense, WeightKind::InputNorm)?,
             gate: lookup(dense, WeightKind::DenseGate)?,
             up: lookup(dense, WeightKind::DenseUp)?,
@@ -155,7 +152,9 @@ pub(super) fn binding(
             branches.routed,
             hidden,
             |kind| lookup(routed, kind),
-            |kind| lookup(routed, kind).map(|element| crate::ScalableWeight { element, scale: 0 }),
+            |kind| {
+                lookup(routed, kind).map(|element| crate::ScalableWeight { element, scale: 0 })
+            },
             activation,
         )?,
         norm,

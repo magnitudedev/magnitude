@@ -65,15 +65,8 @@ fn rate_reaches(pages: u64, window: &DisplacementWindow, per_second: u64) -> boo
 }
 
 fn thrashed(window: &DisplacementWindow) -> bool {
-    rate_reaches(
-        window.compressed_pages,
-        window,
-        THRASHING_COMPRESSIONS_PER_SECOND,
-    ) && rate_reaches(
-        window.decompressed_pages,
-        window,
-        THRASHING_DECOMPRESSIONS_PER_SECOND,
-    )
+    rate_reaches(window.compressed_pages, window, THRASHING_COMPRESSIONS_PER_SECOND)
+        && rate_reaches(window.decompressed_pages, window, THRASHING_DECOMPRESSIONS_PER_SECOND)
 }
 
 /// The distress `host` reports, most severe first. A host that reports no
@@ -132,10 +125,7 @@ impl fmt::Display for MemoryPolicyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedBacking { device, reason } => {
-                write!(
-                    formatter,
-                    "device {device} has no qualified memory backing: {reason}"
-                )
+                write!(formatter, "device {device} has no qualified memory backing: {reason}")
             }
             Self::Observation(error) => write!(formatter, "{error}"),
             Self::MismatchedObservation { device } => write!(
@@ -566,12 +556,7 @@ mod tests {
         }
     }
 
-    fn window(
-        millis: u64,
-        compressed: u64,
-        decompressed: u64,
-        swapped_out: u64,
-    ) -> DisplacementWindow {
+    fn window(millis: u64, compressed: u64, decompressed: u64, swapped_out: u64) -> DisplacementWindow {
         DisplacementWindow {
             duration: std::time::Duration::from_millis(millis),
             compressed_pages: compressed,
@@ -600,10 +585,7 @@ mod tests {
     #[test]
     fn compression_alone_is_not_distress() {
         // Other programs' idle data being compressed is the allowed cost of a load.
-        let compressing = displaced(
-            Some(window(500, 1_000_000, 0, 0)),
-            Some(window(500, 1_000_000, 0, 0)),
-        );
+        let compressing = displaced(Some(window(500, 1_000_000, 0, 0)), Some(window(500, 1_000_000, 0, 0)));
         assert_eq!(host_distress(&compressing), None);
         // Programs faulting compressed pages back without new compression is recovery.
         let recovering = displaced(Some(window(500, 0, 1_000_000, 0)), None);

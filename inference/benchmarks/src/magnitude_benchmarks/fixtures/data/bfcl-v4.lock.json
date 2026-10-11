@@ -1,0 +1,32 @@
+{
+  "repository": "https://github.com/ShishirPatil/gorilla",
+  "commit": "6ea57973c7a6097fd7c5915698c54c17c5b1b6c8",
+  "dataRoot": "berkeley-function-call-leaderboard/bfcl_eval/data",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": "BFCL_v4_simple_python.json",
+      "sha256": "82dd63ba502eb2520c6b5d1d9a5c4b590e03ff261565175561f6228a367d1991"
+    },
+    {
+      "path": "possible_answer/BFCL_v4_simple_python.json",
+      "sha256": "90cd5bc653690ee8e459b5b3f3fc9458606f7f3fcbf795bb51b7dc581f8c86dc"
+    },
+    {
+      "path": "BFCL_v4_parallel.json",
+      "sha256": "19f51a82eff42e5d62541aa500115a056eb78f437c2ba1f10415fd7c8e5dda84"
+    },
+    {
+      "path": "possible_answer/BFCL_v4_parallel.json",
+      "sha256": "8a6aa19c1adddc6a5a2f7e40f9dbf30cc7e95815e7b830c90589ab318229e0f0"
+    },
+    {
+      "path": "BFCL_v4_parallel_multiple.json",
+      "sha256": "8863ea8433239f55c5f016154cf0830853c89f693c6ea270396a2fa121960579"
+    },
+    {
+      "path": "possible_answer/BFCL_v4_parallel_multiple.json",
+      "sha256": "5ebf24f458c1f16300c05505d83d6f0a1b68b79be273a033febd0d4f840507e3"
+    }
+  ]
+}

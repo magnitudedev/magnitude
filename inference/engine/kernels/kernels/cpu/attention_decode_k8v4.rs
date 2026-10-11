@@ -5,7 +5,7 @@
 // absorbs them; fresh rows attend dense. Head widths are whole affine groups
 // (the declaration's `where`), so every vector has at least one group.
 
-use lib::attention::attention::{self, Form, Online, BLOCK};
+use lib::attention::attention::{self, Form, Online, BLOCK, KEY_BITS, VALUE_BITS};
 use seismic::cpu::slab::SlabTensor;
 
 fn form<E: Elements>(cx: &Context<'_, E>) -> Form {
@@ -70,13 +70,13 @@ fn attention_decode_k8v4_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
             unsafe {
                 attention::affine_encode(
                     &keys[head * w..][..w],
-                    (32 * cx.dim_kc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    KEY_BITS,
                     key_codes.row_mut([destination, head, 0]),
                     key_coefficients.row_mut([destination, head, 0]),
                 );
                 attention::affine_encode(
                     &values[head * w..][..w],
-                    (32 * cx.dim_vc() / (2 * cx.dim_p() + cx.dim_s())) as u32,
+                    VALUE_BITS,
                     value_codes.row_mut([destination, head, 0]),
                     value_coefficients.row_mut([destination, head, 0]),
                 );

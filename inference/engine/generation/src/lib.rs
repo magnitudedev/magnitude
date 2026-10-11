@@ -3,8 +3,6 @@
 mod acceptance;
 mod controls;
 mod dflash;
-mod draft_budget;
-mod draft_transition;
 mod method;
 mod mtp;
 mod plain;
@@ -13,8 +11,6 @@ mod shaping;
 pub use acceptance::accept_prefix;
 pub use controls::{EndOfGeneration, ReasoningBudget};
 pub use dflash::DFlash;
-pub use draft_budget::DraftBudget;
-pub use draft_transition::{DraftHeadCall, DraftHistory, DraftRoundState, DraftTargetTransition};
 pub use magnitude_artifacts::{BoundaryRule, InputLayout, InputSpan};
 pub use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, Operation, Priming, RequestId, Sampling, SelectSpec,
@@ -279,7 +275,6 @@ pub struct Generation {
     accepted_position: usize,
     reconciliation_target: usize,
     resident: bool,
-    reusable_prefixes: bool,
     finish: Option<FinishReason>,
     method_factory: Arc<dyn Method>,
     method: Box<dyn MethodState>,
@@ -328,19 +323,8 @@ impl Generation {
         {
             return Err("generation method factory does not match request policy".into());
         }
-        // Media rows enter the target from the projector under placeholder
-        // tokens. A drafter reading the target's history sees them through
-        // the target; one embedding every prompt token cannot enter them.
-        if method_factory.embeds_prompt_tokens()
-            && layout.spans().iter().any(|span| !span.language_history)
-        {
-            return Err(
-                "this drafter embeds prompt tokens and cannot enter media rows; \
-                 generate without drafting"
-                    .into(),
-            );
-        }
         let finish = (options.max_tokens == 0).then_some(FinishReason::Length);
+        let method = method_factory.create(None)?;
         let constraint = controls::Controlled::compose(
             constraint,
             options.end_of_generation,
@@ -349,7 +333,6 @@ impl Generation {
             options.reasoning_budget.as_ref(),
             options.vocabulary,
         )?;
-        let method = method_factory.create(None)?;
         Ok(Self {
             prompt,
             layout,
@@ -362,7 +345,6 @@ impl Generation {
             accepted_position: 0,
             reconciliation_target: 0,
             resident: false,
-            reusable_prefixes: true,
             finish,
             method_factory,
             method,
@@ -415,29 +397,8 @@ impl Generation {
     pub fn method_reclaimable(&self) -> u64 {
         self.method.reclaimable()
     }
-    /// Declare before residency whether another request may reuse an intermediate
-    /// prefix. Reusable histories must be complete at every boundary: a peer can
-    /// introduce a branch point after this request has begun prefilling.
-    pub fn set_prefix_reuse(&mut self, reusable: bool) -> Result<(), String> {
-        if self.resident || self.resident_position != 0 || !self.generated.is_empty() {
-            return Err("prefix reuse must be declared before generation starts".into());
-        }
-        self.reusable_prefixes = reusable;
-        Ok(())
-    }
-
-    fn priming_horizon(&self, boundary: usize) -> usize {
-        if self.reusable_prefixes {
-            boundary
-        } else {
-            self.prompt.len() + self.generated.len()
-        }
-    }
     /// Export owned method state for prefix retention.
     pub fn method_checkpoint(&self) -> Result<MethodCheckpoint, String> {
-        if !self.reusable_prefixes {
-            return Err("request does not retain reusable prefixes".into());
-        }
         if !self.resident {
             return Err("method checkpoint requires resident state".into());
         }
@@ -661,20 +622,14 @@ impl Generation {
         drafter: Option<usize>,
     ) -> Result<RoundState, String> {
         let requirements = self.method_factory.requires();
-        let successor_dependent = self.method_factory.priming_requires_successor();
         let prime = drafter
             .filter(|_| requirements.head && requirements.prefill_demand.contains(Demand::FEATURES))
             .map(|drafter| Priming {
-                tokens: if successor_dependent {
-                    self.prompt[drafter + 1..end].to_vec()
-                } else {
-                    self.prompt[position + 1..(end + 1).min(self.prompt.len())].to_vec()
-                },
-                boundary: successor_dependent,
+                tokens: self.prompt[position + 1..(end + 1).min(self.prompt.len())].to_vec(),
                 position: drafter,
-                draft_from: self.priming_horizon(end),
+                draft_from: self.prompt.len() + self.generated.len(),
             })
-            .filter(|prime| prime.boundary || !prime.tokens.is_empty());
+            .filter(|prime| !prime.tokens.is_empty());
         let finishing = end == self.prompt.len();
         let tokens = self.prompt[position..end].to_vec();
         let forced = if finishing {
@@ -977,22 +932,31 @@ impl Generation {
         let effects = match acceptance.method_update {
             MethodUpdate::None => MethodEffects::default(),
             MethodUpdate::Prime => {
-                if round.forward().demand.contains(Demand::FEATURES) && features.is_none() {
-                    return Err("prompt chunk demanded target features it did not return".into());
+                if self
+                    .method_factory
+                    .requires()
+                    .prefill_demand
+                    .contains(Demand::FEATURES)
+                    && features.is_none()
+                {
+                    return Err("prefill method requires target features".into());
                 }
-                method.prime(
-                    request,
-                    &acceptance.inputs,
-                    acceptance.emitted.first().copied(),
-                    features,
-                    self.priming_horizon(self.resident_position + acceptance.committed_rows),
-                    round
-                        .forward()
-                        .prime
-                        .as_ref()
-                        .map(|prime| prime.tokens.len()),
-                    reader,
-                )?
+                match features {
+                    Some(features) => method.prime(
+                        request,
+                        &acceptance.inputs,
+                        acceptance.emitted.first().copied(),
+                        features,
+                        self.prompt.len() + self.generated.len(),
+                        round
+                            .forward()
+                            .prime
+                            .as_ref()
+                            .map_or(0, |prime| prime.tokens.len()),
+                        reader,
+                    )?,
+                    None => MethodEffects::default(),
+                }
             }
             MethodUpdate::Observe => {
                 let next = *acceptance
@@ -1306,7 +1270,6 @@ fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
                 && requirements
                     == (MethodRequirements {
                         prefill_demand: Demand::NONE,
-                        closing_demand: Demand::NONE,
                         verify_demand: Demand::NONE,
                         head: false,
                     })
@@ -1319,10 +1282,7 @@ fn method_matches_choice(choice: MethodChoice, method: &dyn Method) -> bool {
             proposals > 0
                 && method.identity().starts_with(prefix)
                 && requirements.head
-                // The first draft's anchor is selected by the closing
-                // chunk's final feature, whichever demand returns it.
-                && (requirements.prefill_demand | requirements.closing_demand)
-                    .contains(Demand::FEATURES)
+                && requirements.prefill_demand.contains(Demand::FEATURES)
                 && requirements.verify_demand.contains(Demand::FEATURES)
                 && usize::from(proposals) <= method.proposals()
         }
@@ -1346,9 +1306,6 @@ mod method_choice_tests {
         fn requires(&self) -> MethodRequirements {
             self.requirements
         }
-        fn embeds_prompt_tokens(&self) -> bool {
-            false
-        }
         fn proposals(&self) -> usize {
             self.proposals
         }
@@ -1366,7 +1323,6 @@ mod method_choice_tests {
             identity: "plain",
             requirements: MethodRequirements {
                 prefill_demand: Demand::NONE,
-                closing_demand: Demand::NONE,
                 verify_demand: Demand::NONE,
                 head: false,
             },
@@ -1382,7 +1338,6 @@ mod method_choice_tests {
             identity: "mtp:fixture:3",
             requirements: MethodRequirements {
                 prefill_demand: Demand::FEATURES,
-                closing_demand: Demand::NONE,
                 verify_demand: Demand::FEATURES,
                 head: true,
             },
@@ -1400,27 +1355,5 @@ mod method_choice_tests {
             MethodChoice::Mtp { proposals: 0 },
             &mtp
         ));
-
-        // A head reading the target's history demands only the closing
-        // chunk's features; a head demanding no prompt features cannot draft.
-        let reading = Descriptor {
-            identity: "mtp:fixture:3",
-            requirements: MethodRequirements {
-                prefill_demand: Demand::NONE,
-                closing_demand: Demand::FEATURES,
-                verify_demand: Demand::FEATURES,
-                head: true,
-            },
-            proposals: 3,
-        };
-        assert!(method_matches_choice(MethodChoice::Mtp { proposals: 3 }, &reading));
-        let blind = Descriptor {
-            requirements: MethodRequirements {
-                closing_demand: Demand::NONE,
-                ..reading.requirements
-            },
-            ..reading
-        };
-        assert!(!method_matches_choice(MethodChoice::Mtp { proposals: 3 }, &blind));
     }
 }

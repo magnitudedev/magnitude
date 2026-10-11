@@ -122,8 +122,7 @@ kernel void attention_decode_partial(
             lane, x);
         ATTENTION_UNROLL
         for (uint i = 0; i < E; ++i)
-            reinterpret_cast<threadgroup element::Act::storage *>(prepared)[g * W + lane * E + i] =
-                element::Act::store(x[i]);
+            prepared[g * W + lane * E + i] = attention::Scalar(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint head0 = (simd % SLICES) * H;
@@ -200,8 +199,8 @@ kernel void attention_decode_partial(
             attention::head_norm<ATTENTION_VALUE_NORM>(value + at, value_norm, epsilon, lane, v[0]);
             ATTENTION_UNROLL
             for (uint i = 0; i < E; ++i) {
-                k[0][i] = element::Act::round(k[0][i]);
-                v[0][i] = element::Act::round(v[0][i]);
+                k[0][i] = float(attention::Scalar(k[0][i]));
+                v[0][i] = float(attention::Scalar(v[0][i]));
             }
             attention::absorb_heads<H, 1>(q, k, v, maximum, denominator, output, lane);
         }

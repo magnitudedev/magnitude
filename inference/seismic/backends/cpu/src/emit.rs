@@ -2,9 +2,9 @@
 
 use crate::Cpu;
 use cranelift_codegen::ir::{
-    self, AbiParam, BlockArg, InstBuilder, MemFlags, Value,
+    self,
     condcodes::{FloatCC, IntCC},
-    types,
+    types, AbiParam, BlockArg, InstBuilder, MemFlags, Value,
 };
 use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -41,7 +41,6 @@ pub(crate) struct EmittedKernel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum HostImport {
     ApproxExp,
-    ApproxExp2,
     ApproxLog,
     ApproxSin,
     ApproxCos,
@@ -88,7 +87,6 @@ impl HostImport {
     fn name(self) -> &'static str {
         match self {
             Self::ApproxExp => "seismic_approx_exp_f32",
-            Self::ApproxExp2 => "seismic_approx_exp2_f32",
             Self::ApproxLog => "seismic_approx_log_f32",
             Self::ApproxSin => "seismic_approx_sin_f32",
             Self::ApproxCos => "seismic_approx_cos_f32",
@@ -129,11 +127,7 @@ impl HostImport {
     fn signature(self, call_conv: CallConv) -> ir::Signature {
         let mut signature = ir::Signature::new(call_conv);
         match self {
-            Self::ApproxExp
-            | Self::ApproxExp2
-            | Self::ApproxLog
-            | Self::ApproxSin
-            | Self::ApproxCos => {
+            Self::ApproxExp | Self::ApproxLog | Self::ApproxSin | Self::ApproxCos => {
                 signature.params.push(AbiParam::new(types::F32));
                 signature.returns.push(AbiParam::new(types::F32));
             }
@@ -328,9 +322,6 @@ fn collect_block_imports(kernel: &Kernel<Cpu>, block: BlockId, imports: &mut BTr
                 MathOp::Exp => {
                     imports.insert(HostImport::ApproxExp);
                 }
-                MathOp::Exp2 => {
-                    imports.insert(HostImport::ApproxExp2);
-                }
                 MathOp::Log => {
                     imports.insert(HostImport::ApproxLog);
                 }
@@ -346,7 +337,7 @@ fn collect_block_imports(kernel: &Kernel<Cpu>, block: BlockId, imports: &mut BTr
                 MathOp::Min => {
                     imports.insert(HostImport::Fmin);
                 }
-                MathOp::Fma | MathOp::Rint | MathOp::Rsqrt | MathOp::Sqrt | MathOp::Abs => {}
+                MathOp::Fma | MathOp::Rsqrt | MathOp::Sqrt | MathOp::Abs => {}
             },
             Op::Binary {
                 op: BinaryOp::Min, ..
@@ -1066,12 +1057,10 @@ impl Emitter<'_, '_> {
     fn math(&mut self, op: MathOp, a: Value) -> Value {
         match op {
             MathOp::Exp => self.call_float1(HostImport::ApproxExp, a),
-            MathOp::Exp2 => self.call_float1(HostImport::ApproxExp2, a),
             MathOp::Log => self.call_float1(HostImport::ApproxLog, a),
             MathOp::Sin => self.call_float1(HostImport::ApproxSin, a),
             MathOp::Cos => self.call_float1(HostImport::ApproxCos, a),
             MathOp::Sqrt => self.builder.ins().sqrt(a),
-            MathOp::Rint => self.builder.ins().nearest(a),
             MathOp::Rsqrt => {
                 let one = self.builder.ins().f32const(1.0);
                 let root = self.builder.ins().sqrt(a);
@@ -1737,7 +1726,10 @@ impl Emitter<'_, '_> {
                 let index = self.repack_expression(source_packet, index);
                 let index = self.builder.ins().uextend(types::I64, index);
                 let offset = self.builder.ins().imul_imm(index, 4);
-                let base = self.builder.ins().iconst(types::I64, table.as_ptr() as i64);
+                let base = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, table.as_ptr() as i64);
                 let address = self.builder.ins().iadd(base, offset);
                 self.builder
                     .ins()

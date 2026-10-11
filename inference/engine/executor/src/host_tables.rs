@@ -32,15 +32,9 @@ pub enum HostTableError {
     Shape(String),
     Read(magnitude_artifacts::Error),
     /// A batch row names a table row outside the table.
-    Row {
-        row: i64,
-        rows: u64,
-    },
+    Row { row: i64, rows: u64 },
     /// The gather buffer does not hold the batch's rows exactly.
-    Buffer {
-        expected: usize,
-        actual: usize,
-    },
+    Buffer { expected: usize, actual: usize },
 }
 
 impl fmt::Display for HostTableError {
@@ -204,10 +198,7 @@ mod tests {
         ));
         assert!(matches!(
             table.gather(&[0, 1], &mut out),
-            Err(HostTableError::Buffer {
-                expected: 24,
-                actual: 12
-            })
+            Err(HostTableError::Buffer { expected: 24, actual: 12 })
         ));
         std::fs::remove_file(path).unwrap();
     }

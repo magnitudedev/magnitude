@@ -39,10 +39,7 @@ fn routed_route[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
             let winner = reduce(i32(candidates), 0, max)
             routes[row, K - 1 - rank] = winner
             scores[row, K - 1 - rank] = best
-            # Only a selected expert is excluded from the next rank.
-            for expert in 0..E:
-                if i32(expert) == winner:
-                    probabilities[expert] = -inf
+            probabilities[winner] = -inf
         if normalize != 0:
             let denominator = reduce(f32(scores[row]), 0, sum)
             for choice in 0..K:
@@ -189,10 +186,7 @@ fn routed_route_shared[M, H, E, K, S](residual: &tensor[M, H] f32,
             let winner = reduce(i32(candidates), 0, max)
             routes[row, K - 1 - rank] = winner
             scores[row, K - 1 - rank] = best
-            # Only a selected expert is excluded from the next rank.
-            for expert in 0..E:
-                if i32(expert) == winner:
-                    probabilities[expert] = -inf
+            probabilities[winner] = -inf
         if normalize != 0:
             let denominator = reduce(f32(scores[row]), 0, sum)
             for choice in 0..K:
@@ -442,19 +436,21 @@ fn routed_group[M, E, K, B, T](routes: &tensor[M, K] i32,
 
 native routed_group for metal from "metal/routed_group.metal":
     static (E, K)
-    where E <= 1024
+    params (PARTS in [1, 2, 4])
+    where E * PARTS <= 1024
     launch routed_group:
         threadgroups (1, 1, 1)
-        threads_per_threadgroup (E * (1024 / E), 1, 1)
-        shared_bytes (ceil_div(M * K, 8) * 16 + E * (1024 / E) * 4 + E * 4 + 128 + 16)
+        threads_per_threadgroup (E * PARTS, 1, 1)
+        shared_bytes (E * PARTS * 4 + E * 4 + 16 + ceil_div(M * K, 8) * 16)
 
 native routed_group for cuda from "cuda/routed_group.cu":
     static (E, K)
-    where E <= 1024
+    params (PARTS in [1, 2, 4])
+    where E * PARTS <= 1024
     launch routed_group:
         threadgroups (1, 1, 1)
-        threads_per_threadgroup (E * (1024 / E), 1, 1)
-        shared_bytes (ceil_div(M * K, 8) * 16 + E * (1024 / E) * 4 + E * 4 + 128 + 16)
+        threads_per_threadgroup (E * PARTS, 1, 1)
+        shared_bytes (E * PARTS * 4 + E * 4 + 16 + ceil_div(M * K, 8) * 16)
 
 # Vulkan: the earlier Metal form (per-expert counts, then the ordered walk).
 native routed_group for vulkan from "vulkan/routed_group.comp":
@@ -527,20 +523,12 @@ native routed_experts for metal from "metal/routed_experts.metal":
 # simdgroup-matrix tiles.)
 native routed_experts for cuda from "cuda/routed_experts.cu":
     static (H, F)
-    params (code arithmetic OPERAND in [0, 1])
-    scratch staged bytes (M * H * 2) when OPERAND == 1
     scratch product bytes (B * T * F * 2)
-    launch routed_experts_stage when OPERAND == 1:
-        reads (OPERAND)
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_expand:
-        reads (OPERAND)
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 2 * 10240) + 2 * 4096)
     launch routed_experts_down:
-        reads (OPERAND)
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 10240) + 4096)
@@ -636,20 +624,12 @@ native routed_combine for metal from "metal/routed_combine.metal":
 # unpermutes the grouped expert outputs (2 launches). (Metal: 3 launches.)
 native routed_combine for cuda from "cuda/routed_combine.cu":
     static (H, K, S)
-    params (code arithmetic OPERAND in [0, 1])
-    scratch staged bytes (M * H * 2) when OPERAND == 1
     scratch shared_product bytes (M * S * 2)
-    launch routed_combine_stage when OPERAND == 1:
-        reads (OPERAND)
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
     launch routed_combine_shared:
-        reads (OPERAND)
         threadgroups (ceil_div(ceil_div(S, 16), 8), ceil_div(M, 64), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 2 * 10240) + 2 * 4096)
     launch routed_combine:
-        reads (OPERAND)
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(M, 64), 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 4096)
@@ -759,12 +739,8 @@ fn routed_select[M, H, E, K](residual: &tensor[M, H] f32, norm: &tensor[H] NW,
                     candidates[expert] = i32(expert)
             let winner = reduce(i32(candidates), 0, max)
             routes[row, K - 1 - rank] = winner
-            # An empty selection (no expert matched the maximum) carries no weight.
-            weights[row, K - 1 - rank] = 0.0
-            for expert in 0..E:
-                if i32(expert) == winner:
-                    weights[row, K - 1 - rank] = scores[expert]
-                    ranked[expert] = -inf
+            weights[row, K - 1 - rank] = scores[winner]
+            ranked[winner] = -inf
         let denominator = reduce(f32(weights[row]), 0, sum)
         for choice in 0..K:
             let mut w = weights[row, choice]
@@ -1132,21 +1108,13 @@ native routed_experts_up for metal from "metal/routed_experts_up.metal":
 
 native routed_experts_up for cuda from "cuda/routed_experts_up.cu":
     static (H, F)
-    params (code arithmetic OPERAND in [0, 1])
     where H % 64 == 0 and F % 64 == 0
-    scratch staged bytes (M * H * 2) when OPERAND == 1
     scratch product bytes (B * T * F * 2)
-    launch routed_experts_up_stage when OPERAND == 1:
-        reads (OPERAND)
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
     launch routed_experts_up_expand:
-        reads (OPERAND)
         threadgroups (ceil_div(ceil_div(F, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 10240) + 4096)
     launch routed_experts_up_down:
-        reads (OPERAND)
         threadgroups (ceil_div(ceil_div(H, 16), 8), ceil_div(T, 32), B)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (32 * 144 + 10240) + 4096)

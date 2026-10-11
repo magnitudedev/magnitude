@@ -1,7 +1,3 @@
-#define ATTENTION_AFFINE_HISTORY 1
-#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
-#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
-#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
 #define ATTENTION_U SEISMIC_DIM_U
@@ -66,11 +62,7 @@ kernel void attention_decode_k8v4_partial(
     // Rows per threadgroup: TOKENS decode rows packed into the matrix form's
     // rows; one row otherwise.
     constexpr uint TOKENS = SEISMIC_TUNE_TOKENS;
-    constexpr uint HEAD_BAND = SEISMIC_TUNE_HEAD_BAND;
-    constexpr uint HEAD_BANDS = HEAD_BAND == 0 ? 1 : (G + HEAD_BAND - 1) / HEAD_BAND;
-    const uint kv_head = group.x / HEAD_BANDS;
-    const uint head_band = group.x % HEAD_BANDS;
-    const uint head_base = head_band * HEAD_BAND;
+    const uint kv_head = group.x;
     const uint partition = group.y;
     const ulong row0 = group.z * TOKENS;
     const ulong row = row0;
@@ -80,7 +72,7 @@ kernel void attention_decode_k8v4_partial(
 
     // Partition 0 appends the rows' keys and values encoded, a simdgroup per
     // (row, key or value).
-    for (uint item = simd; ATTENTION_FRESH && partition == 0 && head_band == 0 && item < 2 * TOKENS; item += SIMDS) {
+    for (uint item = simd; ATTENTION_FRESH && partition == 0 && item < 2 * TOKENS; item += SIMDS) {
         const ulong appended = row0 + item / 2;
         if (appended >= SEISMIC_DIM_M)
             break;
@@ -95,7 +87,7 @@ kernel void attention_decode_k8v4_partial(
                     rotary_components, rotary_frequencies, rotary_amplitudes, epsilon, lane, x);
                 ATTENTION_UNROLL
                 for (uint i = 0; i < E; ++i)
-                    x[i] = element::Act::round(x[i]);
+                    x[i] = float(attention::Scalar(x[i]));
                 attention::encode<ATTENTION_KEY_BITS>(x,
                     slab::row<uint>(key_codes, ulong(destination), slab_rows, KV * key_lane::row_words)
                         + vector * key_lane::row_words,
@@ -105,7 +97,7 @@ kernel void attention_decode_k8v4_partial(
                 attention::head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, x);
                 ATTENTION_UNROLL
                 for (uint i = 0; i < E; ++i)
-                    x[i] = element::Act::round(x[i]);
+                    x[i] = float(attention::Scalar(x[i]));
                 attention::encode<ATTENTION_VALUE_BITS>(x,
                     slab::row<uint>(value_codes, ulong(destination), slab_rows, KV * value_lane::row_words)
                         + vector * value_lane::row_words,
@@ -118,11 +110,11 @@ kernel void attention_decode_k8v4_partial(
     if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
         return;
 #if SEISMIC_TUNE_MATRIX
-    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS, HEAD_BAND>(attention::affine_history{key_codes,
+    attention::decode_matrix<SIMDS, SEISMIC_TUNE_KEYS, PARTS, TOKENS>(attention::affine_history{key_codes,
         key_coefficients, value_codes, value_coefficients, ulong(SEISMIC_PARAM_SLAB_ROWS)}, query, key, value,
         query_norm, key_norm, value_norm, rotary_components, rotary_frequencies, rotary_amplitudes, coordinates,
         visible, fresh, partials, statistics, reinterpret_cast<threadgroup uchar *>(shared), R, SEISMIC_DIM_M, epsilon,
-        scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane, head_base);
+        scale * ATTENTION_LOG2E, SEISMIC_TUNE_SPAN, kv_head, partition, group.z, thread_index, simd, lane);
 #else
     const uint total = attention::form_total(visible, fresh, row, R);
     const uint span_keys = attention::partition_span(total, SEISMIC_TUNE_SPAN, PARTS);
@@ -147,8 +139,7 @@ kernel void attention_decode_k8v4_partial(
             lane, x);
         ATTENTION_UNROLL
         for (uint i = 0; i < E; ++i)
-            reinterpret_cast<threadgroup element::Act::storage *>(prepared)[g * W + lane * E + i] =
-                element::Act::store(x[i]);
+            prepared[g * W + lane * E + i] = attention::Scalar(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const uint head0 = (simd % SLICES) * H;
@@ -257,12 +248,10 @@ kernel void attention_decode_k8v4_partial(
                     coordinates + (ulong(lo) + (position - offset)) * 4, rotary_components, rotary_frequencies,
                     rotary_amplitudes, epsilon, lane, k[0]);
                 attention::head_norm<ATTENTION_VALUE_NORM>(value + at, value_norm, epsilon, lane, v[0]);
-                // Use the element's explicit rounding: a native bfloat cast
-                // in this register-heavy scalar loop can lower as F16 bits.
                 ATTENTION_UNROLL
                 for (uint i = 0; i < E; ++i) {
-                    k[0][i] = element::Act::round(k[0][i]);
-                    v[0][i] = element::Act::round(v[0][i]);
+                    k[0][i] = float(attention::Scalar(k[0][i]));
+                    v[0][i] = float(attention::Scalar(v[0][i]));
                 }
                 attention::absorb_heads<H, 1>(q, k, v, maximum, denominator, output, lane);
             }

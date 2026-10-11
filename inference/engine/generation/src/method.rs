@@ -1,6 +1,6 @@
 use magnitude_executor::{
     Demand, FeatureReader, FeatureRef, FeatureRows, Operation, Outcome, RequestId, SelectSpec,
-    TokenId, WeakFeatureRef,
+    TokenId,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -27,12 +27,7 @@ impl MethodChoice {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MethodRequirements {
-    /// Every prompt or replay chunk's demand.
     pub prefill_demand: Demand,
-    /// Added to the prompt chunk that closes the prompt: the one selecting
-    /// (or forcing) the first generated token. A drafter reading the
-    /// target's history needs only that chunk's final feature.
-    pub closing_demand: Demand,
     pub verify_demand: Demand,
     pub head: bool,
 }
@@ -60,24 +55,7 @@ impl MethodCheckpoint {
 pub struct DraftCheckpoint {
     pub(crate) position: usize,
     pub(crate) pending: Option<PendingRows>,
-    pub(crate) open: Option<OpenFeature>,
-}
-
-/// One target feature awaiting its successor token. Device rows are owned by
-/// executor numerical state; checkpoints never retain a graph output arena.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum OpenFeature {
-    Host(FeatureRows),
-    Device(WeakFeatureRef),
-}
-
-impl OpenFeature {
-    pub(crate) fn host_bytes(&self) -> usize {
-        match self {
-            Self::Host(rows) => rows.bytes().len(),
-            Self::Device(_) => 0,
-        }
-    }
+    pub(crate) open: Option<FeatureRows>,
 }
 
 /// Complete head input pairs: each token with the target feature of the
@@ -98,7 +76,7 @@ impl DraftCheckpoint {
     pub fn target_rows(&self) -> usize {
         self.position
             + self.pending.as_ref().map_or(0, |rows| rows.tokens.len())
-            + usize::from(self.open.is_some())
+            + self.open.as_ref().map_or(0, FeatureRows::rows)
     }
 
     pub fn retained_bytes(&self) -> u64 {
@@ -106,7 +84,7 @@ impl DraftCheckpoint {
             .pending
             .as_ref()
             .map_or(0, |rows| rows.features.bytes().len());
-        let open = self.open.as_ref().map_or(0, OpenFeature::host_bytes);
+        let open = self.open.as_ref().map_or(0, |rows| rows.bytes().len());
         (pending + open) as u64
     }
 }
@@ -148,18 +126,12 @@ pub struct MethodEffects {
 }
 
 pub trait Method: Send + Sync {
-    /// Whether each entered head row consumes its target feature's successor token.
-    fn priming_requires_successor(&self) -> bool { false }
-    /// Whether the drafter's history embeds every prompt token. Such a
-    /// drafter cannot enter prompt rows whose input is not a token (a media
-    /// span's rows are the projector's, under a placeholder token).
-    fn embeds_prompt_tokens(&self) -> bool;
     fn identity(&self) -> &str;
     fn requires(&self) -> MethodRequirements;
     /// The most proposals one round may draft.
     fn proposals(&self) -> usize;
     fn create(&self, checkpoint: Option<&MethodCheckpoint>)
-    -> Result<Box<dyn MethodState>, String>;
+        -> Result<Box<dyn MethodState>, String>;
 }
 
 /// Per-request method state remains confined to its owner thread.
@@ -175,18 +147,16 @@ pub trait MethodState {
     /// row selected, when it selected one; `draft_from` is the position the
     /// first draft after this history anchors at (the prefilled length).
     /// `primed` rows of the chunk's entry were drafted on the device behind
-    /// it (see [`MethodState::priming_position`]). `features` are present
-    /// exactly when the chunk demanded them (`prefill_demand`, and
-    /// `closing_demand` when the chunk closes the prompt).
+    /// it (see [`MethodState::priming_position`]).
     #[allow(clippy::too_many_arguments)]
     fn prime(
         &mut self,
         request: RequestId,
         tokens: &[TokenId],
         next: Option<TokenId>,
-        features: Option<FeatureRef>,
+        features: FeatureRef,
         draft_from: usize,
-        primed: Option<usize>,
+        primed: usize,
         reader: &mut dyn FeatureReader,
     ) -> Result<MethodEffects, String>;
     /// Propose one token per selection (keyed by the target's position), or

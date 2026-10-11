@@ -1,5 +1,5 @@
 //! Every catalog component's definition, pinned. For each target header in
-//! `inference/catalog/headers/` (all shards of a split
+//! `inference/validation/results/catalog-headers/` (all shards of a split
 //! target) the family that
 //! recognizes it builds its `ModelDefinition` (with the model's projector,
 //! when the catalog has one), and the `dflash` family builds each of the

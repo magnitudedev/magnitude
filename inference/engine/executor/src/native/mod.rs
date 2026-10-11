@@ -5,8 +5,6 @@ mod head;
 mod import;
 mod preparation;
 mod qualification;
-mod readout;
-mod shared_head;
 mod specialization;
 mod target;
 mod tuning;
@@ -16,21 +14,20 @@ pub(crate) use attestation::AttestedImport;
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::{
     AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,
-    AttestedSharedHead, AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision,
-    OutputScales, output_tails, reads_layer_scale,
+    AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision, OutputScales,
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    AttestedDflash2, Dflash2Kernels, Dflash2Projections, DraftBlockKernels, MarkovKernels,
+    AttestedDflash2, Dflash2Kernels, Dflash2Projections,
+    DraftBlockKernels, MarkovKernels,
 };
 use glue::GlueKernels;
 use head::HeadKernels;
+pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
-use preparation::NativePreparationCache;
 pub(crate) use preparation::kernel_requests;
+use preparation::NativePreparationCache;
 use qualification::QualificationView;
-pub use readout::ProjectionKernels;
-use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
@@ -44,12 +41,11 @@ pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
 pub use tuning::{
-    NumericalProfile, PointShape, ROTATION_LAYERS, Receipt,
-    PinnedChoice, ResolvedNumericalProfile, SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress,
-    TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent,
-    TuningLimits, UnpreparedUnits,
-    TuningObserver, TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource,
-    UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
+    attention_points, row_points, AdmittedErrorClasses, PointShape, SearchProgress, TunedEntry,
+    TuningContext,
+    TuningEvent, TuningLimits, NO_ERROR_CLASSES,
+    TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
+    ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
 };
 pub(crate) use vision::VisionKernels;
 
@@ -58,16 +54,17 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
-    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output,
-    attention_prefill, attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows,
-    dense_expand, dense_output, dense_up, draft_rows, embedding_rows, feature_copy,
-    gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
-    gated_delta_step_convolved, import_dense, moe_tail, per_layer_gate, per_layer_inputs,
-    post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
-    readout_planes_rows, readout_project_rows, readout_refine_rows, readout_selected_rows,
-    readout_top_rows, repack_weight, routed_combine, routed_down, routed_expand, routed_experts,
-    routed_experts_up, routed_gate_up, routed_group, routed_output, routed_route,
-    routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
+    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
+    attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
+    dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,
+    import_dense, moe_tail,
+    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_exact_rows,
+    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
+    readout_selected_rows, readout_top_rows, repack_weight, routed_combine, routed_down,
+    routed_expand, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_output,
+    routed_route, routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows,
+    shape_rows,
     short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
     vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
     vision_position,
@@ -117,14 +114,6 @@ pub enum CatalogFailure {
         entry: &'static str,
         statics: Vec<(String, u64)>,
     },
-    /// Not a failure of the model or the device: a load asked to report
-    /// tuning units without a stored record
-    /// ([`UnpreparedUnits::Report`](tuning::UnpreparedUnits)) met this one
-    /// and stopped before placing anything.
-    Unprepared {
-        entry: &'static str,
-        bindings: String,
-    },
 }
 
 impl fmt::Display for CatalogError {
@@ -167,10 +156,6 @@ impl fmt::Display for CatalogError {
                     "{entry} has no admissible {backend} configuration at {statics}"
                 )
             }
-            CatalogFailure::Unprepared { entry, bindings } => write!(
-                formatter,
-                "{entry} on {path} ({backend}) with {bindings} has no stored tuning record"
-            ),
         }
     }
 }

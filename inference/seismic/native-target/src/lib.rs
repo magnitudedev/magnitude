@@ -9,9 +9,7 @@
 mod description;
 mod error;
 mod native;
-pub mod process;
 mod program;
-pub mod workers;
 
 pub use description::{
     CompatibilityIdentity, DeviceDescription, DeviceDescriptionIdentity, DeviceDescriptionParts,

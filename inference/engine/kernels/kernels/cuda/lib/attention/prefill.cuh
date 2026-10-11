@@ -12,10 +12,7 @@
 // with F32 accumulation; P stays in registers (FA2). Per-row interval masks
 // apply only to K/V tiles outside the rows' common interval, and tiles past
 // every row's interval (the causal tail) are never loaded. A head wider than
-// 256 makes one such scan per 256-column output window, or (split scores, two
-// column warps over a 512-column head) one scan over whole key tiles in which
-// each column warp computes its own 256 query columns' scores and the pair adds
-// them.
+// 256 makes one such scan per 256-column output window.
 //
 // Dense history tiles are copied with `cp.async`, the next tile's copy
 // overlapping the current tile's products. Affine history is
@@ -75,22 +72,10 @@ constexpr int QT = ROWS / G;
 // registers and the stages within shared memory. Its key tiles also stage in
 // 256-column pieces, one per operand stage, the scores accumulating over the
 // pieces (the query tile is the only whole-head operand in shared memory).
-// Split scores (an entry defining ATTENTION_SPLIT_SCORES nonzero, with two or
-// four column warps over a head wider than 256): the key tile stages whole
-// (one piece) and column warp c computes the scores of its own SPAN query
-// columns only (columns [c SPAN, (c + 1) SPAN)); the row block's column warps
-// add their partial score tiles through a shared exchange, so Q K^T is
-// computed once per tile instead of once per column warp, by every column warp
-// at once. Every column warp adds the partials in column order, so their
-// softmax states agree exactly.
-#ifndef ATTENTION_SPLIT_SCORES
-#define ATTENTION_SPLIT_SCORES 0
-#endif
-constexpr bool SPLIT_SCORES = ATTENTION_SPLIT_SCORES != 0 && COLUMNS >= 2 && W > 256;
 constexpr int KEYS = W > 256 ? 16 : 32;
 constexpr int WINDOW = W > 256 * COLUMNS ? 256 * COLUMNS : W;
 constexpr int WINDOWS = W / WINDOW;
-constexpr int PIECE = W > 256 && !SPLIT_SCORES ? 256 : W;
+constexpr int PIECE = W > 256 ? 256 : W;
 constexpr int PIECES = W / PIECE;
 // 8-column output fragments per warp: its column warp's share of the window.
 constexpr int OUT = WINDOW / 8 / COLUMNS;
@@ -100,22 +85,7 @@ constexpr int PIECE_CHUNKS = PIECE / 8;
 static_assert(QT >= 1, "a block holds at least one token's query heads");
 static_assert(W % WINDOW == 0, "output windows tile the head");
 static_assert(OUT % 2 == 0 && OUT * 8 * COLUMNS == WINDOW, "column warps take fragment pairs");
-constexpr int SPAN = SPLIT_SCORES ? W / COLUMNS : PIECE;
-static_assert(!SPLIT_SCORES || (PIECE % SPAN == 0 && SPAN % 16 == 0), "a column warp's span lies in one piece");
-// The split's exchange: [PARITIES][WARPS row blocks][COLUMNS column warps]
-// [32 lanes][KEYS / 8 * 4] F32, after the span table (the entry's shared bytes
-// add PARITIES * COLUMNS * WARPS * 1024 for it). With producer warps a column
-// warp may publish its next tile's scores while the others still read this
-// tile's, so the exchange alternates two parities; the MMA warps' own staging
-// (no producers) synchronizes the block after every unit, so one suffices.
-constexpr int SPLIT_LANE_FLOATS = KEYS / 8 * 4;
-constexpr int PARITIES = ATTENTION_PRODUCER_WARPS > 0 ? 2 : 1;
-static_assert(!SPLIT_SCORES || PARITIES * WARPS * COLUMNS * 32 * SPLIT_LANE_FLOATS * 4 == PARITIES * COLUMNS * WARPS * 1024,
-              "the split exchange is the declared PARITIES * COLUMNS * WARPS * 1024 bytes");
-// Register queries hold one piece: heads up to 256 columns, or with split
-// scores each column warp's own span of the head.
-static_assert(!Q_REGISTERS || PIECES == 1 || SPLIT_SCORES,
-              "register queries hold one piece: heads up to 256 columns, or split scores");
+static_assert(!Q_REGISTERS || PIECES == 1, "register queries hold one piece: heads up to 256 columns");
 
 // MMA operand elements (16-bit floats): the element, a packed pair, and the
 // m16n8k16 product with F32 accumulation.
@@ -149,12 +119,7 @@ template <> struct Operands<DenseHistory> : Bf16Operands {};
 #else
 template <> struct Operands<DenseHistory> : F16Operands {};
 #endif
-#ifdef ATTENTION_AFFINE_HISTORY
 template <> struct Operands<AffineHistory> : F16Operands {};
-#ifdef ATTENTION_HISTORY_STAGING
-template <> struct Operands<ListedF16History> : F16Operands {};
-#endif
-#endif
 
 // Swizzled shared layout of a 16-bit [rows][ROW_CHUNKS * 8] tile (the head,
 // or an output window of it): 16-byte chunk c of row r sits at chunk c ^ (r %
@@ -246,7 +211,6 @@ __device__ __forceinline__ void stage_history(const DenseHistory &history, u8 *k
 }
 
 // ---------------------------------------------------------------------------
-#ifdef ATTENTION_AFFINE_HISTORY
 // Affine history tiles, produced by the producer warps.
 
 // Producer threads (the entry's ATTENTION_PRODUCER_WARPS warps; 0 for dense
@@ -496,17 +460,12 @@ __device__ __forceinline__ void decode_codes(const u8 *codes, u8 *k_tile, u8 *v_
     }
 }
 
-#endif
-
 // Named barriers between the MMA and the producer warps (0 is
 // `__syncthreads`): stage b is full (produced) at FULL + b and empty
 // (consumed) at EMPTY + b; the MMA warps' own barrier is MMA.
 constexpr u32 FULL = 1;
 constexpr u32 EMPTY = FULL + STAGES;
 constexpr u32 MMA_WARPS = EMPTY + STAGES;
-// Split scores: row block r's column warps meet at PAIR + r.
-constexpr u32 PAIR = MMA_WARPS + 1;
-static_assert(!SPLIT_SCORES || PAIR + WARPS <= 16, "the pairs' barriers fit the named barriers");
 __device__ __forceinline__ void named_sync(u32 id, u32 threads) {
     asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
 }
@@ -805,26 +764,6 @@ __device__ __forceinline__ void prepare(const Inputs &in, const History &history
 // for decode rows the exchange [WARPS][W] F32. The MMA warps make one pass
 // over the partition's key tiles per output window; a key tile is PIECES
 // staged units, the last carrying the window's values.
-#ifdef ATTENTION_HISTORY_STAGING
-// Each row is looked up separately. An operand tile may cross compact-page
-// or visibility gaps without changing its original span-based KEY grouping.
-__device__ __forceinline__ void stage_history(const ListedF16History &history, u8 *k_tile,
-                                               u8 *v_tile, int first, int limit, int kv, int piece,
-                                               int column0) {
-    stage_slab<false, PIECE_CHUNKS>(k_tile, KEYS, [&](int r) -> const u8 * {
-        const int token = first + r;
-        const u8 *row = token < limit ? history.key_vector(token, kv) : nullptr;
-        return row ? row + piece * PIECE * 2 : nullptr;
-    }, threadIdx.x, MMA_THREADS);
-    if (piece + 1 < PIECES) return;
-    stage_slab<false, WINDOW_CHUNKS>(v_tile, KEYS, [&](int r) -> const u8 * {
-        const int token = first + r;
-        const u8 *row = token < limit ? history.value_vector(token, kv) : nullptr;
-        return row ? row + column0 * 2 : nullptr;
-    }, threadIdx.x, MMA_THREADS);
-}
-#endif
-
 template <class History, class Rows>
 __device__ __forceinline__ void attend(const Inputs &in, const History &history, const Rows &rows,
                                        Block block) {
@@ -833,16 +772,10 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     constexpr bool CODED = History::CODED;
     // Affine history is decoded by producer warps, or without them by the
     // MMA warps from code stages (`stage_codes`, `decode_codes`).
-#ifdef ATTENTION_AFFINE_HISTORY
     constexpr bool PRODUCED = CODED && PRODUCERS > 0;
     constexpr bool INLINE = CODED && PRODUCERS == 0;
     constexpr int THREADS = MMA_THREADS + (CODED ? PRODUCERS : 0);
-#else
-    constexpr bool PRODUCED = false;
-    constexpr bool INLINE = false;
-    constexpr int THREADS = MMA_THREADS;
-#endif
-    static_assert(!INLINE || (W >= 128 && (W <= 256 || W == 512) && MMA_THREADS % KEYS == 0),
+    static_assert(!INLINE || (W >= 128 && W <= 256 && MMA_THREADS % KEYS == 0),
                   "inline decoding takes whole 16-byte pair rows and whole rows per thread group");
     const int kv = block.kv;
     const long long first_token = static_cast<long long>(block.tile) * QT;
@@ -861,23 +794,14 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     constexpr int Q_BYTES = ROWS * W * 2;
     constexpr int STAGE_BYTES = KEYS * (PIECE + WINDOW) * 2;
     // Inline decoding adds STAGES code stages after the operand stages.
-    // Split scores decode inline from a single code stage: a unit's codes
-    // are copied once the previous unit's are decoded, while its products run.
-    constexpr int CODE_STAGES = SPLIT_SCORES ? 1 : STAGES;
-#ifdef ATTENTION_AFFINE_HISTORY
-    constexpr int STAGED_BYTES = STAGES * STAGE_BYTES + (INLINE ? CODE_STAGES * CODE_STAGE_BYTES : 0);
-#else
-    constexpr int STAGED_BYTES = STAGES * STAGE_BYTES;
-#endif
+    constexpr int STAGED_BYTES = STAGES * (STAGE_BYTES + (INLINE ? CODE_STAGE_BYTES : 0));
     constexpr int REGION = Q_REGISTERS ? (Q_BYTES > STAGED_BYTES ? Q_BYTES : STAGED_BYTES)
                                        : Q_BYTES + STAGED_BYTES;
     u8 *q_tile = shared;
     u8 *kv_tiles = shared + (Q_REGISTERS ? 0 : Q_BYTES);
     auto k_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES; };
     auto v_tile = [&](int b) { return kv_tiles + b * STAGE_BYTES + KEYS * PIECE * 2; };
-#ifdef ATTENTION_AFFINE_HISTORY
-    auto code_tile = [&](int b) { return kv_tiles + STAGES * STAGE_BYTES + (b % CODE_STAGES) * CODE_STAGE_BYTES; };
-#endif
+    auto code_tile = [&](int b) { return kv_tiles + STAGES * STAGE_BYTES + b * CODE_STAGE_BYTES; };
     int *table = reinterpret_cast<int *>(shared + REGION);  // [R + 1][4]
     float *exchange = reinterpret_cast<float *>(table + (spans + 1) * 4);  // [WARPS * COLUMNS][W]
 
@@ -907,17 +831,15 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 
     // The warp's query fragments (row block warp % WARPS, every 16-column
     // step of the head), when they stay in registers.
-    u32 qa[Q_REGISTERS ? SPAN / 16 : 1][4];
+    u32 qa[Q_REGISTERS ? PIECE / 16 : 1][4];
     if constexpr (Q_REGISTERS) {
         seismic_cp_async_wait<0>();
         __syncthreads();
         if (warp < WARPS * COLUMNS) {
 #pragma unroll
-            for (int step = 0; step < SPAN / 16; ++step) {
+            for (int step = 0; step < PIECE / 16; ++step) {
                 const int row = (warp % WARPS) * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
-                // With split scores, the column warp's own span.
-                const int span0 = SPLIT_SCORES ? (warp / WARPS) * SPAN / 8 : 0;
-                seismic_ldmatrix_x4(qa[step], q_tile + swizzled(row, span0 + 2 * step + lane / 16));
+                seismic_ldmatrix_x4(qa[step], q_tile + swizzled(row, 2 * step + lane / 16));
             }
         }
         // The region is the K/V stages' from here on.
@@ -980,7 +902,6 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     // Staged units per output window.
     const int units = count * PIECES;
 
-#ifdef ATTENTION_AFFINE_HISTORY
     if constexpr (PRODUCED) {
         if (warp >= WARPS * COLUMNS) {
             // Producer warps: per output window, the partition's units in
@@ -1025,7 +946,6 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             return;
         }
     }
-#endif
 
     // MMA warps: row block `row_block` (rows 16 row_block ..), output
     // fragments [n0, n0 + OUT) of the window. This lane's two matrix rows
@@ -1042,12 +962,10 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 
     // Produced affine history: the producers stage every K/V tile, so the MMA
     // warps complete their query tile copy here.
-#ifdef ATTENTION_AFFINE_HISTORY
     if constexpr (PRODUCED) {
         seismic_cp_async_wait<0>();
         named_sync(MMA_WARPS, MMA_THREADS);
     }
-#endif
 
     const float NEG_INF = -__int_as_float(0x7f800000);
     // The output window's accumulators and both rows' softmax states, reset
@@ -1059,12 +977,6 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     Span interval_a{0, 0}, interval_b{0, 0};
     // A key tile's scores, accumulated over its pieces.
     float s[KEYS / 8][4];
-    // Split scores: this warp's column, the key piece and first 16-column step
-    // of its span, and the parity of its next exchanged tile.
-    const int column = warp / WARPS;
-    const int span_piece = column * SPAN / PIECE;
-    const int span_step = column * SPAN % PIECE / 16;
-    int parity = 0;
 
     // The products of one staged unit: S = Q K^T over the key piece's
     // columns; after the tile's last piece, the softmax and O += P V.
@@ -1073,14 +985,12 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 #pragma unroll
             for (int n = 0; n < KEYS / 8; ++n) s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
         }
-        if (!SPLIT_SCORES || piece == span_piece) {
 #pragma unroll
-        for (int index = 0; index < SPAN / 16; ++index) {
-            const int step = SPLIT_SCORES ? span_step + index : index;
+        for (int step = 0; step < PIECE / 16; ++step) {
             u32 a[4];
             if constexpr (Q_REGISTERS) {
 #pragma unroll
-                for (int e = 0; e < 4; ++e) a[e] = qa[index][e];
+                for (int e = 0; e < 4; ++e) a[e] = qa[step][e];
             } else {
                 const int row = row_block * 16 + (lane % 8) + 8 * ((lane / 8) % 2);
                 const int chunk = piece * PIECE_CHUNKS + 2 * step + lane / 16;
@@ -1098,35 +1008,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 Ops::mma(s[n + 1], a, b1);
             }
         }
-        }
         if (piece + 1 < PIECES) return;
-
-        if constexpr (SPLIT_SCORES) {
-            // Publish this warp's span scores, meet the row block's other
-            // column warps, and add every span's scores in column order.
-            float *group = exchange + ((parity * WARPS + row_block) * COLUMNS) * 32 * SPLIT_LANE_FLOATS;
-            float *own = group + (column * 32 + lane) * SPLIT_LANE_FLOATS;
-#pragma unroll
-            for (int n = 0; n < KEYS / 8; ++n)
-                *reinterpret_cast<float4 *>(own + 4 * n) = make_float4(s[n][0], s[n][1], s[n][2], s[n][3]);
-            named_sync(PAIR + row_block, COLUMNS * 32);
-#pragma unroll
-            for (int n = 0; n < KEYS / 8; ++n) {
-                const float4 mine = make_float4(s[n][0], s[n][1], s[n][2], s[n][3]);
-#pragma unroll
-                for (int c = 0; c < COLUMNS; ++c) {
-                    const float4 x = c == column ? mine
-                                                 : *reinterpret_cast<const float4 *>(
-                                                       group + (c * 32 + lane) * SPLIT_LANE_FLOATS + 4 * n);
-                    if (c == 0) {
-                        s[n][0] = x.x, s[n][1] = x.y, s[n][2] = x.z, s[n][3] = x.w;
-                    } else {
-                        s[n][0] += x.x, s[n][1] += x.y, s[n][2] += x.z, s[n][3] += x.w;
-                    }
-                }
-            }
-            parity = (parity + 1) % PARITIES;
-        }
 
         if (current.span != cached_span) {
             cached_span = current.span;
@@ -1210,7 +1092,6 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
 
         Tile current = nth(tiles_lo);
         int piece = 0;
-#ifdef ATTENTION_AFFINE_HISTORY
         if constexpr (PRODUCED) {
             // Staged unit i (counted over every window) waits for stage
             // i % STAGES to be full; once its products are issued, the stage
@@ -1224,20 +1105,15 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 if (i + STAGES < staged) named_arrive(EMPTY + b, THREADS);
                 advance(current, piece);
             }
-        } else
-#endif
-        {
+        } else {
             // A history unit goes to its operand stage, or with inline
             // decoding as codes to its code stage.
             auto issue = [&](Tile tile, int tile_piece, int buffer) {
                 if (tile.span < spans) {
-#ifdef ATTENTION_AFFINE_HISTORY
                     if constexpr (INLINE) {
                         stage_codes(history, code_tile(buffer), tile.first, table[tile.span * 4 + 1],
                                     kv, tile_piece, column0, threadIdx.x, MMA_THREADS);
-                    } else
-#endif
-                    {
+                    } else {
                         stage_history(history, k_tile(buffer), v_tile(buffer), tile.first,
                                       table[tile.span * 4 + 1], kv, tile_piece, column0);
                     }
@@ -1245,73 +1121,37 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                     stage_fresh(tile, buffer, tile_piece, column0, threadIdx.x, MMA_THREADS);
                 }
             };
+            // Unit i goes into stage i % STAGES, STAGES - 1 units ahead of
+            // the products; one copy group is committed per unit slot (empty
+            // past the last unit), so the wait for unit i is uniform.
             Tile fetch = current;
             int fetch_piece = 0;
-#ifdef ATTENTION_AFFINE_HISTORY
-            if constexpr (INLINE && SPLIT_SCORES) {
-                // One code stage: unit i's codes land, are decoded into operand
-                // stage i % STAGES, and unit i + 1's copy is issued into the
-                // freed code stage before unit i's products. The block barrier
-                // opening each unit also orders the score exchange and the
-                // operand stages' reuse.
-                if (units > 0) {
-                    issue(fetch, fetch_piece, 0);
+            for (int ahead = 0; ahead < STAGES - 1; ++ahead) {
+                if (ahead < units) {
+                    issue(fetch, fetch_piece, ahead);
                     advance(fetch, fetch_piece);
                 }
                 seismic_cp_async_commit();
-                for (int i = 0; i < units; ++i) {
-                    seismic_cp_async_wait<0>();
-                    __syncthreads();
-                    if (current.span < spans) {
-                        decode_codes(code_tile(0), k_tile(i % STAGES), v_tile(i % STAGES), true,
-                                     threadIdx.x, MMA_THREADS);
-                    }
-                    __syncthreads();
-                    if (i + 1 < units) {
-                        issue(fetch, fetch_piece, (i + 1) % STAGES);
-                        advance(fetch, fetch_piece);
-                    }
-                    seismic_cp_async_commit();
-                    if (computes) absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
-                    advance(current, piece);
+            }
+            for (int i = 0; i < units; ++i) {
+                const int ahead = i + STAGES - 1;
+                if (ahead < units) {
+                    issue(fetch, fetch_piece, ahead % STAGES);
+                    advance(fetch, fetch_piece);
                 }
+                seismic_cp_async_commit();
+                seismic_cp_async_wait<STAGES - 1>();
                 __syncthreads();
-            } else
-#endif
-            {
-                // Unit i goes into stage i % STAGES, STAGES - 1 units ahead of
-                // the products; one copy group is committed per unit slot (empty
-                // past the last unit), so the wait for unit i is uniform.
-                for (int ahead = 0; ahead < STAGES - 1; ++ahead) {
-                    if (ahead < units) {
-                        issue(fetch, fetch_piece, ahead);
-                        advance(fetch, fetch_piece);
+                if constexpr (INLINE) {
+                    if (current.span < spans) {
+                        decode_codes(code_tile(i % STAGES), k_tile(i % STAGES), v_tile(i % STAGES),
+                                     piece + 1 == PIECES, threadIdx.x, MMA_THREADS);
+                        __syncthreads();
                     }
-                    seismic_cp_async_commit();
                 }
-                for (int i = 0; i < units; ++i) {
-                    const int ahead = i + STAGES - 1;
-                    if (ahead < units) {
-                        issue(fetch, fetch_piece, ahead % STAGES);
-                        advance(fetch, fetch_piece);
-                    }
-                    seismic_cp_async_commit();
-                    seismic_cp_async_wait<STAGES - 1>();
-                    __syncthreads();
-#ifdef ATTENTION_AFFINE_HISTORY
-                    if constexpr (INLINE) {
-                        if (current.span < spans) {
-                            decode_codes(code_tile(i % STAGES), k_tile(i % STAGES), v_tile(i % STAGES),
-                                         piece + 1 == PIECES, threadIdx.x, MMA_THREADS);
-                            __syncthreads();
-                        }
-                    }
-#endif
-
-                    if (computes) absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
-                    __syncthreads();
-                    advance(current, piece);
-                }
+                if (computes) absorb_unit(current, piece, k_tile(i % STAGES), v_tile(i % STAGES));
+                __syncthreads();
+                advance(current, piece);
             }
         }
 

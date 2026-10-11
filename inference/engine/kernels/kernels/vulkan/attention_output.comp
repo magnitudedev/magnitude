@@ -72,7 +72,7 @@ projection_epilogue attention_output_output() {
 }
 
 projection_weights attention_output_weight() {
-    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), OUTPUT_GEOMETRY, OUTPUT_K, 0ul, 1ul);
+    return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_OUTPUT_WEIGHT), OUTPUT_GEOMETRY, OUTPUT_K, 0ul);
 }
 
 void attention_output_gemv() {

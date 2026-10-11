@@ -2,7 +2,7 @@
 //!
 //! The reference comes from the model's original `tokenizer.json` and
 //! `transformers` `apply_chat_template` over the GGUF's template, written by
-//! `inference/engine/chat/tests/support/tokenizer_reference.py`. Run with
+//! `inference/validation/tokenizer_reference.py`. Run with
 //! `MAGNITUDE_TEST_GGUF=<name>.gguf MAGNITUDE_TEST_REFERENCE=<name>.json
 //! cargo test -p magnitude-chat --test real_tokenizer -- --ignored`.
 //! The GGUF may be a complete file or the generator's vocabulary-only header.

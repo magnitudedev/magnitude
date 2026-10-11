@@ -2,13 +2,8 @@
 //!
 //! Compiling a program compiles its source once, with an explicit
 //! instantiation for each entry that names a template instance, and forms a
-//! pipeline per entry. Metal keeps no compiled bytes: the OS caches compiled
-//! libraries and pipelines itself, in a shader cache this toolchain can
-//! neither read nor query. What it keeps for a source text is a record of
-//! the entry lists it has compiled of that text ([`compiled`]): that this
-//! OS build compiled exactly this program before, for a process using the
-//! same store. Whether the OS still holds what it compiled then is not
-//! knowable here.
+//! pipeline per entry. Metal keeps no artifacts: the OS caches compiled
+//! libraries itself.
 
 use crate::direct::DirectPipeline;
 use crate::facts::{LanguageVersion, MetalFacts};
@@ -62,27 +57,6 @@ fn host_name(symbol: &str) -> String {
     }
 }
 
-/// One line of a source text's record: the entries a compile of it formed,
-/// in order, each with the group size its pipeline was formed to admit. The
-/// compiled text and every pipeline are functions of the source text and
-/// this list.
-fn compiled(source: &ProgramSource) -> String {
-    source
-        .entries
-        .iter()
-        .map(|entry| match entry.group_size {
-            Some([x, y, z]) => format!("{}@{x}x{y}x{z}", entry.symbol),
-            None => entry.symbol.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join("\t")
-}
-
-/// Whether the record `kept` of a source text names the entry list `line`.
-fn recorded(kept: &[u8], line: &str) -> bool {
-    std::str::from_utf8(kept).is_ok_and(|record| record.lines().any(|kept| kept == line))
-}
-
 impl Toolchain for MetalToolchain {
     type Program = Vec<DirectPipeline>;
 
@@ -90,35 +64,10 @@ impl Toolchain for MetalToolchain {
         &self.identity
     }
 
-    fn keeps(&self, source: &ProgramSource, kept: &[u8]) -> bool {
-        recorded(kept, &compiled(source))
-    }
-
     fn compile(
         &self,
         source: &ProgramSource,
-        cache: Option<&dyn ProgramCache>,
-    ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
-        let pipelines = crate::pooled(|| self.pipelines(source))?;
-        if let Some(cache) = cache {
-            let line = compiled(source);
-            let kept = cache.get().unwrap_or_default();
-            if !recorded(&kept, &line) {
-                let mut record = String::from_utf8(kept).unwrap_or_default();
-                record.push_str(&line);
-                record.push('\n');
-                cache.put(record.as_bytes());
-            }
-        }
-        Ok(pipelines)
-    }
-}
-
-impl MetalToolchain {
-    /// Compile `source` and form each entry's pipeline.
-    fn pipelines(
-        &self,
-        source: &ProgramSource,
+        _cache: Option<&dyn ProgramCache>,
     ) -> Result<Vec<DirectPipeline>, NativeCompilationError> {
         let device = self.device.handle().raw();
         let functions = form_functions(self.device.handle(), source, self.language)?;
@@ -190,27 +139,25 @@ pub fn form_functions(
             ));
         }
     }
-    crate::pooled(|| {
-        let options = crate::profile::compile_options(language);
-        let library = device
-            .raw()
-            .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
-            .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
-        source
-            .entries
-            .iter()
-            .map(|entry| {
-                let name = host_name(&entry.symbol);
-                library
-                    .newFunctionWithName(&NSString::from_str(&name))
-                    .ok_or_else(|| {
-                        NativeCompilationError::MalformedToolchainOutput(format!(
-                            "Metal library does not define kernel `{name}`"
-                        ))
-                    })
-            })
-            .collect()
-    })
+    let options = crate::profile::compile_options(language);
+    let library = device
+        .raw()
+        .newLibraryWithSource_options_error(&NSString::from_str(&text), Some(&options))
+        .map_err(|error| NativeCompilationError::ToolchainFailure(error.to_string()))?;
+    source
+        .entries
+        .iter()
+        .map(|entry| {
+            let name = host_name(&entry.symbol);
+            library
+                .newFunctionWithName(&NSString::from_str(&name))
+                .ok_or_else(|| {
+                    NativeCompilationError::MalformedToolchainOutput(format!(
+                        "Metal library does not define kernel `{name}`"
+                    ))
+                })
+        })
+        .collect()
 }
 
 /// Whether this host's Metal compiler forms tensor-operation types and
@@ -230,7 +177,7 @@ pub fn forms_tensor_operations(device: &DeviceHandle, language: LanguageVersion)
             .to_owned(),
         entries: vec![seismic_native_target::ProgramEntry::named("seismic_tensor_headers")],
     };
-    crate::pooled(|| form_functions(device, &source, language).is_ok())
+    form_functions(device, &source, language).is_ok()
 }
 
 #[cfg(test)]
@@ -260,49 +207,6 @@ mod tests {
         };
         let toolchain = MetalToolchain::new(device, facts.facts());
         assert_eq!(toolchain.compile(&source, None).unwrap().len(), 1);
-    }
-
-    /// Metal keeps no compiled bytes: it records each entry list it
-    /// compiled of a text, and only a compile of exactly a recorded list is
-    /// one the OS compiled before.
-    #[test]
-    fn a_compile_records_its_entry_list_and_only_that_list_is_kept() {
-        struct Kept(std::cell::RefCell<Option<Vec<u8>>>);
-        impl ProgramCache for Kept {
-            fn get(&self) -> Option<Vec<u8>> {
-                self.0.borrow().clone()
-            }
-            fn put(&self, bytes: &[u8]) {
-                *self.0.borrow_mut() = Some(bytes.to_vec());
-            }
-        }
-        let device = crate::test_support::metal_device();
-        let facts = crate::profile::open_device(&device)
-            .unwrap()
-            .facts()
-            .clone();
-        let toolchain = MetalToolchain::new(device, &facts);
-        let of = |symbols: &[&str]| ProgramSource {
-            text: "#include <metal_stdlib>\nusing namespace metal;\n\
-                   template <uint TILE> kernel void probe(device float* x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] *= TILE; }\n"
-                .into(),
-            entries: symbols.iter().copied().map(ProgramEntry::named).collect(),
-        };
-        let kept = Kept(std::cell::RefCell::new(None));
-        let two = of(&["probe<2>", "probe<4>"]);
-        toolchain.compile(&two, Some(&kept)).unwrap();
-        let record = kept.get().expect("the compile was recorded");
-        assert!(toolchain.keeps(&two, &record));
-        // Another instantiation list of the same text is another compile.
-        let one = of(&["probe<4>"]);
-        assert!(!toolchain.keeps(&one, &record));
-        toolchain.compile(&one, Some(&kept)).unwrap();
-        let record = kept.get().unwrap();
-        assert!(toolchain.keeps(&one, &record) && toolchain.keeps(&two, &record));
-        // Compiling a recorded list again records nothing more.
-        toolchain.compile(&two, Some(&kept)).unwrap();
-        assert_eq!(kept.get().unwrap(), record);
-        assert!(!toolchain.keeps(&two, b"\xff not a record"));
     }
 
     #[test]

@@ -10,10 +10,10 @@
 //! physical representations and codec planes; the platform policy owns each
 //! domain's stable capacity and reserve.
 
-use super::resources::{NativeGraphCharge, history_row_bytes, recurrent_bank_bytes};
+use super::resources::{history_row_bytes, recurrent_bank_bytes, NativeGraphCharge};
 use super::{
-    ComponentSelection, ModelLoadPlan, PlannedMethod, ResourceLimits, source_import_peak_bytes,
-    weight_bytes_by_component,
+    source_import_peak_bytes, weight_bytes_by_component, ComponentSelection, ModelLoadPlan,
+    PlannedMethod, ResourceLimits,
 };
 use crate::assessment::DomainFit;
 use crate::platform::{DomainRole, FitCapacity};
@@ -50,30 +50,6 @@ pub struct AssessmentMemoryBounds {
     pub prepared_resource_bytes: u64,
     pub startup_additional_bytes: u64,
     pub staging_upload_bytes: u64,
-    /// Host heap of the sealed target graphs
-    /// (`AssessmentGraphResourceBounds::sealed_target_graphs`): system RAM
-    /// like the host tables, held from sealing on.
-    pub sealed_graph_host_bytes: SealedGraphHostBytes,
-    /// Host heap of the static bindings of those graphs
-    /// (`PlannedSealedGraphs::bound`): system RAM, held from the binding of
-    /// the resident weights on, after the import.
-    pub bound_graph_host_bytes: u64,
-}
-
-/// The host heap a load's sealed target graphs hold (their plans, the
-/// prepared graphs that hold them and the family's constant values) and
-/// its state copy graphs, from both sides (`PlannedSealedGraphs`). The
-/// readout, head, draft and vision graphs are not in it. The two are one figure wherever the
-/// plan fixes which blocks share a sealed plan, and apart where blocks of
-/// one shape read layer scales the plan does not know.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SealedGraphHostBytes {
-    /// No load holds more: what a load is held to a domain's capacity by
-    /// (`AssessmentMemoryCharge::assess_fit`).
-    pub at_most: u64,
-    /// No load holds fewer: what is held to the load's own planned holding
-    /// reads this (`HostPeak::sealed_graphs`).
-    pub at_least: u64,
 }
 
 /// Header-derived charges that are known before graph formation. Prepared
@@ -93,10 +69,6 @@ pub struct AssessmentMemoryCharge {
     /// Weights and slab-rounded state at the fit depth, all exact.
     pub exact_resident_bytes: u64,
     pub bounds: AssessmentMemoryBounds,
-    /// What the device's allocation domain holds while the loaded model
-    /// serves at the fit depth: the weights, every prepared resource and the
-    /// workload's state. A first load's tuning holds no more than this.
-    pub serving_bytes: u64,
     /// Everything the device's allocation domain holds at the clean-load peak.
     pub allocation_bytes: u64,
     /// Host RAM a dedicated device's staged import holds at its peak.
@@ -139,17 +111,6 @@ pub struct AssessmentGraphResourceBounds {
     pub state: NativeGraphCharge,
     pub binding_constant_bytes: u64,
     pub total_bytes: u64,
-    /// The target graphs a load seals and the host heap they hold, from
-    /// the sealer's own enumeration: one count, or bounds from both sides
-    /// where blocks that read a layer scale could share a plan
-    /// (`PlannedSealedGraphs::exact`). Host memory, not part of
-    /// `total_bytes`.
-    pub sealed_target_graphs: crate::PlannedSealedGraphs,
-    /// The host heap of the state copy graphs a load prepares
-    /// (`PreparedStateCopyGraphs::host_heap`): their sealed plans and what
-    /// stores them, exact from the classes the load prepares. Host memory,
-    /// not part of `total_bytes`.
-    pub sealed_state_graphs: seismic::HostHeap,
 }
 
 impl AssessmentGraphResourceBounds {
@@ -165,22 +126,21 @@ impl AssessmentGraphResourceBounds {
         let plan = load
             .program_plan(definition, codec)
             .map_err(|error| error.to_string())?;
-        if plan.drafts_with_head() != matches!(method, PlannedMethod::Mtp { .. })
+        if plan.head().is_some() != matches!(method, PlannedMethod::Mtp { .. })
             || plan.draft().is_some() != matches!(method, PlannedMethod::DFlash { .. })
         {
             return Err("assessment method and drafter program disagree".into());
         }
         // The same startup slots a load commits: one request's need.
         let slots = limits.startup_slots();
-        let (target_graph, sealed_target_graphs) =
-            crate::programs::native_target_graph::checked_target_family(
-                backend,
-                load,
-                &definition.decoder,
-                state,
-                plan.target(),
-                limits,
-            )?;
+        let target_graph = crate::programs::native_target_graph::checked_target_family_storage(
+            backend,
+            load,
+            &definition.decoder,
+            state,
+            plan.target(),
+            limits,
+        )?;
         let target = NativeGraphCharge::from_checked(
             target_graph.storage,
             crate::programs::native_target_graph::target_runs_per_step(&definition.decoder),
@@ -197,40 +157,16 @@ impl AssessmentGraphResourceBounds {
             slots.readout,
         )?;
         let (head, head_constant_bytes) = match (plan.head(), plan.draft(), state.head_state()) {
-            // A head reading target history keeps no state of its own.
-            (None, None, None) if plan.shared_head().is_some() => {
-                let shared = plan
-                    .shared_head()
-                    .ok_or("a shared head program is absent")?;
-                let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
-                    definition, state, shared,
-                )?;
-                let head_graph =
-                    crate::programs::native_shared_head::checked_shared_head_family_storage(
-                        backend,
-                        load,
-                        &geometry,
-                        crate::programs::native_shared_head::shared_head_graph_classes(
-                            limits,
-                            method.draft_rows(),
-                        )?,
-                    )?;
-                (
-                    Some(NativeGraphCharge::from_checked(
-                        head_graph.storage,
-                        1,
-                        slots.head,
-                    )?),
-                    head_graph.binding_constant_bytes,
-                )
-            }
             (None, Some(draft_plan), Some(head_state)) => {
                 let draft = definition
                     .draft
                     .as_ref()
                     .ok_or("a draft program without a draft")?;
-                let geometry =
-                    crate::programs::native_draft::DraftGeometry::new(definition, head_state)?;
+                let geometry = crate::programs::native_draft::DraftGeometry::new(
+                    definition,
+                    head_state,
+                    method.draft_rows(),
+                )?;
                 let draft_graph = crate::programs::native_draft::checked_draft_family_storage(
                     backend,
                     load,
@@ -239,7 +175,6 @@ impl AssessmentGraphResourceBounds {
                     crate::programs::native_draft::draft_graph_classes(
                         limits,
                         method.draft_rows(),
-                        method.block_proposals(),
                         draft,
                     )?,
                 )?;
@@ -254,17 +189,11 @@ impl AssessmentGraphResourceBounds {
             }
             (Some(head), None, Some(head_state)) => {
                 let binding = *head.blocks().first().ok_or("head program has no block")?;
-                let head = definition
+                let head_block = definition
                     .head
                     .as_ref()
-                    .ok_or("head graph requires a draft head")?;
-                let head_block = crate::operators::EmbeddedHeadBlock::of(
-                    head,
-                    head.blocks
-                        .first()
-                        .ok_or("head graph requires a draft head block")?,
-                )
-                .map_err(|error| error.to_string())?;
+                    .and_then(|head| head.blocks.first())
+                    .ok_or("head graph requires a draft head block")?;
                 let history = head_state.sole_history()?;
                 let history_rows =
                     u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
@@ -323,16 +252,18 @@ impl AssessmentGraphResourceBounds {
             .into_iter()
             .map(|rows| rows as u64)
             .collect::<Vec<_>>();
-        let (state_storage, sealed_state_graphs) =
-            crate::programs::native_state::checked_copy_family(
+        let state = NativeGraphCharge::from_checked(
+            crate::programs::native_state::checked_copy_family_storage(
                 backend,
                 crate::programs::native_state::state_copy_classes(
                     state.target_state(),
                     state.head_state(),
                     &row_classes,
                 )?,
-            )?;
-        let state = NativeGraphCharge::from_checked(state_storage, 1, slots.state)?;
+            )?,
+            1,
+            slots.state,
+        )?;
         let binding_constant_bytes = target_graph
             .binding_constant_bytes
             .checked_add(head_constant_bytes)
@@ -360,8 +291,6 @@ impl AssessmentGraphResourceBounds {
             state,
             binding_constant_bytes,
             total_bytes,
-            sealed_target_graphs,
-            sealed_state_graphs,
         })
     }
 }
@@ -407,22 +336,6 @@ impl AssessmentHeaderBounds {
                 .ok_or("assessment prepared resource bound overflow")?,
             startup_additional_bytes: self.startup_additional_bytes,
             staging_upload_bytes: self.staging_upload_bytes,
-            // The target's sealed plans, the prepared graphs that hold
-            // them and the family's constant values, and the state copy
-            // graphs, which the plan fixes.
-            sealed_graph_host_bytes: SealedGraphHostBytes {
-                at_most: graph
-                    .sealed_target_graphs
-                    .at_most_bytes()
-                    .and_then(|bytes| bytes.checked_add(graph.sealed_state_graphs.bytes))
-                    .ok_or("assessment sealed graph bytes overflow")?,
-                at_least: graph
-                    .sealed_target_graphs
-                    .at_least_bytes()
-                    .and_then(|bytes| bytes.checked_add(graph.sealed_state_graphs.bytes))
-                    .ok_or("assessment sealed graph bytes overflow")?,
-            },
-            bound_graph_host_bytes: graph.sealed_target_graphs.bound.bytes,
         })
     }
 }
@@ -526,20 +439,14 @@ impl AssessmentMemoryTerms {
         let loading_bytes = startup_state_bytes
             .checked_add(bounds.startup_additional_bytes)
             .ok_or("assessment startup charge overflow")?;
-        let prepared_bytes = self
+        let allocation_bytes = self
             .exact_resident_bytes(0)?
             .checked_add(bounds.prepared_resource_bytes)
-            .ok_or("assessment prepared charge overflow")?;
-        let serving_bytes = prepared_bytes
-            .checked_add(state_slab_bytes)
-            .ok_or("assessment serving charge overflow")?;
-        let allocation_bytes = prepared_bytes
-            .checked_add(state_slab_bytes.max(loading_bytes))
+            .and_then(|bytes| bytes.checked_add(state_slab_bytes.max(loading_bytes)))
             .ok_or("assessment allocation charge overflow")?;
         Ok(AssessmentMemoryCharge {
             exact_resident_bytes,
             bounds,
-            serving_bytes,
             allocation_bytes,
             staging_bytes: bounds.staging_upload_bytes,
             host_table_bytes: self.host_table_bytes,
@@ -562,16 +469,14 @@ impl AssessmentMemoryCharge {
         {
             return Err("fit capacities have no allocation domain".into());
         }
-        // Host tables and the sealed graph plans are system RAM: the staging
-        // domain of a dedicated device, the allocation domain of a unified
-        // one.
+        // Host tables are system RAM: the staging domain of a dedicated
+        // device, the allocation domain of a unified one.
         let dedicated = capacities
             .iter()
             .any(|(role, _)| *role == DomainRole::Staging);
         let with_tables = |bytes: u64| {
             bytes
                 .checked_add(self.host_table_bytes)
-                .and_then(|bytes| bytes.checked_add(self.bounds.sealed_graph_host_bytes.at_most))
                 .ok_or_else(|| "domain charge with host tables overflows".to_owned())
         };
         let domains = capacities
@@ -854,9 +759,8 @@ mod tests {
         use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
         use magnitude_family_contracts::{
             ActivationFunction, ExitNorm, ExpertSelection, FeedForwardUp, Head, HeadBlock,
-            HeadChain, HeadComponent, HeadHistory, HeadInput, HeadReadout, InputNorm, Operator,
-            RmsNorm, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-            SharedExpert, SharedExpertGate, VocabularyProjection, WeightDescriptor,
+            InputNorm, Operator, RmsNorm, RouteNormalization, RoutedFfn, Router, RouterInput,
+            ScoreFunction, SharedExpert, SharedExpertGate, WeightDescriptor,
         };
 
         let mut definition = crate::planning::tests::fixture_definition();
@@ -907,18 +811,12 @@ mod tests {
         }
         definition.head = Some(Head {
             blocks: vec![HeadBlock {
-                input: HeadInput::Combine {
-                    embedding_norm: rms("embedding_norm"),
-                    hidden_norm: rms("hidden_norm"),
-                    combine: descriptor("combine", &[128, 256]),
-                },
-                blocks: vec![head_layer],
+                embedding_norm: rms("embedding_norm"),
+                hidden_norm: rms("hidden_norm"),
+                combine: descriptor("combine", &[128, 256]),
+                block: head_layer,
                 output_norm: ExitNorm::Rms(rms("output_norm")),
-                readout: HeadReadout::full(VocabularyProjection::Target),
-                chain: HeadChain::Output,
             }],
-            history: HeadHistory::Own,
-            component: HeadComponent::Target,
         });
         let mut manifest = crate::planning::tests::fixture_manifest(&definition);
         let mut offset = manifest.target.files[0].size;
@@ -959,8 +857,7 @@ mod tests {
         )
         .unwrap();
         let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-        let head = definition.head.clone().unwrap();
-        let head_block = crate::operators::EmbeddedHeadBlock::of(&head, &head.blocks[0]).unwrap();
+        let head_block = definition.head.as_ref().unwrap().blocks[0].clone();
         let head_state = state.head_state().unwrap();
         let head_history = head_state.sole_history().unwrap();
         let classes = crate::programs::native_head::head_graph_classes(
@@ -972,16 +869,14 @@ mod tests {
         )
         .unwrap();
         assert!(classes.iter().any(|class| class.steps == 1 && class.shaped));
-        assert!(
-            classes
-                .iter()
-                .any(|class| class.entry_rows > crate::operators::routed::fused_graph::DECODE_ROWS)
-        );
+        assert!(classes
+            .iter()
+            .any(|class| class.entry_rows > crate::operators::routed::fused_graph::DECODE_ROWS));
         let family = crate::programs::native_head::checked_head_family_storage(
             BackendName::Cpu,
             &load,
             &definition.decoder,
-            head_block,
+            &head_block,
             plan.head().unwrap().blocks()[0],
             classes.clone(),
         )
@@ -990,7 +885,7 @@ mod tests {
             BackendName::Cpu,
             &load,
             &definition.decoder,
-            head_block,
+            &head_block,
             plan.head().unwrap().blocks()[0],
             &classes,
         )
@@ -1025,8 +920,10 @@ mod tests {
             target.binding_constant_bytes + family.binding_constant_bytes
         );
 
-        // Candidate views do not change resource metadata. This fixture
-        // explicitly finalizes a selected-row class before forming both recipes.
+        // A Q8_0 output head a backend reads progressively: the head projects
+        // the planes' leading draft-vocabulary rows, certifying the drafting
+        // slots the backend's bound covers (Metal's one of the two here, so
+        // both forms seal).
         let output = manifest
             .target
             .tensors
@@ -1047,27 +944,11 @@ mod tests {
                 crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
             )
             .unwrap()
-            .with_readout_candidates(&definition)
+            .with_progressive_head(&definition)
             .unwrap();
-            let candidate_plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-            assert!(matches!(
-                candidate_plan.head().unwrap().blocks()[0].projection,
-                crate::ReadoutHead::Packed { .. }
-            ));
-            let load = load
-                .finalize_readout(&[crate::ReadoutClassChoice {
-                    scope: magnitude_family_contracts::WeightScope::Target,
-                    norm_scope: magnitude_family_contracts::WeightScope::HeadBlock(0),
-                    prepared: true,
-                    rows: vec![1],
-                }])
-                .unwrap();
             let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
             let binding = plan.head().unwrap().blocks()[0];
-            assert!(matches!(
-                binding.projection,
-                crate::ReadoutHead::Qualified { .. }
-            ));
+            assert_eq!(binding.projection, crate::HeadProjection::Progressive);
             let classes = crate::programs::native_head::head_graph_classes(
                 limits,
                 head_history.rows as u64,
@@ -1080,7 +961,7 @@ mod tests {
                 backend,
                 &load,
                 &definition.decoder,
-                head_block,
+                &head_block,
                 binding,
                 classes.clone(),
             )
@@ -1090,7 +971,7 @@ mod tests {
                 backend,
                 &load,
                 &definition.decoder,
-                head_block,
+                &head_block,
                 binding,
                 &classes,
             )
@@ -1165,10 +1046,9 @@ mod tests {
             offset += nbytes;
         }
         manifest.target.files[0].size = offset;
-        definition.head.as_mut().unwrap().blocks[0].blocks[0].sublayers[1].op =
-            Operator::RoutedFfn(Box::new(routed));
-        let head = definition.head.clone().unwrap();
-        let head_block = crate::operators::EmbeddedHeadBlock::of(&head, &head.blocks[0]).unwrap();
+        let head = &mut definition.head.as_mut().unwrap().blocks[0];
+        head.block.sublayers[1].op = Operator::RoutedFfn(Box::new(routed));
+        let head_block = head.clone();
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -1188,7 +1068,7 @@ mod tests {
             BackendName::Cpu,
             &load,
             &definition.decoder,
-            head_block,
+            &head_block,
             plan.head().unwrap().blocks()[0],
             crate::programs::native_head::head_graph_classes(
                 limits,
@@ -1215,404 +1095,6 @@ mod tests {
             routed_pools.head.unwrap().workspace_bytes,
             routed_family.storage.workspace
         );
-    }
-
-    /// A draft head of its own width that reads the target's history and is
-    /// stored in the draft component (the Gemma 4 assistant's form): the
-    /// fixture target's layer under head names at width 96, its attention
-    /// Shared with the target's only attention layer.
-    fn target_reading_head_fixture() -> (ModelDefinition, magnitude_artifacts::PackageManifest) {
-        use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
-        use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
-        use magnitude_family_contracts::{
-            ExitNorm, FeedForwardUp, Head, HeadBlock, HeadChain, HeadComponent, HeadHistory,
-            HeadInput, HeadNorm, HeadReadout, InputNorm, KeyValue, Operator, RmsNorm,
-            SublayerIndex, VocabularyProjection, WeightDescriptor,
-        };
-        const WIDTH: u64 = 96;
-        let mut definition = crate::planning::tests::fixture_definition();
-        let manifest = crate::planning::tests::fixture_manifest(&definition);
-        let (hidden, vocabulary) = (definition.decoder.hidden, definition.decoder.vocabulary);
-        let descriptor =
-            |name: &str, shape: &[u64]| WeightDescriptor::stored(format!("head_{name}"), shape);
-        let rms = |name: &str, width: u64| RmsNorm {
-            weight: descriptor(name, &[width]),
-            epsilon: 1e-6,
-        };
-        let mut block = definition.decoder.blocks[0].clone();
-        for (index, sublayer) in block.sublayers.iter_mut().enumerate() {
-            sublayer.input = InputNorm::Rms(rms(&format!("input_norm_{index}"), WIDTH));
-            match &mut sublayer.op {
-                Operator::Attention(attention) => {
-                    let [rows, _] = attention.query.shape[..] else {
-                        unreachable!()
-                    };
-                    attention.query = descriptor("query", &[rows, WIDTH]);
-                    let [_, columns] = attention.output.shape[..] else {
-                        unreachable!()
-                    };
-                    attention.output = descriptor("attention_output", &[WIDTH, columns]);
-                    if let HeadNorm::Rms(norm) = &mut attention.query_norm {
-                        norm.weight = descriptor("query_norm", &norm.weight.shape);
-                    }
-                    attention.key_value = KeyValue::Shared {
-                        source: SublayerIndex {
-                            block: 0,
-                            sublayer: 0,
-                        },
-                    };
-                }
-                Operator::DenseFfn(dense) => {
-                    let FeedForwardUp::Gated { gate, up, .. } = &mut dense.up else {
-                        unreachable!()
-                    };
-                    *gate = descriptor("gate", &[dense.intermediate, WIDTH]);
-                    *up = descriptor("up", &[dense.intermediate, WIDTH]);
-                    dense.down = descriptor("down", &[WIDTH, dense.intermediate]);
-                }
-                _ => unreachable!(),
-            }
-        }
-        definition.head = Some(Head {
-            blocks: vec![HeadBlock {
-                input: HeadInput::Projected {
-                    pre: descriptor("pre_projection", &[WIDTH, 2 * hidden]),
-                    embedding_scale: definition.decoder.entry.scale,
-                },
-                blocks: vec![block],
-                output_norm: ExitNorm::Rms(rms("output_norm", WIDTH)),
-                readout: HeadReadout::full(VocabularyProjection::Own {
-                    table: descriptor("table", &[vocabulary, WIDTH]),
-                }),
-                chain: HeadChain::Projected {
-                    post: descriptor("post_projection", &[hidden, WIDTH]),
-                },
-            }],
-            history: HeadHistory::Target,
-            component: HeadComponent::Draft,
-        });
-        definition.validate().unwrap();
-        let mut offset = 0;
-        let tensors = crate::operators::head_weights(definition.head.as_ref().unwrap())
-            .unwrap()
-            .into_iter()
-            .map(|(_, descriptor)| {
-                let nbytes = descriptor.shape.iter().product::<u64>() * 2;
-                let tensor = TensorDescriptor {
-                    name: descriptor.name.clone(),
-                    shape: descriptor.shape.clone(),
-                    encoding: Encoding::F16,
-                    offset,
-                    nbytes,
-                };
-                offset += nbytes;
-                tensor
-            })
-            .collect();
-        let manifest = magnitude_artifacts::PackageManifest {
-            draft: Some(ComponentManifest {
-                files: vec![ComponentFile {
-                    path: "assistant-fixture.gguf".into(),
-                    size: offset,
-                }],
-                identity: ArtifactIdentity([9; 32]),
-                tensors,
-            }),
-            ..manifest
-        };
-        (definition, manifest)
-    }
-
-    /// A head reading target history plans its own program over the draft
-    /// component's weights, keeps no state store, and its checked graph
-    /// family is the head charge of header assessment.
-    #[test]
-    fn target_reading_head_plans_its_program_weights_and_charge() {
-        let (definition, manifest) = target_reading_head_fixture();
-        let load = ModelLoadPlan::derive(
-            &manifest,
-            &definition,
-            ComponentSelection {
-                head: true,
-                vision: false,
-            },
-            Layout::Rows16,
-        )
-        .unwrap();
-        // Every head weight, its own vocabulary table and both projections
-        // included, is the draft component's.
-        let head_weights = load.head.as_ref().unwrap();
-        assert_eq!(
-            head_weights.len(),
-            crate::operators::head_weights(definition.head.as_ref().unwrap())
-                .unwrap()
-                .len()
-        );
-        assert!(
-            head_weights
-                .iter()
-                .all(|weight| weight.component.kind == crate::ArtifactComponentKind::Draft)
-        );
-        let method = PlannedMethod::Mtp {
-            greedy_proposals: 3,
-            sampled_proposals: 3,
-        };
-        let limits = fixture_limits(false);
-        let state = crate::ResourcePlanner::state_plan(
-            &definition,
-            &load,
-            method,
-            KvCodec::Dense,
-            limits,
-            crate::ResourceCapacity {
-                domain_bytes: 512 * 1024 * 1024,
-                tensor_operations: crate::TensorOperations::Absent,
-            },
-        )
-        .unwrap();
-        assert!(state.head_state().is_none());
-        let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-        assert!(plan.head().is_none() && plan.draft().is_none());
-        assert!(plan.drafts_with_head());
-        let shared = plan.shared_head().unwrap();
-        assert_eq!((shared.width, shared.blocks.len()), (96, 1));
-        let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
-            &definition,
-            &state,
-            shared,
-        )
-        .unwrap();
-        let classes =
-            crate::programs::native_shared_head::shared_head_graph_classes(limits, 3).unwrap();
-        assert!(classes.iter().any(|class| class.steps == 3 && class.shaped));
-        let family = crate::programs::native_shared_head::checked_shared_head_family_storage(
-            BackendName::Cpu,
-            &load,
-            &geometry,
-            classes,
-        )
-        .unwrap();
-        assert!(family.storage.workspace > 0);
-        assert!(family.storage.output > 0);
-        let pools = AssessmentGraphResourceBounds::derive(
-            &definition,
-            &load,
-            &state,
-            method,
-            KvCodec::Dense,
-            limits,
-            BackendName::Cpu,
-        )
-        .unwrap();
-        assert_eq!(
-            pools.head.unwrap().workspace_bytes,
-            family.storage.workspace
-        );
-    }
-
-    /// A separate draft keeps its full packed logits: the projection it
-    /// reads, the target's or its own, is stored packed and never as views.
-    #[test]
-    fn a_projection_a_separate_draft_reads_is_stored_packed() {
-        use magnitude_artifacts::gguf::{Encoding, TensorDescriptor};
-        use magnitude_artifacts::{ArtifactIdentity, ComponentFile, ComponentManifest};
-        use magnitude_family_contracts::{
-            BlockAttention, BlockLayout, DraftDefinition, DraftEmbedding, DraftMethod, RmsNorm,
-            TapPoint, TokenId, WeightDescriptor,
-        };
-        for owns_output in [false, true] {
-            let mut definition = crate::planning::tests::fixture_definition();
-            let mut manifest = crate::planning::tests::fixture_manifest(&definition);
-            let (hidden, vocabulary) = (definition.decoder.hidden, definition.decoder.vocabulary);
-            let norm = |name: &str| RmsNorm {
-                weight: WeightDescriptor::stored(name, &[hidden]),
-                epsilon: 1e-6,
-            };
-            definition.draft = Some(DraftDefinition {
-                method: DraftMethod::DFlash,
-                taps: vec![TapPoint::Exit],
-                fusion: WeightDescriptor::stored("draft_fusion", &[hidden, hidden]),
-                fusion_norm: norm("draft_fusion_norm"),
-                embedding: DraftEmbedding::Target,
-                output: owns_output
-                    .then(|| WeightDescriptor::stored("draft_output", &[vocabulary, hidden])),
-                embedding_scale: 1.0,
-                blocks: definition.decoder.blocks.clone(),
-                block_attention: vec![BlockAttention::Bidirectional],
-                output_norm: norm("draft_output_norm"),
-                logit_softcap: Some(0.1),
-                block_size: 2,
-                mask_token: TokenId(0),
-                layout: BlockLayout::MaskSlots,
-            });
-            definition.validate().unwrap();
-            let draft = definition.draft.as_ref().unwrap();
-            let mut offset = 0;
-            let tensors = crate::operators::draft::fusion_weights(draft)
-                .into_iter()
-                .chain(crate::operators::draft::draft_weights(draft).unwrap())
-                .map(|(_, descriptor)| {
-                    let nbytes = descriptor.shape.iter().product::<u64>() * 2;
-                    let tensor = TensorDescriptor {
-                        name: descriptor.name.clone(),
-                        shape: descriptor.shape.clone(),
-                        encoding: Encoding::F16,
-                        offset,
-                        nbytes,
-                    };
-                    offset += nbytes;
-                    tensor
-                })
-                .collect();
-            manifest.draft = Some(ComponentManifest {
-                files: vec![ComponentFile {
-                    path: "draft-fixture.gguf".into(),
-                    size: offset,
-                }],
-                identity: ArtifactIdentity([9; 32]),
-                tensors,
-            });
-            let (component, descriptor) = match &draft.output {
-                Some(output) => (manifest.draft.as_mut().unwrap(), output),
-                None => (&mut manifest.target, &definition.decoder.exit.output),
-            };
-            let output = component
-                .tensors
-                .iter_mut()
-                .find(|tensor| tensor.name == descriptor.name)
-                .unwrap();
-            output.encoding = Encoding::Q8_0;
-            output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
-            let load = ModelLoadPlan::derive(
-                &manifest,
-                &definition,
-                ComponentSelection {
-                    head: true,
-                    vision: false,
-                },
-                Layout::Rows16,
-            )
-            .unwrap()
-            .with_readout_candidates(&definition)
-            .unwrap();
-            let candidate_plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-            assert!(matches!(
-                candidate_plan.draft().unwrap().projection(),
-                crate::ReadoutHead::Packed { .. }
-            ));
-            // A weight has one stored form, and the draft has no kernel for
-            // the views: a projection it reads is not offered as them,
-            // whether it is the target's or the draft's own, so no reader
-            // of it can select a class.
-            let read_by_draft = if owns_output {
-                magnitude_family_contracts::WeightScope::Draft
-            } else {
-                magnitude_family_contracts::WeightScope::Target
-            };
-            assert!(
-                !load
-                    .readout_candidates()
-                    .iter()
-                    .any(|candidate| candidate.role.scope == read_by_draft),
-                "a projection the draft reads is not offered as views"
-            );
-            assert!(
-                load.clone()
-                    .finalize_readout(&[crate::ReadoutClassChoice {
-                        scope: magnitude_family_contracts::WeightScope::Target,
-                        norm_scope: magnitude_family_contracts::WeightScope::Target,
-                        prepared: false,
-                        rows: vec![1],
-                    }])
-                    .is_err()
-            );
-            let load = load.finalize_readout(&[]).unwrap();
-            let limits = fixture_limits(false);
-            let state = crate::ResourcePlanner::state_plan(
-                &definition,
-                &load,
-                PlannedMethod::DFlash {
-                    proposals: 1,
-                    generated: 1,
-                },
-                KvCodec::Dense,
-                limits,
-                crate::ResourceCapacity {
-                    domain_bytes: 512 << 20,
-                    tensor_operations: crate::TensorOperations::Absent,
-                },
-            )
-            .unwrap();
-            let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
-            let draft_plan = plan.draft().unwrap();
-            // The draft's block pass projects every proposing row through
-            // the packed weight, whichever component owns it, and the
-            // target's readout reads the same one form.
-            assert!(matches!(
-                plan.target().readout().head,
-                crate::ReadoutHead::Packed { .. }
-            ));
-            assert!(matches!(
-                draft_plan.projection(),
-                crate::ReadoutHead::Packed { .. }
-            ));
-            assert_eq!(
-                draft_plan.projection_scope(),
-                if owns_output {
-                    magnitude_family_contracts::WeightScope::Draft
-                } else {
-                    magnitude_family_contracts::WeightScope::Target
-                }
-            );
-            let geometry = crate::programs::native_draft::DraftGeometry::new(
-                &definition,
-                state.head_state().unwrap(),
-            )
-            .unwrap();
-            let class = crate::programs::native_draft::DraftGraphClass {
-                entry_rows: 1,
-                slots: 1,
-                proposals: 1,
-                shaped: false,
-                windowed: true,
-                device: false,
-            };
-            let family = crate::programs::native_draft::checked_draft_family_storage(
-                BackendName::Metal,
-                &load,
-                draft_plan,
-                &geometry,
-                [class],
-            )
-            .unwrap();
-            assert!(family.storage.workspace > 0 && family.storage.output > 0);
-        }
-    }
-
-    /// A head reading target history whose embedding scale differs from
-    /// the target's entry transform is refused: its graphs gather rows
-    /// through the target's embedding entry.
-    #[test]
-    fn target_reading_head_must_scale_the_embedding_as_its_target() {
-        use magnitude_family_contracts::{EmbeddingScale, HeadInput};
-        let (mut definition, _) = target_reading_head_fixture();
-        let head = definition.head.as_mut().unwrap();
-        let HeadInput::Projected {
-            embedding_scale, ..
-        } = &mut head.blocks[0].input
-        else {
-            unreachable!()
-        };
-        assert_eq!(*embedding_scale, EmbeddingScale::Unit);
-        *embedding_scale = EmbeddingScale::SqrtHidden;
-        assert!(matches!(
-            crate::operators::admit(&definition, true),
-            Err(crate::PlanError::Unsupported(
-                "a draft head scaling the target's embedding differently"
-            ))
-        ));
-        // An unselected head does not bear on the model.
-        crate::operators::admit(&definition, false).unwrap();
     }
 
     #[test]
@@ -1913,9 +1395,6 @@ mod tests {
             head: None,
             vision: Some(weights),
             host_tables: Vec::new(),
-            readout_candidates: Vec::new(),
-            readout_choices: Vec::new(),
-            unplaced_output: Vec::new(),
         };
         let program = crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
         let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());
@@ -2003,20 +1482,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(pipelined.recurrent_banks, 4);
-        assert!(
-            AssessmentMemoryTerms::derive(
-                &definition,
-                &load,
-                selection,
-                KvCodec::Dense,
-                PlannedMethod::Mtp {
-                    greedy_proposals: 1,
-                    sampled_proposals: 1,
-                },
-                limits,
-            )
-            .is_err()
-        );
+        assert!(AssessmentMemoryTerms::derive(
+            &definition,
+            &load,
+            selection,
+            KvCodec::Dense,
+            PlannedMethod::Mtp {
+                greedy_proposals: 1,
+                sampled_proposals: 1,
+            },
+            limits,
+        )
+        .is_err());
 
         let header =
             AssessmentHeaderBounds::derive(&definition, &load, KvCodec::Dense, BackendName::Cpu)
@@ -2116,13 +1593,7 @@ mod tests {
                 prepared_resource_bytes: 0,
                 startup_additional_bytes: 0,
                 staging_upload_bytes: staging_bytes,
-                sealed_graph_host_bytes: SealedGraphHostBytes {
-                    at_most: 0,
-                    at_least: 0,
-                },
-                bound_graph_host_bytes: 0,
             },
-            serving_bytes: allocation_bytes,
             allocation_bytes,
             staging_bytes,
             host_table_bytes: 0,
@@ -2146,34 +1617,24 @@ mod tests {
             prepared_resource_bytes: 40,
             startup_additional_bytes: 60,
             staging_upload_bytes: 7,
-            sealed_graph_host_bytes: SealedGraphHostBytes {
-                at_most: 0,
-                at_least: 0,
-            },
-            bound_graph_host_bytes: 0,
         };
         // The workload's state outgrows the load's startup state and peak:
         // the peak is not charged on top of it.
         let charge = terms.charge(bounds, 90, 10).unwrap();
         assert_eq!(charge.exact_resident_bytes, 100 + 20 + 5 + 90);
         assert_eq!(charge.allocation_bytes, 125 + 40 + 90);
-        assert_eq!(charge.serving_bytes, 125 + 40 + 90);
         assert_eq!(charge.staging_bytes, 7);
-        // The load's startup state and peak exceed the workload's state:
-        // serving holds the workload's state, not the load's peak.
+        // The load's startup state and peak exceed the workload's state.
         let loading = terms.charge(bounds, 50, 10).unwrap();
         assert_eq!(loading.allocation_bytes, 125 + 40 + (10 + 60));
-        assert_eq!(loading.serving_bytes, 125 + 40 + 50);
         assert!(terms.charge(bounds, u64::MAX, 10).is_err());
         assert!(terms.charge(bounds, 50, u64::MAX).is_err());
-        assert!(
-            AssessmentMemoryTerms {
-                history_per_token: u64::MAX,
-                ..terms
-            }
-            .history_at_fit_depth()
-            .is_err()
-        );
+        assert!(AssessmentMemoryTerms {
+            history_per_token: u64::MAX,
+            ..terms
+        }
+        .history_at_fit_depth()
+        .is_err());
     }
 
     #[test]
@@ -2251,11 +1712,9 @@ mod tests {
                 deficit_bytes: 101,
             }
         );
-        assert!(
-            fixture_charge(1, 0)
-                .assess_fit(&[(DomainRole::Staging, domain(100, 0))])
-                .is_err()
-        );
+        assert!(fixture_charge(1, 0)
+            .assess_fit(&[(DomainRole::Staging, domain(100, 0))])
+            .is_err());
 
         // Host tables are system RAM: charged to a unified device's
         // allocation domain, and to a dedicated device's staging domain.
@@ -2268,18 +1727,5 @@ mod tests {
         let dedicated_tables = tables.assess_fit(&dedicated).unwrap();
         assert_eq!(dedicated_tables.domains[0].required_bytes, 800);
         assert_eq!(dedicated_tables.domains[1].required_bytes, 350);
-
-        // The sealed graph plans are system RAM beside the tables.
-        let mut sealed = tables;
-        // A load is held to a domain by the most they may hold.
-        sealed.bounds.sealed_graph_host_bytes = SealedGraphHostBytes {
-            at_most: 20,
-            at_least: 15,
-        };
-        let unified_sealed = sealed.assess_fit(&unified).unwrap();
-        assert_eq!(unified_sealed.domains[0].required_bytes, 870);
-        let dedicated_sealed = sealed.assess_fit(&dedicated).unwrap();
-        assert_eq!(dedicated_sealed.domains[0].required_bytes, 800);
-        assert_eq!(dedicated_sealed.domains[1].required_bytes, 370);
     }
 }

@@ -102,7 +102,7 @@ fn word(ty: &ValueType) -> bool {
 /// L24: the width `w` of `s : s + w` (or `s : w + s`) when `w` is a
 /// nonnegative constant or a quantity. A quantity written into a word
 /// addition keeps its exact value as the width.
-pub(super) fn static_width(
+fn static_width(
     arena: &crate::expr::ExprArena,
     start: &Option<CheckedExpr>,
     end: &Option<CheckedExpr>,
@@ -140,7 +140,7 @@ pub(super) fn static_width(
         } if quantity(&operands[0].ty) => &operands[0],
         _ => width,
     };
-    let value = width.integer()?;
+    let value = width.sym?;
     (quantity(&width.ty) || super::prove::constant(arena, value).is_some_and(|c| c >= 0))
         .then_some(value)
 }
@@ -157,7 +157,6 @@ fn operand_dtype(ty: &ValueType) -> Option<DType> {
 impl<'a> Checker<'a> {
     pub fn expr(&mut self, e: &ast::Expr, expected: Option<&ValueType>) -> Option<CheckedExpr> {
         self.expr_inner(e, expected, false)
-            .map(|value| self.word_value(value))
     }
 
     pub fn scalar_expr(
@@ -167,8 +166,7 @@ impl<'a> Checker<'a> {
         sym: Option<IntExpr>,
         span: Span,
     ) -> CheckedExpr {
-        let value = CheckedExpr::new(kind, ValueType::Scalar(dtype), sym, span);
-        self.word_value(value)
+        CheckedExpr::new(kind, ValueType::Scalar(dtype), sym, span)
     }
 
     /// A checked primitive, with the checker's proof about its failures.
@@ -181,7 +179,7 @@ impl<'a> Checker<'a> {
         span: Span,
     ) -> CheckedExpr {
         let failure = self.primitive_failure(&id, &operands);
-        let value = CheckedExpr::new(
+        CheckedExpr::new(
             CheckedExprKind::Primitive {
                 id,
                 operands,
@@ -190,8 +188,7 @@ impl<'a> Checker<'a> {
             ty,
             sym,
             span,
-        );
-        self.word_value(value)
+        )
     }
 
     /// The only constructor of `PrimitiveFailure`: `ProvedAbsent` when the
@@ -212,29 +209,25 @@ impl<'a> Checker<'a> {
         match id {
             PrimitiveId::Binary(BinaryOp::Div | BinaryOp::Rem) => {
                 let divisor = &operands[1];
-                let Some(d) = divisor.integer() else {
+                let Some(d) = divisor.sym else {
                     return PrimitiveFailure::Possible;
                 };
                 let one = self.arena.int(1);
                 let positive = self.arena.int_sub(d, one);
-                if super::prove::derive_nonnegative(&mut self.arena, &self.facts, positive)
-                    .is_established()
-                {
+                if super::prove::nonneg(&self.arena, &self.facts, positive) {
                     return PrimitiveFailure::ProvedAbsent;
                 }
                 proved(quantity(&divisor.ty) && self.facts.nonzero(&mut self.arena, d))
             }
             PrimitiveId::Binary(BinaryOp::Shl | BinaryOp::Shr) => {
-                let Some(c) = operands[1].integer() else {
+                let Some(c) = operands[1].sym else {
                     return PrimitiveFailure::Possible;
                 };
                 let thirty_one = self.arena.int(31);
                 let headroom = self.arena.int_sub(thirty_one, c);
                 proved(
-                    super::prove::derive_nonnegative(&mut self.arena, &self.facts, c)
-                        .is_established()
-                        && super::prove::derive_nonnegative(&mut self.arena, &self.facts, headroom)
-                            .is_established(),
+                    super::prove::nonneg(&self.arena, &self.facts, c)
+                        && super::prove::nonneg(&self.arena, &self.facts, headroom),
                 )
             }
             _ => {
@@ -353,19 +346,13 @@ impl<'a> Checker<'a> {
                 let order = self.arena.int_sub(hi_sym, lo_sym);
                 let tail = self.arena.int_sub(bound, hi_sym);
                 let mut unproved = Vec::new();
-                if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, lo_sym)
-                    .is_established()
-                {
+                if !super::prove::nonneg(&self.arena, &self.facts, lo_sym) {
                     unproved.push(format!("0 <= {}", self.text(lo.span)));
                 }
-                if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, order)
-                    .is_established()
-                {
+                if !super::prove::nonneg(&self.arena, &self.facts, order) {
                     unproved.push(format!("{} <= {}", self.text(lo.span), self.text(hi.span)));
                 }
-                if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, tail)
-                    .is_established()
-                {
+                if !super::prove::nonneg(&self.arena, &self.facts, tail) {
                     unproved.push(format!("{} <= {}", self.text(hi.span), self.render(bound)));
                 }
                 if !unproved.is_empty() {
@@ -486,14 +473,18 @@ impl<'a> Checker<'a> {
                 return None;
             }
             let ty = self.locals[id.index()].ty.clone();
-            let _ = place_context;
-            let mut value = CheckedExpr::new(CheckedExprKind::Local(id), ty, None, n.span);
-            value.value = self
-                .source_values
+            let sym = self
+                .symbols
                 .get(&id)
-                .cloned()
-                .unwrap_or_else(|| self.locals[id.index()].value.clone());
-            return Some(self.word_value(value));
+                .map(|symbol| self.arena.int_symbol(*symbol))
+                .or_else(|| self.scalar_symbols.get(&id).copied());
+            let _ = place_context;
+            return Some(CheckedExpr::new(
+                CheckedExprKind::Local(id),
+                ty,
+                sym,
+                n.span,
+            ));
         }
         if let Some(ordinal) = self
             .sig
@@ -656,11 +647,7 @@ impl<'a> Checker<'a> {
             match index {
                 ast::Index::Expr(e) => {
                     let i = self.index_value(e, "a point index")?;
-                    let s = i
-                        .binding()
-                        .map(|binding| self.arena.int_symbol(binding))
-                        .or_else(|| i.integer());
-                    let Some(s) = s else {
+                    let Some(s) = i.sym else {
                         point(&mut packed_axis, position);
                         out.push(CheckedIndex::Point {
                             value: i,
@@ -706,16 +693,8 @@ impl<'a> Checker<'a> {
                     }
                     let [start, end] = bounds;
                     let zero = self.arena.int(0);
-                    let lo = start.as_ref().map_or(Some(zero), |b| {
-                        b.binding()
-                            .map(|binding| self.arena.int_symbol(binding))
-                            .or_else(|| b.integer())
-                    });
-                    let hi = end.as_ref().map_or(Some(extent), |b| {
-                        b.binding()
-                            .map(|binding| self.arena.int_symbol(binding))
-                            .or_else(|| b.integer())
-                    });
+                    let lo = start.as_ref().map_or(Some(zero), |b| b.sym);
+                    let hi = end.as_ref().map_or(Some(extent), |b| b.sym);
                     let width = static_width(&self.arena, &start, &end);
                     let (kept, checks) = match (lo, hi) {
                         (Some(lo), Some(hi)) => {
@@ -737,8 +716,7 @@ impl<'a> Checker<'a> {
                             // addition that may wrap keeps a width check.
                             let check_width = width.is_some_and(|w| {
                                 let realized = self.arena.int_sub(order, w);
-                                !super::prove::derive_zero(&mut self.arena, &self.facts, realized)
-                                    .is_established()
+                                !super::prove::zero(&self.arena, &self.facts, realized)
                             });
                             (
                                 width.unwrap_or(order),
@@ -943,17 +921,12 @@ impl<'a> Checker<'a> {
         Some(self.primitive_expr(PrimitiveId::TensorAlloc, operands, ty, None, span))
     }
 
-    /// Geometry references the dominating source word publication. Pure
-    /// mathematical/header quantities retain their exact host expression.
+    /// The one symbol an integer value has at a quantity position (I-90): a
+    /// word's `word_value` symbol, or a quantity's exact symbol. A quantity
+    /// with no exact symbol has no provable range.
     pub fn position_value(&mut self, value: CheckedExpr) -> Option<(CheckedExpr, IntExpr)> {
         let value = self.word_value(value);
-        let quantity = match value.value.scalar_value() {
-            Some(super::ir::SourceScalar::Word { binding, .. }) => {
-                Some(self.arena.int_symbol(binding))
-            }
-            _ => value.integer(),
-        };
-        match quantity {
+        match value.sym {
             Some(sym) => Some((value, sym)),
             None => {
                 let text = self.text(value.span).to_owned();
@@ -1165,7 +1138,7 @@ impl<'a> Checker<'a> {
             return None;
         }
         if quantity(&inner.ty) {
-            let Some(value) = inner.integer() else {
+            let Some(value) = inner.sym else {
                 self.error(
                     DiagnosticRule::Type,
                     span,
@@ -1260,7 +1233,7 @@ impl<'a> Checker<'a> {
             } else if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = r.ty {
                 l = self.quantity_to_word(l, dtype);
             } else {
-                let (Some(a), Some(b)) = (l.integer(), r.integer()) else {
+                let (Some(a), Some(b)) = (l.sym, r.sym) else {
                     self.error(
                         DiagnosticRule::Type,
                         span,
@@ -1335,7 +1308,7 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             }
-            if r.integer()
+            if r.sym
                 .and_then(|value| super::prove::constant(&self.arena, value))
                 .is_some_and(|n| !(0..32).contains(&n))
             {
@@ -1386,8 +1359,9 @@ impl<'a> Checker<'a> {
         Some(self.word_value(out))
     }
 
-    /// Exact wrapping conversion of a mathematical quantity. Range derivation
-    /// belongs to its later consumer, not construction of this source value.
+    /// The word projection of a quantity. Its symbol is the word's one
+    /// symbol (`word_value`): the quantity where it is proved in the word's
+    /// range, otherwise the wrapped value.
     pub fn quantity_to_word(&mut self, value: CheckedExpr, dtype: DType) -> CheckedExpr {
         if !quantity(&value.ty) {
             return value;
@@ -1412,7 +1386,7 @@ impl<'a> Checker<'a> {
         sym: IntExpr,
         what: &str,
     ) -> bool {
-        if super::prove::derive_nonnegative(&mut self.arena, &self.facts, sym).is_established() {
+        if super::prove::nonneg(&self.arena, &self.facts, sym) {
             return true;
         }
         let text = self.text(value.span).to_owned();
@@ -1424,314 +1398,150 @@ impl<'a> Checker<'a> {
         false
     }
 
-    pub(super) fn source_value(
-        &mut self,
-        ty: &ValueType,
-        assigned: Option<&super::ir::SourceValue>,
-        runtime: bool,
-    ) -> super::ir::SourceValue {
-        use super::ir::{SourceScalar, SourceValue};
-        match ty {
-            ValueType::Tuple(parts) => SourceValue::Tuple(
-                parts
-                    .as_slice()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, ty)| {
-                        let prior = match assigned {
-                            Some(SourceValue::Tuple(values)) => values.get(index),
-                            _ => None,
-                        };
-                        self.source_value(ty, prior, runtime)
-                    })
-                    .collect(),
-            ),
-            ValueType::Integer
-            | ValueType::Index { .. }
-            | ValueType::Scalar(DType::I32 | DType::U32) => {
-                let binding = self.arena.checker_variable(crate::expr::SymbolSort::Int);
-                if runtime {
-                    self.data_symbols.insert(binding);
-                }
-                self.facts.assume_type(&mut self.arena, binding, ty);
-                let published = self.arena.int_symbol(binding);
-                let meaning = assigned.and_then(SourceValue::integer).unwrap_or(published);
-                assert!(
-                    self.facts.define_scalar(&self.arena, binding, meaning),
-                    "source value must publish an immutable acyclic occurrence"
-                );
-                let value = match ty {
-                    ValueType::Scalar(dtype) => SourceScalar::Word {
-                        dtype: *dtype,
-                        meaning,
-                        binding,
-                    },
-                    _ => SourceScalar::Quantity {
-                        meaning,
-                        binding: Some(binding),
-                    },
-                };
-                SourceValue::Scalar(value)
-            }
-            ValueType::Scalar(dtype) => {
-                let binding = self
-                    .arena
-                    .checker_variable(crate::expr::SymbolSort::Scalar(*dtype));
-                if runtime {
-                    self.data_symbols.insert(binding);
-                }
-                let value = assigned
-                    .and_then(SourceValue::scalar)
-                    .unwrap_or_else(|| self.arena.scalar_symbol_erased(binding));
-                SourceValue::Scalar(SourceScalar::Scalar { value, binding })
-            }
-            ValueType::Range { bound } => {
-                let prior = match assigned {
-                    Some(SourceValue::Range { start, end }) => Some((*start, *end)),
-                    _ => None,
-                };
-                let endpoint = |previous: Option<SourceScalar>, this: &mut Self| {
-                    let binding = this.arena.checker_variable(crate::expr::SymbolSort::Int);
-                    if runtime {
-                        this.data_symbols.insert(binding);
-                    }
-                    let zero = this.arena.int(0);
-                    this.facts.set_range(binding, zero, *bound);
-                    let published = this.arena.int_symbol(binding);
-                    let meaning = previous
-                        .and_then(SourceScalar::integer)
-                        .unwrap_or(published);
-                    assert!(
-                        this.facts.define_scalar(&this.arena, binding, meaning),
-                        "range endpoint must publish an immutable acyclic occurrence"
-                    );
-                    SourceScalar::Quantity {
-                        meaning,
-                        binding: Some(binding),
-                    }
-                };
-                let start = endpoint(prior.map(|(start, _)| start), self);
-                let end = endpoint(prior.map(|(_, end)| end), self);
-                let ordered = self.arena.int_sub(
-                    end.integer().expect("range end"),
-                    start.integer().expect("range start"),
-                );
-                self.facts.assume_nonnegative(&mut self.arena, ordered);
-                SourceValue::Range { start, end }
-            }
-            _ => SourceValue::Untracked,
-        }
-    }
-
-    /// Origin is a source property, independent of arithmetic derivation.
-    fn source_runtime(&self, expr: &CheckedExpr) -> bool {
-        match &expr.kind {
-            CheckedExprKind::Literal(_) | CheckedExprKind::Dimension(_) => false,
-            CheckedExprKind::Local(id) => self.source_values.get(id).is_some_and(|value| {
-                value
-                    .leaf_bindings()
-                    .iter()
-                    .any(|(_, symbol)| self.data_symbols.contains(symbol))
-                    || value
-                        .integer()
-                        .is_some_and(|meaning| self.data_dependent(meaning))
-            }),
-            CheckedExprKind::Primitive {
-                id: PrimitiveId::Symbolic(value),
-                ..
-            } => self.data_dependent(*value),
-            CheckedExprKind::Primitive {
-                id: PrimitiveId::ElementRead { .. } | PrimitiveId::QuantizedComponentRead { .. },
-                ..
-            } => true,
-            CheckedExprKind::Primitive { operands, .. } => {
-                operands.iter().any(|operand| self.source_runtime(operand))
-            }
-            CheckedExprKind::IndexPosition(value) => self.source_runtime(value),
-            _ => true,
-        }
-    }
-
-    /// Attach exact meaning and the actual source occurrence. This never asks
-    /// whether arithmetic is in range; consumers own those obligations.
+    /// L31 (I-90): the one checker symbol of a word (`i32`/`u32`) value.
+    /// A word that already has a symbol (a literal, a parameter, an element
+    /// read, a local) keeps it. Otherwise its symbol is its exact integer
+    /// expression where one exists: an operation or cast over constants,
+    /// folded by its scalar recipe; `a + b`, `a - b`, `a * b` and `-a` when
+    /// the result is proved in the dtype's range; `a / b` and `a % b` when
+    /// `a >= 0` and `b >= 1` are proved; a word cast of a word or quantity
+    /// proved in the target's range. Every other word (a float → word cast,
+    /// a bit or shift operation, a call result, a possibly wrapping result)
+    /// is one fresh runtime variable carrying the dtype's range. Every
+    /// position proves over this symbol, so a guard on the word reaches all
+    /// of them alike. Non-word values are returned unchanged.
     pub fn word_value(&mut self, mut expr: CheckedExpr) -> CheckedExpr {
-        use super::ir::SourceScalar;
-        if matches!(
-            expr.value.scalar_value(),
-            Some(SourceScalar::Word { .. } | SourceScalar::Scalar { .. })
-        ) {
-            return expr;
-        }
-        if matches!(expr.value, super::ir::SourceValue::Untracked) {
-            match &expr.kind {
-                CheckedExprKind::Primitive {
-                    id: PrimitiveId::TuplePack,
-                    operands,
-                    ..
-                } => {
-                    expr.value = super::ir::SourceValue::Tuple(
-                        operands
-                            .iter()
-                            .map(|operand| operand.value.clone())
-                            .collect(),
-                    );
-                    return expr;
-                }
-                CheckedExprKind::Primitive {
-                    id: PrimitiveId::TupleGet(index),
-                    operands,
-                    ..
-                } => {
-                    if let Some(super::ir::SourceValue::Tuple(parts)) =
-                        operands.first().map(|operand| &operand.value)
-                    {
-                        expr.value = parts[*index as usize].clone();
-                        return expr;
-                    }
-                }
-                CheckedExprKind::Primitive {
-                    id: PrimitiveId::RangeMake,
-                    operands,
-                    ..
-                } if operands.len() == 2 => {
-                    let endpoint = |operand: &CheckedExpr| {
-                        operand.integer().map(|meaning| SourceScalar::Quantity {
-                            meaning,
-                            binding: operand.binding(),
-                        })
-                    };
-                    let start = endpoint(&operands[0]);
-                    let end = endpoint(&operands[1]);
-                    if let (Some(start), Some(end)) = (start, end) {
-                        expr.value = super::ir::SourceValue::Range { start, end };
-                        return expr;
-                    }
-                }
-                CheckedExprKind::Primitive {
-                    id: PrimitiveId::RangeStart | PrimitiveId::RangeEnd,
-                    operands,
-                    ..
-                } => {
-                    if let Some(super::ir::SourceValue::Range { start, end }) =
-                        operands.first().map(|operand| &operand.value)
-                    {
-                        let endpoint = if matches!(
-                            &expr.kind,
-                            CheckedExprKind::Primitive {
-                                id: PrimitiveId::RangeStart,
-                                ..
-                            }
-                        ) {
-                            *start
-                        } else {
-                            *end
-                        };
-                        if let Some(meaning) = endpoint.integer() {
-                            let meaning = self.arena.int_to_word(meaning, DType::I32);
-                            expr.value = super::ir::SourceValue::Scalar(SourceScalar::Quantity {
-                                meaning,
-                                binding: None,
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let ValueType::Scalar(dtype) = expr.ty else {
-            if matches!(expr.value, super::ir::SourceValue::Untracked) {
-                let runtime = self.source_runtime(&expr);
-                expr.value = self.source_value(&expr.ty, None, runtime);
-            }
+        let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = expr.ty else {
             return expr;
         };
-        if let CheckedExprKind::Primitive {
-            id: PrimitiveId::Copy,
-            operands,
-            ..
-        } = &expr.kind
-        {
-            if let Some(value) = operands.first().map(|operand| operand.value.clone()) {
-                expr.value = value;
-                return expr;
-            }
+        if expr.sym.is_some() {
+            return expr;
         }
-        let local_binding = match &expr.kind {
-            CheckedExprKind::Local(id) => self
-                .source_values
-                .get(id)
-                .and_then(super::ir::SourceValue::binding),
+        let exact = match &mut expr.kind {
+            CheckedExprKind::Primitive { id, operands, .. } => {
+                let taken = std::mem::take(operands);
+                *operands = taken
+                    .into_iter()
+                    .map(|operand| self.word_value(operand))
+                    .collect();
+                self.exact_word(id, operands, dtype)
+            }
             _ => None,
         };
-        if dtype.is_int() {
-            let existing = expr.integer();
-            let meaning = existing.or_else(|| match &expr.kind {
-                CheckedExprKind::Primitive { id, operands, .. } => {
-                    self.exact_word(id, operands, dtype)
-                }
-                _ => None,
-            });
-            let binding = local_binding
-                .unwrap_or_else(|| self.arena.checker_variable(crate::expr::SymbolSort::Int));
-            self.facts.assume_type(&mut self.arena, binding, &expr.ty);
-            let published = self.arena.int_symbol(binding);
-            let meaning = meaning.unwrap_or(published);
-            // Runtime origin follows source operands and opaque input ownership,
-            // never success/failure of a bound derivation.
-            let runtime = self.source_runtime(&expr);
-            if runtime {
-                self.data_symbols.insert(binding);
+        let sym = match exact {
+            Some(exact) => exact,
+            None => {
+                let symbol = self.fresh_data_symbol();
+                self.facts.assume_type(&mut self.arena, symbol, &expr.ty);
+                self.arena.int_symbol(symbol)
             }
-            self.facts.assume_scalar_defined(&mut self.arena, meaning);
-            assert!(
-                self.facts.define_scalar(&self.arena, binding, meaning),
-                "source value must publish an immutable acyclic occurrence"
-            );
-            expr.value = super::ir::SourceValue::Scalar(SourceScalar::Word {
-                dtype,
-                meaning,
-                binding,
-            });
-        } else {
-            let binding = local_binding.unwrap_or_else(|| {
-                self.arena
-                    .checker_variable(crate::expr::SymbolSort::Scalar(dtype))
-            });
-            let value = match &expr.kind {
-                CheckedExprKind::Literal(value)
-                | CheckedExprKind::Primitive {
-                    id: PrimitiveId::Constant(value),
-                    ..
-                } => self.arena.scalar_const_erased(*value),
-                _ => self.arena.scalar_symbol_erased(binding),
-            };
-            if self.source_runtime(&expr) {
-                self.data_symbols.insert(binding);
-            }
-            expr.value = super::ir::SourceValue::Scalar(SourceScalar::Scalar { value, binding });
-        }
+        };
+        expr.sym = Some(sym);
         expr
     }
 
+    /// The exact integer expression of a word operation, if it has one
+    /// (`word_value`'s table).
     fn exact_word(
         &mut self,
         id: &PrimitiveId,
         operands: &[CheckedExpr],
         dtype: DType,
     ) -> Option<IntExpr> {
-        let operands = operands
+        if let Some(value) = self.folded_word(id, operands) {
+            return Some(value);
+        }
+        let symbols = operands
             .iter()
-            .map(|operand| super::scalar_quantity::Operand {
-                ty: &operand.ty,
-                value: operand.integer(),
-                scalar: operand.scalar(),
-                literal: match &operand.kind {
-                    CheckedExprKind::Literal(value) => Some(*value),
-                    _ => None,
-                },
-            })
-            .collect::<Vec<_>>();
-        super::scalar_quantity::exact(&mut self.arena, id, &ValueType::Scalar(dtype), &operands)
+            .map(|operand| operand.sym)
+            .collect::<Option<Vec<_>>>()?;
+        match (id, symbols.as_slice()) {
+            (
+                PrimitiveId::Binary(op @ (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)),
+                &[a, b],
+            ) => {
+                let value = match op {
+                    BinaryOp::Add => self.arena.int_add(a, b),
+                    BinaryOp::Sub => self.arena.int_sub(a, b),
+                    _ => self.arena.int_mul(a, b),
+                };
+                self.in_word_range(value, dtype).then_some(value)
+            }
+            (PrimitiveId::Binary(op @ (BinaryOp::Div | BinaryOp::Rem)), &[a, b]) => {
+                let one = self.arena.int(1);
+                let positive = self.arena.int_sub(b, one);
+                let defined = super::prove::nonneg(&self.arena, &self.facts, a)
+                    && super::prove::nonneg(&self.arena, &self.facts, positive);
+                defined.then(|| match op {
+                    BinaryOp::Div => self.arena.int_div(a, b),
+                    _ => self.arena.int_rem(a, b),
+                })
+            }
+            (PrimitiveId::Unary(UnaryOp::Neg), &[a]) => {
+                let zero = self.arena.int(0);
+                let value = self.arena.int_sub(zero, a);
+                self.in_word_range(value, dtype).then_some(value)
+            }
+            (PrimitiveId::Cast(_), &[a]) if word(&operands[0].ty) || quantity(&operands[0].ty) => {
+                self.in_word_range(a, dtype).then_some(a)
+            }
+            _ => None,
+        }
+    }
+
+    /// A word operation or cast whose operands are all constants: the
+    /// constant its scalar recipe yields, wrapping included. A quantity
+    /// constant projects to the word modulo 2^32.
+    fn folded_word(&mut self, id: &PrimitiveId, operands: &[CheckedExpr]) -> Option<IntExpr> {
+        let operation = reference_math::scalar_operation(id)?;
+        let mut inputs = Vec::with_capacity(operands.len());
+        for operand in operands {
+            let input = match (&operand.kind, &operand.ty) {
+                (CheckedExprKind::Literal(value), _) => *value,
+                (_, ValueType::Scalar(dtype @ (DType::I32 | DType::U32))) => {
+                    reference_math::integer_literal(
+                        *dtype,
+                        i128::from(super::prove::constant(&self.arena, operand.sym?)?),
+                    )
+                }
+                (_, ty) if quantity(ty) => {
+                    let ScalarOp::Cast(dtype) = operation else {
+                        return None;
+                    };
+                    let value = super::prove::constant(&self.arena, operand.sym?)?;
+                    // Two's-complement wrapping to the 32-bit word.
+                    let bits = value as u32;
+                    return Some(self.arena.int(match dtype {
+                        DType::I32 => i64::from(bits as i32),
+                        _ => i64::from(bits),
+                    }));
+                }
+                _ => return None,
+            };
+            inputs.push(input);
+        }
+        let types = inputs.iter().map(|input| input.dtype()).collect::<Vec<_>>();
+        let recipe = reference_math::scalar_recipe(operation, &types);
+        match reference_math::evaluate(&recipe, &inputs).ok()? {
+            ReferenceScalar::I32(value) => Some(self.arena.int(i64::from(value))),
+            ReferenceScalar::U32(value) => Some(self.arena.int(i64::from(value))),
+            other => unreachable!("a word operation yielded {other:?}"),
+        }
+    }
+
+    /// Whether `value` is proved in the range of word `dtype`.
+    fn in_word_range(&mut self, value: IntExpr, dtype: DType) -> bool {
+        let (lower, upper) = match dtype {
+            DType::I32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
+            DType::U32 => (0, i64::from(u32::MAX)),
+            _ => unreachable!("a word is an i32 or u32"),
+        };
+        let lower = self.arena.int(lower);
+        let upper = self.arena.int(upper);
+        let above = self.arena.int_sub(value, lower);
+        let below = self.arena.int_sub(upper, value);
+        super::prove::nonneg(&self.arena, &self.facts, above)
+            && super::prove::nonneg(&self.arena, &self.facts, below)
     }
 
     // ---- attributes ----
@@ -1897,14 +1707,10 @@ impl<'a> Checker<'a> {
     /// index; nothing is ever clamped). Returns whether a runtime check is
     /// needed.
     fn require_in_bounds(&mut self, e: IntExpr, span: Span, what: &str) -> bool {
-        if self.data_dependent(e) {
-            // A runtime-data bound already has a checked continuation. Elide
-            // that check only with established facts; required static bounds
-            // retain the complete arithmetic proof below.
-            return !super::prove::established_nonnegative(&self.arena, &self.facts, e);
-        }
-        if super::prove::derive_nonnegative(&mut self.arena, &self.facts, e).is_established() {
+        if super::prove::nonneg(&self.arena, &self.facts, e) {
             false
+        } else if self.data_dependent(e) {
+            true
         } else {
             self.require_nonneg(DiagnosticRule::Type, e, span, what);
             false
@@ -2006,12 +1812,10 @@ impl<'a> Checker<'a> {
         let headroom = self.arena.int_sub(last, sym);
         let text = self.text(value.span).to_owned();
         let mut unproved = Vec::new();
-        if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, sym).is_established() {
+        if !super::prove::nonneg(&self.arena, &self.facts, sym) {
             unproved.push(format!("0 <= {text}"));
         }
-        if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, headroom)
-            .is_established()
-        {
+        if !super::prove::nonneg(&self.arena, &self.facts, headroom) {
             unproved.push(format!("{text} <= {}", self.render(last)));
         }
         if !unproved.is_empty() {
@@ -2177,28 +1981,13 @@ mod word_value_tests {
     #[test]
     fn an_unguarded_word_position_names_its_conjunct() {
         for (body, conjunct) in [
-            (
-                "        let w = lens[r] + 1\n        let mut t = tensor[w] f32\n",
-                "`w >= 0`",
-            ),
-            (
-                "        let n = lens[r]\n        let mut t = tensor[n % 8] f32\n",
-                "`n % 8 >= 0`",
-            ),
-            (
-                "        let w = i32(lens[r] * 3)\n        for i in 0..w:\n            out[r] = 1.0\n",
-                "`0 <= w`",
-            ),
+            ("        let w = lens[r] + 1\n        let mut t = tensor[w] f32\n", "`w >= 0`"),
+            ("        let n = lens[r]\n        let mut t = tensor[n % 8] f32\n", "`n % 8 >= 0`"),
+            ("        let w = i32(lens[r] * 3)\n        for i in 0..w:\n            out[r] = 1.0\n", "`0 <= w`"),
             // An inline element read has a symbol of its own, so a guard on an
             // earlier read does not reach it; the goal names the read.
-            (
-                "        if lens[r] >= 1:\n            let j = index[lens[r]](0)\n",
-                "an index bound may be negative: cannot prove `lens[r] >= 0`",
-            ),
-            (
-                "        if lens[r] >= 0:\n            let y = reshape(lens, (lens[r], 1))\n",
-                "reshape extent may be negative: cannot prove `lens[r] >= 0`",
-            ),
+            ("        if lens[r] >= 1:\n            let j = index[lens[r]](0)\n", "an index bound may be negative: cannot prove `lens[r] >= 0`"),
+            ("        if lens[r] >= 0:\n            let y = reshape(lens, (lens[r], 1))\n", "reshape extent may be negative: cannot prove `lens[r] >= 0`"),
         ] {
             let source = format!(
                 "fn probe[R](lens: &tensor[R] i32, out: &mut tensor[R] f32):\n    parallel for r in 0..R:\n{body}"

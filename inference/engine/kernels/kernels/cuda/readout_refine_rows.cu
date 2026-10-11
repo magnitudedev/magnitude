@@ -18,7 +18,7 @@ extern "C" __global__ void readout_refine_rows_gather(SEISMIC_KERNEL_PARAMS) {
         SEISMIC_DRAWS_STRIDE_1, F32_IN(SEISMIC_BUFFER_TEMPERATURE), SEISMIC_TEMPERATURE_STRIDE_0,
         reinterpret_cast<const unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_MASK)), SEISMIC_MASK_STRIDE_0,
         SEISMIC_MASK_STRIDE_1, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED)),
-        SEISMIC_CONSTRAINED_STRIDE_0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)};
+        SEISMIC_CONSTRAINED_STRIDE_0};
     const float *radius = F32_IN(SEISMIC_BUFFER_RADIUS);
     // Radius columns 0 and 1: the 4- and 5-bit views'.
     progressive::gather<true>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0, planes, radius,

@@ -148,7 +148,7 @@ impl Inference<'_> {
                 | SymbolKind::Decision(_)
                 | SymbolKind::ScheduleSlot(_) => U::Workgroup,
                 SymbolKind::TemplateDimension(_) => unreachable!("uninstantiated template"),
-                SymbolKind::CheckerVariable(_) => {
+                SymbolKind::ProofVariable(_) => {
                     unreachable!("proof variables never enter an entry arena")
                 }
             }
@@ -638,11 +638,8 @@ fn probe(x: i32, times: range[4]) -> i32:
                 U::Workgroup,
                 Meaning::Physical,
             );
-            assert_eq!(
-                scalar(&values, function.results()[0]),
-                input,
-                "the second carry must inherit the first carry's later scope, including through a call"
-            );
+            assert_eq!(scalar(&values, function.results()[0]), input,
+                "the second carry must inherit the first carry's later scope, including through a call");
         }
     }
 

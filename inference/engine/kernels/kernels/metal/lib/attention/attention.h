@@ -18,8 +18,7 @@
 //
 // Every dense operand is bound canonically (row-major, unit innermost stride),
 // so rows are addressed from their logical offsets. Activations are addressed
-// as the element's MSL scalar. Preparation is rounded explicitly by
-// element::Act before conversion to the history's physical operand type.
+// as the element's MSL scalar and converted with the compiler's conversions.
 
 #include "../core/activation.h"
 #include <seismic/slab.h>
@@ -60,15 +59,14 @@ inline float sincos(float angle, thread float &cosine) {
 }
 
 // Appends lane `lane`'s columns of one kv head row at history row
-// `destination` (the caller skips rows without a destination). The element
-// owns publication rounding and its storage payload; native casts do not
-// define a second semantic preparation recipe.
+// `destination` (the caller skips rows without a destination).
+template <typename T>
 inline void append(device Scalar *history, int destination, uint kv_head, uint lane,
-    thread const float (&x)[ATTENTION_E]) {
+    thread const T (&x)[ATTENTION_E]) {
     const ulong target = (ulong(destination) * SEISMIC_DIM_KV + kv_head) * ATTENTION_W + lane * ATTENTION_E;
     ATTENTION_UNROLL
     for (uint i = 0; i < ATTENTION_E; ++i)
-        reinterpret_cast<device element::Act::storage *>(history)[target + i] = element::Act::store(float(x[i]));
+        history[target + i] = Scalar(x[i]);
 }
 
 // Keys per decode partition for a row seeing `total` keys: at least `span`,
@@ -702,7 +700,7 @@ struct dense_history {
     ulong rows_per_slab;
 
     inline void append(int destination, uint kv_head, uint lane, thread const float (&k)[ATTENTION_E],
-        thread const float (&v)[ATTENTION_E]) const {
+        thread const Scalar (&v)[ATTENTION_E]) const {
         attention::append(slab::row<Scalar>(key, ulong(destination), rows_per_slab,
             SEISMIC_DIM_KV * ATTENTION_W), 0, kv_head, lane, k);
         attention::append(slab::row<Scalar>(value, ulong(destination), rows_per_slab,
@@ -814,7 +812,6 @@ struct dense_history {
 // BF16 rounding would cost the 8-bit keys up to a code step), and queries,
 // fresh keys and values (activation-dtype values, exact in F16 within the
 // codec's range) and probabilities enter as F16.
-#ifdef ATTENTION_AFFINE_HISTORY
 struct affine_history {
     enum : bool { AFFINE = true };
     typedef half Operand;
@@ -825,14 +822,14 @@ struct affine_history {
     ulong rows_per_slab;
 
     inline void append(int destination, uint kv_head, uint lane, thread const float (&k)[ATTENTION_E],
-        thread const float (&v)[ATTENTION_E]) const {
+        thread const Scalar (&v)[ATTENTION_E]) const {
         typedef lane_codes<ATTENTION_KEY_BITS> key_lane;
         typedef lane_codes<ATTENTION_VALUE_BITS> value_lane;
         const ulong vector = kv_head;
         float x[ATTENTION_E];
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i)
-            x[i] = element::Act::round(k[i]);
+            x[i] = float(Scalar(k[i]));
         encode<ATTENTION_KEY_BITS>(x,
             slab::row<uint>(key_codes, ulong(destination), rows_per_slab,
                 SEISMIC_DIM_KV * key_lane::row_words) + vector * key_lane::row_words,
@@ -840,7 +837,7 @@ struct affine_history {
                 SEISMIC_DIM_KV * key_lane::pairs * 2) + vector * key_lane::pairs * 2, lane);
         ATTENTION_UNROLL
         for (uint i = 0; i < ATTENTION_E; ++i)
-            x[i] = element::Act::round(v[i]);
+            x[i] = float(v[i]);
         encode<ATTENTION_VALUE_BITS>(x,
             slab::row<uint>(value_codes, ulong(destination), rows_per_slab,
                 SEISMIC_DIM_KV * value_lane::row_words) + vector * value_lane::row_words,
@@ -1064,8 +1061,6 @@ struct affine_history {
     }
 };
 
-
-#endif
 // The history row tiles a call's rows see (the entry's `history_tiles`):
 // `count` listed tiles of PREFILL_HISTORY_TILE rows, distinct and ascending.
 // Per-call storage of history rows holds listed tile i at slot i, so tiles
@@ -1276,7 +1271,6 @@ struct decoded_history {
 // striped over the lanes, to F16 exactly as `affine_history::stage` decodes
 // it (zero past the history's T rows); the PREFILL_PAD rows after
 // the round's last are zeroed, and the rest are left alone.
-#ifdef ATTENTION_AFFINE_HISTORY
 inline void prefill_decode(affine_history history, history_window window, decoded_history decoded, ulong T,
     uint row, uint lane) {
     constexpr uint W = ATTENTION_W;
@@ -1296,8 +1290,6 @@ inline void prefill_decode(affine_history history, history_window window, decode
     history.template decode_row<ATTENTION_VALUE_BITS>(history.value_codes, history.value_coefficients, uint(source),
         decode, window.values + ulong(row) * KV * W, lane);
 }
-#endif
-
 
 // L1: one simdgroup per (row, kv head), rows padded to whole QT tiles: the
 // kv head's G query heads, then its key and value, all rotated by the row's
@@ -1350,7 +1342,7 @@ inline void prefill_prepare(History history, device const Scalar *query,
             const ulong head = row * KV * G + kv_head * G + g;
             head_rotary<ATTENTION_NORM>(query + head * ATTENTION_QUERY_STRIDE, query_norm, table, epsilon, lane, x);
             for (uint i = 0; i < E; ++i)
-                queries[head * W + lane * E + i] = Operand(element::Act::round(x[i]));
+                queries[head * W + lane * E + i] = Operand(Scalar(x[i]));
         }
     }
     if (!ATTENTION_FRESH)
@@ -1359,11 +1351,11 @@ inline void prefill_prepare(History history, device const Scalar *query,
     head_rotary<ATTENTION_NORM>(key + source, key_norm, table, epsilon, lane, x);
     float y[E];
     head_norm<ATTENTION_VALUE_NORM>(value + source, value_norm, epsilon, lane, y);
-    float v[E];
+    Scalar v[E];
     for (uint i = 0; i < E; ++i) {
         if (!inject_only)
-            keys[source + lane * E + i] = Operand(element::Act::round(x[i]));
-        v[i] = element::Act::round(y[i]);
+            keys[source + lane * E + i] = Operand(Scalar(x[i]));
+        v[i] = Scalar(y[i]);
         if (!inject_only)
             values[source + lane * E + i] = Operand(v[i]);
     }
@@ -3143,7 +3135,7 @@ inline void decode_matrix_fresh(threadgroup Operand *region, device const Scalar
         for (uint i = 0; i < E; ++i) {
             const uint column = lane * E + i;
             if (column >= col0 && column < col0 + WC)
-                region[k * PITCH + column - col0] = Operand(element::Act::round(x[i]));
+                region[k * PITCH + column - col0] = Operand(Scalar(x[i]));
         }
     }
 }
@@ -3154,39 +3146,28 @@ inline void decode_matrix_fresh(threadgroup Operand *region, device const Scalar
 // (F32), which the merged output [ROWS][W] (F32) aliases after the key loop;
 // then the team states [TEAMS][ROWS][2] (F32). The contract's shared bytes
 // are this sum.
-template <uint SIMDS, uint KEYS, uint PARTS, uint TOKENS, uint HEAD_BAND = 0, class History>
+template <uint SIMDS, uint KEYS, uint PARTS, uint TOKENS, class History>
 inline void decode_matrix(History history, device const Scalar *query, device const Scalar *key,
     device const Scalar *value, device const float *query_norm, device const float *key_norm,
     device const float *value_norm, device const int *rotary_components, device const float *rotary_frequencies,
     device const float *rotary_amplitudes, device const int *coordinates, device const int *visible,
     device const int *fresh, device float *partials, device float *statistics, threadgroup uchar *shared,
     ulong R, ulong rows, float epsilon, float scale, uint span_min, uint kv_head, uint partition, ulong tile,
-    uint thread_index, uint simd, uint lane, uint head_base = 0) {
+    uint thread_index, uint simd, uint lane) {
     typedef typename History::KeyOperand KeyOperand;
     constexpr uint W = ATTENTION_W;
     constexpr uint E = ATTENTION_E;
     constexpr uint KV = SEISMIC_DIM_KV;
     constexpr uint G = ATTENTION_QUERY_GROUP;
-    // Head bands own at most eight global heads and two token rows. Two
-    // column slices per token reduce register-resident Q/O fragments; the
-    // score exchange lives after both K/V regions, never over their bytes.
-    // The original packed form: one simdgroup per token owns up to eight heads, padded to
-    // eight matrix rows over the whole head width, with no score exchange;
-    // the four tokens share each
+    // Packed: one simdgroup per token owns its G = 8 heads over the whole
+    // head width, so scores need no exchange; the four tokens share each
     // tile's K and V, decoded once into separate regions.
-    constexpr uint PACKED_QUERY_BYTES = TOKENS * 8 * W * 2;
-    constexpr uint PACKED_TILE_BYTES = KEYS * W * 4;
-    constexpr uint PACKED_SHARED_BYTES =
-        (PACKED_QUERY_BYTES > PACKED_TILE_BYTES ? PACKED_QUERY_BYTES : PACKED_TILE_BYTES) + 8 * 8;
-    constexpr bool BANDED = History::AFFINE && HEAD_BAND == 8;
-    constexpr bool PACKED = BANDED || (History::AFFINE && TOKENS == 4 && G <= 8 && (W == 128 || W == 256)
-        && SIMDS == TOKENS && PACKED_SHARED_BYTES <= 32768);
-    static_assert(HEAD_BAND == 0 || (HEAD_BAND == 8 && TOKENS == 2 && SIMDS == 4),
-        "head bands own two tokens and two column slices per token");
-    constexpr uint ROWS = PACKED ? 8 : DECODE_MATRIX_ROWS(TOKENS);
-    constexpr uint QUERY_ROWS = PACKED ? TOKENS * ROWS : ROWS;
+    constexpr bool PACKED = History::AFFINE && TOKENS == 4 && G == 8 && (W == 128 || W == 256)
+        && SIMDS == TOKENS;
+    constexpr uint ROWS = PACKED ? G : DECODE_MATRIX_ROWS(TOKENS);
+    constexpr uint QUERY_ROWS = PACKED ? TOKENS * G : ROWS;
     constexpr uint RB = ROWS / 8;
-    constexpr uint COLS = BANDED ? 2 : PACKED ? 1 : DECODE_MATRIX_COLS(TOKENS);
+    constexpr uint COLS = PACKED ? 1 : DECODE_MATRIX_COLS(TOKENS);
     constexpr uint TEAMS = PACKED ? 1 : SIMDS / COLS;
     constexpr bool DIRECT = History::AFFINE && TEAMS == 1;
     constexpr uint WC = W / COLS;
@@ -3196,12 +3177,6 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     constexpr uint TILE_BYTES = (PACKED ? 1 : SIMDS) * KEYS * PITCH * 2;
     constexpr uint EXCHANGE_BYTES = COLS > 1 ? 2 * SIMDS * ROWS * KEYS * 4 : 0;
     constexpr uint MERGED_BYTES = ROWS * W * 4;
-    static_assert(!BANDED || (W >= 64 && W <= 512 && W % 64 == 0),
-        "head-band columns are whole 32-column codec groups");
-    constexpr uint BAND_WORK_BYTES = KEYS * W * 4 + EXCHANGE_BYTES;
-    static_assert(!BANDED || ((PACKED_QUERY_BYTES > BAND_WORK_BYTES
-        ? PACKED_QUERY_BYTES : BAND_WORK_BYTES) + 64 <= 32768),
-        "head-band query staging and nonaliasing exchange fit shared memory");
     static_assert(sizeof(KeyOperand) == 2, "tile regions hold 2-byte operands");
     static_assert(KEYS % 8 == 0, "a key tile is whole 8-key fragments");
     static_assert(W % COLS == 0 && WC % 32 == 0, "column slices are whole code groups");
@@ -3227,24 +3202,22 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     threadgroup KeyOperand *key_region = reinterpret_cast<threadgroup KeyOperand *>(middle)
         + (PACKED ? 0 : simd) * KEYS * PITCH;
     threadgroup half *value_region = reinterpret_cast<threadgroup half *>(key_region) + (PACKED ? KEYS * PITCH : 0);
-    threadgroup float *exchange = reinterpret_cast<threadgroup float *>(BANDED ? middle + KEYS * W * 4 : DIRECT ? middle : middle + TILE_BYTES);
+    threadgroup float *exchange = reinterpret_cast<threadgroup float *>(DIRECT ? middle : middle + TILE_BYTES);
     threadgroup float *merged = reinterpret_cast<threadgroup float *>(middle);
-    constexpr uint WORK_BYTES = BANDED ? KEYS * W * 4 + EXCHANGE_BYTES : DIRECT
+    constexpr uint WORK_BYTES = DIRECT
         ? (TILE_BYTES > EXCHANGE_BYTES ? TILE_BYTES : EXCHANGE_BYTES)
         : (TILE_BYTES + EXCHANGE_BYTES > MERGED_BYTES ? TILE_BYTES + EXCHANGE_BYTES : MERGED_BYTES);
     threadgroup float *states = reinterpret_cast<threadgroup float *>(middle + WORK_BYTES);
 
-    // Packed tokens pad their query heads to eight matrix rows; other forms
-    // use matrix row i for row row0 + i / G, head i % G. Queries are
+    // The tile's queries (matrix row i is row row0 + i / G, head i % G),
     // rotary-prepared and rounded to the activation dtype (as the contract
     // publishes them); padding rows are zero.
     for (uint g = PACKED ? 0 : simd; g < ROWS; g += PACKED ? 1 : SIMDS) {
         float x[E];
-        const uint global_g = PACKED ? team * ROWS + g : g;
-        const ulong row = row0 + (PACKED ? team : global_g / G);
-        const uint head = PACKED ? head_base + g : global_g % G;
-        if (head < G && (PACKED || global_g < TOKENS * G) && row < rows) {
-            head_rotary<ATTENTION_NORM>(query + (row * KV * G + kv_head * G + head) * ATTENTION_QUERY_STRIDE,
+        const uint global_g = PACKED ? team * G + g : g;
+        const ulong row = row0 + global_g / G;
+        if (global_g < TOKENS * G && row < rows) {
+            head_rotary<ATTENTION_NORM>(query + (row * KV * G + kv_head * G + global_g % G) * ATTENTION_QUERY_STRIDE,
                 query_norm, coordinates + row * 4, rotary_components, rotary_frequencies, rotary_amplitudes, epsilon,
                 lane, x);
         } else {
@@ -3255,7 +3228,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         ATTENTION_UNROLL
         for (uint i = 0; i < E; ++i)
             if (!PACKED || slice == 0)
-                queries[global_g * W + lane * E + i] = KeyOperand(element::Act::round(x[i]));
+                queries[global_g * W + lane * E + i] = KeyOperand(Scalar(x[i]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3265,7 +3238,7 @@ inline void decode_matrix(History history, device const Scalar *query, device co
     if (PACKED) {
         ATTENTION_UNROLL
         for (uint d = 0; d < DB; ++d)
-            simdgroup_load(prepared_query[d], queries + team * ROWS * W + col0 + d * 8, W);
+            simdgroup_load(prepared_query[d], queries + team * G * W + col0 + d * 8, W);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -3414,10 +3387,10 @@ inline void decode_matrix(History history, device const Scalar *query, device co
                 // This lane's row of the block: its own interval of the span.
                 int own_lo = int(0x80000000), own_hi = 0x7fffffff;
                 if (!inside) {
-                    const uint r = (PACKED ? team * G + head_base : 0) + b * 8 + fm;
-                    const ulong row = row0 + (PACKED ? team : r / G);
+                    const uint r = (PACKED ? team * G : 0) + b * 8 + fm;
+                    const ulong row = row0 + r / G;
                     own_lo = own_hi = 0;
-                    if ((!PACKED || head_base + b * 8 + fm < G) && r < TOKENS * G && row < rows)
+                    if (r < TOKENS * G && row < rows)
                         form_span(visible, fresh, row, R, span, own_lo, own_hi);
                 }
                 float tile_maximum = -INFINITY;
@@ -3571,12 +3544,10 @@ inline void decode_matrix(History history, device const Scalar *query, device co
         const uint live_rows = uint(metal::min(ulong(TOKENS), rows - row0)) * G;
         ATTENTION_UNROLL
         for (uint b = 0; b < RB; ++b) {
-            const uint r = (PACKED ? team * G + head_base : 0) + b * 8 + fm;
-            if ((PACKED && (head_base + b * 8 + fm >= G || row0 + team >= rows)) || (!PACKED && r >= live_rows))
+            const uint r = (PACKED ? team * G : 0) + b * 8 + fm;
+            if (r >= live_rows)
                 continue;
-            const ulong output_row = row0 + (PACKED ? team : r / G);
-            const uint output_head = PACKED ? head_base + b * 8 + fm : r % G;
-            const ulong slot = (output_row * KV + kv_head) * G * PARTS + output_head * PARTS + partition;
+            const ulong slot = ((row0 + r / G) * KV + kv_head) * G * PARTS + (r % G) * PARTS + partition;
             ATTENTION_UNROLL
             for (uint d = 0; d < DB; ++d) {
                 const uint column = col0 + d * 8 + fn;

@@ -6,7 +6,7 @@
 
 use magnitude_executor::{
     Completion, CompletionWake, DomainError, DomainRequirements, GroupKey, HeadFlight, NativeFamily, Operation,
-    PendingOperationOutcome, PrimingCompletionFlight, TargetContinuation, ProgramFamily, ReservedResources, StateBindings, SubmitFailure,
+    PendingOperationOutcome, ProgramFamily, ReservedResources, StateBindings, SubmitFailure,
     TargetFlight, VisionFlight,
 };
 pub use magnitude_executor::{ExecutorDomain, ResumeState};
@@ -115,7 +115,6 @@ pub enum DomainFlight<F: ProgramFamily = NativeFamily> {
     Target(TargetFlight<F>),
     Head(HeadFlight<F>),
     Vision(VisionFlight<F>),
-    Priming(PrimingCompletionFlight<F>),
 }
 
 impl<F: ProgramFamily> DomainFlight<F> {
@@ -124,7 +123,6 @@ impl<F: ProgramFamily> DomainFlight<F> {
             Self::Target(flight) => flight.completion(),
             Self::Head(flight) => flight.completion(),
             Self::Vision(flight) => flight.completion(),
-            Self::Priming(flight) => flight.completion(),
         }
     }
 }
@@ -134,7 +132,6 @@ pub enum FlightOutcomes {
     Target(Vec<PendingOperationOutcome>),
     Head(Vec<PendingOperationOutcome>),
     Vision(PendingOperationOutcome),
-    Priming(magnitude_executor::RequestId, std::time::Duration),
 }
 
 /// Reserve and submit one group. Submission moves the bindings into the
@@ -206,28 +203,17 @@ fn submit<F: ProgramFamily>(
 pub fn finish<F: ProgramFamily>(
     domain: &mut ExecutorDomain<F>,
     flight: DomainFlight<F>,
-    operations: &[Operation],
-) -> Result<(FlightOutcomes, TargetContinuation<F>), DomainError> {
+) -> Result<(FlightOutcomes, StateBindings<F>), DomainError> {
     match flight {
-        DomainFlight::Target(flight) => {
-            // A finishing prompt chunk knows one fewer successor token
-            // than it has rows. Its target result can publish independently
-            // of the already submitted history entry.
-            let finishing = matches!(operations, [Operation::Forward {
-                kind: magnitude_executor::WorkKind::Prefill, tokens, prime: Some(prime), ..
-            }] if prime.tokens.len() + 1 == tokens.len());
-            domain.finish_target_for_publication(flight, finishing)
-                .map(|(outcomes, continuation)| (FlightOutcomes::Target(outcomes), continuation))
-        }
+        DomainFlight::Target(flight) => domain
+            .finish_target(flight)
+            .map(|(outcomes, bindings)| (FlightOutcomes::Target(outcomes), bindings)),
         DomainFlight::Head(flight) => domain
             .finish_head(flight)
-            .map(|(outcomes, bindings)| (FlightOutcomes::Head(outcomes), TargetContinuation::Ready(bindings))),
+            .map(|(outcomes, bindings)| (FlightOutcomes::Head(outcomes), bindings)),
         DomainFlight::Vision(flight) => domain
             .finish_vision(flight)
-            .map(|(outcome, bindings)| (FlightOutcomes::Vision(outcome), TargetContinuation::Ready(bindings))),
-        DomainFlight::Priming(flight) => domain
-            .finish_priming(flight)
-            .map(|(request, duration, bindings)| (FlightOutcomes::Priming(request, duration), TargetContinuation::Ready(bindings))),
+            .map(|(outcome, bindings)| (FlightOutcomes::Vision(outcome), bindings)),
     }
 }
 
@@ -252,7 +238,6 @@ mod tests {
             program_identity: ProgramIdentity::new("target").unwrap(),
             executable: ExecutableKind::Target,
             commitment: CommittedClass::AllCommitted,
-            draft_width: None,
         };
         let operation = |id| Operation::Forward {
             request: RequestId(id),

@@ -21,7 +21,6 @@ mod ownership;
 mod ownership_tests;
 pub(crate) mod prove;
 pub(crate) mod resolve;
-mod scalar_quantity;
 #[cfg(test)]
 mod stable_identity_tests;
 mod stmt;
@@ -90,13 +89,12 @@ pub(crate) struct Checker<'a> {
     pub kinds: Vec<LocalKind>,
     pub scopes: Vec<HashMap<String, LocalId>>,
     pub facts: Facts,
-
+    pub symbols: HashMap<LocalId, SymbolId>,
+    pub scalar_symbols: HashMap<LocalId, IntExpr>,
     /// Symbols that stand for runtime data values (element reads, words,
     /// runtime slice lengths, binders over data bounds). A bound over one of
     /// them that is not proved is checked at run time instead of rejected.
     pub data_symbols: HashSet<SymbolId>,
-    /// Reached source versions; Local.value remains the declaration identity.
-    pub source_values: HashMap<LocalId, ir::SourceValue>,
     /// Runtime-bounded range views: (start, end, parent extent, realized-length atom).
     pub dyn_views: Vec<(Option<CheckedExpr>, Option<CheckedExpr>, IntExpr, SymbolId)>,
     /// Active independent (`parallel for`) loops: (captured floor, binder).
@@ -132,9 +130,9 @@ impl<'a> Checker<'a> {
             kinds: Vec::new(),
             scopes: vec![HashMap::new()],
             facts: Facts::new(),
-
+            symbols: HashMap::new(),
+            scalar_symbols: HashMap::new(),
             data_symbols: HashSet::new(),
-            source_values: HashMap::new(),
             dyn_views: Vec::new(),
             logical_parallel: Vec::new(),
             divergence: vec![0],
@@ -156,7 +154,6 @@ impl<'a> Checker<'a> {
                 Predicate::NonNegative(e) => c.assume_nonneg(e),
                 Predicate::Zero(e) => c.assume_zero(e),
                 Predicate::NonZero(e) => c.facts.assume_nonzero(&c.arena, e),
-                Predicate::Boolean(e) => c.facts.assume_boolean(e),
             }
         }
         for (i, p) in c.sig.params.clone().into_iter().enumerate() {
@@ -167,9 +164,21 @@ impl<'a> Checker<'a> {
                 LocalKind::Param(i),
                 p.ownership == ParamOwnership::Exclusive,
             );
-            let value = c.source_value(&p.ty, None, true);
-            c.locals[id.index()].value = value.clone();
-            c.source_values.insert(id, value);
+            match &p.ty {
+                ValueType::Index { .. } => {
+                    let symbol = c.arena.proof_variable(SymbolSort::Int);
+                    c.facts.assume_type(&mut c.arena, symbol, &p.ty);
+                    c.symbols.insert(id, symbol);
+                    c.locals[id.index()].symbol = Some(symbol);
+                }
+                ValueType::Scalar(DType::I32 | DType::U32) => {
+                    let symbol = c.fresh_data_symbol();
+                    c.facts.assume_type(&mut c.arena, symbol, &p.ty);
+                    c.symbols.insert(id, symbol);
+                    c.locals[id.index()].symbol = Some(symbol);
+                }
+                _ => {}
+            }
             if p.ownership == ParamOwnership::Exclusive {
                 for element in tensor_elements(&p.ty) {
                     c.elements.stored(element);
@@ -206,8 +215,19 @@ impl<'a> Checker<'a> {
         if let Some(ordinal) = self.sig.dimension_of(symbol) {
             return self.sig.dimensions[ordinal].name.clone();
         }
-        self.locals.iter().find(|local| local.value.leaf_bindings().iter().any(|(_, candidate)| *candidate == symbol))
-            .map(|local| local.name.clone()).unwrap_or_else(|| "?".to_owned())
+        self.symbols
+            .iter()
+            .find(|(_, candidate)| **candidate == symbol)
+            .or_else(|| {
+                self.locals
+                    .iter()
+                    .enumerate()
+                    .find(|(_, local)| local.symbol == Some(symbol))
+                    .map(|(ordinal, local)| (&local.name, ordinal))
+                    .and(None)
+            })
+            .map(|(local, _)| self.locals[local.index()].name.clone())
+            .unwrap_or_else(|| "?".to_owned())
     }
 
     /// An integer expression in source spelling.
@@ -271,7 +291,7 @@ impl<'a> Checker<'a> {
             ty,
             mutable,
             span,
-            value: ir::SourceValue::Untracked,
+            symbol: None,
         });
         self.kinds.push(kind);
         if let Some(scope) = self.scopes.last_mut() {
@@ -282,7 +302,7 @@ impl<'a> Checker<'a> {
 
     /// A fresh proof variable.
     pub fn fresh_symbol(&mut self) -> SymbolId {
-        self.arena.checker_variable(SymbolSort::Int)
+        self.arena.proof_variable(SymbolSort::Int)
     }
 
     /// A fresh proof variable standing for a runtime data value.
@@ -321,7 +341,7 @@ impl<'a> Checker<'a> {
         span: Span,
         what: &str,
     ) -> bool {
-        if prove::derive_nonnegative(&mut self.arena, &self.facts, e).is_established() {
+        if prove::nonneg(&self.arena, &self.facts, e) {
             return true;
         }
         let rendered = self.render(e);
@@ -360,15 +380,13 @@ impl<'a> Checker<'a> {
                         );
                     }
                 }
-                if !prove::derive_nonnegative(&mut self.arena, &self.facts, extent).is_established() {
+                if !prove::nonneg(&self.arena, &self.facts, extent) {
                     let rendered = self.render(extent);
                     let shown = self.shown(&ty);
                     self.error(
                         DiagnosticRule::Dimension,
                         span,
-                        format!(
-                            "type `{shown}` requires `{rendered} >= 0`; add `where {rendered} >= 0`"
-                        ),
+                        format!("type `{shown}` requires `{rendered} >= 0`; add `where {rendered} >= 0`"),
                     );
                 }
             }
@@ -542,7 +560,7 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        self.source_values.remove(&root);
+        self.scalar_symbols.remove(&root);
         let tensor_effect = matches!(self.locals[root.index()].ty, ValueType::Tensor(_));
         self.dyn_views.retain(|(start, end, _, _)| {
             let mentions =
@@ -661,6 +679,9 @@ struct CheckedOutcome {
     initialization: initialization::Contract,
     element_domain: crate::checked::ElementDomain,
     placement: Placement,
+    /// The family dimension plan, for a family contract whose dimensions
+    /// input tensor axes determine.
+    plan: Option<dimensions::DimensionPlan>,
 }
 
 fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
@@ -670,6 +691,34 @@ fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
     let (mut root, mut result) = c.function_body(declared.body, declared.name_span);
     let initialization =
         initialization::check(&mut c, &mut root, &mut result, initialization_facts);
+    let contract = env.resolved.families[declared.family.index()]
+        .contract
+        .index()
+        == def;
+    let plan = if contract {
+        match dimensions::plan_dimensions(&c.arena, &c.sig.dimensions, &c.sig.params) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                c.error(
+                    DiagnosticRule::Dimension,
+                    declared.name_span,
+                    format!(
+                        "dimensions {} are not determined by the input tensor axes; every dimension of `{}` must be derivable from its tensor parameters' extents",
+                        error
+                            .underdetermined
+                            .iter()
+                            .map(|name| format!("`{name}`"))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        c.sig.name
+                    ),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let parts = c.finish(root, result);
     CheckedOutcome {
         body: parts.body,
@@ -679,6 +728,7 @@ fn check_definition(env: &Env, def: usize) -> CheckedOutcome {
         initialization,
         element_domain: parts.element_domain,
         placement: parts.placement,
+        plan,
     }
 }
 
@@ -702,55 +752,14 @@ pub(crate) fn check_program(
             .map(|cycle| cycle.diagnostic(&resolved.declared)),
     );
     let mut outcomes: Vec<Option<CheckedOutcome>> = (0..count).map(|_| None).collect();
-    // A definition reads only its callees' outcomes, so the definitions of
-    // one call depth are independent: check each depth's definitions on
-    // separate threads, after every deeper callee is complete.
-    let mut depth = vec![0usize; count];
-    let mut levels: Vec<Vec<usize>> = Vec::new();
-    for &def in &order {
-        depth[def] = resolved
-            .call_graph
-            .callees(def)
-            .iter()
-            .map(|callee| depth[*callee] + 1)
-            .max()
-            .unwrap_or(0);
-        if levels.len() <= depth[def] {
-            levels.resize_with(depth[def] + 1, Vec::new);
-        }
-        levels[depth[def]].push(def);
-    }
-    let workers = std::thread::available_parallelism().map_or(1, usize::from);
-    for level in levels {
+    for def in order {
         let env = Env {
             resolved: &resolved,
             texts,
             checked: &outcomes,
         };
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let checked = std::thread::scope(|scope| {
-            let threads = (0..workers.min(level.len()))
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut checked = Vec::new();
-                        loop {
-                            let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(&def) = level.get(index) else {
-                                return checked;
-                            };
-                            checked.push((def, check_definition(&env, def)));
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            threads
-                .into_iter()
-                .flat_map(|thread| thread.join().expect("definition check thread panicked"))
-                .collect::<Vec<_>>()
-        });
-        for (def, outcome) in checked {
-            outcomes[def] = Some(outcome);
-        }
+        let checked = check_definition(&env, def);
+        outcomes[def] = Some(checked);
     }
     let mut clean = diagnostics.is_empty();
     for (outcome, declared) in outcomes.iter_mut().zip(&resolved.declared) {
@@ -766,7 +775,7 @@ pub(crate) fn check_program(
         return None;
     }
     // Without a recursion, the order holds every definition.
-    let outcomes = outcomes.into_iter().flatten().collect::<Vec<_>>();
+    let mut outcomes = outcomes.into_iter().flatten().collect::<Vec<_>>();
     assert_eq!(
         outcomes.len(),
         count,
@@ -780,6 +789,10 @@ pub(crate) fn check_program(
             contract: family.contract,
             bodies: family.bodies.clone(),
             lowerings: family.lowerings.clone(),
+            dimension_plan: outcomes[family.contract.index()]
+                .plan
+                .take()
+                .expect("a checked family contract has its dimension plan"),
         })
         .collect();
     let mut definitions = Vec::with_capacity(count);
@@ -958,12 +971,7 @@ pub(crate) fn check_closed(
                 ));
                 continue;
             }
-            match check_native(
-                native,
-                entry,
-                backend,
-                &sources.files()[*file].path,
-            ) {
+            match check_native(native, entry, backend, &sources.files()[*file].path) {
                 Ok(implementation) => native_implementations.push(implementation),
                 Err(errors) => {
                     for (span, message) in errors {
@@ -1111,6 +1119,9 @@ fn check_native(
         };
         let mut declaration = native.clone();
         declaration.constraint.iter_mut().for_each(expand);
+        for class in &mut declaration.error_classes {
+            expand(&mut class.when);
+        }
         for scratch in &mut declaration.scratch {
             expand(&mut scratch.bytes);
             scratch.when.iter_mut().for_each(expand);
@@ -1297,6 +1308,46 @@ fn check_native(
         }
     }
 
+    // An error class is a property of the entry's configuration: its
+    // condition reads static dimensions and entry parameters only.
+    let mut error_classes: Vec<crate::checked::NativeErrorClass> = Vec::new();
+    for class in &native.error_classes {
+        if error_classes
+            .iter()
+            .any(|existing| existing.name == class.name.name)
+        {
+            errors.push((
+                class.name.span,
+                format!("error class `{}` is declared twice", class.name.name),
+            ));
+            continue;
+        }
+        match native_condition(
+            "error_class",
+            &class.when,
+            &entry.dimensions,
+            &parameter_names,
+        ) {
+            Ok(when) => {
+                let mut read = Vec::new();
+                when.dimensions(&mut read);
+                if let Some(dynamic) = read.iter().find(|name| !statics.contains(name)) {
+                    errors.push((
+                        class.when.span,
+                        format!(
+                            "native `error_class` reads dimension `{dynamic}`, which is not static; its value is unknown at preparation"
+                        ),
+                    ));
+                }
+                error_classes.push(crate::checked::NativeErrorClass {
+                    name: class.name.name.clone(),
+                    when,
+                });
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+
     let mut scratch: Vec<NativeScratch> = Vec::new();
     for buffer in &native.scratch {
         if scratch
@@ -1471,13 +1522,13 @@ fn check_native(
             ));
             None
         }
-        Some(repeat) => {
-            expression(&repeat.count, &mut errors).map(|count| crate::checked::NativeRepeat {
+        Some(repeat) => expression(&repeat.count, &mut errors).map(|count| {
+            crate::checked::NativeRepeat {
                 first: repeat.first,
                 launches: repeat.launches,
                 count,
-            })
-        }
+            }
+        }),
     };
 
     if !errors.is_empty() {
@@ -1492,7 +1543,7 @@ fn check_native(
         params,
         elements,
         constraint,
-
+        error_classes,
         scratch,
         launches,
         repeat,
@@ -1840,4 +1891,3 @@ fn entry_info(
         element_domain: definition.element_domain.clone(),
     }
 }
-

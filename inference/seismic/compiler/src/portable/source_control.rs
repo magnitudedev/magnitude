@@ -32,7 +32,6 @@ pub(super) struct SegmentEnvironment {
     pub(super) values: BTreeMap<SemanticValueId, SegmentBound>,
     pub(super) alive: PortableValue,
     pub(super) successful: uniformity::Values,
-    pub(super) quantity_bounds: BTreeMap<SemanticValueId, capacity::ShapeInterval>,
     pub(super) lexical: registry::IntrinsicUniformity,
 }
 
@@ -122,7 +121,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
             values: self.values.clone(),
             alive: self.alive,
             successful: self.successful.clone(),
-            quantity_bounds: self.quantity_bounds.clone(),
             lexical: self.lexical,
         }
     }
@@ -133,7 +131,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
             values: self.values,
             alive: self.alive,
             successful: self.successful,
-            quantity_bounds: self.quantity_bounds,
             lexical: self.lexical,
         }
     }
@@ -143,7 +140,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         self.values = environment.values;
         self.alive = environment.alive;
         self.successful = environment.successful;
-        self.quantity_bounds = environment.quantity_bounds;
         self.lexical = environment.lexical;
     }
 
@@ -158,11 +154,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
             SegmentFrame::Bind { outputs, results } => {
                 for (output, result) in outputs.into_iter().zip(results) {
                     self.values.insert(output, self.bound(result));
-                    if let Some(interval) = self.quantity_bounds.get(&result).copied() {
-                        self.quantity_bounds.insert(output, interval);
-                    } else {
-                        self.quantity_bounds.remove(&output);
-                    }
                 }
                 return Ok(());
             }
@@ -264,31 +255,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         let Some((id, node)) = function.nodes(region).nth(next) else {
             return Ok(());
         };
-        if let SemanticNodeView::Primitive {
-            primitive, output, ..
-        } = node.view()
-        {
-            if matches!(function.value(output).ty, SemanticType::Integer) {
-                let admission = match primitive {
-                    PrimitiveId::Symbolic(expression) => {
-                        self.admit_native_quantity(output, *expression)
-                    }
-                    _ => self.admit_native_integer_value(output),
-                };
-                if let Err(reason) = admission {
-                    frames.push(SegmentFrame::Nodes { region, next });
-                    return Err(reason);
-                }
-            }
-        }
-        if let SemanticNodeView::Extent { output, .. } = node.view() {
-            if matches!(function.value(output).ty, SemanticType::Integer) {
-                if let Err(reason) = self.admit_native_integer_value(output) {
-                    frames.push(SegmentFrame::Nodes { region, next });
-                    return Err(reason);
-                }
-            }
-        }
         let result = match self.node_tensor_result(id) {
             Ok(result) => result,
             Err(reason) => {
@@ -306,7 +272,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         });
         match node.view() {
             SemanticNodeView::Check { condition, reason } => {
-                self.admit_checked_bounds(condition);
                 let condition = self.scalar(condition);
                 let stopped = self.kernel.not(self.alive);
                 let passed = self.kernel.logic(LogicOp::Or, stopped, condition);
@@ -322,8 +287,6 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                 outputs,
             } => {
                 let helper = self.helpers[&family];
-                self.quantity_bounds
-                    .retain(|value, _| value.function() != helper.id());
                 let mut equality = self.successful.clone();
                 for (parameter, input) in helper.parameters().iter().zip(inputs) {
                     self.values.insert(parameter.value, self.bound(*input));

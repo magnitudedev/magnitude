@@ -4,6 +4,11 @@ inference/target/
 inference/**/target/
 # Per-agent Cargo target directories and scratch source mirrors.
 **/.agent-targets/
+# Session Bench results and local model aliases are untracked.
+inference/benchmarks/runs/
+inference/benchmarks/models.local.json
+# TypeScript benchmark evidence is generated, immutable, and workspace-local.
+benchmark-results/
 .turbo
 dist
 /bin

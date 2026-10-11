@@ -82,7 +82,7 @@ projection_epilogue selected_rows_output() {
 // Weight row n is vocabulary row selected[n] (a unit-stride i32 table).
 projection_weights selected_rows_weight() {
     return projection_weights(SEISMIC_PTR(SEISMIC_BUFFER_WEIGHT), HEAD_GEOMETRY, HEAD_K,
-        SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), 1ul);
+        SEISMIC_PTR(SEISMIC_BUFFER_SELECTED));
 }
 
 void readout_selected_rows_gemv() {

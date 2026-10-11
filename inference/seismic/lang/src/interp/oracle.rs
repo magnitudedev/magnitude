@@ -1,19 +1,19 @@
 use super::scalar;
 use super::tensor::{read_bits, write_bits};
-use super::value::{Backing, TensorValue, Value, row_major};
+use super::value::{row_major, Backing, TensorValue, Value};
 use super::{Arg, EvalError, Interpreter, OracleError, TensorData};
 use crate::entry::{
     Candidate, LoopKind, NumericalRole, ParameterKind, RegionKind, ScalarRef, SemanticFunction,
     SemanticNodeView, SemanticType, TensorStorage, ViewTransform,
 };
 use crate::expr::{
-    Assignment, ExprArena, PartialAssignment, SymbolId, SymbolKind, SymbolSort, SymbolValue,
-    compiled::InvocationValues,
+    compiled::InvocationValues, Assignment, ExprArena, PartialAssignment, SymbolId, SymbolKind,
+    SymbolValue,
 };
 use crate::failure::{SourceFailure, SourceFailureCause};
 use crate::ids::{FamilyId, RepresentationConversionId, SemanticValueId};
 use crate::intrinsics::{
-    AtomicOp, CombineLaw, PrimitiveId, ReduceIdentity, ReduceOp, reduce_schema,
+    reduce_schema, AtomicOp, CombineLaw, PrimitiveId, ReduceIdentity, ReduceOp,
 };
 use crate::reference_math::ReferenceScalar;
 use crate::registry::{self, PlaneRepackRecipe, RepackExpr, RepresentationKind};
@@ -26,22 +26,19 @@ use std::rc::Rc;
 type Environment = BTreeMap<SemanticValueId, Value>;
 
 /// The `RuntimeValue` symbol of every semantic value that has one. The entry
-/// graph mints at most one per value, retaining its quantity or scalar sort.
-pub(super) type RuntimeSymbols = Rc<HashMap<SemanticValueId, (SymbolId, SymbolSort)>>;
+/// graph mints at most one per value, so the map is exact.
+pub(super) type RuntimeSymbols = Rc<HashMap<SemanticValueId, SymbolId>>;
 
 pub(super) fn runtime_symbols(arena: &ExprArena) -> RuntimeSymbols {
-    let mut symbols = HashMap::new();
-    for symbol in arena.symbols() {
-        if let SymbolKind::RuntimeValue(value) = arena.symbol_kind(symbol) {
-            assert!(
-                symbols
-                    .insert(value, (symbol, arena.symbol_sort(symbol)))
-                    .is_none(),
-                "semantic value has conflicting runtime symbol interpretations"
-            );
-        }
-    }
-    Rc::new(symbols)
+    Rc::new(
+        arena
+            .symbols()
+            .filter_map(|symbol| match arena.symbol_kind(symbol) {
+                SymbolKind::RuntimeValue(value) => Some((value, symbol)),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// The values and symbol assignment of one executing function body. Every
@@ -65,21 +62,11 @@ impl Frame {
     }
 
     fn bind(&mut self, id: SemanticValueId, value: Value) {
-        if let Some((symbol, sort)) = self.runtime_symbols.get(&id) {
-            let published = match sort {
-                SymbolSort::Int => SymbolValue::Int(value.as_integer()),
-                SymbolSort::Nat => SymbolValue::Nat(value.as_nat()),
-                SymbolSort::Scalar(dtype) => {
-                    let scalar = value.as_scalar();
-                    assert_eq!(
-                        scalar.dtype(),
-                        *dtype,
-                        "runtime scalar publication changed dtype"
-                    );
-                    scalar_symbol(scalar)
-                }
-            };
-            self.assignment.bind(*symbol, published);
+        if let Some(symbol) = self.runtime_symbols.get(&id) {
+            // RuntimeValue expressions have the mathematical Int sort,
+            // independently of the producing scalar's storage dtype.
+            self.assignment
+                .bind(*symbol, SymbolValue::Int(value.as_integer()));
         }
         self.environment.insert(id, value);
     }
@@ -161,7 +148,7 @@ impl Interpreter<'_> {
                     return Err(OracleError::InvalidInvocation(format!(
                         "argument kind mismatch for `{}`",
                         parameter.name
-                    )));
+                    )))
                 }
             };
             values.push(value);
@@ -634,12 +621,9 @@ impl Interpreter<'_> {
                         let extent = frame.value(tensor).as_tensor().shape[axis as usize];
                         let value = match function.value(output).ty {
                             SemanticType::Integer => Value::Integer(extent.into()),
-                            // Authored `extent(t, axis)` is the `i32` word of
-                            // the mathematical extent (its two's-complement
-                            // projection), as the checker types it.
-                            SemanticType::Scalar(dtype) => {
-                                Value::Scalar(word_literal(dtype, &BigInt::from(extent)))
-                            }
+                            // Authored extent keeps its existing source value
+                            // path; only the hidden call-dimension capture is
+                            // an exact mathematical Integer result.
                             _ => Value::Index(extent.into()),
                         };
                         frame.bind(output, value);
@@ -664,23 +648,6 @@ impl Interpreter<'_> {
         frame: &Frame,
     ) -> Result<Value, EvalError> {
         match primitive {
-            PrimitiveId::QuantizedComponentRead { component, .. } => {
-                let tensor = frame.value(inputs[0]).as_tensor();
-                let logical = self.element_index(tensor, &inputs[1..], frame)?;
-                self.charge_work(1)?;
-                let info = registry::representation_info(tensor.representation);
-                let recipe = registry::decode_recipe(tensor.representation, info.decoded)
-                    .expect("checked packed component");
-                let _decode = self.reserve_elements::<ReferenceScalar>(recipe.temporary_count())?;
-                let flat = tensor.positions[logical];
-                Ok(Value::Scalar(match &tensor.backing {
-                    Backing::Argument(index) => {
-                        self.tensors[*index].read_component(flat, *component)
-                    }
-                    Backing::Owned(data) => data.borrow().read_component(flat, *component),
-                }))
-            }
-
             PrimitiveId::RangeMake => Ok(Value::Range(
                 frame.value(inputs[0]).as_nat(),
                 frame.value(inputs[1]).as_nat(),
@@ -823,10 +790,6 @@ impl Interpreter<'_> {
                     _ => scalar::cast(*dtype, value.as_scalar()),
                 }))
             }
-            PrimitiveId::Bitcast(dtype) => Ok(Value::Scalar(ReferenceScalar::from_bits(
-                *dtype,
-                frame.value(inputs[0]).as_scalar().bits(),
-            ))),
             PrimitiveId::Math(operation) => {
                 let arguments = inputs
                     .iter()
@@ -1468,8 +1431,7 @@ pub(crate) fn repack_bytes(
                 PlaneRepackRecipe::PackedEntries(expressions) => {
                     let bits = plane.entry_bits;
                     for (entry, expression) in expressions.iter().enumerate() {
-                        let value =
-                            scalar::cast(DType::I32, eval_repack(expression, source_packet));
+                        let value = scalar::cast(DType::I32, eval_repack(expression, source_packet));
                         write_bits(plane_bytes, entry * bits as usize, bits, value.bits());
                     }
                 }
@@ -1565,60 +1527,6 @@ fn scalar_symbol(value: ReferenceScalar) -> SymbolValue {
     }
 }
 
-#[cfg(test)]
-mod runtime_symbol_tests {
-    use super::*;
-    use crate::ids::{FunctionId, ProgramId};
-
-    #[test]
-    fn runtime_publications_preserve_scalar_payloads_and_quantity_versions() {
-        let mut arena = ExprArena::new();
-        let function = FunctionId::new(ProgramId::fresh(), 0);
-        let scalars = [
-            ReferenceScalar::F32(0x8000_0000),
-            ReferenceScalar::F32(0x7fc0_1234),
-            ReferenceScalar::F16(0xfe12),
-            ReferenceScalar::BF16(0xffc1),
-            ReferenceScalar::Bool(true),
-            ReferenceScalar::I32(i32::MIN),
-            ReferenceScalar::U32(u32::MAX),
-        ];
-        let publications: Vec<_> = scalars
-            .iter()
-            .enumerate()
-            .map(|(index, scalar)| {
-                let id = SemanticValueId::new(function, u32::try_from(index).unwrap());
-                let (symbol, _) = arena.runtime_scalar_value(id, scalar.dtype());
-                (id, symbol, *scalar)
-            })
-            .collect();
-        let quantity_id = SemanticValueId::new(function, u32::try_from(scalars.len()).unwrap());
-        let (quantity_symbol, quantity) = arena.runtime_value(quantity_id);
-        let mut frame = Frame::new(runtime_symbols(&arena), Assignment::new());
-        for (id, symbol, scalar) in publications {
-            frame.bind(id, Value::Scalar(scalar));
-            assert_eq!(
-                frame.assignment.get(symbol).unwrap().try_word64().unwrap(),
-                scalar_symbol(scalar).try_word64().unwrap()
-            );
-            assert!(matches!(frame.value(id), Value::Scalar(actual) if *actual == scalar));
-        }
-        let large = BigInt::from(1u32) << 96usize;
-        frame.bind(quantity_id, Value::Integer(large.clone()));
-        assert_eq!(arena.eval_int(quantity, &frame.assignment).unwrap(), large);
-        // Reached loop values replace the previous publication in this frame.
-        frame.bind(quantity_id, Value::Index(7u32.into()));
-        assert_eq!(
-            frame.assignment.get(quantity_symbol),
-            Some(SymbolValue::Int(7u32.into()))
-        );
-        assert_eq!(
-            arena.eval_int(quantity, &frame.assignment).unwrap(),
-            BigInt::from(7u32)
-        );
-    }
-}
-
 fn word_literal(dtype: DType, value: &BigInt) -> ReferenceScalar {
     assert!(
         dtype.is_int(),
@@ -1651,7 +1559,6 @@ fn apply_scalar_primitive(
             scalar::binary(*operation, arguments[0], arguments[1], Some(output)).map_err(Into::into)
         }
         PrimitiveId::Cast(dtype) => Ok(scalar::cast(*dtype, arguments[0])),
-        PrimitiveId::Bitcast(dtype) => Ok(ReferenceScalar::from_bits(*dtype, arguments[0].bits())),
         PrimitiveId::Math(operation) => scalar::math(*operation, arguments).map_err(Into::into),
         PrimitiveId::Select => Ok(if arguments[0].bits() != 0 {
             arguments[1]
@@ -1671,7 +1578,6 @@ fn apply_scalar_primitive(
         | PrimitiveId::Transpose
         | PrimitiveId::Reshape
         | PrimitiveId::SliceView { .. }
-        | PrimitiveId::QuantizedComponentRead { .. }
         | PrimitiveId::ElementRead { .. }
         | PrimitiveId::Extent { .. }
         | PrimitiveId::Atomic { .. }

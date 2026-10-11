@@ -150,7 +150,6 @@ fn main() {
         // first addition; the recursive directory source deduplicates them.
         .source("kernels/draft.seismic")
         .source("kernels/readout.seismic")
-        .source("kernels/clustered_readout.seismic")
         .source("kernels/vision.seismic")
         .source("kernels/recurrent.seismic")
         .source("kernels/short_conv.seismic")

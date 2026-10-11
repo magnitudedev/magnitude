@@ -7,8 +7,7 @@ use magnitude_artifacts::{
     ImageProcessor, InputLayout, TokenId,
 };
 use magnitude_family_contracts::{
-    AttentionGate, GateFunction, HeadComponent, HeadHistory, HeadInput, ImportTransform,
-    InputNorm, ModelInputAdapter, Operator,
+    AttentionGate, GateFunction, ImportTransform, InputNorm, ModelInputAdapter, Operator,
     OutputForm, PositionSampling, RecurrentHeadMapping, RowRange, TokenPlan, VisionResize,
 };
 use magnitude_family_qwen35::inputs::{QwenImageTokens, QwenInputAdapter};
@@ -240,10 +239,7 @@ fn routed_mtp_head_uses_expert_roles_without_dense_intermediate_metadata() {
     assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    let [block] = head.blocks[0].blocks.as_slice() else {
-        panic!("a Qwen3.5 MTP head block is one decoder block");
-    };
-    let sublayers = &block.sublayers;
+    let sublayers = &head.blocks[0].block.sublayers;
     assert!(matches!(sublayers[0].op, Operator::Attention(_)));
     assert!(matches!(sublayers[1].op, Operator::RoutedFfn(_)));
 }
@@ -435,12 +431,7 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
     assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    let HeadInput::Combine { combine, .. } = &head.blocks[0].input else {
-        panic!("a Qwen3.5 MTP head combines its input at the target's width");
-    };
-    assert_eq!(combine.shape, [8, 16]);
-    assert_eq!(head.history, HeadHistory::Own);
-    assert_eq!(head.component, HeadComponent::Target);
+    assert_eq!(head.blocks[0].combine.shape, [8, 16]);
 
     let mut malformed = mtp_directory();
     malformed

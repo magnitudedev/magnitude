@@ -1,243 +1,190 @@
-# Precision system
+# Precision policy
 
-The precision system lets native tuning choose faster implementations while controlling their
-added numerical error. One caller policy, α, applies across operations, models, representations
-and devices. The engine's standard is α = 8, set to admit every technique with a measured effect
-on speed (the packed weight forms measure 3.1 to 6.7 from their defaults). Per-operation
-allowances follow from the resolution of the
-stored inputs; they are not handwritten tolerances or a table of model-specific permissions.
+Magnitude allows small, explicitly bounded floating-point differences so the native kernel tuner
+can choose faster implementations. A candidate must meet the precision policy before it can
+continue competing on speed. Speed never compensates for failing a numerical check.
 
-The system combines three kinds of knowledge. Checked portable bodies and representation
-definitions describe the computation and its stored values. Executing native kernels establishes
-their actual error and speed. Independent model evaluation measures what the admitted error costs
-at model level over the intended workloads. None substitutes for the others.
+The engine supplies the limits. Seismic supplies the shared policy representation, comparison,
+and enforcement in native tuning. This document explains the current behavior; the governing
+contracts are [numerical precision](../../design/inference/seismic-numerical-precision.md) and
+[execution planning](../../design/inference/engine/execution-plan.md).
 
-This document defines the intended error model and admission policy. [Tuning](tuning.md) owns
-search, deadlines and retained evidence; [compiler numerical applicability](seismic/compiler/numerics.md)
-remains a separate source-preservation contract.
+## The production limits
 
-## What admission guarantees
-
-Admission makes one exact statement: at every checked output and written state, the candidate
-moved the default's result by no more than α times the movement that storage-resolution noise
-causes there. Both quantities are measured at the point. Nothing is fitted, declared or inferred
-from the rest of the model, so every candidate that fits α is admitted and no other is.
-
-Admission does not state a ceiling on model-level quality change. The downstream cost of an error
-depends on how the rest of the network responds to its direction and covariance, and that response
-cannot be observed from an operation's own inputs and outputs. Tuning runs no model-level passes
-and ships no sensitivity data, so a local correction for it would be a guess about the network.
-There is none. Model-level impact is a measured property of the system, established by evaluation.
-
-Four relations determine how a local ratio becomes a model-level effect. Evaluation measures each
-over the intended operating regime; none is a universal fact about floating-point programs, and
-none is enforced by admission.
-
-1. **Small-error cost follows a square law.** At a fixed location, scaling an error of fixed
-   structure by a factor c approximately scales its model-level distributional effect by c².
-   Sensitivity depends on the location and the surrounding computation. Large perturbations,
-   changed control decisions and different error directions need not follow the same curve.
-2. **Independent error effects add.** Contributions from different operations or techniques
-   approximately add when their propagated cross terms are negligible. Dependencies across
-   layers, shared operands and time can break this; different kernel names do not establish
-   independence.
-3. **Existing error does not mask new error.** The same injected error has approximately the
-   same incremental reference loss on matched higher- and lower-precision versions of a model.
-   A coarse file is not free capacity for further degradation. This transfer is measured across
-   file types, not inferred from bit width.
-4. **Equal-sized errors cost different amounts.** Candidate error and storage-resolution noise of
-   the same size at the same location differ in downstream effect according to their direction
-   and covariance. The spread of that cost around the noise's cost is the system's model-level
-   approximation. It is measured and reported, never corrected for.
-
-If measurement shows a value of α costs more quality than is acceptable, the remedy is a different
-α or a different generic yardstick, not per-model allowances or a correction inside admission.
-
-## Why magnitude, structure and dependence matter
-
-For one fixed rendered input, let δᵢ be the error introduced at operation i, including any state
-it writes. Let Jᵢ map a small error there to its first-order change in the final logits. For
-baseline probabilities p, the local KL metric on logits is F = diag(p) − ppᵀ. Then:
+For every finite floating-point result or writable-state element, compare the candidate value
+with the reference value:
 
 ```text
-change in logits ≈ Σᵢ Jᵢ δᵢ
-Hᵢⱼ = Jᵢᵀ F Jⱼ
-
-KL(baseline || perturbed)
-    ≈ ½ Σᵢ δᵢᵀ Hᵢᵢ δᵢ + Σᵢ<ⱼ δᵢᵀ Hᵢⱼ δⱼ
+error = abs(candidate - reference)
+allowed_error = absolute + relative * abs(reference)
+pass when error <= allowed_error
 ```
 
-The diagonal terms explain the square law. They also explain why equal-sized errors can have
-different costs: the network amplifies some directions and suppresses others. A scalar
-sensitivity times squared RMS is exact only for a fixed error structure. The tuner does not
-compute or ship these Jacobians, which is why its local rule claims nothing about them; this
-model explains what evaluation measures instead.
+**Absolute** is a fixed allowance in the value's units. It provides a meaningful allowance near
+zero, where a percentage alone would approach zero. **Relative** is an allowance proportional to
+the reference's magnitude. The two allowances add together; an element does not have to pass two
+separate tests.
 
-The cross terms explain compounding. At a fixed input, conditionally zero-mean errors with zero
-cross-covariance make the expected cross terms vanish in this local model. Extending that result
-across inputs must preserve the condition: H changes with the input. This is an expectation over
-perturbations, not a guarantee for each token. Bias and correlated directions can
-reinforce each other; favorable cancellation cannot be counted as spare error budget. Pairwise
-raw correlation alone does not establish the absence of sensitivity-weighted interactions.
-For n equal contributions, independent effects grow like n; perfectly aligned propagated
-errors can instead grow like n².
+| Result or writable-state type | Absolute | Relative |
+| --- | ---: | ---: |
+| F32 | `0.00001` | `0.0001` (0.01%) |
+| F16 | `0.001` | `0.002` (0.2%) |
+| BF16 | `0.01` | `0.01` (1%) |
+| Integer, Boolean, index, or packed-code state | Exact | Exact |
 
-Even independently perturbed stored weights produce correlated output errors when the same
-weights are reused across tokens. A cache error is reused by later queries, and recurrent state
-feeds subsequent state. Noise must follow that same storage lifetime, not be redrawn on each
-read to make the experiment appear independent. Errors in discarded prompt intermediates and
-errors published into persistent state have different future effects. A one-step comparison of
-written state therefore requires validation over subsequent generation before it can stand in
-for its lifetime cost.
+These types describe the observed result or state, not the model's weight quantization. A Q4
+model can produce BF16 activations, F32 results, and F16 state; each receives its corresponding
+policy. Every floating result/state subject is assigned an explicit tolerance, with exact
+comparison as the default for other subjects.
 
-There are also two different KL questions:
+One case takes the type of what was computed instead of the type it is stored as: a result that
+is a residual plus a value the kernel rounds to the activation type first (the MLP down
+projection and the attention output projection write the F32 residual stream this way). Summing
+in another order can round that value one step differently, which no F32 tolerance admits, so
+such a result takes the activation type's row: BF16 for a BF16 model.
 
-```text
-distribution change = KL(default || candidate)
-added reference loss = KL(reference || candidate) − KL(reference || default)
-```
+For example, BF16 allows **0.01 plus 1% of the reference's magnitude**:
 
-They are not interchangeable. In a common quadratic approximation around the independent
-reference, let e be the default's existing logit error, d the added logit error, and G the
-reference's local KL metric:
+| Reference | Maximum allowed error | Accepted interval |
+| ---: | ---: | ---: |
+| 0 | 0.01 | −0.01 to 0.01 |
+| 1 | 0.02 | 0.98 to 1.02 |
+| 10 | 0.11 | 9.89 to 10.11 |
+| 100 | 1.01 | 98.99 to 101.01 |
 
-```text
-added reference loss ≈ ½ dᵀ G d + eᵀ G d
-```
+Every checked element must pass. A bad element cannot be hidden by averaging its error with a
+large number of correct elements. Shapes and representations must also match. NaNs, infinities,
+signed zeros, and subnormals follow the shared `SpecialPolicy::PRESERVE` rules rather than using
+the finite-value formula to excuse changes.
 
-The second term can reinforce or cancel the new error; it is first-order in d and can make
-added reference loss negative. No masking requires this interaction, and changes in sensitivity
-between the two baselines, not to invalidate the incremental-cost model. Small default-relative
-KL alone does not establish that condition. Where the errors leave the local quadratic regime,
-the expansion itself no longer supplies the argument.
+The shared `Tolerance` type also supports a relative floor and a limit on representable
+floating-point steps (ULPs). Production uses a zero relative floor and no additional ULP cap.
+The constants are defined in the engine's [precision policy](../engine/executor/src/native/tuning/precision.rs).
 
-## Storage resolution supplies the yardstick
+## Error classes
 
-A stored value can only be one of the values its format represents. The gap between adjacent
-representable values is its step. The yardstick is how far the canonical default's output moves
-when its stored inputs are perturbed by their own steps. It is a defined comparison scale read
-from the stored data and declared types, not an estimate of the error the file already contains:
-no original weights or knowledge of how the file was produced is needed.
+A kernel form whose error against its entry's default exceeds these limits by design declares an
+**error class** (`error_class NAME when ...` in its native declaration). The tuner forms a
+configuration of a class only when the load admits the class by name, none by default
+(`--admit-error-class` on the engine CLI), and then validates it against the default under the
+class's envelope instead of the per-element limits: a bound on the relative RMS difference of
+each result and on its largest element difference in units of the reference RMS. Whether a model
+tolerates a class is decided by the model's qualification, not at load. The envelopes are in the
+engine's [precision policy](../engine/executor/src/native/tuning/precision.rs):
 
-| Stored input | Step |
+| Class | Forms | Relative RMS | Largest element |
+| --- | --- | ---: | ---: |
+| `int8_activations` | INT8 of `dense_expand` and `dense_output` on Metal tensor operations: activations as int8 per (row, 32 columns) against exact weight codes | `0.02` | `0.25` |
+| `int8_token_packing` | PACK of `dense_expand`, `dense_output`, `project_rows`, `gated_delta_project`, `attention_project` and `attention_output` on Metal without tensor operations, over Q4_K, Q5_K, Q6_K or q4g32s (GGUF Q4_0) weights: activations as integer codes per (row, 32 columns), two rows packed into one F32 matrix operand against exact weight codes | `0.02` | `0.5` |
+
+`int8_token_packing` is row-dependent: the top row's sums of a pair are exact, and the low row's
+carry the rounding of the accumulator the two share, so a row's result depends on the row it is
+packed with (and through it on how a request is split into forwards).
+
+## What the reference is
+
+Production executes the native kernel with its **declared default tuning parameters** to produce
+the reference for each test case. Candidates run with the same inputs and initial writable state.
+Reference observations are retained independently so later candidate executions cannot overwrite
+them.
+
+This establishes agreement with the native default. It does not establish independent agreement
+with the mathematical operation: a defect shared by the default and a candidate can pass.
+Independent kernel tests and model regressions therefore remain necessary.
+
+The runtime also supports an explicitly selected portable reference for development tests.
+Full-size portable reference execution proved too slow for production startup. Reference selection
+is explicit; failure to execute a reference does not silently switch to another one.
+
+## How the tuner enforces it
+
+A candidate is a complete kernel entry with concrete tuning parameters. It can contain several
+GPU launches. Validation checks every element of the entry's returned outputs and of the rows
+its writable state declares written. Each case declares, per writable parameter, the rows the
+entry writes (for attention, the appended rows of the history); the rest of that state is input
+the entry only reads, so comparing it would re-read bytes that were just restored. Long
+histories would make that the dominant startup cost. One case per tuned unit, the one with the
+least state, instead restores and compares its writable state whole, so a candidate that writes
+outside its declared rows is still rejected.
+
+For a candidate without matching prior evidence, the tuner performs this sequence:
+
+1. Restore the case's written rows (the whole state at the unit's one whole case) to their
+   pristine contents and clear reused output storage. This prevents a missing write from
+   inheriting a previous candidate's correct output.
+2. Execute and time the candidate's first invocation for the case.
+3. Read its outputs and written state, then compare them with the retained reference. Readback,
+   comparison, and state initialization are outside the GPU timing interval.
+4. On failure, reject the candidate immediately and stop its remaining performance samples.
+   On success, check the remaining required cases and input rotations.
+5. Once qualified, continue performance sampling, ranking, and confirmation. Reuse the first
+   duration as a speed sample when it meets the existing warmup/calibration rules; otherwise it
+   serves as calibration. There is no extra kernel invocation solely to obtain validation output.
+
+Later timing passes are batched and do not restore mutable state: every configuration is timed
+the same way, so the state they leave behind affects all of them alike, and only the validated
+first invocation needs pristine state. Serving state is never used as tuning scratch. Comparison
+still has a host-side cost even though the validation execution is shared with timing.
+
+Ordinary search, searches over launch-local choices, startup census seeds, and final assembled
+configurations obey the same numerical gate. Timing equivalence between two choices does not
+authorize numerical reuse. The default configuration is also a candidate that must qualify;
+it is not an unchecked fallback after a failure. If no candidate qualifies, preparation fails.
+
+Test coverage is part of enforcement. Cases include served row classes, real model-weight
+rotations where appropriate, and the empty as well as long attention histories. Attention history
+lengths are `0, 256, 4096, 16384, 65536`, subject to the model's supported limits. The original
+Gemma attention defect reproduces on the fresh-only path of an empty history and passed at long
+histories, so checking only long histories would miss it even with a tighter tolerance.
+
+## Cache reuse
+
+Only a completed search whose choice passed every case is stored. Evidence binds the case
+structure, policy, source, reference kind and artifact, candidate artifact, and device; the
+cache key covers the implementation, the precision policy and the search objective. Tuning
+inputs are generated test data and resident weights, so evidence is not bound to their bytes.
+
+A hit uses the stored choice without constructing inputs, validating or timing. A changed
+implementation, policy or objective is a different key and requires fresh qualification.
+Persisted policy values and search weights retain their exact floating-point values through
+JSON round trips.
+
+## Relationship to compiler precision
+
+Both the native tuner and compiler use `PrecisionPolicy` and `Tolerance`. Their enforcement
+has different scopes:
+
+| Policy | Meaning |
 | --- | --- |
-| Quantized weights | Adjacent codes of each stored plane, including the format's own stored scales |
-| Compressed state | Adjacent codes of the codec and adjacent values of its stored coefficients |
-| Floating activations and dense state | Adjacent representable values of the declared type |
+| `Exact` | Preserve the source's declared numerical behavior. |
+| `Bounded` | Allow only differences within the declared numerical limits. |
+| `Unconstrained` | Relax floating-point error bounds while retaining discrete-value and other correctness requirements. |
 
-Two consequences follow. Finer storage gives a smaller allowance, all else equal. Files in one
-format receive the same allowance however they were produced: importance-aware quantization and
-quantization-aware training leave less error than their step implies, so a given α is a larger
-share of such a file's own error than of a plainly rounded file's. α therefore has no fixed
-equivalent in bits of precision across kinds of file.
+Production native tuning uses `Bounded` and rejects `Unconstrained`. It establishes empirical
+agreement on its tested cases. Compiler selection requires an established numerical relation
+to the portable source; passing tuner samples cannot make an otherwise unproven compiler
+transformation eligible. The shared representation keeps the limits and comparison semantics
+consistent without treating local test results as a proof for every input.
 
-**The reference perturbation.** Each stored value independently moves to the adjacent
-representable value above or below, with probability 1/24 each, and otherwise stays. Storage
-cannot hold part of a step; this is the realizable perturbation with the variance of rounding
-error over one step, s²/12. A move with no adjacent value in range is no move. Indices, counts and
-masks are not stored values and are never perturbed. One draw is made per stored value and reused
-wherever that value is read.
+## Why these bounds, and what they guarantee
 
-**Obtaining the yardstick.** Execute the default once more on the perturbed inputs and measure
-the movement of every returned output and written-state subject. One method serves every
-operation: the real kernel carries the perturbation through its own normalization, rounding and
-nonlinear stages, so nothing is derived about its internals. The yardstick does not depend on
-the candidate. For an output linear in a perturbed input the expected movement is exact:
+The current constants are the selected **1× policy** from local 0.25×, 1×, and 4× experiments on
+Gemma 26B A4B and Gemma E2B using Metal on an M4 Max. Tightening to 0.25× slowed E2B by about 17%
+without improving the answer checks. Loosening to 4× gained about 1.9% on Gemma 26B but lost
+about 4.6% on E2B. The original Gemma/Pi regression passed at 1×, and the numerical gate rejected
+the historical bad attention configuration at all three tested scales.
 
-```text
-y = Wx, perturbing W:    E[‖δy‖²] = Σᵣ Σₖ (sᵣₖ² / 12) xₖ²
-```
+The [experiment report](../../bugs/26-09-29/bounded-precision-status.md) contains the chart,
+raw measurements, unchanged answer mistakes, startup costs, and coverage limits. These results
+support an engineering default for the tested workloads, not a universal optimal threshold.
 
-Elsewhere the measured movement is one draw of the defined perturbation, and a few whole steps
-need not move a nonlinear output as many part-steps of equal variance would. Evaluation
-establishes its stability across draws.
+Ordinary production builds use fixed constants. The development-only
+`tuning-precision-experiment` feature enables `MAGNITUDE_TUNING_PRECISION_SCALE`, which scales
+both absolute and relative allowances. It is not a production tuning knob, and the tuner does
+not widen limits automatically to admit a faster candidate.
 
-## From local measurements to one admission rule
-
-For each floating output or writable-state subject at a point, let ε be the candidate's relative
-RMS difference from the default, and b the yardstick expressed with the same normalization.
-Then r = ε / b is dimensionless. Equivalently, it compares candidate error power with
-resolution-noise output power before taking the square root; the shared output normalization
-cancels. A zero yardstick permits no nonzero error, and an unavailable yardstick grants no
-admission to an alternative. Geometry, discrete values, memory behavior and exceptional-value
-rules remain separate hard constraints.
-
-The decision is:
-
-```text
-r ≤ α
-```
-
-There is no further term. In particular there is no correction for the structure of the error:
-any such factor would have to estimate the network's downstream sensitivity from local data,
-which local data does not contain.
-
-The model-level consequence follows from the four relations. Let Cᵢ be the expected
-default-relative KL from resolution noise at location i over the assessed inputs, and kᵢ the cost
-of the candidate's error there relative to resolution noise of the same size:
-
-```text
-candidate contribution at i ≈ kᵢ × Cᵢ × rᵢ²,     rᵢ ≤ α
-
-with additive effects:
-total candidate contribution ≈ Σᵢ kᵢ × Cᵢ × rᵢ²
-```
-
-Admission fixes rᵢ ≤ α. Each location carries its own sensitivity in Cᵢ, so no budget is
-assigned or redistributed between layers. The tuner knows neither kᵢ nor Cᵢ. Were every kᵢ equal
-to one, the total would be at most α² × Σᵢ Cᵢ, the effect of one resolution-noise budget; how far
-kᵢ departs from one is what evaluation measures. Reading the total as added reference loss needs
-the no-masking relation as well. Correlated contributions do not simply add, and a candidate that
-writes several subjects has joint structure that per-subject ratios do not describe.
-
-α = 1 is not a promise to double the model's existing error, lose a fixed number of effective
-bits, or admit every low-precision optimization. α is a ceiling on local movement, not a target to
-spend. The squared ratios are contributions relative to resolution noise; neither they nor their
-unweighted sum are KL predictions in nats.
-
-## How this governs tuning
-
-The [native tuner](tuning.md) selects the fastest measured admissible complete configuration.
-The canonical default defines the local comparison and is always numerically admissible; it
-need not be compared with itself. It must still form and execute legally. Its default status is
-not independent evidence of correctness.
-
-Inputs, default outputs and yardsticks are shared across candidate comparisons at a point.
-A candidate's initialized execution supplies both timing and numerical observations; device-side
-reductions compute the error before outputs are reused. An over-budget candidate is
-rejected immediately. Performance sampling does not trigger a separate reference execution for
-every candidate. The selected artifact must additionally cover required shapes and witnesses
-outside the timed workload before it replaces the default.
-
-All of this shares the single first-load allowance, including canonical compilation. There is
-no slow CPU reference, offline calibration, shipped sensitivity map, or whole-model startup pass.
-The language declares computation and representation semantics, not precision permissions or
-claims about how a native kernel accumulates. Reordering, packing and narrower arithmetic face
-the same measured rule. There are no `numerics`, `error_class` or `deviates` declarations.
-
-## Evidence and boundaries
-
-Development evaluation measures the four relations together: scaling at fixed structure;
-independent versus combined effects; transfer across file types without masking; and
-candidate-versus-noise cost across structures. It must also establish that tuning inputs
-represent real activations, that one draw of the yardstick is stable, and that errors
-written into state remain within the model over long generation. Testing only one site, only
-random noise, or only prompt logits cannot discharge these obligations.
-
-Whole-model checks use rendered chat fixtures and sane independent references, retain the full
-quality distribution, and distinguish default-relative movement from added reference loss.
-Changing a KV codec has its own model-quality obligation: matching a compressed canonical kernel
-does not establish that the compression itself is suitable. The [evaluation contract](../../design/inference/evaluation.md)
-owns these measurements; empirical results and implementation status are recorded separately
-from this intended design.
-
-Native agreement cannot detect a defect shared with the default. Kernel tests and independent
-semantic checks remain necessary. A rounding-scale estimate, such as √K times accumulator unit
-roundoff for a reduction, is an inspection signal under its rounding and conditioning assumptions,
-not a second admission threshold or a general correctness proof. Large departures can indicate
-an intentional approximation or a defect; small departures do not prove correctness.
-
-Compiler-generated alternatives require an established whole-entry numerical relation to the
-portable source. Passing native tuning samples cannot grant that applicability. The governing
-[numerical contract](../../design/inference/seismic-numerical-precision.md) keeps compiler proof,
-native empirical admission and model-quality evidence distinct.
+Local bounds do not prove that errors cannot compound across a model or change a near-tied token
+choice. Whole-model numerical and output/parser regressions are development and release checks.
+Startup does not run a full-model test for each candidate or search combinations of kernel
+winners. The guarantee is that every selected native candidate has qualifying evidence for
+its required local cases under the declared policy.

@@ -273,108 +273,6 @@ impl<'a> Checker<'a> {
             ok
         };
         match name.name.as_str() {
-            "quantized_code"
-            | "quantized_code_value"
-            | "quantized_scale_code"
-            | "quantized_bias_code"
-            | "quantized_scale"
-            | "quantized_bias"
-            | "quantized_group_size"
-            | "quantized_code_min"
-            | "quantized_code_max"
-            | "quantized_scale_factor"
-            | "quantized_bias_factor"
-            | "quantized_coefficient_code_max"
-            | "quantized_bias_present" => {
-                if args.len() < 2 || args.iter().any(|arg| arg.name.is_some()) {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        "a quantized component takes a tensor followed by logical point indices",
-                    );
-                    return None;
-                }
-                let indexed = ast::Expr {
-                    span,
-                    kind: A::Index {
-                        base: Box::new(args[0].value.clone()),
-                        indices: args[1..]
-                            .iter()
-                            .map(|arg| ast::Index::Expr(arg.value.clone()))
-                            .collect(),
-                    },
-                };
-                let mut read = self.expr(&indexed, None)?;
-                let component = match name.name.as_str() {
-                    "quantized_code" => crate::registry::QuantizedComponent::Code,
-                    "quantized_code_value" => crate::registry::QuantizedComponent::CodeValue,
-                    "quantized_scale_code" => crate::registry::QuantizedComponent::ScaleCode,
-                    "quantized_bias_code" => crate::registry::QuantizedComponent::BiasCode,
-                    "quantized_scale" => crate::registry::QuantizedComponent::Scale,
-                    "quantized_bias" => crate::registry::QuantizedComponent::Bias,
-                    "quantized_group_size" => crate::registry::QuantizedComponent::GroupSize,
-                    "quantized_code_min" => crate::registry::QuantizedComponent::CodeMin,
-                    "quantized_code_max" => crate::registry::QuantizedComponent::CodeMax,
-                    "quantized_scale_factor" => crate::registry::QuantizedComponent::ScaleFactor,
-                    "quantized_bias_factor" => crate::registry::QuantizedComponent::BiasFactor,
-                    "quantized_coefficient_code_max" => {
-                        crate::registry::QuantizedComponent::CoefficientCodeMax
-                    }
-                    _ => crate::registry::QuantizedComponent::BiasPresent,
-                };
-                let CheckedExprKind::Primitive { id, operands, .. } = &mut read.kind else {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        "a quantized component requires logical point indices",
-                    );
-                    return None;
-                };
-                let PrimitiveId::ElementRead { checks } = id else {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        "a quantized component requires logical point indices",
-                    );
-                    return None;
-                };
-                let ValueType::Tensor(tensor) = &operands[0].ty else {
-                    unreachable!("element read takes a tensor");
-                };
-                self.elements.component_read(&tensor.elem, component);
-                *id = PrimitiveId::QuantizedComponentRead {
-                    component,
-                    checks: checks.clone(),
-                };
-                read.ty = ValueType::Scalar(component.dtype());
-                read.value = super::ir::SourceValue::Untracked;
-                Some(read)
-            }
-            "bitcast_f32" | "bitcast_u32" => {
-                if !positional(self, 1) {
-                    return None;
-                }
-                let (from, to) = if name.name == "bitcast_f32" {
-                    (DType::U32, DType::F32)
-                } else {
-                    (DType::F32, DType::U32)
-                };
-                let input = self.expr(&args[0].value, Some(&ValueType::Scalar(from)))?;
-                let id = PrimitiveId::Bitcast(to);
-                if !primitive(&id).accepts(&[input.ty.clone()]) {
-                    self.error(
-                        DiagnosticRule::Type,
-                        span,
-                        format!("`{}` requires scalar or dense tensor {from}", name.name),
-                    );
-                    return None;
-                }
-                let axes = match &input.ty {
-                    ValueType::Tensor(t) => Some(t.axes.clone()),
-                    _ => None,
-                };
-                self.elementwise_primitive(id, vec![input], axes, span)
-            }
             "index" => {
                 self.error(
                     DiagnosticRule::Type,
@@ -481,7 +379,7 @@ impl<'a> Checker<'a> {
                     return None;
                 };
                 let axis = self.constant_axis(&args[1].value, s.rank())?;
-                let sym = self.arena.int_to_word(s.axes[axis], DType::I32);
+                let sym = s.axes[axis];
                 Some(self.primitive_expr(
                     PrimitiveId::Extent { axis: axis as u32 },
                     vec![base],
@@ -690,12 +588,12 @@ impl<'a> Checker<'a> {
                         intrinsics::IndexSlot::Full => {}
                         intrinsics::IndexSlot::Range { start, end, .. } => {
                             let lo = start.then(|| {
-                                let value = operands[operand].integer();
+                                let value = operands[operand].sym;
                                 operand += 1;
                                 value
                             });
                             let hi = end.then(|| {
-                                let value = operands[operand].integer();
+                                let value = operands[operand].sym;
                                 operand += 1;
                                 value
                             });
@@ -931,61 +829,6 @@ impl<'a> Checker<'a> {
         if out.len() > 1 && matches!(args[0].value.kind, A::Int(_) | A::Float(_)) {
             out[0] = self.expr(&args[0].value, Some(&out[1].ty.clone()))?;
         }
-        if matches!(op, MathOp::Min | MathOp::Max)
-            && out
-                .iter()
-                .all(|value| matches!(value.ty, ValueType::Integer | ValueType::Index { .. }))
-        {
-            // A helper result can carry an exact quantity without a prior
-            // symbolic name. Bind that name to its reached value during lowering;
-            // retain the operand itself so calls and source effects still occur.
-            for operand in &mut out {
-                if operand.integer().is_none() {
-                    let symbol = self.fresh_data_symbol();
-                    self.facts.assume_type(&mut self.arena, symbol, &operand.ty);
-                    operand.value =
-                        super::ir::SourceValue::Scalar(super::ir::SourceScalar::Quantity {
-                            meaning: self.arena.int_symbol(symbol),
-                            binding: Some(symbol),
-                        });
-                }
-            }
-            let lhs = out[0].integer().unwrap();
-            let rhs = out[1].integer().unwrap();
-            let value = if op == MathOp::Min {
-                self.arena.int_min(lhs, rhs)
-            } else {
-                self.arena.int_max(lhs, rhs)
-            };
-            return Some(self.primitive_expr(
-                PrimitiveId::Math(op),
-                out,
-                ValueType::Integer,
-                Some(value),
-                span,
-            ));
-        }
-        // As in ordinary binary arithmetic, a fixed-width integer operand
-        // chooses word arithmetic when paired with an exact quantity.
-        // Keep the conversion as an evaluated operand, including wrapping.
-        if matches!(op, MathOp::Min | MathOp::Max) {
-            let word = out.iter().find_map(|value| match value.ty {
-                ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) => Some(dtype),
-                _ => None,
-            });
-            if let Some(dtype) = word {
-                out = out
-                    .into_iter()
-                    .map(|value| {
-                        if matches!(value.ty, ValueType::Integer | ValueType::Index { .. }) {
-                            self.quantity_to_word(value, dtype)
-                        } else {
-                            value
-                        }
-                    })
-                    .collect();
-            }
-        }
         let operands: Vec<&CheckedExpr> = out.iter().collect();
         let (axes, dtypes) = self.broadcast(&operands, &format!("`{name}`"), span)?;
         let mut dtype = dtypes[0];
@@ -1085,7 +928,7 @@ impl<'a> Checker<'a> {
         let check_nonempty = op != intrinsics::ReduceOp::Sum && {
             let one = self.arena.int(1);
             let slack = self.arena.int_sub(s.axes[axis], one);
-            !super::prove::derive_nonnegative(&mut self.arena, &self.facts, slack).is_established()
+            !super::prove::nonneg(&self.arena, &self.facts, slack)
         };
         let id = PrimitiveId::Reduce {
             op,
@@ -1145,9 +988,7 @@ impl<'a> Checker<'a> {
             operands.push(d);
         }
         let difference = self.arena.int_sub(target, source);
-        if axes.is_empty()
-            || !super::prove::derive_zero(&mut self.arena, &self.facts, difference).is_established()
-        {
+        if axes.is_empty() || !super::prove::zero(&self.arena, &self.facts, difference) {
             self.error(
                 DiagnosticRule::Type,
                 span,
@@ -1770,8 +1611,7 @@ impl<'a> Checker<'a> {
                 .map(ValueType::Scalar);
             let write_only_candidate =
                 param.is_some_and(|p| p.ownership == ParamOwnership::Exclusive);
-            let value = self.expr_inner(&arg.value, hint.as_ref(), write_only_candidate)?;
-            args.push(self.word_value(value));
+            args.push(self.expr_inner(&arg.value, hint.as_ref(), write_only_candidate)?);
         }
         let (family, order, elements) = match self.select_family(name, families, ast_args, &args) {
             Ok(selected) => selected,
@@ -1798,6 +1638,10 @@ impl<'a> Checker<'a> {
         if !outcome.diagnostics.is_empty() {
             return None;
         }
+        let plan = outcome
+            .plan
+            .as_ref()
+            .expect("a family contract without diagnostics has its dimension plan");
         let dimension_symbols = outcome
             .signature
             .dimensions
@@ -1819,41 +1663,12 @@ impl<'a> Checker<'a> {
                 );
                 return None;
             };
-            let value = value.integer().expect("a checked seed has its symbol");
+            let value = value.sym.expect("a checked seed has its symbol");
             seeded.push((
                 u32::try_from(ordinal).expect("dimension ordinal fits u32"),
                 value,
             ));
         }
-        let seed_ordinals = seeded
-            .iter()
-            .map(|(ordinal, _)| *ordinal)
-            .collect::<Vec<_>>();
-        let plan = match dimensions::plan_dimensions_with_seeds(
-            &outcome.arena,
-            &outcome.signature.dimensions,
-            &outcome
-                .signature
-                .params
-                .iter()
-                .map(|parameter| &parameter.ty)
-                .collect::<Vec<_>>(),
-            &seed_ordinals,
-        ) {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.error(
-                    DiagnosticRule::Dimension,
-                    span,
-                    format!(
-                        "dimensions {} of `{}` are not determined by these input axes and explicit bindings",
-                        error.underdetermined.iter().map(|name| format!("`{name}`")).collect::<Vec<_>>().join(", "),
-                        name.name,
-                    ),
-                );
-                return None;
-            }
-        };
         // L16: the family plan solves every dimension from the actual axes.
         let actual_axes = |axis: &dimensions::ObservedAxis| {
             let mut ty = &args[order[axis.parameter as usize]].ty;
@@ -1866,7 +1681,7 @@ impl<'a> Checker<'a> {
             ty.shaped().expect("an observed axis is a tensor axis").axes[axis.axis as usize]
         };
         let values = match dimensions::apply_at_call(
-            &plan,
+            plan,
             &outcome.arena,
             &mut self.arena,
             &actual_axes,
@@ -1888,7 +1703,10 @@ impl<'a> Checker<'a> {
                 return None;
             }
         };
-
+        let seed_ordinals = seeded
+            .iter()
+            .map(|(ordinal, _)| *ordinal)
+            .collect::<Vec<_>>();
         // Every formal axis equals its actual axis under the solved dimensions.
         let params = outcome.signature.params.clone();
         for (parameter_ordinal, parameter) in params.iter().enumerate() {
@@ -1929,9 +1747,7 @@ impl<'a> Checker<'a> {
         for (ordinal, dimension) in outcome.signature.dimensions.iter().enumerate() {
             let lower = self.arena.int(if dimension.admits_zero { 0 } else { 1 });
             let slack = self.arena.int_sub(values[ordinal], lower);
-            if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, slack)
-                .is_established()
-            {
+            if !super::prove::nonneg(&self.arena, &self.facts, slack) {
                 let rendered = self.render(values[ordinal]);
                 self.error(
                     DiagnosticRule::CallContract,
@@ -1947,26 +1763,6 @@ impl<'a> Checker<'a> {
             }
         }
         for conjunct in outcome.signature.predicates.clone() {
-            if let Predicate::Boolean(predicate) = conjunct.predicate {
-                let mut map = |symbol: SymbolId, _: &mut ExprArena| {
-                    let ordinal = dimension_symbols
-                        .iter()
-                        .position(|candidate| *candidate == symbol)
-                        .expect("predicate symbol names a dimension");
-                    AnyExpr::Int(values[ordinal])
-                };
-                let predicate = super::xfer::transfer_bool(
-                    &outcome.arena,
-                    predicate,
-                    &mut self.arena,
-                    &mut map,
-                );
-                if !self.facts.boolean(&mut self.arena, predicate) {
-                    self.error(DiagnosticRule::CallContract, span, format!("`{}` requires its boolean shape condition at this call; guard the call", name.name));
-                    return None;
-                }
-                continue;
-            }
             let expression = substitute(
                 &outcome.arena,
                 &dimension_symbols,
@@ -1976,15 +1772,10 @@ impl<'a> Checker<'a> {
             );
             let proved = match conjunct.predicate {
                 Predicate::NonNegative(_) => {
-                    super::prove::derive_nonnegative(&mut self.arena, &self.facts, expression)
-                        .is_established()
+                    super::prove::nonneg(&self.arena, &self.facts, expression)
                 }
-                Predicate::Zero(_) => {
-                    super::prove::derive_zero(&mut self.arena, &self.facts, expression)
-                        .is_established()
-                }
+                Predicate::Zero(_) => super::prove::zero(&self.arena, &self.facts, expression),
                 Predicate::NonZero(_) => self.facts.nonzero(&mut self.arena, expression),
-                Predicate::Boolean(_) => unreachable!("boolean predicate handled above"),
             };
             if !proved {
                 let file = resolved.declared[contract].file;
@@ -2015,9 +1806,7 @@ impl<'a> Checker<'a> {
             let checked = match (&formal, &argument.ty) {
                 (ValueType::Index { bound }, ValueType::Index { bound: actual }) => {
                     let slack = self.arena.int_sub(*bound, *actual);
-                    if super::prove::derive_nonnegative(&mut self.arena, &self.facts, slack)
-                        .is_established()
-                    {
+                    if super::prove::nonneg(&self.arena, &self.facts, slack) {
                         argument
                     } else {
                         let span = argument.span;
@@ -2030,9 +1819,7 @@ impl<'a> Checker<'a> {
                 }
                 (ValueType::Range { bound }, ValueType::Range { bound: actual }) => {
                     let slack = self.arena.int_sub(*bound, *actual);
-                    if !super::prove::derive_nonnegative(&mut self.arena, &self.facts, slack)
-                        .is_established()
-                    {
+                    if !super::prove::nonneg(&self.arena, &self.facts, slack) {
                         let (formal, actual) = (self.render(*bound), self.render(*actual));
                         self.error(
                             DiagnosticRule::Type,
@@ -2255,7 +2042,7 @@ impl<'a> Checker<'a> {
                     failure,
                 },
             ty,
-            value,
+            sym,
             span,
         } = argument
         else {
@@ -2273,16 +2060,16 @@ impl<'a> Checker<'a> {
                 marked.push(endpoint);
             }
         }
-        Some(CheckedExpr {
-            kind: CheckedExprKind::Primitive {
+        Some(CheckedExpr::new(
+            CheckedExprKind::Primitive {
                 id: PrimitiveId::RangeMake,
                 operands: marked,
                 failure,
             },
             ty,
-            value,
+            sym,
             span,
-        })
+        ))
     }
 }
 

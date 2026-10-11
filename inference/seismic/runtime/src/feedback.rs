@@ -169,7 +169,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                     registry::RepresentationKind::PackedRows(_) => {
                         return Err(ObservationError::Unsupported(
                             registry::ROW_LAYOUT_IS_NATIVE_ONLY.into(),
-                        ));
+                        ))
                     }
                 };
                 construction_temporary = construction_temporary.max(temporary);
@@ -452,10 +452,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                 })? {
                     Comparison::Match => {}
                     Comparison::Mismatch(reason) => {
-                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")));
+                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")))
                     }
                     Comparison::Unsupported(reason) => {
-                        return Err(ObservationError::Unsupported(reason));
+                        return Err(ObservationError::Unsupported(reason))
                     }
                 }
             }
@@ -685,7 +685,7 @@ fn scalar(
         _ => {
             return Err(ObservationError::InvalidCase(
                 "index sort cannot encode a scalar parameter".into(),
-            ));
+            ))
         }
     })
 }
@@ -878,7 +878,7 @@ fn capture_invocation<T: TargetFamily, H>(
                 _ => {
                     return Err(ObservationError::InvalidCase(
                         "non-value in completed scalar result".into(),
-                    ));
+                    ))
                 }
             },
         };

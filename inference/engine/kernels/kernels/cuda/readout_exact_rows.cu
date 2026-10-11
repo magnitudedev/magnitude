@@ -22,7 +22,7 @@ extern "C" __global__ void readout_exact_rows_gather(SEISMIC_KERNEL_PARAMS) {
         SEISMIC_DRAWS_STRIDE_1, F32_IN(SEISMIC_BUFFER_TEMPERATURE), SEISMIC_TEMPERATURE_STRIDE_0,
         reinterpret_cast<const unsigned *>(SEISMIC_PTR(SEISMIC_BUFFER_MASK)), SEISMIC_MASK_STRIDE_0,
         SEISMIC_MASK_STRIDE_1, reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_CONSTRAINED)),
-        SEISMIC_CONSTRAINED_STRIDE_0, __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP)};
+        SEISMIC_CONSTRAINED_STRIDE_0};
     // Radius column 1: the 5-bit view's.
     progressive::gather<false>(SEISMIC_PTR(SEISMIC_BUFFER_FEATURES), SEISMIC_FEATURES_STRIDE_0, planes,
                                F32_IN(SEISMIC_BUFFER_RADIUS) + SEISMIC_RADIUS_STRIDE_1, nullptr,

@@ -331,11 +331,6 @@ fn specialization(
         seismic::NativeSpecialization::new(),
         |spec, (name, value)| spec.with_static(*name, *value as u64),
     );
-    let specialization = if device.backend() == seismic::BackendName::Cuda {
-        specialization.with_param("OPERAND", 0)
-    } else {
-        specialization
-    };
     mapping
         .params
         .iter()
@@ -374,7 +369,7 @@ const ROW_CLASSES: [usize; 6] = [1, 3, 5, 12, 40, 80];
 /// Whether `rows` runs the INT8 candidate under `mapping` (CUDA: only the
 /// small GEMM band takes it; the CPU: every class).
 fn quantized(device: &seismic::Device, mapping: &Mapping, rows: usize) -> bool {
-    mapping.int8 && (is_cpu(device) || (16 < rows))
+    mapping.int8 && (is_cpu(device) || (16 < rows && rows <= 64))
 }
 
 // ---------------------------------------------------------------------------
@@ -866,8 +861,8 @@ fn native_dense_up_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
-        cuda_gemm: 4,
+        cuda_gemv: [2, 3],
+        cuda_gemm: 5,
         split: false,
     };
     let devices = devices();
@@ -940,8 +935,8 @@ fn native_short_conv_project_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
-        cuda_gemm: 4,
+        cuda_gemv: [2, 3],
+        cuda_gemm: 5,
         split: false,
     };
     let devices = devices();
@@ -1015,8 +1010,8 @@ fn native_per_layer_gate_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [1, 2],
-        cuda_gemm: 4,
+        cuda_gemv: [2, 3],
+        cuda_gemm: 5,
         split: false,
     };
     let devices = devices();

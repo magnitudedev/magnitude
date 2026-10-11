@@ -350,14 +350,6 @@ pub fn release() -> Result<(u32, u32), NvrtcError> {
 /// plain `extern "C"` name or a template instance). NVRTC gives their linker
 /// symbols back in request order; callers retain those symbols alongside the
 /// image when keeping it.
-///
-/// The compile runs on the thread that asks for it. A compile allocates and
-/// frees tens of megabytes of host heap, which an allocator keeps for the
-/// thread that freed it, so whoever owns a span of formation owns the
-/// threads it compiles on and returns what they freed when it is done
-/// ([`seismic_native_target::workers::Workers`],
-/// [`seismic_native_target::process::return_freed_pages`]): this module
-/// starts no thread and keeps none.
 pub fn compile_cubin_named(
     source: &str,
     name: &str,
@@ -477,11 +469,6 @@ impl Nvrtc {
             unsafe { (nvrtc.cubin)(owned.1, image.as_mut_ptr().cast()) },
             "CUBIN",
         )?;
-        // The compile holds its program and what it formed: a reading of
-        // the footprint here is in the peak where the peak is of readings.
-        if seismic_native_target::process::ProcessMemory::PEAK_IS_SAMPLED {
-            seismic_native_target::process::ProcessMemory::footprint_now();
-        }
         Ok(Cubin {
             image,
             lowered_names,

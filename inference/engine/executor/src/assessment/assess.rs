@@ -6,11 +6,11 @@
 //! only a fitting model is estimated, from its decode demand over the
 //! device's bandwidth.
 
-use super::AssessmentError;
 use super::bandwidth::DeviceBandwidth;
 use super::demand::DecodeDemand;
-use super::estimate::{PerformanceEstimate, estimate_performance, performance_depths};
-use crate::platform::{DomainRole, MemoryReserves, fit_capacities};
+use super::estimate::{estimate_performance, performance_depths, PerformanceEstimate};
+use super::AssessmentError;
+use crate::platform::{fit_capacities, DomainRole, MemoryReserves};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, ExecutionPlanDraft, ResourceCapacity,
@@ -70,11 +70,6 @@ impl PreparedExecutionAssessment {
     /// The plain decode step's demand under the planned history codec.
     pub fn demand(&self) -> &DecodeDemand {
         &self.demand
-    }
-
-    /// The checked header and graph charge, shared with physical finalization.
-    pub fn memory_charge(&self) -> &AssessmentMemoryCharge {
-        &self.charge
     }
 }
 
@@ -322,12 +317,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![25_000, 50_000, 150_000]
         );
-        assert!(
-            performance
-                .iter()
-                .all(|estimate| estimate.tokens_per_second.is_finite()
-                    && estimate.tokens_per_second > 0.0)
-        );
+        assert!(performance
+            .iter()
+            .all(|estimate| estimate.tokens_per_second.is_finite()
+                && estimate.tokens_per_second > 0.0));
         assert_eq!(domains[0].role, DomainRole::Allocation);
         assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
         for domain in &domains {

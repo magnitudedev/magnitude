@@ -9,7 +9,7 @@
 //! admissible specialization: the MSL the Metal pipeline compiles, the CUDA
 //! source NVRTC compiles to PTX, and the GLSL the Vulkan pipeline compiles.
 
-use super::abi::{Dialect, MetalFeatures, render_source, vulkan::VulkanFeatures};
+use super::abi::{render_source, vulkan::VulkanFeatures, Dialect, MetalFeatures};
 use seismic_lang::bundle::{decode_checked_bundle, encode_checked_bundle};
 use seismic_lang::checked::{
     CheckedModule, ElementParameter, NativeImplementation, NativeSpecialization,
@@ -112,7 +112,8 @@ fn specialization(native: &NativeImplementation) -> NativeSpecialization {
 #[test]
 #[ignore]
 fn decoded_kernel_bundle_forms_identical_native_sources() {
-    let kernels = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
+    let kernels =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
     let checked = seismic_lang::source::load(&[kernels], seismic_std::sources())
         .expect("the engine kernel library checks")
         .module;

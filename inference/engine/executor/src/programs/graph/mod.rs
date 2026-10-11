@@ -70,7 +70,6 @@ impl From<&str> for GraphError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct RowForm {
     attention_decode: bool,
-    attention_prepared_append: bool,
     recurrent_chunked: bool,
     routed_decode: bool,
 }
@@ -79,7 +78,6 @@ impl RowForm {
     pub(crate) fn of(rows: u64) -> Self {
         Self {
             attention_decode: attention::graph::decodes(rows),
-            attention_prepared_append: rows > 1 && attention::graph::decodes(rows),
             recurrent_chunked: gated_delta::graph::chunked(rows),
             routed_decode: routed::fused_graph::decodes(rows),
         }

@@ -167,9 +167,7 @@ pub struct StateSpaceBinding {
 pub(crate) fn admit(space: &StateSpace) -> Result<(), PlanError> {
     if space.head_width == 0
         || !space.norm_group.is_multiple_of(space.head_width)
-        || !space
-            .heads
-            .is_multiple_of(space.norm_group / space.head_width)
+        || !space.heads.is_multiple_of(space.norm_group / space.head_width)
     {
         return Err(PlanError::Unsupported(
             "state-space output norm group of partial heads",
@@ -183,10 +181,7 @@ pub(super) fn weights<'a>(space: &'a StateSpace, push: &mut super::WeightPush<'_
     use magnitude_family_contracts::WeightKind;
     push(WeightKind::StateSpaceProjection, &space.projection);
     push(WeightKind::RecurrentConvolution, &space.convolution);
-    push(
-        WeightKind::RecurrentConvolutionBias,
-        &space.convolution_bias,
-    );
+    push(WeightKind::RecurrentConvolutionBias, &space.convolution_bias);
     push(WeightKind::RecurrentTimeBias, &space.time_bias);
     push(WeightKind::RecurrentDecay, &space.decay);
     push(WeightKind::StateSpaceSkip, &space.skip);

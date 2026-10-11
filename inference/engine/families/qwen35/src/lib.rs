@@ -10,23 +10,23 @@ pub mod inputs;
 pub use family::Qwen35Family;
 
 use magnitude_artifacts::{
-    Package, PackageIdentity,
     gguf::{Directory, Scalar, Value},
+    Package, PackageIdentity,
+};
+use magnitude_family_contracts::{
+    checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
+    CellReduction, Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm,
+    ExpertSelection, FamilyId, FeedForwardUp, GateFunction, GatedDelta, Head, HeadBlock,
+    HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics, KeyValue,
+    MediaRowAttention, MergerStage, ModelDefinition, Operator, OutputForm, PositionSampling,
+    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router,
+    RouterInput, RowRange, ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
+    ValueNorm, ValueSource, VisionActivation, VisionAttention,
+    VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward,
+    VisionLinear, VisionMerger, VisionNorm, VisionPositions, VisionPreprocessing,
+    VisionResampling, VisionResize, VisionStem, VisionUp, WeightDescriptor,
 };
 use magnitude_family_common::{HeaderError, Tensors};
-use magnitude_family_contracts::{
-    ActivationDType, ActivationFunction, Attention, AttentionGate, Block, CellReduction, Decoder,
-    DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
-    FeedForwardUp, GateFunction, GatedDelta, Head, HeadBlock, HeadChain, HeadComponent,
-    HeadHistory, HeadInput, HeadNorm, HeadReadout, HistoryDomain, HistoryReads, ImportTransform,
-    InputNorm, InputSemantics, KeyValue, MediaRowAttention, MergerStage, ModelDefinition, Operator,
-    OutputForm, PositionSampling, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
-    RouteNormalization, RoutedFfn, Router, RouterInput, RowRange, ScoreFunction, SharedExpert,
-    SharedExpertGate, Sublayer, ValueNorm, ValueSource, VisionActivation, VisionAttention,
-    VisionAttentionScale, VisionAttentionSpan, VisionBlock, VisionDescription, VisionFeedForward,
-    VisionLinear, VisionMerger, VisionNorm, VisionPositions, VisionPreprocessing, VisionResampling,
-    VisionResize, VisionStem, VisionUp, VocabularyProjection, WeightDescriptor, checked_product,
-};
 use std::{error, fmt};
 
 /// Qwen 3.5 architecture recognized from literal artifact metadata.
@@ -241,9 +241,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
     }
     let table = tensor("v.position_embd.weight", &[table_rows, hidden])?;
     if heads == 0 || hidden % heads != 0 || (hidden / heads) % 4 != 0 {
-        return Err(invalid(
-            "projector heads do not split into 2-D rotary heads",
-        ));
+        return Err(invalid("projector heads do not split into 2-D rotary heads"));
     }
     let layer_norm = |weight: WeightDescriptor, bias: WeightDescriptor| VisionNorm::Layer {
         weight,
@@ -565,123 +563,138 @@ pub fn inspect_components(
                  kind: LocalMixerKind,
                  intermediate: u64|
      -> Result<Block, Error> {
-        let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
-        let mixer = match kind {
-            LocalMixerKind::Attention => Operator::Attention(Box::new(Attention {
-                heads: attention_heads,
-                kv_heads,
-                width: attention_width,
-                query: weight(
-                    "attn_q.weight",
-                    &[product(&[2, attention_heads, attention_width])?, hidden],
-                )?,
-                gate: AttentionGate::Interleaved {
-                    function: GateFunction::Sigmoid,
-                },
-                query_norm: HeadNorm::Rms(rms(weight("attn_q_norm.weight", &[attention_width])?)),
-                key_value: KeyValue::Owned {
-                    key: weight(
-                        "attn_k.weight",
-                        &[product(&[kv_heads, attention_width])?, hidden],
+            let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
+            let mixer = match kind {
+                LocalMixerKind::Attention => Operator::Attention(Box::new(Attention {
+                    heads: attention_heads,
+                    kv_heads,
+                    width: attention_width,
+                    query: weight(
+                        "attn_q.weight",
+                        &[product(&[2, attention_heads, attention_width])?, hidden],
                     )?,
-                    value: ValueSource::Projected(weight(
-                        "attn_v.weight",
-                        &[product(&[kv_heads, attention_width])?, hidden],
-                    )?),
-                    key_norm: HeadNorm::Rms(rms(weight("attn_k_norm.weight", &[attention_width])?)),
-                    value_norm: ValueNorm::None,
-                    domain: HistoryDomain::Token,
-                },
-                rotary: rotary.clone(),
-                scale: 1.0 / (attention_width as f64).sqrt(),
-                reads: HistoryReads::Visible,
-                media_rows: MediaRowAttention::Causal,
-                output: weight(
-                    "attn_output.weight",
-                    &[hidden, product(&[attention_heads, attention_width])?],
-                )?,
-            })),
-            LocalMixerKind::Recurrent => Operator::GatedDelta(Box::new(GatedDelta {
-                convolution_width,
-                key_heads: recurrent_key_heads,
-                value_heads: recurrent_value_heads,
-                width: recurrent_width,
-                head_mapping: RecurrentHeadMapping::Tiled,
-                query_key_value: weight("attn_qkv.weight", &[recurrent_channels, hidden])?,
-                gate: weight("attn_gate.weight", &[recurrent_inner, hidden])?,
-                alpha: weight("ssm_alpha.weight", &[recurrent_value_heads, hidden])?,
-                beta: weight("ssm_beta.weight", &[recurrent_value_heads, hidden])?,
-                convolution: weight(
-                    "ssm_conv1d.weight",
-                    &[recurrent_channels, convolution_width],
-                )?,
-                decay: weight("ssm_a", &[recurrent_value_heads])?,
-                time_bias: weight("ssm_dt.bias", &[recurrent_value_heads])?,
-                norm: rms(weight("ssm_norm.weight", &[recurrent_width])?),
-                output: weight("ssm_out.weight", &[hidden, recurrent_inner])?,
-            })),
-        };
-        let feed_forward = if let Some(e) = &experts {
-            Operator::RoutedFfn(Box::new(RoutedFfn {
-                experts: e.count,
-                selected: e.selected,
-                intermediate: e.intermediate,
-                router: Router {
-                    weight: weight("ffn_gate_inp.weight", &[e.count, hidden])?,
-                    input: RouterInput::Operator,
-                    score: ScoreFunction::Softmax,
-                    selection: ExpertSelection::TopK { bias: None },
-                    normalization: RouteNormalization::Sum,
-                    scale: 1.0,
-                },
-                expert_up: FeedForwardUp::Gated {
-                    activation: ActivationFunction::Silu,
-                    gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
-                    up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
-                },
-                expert_down: weight("ffn_down_exps.weight", &[e.count, hidden, e.intermediate])?,
-                expert_scale: None,
-                latent: None,
-                shared: Some(SharedExpert {
-                    intermediate: e.shared_intermediate,
+                    gate: AttentionGate::Interleaved {
+                        function: GateFunction::Sigmoid,
+                    },
+                    query_norm: HeadNorm::Rms(rms(weight(
+                        "attn_q_norm.weight",
+                        &[attention_width],
+                    )?)),
+                    key_value: KeyValue::Owned {
+                        key: weight(
+                            "attn_k.weight",
+                            &[product(&[kv_heads, attention_width])?, hidden],
+                        )?,
+                        value: ValueSource::Projected(weight(
+                            "attn_v.weight",
+                            &[product(&[kv_heads, attention_width])?, hidden],
+                        )?),
+                        key_norm: HeadNorm::Rms(rms(weight(
+                            "attn_k_norm.weight",
+                            &[attention_width],
+                        )?)),
+                        value_norm: ValueNorm::None,
+                        domain: HistoryDomain::Token,
+                    },
+                    rotary: rotary.clone(),
+                    scale: 1.0 / (attention_width as f64).sqrt(),
+                    reads: HistoryReads::Visible,
+                    media_rows: MediaRowAttention::Causal,
+                    output: weight(
+                        "attn_output.weight",
+                        &[hidden, product(&[attention_heads, attention_width])?],
+                    )?,
+                })),
+                LocalMixerKind::Recurrent => Operator::GatedDelta(Box::new(GatedDelta {
+                    convolution_width,
+                    key_heads: recurrent_key_heads,
+                    value_heads: recurrent_value_heads,
+                    width: recurrent_width,
+                    head_mapping: RecurrentHeadMapping::Tiled,
+                    query_key_value: weight("attn_qkv.weight", &[recurrent_channels, hidden])?,
+                    gate: weight("attn_gate.weight", &[recurrent_inner, hidden])?,
+                    alpha: weight("ssm_alpha.weight", &[recurrent_value_heads, hidden])?,
+                    beta: weight("ssm_beta.weight", &[recurrent_value_heads, hidden])?,
+                    convolution: weight(
+                        "ssm_conv1d.weight",
+                        &[recurrent_channels, convolution_width],
+                    )?,
+                    decay: weight("ssm_a", &[recurrent_value_heads])?,
+                    time_bias: weight("ssm_dt.bias", &[recurrent_value_heads])?,
+                    norm: rms(weight("ssm_norm.weight", &[recurrent_width])?),
+                    output: weight("ssm_out.weight", &[hidden, recurrent_inner])?,
+                })),
+            };
+            let feed_forward = if let Some(e) = &experts {
+                Operator::RoutedFfn(Box::new(RoutedFfn {
+                    experts: e.count,
+                    selected: e.selected,
+                    intermediate: e.intermediate,
+                    router: Router {
+                        weight: weight("ffn_gate_inp.weight", &[e.count, hidden])?,
+                        input: RouterInput::Operator,
+                        score: ScoreFunction::Softmax,
+                        selection: ExpertSelection::TopK { bias: None },
+                        normalization: RouteNormalization::Sum,
+                        scale: 1.0,
+                    },
+                    expert_up: FeedForwardUp::Gated {
+                        activation: ActivationFunction::Silu,
+                        gate: weight("ffn_gate_exps.weight", &[e.count, e.intermediate, hidden])?,
+                        up: weight("ffn_up_exps.weight", &[e.count, e.intermediate, hidden])?,
+                    },
+                    expert_down: weight(
+                        "ffn_down_exps.weight",
+                        &[e.count, hidden, e.intermediate],
+                    )?,
+                    expert_scale: None,
+                    latent: None,
+                    shared: Some(SharedExpert {
+                        intermediate: e.shared_intermediate,
+                        up: FeedForwardUp::Gated {
+                            activation: ActivationFunction::Silu,
+                            gate: weight(
+                                "ffn_gate_shexp.weight",
+                                &[e.shared_intermediate, hidden],
+                            )?,
+                            up: weight("ffn_up_shexp.weight", &[e.shared_intermediate, hidden])?,
+                        },
+                        down: weight("ffn_down_shexp.weight", &[hidden, e.shared_intermediate])?,
+                        gate: SharedExpertGate::Sigmoid(weight(
+                            "ffn_gate_inp_shexp.weight",
+                            &[hidden],
+                        )?),
+                    }),
+                }))
+            } else {
+                Operator::DenseFfn(Box::new(DenseFfn {
+                    intermediate,
                     up: FeedForwardUp::Gated {
                         activation: ActivationFunction::Silu,
-                        gate: weight("ffn_gate_shexp.weight", &[e.shared_intermediate, hidden])?,
-                        up: weight("ffn_up_shexp.weight", &[e.shared_intermediate, hidden])?,
+                        gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
+                        up: weight("ffn_up.weight", &[intermediate, hidden])?,
                     },
-                    down: weight("ffn_down_shexp.weight", &[hidden, e.shared_intermediate])?,
-                    gate: SharedExpertGate::Sigmoid(weight(
-                        "ffn_gate_inp_shexp.weight",
-                        &[hidden],
-                    )?),
-                }),
-            }))
-        } else {
-            Operator::DenseFfn(Box::new(DenseFfn {
-                intermediate,
-                up: FeedForwardUp::Gated {
-                    activation: ActivationFunction::Silu,
-                    gate: weight("ffn_gate.weight", &[intermediate, hidden])?,
-                    up: weight("ffn_up.weight", &[intermediate, hidden])?,
-                },
-                down: weight("ffn_down.weight", &[hidden, intermediate])?,
-            }))
+                    down: weight("ffn_down.weight", &[hidden, intermediate])?,
+                }))
+            };
+            Ok(Block {
+                sublayers: vec![
+                    Sublayer {
+                        input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
+                        op: mixer,
+                        output: OutputForm::Residual,
+                    },
+                    Sublayer {
+                        input: InputNorm::Rms(rms(weight(
+                            "post_attention_norm.weight",
+                            &[hidden],
+                        )?)),
+                        op: feed_forward,
+                        output: OutputForm::Residual,
+                    },
+                ],
+            })
         };
-        Ok(Block {
-            sublayers: vec![
-                Sublayer {
-                    input: InputNorm::Rms(rms(weight("attn_norm.weight", &[hidden])?)),
-                    op: mixer,
-                    output: OutputForm::Residual,
-                },
-                Sublayer {
-                    input: InputNorm::Rms(rms(weight("post_attention_norm.weight", &[hidden])?)),
-                    op: feed_forward,
-                    output: OutputForm::Residual,
-                },
-            ],
-        })
-    };
     let blocks = layers
         .iter()
         .enumerate()
@@ -699,32 +712,21 @@ pub fn inspect_components(
         let mut head_blocks = Vec::with_capacity(speculative as usize);
         for offset in 0..speculative {
             let p = format!("blk.{}.", layer_count + offset);
-            let block = block(
-                &mut tensor,
-                &p,
-                LocalMixerKind::Attention,
-                head_intermediate,
-            )?;
+            let block = block(&mut tensor, &p, LocalMixerKind::Attention, head_intermediate)?;
             let mut weight = |name: &str, shape: &[u64]| tensor(&format!("{p}{name}"), shape);
             head_blocks.push(HeadBlock {
-                input: HeadInput::Combine {
-                    embedding_norm: rms(weight("nextn.enorm.weight", &[hidden])?),
-                    hidden_norm: rms(weight("nextn.hnorm.weight", &[hidden])?),
-                    combine: weight("nextn.eh_proj.weight", &[hidden, product(&[2, hidden])?])?,
-                },
-                blocks: vec![block],
+                embedding_norm: rms(weight("nextn.enorm.weight", &[hidden])?),
+                hidden_norm: rms(weight("nextn.hnorm.weight", &[hidden])?),
+                combine: weight("nextn.eh_proj.weight", &[hidden, product(&[2, hidden])?])?,
+                block,
                 output_norm: ExitNorm::Rms(rms(weight(
                     "nextn.shared_head_norm.weight",
                     &[hidden],
                 )?)),
-                readout: HeadReadout::full(VocabularyProjection::Target),
-                chain: HeadChain::Output,
             });
         }
         Some(Head {
             blocks: head_blocks,
-            history: HeadHistory::Own,
-            component: HeadComponent::Target,
         })
     };
     tensors.finish()?;
@@ -749,7 +751,9 @@ pub fn inspect_components(
     let definition = ModelDefinition {
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
-        inputs: InputSemantics { coordinate_axes: 3 },
+        inputs: InputSemantics {
+            coordinate_axes: 3,
+        },
         decoder: Decoder {
             activation_dtype: ActivationDType::BF16,
             hidden,

@@ -645,7 +645,7 @@ impl<'a> Analysis<'a> {
     ) -> Result<Term> {
         match written {
             MemoryWrite::Map { .. } => {
-                return Err("read after a parallel map relation is unfinished");
+                return Err("read after a parallel map relation is unfinished")
             }
             MemoryWrite::Conditional(condition, write) => {
                 let replacement = self.read_after_write(place, value, write)?;
@@ -932,15 +932,14 @@ impl<'a> Analysis<'a> {
                     Op::Binary { op, out, a, b }
                         if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
                     {
-                        let operation = match op {
-                            ops::BinaryOp::Add => WordOp::Add,
-                            ops::BinaryOp::Sub => WordOp::Sub,
-                            _ => {
-                                return Err(
+                        let operation =
+                            match op {
+                                ops::BinaryOp::Add => WordOp::Add,
+                                ops::BinaryOp::Sub => WordOp::Sub,
+                                _ => return Err(
                                     "physical word operation has no terminal reference relation",
-                                );
-                            }
-                        };
+                                ),
+                            };
                         Some((
                             *out,
                             self.terms.node(Node::Word(operation, get(a)?, get(b)?)),
@@ -1220,7 +1219,7 @@ impl<'a> Analysis<'a> {
                     _ => {
                         return Err(
                             "physical state, control or native operation relation is unfinished",
-                        );
+                        )
                     }
                 })
             })();

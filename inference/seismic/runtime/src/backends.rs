@@ -6,12 +6,12 @@
 //! API.  It does not reproduce target facts or planning policy.
 
 use crate::api::{
-    CallError, WorkflowError,
     device::DeviceInner,
     kernel::{
         DecodedResults, EncodedArgs, EncodedWorkflowArgs, PendingWorkflowResults,
         WorkflowCompletionAny,
     },
+    CallError, WorkflowError,
 };
 use crate::devices::{
     Availability, CapacityBasis, DeviceInfo, DeviceKind, DeviceMeasurements, DeviceMemoryStatus,
@@ -24,7 +24,7 @@ use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::NativeExecutor;
 use seismic_compiler::feedback::PreparationOptions;
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::{ElementBindings, LogicalEntry};
+use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_native_target::TargetFamily;
 use std::sync::Arc;
@@ -52,7 +52,7 @@ type MetalAdmittedRun = crate::execution::AdmittedRun<seismic_metal::Metal, Meta
 #[cfg(not(target_os = "macos"))]
 mod vulkan;
 #[cfg(not(target_os = "macos"))]
-pub(crate) use vulkan::{VulkanOpened, vulkan_buffer};
+pub(crate) use vulkan::{vulkan_buffer, VulkanOpened};
 
 type CudaExecutor = seismic_cuda::Executor;
 pub(crate) type CudaOpened = Opened<seismic_cuda::Cuda, CudaExecutor>;
@@ -508,7 +508,6 @@ pub(crate) fn open(
         trace: std::sync::Mutex::new(None),
         artifacts: options.artifacts,
         native: crate::native::NativeQueue::default(),
-        chosen: std::sync::Mutex::new(std::collections::HashMap::new()),
     }))
 }
 
@@ -524,123 +523,6 @@ pub(crate) enum DevicePrograms {
 }
 
 impl DevicePrograms {
-    /// Lend the device's former `workers`, or take them back
-    /// ([`ProgramFormer::staff`]).
-    pub(crate) fn staff(
-        &self,
-        workers: Option<Arc<seismic_native_target::workers::Workers>>,
-    ) {
-        match self {
-            Self::Cpu => {}
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.staff(workers),
-            Self::Cuda(former) => former.staff(workers),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.staff(workers),
-        }
-    }
-
-    /// The threads lent to the device's former, if any.
-    pub(crate) fn workers(&self) -> Option<Arc<seismic_native_target::workers::Workers>> {
-        match self {
-            Self::Cpu => None,
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.workers(),
-            Self::Cuda(former) => former.workers(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.workers(),
-        }
-    }
-
-    /// How many native programs this device's toolchain has formed.
-    pub(crate) fn formed(&self) -> usize {
-        match self {
-            Self::Cpu => 0,
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.formed(),
-            Self::Cuda(former) => former.formed(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.formed(),
-        }
-    }
-
-    /// What forming `sources` together on this device does, known before
-    /// they are formed, and the most entries one source's compile forms.
-    pub(crate) fn class(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> (crate::formation::FormationClass, usize) {
-        match self {
-            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.class(sources),
-            Self::Cuda(former) => former.class(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.class(sources),
-        }
-    }
-
-    /// What publishing `sources` on this device does, known before it runs
-    /// ([`ProgramFormer::publication`]).
-    pub(crate) fn publication(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> (crate::formation::FormationClass, usize) {
-        match self {
-            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publication(sources),
-            Self::Cuda(former) => former.publication(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publication(sources),
-        }
-    }
-
-    /// How many of `sources` publishing them on this device compiles
-    /// ([`ProgramFormer::publishing_sources`]).
-    pub(crate) fn publishing_sources(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> usize {
-        match self {
-            Self::Cpu => 0,
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publishing_sources(sources),
-            Self::Cuda(former) => former.publishing_sources(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publishing_sources(sources),
-        }
-    }
-
-    /// Publish `sources` as a later process will request them
-    /// ([`ProgramFormer::publish`]).
-    pub(crate) fn publish(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> Result<(), seismic_native_target::NativeCompilationError> {
-        match self {
-            Self::Cpu => Ok(()),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.publish(sources),
-            Self::Cuda(former) => former.publish(sources),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.publish(sources),
-        }
-    }
-
-    /// What this device's toolchain's compiles have taken in this process,
-    /// by the entries each formed.
-    pub(crate) fn compiled(&self) -> crate::native::tune::Linear {
-        match self {
-            Self::Cpu => crate::native::tune::Linear::default(),
-            #[cfg(target_os = "macos")]
-            Self::Metal(former) => former.compiled(),
-            Self::Cuda(former) => former.compiled(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(former) => former.compiled(),
-        }
-    }
-
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &ProgramFormer<seismic_metal::toolchain::MetalToolchain> {
         let Self::Metal(former) = self else {
@@ -724,7 +606,7 @@ impl OpenedKind {
             Self::Vulkan(_) => {
                 return Err(WorkflowError::PlannedRouteUnavailable {
                     backend: seismic_lang::registry::BackendName::Vulkan,
-                });
+                })
             }
         })
     }
@@ -759,17 +641,6 @@ impl OpenedKind {
             Self::Cuda(device) => device.set_memory_limit(limit),
             #[cfg(not(target_os = "macos"))]
             Self::Vulkan(device) => device.set_memory_limit(limit),
-        }
-    }
-
-    pub(crate) fn restart_memory_high_water(&self) {
-        match self {
-            Self::Cpu(device) => device.restart_memory_high_water(),
-            #[cfg(target_os = "macos")]
-            Self::Metal(device) => device.restart_memory_high_water(),
-            Self::Cuda(device) => device.restart_memory_high_water(),
-            #[cfg(not(target_os = "macos"))]
-            Self::Vulkan(device) => device.restart_memory_high_water(),
         }
     }
 
@@ -975,13 +846,10 @@ impl OpenedKind {
             Self::Cpu(_) => driver::typed_buffer::<seismic_cpu::Cpu, CpuExecutor>(allocation)
                 .data_pointer() as u64,
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => {
-                driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
-                    .gpu_address()
-            }
-            Self::Cuda(_) => {
-                driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation).pointer()
-            }
+            Self::Metal(_) => driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
+                .gpu_address(),
+            Self::Cuda(_) => driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation)
+                .pointer(),
             #[cfg(not(target_os = "macos"))]
             Self::Vulkan(_) => vulkan_buffer(allocation).address(),
         }
@@ -1025,7 +893,8 @@ impl OpenedKind {
 
     pub(crate) fn prepare(
         &self,
-        logical: LogicalEntry,
+        module: &CheckedModule,
+        entry: EntryId,
         bindings: ElementBindings,
         public_device: &Arc<DeviceInner>,
         options: PreparationOptions,
@@ -1035,7 +904,8 @@ impl OpenedKind {
                 device,
                 seismic_cpu::native_compiler(),
                 &(),
-                logical,
+                module,
+                entry,
                 bindings,
                 public_device,
                 options,
@@ -1048,7 +918,8 @@ impl OpenedKind {
                     device,
                     seismic_metal::native_compiler(),
                     &context,
-                    logical,
+                    module,
+                    entry,
                     bindings,
                     public_device,
                     options,
@@ -1059,7 +930,8 @@ impl OpenedKind {
                 device,
                 seismic_cuda::native_compiler(),
                 &(),
-                logical,
+                module,
+                entry,
                 bindings,
                 public_device,
                 options,
@@ -1138,7 +1010,8 @@ fn prepare<T, E, C>(
     device: &Arc<Opened<T, E>>,
     compiler: &C,
     native_context: &C::Context,
-    logical: LogicalEntry,
+    module: &CheckedModule,
+    entry: EntryId,
     bindings: ElementBindings,
     public_device: &Arc<DeviceInner>,
     options: PreparationOptions,
@@ -1152,7 +1025,8 @@ where
         device,
         compiler,
         native_context,
-        logical,
+        module,
+        entry,
         bindings,
         public_device,
         options,

@@ -42,7 +42,6 @@ struct DenseHistory {
     }
 };
 
-#ifdef ATTENTION_AFFINE_HISTORY
 // Affine K8/V4 history (the `affine_k8_uniform_v4` codec,
 // `attention_*_k8v4`). A (history row, kv head) vector is a code row of
 // W * B / 32 u32 words (code i at bits B * (i % (32 / B)) of word
@@ -50,11 +49,11 @@ struct DenseHistory {
 // consecutive dimensions, pairs in group order; decoded value =
 // code * scale + zero with its group's pair. Keys use B = 8, values B = 4. A
 // lane's DPL dimensions lie in one group, shared by PAIR_LANES lanes.
-constexpr int KEY_BITS = 32 * ATTENTION_KEY_CODE_WORDS / W;
-constexpr int VALUE_BITS = 32 * ATTENTION_VALUE_CODE_WORDS / W;
+constexpr int KEY_BITS = 8;
+constexpr int VALUE_BITS = 4;
 // Dimensions per (scale, zero) pair: the codec's group (model-state
 // `AFFINE_GROUP`), and the pairs per vector.
-constexpr int GROUP = 2 * W / ATTENTION_KEY_COEFFICIENTS;
+constexpr int GROUP = 32;
 constexpr int PAIRS = W / GROUP;
 constexpr int PAIR_LANES = GROUP / DPL;
 static_assert(W % GROUP == 0 && GROUP % DPL == 0, "a lane's dimensions lie in one group");
@@ -217,8 +216,6 @@ struct AffineHistory {
     }
 };
 
-#endif
-
 // Append row `row`'s prepared key `k` and raw value for `kv_head` at its
 // destination through `history`, when it has one. One warp.
 template <class History>
@@ -231,40 +228,3 @@ __device__ __forceinline__ void append(const Inputs &in, const History &history,
     fresh_value(in, row, kv_head, v, lane);
     history.append(destination, kv_head, k, v, lane);
 }
-#ifdef ATTENTION_HISTORY_STAGING
-// Ephemeral operands for exactly the call's union of visible rows. The
-// stored planes and append policy remain affine. Every vector is located
-// independently: consumer KEY tiles retain the original span-based grouping.
-struct ListedF16History {
-    static constexpr bool CODED = false;
-    const int *tiles;
-    const u32 *valid;
-    const u16 *keys;
-    const u16 *values;
-    u64 count, tile_stride, slab_rows;
-
-    __device__ __forceinline__ int listed(int token) const {
-        if (token < 0) return -1;
-        const int page = token / 256;
-        u64 lo = 0, hi = count;
-        while (lo < hi) {
-            const u64 mid = lo + (hi - lo) / 2;
-            const int held = tiles[mid * tile_stride];
-            if (held >= 0 && held < page) lo = mid + 1;
-            else hi = mid;
-        }
-        return lo < count && tiles[lo * tile_stride] == page ? static_cast<int>(lo) : -1;
-    }
-    __device__ __forceinline__ int slab_end(int token, int hi) const {
-        return static_cast<int>(min(static_cast<u64>(hi), (static_cast<u64>(token) / slab_rows + 1) * slab_rows));
-    }
-    __device__ __forceinline__ const u8 *vector(const u16 *plane, int token, int kv) const {
-        const int slot = listed(token);
-        const int row = token & 255;
-        if (slot < 0 || !(valid[static_cast<u64>(slot) * 8 + row / 32] & (1u << (row & 31)))) return nullptr;
-        return reinterpret_cast<const u8 *>(plane + ((static_cast<u64>(slot) * 256 + row) * KV + kv) * W);
-    }
-    __device__ __forceinline__ const u8 *key_vector(int token, int kv) const { return vector(keys, token, kv); }
-    __device__ __forceinline__ const u8 *value_vector(int token, int kv) const { return vector(values, token, kv); }
-};
-#endif

@@ -3,7 +3,7 @@
 //! product with the layer's slice of the per-layer inputs.
 
 use super::cases::projection_shape;
-use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
+use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
 use crate::PerLayerBinding;
 use magnitude_family_contracts::{Operator, WeightKind, WeightScope};
 use magnitude_kernels::per_layer_gate;

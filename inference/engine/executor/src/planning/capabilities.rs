@@ -15,10 +15,9 @@ pub enum PlannedMethod {
         greedy_proposals: u8,
         sampled_proposals: u8,
     },
-    /// A separate DFlash/DSpark draft, greedy and sampled alike: a round
-    /// carries at most `proposals` draft rows, and each block pass drafts
-    /// exactly `generated` of them (none when 0). Both are fixed per load.
-    DFlash { proposals: u8, generated: u8 },
+    /// A separate DFlash/DSpark draft drafting `proposals` tokens per block
+    /// pass, greedy and sampled alike: the block's width is fixed per load.
+    DFlash { proposals: u8 },
 }
 
 impl PlannedMethod {
@@ -31,16 +30,7 @@ impl PlannedMethod {
                 greedy_proposals,
                 sampled_proposals,
             } => usize::from(greedy_proposals.max(sampled_proposals)),
-            Self::DFlash { proposals, .. } => usize::from(proposals),
-        }
-    }
-
-    /// The proposals each block pass of a separate draft generates: 0 when
-    /// the method drafts no block.
-    pub fn block_proposals(self) -> u8 {
-        match self {
-            Self::DFlash { generated, .. } => generated,
-            Self::Plain | Self::Mtp { .. } => 0,
+            Self::DFlash { proposals } => usize::from(proposals),
         }
     }
 

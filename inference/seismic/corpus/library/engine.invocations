@@ -36,7 +36,7 @@ dense_output[A=f32,DW=f32]: f32[3,4]=rand(146) ; f32[2,6]=rand(147) ; f32[4,6]=r
 
 # draft.seismic: M = 2, V = 5, D = 4, O = 2.
 draft_rows[EW=f32,A=f32,EN=f32,HN=f32,CW=f32]: i32[2]=1,3 ; f32[5,4]=rand(149) ; f32[2,4]=rand(150) ; f32[4]=rand(151) ; f32[4]=rand(152) ; f32[4,8]=rand(153) ; f32:0.000001
-readout_project_rows[A=f32,OW=f32]: f32[2,4]=rand(154) ; f32[5,4]=rand(155) ; i32[2,1,3]=1,3,4,2,0,3 ; f32[0]= ; f32:0.0
+head_logits_rows[A=f32,OW=f32]: f32[2,4]=rand(154) ; f32[5,4]=rand(155)
 
 # import.seismic: [B, N, K] weight views. Dense import at 1 x 4 x 16 and 2 x 4 x 8; one repack
 # line per registered external conversion (packet, rows16, mma16), two rows of two k-quant

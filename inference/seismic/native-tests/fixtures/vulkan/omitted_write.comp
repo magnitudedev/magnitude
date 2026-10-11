@@ -1,8 +1,0 @@
-void omitted_write() {
-    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
-    seismic_f32 result = seismic_f32(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
-    const uint index = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
-    if (SEISMIC_TUNE_WRITE != 0 && index < SEISMIC_DIM_N) {
-        result[uint(index * SEISMIC_RESULT_0_STRIDE_0)].v = x[uint(index * SEISMIC_X_STRIDE_0)].v;
-    }
-}

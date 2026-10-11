@@ -7,9 +7,8 @@
 
 use super::demand::DecodeDemand;
 use crate::{
-    AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection, ExecutionPath,
-    ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
-    resident_layout,
+    resident_layout, AssessmentGraphResourceBounds, AssessmentMemoryTerms, ComponentSelection,
+    ExecutionPath, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner,
 };
 use magnitude_artifacts::{
     ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
@@ -185,11 +184,7 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     }
     println!("admitted:\n  {}", admitted.join("\n  "));
     println!("refused:\n  {}", refused.join("\n  "));
-    assert!(
-        failures.is_empty(),
-        "failing targets:\n  {}",
-        failures.join("\n  ")
-    );
+    assert!(failures.is_empty(), "failing targets:\n  {}", failures.join("\n  "));
     assert!(!admitted.is_empty());
 }
 
@@ -199,26 +194,10 @@ fn every_admitted_catalog_target_derives_complete_terms() {
 /// alone, on every backend: the draft graphs are sealed exactly, in
 /// metadata, for the planned method's proposals.
 const SEPARATE_DRAFTS: [(&str, &str, &dyn ModelFamily); 6] = [
-    (
-        "qwen3.6-35b-a3b__target-gguf_q4.json",
-        "qwen3.6-35b-a3b__draft.json",
-        &Qwen35Family,
-    ),
-    (
-        "lfm2.5-2.6b__target-gguf_q4.json",
-        "lfm2.5-2.6b__draft.json",
-        &Lfm2Family,
-    ),
-    (
-        "qwen3.8-27b__target-gguf_q4.json",
-        "qwen3.8-27b__draft-dspark.json",
-        &Qwen35Family,
-    ),
-    (
-        "qwen3.8-27b__target-gguf_q4.json",
-        "qwen3.8-27b__draft-dflash2.json",
-        &Qwen35Family,
-    ),
+    ("qwen3.6-35b-a3b__target-gguf_q4.json", "qwen3.6-35b-a3b__draft.json", &Qwen35Family),
+    ("lfm2.5-2.6b__target-gguf_q4.json", "lfm2.5-2.6b__draft.json", &Lfm2Family),
+    ("qwen3.8-27b__target-gguf_q4.json", "qwen3.8-27b__draft-dspark.json", &Qwen35Family),
+    ("qwen3.8-27b__target-gguf_q4.json", "qwen3.8-27b__draft-dflash2.json", &Qwen35Family),
     // An NVFP4 draft (scaled fusion and feed-forward) beside a Q4_K_M
     // target, and beside the NVFP4 target (a scaled vocabulary projection).
     (
@@ -248,9 +227,7 @@ fn synthetic_separate_draft_directory(file: &str) -> magnitude_artifacts::gguf::
         _ => panic!("no synthetic attention semantics for {file}"),
     };
     let mut directory = headers::directory(file);
-    directory
-        .metadata
-        .retain(|entry| entry.name != "dflash.attention.causal");
+    directory.metadata.retain(|entry| entry.name != "dflash.attention.causal");
     directory.metadata.push(Metadata {
         name: "dflash.attention.causal".into(),
         value: Value::Array(causal.iter().copied().map(Scalar::Bool).collect()),
@@ -301,29 +278,7 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
             head: true,
             vision: false,
         };
-        for generated in [0, 1, proposals] {
-            let classes = crate::programs::native_draft::draft_graph_classes(
-                LIMITS,
-                proposals as usize,
-                generated,
-                definition.draft.as_ref().unwrap(),
-            )
-            .unwrap();
-            let actual: std::collections::BTreeSet<_> = classes
-                .iter()
-                .filter(|class| class.slots > 0)
-                .map(|class| class.proposals as u8)
-                .collect();
-            assert_eq!(
-                actual,
-                (generated > 0).then_some(generated).into_iter().collect(),
-                "only the load's generated width is prepared"
-            );
-        }
-        let method = PlannedMethod::DFlash {
-            proposals,
-            generated: proposals,
-        };
+        let method = PlannedMethod::DFlash { proposals };
         for backend in BACKENDS {
             let context = format!("{draft_file} {}", backend.as_str());
             let layout = resident_layout(ExecutionPath::Native, backend);
@@ -338,10 +293,7 @@ fn synthetic_separate_drafts_plan_and_charge_every_graph_class() {
                 LIMITS,
             )
             .unwrap_or_else(|error| panic!("{context}: {error}"));
-            assert!(
-                terms.head_weights > 0,
-                "{context}: the draft's weights are charged"
-            );
+            assert!(terms.head_weights > 0, "{context}: the draft's weights are charged");
             let state = ResourcePlanner::state_plan(
                 &definition,
                 &load,

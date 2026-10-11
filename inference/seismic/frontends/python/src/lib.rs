@@ -449,7 +449,6 @@ fn options(text: &str) -> PyResult<seismic::PreparationOptions> {
     Ok(seismic::PreparationOptions {
         precision,
         evaluation,
-        deadline: None,
     })
 }
 #[pymethods]

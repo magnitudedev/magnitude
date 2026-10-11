@@ -32,11 +32,3 @@ fn scale_rows[M, N, S](x: &tensor[M, N] f32, scale: &tensor[S] f32, result: &mut
     parallel for rows in 0..M:
         parallel for cols in 0..N:
             result[rows, cols] = x[rows, cols] * factor
-
-# The output-head transform. Bounds transform their two endpoints with this
-# same monotone operation; exact survivors publish it before token selection.
-fn cap_logit(z: f32, softcap: f32) -> f32:
-    let mut result = z
-    if softcap > 0.0:
-        result = softcap * (2.0 / (1.0 + exp(-2.0 * z / softcap)) - 1.0)
-    return result

@@ -108,10 +108,8 @@ fn prepare_every_entry(
                 weights: &package,
                 observer: &UnreportedTuning,
                 cache: cache.as_deref(),
-                numerical_profile: magnitude_executor::ResolvedNumericalProfile::standard(),
-                settings: magnitude_executor::TuningSettings::STANDARD,
+                error_classes: &magnitude_executor::NO_ERROR_CLASSES,
             },
-            magnitude_executor::UnpreparedUnits::ServeDefaults,
         )
         .unwrap_or_else(|error| panic!("{error}"));
         let seconds = began.elapsed().as_secs_f64();

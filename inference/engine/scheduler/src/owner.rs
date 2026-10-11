@@ -29,7 +29,7 @@ use super::{
     worker::Wakes,
 };
 use magnitude_executor::{
-    DomainError, InvariantError, MemoryChargeReconciliation,
+    DomainError, HeadPhase, InvariantError, MemoryChargeReconciliation,
     NativeFamily,
     OpenRequirements, Operation, Outcome, PendingOperationOutcome, PhysicalDecision,
     ProgramFamily, RequestId, ResourceKind, ResourcePlan, StateBindings, SubmitError,
@@ -882,7 +882,7 @@ impl<F: ProgramFamily> Service<F> {
 
     fn admit(
         &mut self,
-        mut generation: Generation,
+        generation: Generation,
         input: PreparedModelInput,
         retention: PrefixRetention,
         output_capacity: usize,
@@ -898,14 +898,11 @@ impl<F: ProgramFamily> Service<F> {
                 "only a fresh generation can be admitted".into(),
             ));
         }
+        let path = PrefixPath::of(&generation);
         let (prefix_cache, cache_points) = match retention {
             PrefixRetention::Transient => (false, Vec::new()),
             PrefixRetention::Retain { cache_points } => (true, cache_points),
         };
-        generation
-            .set_prefix_reuse(prefix_cache)
-            .map_err(AdmissionError::invariant("admission"))?;
-        let path = PrefixPath::of(&generation);
         if cache_points
             .iter()
             .any(|&point| point >= generation.prompt().len() || !path.exact_boundary(point))
@@ -1222,9 +1219,9 @@ impl<F: ProgramFamily> Service<F> {
                             self.ran(true, unload),
                         ));
                     }
-                    // Reconciling submits the round's next flight.
+                    let (round, bindings) = self.reconcile(round, active)?;
                     submitted = true;
-                    self.reconcile(round, active)?
+                    self.advance(round, bindings)?
                 }
                 Pipeline::Idle(mut bindings) => {
                     unload |= self
@@ -2276,7 +2273,7 @@ impl<F: ProgramFamily> Service<F> {
     }
 
     /// Reconcile the completed group and take back the bindings.
-    fn reconcile(&mut self, mut round: Round, active: ActiveGroup<F>) -> Result<Pipeline<F>, Fatal> {
+    fn reconcile(&mut self, mut round: Round, active: ActiveGroup<F>) -> Result<(Round, StateBindings<F>), Fatal> {
         let ActiveGroup {
             flight,
             operations,
@@ -2287,7 +2284,7 @@ impl<F: ProgramFamily> Service<F> {
                 return Err((Some(round.members), invariant("prefix cache")(error)));
             }
         }
-        let (outcomes, continuation) = match finish(&mut self.domain, flight, &operations) {
+        let (outcomes, mut bindings) = match finish(&mut self.domain, flight) {
             Ok(finished) => finished,
             Err(error) => return Err((Some(round.members), classify_domain_error(error))),
         };
@@ -2295,37 +2292,16 @@ impl<F: ProgramFamily> Service<F> {
             FlightOutcomes::Target(pending) => self.reconcile_target(&mut round, pending, &operations),
             FlightOutcomes::Head(pending) => self.reconcile_method(&mut round, pending, &operations),
             FlightOutcomes::Vision(item) => self.reconcile_vision(&mut round, item, &operations),
-            FlightOutcomes::Priming(request, duration) => {
-                if let Some(member) = round.members.get_mut(&request) {
-                    member.record.add_physical_duration(duration);
-                }
-                Ok(())
-            }
         };
         if let Err(error) = reconciled {
             return Err((Some(round.members), error));
         }
-        let mut bindings = match continuation {
-            magnitude_executor::TargetContinuation::Ready(bindings) => bindings,
-            magnitude_executor::TargetContinuation::Priming(priming) => {
-                // Publish the accepted target token while the entry still owns
-                // the binding right. Its own completion wakes the event pump;
-                // controls remain responsive and no checkpoint can observe a
-                // half-resolved pair of numerical lanes.
-                self.publish_members(&mut round);
-                let mut flight = DomainFlight::Priming(priming);
-                flight.completion().notify(self.wakes.completion());
-                return Ok(Pipeline::InFlight(round, ActiveGroup {
-                    flight, operations: Vec::new(), prefix_uses: Vec::new(),
-                }));
-            }
-        };
         self.epoch.advance();
         if let Err(error) = self.observe(Some(&mut bindings)) {
             return Err((Some(round.members), error));
         }
         self.publish_members(&mut round);
-        self.advance(round, bindings)
+        Ok((round, bindings))
     }
 
     fn reconcile_target(
@@ -3208,7 +3184,7 @@ mod timing_tests {
 #[cfg(test)]
 mod pending_retention_tests {
     use super::*;
-    use magnitude_executor::{DraftForm, FeatureReader, FeatureRows, FeatureSpan, HeadPhase};
+    use magnitude_executor::{DraftForm, FeatureReader, FeatureRows, FeatureSpan};
 
     struct NoFeatures;
     impl FeatureReader for NoFeatures {

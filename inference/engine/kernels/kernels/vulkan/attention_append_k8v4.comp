@@ -1,7 +1,3 @@
-#define ATTENTION_AFFINE_HISTORY 1
-#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
-#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
-#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 #define ATTENTION_QUERY_GROUP 1
 // State-only geometry: common helpers have no query or gate rows.
 // Ordered cache publication before causal target attention.

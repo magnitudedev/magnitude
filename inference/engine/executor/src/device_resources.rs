@@ -1,19 +1,18 @@
 //! Cloneable RAII leases for executor-owned device resources.
 //!
 //! A lease owns its allocation directly through `Rc`; dropping the final clone
-//! releases the tensor. A weak allocation census observes standalone feature
-//! storage without extending any resource lifetime.
+//! releases the tensor. There is no registry, numeric handle space, explicit
+//! release operation, or side-channel keeper object.
 
 use crate::{GraphOutputTensor, ResourceDomainId};
 use magnitude_family_contracts::PreparedVisionInput;
 use seismic::{Device, Tensor};
 use std::{
-    cell::RefCell,
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
     ops::Range,
-    rc::{Rc, Weak},
+    rc::Rc,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +23,6 @@ pub struct ConditioningRange {
 /// Graph results keep their output arena claim alive until the final
 /// consumer drops its reference. An owned tensor remains available for
 /// non-pooled callers.
-#[derive(Clone)]
 enum TensorBacking {
     Owned(Tensor),
     Graph(GraphOutputTensor),
@@ -52,7 +50,6 @@ impl fmt::Debug for TensorBacking {
 #[derive(Debug)]
 pub(crate) struct FeatureAllocation {
     tensor: Option<TensorBacking>,
-    boundary: Option<FeatureRef>,
     rows: usize,
     width: usize,
 }
@@ -197,62 +194,7 @@ lease!(FeatureRef, FeatureAllocation);
 lease!(ConditioningRef, ConditioningAllocation);
 lease!(LogitsRef, LogitsAllocation);
 
-/// A method's obligation to use a row owned by executor numerical state.
-/// It does not keep device storage resident after that state is evicted.
-#[derive(Clone, Debug)]
-pub struct WeakFeatureRef {
-    domain: ResourceDomainId,
-    allocation: Weak<FeatureAllocation>,
-}
-impl PartialEq for WeakFeatureRef {
-    fn eq(&self, other: &Self) -> bool {
-        self.domain == other.domain && self.allocation.ptr_eq(&other.allocation)
-    }
-}
-impl Eq for WeakFeatureRef {}
-impl WeakFeatureRef {
-    pub fn upgrade(&self) -> Option<FeatureRef> {
-        self.allocation.upgrade().map(|allocation| FeatureRef {
-            domain: self.domain.clone(),
-            allocation,
-        })
-    }
-}
-
 impl FeatureRef {
-    pub fn downgrade(&self) -> WeakFeatureRef {
-        WeakFeatureRef {
-            domain: self.domain.clone(),
-            allocation: Rc::downgrade(&self.allocation),
-        }
-    }
-
-    pub(crate) fn reclaimable_bytes(features: &[&Self]) -> Result<u64, ResourceError> {
-        let mut allocations = Vec::<&Rc<FeatureAllocation>>::new();
-        for feature in features {
-            if allocations
-                .iter()
-                .any(|other| Rc::ptr_eq(other, &feature.allocation))
-            {
-                continue;
-            }
-            let selected = features
-                .iter()
-                .filter(|other| feature.same_allocation(other))
-                .count();
-            if Rc::strong_count(&feature.allocation) == selected {
-                allocations.push(&feature.allocation);
-            }
-        }
-        let tensors = allocations
-            .iter()
-            .filter_map(|allocation| match &allocation.tensor {
-                Some(TensorBacking::Owned(tensor)) => Some(tensor),
-                _ => None,
-            });
-        Tensor::reclaimable_bytes(tensors).map_err(|error| ResourceError::Tensor(error.to_string()))
-    }
-
     /// Tensor-free RAII lease for contract tests and non-device executors.
     pub fn logical(
         domain: ResourceDomainId,
@@ -266,37 +208,8 @@ impl FeatureRef {
             domain,
             allocation: Rc::new(FeatureAllocation {
                 tensor: None,
-                boundary: None,
                 rows,
                 width,
-            }),
-        })
-    }
-
-    /// The independently owned last row of a successor-dependent prefix.
-    pub fn boundary(&self) -> Option<&FeatureRef> {
-        self.allocation.boundary.as_ref()
-    }
-
-    /// Attach a single independent device row without retaining this aggregate
-    /// through it. Generation checkpoints keep a weak boundary reference;
-    /// executor numerical state owns the row.
-    pub fn with_boundary(self, boundary: FeatureRef) -> Result<Self, ResourceError> {
-        if boundary.domain != self.domain
-            || boundary.allocation.rows != 1
-            || boundary.allocation.width != self.allocation.width
-            || boundary.allocation.is_graph_backed()
-            || boundary.boundary().is_some()
-        {
-            return Err(ResourceError::InvalidFeatureShape);
-        }
-        Ok(Self {
-            domain: self.domain,
-            allocation: Rc::new(FeatureAllocation {
-                tensor: self.allocation.tensor.clone(),
-                rows: self.allocation.rows,
-                width: self.allocation.width,
-                boundary: Some(boundary),
             }),
         })
     }
@@ -483,16 +396,11 @@ impl Ord for ImageRef {
 pub struct ResourceDomain {
     id: ResourceDomainId,
     device: Rc<Device>,
-    owned_features: Rc<RefCell<Vec<seismic::TensorStorageObserver>>>,
 }
 
 impl ResourceDomain {
     pub fn new(id: ResourceDomainId, device: Rc<Device>) -> Self {
-        Self {
-            id,
-            device,
-            owned_features: Rc::default(),
-        }
+        Self { id, device }
     }
     pub fn id(&self) -> &ResourceDomainId {
         &self.id
@@ -506,25 +414,8 @@ impl ResourceDomain {
             .then_some(())
             .ok_or(ResourceError::ForeignDevice)
     }
-    /// Includes in-flight, method, live and retained owners; weak observation
-    /// never pins a row after its last lease has been dropped.
-    pub(crate) fn owned_feature_bytes(&self) -> Result<u64, ResourceError> {
-        let mut census = self.owned_features.borrow_mut();
-        let mut seen = std::collections::BTreeSet::new();
-        census.retain(|tensor| tensor.charged_bytes().is_some() && seen.insert(tensor.identity()));
-        census.iter().try_fold(0u64, |bytes, tensor| {
-            bytes
-                .checked_add(tensor.charged_bytes().unwrap_or(0))
-                .ok_or(ResourceError::InvalidFeatureShape)
-        })
-    }
     pub fn publish_features(&self, tensor: Tensor) -> Result<FeatureRef, ResourceError> {
-        let observation = tensor.observe_storage();
-        let feature = self.publish_feature_backing(TensorBacking::Owned(tensor))?;
-        let mut census = self.owned_features.borrow_mut();
-        census.retain(|tensor| tensor.charged_bytes().is_some());
-        census.push(observation);
-        Ok(feature)
+        self.publish_feature_backing(TensorBacking::Owned(tensor))
     }
     pub fn publish_graph_features(
         &self,
@@ -548,7 +439,6 @@ impl ResourceDomain {
             domain: self.id.clone(),
             allocation: Rc::new(FeatureAllocation {
                 tensor: Some(tensor),
-                boundary: None,
                 rows,
                 width,
             }),
@@ -687,71 +577,6 @@ impl std::error::Error for ResourceError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn standalone_feature_census_is_shared_and_does_not_retain_allocations() {
-        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
-            return;
-        };
-        let Ok(device) = catalog.open_backend(seismic::BackendName::Cpu) else {
-            return;
-        };
-        let domain = ResourceDomain::new(ResourceDomainId::new("census").unwrap(), Rc::new(device));
-        let feature = domain
-            .publish_features(
-                Tensor::zeros(domain.device(), seismic::Element::bf16(), &[1, 32]).unwrap(),
-            )
-            .unwrap();
-        let bytes = feature.allocation().tensor().unwrap().storage_bytes();
-        let weak = feature.downgrade();
-        let fork = feature.clone();
-        assert_eq!(FeatureRef::reclaimable_bytes(&[&feature]).unwrap(), 0);
-        assert_eq!(
-            FeatureRef::reclaimable_bytes(&[&feature, &fork]).unwrap(),
-            bytes
-        );
-        assert_eq!(domain.owned_feature_bytes().unwrap(), bytes);
-        drop(feature);
-        assert_eq!(domain.clone().owned_feature_bytes().unwrap(), bytes);
-        let consumer = fork
-            .allocation()
-            .tensor()
-            .unwrap()
-            .slice_leading(0, 1)
-            .unwrap();
-        drop(fork);
-        assert!(weak.upgrade().is_none());
-        assert_eq!(domain.owned_feature_bytes().unwrap(), bytes);
-        drop(consumer);
-        assert_eq!(domain.owned_feature_bytes().unwrap(), 0);
-    }
-
-    #[test]
-    fn independent_boundary_does_not_retain_the_aggregate() {
-        let domain = ResourceDomainId::new("boundary").unwrap();
-        let boundary = FeatureRef::logical(domain.clone(), 1, 4).unwrap();
-        let aggregate = FeatureRef::logical(domain.clone(), 512, 4)
-            .unwrap()
-            .with_boundary(boundary.clone())
-            .unwrap();
-        let weak = Rc::downgrade(&aggregate.allocation);
-        let retained = aggregate.boundary().unwrap().clone();
-        drop(aggregate);
-        assert!(weak.upgrade().is_none());
-        assert!(retained.same_allocation(&boundary));
-        assert!(
-            FeatureRef::logical(domain.clone(), 2, 8)
-                .unwrap()
-                .with_boundary(boundary.clone())
-                .is_err()
-        );
-        assert!(
-            FeatureRef::logical(ResourceDomainId::new("foreign").unwrap(), 2, 4)
-                .unwrap()
-                .with_boundary(boundary)
-                .is_err()
-        );
-    }
-
     #[test]
     fn logical_leases_are_raii_and_domain_checked() {
         let domain = ResourceDomainId::new("a").unwrap();
