@@ -1,6 +1,6 @@
-import { Option } from "effect"
+import { Effect, Fiber, Option, Schema, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
-import { modelCommandFailure } from "./model-commands"
+import { modelCommandFailure, type ModelCommandsApi } from "./model-commands"
 
 describe("modelCommandFailure", () => {
   it("preserves the server's structured remote failure details", () => {
@@ -102,4 +102,98 @@ it("stops a running model before removing it, and removes an idle model without 
   await Effect.runPromise(remove("model-a:gguf:test"))
   await Effect.runPromise(remove("model-b:gguf:test"))
   expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
+})
+
+describe("load acknowledgement", () => {
+  const loadFixture = async (initial: unknown, ensure: (modelId: string) => unknown) => {
+    const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+    const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
+    const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+    const { ModelSlotController } = await import("./model-slot-controller")
+    const { LocalModelRemovals } = await import("./local-model-removals")
+    const decode = Schema.decodeUnknownSync(ModelInstancesSnapshot)
+    const instances = await Effect.runPromise(SubscriptionRef.make(decode(initial)))
+    const slotsRefreshed: string[] = []
+    const run = <A, E>(use: (commands: ModelCommandsApi) => Effect.Effect<A, E>) =>
+      Effect.runPromise(ModelCommands.pipe(
+        Effect.flatMap(use),
+        Effect.either,
+        Effect.provide(ModelCommandsLive),
+        Effect.provideService(IcnInstances, { get: SubscriptionRef.get(instances), changes: instances.changes } as never),
+        Effect.provideService(IcnClient, { models: { ensureModelInstance: ({ payload }: { payload: { modelId: string } }) => ensure(payload.modelId) } } as never),
+        Effect.provideService(ModelSlotController, {
+          state: Effect.succeed({ slots: { primary: { _tag: "ConfiguredLocal", selection: { providerModelId: "model-a:gguf:test" } } } }),
+          refresh: Effect.sync(() => { slotsRefreshed.push("primary") }),
+        } as never),
+        Effect.provideService(IcnCatalog, {} as never),
+        Effect.provideService(IcnCatalogInstallations, {} as never),
+        Effect.provideService(LocalModelRemovals, {} as never),
+      ))
+    const publish = (snapshot: unknown) => SubscriptionRef.set(instances, decode(snapshot))
+    return { run, publish, slotsRefreshed }
+  }
+  const loading = (revision: number) => ({ revision, instances: [{
+    id: "instance-1", modelId: "model-a:gguf:test",
+    lifecycle: { _tag: "Loading", stage: "optimizing", fraction: 0.1 },
+  }] })
+
+  it("acknowledges a load once ICN admits it while the warm demand keeps waiting for readiness", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const demands: string[] = []
+    let demandInterrupted = false
+    const fixture = await loadFixture({ revision: 1, instances: [] }, (modelId) => Effect.sync(() => { demands.push(modelId) }).pipe(
+      Effect.zipRight(Effect.never),
+      Effect.onInterrupt(() => Effect.sync(() => { demandInterrupted = true })),
+    ))
+    const outcome = await fixture.run((commands) => Effect.gen(function* () {
+      const load = yield* commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test")).pipe(Effect.fork)
+      yield* Effect.yieldNow()
+      expect(Option.isNone(yield* Fiber.poll(load))).toBe(true)
+      yield* fixture.publish(loading(2))
+      const acknowledged = yield* Fiber.join(load)
+      yield* Effect.yieldNow()
+      expect(demandInterrupted).toBe(false)
+      return acknowledged
+    }))
+
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(demands).toEqual(["model-a:gguf:test"])
+  })
+
+  it("delivers the warm demand for an already admitted model and acknowledges without waiting", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const demands: string[] = []
+    const fixture = await loadFixture(loading(1), (modelId) => Effect.sync(() => { demands.push(modelId) }).pipe(Effect.zipRight(Effect.never)))
+    const outcome = await fixture.run((commands) => commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test")).pipe(
+      Effect.zipLeft(Effect.yieldNow()),
+    ))
+
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(demands).toEqual(["model-a:gguf:test"])
+  })
+
+  it("reports a demand rejected before admission", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const fixture = await loadFixture({ revision: 1, instances: [] }, () => Effect.fail({
+      _tag: "GeneratedClientRemoteError", operationId: "ensureModelInstance", status: 409, headers: {},
+      body: { error: { code: "memory_shortage", message: "Not enough memory", type: "model_error", param: Option.none() } },
+    }))
+    const outcome = await fixture.run((commands) => commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test")))
+
+    expect(outcome).toMatchObject({ _tag: "Left", left: { _tag: "LocalModelMutationFailed", code: "memory_shortage" } })
+  })
+
+  it("acknowledges a slot load at admission and refreshes the slot", async () => {
+    const { PRIMARY_SLOT_ID } = await import("@magnitudedev/acn-protocol")
+    const fixture = await loadFixture({ revision: 1, instances: [] }, () => Effect.never)
+    const outcome = await fixture.run((commands) => Effect.gen(function* () {
+      const load = yield* commands.loadSlot(PRIMARY_SLOT_ID).pipe(Effect.fork)
+      yield* Effect.yieldNow()
+      yield* fixture.publish(loading(2))
+      return yield* Fiber.join(load)
+    }))
+
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(fixture.slotsRefreshed).toEqual(["primary"])
+  })
 })

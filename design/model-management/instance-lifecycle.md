@@ -196,6 +196,12 @@ canonical model ID and exposes one zero-argument stop for the singleton active I
 resolves either product intent to ICN's exact Instance operations; callers never supply a native
 Instance ID.
 
+ICN's explicit warm demand answers only once its Instance is Ready, which can take minutes. A load
+command is a request, not a wait for readiness: ACN issues that warm demand in its own lifetime
+rather than the caller's and acknowledges the command once ICN admits it, observed as a Loading or Ready Instance of the model,
+or with the demand's own earlier outcome. No client request or ACN RPC stays open for the duration
+of a load; load progress, readiness, and load failure are observed through the projected Instance.
+
 ## Conformance
 
 - ICN is the sole authority for loading, replacement, request leases, idle release, and pressure
@@ -206,6 +212,8 @@ Instance ID.
 - Stop and replacement cannot race past accepted inference demand or active leases.
 - ACN never stores Instance residency inside Slot state; it projects current residency into the
   client-facing local model.
+- An ACN load command is acknowledged at ICN admission; its warm demand is not cut short when the
+  command returns or its caller leaves.
 - Agent and external inference requests follow the same ICN acquisition path.
 - Loading-instance Stop terminalizes every joined preparation waiter without admitting a
   replacement.

@@ -1,4 +1,4 @@
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import {
   ModelIdSchema,
   ModelSlotMutationRejected,
@@ -36,7 +36,8 @@ export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
   IcnClient | IcnCatalog | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals
-> = Layer.effect(ModelCommands, Effect.gen(function* () {
+> = Layer.scoped(ModelCommands, Effect.gen(function* () {
+  const scope = yield* Effect.scope
   const client = yield* IcnClient
   const catalog = yield* IcnCatalog
   const installations = yield* IcnCatalogInstallations
@@ -58,6 +59,22 @@ export const ModelCommandsLive: Layer.Layer<
   const operationFor = (modelId: ModelId) => installations.get.pipe(
     Effect.map(({ state }) => state.operations.findLast((operation) => operation.modelId === modelId)),
   )
+  const admitted = (modelId: ModelId) => instances.changes.pipe(
+    Stream.filter(({ instances: current }) => current.some((instance) => instance.modelId === modelId
+      && (instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready"))),
+    Stream.runHead,
+  )
+  /**
+   * ICN's warm demand answers only once the Instance is Ready, which can take many minutes. ACN
+   * issues that demand in its own lifetime rather than the caller's and acknowledges the load once
+   * ICN admits it, or with the demand's own earlier outcome, so no caller holds a request open for
+   * the duration of a load.
+   */
+  const requestLoad = (modelId: ModelId) => Effect.gen(function* () {
+    const demand = yield* client.models.ensureModelInstance({ payload: { modelId } }).pipe(Effect.forkIn(scope))
+    yield* Effect.raceFirst(Fiber.join(demand), admitted(modelId))
+    return {}
+  })
   const stopModel = (modelId: ModelId) => Effect.gen(function* () {
     const instance = (yield* instances.get).instances.findLast((candidate) => candidate.modelId === modelId
       && (candidate.lifecycle._tag === "Loading" || candidate.lifecycle._tag === "Ready" || candidate.lifecycle._tag === "Stopping"))
@@ -92,16 +109,15 @@ export const ModelCommandsLive: Layer.Layer<
     ),
     remove: (modelId) => stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
-      Effect.flatMap((modelId) => client.models.ensureModelInstance({ payload: { modelId } })),
-      Effect.tap(() => slots.refresh), Effect.as({}),
+      Effect.flatMap(requestLoad),
+      Effect.tap(() => slots.refresh),
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("load", cause))),
     previewSlotLoad: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap((modelId) => client.models.previewModelLoad({ path: { model_id: modelId } })),
       Effect.map(projectInferenceLoadPlan),
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("preview", cause))),
     stopSlot: (slotId) => selectedLocalModel(slotId).pipe(Effect.flatMap(stopModel)),
-    loadModel: (modelId) => client.models.ensureModelInstance({ payload: { modelId } }).pipe(
-      Effect.as({}), Effect.mapError((cause) => modelCommandFailure("load", cause))),
+    loadModel: (modelId) => requestLoad(modelId).pipe(Effect.mapError((cause) => modelCommandFailure("load", cause))),
     stopActiveModel: instances.get.pipe(Effect.flatMap(({ instances: current }) => {
       const active = current.findLast((instance) =>
         instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready" || instance.lifecycle._tag === "Stopping")
