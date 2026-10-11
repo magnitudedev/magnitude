@@ -13,18 +13,18 @@ pub use advance::{
     OwnedCodecBindings, OwnedStateAdvance, OwnedSuccessorAdvance, OwnedTailRelocation,
     TentativeAdvance,
 };
-pub use bank::{recurrent_bank_bytes, BankComponent};
+pub use bank::{BankComponent, recurrent_bank_bytes};
 pub use domain::{
     HistoryDomainId, HistoryDomainKind, HistoryDomainLayout, HistoryDomainPlan, HistorySource,
 };
 
 pub use codec::{
-    Codec, CodecIdentity, CodecSpec, ComponentDescriptor, KvCodec, LayerRef, LayoutError,
-    PlaneDescriptor, PlaneName, VectorKind, AFFINE_GROUP,
+    AFFINE_GROUP, AffineGeometry, Codec, CodecIdentity, CodecSpec, ComponentDescriptor,
+    HistoryEncoding, KvCodec, LayerRef, LayoutError, PlaneDescriptor, PlaneName, VectorKind,
 };
 pub use layout::{
-    banks_per_slab, history_geometry, HistoryGeometry, ModelStateLayout, MAX_HISTORY_SPANS,
-    SLAB_BYTE_TARGET, SLAB_ROW_TILE,
+    HistoryGeometry, MAX_HISTORY_SPANS, ModelStateLayout, SLAB_BYTE_TARGET, SLAB_ROW_TILE,
+    banks_per_slab, history_geometry,
 };
 
 use placement::{Generation, LogicalId, Placement, PlacementError};
@@ -733,6 +733,32 @@ fn append_ranges(
     }
 }
 
+/// The rows `histories` fresh histories of `rows` rows each hold in an empty
+/// domain of `geometry`, each filled whole before the next begins, as a
+/// store fills requests that arrive together: per history, its `(start,
+/// count)` ranges in logical order. Slabs are backed as the store backs
+/// them, the lowest unbacked while the free pages are short, and every row
+/// is placed by the store's own rule ([`Arena::claim`]): a history keeps
+/// to itself, away from the others.
+pub fn fresh_history_ranges(
+    geometry: HistoryGeometry,
+    histories: usize,
+    rows: usize,
+) -> Vec<Vec<(usize, usize)>> {
+    let mut arena = Arena::new(0, geometry.slab_rows, geometry.page_rows);
+    let pages = rows.div_ceil(geometry.page_rows);
+    (0..histories)
+        .map(|_| {
+            while arena.free_pages().len() < pages {
+                arena.back_slab(arena.backed.len(), usize::MAX);
+            }
+            let mut ranges = Vec::new();
+            append_ranges(&mut ranges, arena.claim(None, rows), geometry.slab_rows);
+            ranges
+        })
+        .collect()
+}
+
 /// A history's claims: one reference on each row of its ranges, registered in
 /// the arena, so the arena knows every history and can relocate them all.
 /// Cloning adds a reference to every row, dropping removes one; appending and
@@ -1062,10 +1088,12 @@ impl BankPool {
 
     fn mark_slab_unavailable(&self, start: usize, end: usize) {
         let placement = self.inner.placement.borrow().clone();
-        assert!(placement
-            .resources()
-            .values()
-            .all(|&slot| slot < start || slot >= end));
+        assert!(
+            placement
+                .resources()
+                .values()
+                .all(|&slot| slot < start || slot >= end)
+        );
         *self.inner.placement.borrow_mut() = placement
             .with_resources(placement.resources().clone())
             .expect("bank slab release advances placement generation");
@@ -1209,7 +1237,8 @@ impl HistoryDomain {
         for slab in 0..self.capacity.div_ceil(self.slab_rows) {
             if !arena.backed.contains(&slab) && added_pages < shortage {
                 let start = slab * self.slab_rows;
-                added_pages += ((start + self.slab_rows).min(self.capacity) - start) / self.page_rows;
+                added_pages +=
+                    ((start + self.slab_rows).min(self.capacity) - start) / self.page_rows;
                 additional_slabs += 1;
             }
         }
@@ -1561,10 +1590,7 @@ impl StateStore {
             transactions: Transactions(Rc::new(RefCell::new(TransactionClaims::default()))),
             compactions: Cell::new(Compactions::default()),
         });
-        Ok((
-            store.clone(),
-            StoreBindings { store },
-        ))
+        Ok((store.clone(), StoreBindings { store }))
     }
     pub fn component_specs(&self) -> &[ComponentSpec] {
         &self.component_specs
@@ -2566,8 +2592,7 @@ impl StateStore {
                 }
                 history.rows = domain.backed_extent(&history.slabs);
             }
-            *domain.arena.borrow_mut() =
-                Arena::new(0, domain.slab_rows, domain.page_rows);
+            *domain.arena.borrow_mut() = Arena::new(0, domain.slab_rows, domain.page_rows);
         }
         drop(backing);
         usize::try_from(before.saturating_sub(self.device.memory_usage().charged))
@@ -3095,7 +3120,8 @@ mod tests {
                 logical_rows: rows,
             }]
         };
-        StateStore::new(device, context, context, domains, specs, banks).map(|(_, bindings)| bindings)
+        StateStore::new(device, context, context, domains, specs, banks)
+            .map(|(_, bindings)| bindings)
     }
 
     impl StateStore {
@@ -3212,14 +3238,18 @@ mod tests {
         }
         assert_eq!(arena.borrow().free, vec![(0, 4), (4, 4), (8, 4)]);
         let ranges = arena.borrow_mut().claim(None, 6);
-        assert!(ranges
-            .iter()
-            .all(|(start, count)| start / 4 == (start + count - 1) / 4));
+        assert!(
+            ranges
+                .iter()
+                .all(|(start, count)| start / 4 == (start + count - 1) / 4)
+        );
         let claims = Claims::new(&arena, ranges);
-        assert!(claims
-            .ranges()
-            .iter()
-            .all(|(start, count)| start / 4 == (start + count - 1) / 4));
+        assert!(
+            claims
+                .ranges()
+                .iter()
+                .all(|(start, count)| start / 4 == (start + count - 1) / 4)
+        );
         drop(claims);
         assert_eq!(arena.borrow().free, vec![(0, 4), (4, 4), (8, 4)]);
     }
@@ -3489,19 +3519,14 @@ mod tests {
             .unwrap()
             .write_from_host(&value)
             .unwrap();
-        let slab_bytes = store
-            .history_slabs()
-            .slab_bytes();
+        let slab_bytes = store.history_slabs().slab_bytes();
         let charged = device.memory_usage().charged;
         device.set_memory_limit(Some(charged));
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), slab_bytes);
         device.set_memory_limit(None);
         assert_eq!(store.compactions().history_rows, 1);
         assert_eq!(sparse.ranges(), vec![(moved, 1)]);
-        assert!(store
-            .history_slabs()
-            .slab(1)
-            .is_none());
+        assert!(store.history_slabs().slab(1).is_none());
         assert_eq!(
             store
                 .history_slabs()
@@ -3551,10 +3576,7 @@ mod tests {
         assert_eq!(sparse.ranges(), before_ranges);
         assert_eq!(store.compactions(), before_stats);
         assert_eq!(device.memory_usage().charged, before_charge);
-        assert!(store
-            .history_slabs()
-            .slab(1)
-            .is_some());
+        assert!(store.history_slabs().slab(1).is_some());
     }
 
     #[test]
@@ -3575,22 +3597,14 @@ mod tests {
             },
         )
         .unwrap();
-        let slab_bytes = store
-            .history_slabs()
-            .slab_bytes();
+        let slab_bytes = store.history_slabs().slab_bytes();
         let binding = store.history_planes().unwrap()[0].buffer.clone();
         let charged = device.memory_usage().charged;
         assert!(store.shrink(ShrinkPolicy::Reclaim).is_err());
-        assert!(store
-            .history_slabs()
-            .slab(0)
-            .is_some());
+        assert!(store.history_slabs().slab(0).is_some());
         assert_eq!(device.memory_usage().charged, charged);
         drop(binding);
-        let pinned = store
-            .history_slabs()
-            .region_rows(0, 0, 1)
-            .unwrap();
+        let pinned = store.history_slabs().region_rows(0, 0, 1).unwrap();
         assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 0);
         assert_eq!(committed_extent(&store).0, 0);
         assert_eq!(device.memory_usage().charged, charged);
@@ -3746,10 +3760,12 @@ mod tests {
         }));
 
         let second = store.history_planes().unwrap();
-        assert!(first
-            .iter()
-            .zip(second.iter())
-            .all(|(left, right)| left.buffer.shares_allocation(&right.buffer)));
+        assert!(
+            first
+                .iter()
+                .zip(second.iter())
+                .all(|(left, right)| left.buffer.shares_allocation(&right.buffer))
+        );
     }
 
     fn validate(plans: Vec<HistoryDomainPlan>) -> Result<(), Error> {
@@ -3777,7 +3793,9 @@ mod tests {
         let component = dense_component(4);
         assert!(matches!(
             validate(vec![token(vec![component.clone(), component], 2)]),
-            Err(Error::Layout(LayoutError::DuplicateLayer(LayerRef::Target(0))))
+            Err(Error::Layout(LayoutError::DuplicateLayer(
+                LayerRef::Target(0)
+            )))
         ));
         // A layer belongs to one domain, stored or shared.
         assert!(matches!(
@@ -3791,7 +3809,9 @@ mod tests {
                     logical_rows: 0,
                 },
             ]),
-            Err(Error::Layout(LayoutError::DuplicateLayer(LayerRef::Target(0))))
+            Err(Error::Layout(LayoutError::DuplicateLayer(
+                LayerRef::Target(0)
+            )))
         ));
     }
 
@@ -3805,14 +3825,30 @@ mod tests {
             logical_rows,
         };
         assert!(matches!(
-            validate(vec![token(vec![dense_component(4)], 2), shared(LayerRef::Target(3), 0)]),
-            Err(Error::Layout(LayoutError::UnknownSharedSource(LayerRef::Target(3))))
+            validate(vec![
+                token(vec![dense_component(4)], 2),
+                shared(LayerRef::Target(3), 0)
+            ]),
+            Err(Error::Layout(LayoutError::UnknownSharedSource(
+                LayerRef::Target(3)
+            )))
         ));
         assert!(matches!(
-            validate(vec![token(vec![dense_component(4)], 2), shared(LayerRef::Target(0), 2)]),
-            Err(Error::Layout(LayoutError::SharedDomainRows(LayerRef::Target(0))))
+            validate(vec![
+                token(vec![dense_component(4)], 2),
+                shared(LayerRef::Target(0), 2)
+            ]),
+            Err(Error::Layout(LayoutError::SharedDomainRows(
+                LayerRef::Target(0)
+            )))
         ));
-        assert!(validate(vec![token(vec![dense_component(4)], 2), shared(LayerRef::Target(0), 0)]).is_ok());
+        assert!(
+            validate(vec![
+                token(vec![dense_component(4)], 2),
+                shared(LayerRef::Target(0), 0)
+            ])
+            .is_ok()
+        );
         assert!(matches!(
             validate(vec![HistoryDomainPlan {
                 layout: HistoryDomainLayout::Window {
@@ -3840,7 +3876,9 @@ mod tests {
                 },
                 logical_rows: 2,
             }]),
-            Err(Error::UnsupportedHistoryDomain(HistoryDomainKind::Block { rate: 4 }))
+            Err(Error::UnsupportedHistoryDomain(HistoryDomainKind::Block {
+                rate: 4
+            }))
         ));
     }
 
@@ -4026,13 +4064,15 @@ mod tests {
         assert_eq!(submitted.live, (6 + 3) * row + 2 * bank);
         assert_eq!(submitted.retained, bank);
         assert_eq!(submitted.total(), store.committed_bytes());
-        assert!(store
-            .holding_census(
-                &[Holder::State(&a), Holder::State(&b)],
-                &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
-                &[],
-            )
-            .is_err());
+        assert!(
+            store
+                .holding_census(
+                    &[Holder::State(&a), Holder::State(&b)],
+                    &[Holder::Checkpoint(&system), Holder::Checkpoint(&a_turn)],
+                    &[],
+                )
+                .is_err()
+        );
         // Alone, each live request owns only its private tail and its bank.
         assert_eq!(
             store.exclusive_bytes(&[Holder::State(&b)]).unwrap(),
@@ -4231,10 +4271,12 @@ mod tests {
             assert_eq!(bindings.previous_bank, ZERO_SEED_BANK);
             assert_ne!(bindings.following_bank, ZERO_SEED_BANK);
             assert!(!readable(&[], &[&root]).contains(&bindings.following_bank));
-            assert!(successors
-                .iter()
-                .enumerate()
-                .all(|(other, bank)| other == index || *bank != bindings.following_bank));
+            assert!(
+                successors
+                    .iter()
+                    .enumerate()
+                    .all(|(other, bank)| other == index || *bank != bindings.following_bank)
+            );
         }
         let OwnedAdvanceResolution::Committed(left) = left.commit_all().ok().unwrap() else {
             panic!("full prefix must commit");
@@ -4425,6 +4467,35 @@ mod tests {
         assert_eq!(second.history_ranges(TOKEN), [(destination, 13)]);
         assert_eq!(first.history_ranges(TOKEN), [(page, 13)]);
         assert_eq!(checkpoint.history_ranges(TOKEN), [(page, 10)]);
+    }
+
+    /// Requests that arrive together lie apart, each by the store's rule: a
+    /// fresh history takes the middle of the largest free run, and backs a
+    /// slab only when the free pages are short.
+    #[test]
+    fn fresh_histories_lie_where_the_store_places_them() {
+        let geometry = HistoryGeometry {
+            page_rows: 256,
+            slab_rows: 29 * 256,
+            span_limit: 18,
+        };
+        let ranges = fresh_history_ranges(geometry, 8, 2_621);
+        assert_eq!(ranges[0], [(0, 2_621)]);
+        // The second begins at the middle of the 18 free pages after the
+        // first, runs to the slab's end, and takes its last rows from the
+        // middle of what is left.
+        assert_eq!(ranges[1], [(4_864, 2_560), (3_584, 61)]);
+        let mut rows = ranges
+            .iter()
+            .flat_map(|history| history.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(ranges.iter().all(|history| {
+            history.iter().map(|&(_, count)| count).sum::<usize>() == 2_621
+                && history.len() <= geometry.span_limit
+        }));
+        rows.sort_unstable();
+        assert!(rows.windows(2).all(|pair| pair[0].0 + pair[0].1 <= pair[1].0));
+        assert_eq!(fresh_history_ranges(geometry, 2, 0), [vec![], vec![]]);
     }
 
     /// Without a free page a relocation is a capacity error before any row
@@ -4687,10 +4758,8 @@ mod tests {
                             // guarantee the claim.
                             {
                                 let inner = arena.borrow();
-                                let demand = rows
-                                    .saturating_sub(inner.in_place(end))
-                                    .div_ceil(page)
-                                    * page;
+                                let demand =
+                                    rows.saturating_sub(inner.in_place(end)).div_ceil(page) * page;
                                 if inner.available() >= demand {
                                     assert!(inner.claimable(end) >= rows);
                                 }
@@ -4950,7 +5019,10 @@ mod tests {
         let base = charged();
         assert_eq!(
             committed_extent(&store),
-            (store.history_slab_rows(TOKEN), store.bank_slab_banks().min(49))
+            (
+                store.history_slab_rows(TOKEN),
+                store.bank_slab_banks().min(49)
+            )
         );
         // A 1,000-row prefill commits exactly one slab.
         let advance = OwnedStateAdvance::begin(store.create().unwrap(), 1000)
@@ -5110,9 +5182,7 @@ mod tests {
         }];
         let baseline = device.memory_usage().charged;
         let committed = committed_extent(&store);
-        let history_bytes = store
-            .history_slabs()
-            .slab_bytes();
+        let history_bytes = store.history_slabs().slab_bytes();
         let bank_bytes = store
             .backing
             .borrow()
@@ -5140,7 +5210,10 @@ mod tests {
             .provision_with_growth(&demand, 4, GrowthChoice::Minimum)
             .unwrap();
         assert_eq!(store.arena().borrow().backed, BTreeSet::from([0, 1]));
-        assert_eq!(committed_extent(&store).1, committed.1 + store.bank_slab_banks());
+        assert_eq!(
+            committed_extent(&store).1,
+            committed.1 + store.bank_slab_banks()
+        );
         assert_eq!(
             device.memory_usage().charged,
             baseline + history_bytes + bank_bytes
@@ -5293,16 +5366,11 @@ mod tests {
             rows: store.history_slab_rows(TOKEN),
         }];
         let claim = store.growth_claim(&demand, 0).unwrap();
-        let slab_bytes = store
-            .history_slabs()
-            .slab_bytes();
+        let slab_bytes = store.history_slabs().slab_bytes();
         assert_eq!(claim.minimum_bytes, slab_bytes);
         assert_eq!(claim.preferred_bytes, slab_bytes);
         bindings.provision(&demand, 0).unwrap();
-        assert!(store
-            .history_slabs()
-            .slab(0)
-            .is_some());
+        assert!(store.history_slabs().slab(0).is_some());
     }
 
     #[test]
@@ -5342,9 +5410,7 @@ mod tests {
                 .unwrap()
                 .write_from_host(&value)
                 .unwrap();
-            let slab_bytes = store
-                .history_slabs()
-                .slab_bytes();
+            let slab_bytes = store.history_slabs().slab_bytes();
             let charged = device.memory_usage().charged;
             device.set_memory_limit(Some(charged));
             assert_eq!(store.shrink(ShrinkPolicy::Reclaim).unwrap(), 2 * slab_bytes);
@@ -5522,14 +5588,16 @@ mod tests {
         let claim = store.growth_claim(&[], 4).unwrap();
         assert_eq!(claim.minimum_bytes, slab_bytes);
         store.provision(&[], 4).unwrap();
-        assert!(store
-            .backing
-            .borrow()
-            .recurrent
-            .as_ref()
-            .unwrap()
-            .slab(1)
-            .is_some());
+        assert!(
+            store
+                .backing
+                .borrow()
+                .recurrent
+                .as_ref()
+                .unwrap()
+                .slab(1)
+                .is_some()
+        );
         assert_eq!(store.available_banks(), 7);
     }
 
@@ -5640,14 +5708,16 @@ mod tests {
         device.set_memory_limit(None);
         assert_eq!(sparse.index(), 11);
         assert_eq!(store.compactions().banks, 1);
-        assert!(store
-            .backing
-            .borrow()
-            .recurrent
-            .as_ref()
-            .unwrap()
-            .slab(1)
-            .is_none());
+        assert!(
+            store
+                .backing
+                .borrow()
+                .recurrent
+                .as_ref()
+                .unwrap()
+                .slab(1)
+                .is_none()
+        );
         assert_eq!(
             store.recurrent_arenas()[0]
                 .slice_leading(sparse.index() as u64, sparse.index() as u64 + 1)
@@ -5702,14 +5772,16 @@ mod tests {
         assert_eq!(store.bank_placement_generation(), before_generation);
         assert_eq!(store.compactions(), before_stats);
         assert_eq!(device.memory_usage().charged, before_charge);
-        assert!(store
-            .backing
-            .borrow()
-            .recurrent
-            .as_ref()
-            .unwrap()
-            .slab(1)
-            .is_some());
+        assert!(
+            store
+                .backing
+                .borrow()
+                .recurrent
+                .as_ref()
+                .unwrap()
+                .slab(1)
+                .is_some()
+        );
     }
 
     #[test]
@@ -5759,10 +5831,7 @@ mod tests {
         let before_slot = bank.index();
         let before_generation = store.bank_placement_generation();
         let before_stats = store.compactions();
-        let before_history_slabs = store
-            .history_slabs()
-            .slabs()
-            .count();
+        let before_history_slabs = store.history_slabs().slabs().count();
         let before_bank_slabs = store
             .backing
             .borrow()
@@ -5798,13 +5867,7 @@ mod tests {
         assert_eq!(bank.index(), before_slot);
         assert_eq!(store.bank_placement_generation(), before_generation);
         assert_eq!(store.compactions(), before_stats);
-        assert_eq!(
-            store
-                .history_slabs()
-                .slabs()
-                .count(),
-            before_history_slabs
-        );
+        assert_eq!(store.history_slabs().slabs().count(), before_history_slabs);
         assert_eq!(
             store
                 .backing

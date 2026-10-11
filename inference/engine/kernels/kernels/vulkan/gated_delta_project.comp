@@ -224,7 +224,7 @@ projection_epilogue recurrent_project_out(uint column) {
 }
 
 projection_weights recurrent_project_weight(uint64_t base, packets_rows16 geometry) {
-    return projection_weights(base, geometry, PROJECT_K, 0ul);
+    return projection_weights(base, geometry, PROJECT_K, 0ul, 1ul);
 }
 
 void gated_delta_project_gemv() {

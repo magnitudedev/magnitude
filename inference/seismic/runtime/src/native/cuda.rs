@@ -16,7 +16,7 @@
 use super::graph_replays::Replays;
 use super::{DispatchList, NativeRoute, RouteSubmission};
 use crate::api::CallError;
-use crate::driver::{typed_buffer, Allocation};
+use crate::driver::{Allocation, typed_buffer};
 use seismic_compiler::errors::ExecutionError;
 use seismic_cuda::direct::{DirectBatch, DirectGraph, DirectGraphBuilder, DirectLaunch};
 use std::any::Any;

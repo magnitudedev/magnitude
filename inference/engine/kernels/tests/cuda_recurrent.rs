@@ -305,15 +305,9 @@ fn cuda_recurrent_scoped_tuning_completes() {
     let search = || {
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
-            admission: std::time::Duration::from_secs(600),
-            required: std::time::Duration::from_secs(600),
+
             settings: seismic::SearchSettings {
-                improvement: 0.01,
-                restarts: 2,
-                confirmed: 3,
-                default_margin: 0.02,
-                samples: 3,
-                confirmation_samples: 5,
+                error_rate: 0.05,
             },
             min_sample_seconds: 0.0002,
             start: Vec::new(),
@@ -324,7 +318,7 @@ fn cuda_recurrent_scoped_tuning_completes() {
         weight: 1.0,
         class: None,
         cost: 1.0,
-        required: false,
+        workload: seismic::WorkloadRotation::All,
         rotation: vec![tensors.chunk_args(&case)],
         initialize: Some(Box::new(move || {
             window.write_from_host(&initial_window)?;
@@ -341,21 +335,19 @@ fn cuda_recurrent_scoped_tuning_completes() {
         },
         &statics,
         points,
-        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-            absolute: seismic::precision::Limit::new(0.01).unwrap(),
-            relative: seismic::precision::Limit::new(0.05).unwrap(),
-            relative_floor: seismic::precision::Limit::ZERO,
-            ulps: None,
-        }),
+        // Eight rounding steps of the `bf16` activations: the engine's
+        // standard α.
+        seismic::NumericalRequirement::RoundingSteps {
+            alpha: 8.,
+            activation: Some(seismic::DType::BF16),
+        },
         search(),
-        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
-        seismic::TuningMethod::Factored {
+        seismic::TuningMethod::Search {
             groups: 1,
-            candidates: 3,
             complete: true,
             ..
         }

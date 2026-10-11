@@ -132,6 +132,7 @@ impl CpuInvocation<'_> {
 }
 
 /// The CPU route of one prepared implementation.
+#[derive(Clone)]
 pub(crate) struct CpuRoute {
     pub(crate) opened: Arc<CpuOpened>,
     pub(crate) tier: Tier,

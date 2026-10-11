@@ -4,13 +4,24 @@ applies_to:
   - inference/seismic-std/**
   - inference/engine/**
   - inference/docs/seismic/**
+  - inference/docs/precision.md
 ---
 
 # Seismic numerical precision
 
 Numerical precision is an observable whole-entry compilation contract and a hard selection constraint. It is not a source-level permission, a backend-wide fast-math setting, or a performance penalty.
 
-An explicitly selected top-level native implementation remains outside compiler selection. Native tuning uses the same caller-owned precision policy and element comparison semantics as the compiler, but establishes only empirical agreement on the supplied cases. The caller explicitly selects either the portable operation or the declared native default as its reference. Default agreement does not establish agreement with source semantics and cannot detect shared defects. These observations do not establish compiler applicability. Direct native selection cannot silently fall back.
+A lossy model-state representation has a separate admission obligation from a physical
+kernel. A compressed-history implementation must preserve its supplied codec's packing,
+coefficient rounding, prepared-activation rounding and decoded semantics. Comparing a
+native consumer against an already compressed source qualifies that implementation;
+it does not qualify the codec against the independent model definition. Whole-model
+reference evidence owns representation suitability across its declared contexts and
+categories. Diagnostic Dense/compressed comparisons identify distortion but cannot
+substitute for independent model quality. Existing serving presets remain unchanged
+until their representation admission has that evidence.
+
+An explicitly selected top-level native implementation remains outside compiler selection. Native tuning judges every candidate empirically against the declaration's canonical native default on the same device; there is no portable or host reference and no declared precision permission. Compiler precision policies govern portable selection; native empirical comparisons do not grant compiler applicability. Default agreement does not establish agreement with source semantics and cannot detect shared defects. These observations do not establish compiler applicability. Direct native selection cannot silently fall back.
 
 ## Source authority and policies
 
@@ -40,31 +51,80 @@ One construction-owned numerical applicability determines both solver admission 
 
 Native formation preserves the operation recipes and compiler options assessed before selection. Contraction, reassociation, FTZ/DAZ, approximate math, changed accumulation width, storage rounding, and target intrinsics are distinct physical choices. A typed native Cast is not automatically the source-defined conversion. CPU, Metal, and CUDA emitters must preserve the selected recipe's rounding boundaries, narrow payloads, signed zero, subnormals, infinities, and NaN behavior. A backend unable to do so cannot advertise the required source mapping.
 
+Metal attention prepares queries, keys and values through the activation element's explicit
+rounding recipe before converting to a history representation's physical operands. Dense
+history publishes the element's storage payload; affine encoding consumes the same rounded
+F32 values. Native BF16 casts cannot introduce an intermediate preparation authority.
+Scalar fresh attention, prefill preparation and matrix staging share this boundary. Final
+output publication remains the declared activation store, separate from history coding.
+
+Staging and fusion preserve the declared normalization computation and activation
+publication boundary. Current Metal helpers share a fixed native RMS reduction recipe
+across row classes; its fidelity to ordinary `rms_norm` requires independent
+qualification. Row scheduling does not grant permission to change that computation.
+Paired gate/up projections preserve every declared narrow rounding boundary before
+activation and multiplication; agreement of the unrounded dot products alone does not establish
+agreement of the published gated product.
+
+A projection's semantic activation type owns normalization and epilogue rounding;
+its physical tensor operand type separately owns reusable staging storage and MMA
+operands. Physical staging stores the already rounded semantic value. Converting
+that value or decoded weight coefficients to another physical type is an explicit
+numerical transformation, including its range and subnormal behavior, and requires
+explicit caller approval of the complete resulting computation. Packed weight residency and row scheduling do not
+imply exactness or confer admission. Reuse performs a selected conversion once;
+it does not substitute a different semantic normalization recipe.
+When a producer publishes an intermediate into another physical storage type,
+it first performs the declared semantic publication rounding. A grouped expert's
+gate/up product therefore retains its semantic activation rounding before its
+storage conversion; its down projection consumes that physical representation
+and publishes the declared semantic result. Live-row gather and padding rules
+remain independent from these numerical choices.
+
 Native artifact and numerical-environment identities protect reuse of an assessed formed implementation. Reflected signatures and matching result types alone do not establish its numerical behavior.
 
 ## Observation and comparison
 
 The interpreter and comparator diagnose and test implementations; they do not create selectable scope. A completed reference outcome owns returned values, final input state, and permitted outcome information. Full compiler diagnostic comparison uses the actual completed native observation and checks every subject's geometry and read-only bytes before numeric differences. Native tuning compares complete results and writable state against retained observations from the selected reference on identical initialized inputs; a case that declares a writable parameter's written rows scopes that parameter's observation to them, and the caller keeps a case that observes it whole. It binds evidence to the source, reference kind and artifact, policy, cases, implementation and device; routine comparison need not reread immutable weights after every candidate. Integer and Boolean subjects remain exact under every floating policy.
 
-Native tuning separates two questions the element tolerances cannot answer together. Whether a
-candidate is a correct kernel is tuning's question; whether a model tolerates a form's error is
-not, and is decided outside it by whole-model qualification. A native declaration names the error
-class of every configuration that changes numerics beyond summation order. The caller passes the
-classes it admits, each with an envelope. A configuration in a class that is not admitted is
-outside the search domain: it is never formed, timed or chosen. A configuration in admitted
-classes is compared with the same reference under the widest of its classes' envelopes instead of
-the element tolerances: per floating subject, the error's root mean square relative to the
-reference's, and the largest distance between the published values' rounding cells in units of
-the reference's root mean square. The first bound uses raw published errors. For the peak guard,
-the cell distance subtracts each endpoint's half-spacing toward the other endpoint, clamped at
-zero; this accounts for final storage quantization, including asymmetric spacing at exponent
-boundaries. This gap is the minimum error compatible with the two rounding cells, not an upper
-bound on actual pre-rounding error. It is an empirical concentration guard, not an equivalence
-proof; raw RMS and whole-model qualification remain required. These comparison semantics are
-versioned in admitted-class evidence. Non-finite values must agree bit for bit and
-discrete subjects stay exact. A configuration in no class is held to the policy as before, and the
-declaration default, which is the reference, must be in none. Admitted classes and their
-envelopes are part of the evidence identity.
+Native declarations carry no precision declarations of any kind. Admission is automatic: the
+default configuration is always admissible and defines the recipe, and every other candidate is
+admitted when its measured error relative to the default, divided by the output movement caused
+by noise at the stored inputs' resolution (its yardstick), stays within the caller's single policy
+number α. No other term enters: there is no correction for the error's structure. Storage
+resolution does not estimate the file's error relative to an original model. α is the caller's
+numerical profile; per-unit thresholds are derived, never authored per operation. There is no
+separate defect admission limit. Admission is an exact local statement and claims no model-level
+ceiling: equal local RMS does not establish equal downstream cost. The square-law, additivity,
+no-masking and structure relations that connect the two, and their measurement by evaluation,
+are defined by the [precision system](../../inference/docs/precision.md).
+
+The language supplies the facts these limits need by analysis of what it already states, with no
+extra declarations:
+
+- the storage resolution of every representation, codec and floating type, from decoding
+  definitions and type declarations: the inputs to every yardstick;
+- what each tensor input stores, from the portable body and representation definitions: floating
+  values, packed codes, codec codes decoded by value, or indices. This decides what a yardstick
+  perturbs;
+- the operation's reduction extent K and accumulator type, from the portable body. About √K times
+  the accumulator's unit roundoff is a rounding-scale estimate under suitable rounding and
+  conditioning assumptions. It is used only for inspection, never for admission.
+
+Derived facts preserve the conditions of writes and bind those conditions to the observed
+indices. A conditional initialization supplies no value on an unwritten path. A publication
+rounding boundary does not have a smooth derivative: an unsupported transfer remains unresolved
+rather than using a straight-through derivative. Analysis and expression evaluation share the
+preparation deadline; interrupted work supplies no partial admission facts.
+
+Bug detection is a development concern. Tuning traces record each candidate's error ratio and
+rounding-level ratio (measured error divided by the rounding-scale estimate) with its configuration
+values. A large ratio warrants investigation of conditioning, an intentional approximation or a
+defect; a small ratio is not a correctness proof. Kernel tests may establish that specific
+configurations stay within that scale on their tested inputs; an author's intent that a variant
+only reorders is enforced there, not in syntax. Agreement with the default cannot detect a shared
+implementation defect and does not
+establish compiler applicability.
 
 For finite floating elements, diagnostic comparison records absolute error, scale-stabilized relative error, and published-dtype ULP distance. The bounded comparison envelope is abs_error <= atol + rtol * max(abs(reference), relative_floor), together with any ULP and special-value rules. NaN, infinity, signed-zero, and subnormal changes are counted separately. A passing sample, corpus, feedback observation, or benchmark never grants numerical applicability. A definite mismatch from an admitted candidate is a compiler or backend defect, not a reason to widen tolerance or gather more samples.
 
@@ -77,4 +137,13 @@ Alternative analysis is conservative and may remain Pending. The general require
 - Unconstrained selection never relaxes discrete values, memory, effect order, failure prefix, or progress requirements.
 - Calls import selected child applicability; a Pending child cannot become Exact merely because its parent used the required body.
 - Observations may reveal defects but never create or enlarge accepted regions.
-- Direct native selection remains explicit and separate from policy-checked compiler selection. Every tuned serving candidate, including the declaration default, needs matching evidence for every required case. A failing first execution receives no further performance samples. Whole-model qualification remains a development and release check; startup does not search combinations of model kernels.
+- Direct native selection remains explicit and separate from policy-checked compiler selection. Every tuned serving candidate other than the declaration default needs matching evidence for every required case; the default defines the recipe and is always admissible. A failing first execution receives no further performance samples. Whole-model qualification remains a development and release check; startup does not search combinations of model kernels.
+
+
+A rounded paired projection describes and qualifies its complete staged result,
+including constituent activation rounding, activation, multiplication and publication.
+Reassociation can cross an intermediate rounding boundary and amplify downstream error.
+Its caller approval must cover the complete resulting computation and affected consumer
+contexts. Neither an unrounded-dot comparison nor a final-storage-only description is
+sufficient. A pilot distinguishes a consumer regression; it does not replace the caller's
+release qualification corpus.

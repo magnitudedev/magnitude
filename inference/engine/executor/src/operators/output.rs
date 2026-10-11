@@ -4,9 +4,9 @@
 //! row op that normalizes each row first (`post_norm_residual`), since the
 //! norm spans a whole output row that a column-tiled epilogue cannot form.
 
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::ScaledWeight;
 use crate::native::{PostNormKernels, SublayerOutput};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_target_graph::ScaledWeight;
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
     Element, Entry, NativeGraph, NativeGraphMetadata, NativeKernel, WorkflowTensor,
@@ -38,7 +38,9 @@ impl<'a, G: GraphDraft + 'a> Clone for PostNormEntries<'a, G> {
     }
 }
 
-impl<'a, E: Entry + 'a> From<&'a SublayerOutput<NativeKernel<E>>> for TailEntries<'a, NativeGraph, E> {
+impl<'a, E: Entry + 'a> From<&'a SublayerOutput<NativeKernel<E>>>
+    for TailEntries<'a, NativeGraph, E>
+{
     fn from(output: &'a SublayerOutput<NativeKernel<E>>) -> Self {
         match output {
             SublayerOutput::Residual(kernel) => Self::Residual(kernel),
@@ -99,13 +101,17 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     let projected = graph
         .enqueue(
             entries.project,
-            &[("M", out), ("K", inputs), ("N", outputs), ("WS", weight.extent)],
+            &[
+                ("M", out),
+                ("K", inputs),
+                ("N", outputs),
+                ("WS", weight.extent),
+            ],
             project_rows::WorkflowArgs {
                 source,
                 weight: (&weight.weight).into(),
                 weight_scale: (&weight.scale).into(),
-            },
-        )?
+            },        )?
         .value;
     Ok(graph
         .enqueue(
@@ -118,8 +124,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
                 out_rows: out_rows.into(),
                 epsilon,
                 scale,
-            },
-        )?
+            },        )?
         .value)
 }
 
@@ -139,9 +144,9 @@ mod tests {
     use crate::planning::tests::{fixture_definition, fixture_manifest};
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, ComponentSelection, ExecutionPath, FeedForwardProgramSlot,
-        MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits,
-        ResourcePlanner, SublayerTail,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, SublayerTail,
+        resident_layout,
     };
     use magnitude_family_contracts::{
         ModelDefinition, OutputForm, RmsNorm, UnweightedRms, WeightDescriptor,
@@ -154,7 +159,11 @@ mod tests {
     fn sandwich() -> ModelDefinition {
         let mut definition = fixture_definition();
         let hidden = definition.decoder.hidden;
-        for (index, sublayer) in definition.decoder.blocks[0].sublayers.iter_mut().enumerate() {
+        for (index, sublayer) in definition.decoder.blocks[0]
+            .sublayers
+            .iter_mut()
+            .enumerate()
+        {
             sublayer.output = OutputForm::PostNorm(RmsNorm {
                 weight: WeightDescriptor::stored(format!("post_norm_{index}"), [hidden]),
                 epsilon: 1e-8,

@@ -1,7 +1,7 @@
 ---
 applies_to:
-  - inference/validation/v3_*.py
-  - inference/validation/reference_source.py
+  - inference-v3/src/**
+  - inference-v3/formula-performance/**
 ---
 
 # Formula-defined execution and measurement

@@ -1814,19 +1814,21 @@ pub unsafe fn dot_rows<W: Format, const R: usize>(
 ) -> [f32; R] {
     let x = &x[..k];
     let mut lanes = [[0.0f32; LANES]; R];
-    let mut decoded = [[0.0f32; PACKET]; R];
+    // One packet buffer, consumed by its row before the next row decodes:
+    // with every row's packet live at once, x86 vectorizers transpose the
+    // accumulation across rows into a gather per multiply-add.
+    let mut packet = [0.0f32; PACKET];
     let resolved = std::array::from_fn::<_, R, _>(|r| {
         geometry.for_row(unsafe { rows.add(r * geometry.stride) })
     });
     let full = k / PACKET;
     for p in 0..full {
-        for (r, packet) in decoded.iter_mut().enumerate() {
-            unsafe { W::decode(rows.add(r * geometry.stride), &resolved[r], p, k, packet) };
-        }
         let xs: &[f32; PACKET] = x[p * PACKET..(p + 1) * PACKET]
             .try_into()
             .expect("a whole packet");
-        for (lanes, packet) in lanes.iter_mut().zip(&decoded) {
+        for (r, lanes) in lanes.iter_mut().enumerate() {
+            let row = unsafe { rows.add(r * geometry.stride) };
+            unsafe { W::decode(row, &resolved[r], p, k, &mut packet) };
             for chunk in 0..PACKET / LANES {
                 for lane in 0..LANES {
                     let i = chunk * LANES + lane;
@@ -1837,11 +1839,10 @@ pub unsafe fn dot_rows<W: Format, const R: usize>(
     }
     let tail = k - full * PACKET;
     if tail > 0 {
-        for (r, packet) in decoded.iter_mut().enumerate() {
-            unsafe { W::decode(rows.add(r * geometry.stride), &resolved[r], full, k, packet) };
-        }
         let xs = &x[full * PACKET..];
-        for (lanes, packet) in lanes.iter_mut().zip(&decoded) {
+        for (r, lanes) in lanes.iter_mut().enumerate() {
+            let row = unsafe { rows.add(r * geometry.stride) };
+            unsafe { W::decode(row, &resolved[r], full, k, &mut packet) };
             for (i, value) in xs.iter().enumerate() {
                 lanes[i % LANES] = packet[i].mul_add(*value, lanes[i % LANES]);
             }

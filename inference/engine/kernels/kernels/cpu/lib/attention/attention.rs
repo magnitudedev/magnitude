@@ -27,12 +27,9 @@ pub const BLOCK: usize = 32;
 /// The fewest keys of a decode partition: shorter rows use fewer partitions.
 pub const PARTITION_KEYS: usize = 128;
 
-/// Columns per affine (scale, zero) pair: the codec's group.
+/// Columns of the native SIMD affine group32 implementation. Its entry
+/// eligibility checks the descriptor coefficient extent before dispatch.
 pub const GROUP: usize = 32;
-/// Code bits of affine history keys and values.
-pub const KEY_BITS: u32 = 8;
-pub const VALUE_BITS: u32 = 4;
-
 /// The head geometry of an entry: KV key/value heads of G query heads each,
 /// rows of W = 2P + S columns whose first 2P rotate.
 #[derive(Clone, Copy, Debug)]
@@ -370,11 +367,11 @@ impl Online<'_> {
             row,
             |j, out| {
                 let (codes, coefficients) = key(j);
-                affine_decode(codes, coefficients, KEY_BITS, out)
+                affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
             },
             |j, out| {
                 let (codes, coefficients) = value(j);
-                affine_decode(codes, coefficients, VALUE_BITS, out)
+                affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
             },
         );
     }
@@ -451,11 +448,11 @@ mod affine_neon {
                 row,
                 |j, out| {
                     let (codes, coefficients) = key(j);
-                    super::affine_decode(codes, coefficients, super::KEY_BITS, out)
+                    super::affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
                 },
                 |j, out| {
                     let (codes, coefficients) = value(j);
-                    super::affine_decode(codes, coefficients, super::VALUE_BITS, out)
+                    super::affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
                 },
             ),
         }

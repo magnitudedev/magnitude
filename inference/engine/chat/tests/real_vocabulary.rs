@@ -436,3 +436,48 @@ fn harness_task_schema_binds_with_parallel_calls() {
     );
     walk(&mut model, &request, &completion).unwrap();
 }
+
+/// Claude Code's and Oh My Pi's tool sets (captured requests, schemas only)
+/// once failed every request on MiniCPM5 and LFM2.5: their tool grammars had
+/// character-level lexemes, and the first mask over the real vocabulary
+/// exceeded the matcher's item limit.
+#[test]
+#[ignore = "requires MAGNITUDE_TEST_GGUF"]
+fn harness_tool_sets_bind_over_the_real_vocabulary() {
+    let mut model = model();
+    let sets: Value = serde_json::from_str(include_str!("assets/harness-tools.json")).unwrap();
+    let mut failures = Vec::new();
+    for harness in ["claude-code", "oh-my-pi"] {
+        let offered = sets[harness]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| tool(entry["name"].as_str().unwrap(), entry["parameters"].clone()))
+            .collect::<Vec<_>>();
+        for choice in [ToolChoice::Auto, ToolChoice::Required] {
+            let case = format!("{harness} / {choice:?}");
+            let request = tools(offered.clone(), choice, true);
+            let prepared = PreparedChat::prepare(
+                &model.templates,
+                &model.tokenizer,
+                &request,
+                &TemplateSelection::default(),
+            )
+            .unwrap();
+            let report = &prepared.constraint().unwrap().report;
+            if report.character_lexemes != 0 {
+                failures.push(format!("{case}: character-level lexemes: {report:?}"));
+            }
+            let plan = prepared.input().constraint.as_ref().unwrap();
+            let bound = model
+                .vocabulary
+                .bind(&plan.grammar, &plan.prefix)
+                .map_err(|error| error.to_string())
+                .and_then(|state| Constraint::mask(&state).map(drop));
+            if let Err(error) = bound {
+                failures.push(format!("{case}: {error}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

@@ -91,7 +91,6 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
     static (H, NK, NV, W)
     params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form PACK in [0, 1])
     where (TALL == 0 or H % 128 == 0) and (PACK == 0 or (TALL == 1 and H % 256 == 0 and H < 1048576 and (2 * NK + NV) * W % 32 == 0 and NV * W % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2))
-    error_class int8_token_packing when PACK == 1
     scratch normalized bytes ((M + TALL * (ceil_div(M, 64) * 64 - M)) * H * 2) when M > 16
     scratch packed bytes (ceil_div(M, 128) * 128 * H * 2 + 1024) when M > 64 and PACK == 1
     scratch token_factors bytes (ceil_div(M, 128) * 128 * (H / 32) * 4) when M > 64 and PACK == 1
@@ -148,19 +147,16 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
 
 # CUDA: GEMV to 16 rows (`gemv` to 8, `gemv16` beyond; at M = 1 the block
 # forms its A row in shared memory), GEMM beyond in the K1 row bands
-# (`gemm_small` to 64 rows with the INT8 candidate, `gemm` beyond; see
-# `cuda_dense.seismic`); `stage` forms the A rows for M > 1, `stage_s8` the
-# q8_1 rows for the INT8 GEMM. (Metal: batched GEMV class, no INT8 path.)
+# (`gemm_small` to 64 rows, `gemm` beyond; either supports selected operands; see
+# `cuda_dense.seismic`); one shared stage forms semantic rows or selected S8/F16 matrix operands. (Metal: batched GEMV class, no INT8 path.)
 native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
     static (H, NK, NV, W)
-    params (code arithmetic INT8 in [0, 1])
-    where H % 64 == 0
+    params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
+    where H % 64 == 0 and (OPERAND == 0 or INT8 == 0)
     scratch staged bytes (M * H * 2) when M > 1
-    scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16 and M <= 64
-    launch gated_delta_project_stage when M > 1 and (M <= 16 or M > 64 or INT8 == 0):
-        threadgroups (M, 1, 1)
-        threads_per_threadgroup (256, 1, 1)
-    launch gated_delta_project_stage_s8 when INT8 == 1 and M > 16 and M <= 64:
+    scratch groups bytes (M * H / 4) when INT8 == 1 and M > 16
+    launch gated_delta_project_stage when M > 1:
+        reads (INT8, OPERAND)
         threadgroups (M, 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_project_gemv when M <= 8:
@@ -175,13 +171,14 @@ native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
             + ceil_div(NV * W, 16) + 2 * ceil_div(NV, 16), 8 / KSPLIT), 1, 1)
         threads_per_threadgroup (256, 1, 1)
     launch gated_delta_project_gemm_small when M > 16 and M <= 64:
-        reads (INT8)
+        reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
             + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (3 * (64 * 144 + 10240) + 2048)
     launch gated_delta_project_gemm when M > 64:
         params (code ROTATE in [2, 1, 4])
+        reads (INT8, OPERAND)
         threadgroups (ceil_div(ceil_div((2 * NK + NV) * W, 16), 8)
             + ceil_div(ceil_div(NV * W, 16), 8) + 2 * ceil_div(ceil_div(NV, 16), 8), ceil_div(M, 128), 1)
         threads_per_threadgroup (256, 1, 1)
@@ -665,11 +662,11 @@ native gated_delta_chunk for metal from "metal/gated_delta_chunk.metal":
 # at most 16 rows have no pieces, and the rows after a stop row none either:
 # they advance row-sequentially in the scan with the step's bits. The scan
 # stores the raw outputs to `mixed`, and `gate` forms each row as the step's
-# does. Every scan ROWS divides W. (Metal: an `inputs` convolution launch; the
+# does. The scan's ROWS divides W. (Metal: an `inputs` convolution launch; the
 # systems are built in its scan.)
 native gated_delta_chunk for cuda from "cuda/gated_delta_chunk.cu":
     static (NK, NV, W, C)
-    where W % 128 == 0 and W <= 256 and NV % NK == 0 and NV / NK <= 8 and NV % 4 == 0
+    where W % 32 == 0 and W <= 256 and W % ROWS == 0 and NV % NK == 0 and NV / NK <= 8 and NV % 4 == 0
     scratch pieces bytes ((ceil_div(M, 16) + B) * (NK * 96 * W + NV * (32 * W + 1168)))
     scratch mixed bytes (M * NV * W * 4)
     launch gated_delta_chunk_prepare:

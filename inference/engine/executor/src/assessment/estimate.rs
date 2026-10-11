@@ -48,8 +48,7 @@ pub fn step_seconds(demand: &DecodeDemand, bandwidth: DeviceBandwidth, depth: u3
     StepSeconds {
         step: DECODE_COSTS.step_seconds,
         launches: demand.launches as f64 * DECODE_COSTS.launch_seconds,
-        weights: demand.streamed_bytes as f64
-            / (bytes_per_second * DECODE_COSTS.weight_efficiency),
+        weights: demand.streamed_bytes as f64 / (bytes_per_second * DECODE_COSTS.weight_efficiency),
         history: demand
             .history
             .iter()

@@ -54,7 +54,8 @@ flowchart TD
 | --- | --- |
 | [Engine overview](engine/overview.md) | Inference owners, interfaces, and request lifecycle |
 | [Seismic overview](seismic/overview.md) | Language, libraries, compiler, and execution architecture |
-| [Precision](precision.md) | Numerical limits, native-tuning enforcement, reference selection, and cache evidence |
+| [Precision](precision.md) | Error model, composition assumptions, storage-resolution yardsticks and numerical admission |
+| [Native tuning](tuning.md) | First-load search, time allocation, numerical coverage, selection and reuse |
 | [Distribution](distribution.md) | Products, platform composition, and runtime dependencies |
 
 These documents describe intended architecture and own their respective contracts.

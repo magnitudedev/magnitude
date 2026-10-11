@@ -17,14 +17,16 @@ pub mod estimate;
 pub(crate) mod fixtures;
 
 pub use assess::{
-    assess_execution, finish_execution_assessment, prepare_execution_assessment, AssessmentRequest,
-    DomainFit, ExecutionAssessment, PreparedExecutionAssessment,
+    AssessmentRequest, DomainFit, ExecutionAssessment, PreparedExecutionAssessment,
+    assess_execution, finish_execution_assessment, prepare_execution_assessment,
 };
-pub use bandwidth::{normalize_name, resolve_bandwidth, BandwidthSource, DeviceBandwidth, DeviceClass};
-pub use costs::{DecodeCosts, DECODE_COSTS};
+pub use bandwidth::{
+    BandwidthSource, DeviceBandwidth, DeviceClass, normalize_name, resolve_bandwidth,
+};
+pub use costs::{DECODE_COSTS, DecodeCosts};
 pub use demand::{DecodeDemand, HistoryRead};
 pub use estimate::{
-    estimate_performance, performance_depths, step_seconds, PerformanceEstimate, StepSeconds,
+    PerformanceEstimate, StepSeconds, estimate_performance, performance_depths, step_seconds,
 };
 
 use crate::GraphError;

@@ -31,7 +31,7 @@ use seismic_compiler::{
     prepare_analytically, OptimizationCompletion, PlanningBudget, PreparationBudget,
 };
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::{CallSchema, ElementBindings, ParameterKind, TensorAccess};
+use seismic_lang::entry::{CallSchema, ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::{EntryId, ModuleHash, RepresentationId, StableEntryId};
@@ -175,6 +175,9 @@ where
     pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
         self.memory.set_limit(limit)
     }
+    pub(crate) fn restart_memory_high_water(&self) {
+        self.memory.restart_high_water()
+    }
     pub(crate) fn allocate_storage(
         self: &Arc<Self>,
         bytes: u64,
@@ -200,13 +203,16 @@ where
     /// Recommit an exclusively owned reserved allocation. The backend keeps
     /// its physical reservation, so only growth needs a new ledger grant;
     /// shrink releases the difference after the backend has unmapped it.
+    /// The replacement is tentative while `old` lives: dropping it first
+    /// abandons the resize, and `restore_backing` (the service, the
+    /// replacement's buffer, `old`'s bytes) then backs `old`'s bytes again.
     pub(crate) fn recommit_storage_with(
         self: &Arc<Self>,
         old: &Arc<Allocation>,
         bytes: u64,
         alignment: u64,
         make: impl FnOnce(&Service<T, E>) -> Result<Buffer<T, E>, ExecutionError>,
-        undo_growth: impl Fn(&Service<T, E>, &Buffer<T, E>, u64) -> Result<(), ExecutionError>
+        restore_backing: impl Fn(&Service<T, E>, &Buffer<T, E>, u64) -> Result<(), ExecutionError>
             + Send
             + Sync
             + 'static,
@@ -236,11 +242,11 @@ where
             .then(|| reserve(&self.memory, growth))
             .transpose()?;
         let buffer = make(&self.service)?;
-        let rollback = (growth != 0).then(|| {
+        let restore = (bytes != old.bytes).then(|| {
             let service = self.service.clone();
             let buffer = buffer.clone();
             let old_bytes = old.bytes;
-            Box::new(move || undo_growth(&service, &buffer, old_bytes))
+            Box::new(move || restore_backing(&service, &buffer, old_bytes))
                 as Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>
         });
         let storage = Box::new(TypedStorage::<T, E> {
@@ -269,7 +275,7 @@ where
             charge,
             storage,
             old,
-            rollback,
+            restore,
         );
         drop(guard);
         Ok(replacement)
@@ -433,9 +439,12 @@ pub(crate) struct Allocation {
     bytes: u64,
     charge: Mutex<Option<MemoryCharge>>,
     // An in-place replacement is tentative while its old allocation lives.
-    // Dropping unpublished growth restores the old physical prefix and charge.
+    // Dropping it unpublished abandons the resize: `restore_backing` (present
+    // when the sizes differ) backs the old allocation's bytes again, and the
+    // old allocation takes its charge back. Abandoned growth keeps the old
+    // contents; an abandoned shrink reads zero where it had released bytes.
     predecessor: Option<Weak<Allocation>>,
-    rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
+    restore_backing: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
     storage: Box<dyn Storage>,
     access: Arc<AccessGroup>,
     shared_access: OnceLock<Arc<AccessGroup>>,
@@ -513,7 +522,7 @@ impl Allocation {
             bytes,
             charge: Mutex::new(Some(charge)),
             predecessor: None,
-            rollback_growth: None,
+            restore_backing: None,
             storage,
             access: Arc::new(AccessGroup::default()),
             shared_access: OnceLock::new(),
@@ -526,14 +535,14 @@ impl Allocation {
         charge: MemoryCharge,
         storage: Box<dyn Storage>,
         predecessor: &Arc<Self>,
-        rollback_growth: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
+        restore_backing: Option<Box<dyn Fn() -> Result<(), ExecutionError> + Send + Sync>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             identity,
             bytes,
             charge: Mutex::new(Some(charge)),
             predecessor: Some(Arc::downgrade(predecessor)),
-            rollback_growth,
+            restore_backing,
             storage,
             access: Arc::new(AccessGroup::default()),
             shared_access: OnceLock::new(),
@@ -717,11 +726,20 @@ impl Drop for Allocation {
         let Some(old) = self.predecessor.as_ref().and_then(Weak::upgrade) else {
             return;
         };
-        if let Some(rollback) = self.rollback_growth.as_ref() {
-            rollback()
-                .unwrap_or_else(|error| panic!("CUDA in-place growth rollback failed: {error}"));
+        // Back the predecessor's bytes again before it takes its charge back,
+        // so the charge never claims bytes the backend does not hold.
+        if let Some(restore) = self.restore_backing.as_ref() {
+            restore().unwrap_or_else(|error| {
+                panic!(
+                    "restoring the {} backed bytes of an abandoned in-place recommit to {} failed: {error}",
+                    old.bytes, self.bytes
+                )
+            });
         } else {
-            assert_eq!(self.bytes, old.bytes, "discarded in-place shrink");
+            assert_eq!(
+                self.bytes, old.bytes,
+                "an in-place recommit that changed the backed bytes restores them when abandoned"
+            );
         }
         let mut charge = self
             .charge
@@ -729,7 +747,7 @@ impl Drop for Allocation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .expect("discarded recommit must own its charge");
-        charge.shrink(old.bytes);
+        charge.restore(old.bytes);
         let mut prior = old.charge.lock().expect("allocation charge lock poisoned");
         assert!(prior.is_none(), "recommit predecessor already has a charge");
         *prior = Some(charge);
@@ -823,8 +841,7 @@ pub(crate) fn prepare<T, E, C>(
     opened: &Arc<Opened<T, E>>,
     compiler: &C,
     native_context: &C::Context,
-    module: &CheckedModule,
-    entry: EntryId,
+    logical: LogicalEntry,
     bindings: ElementBindings,
     public_device: &Arc<crate::api::device::DeviceInner>,
     options: PreparationOptions,
@@ -834,9 +851,6 @@ where
     E: NativeExecutor<T>,
     C: seismic_native_target::NativeCompiler<T, Handle = E::Handle>,
 {
-    let logical = module
-        .entry(entry, &bindings)
-        .map_err(PrepareError::Source)?;
     let key = PreparationKey {
         module: logical.module_hash(),
         entry: logical.identity(),
@@ -895,48 +909,56 @@ where
         preparation_budget.native_compile_wall_time = feedback.search_time;
     }
     let planning_budget = PlanningBudget::default();
-    let (kernel, feedback_report) = match options.evaluation {
-        EvaluationMethod::Analytical => {
-            let analytical = opened.analytical().map_err(|error| {
-                PrepareError::Preparation(
-                    seismic_compiler::errors::PreparationError::NativeCompilation(
-                        seismic_native_target::NativeCompilationError::ToolchainFailure(
-                            error.to_string(),
+    // Past its deadline, preparation stops at its next step boundary; what it
+    // had constructed is dropped, and only the typed expiry is returned.
+    let deadline = options.deadline;
+    let evaluated = seismic_lang::cancellation::within(deadline, || {
+        Ok::<_, PrepareError>(match options.evaluation {
+            EvaluationMethod::Analytical => {
+                let analytical = opened.analytical().map_err(|error| {
+                    PrepareError::Preparation(
+                        seismic_compiler::errors::PreparationError::NativeCompilation(
+                            seismic_native_target::NativeCompilationError::ToolchainFailure(
+                                error.to_string(),
+                            ),
                         ),
-                    ),
+                    )
+                })?;
+                let kernel = prepare_analytically(
+                    logical,
+                    analytical,
+                    opened.compiler_registry,
+                    compiler,
+                    native_context,
+                    &options.precision,
+                    &preparation_budget,
+                    &planning_budget,
                 )
-            })?;
-            let kernel = prepare_analytically(
-                logical,
-                analytical,
-                opened.compiler_registry,
-                compiler,
-                native_context,
-                &options.precision,
-                &preparation_budget,
-                &planning_budget,
-            )
-            .map_err(PrepareError::Preparation)?;
-            (kernel, None)
-        }
-        EvaluationMethod::Feedback(feedback_options) => {
-            let observer = feedback::Observer::new(opened.clone(), public_device.clone());
-            let (campaign, kernel) = FeedbackPreparation::start(
-                logical,
-                opened.device_description(),
-                opened.compiler_registry,
-                compiler,
-                native_context,
-                &options.precision,
-                &preparation_budget,
-                &planning_budget,
-                observer,
-                feedback_options,
-            )
-            .map_err(PrepareError::Preparation)?;
-            (kernel, Some(campaign.report().clone()))
-        }
-    };
+                .map_err(PrepareError::Preparation)?;
+                (kernel, None)
+            }
+            EvaluationMethod::Feedback(feedback_options) => {
+                let observer = feedback::Observer::new(opened.clone(), public_device.clone());
+                let (campaign, kernel) = FeedbackPreparation::start(
+                    logical,
+                    opened.device_description(),
+                    opened.compiler_registry,
+                    compiler,
+                    native_context,
+                    &options.precision,
+                    &preparation_budget,
+                    &planning_budget,
+                    observer,
+                    feedback_options,
+                )
+                .map_err(PrepareError::Preparation)?;
+                (kernel, Some(campaign.report().clone()))
+            }
+        })
+    });
+    let (kernel, feedback_report) = evaluated.map_err(|_| {
+        PrepareError::Preparation(seismic_compiler::errors::PreparationError::Expired)
+    })??;
     span.attribute(key_u64("seismic.variants", kernel.variants().len() as u64));
     let planning_report = kernel.planning_report();
     span.attribute(key_str(
@@ -1504,6 +1526,84 @@ mod physical_slot_tests {
         drop(old);
         assert_eq!(published.charged_bytes(), Some(16));
         drop(published);
+        assert_eq!(memory.usage().charged, 0);
+    }
+
+    /// An in-place shrink releases its bytes at once. Abandoning it (the
+    /// replacement dropped while the old allocation lives) backs the old
+    /// bytes again and then returns the whole old charge, even when the
+    /// released bytes were spent meanwhile; publishing it restores nothing.
+    #[test]
+    fn discarded_in_place_shrink_restores_predecessor_backing_and_charge() {
+        let memory = MemoryDomain::new(crate::memory::PoolLedger::new());
+        memory.set_limit(Some(16));
+        let shrink = |identity: u64, old: &Arc<Allocation>, backed: &Arc<AtomicUsize>| {
+            let mut charge = old.charge.lock().unwrap().take().unwrap();
+            charge.shrink(4);
+            backed.store(4, Ordering::SeqCst);
+            let (backed, old_bytes, weak) = (backed.clone(), old.bytes(), Arc::downgrade(old));
+            Allocation::new_recommitted(
+                identity,
+                4,
+                charge,
+                Box::new(EmptyStorage),
+                old,
+                Some(Box::new(move || {
+                    let old = weak.upgrade().expect("an abandoned shrink has a live predecessor");
+                    assert_eq!(
+                        old.charged_bytes(),
+                        None,
+                        "the backing is restored before the charge is returned"
+                    );
+                    backed.store(old_bytes as usize, Ordering::SeqCst);
+                    Ok(())
+                })),
+            )
+        };
+
+        let mut initial = memory.reserve(16).unwrap();
+        let old = Allocation::new(1, 16, initial.take(16), Box::new(EmptyStorage));
+        drop(initial);
+        let backed = Arc::new(AtomicUsize::new(16));
+        let tentative = shrink(2, &old, &backed);
+        assert_eq!(memory.usage().charged, 4);
+        assert_eq!(old.charged_bytes(), None);
+        assert!(tentative.has_live_predecessor());
+        // Another allocation takes what the shrink released.
+        let other = memory.reserve(12).unwrap();
+        drop(tentative);
+        assert_eq!(backed.load(Ordering::SeqCst), 16);
+        assert_eq!(old.charged_bytes(), Some(16));
+        assert_eq!(memory.usage().charged, 28);
+        assert!(memory.reserve(1).is_err());
+        drop(other);
+        assert_eq!(memory.usage().charged, 16);
+        drop(old);
+        assert_eq!(memory.usage().charged, 0);
+
+        let mut initial = memory.reserve(16).unwrap();
+        let old = Allocation::new(3, 16, initial.take(16), Box::new(EmptyStorage));
+        drop(initial);
+        let backed = Arc::new(AtomicUsize::new(16));
+        let published = shrink(4, &old, &backed);
+        drop(old);
+        assert!(!published.has_live_predecessor());
+        assert_eq!(published.charged_bytes(), Some(4));
+        assert_eq!(memory.usage().charged, 4);
+        drop(published);
+        assert_eq!(backed.load(Ordering::SeqCst), 4);
+        assert_eq!(memory.usage().charged, 0);
+
+        // A same-size recommit has no backing to restore; abandoning it
+        // only returns the charge.
+        let mut initial = memory.reserve(8).unwrap();
+        let old = Allocation::new(5, 8, initial.take(8), Box::new(EmptyStorage));
+        drop(initial);
+        let charge = old.charge.lock().unwrap().take().unwrap();
+        let same = Allocation::new_recommitted(6, 8, charge, Box::new(EmptyStorage), &old, None);
+        drop(same);
+        assert_eq!(old.charged_bytes(), Some(8));
+        drop(old);
         assert_eq!(memory.usage().charged, 0);
     }
 

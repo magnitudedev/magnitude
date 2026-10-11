@@ -11,11 +11,15 @@ use magnitude_engine::error::{LoadError, UnloadCause};
 use magnitude_engine::options::ExecutionManifest;
 use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_engine::worker::transport::{FramedTransport, stdio_worker_transport};
+use magnitude_engine::LoadAttempt;
 use magnitude_engine::worker::{
-    EngineClient, WorkerConnection, WorkerExit, connect_worker, prepare_worker, serve_worker,
+    EngineClient, WorkerConnection, WorkerExit, WorkerProcess, WorkerReport, connect_worker,
+    serve_worker,
 };
+use magnitude_executor::UnpreparedUnits;
 
 use super::ResidencyWorker;
+use super::controller::GRACEFUL_EXIT;
 use crate::worker_process::{BlockingChild, BlockingProcess, WorkerLauncher, WorkerRole};
 
 /// The most recent worker diagnostics kept for failure reports.
@@ -25,7 +29,10 @@ const DIAGNOSTIC_TAIL_BYTES: usize = 16 * 1024;
 /// only whether the worker is gone; the code is diagnostic.
 pub fn worker_exit_code(exit: &WorkerExit) -> i32 {
     match exit {
-        WorkerExit::Shutdown | WorkerExit::Prepared | WorkerExit::HostLost { .. } => 0,
+        WorkerExit::Shutdown
+        | WorkerExit::Prepared
+        | WorkerExit::Unprepared
+        | WorkerExit::HostLost { .. } => 0,
         WorkerExit::Unloaded(UnloadCause::MemoryPressure) => 10,
         WorkerExit::Unloaded(_) => 11,
         WorkerExit::LoadFailed(_) => 12,
@@ -79,15 +86,18 @@ pub struct EngineWorker {
     diagnostics: Arc<Mutex<DiagnosticTail>>,
 }
 
+/// The host end of an inference worker process's transport.
+pub type HostEnd = FramedTransport<
+    std::io::BufReader<crate::worker_process::BlockingStdout>,
+    crate::worker_process::BlockingStdin,
+    magnitude_engine::worker::protocol::WorkerMessage,
+    magnitude_engine::worker::protocol::HostMessage,
+>;
+
 /// A spawned worker and the host end of its transport, before the load handshake.
 pub struct SpawnedWorker {
     pub worker: Arc<EngineWorker>,
-    transport: FramedTransport<
-        std::io::BufReader<crate::worker_process::BlockingStdout>,
-        crate::worker_process::BlockingStdin,
-        magnitude_engine::worker::protocol::WorkerMessage,
-        magnitude_engine::worker::protocol::HostMessage,
-    >,
+    transport: HostEnd,
 }
 
 impl EngineWorker {
@@ -118,6 +128,26 @@ impl EngineWorker {
         self.diagnostics.lock().expect("diagnostic tail lock").text()
     }
 
+    /// Prove retired a worker that reported its outcome and is exiting on its own: it is
+    /// left to exit, as a released worker is after its shutdown, for the same bound
+    /// ([`GRACEFUL_EXIT`]), and stopped only if it has not exited by then. Killing it at once
+    /// would skip everything its normal exit completes (the system's compiled-kernel cache a
+    /// Prepare's search wrote among it).
+    fn retire_reported(&self) -> std::io::Result<ExitStatus> {
+        let deadline = std::time::Instant::now() + GRACEFUL_EXIT;
+        while std::time::Instant::now() < deadline {
+            if let Some(status) = self.try_wait()? {
+                return Ok(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        tracing::warn!(
+            worker.pid = self.pid(),
+            "inference worker reported its outcome and did not exit; stopping it"
+        );
+        self.retire()
+    }
+
     fn retire(&self) -> std::io::Result<ExitStatus> {
         let mut state = self.process.lock().expect("worker process lock");
         match &mut *state {
@@ -133,35 +163,58 @@ impl EngineWorker {
 }
 
 impl SpawnedWorker {
-    /// Send `Hello` and `Load{manifest}` and wait for readiness, reporting load progress.
-    /// Blocking: the worker reports its progress until it is ready or fails.
+    /// One attempt to load: send `Hello` and `Load{manifest, unprepared}` and wait for
+    /// readiness, reporting load progress. Blocking: the worker reports its progress until it
+    /// is ready or fails. A worker asked to report tuning units without a stored record that
+    /// met one placed nothing; it is proven retired before `Unprepared` is returned.
     pub fn connect(
         self,
         manifest: ExecutionManifest,
+        unprepared: UnpreparedUnits,
         progress: impl FnMut(LoadProgress),
-    ) -> Result<(Arc<EngineWorker>, WorkerConnection), (Arc<EngineWorker>, LoadError)> {
-        match connect_worker(self.transport, Some(manifest), progress) {
-            Ok(connection) => {
+    ) -> Result<LoadAttempt<(Arc<EngineWorker>, WorkerConnection)>, (Arc<EngineWorker>, LoadError)>
+    {
+        match connect_worker(self.transport, Some((manifest, unprepared)), progress) {
+            Ok(LoadAttempt::Loaded(connection)) => {
                 self.worker
                     .client
                     .set(connection.client.clone())
                     .unwrap_or_else(|_| unreachable!("a worker connects once"));
-                Ok((self.worker, connection))
+                Ok(LoadAttempt::Loaded((self.worker, connection)))
             }
+            Ok(LoadAttempt::Unprepared) => match self.worker.retire_reported() {
+                Ok(_) => Ok(LoadAttempt::Unprepared),
+                Err(error) => Err((
+                    self.worker,
+                    LoadError::WorkerLost {
+                        reason: format!(
+                            "the unprepared Load worker could not be shown to have ended: {error}"
+                        ),
+                    },
+                )),
+            },
             Err(error) => Err((self.worker, error)),
         }
     }
-}
 
-impl SpawnedWorker {
-    /// Send `Hello` and `Prepare{manifest}` and wait until the worker has prepared the model's
-    /// programs, reporting its progress. Blocking; the worker exits once prepared.
-    pub fn prepare(
+    /// This worker as the process of a model's Prepare (`magnitude_engine::worker::prepare`,
+    /// `load_prepared`): its transport, and the proof of its retirement. A Prepare that
+    /// reported its outcome is left to exit; one that reported nothing is stopped.
+    pub fn into_process(
         self,
-        manifest: ExecutionManifest,
-        progress: impl FnMut(LoadProgress),
-    ) -> Result<(), LoadError> {
-        prepare_worker(self.transport, manifest, progress)
+    ) -> WorkerProcess<HostEnd, impl FnOnce(WorkerReport) -> Result<(), String>> {
+        let Self { worker, transport } = self;
+        WorkerProcess {
+            transport,
+            retire: move |report| {
+                match report {
+                    WorkerReport::Reported => worker.retire_reported(),
+                    WorkerReport::Unreported => worker.retire(),
+                }
+                .map(drop)
+                .map_err(|error| error.to_string())
+            },
+        }
     }
 }
 

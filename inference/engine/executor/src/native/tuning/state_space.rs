@@ -13,8 +13,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
-    TuningLimits,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    served_row_points,
 };
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use crate::{StateSpaceBinding, StateSpaceShape};
@@ -225,7 +225,7 @@ impl EntryTuning for StateSpaceOutputTuning {
     generated_entry!(attention_output, this => attention_output::Elements {
         OW: this.binding.output,
         A: this.binding.activation,
-    }, rounded to this.binding.activation);
+    });
 }
 
 /// What both state entries tune over: the advance of one request's rows from
@@ -274,7 +274,7 @@ impl StateSpaceState {
         seed: u64,
     ) -> Result<StateSpaceStateCase, String> {
         let shape = &self.shape;
-        let tables = inputs.batch(rows, 0, 1, 0)?;
+        let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
         let slots = tables.actual_slots;
         let segments = tables.segments[..=slots]
             .iter()

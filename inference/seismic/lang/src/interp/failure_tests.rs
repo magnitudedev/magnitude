@@ -1,5 +1,5 @@
 use super::*;
-use crate::checked::{check_source, SourceFile, SourceSet};
+use crate::checked::{SourceFile, SourceSet, check_source};
 use crate::entry::ElementBindings;
 use crate::reference_math::ScalarFailure;
 
@@ -26,7 +26,9 @@ fn run(entry: &LogicalEntry, scalar: i32) -> OracleOutcome {
 
 #[test]
 fn quantity_product_remains_exact_above_u64_until_explicit_word_cast() {
-    let entry = entry("fn probe(i: index[9223372036854775807]) -> i32:\n    let product = i * i\n    return i32(product / (i + 1))\n");
+    let entry = entry(
+        "fn probe(i: index[9223372036854775807]) -> i32:\n    let product = i * i\n    return i32(product / (i + 1))\n",
+    );
     let outcome = Interpreter::new(&entry)
         .run(&[Arg::Index(4_294_967_296u64.into())])
         .expect("exact mathematical product is a legal source value");
@@ -40,7 +42,9 @@ fn quantity_product_remains_exact_above_u64_until_explicit_word_cast() {
 #[test]
 fn signed_quantity_division_and_remainder_fail_at_their_source_position() {
     for (operation, expected) in [("/", 2), ("%", 0)] {
-        let entry = entry(&format!("fn probe[N](shape: &tensor[N] f32, dst: &mut tensor[2] i32) -> i32:\n    dst[0] = 7\n    let q = (N - 3) {operation} (N - 2)\n    dst[1] = 9\n    return i32(q)\n"));
+        let entry = entry(&format!(
+            "fn probe[N](shape: &tensor[N] f32, dst: &mut tensor[2] i32) -> i32:\n    dst[0] = 7\n    let q = (N - 3) {operation} (N - 2)\n    dst[1] = 9\n    return i32(q)\n"
+        ));
         let mut interpreter = Interpreter::new(&entry);
         let shape = interpreter.add_tensor(TensorData::dense(DType::F32, vec![1], vec![0.0]));
         let dst = interpreter.add_tensor(TensorData::dense(DType::I32, vec![2], vec![2.0, 3.0]));
@@ -71,7 +75,9 @@ fn signed_quantity_division_and_remainder_fail_at_their_source_position() {
 
 #[test]
 fn guarded_quantity_loop_uses_joined_actual_value_without_visiting_false_arm() {
-    let entry = entry("fn probe(flag: &tensor[1] bool, start: index[1000000000], times: range[1000000000]) -> i32:\n    let mut q = start + 0\n    if flag[0]:\n        for i in times:\n            q = q * (i + 1)\n    return i32(q)\n");
+    let entry = entry(
+        "fn probe(flag: &tensor[1] bool, start: index[1000000000], times: range[1000000000]) -> i32:\n    let mut q = start + 0\n    if flag[0]:\n        for i in times:\n            q = q * (i + 1)\n    return i32(q)\n",
+    );
     let mut interpreter = Interpreter::new(&entry);
     let flag = interpreter.add_tensor(TensorData::dense(DType::Bool, vec![1], vec![0.0]));
     let outcome = interpreter
@@ -108,7 +114,9 @@ fn failure(outcome: &OracleOutcome) -> &SourceFailure {
 }
 #[test]
 fn failure_owns_only_completed_writes_and_actual_helper_site() {
-    let entry = entry("fn quotient(divisor: i32) -> i32:\n    return 42 / divisor\n\nfn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = quotient(divisor)\n    dst[1] = 9\n");
+    let entry = entry(
+        "fn quotient(divisor: i32) -> i32:\n    return 42 / divisor\n\nfn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = quotient(divisor)\n    dst[1] = 9\n",
+    );
     let outcome = run(&entry, 0);
     let stopped = failure(&outcome);
     assert_eq!(
@@ -121,11 +129,12 @@ fn failure_owns_only_completed_writes_and_actual_helper_site() {
         .find(|(_, function)| function.stable() == stopped.event.body())
         .unwrap();
     assert!(function.name().contains("quotient"));
-    assert!(function.nodes(function.root()).any(|(id, node)| node
-        .events()
-        .iter()
-        .any(|e| matches!(e.kind(), crate::entry::SemanticEventKind::MayFail))
-        && SourceFailure::at(function, id, stopped.cause.clone()) == *stopped));
+    assert!(function.nodes(function.root()).any(|(id, node)| {
+        node.events()
+            .iter()
+            .any(|e| matches!(e.kind(), crate::entry::SemanticEventKind::MayFail))
+            && SourceFailure::at(function, id, stopped.cause.clone()) == *stopped
+    }));
     let input = outcome.inputs().next().unwrap();
     assert_eq!(input.tensor().read(0).unwrap(), 7.);
     assert_eq!(input.tensor().read(1).unwrap(), 3.);
@@ -142,7 +151,9 @@ fn recipe_causes_and_ordered_prefix_are_preserved() {
         ),
         ("42 << divisor", 32, ScalarFailure::ShiftCount),
     ] {
-        let entry = entry(&format!("fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    for i in 0..2:\n        dst[i] = 7\n        let unused = {expression}\n    dst[1] = 9\n"));
+        let entry = entry(&format!(
+            "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    for i in 0..2:\n        dst[i] = 7\n        let unused = {expression}\n    dst[1] = 9\n"
+        ));
         let outcome = run(&entry, arg);
         assert_eq!(failure(&outcome).cause, SourceFailureCause::Scalar(cause));
         let input = outcome.inputs().next().unwrap();
@@ -152,7 +163,9 @@ fn recipe_causes_and_ordered_prefix_are_preserved() {
 }
 #[test]
 fn unused_partial_tensor_stops_at_its_definition() {
-    let entry = entry("fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = dst / divisor\n    dst[1] = 9\n");
+    let entry = entry(
+        "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = dst / divisor\n    dst[1] = 9\n",
+    );
     let outcome = run(&entry, 0);
     assert_eq!(
         failure(&outcome).cause,
@@ -165,7 +178,9 @@ fn unused_partial_tensor_stops_at_its_definition() {
 }
 #[test]
 fn entered_parallel_regions_describe_possible_prefixes_only_when_executed() {
-    let entry = entry("fn probe(dst: &mut tensor[2] i32, enabled: i32):\n    if enabled > 0:\n        parallel for i in 0..2:\n            dst[i] = 7\n            let unused = 42 / (enabled - 1)\n");
+    let entry = entry(
+        "fn probe(dst: &mut tensor[2] i32, enabled: i32):\n    if enabled > 0:\n        parallel for i in 0..2:\n            dst[i] = 7\n            let unused = 42 / (enabled - 1)\n",
+    );
     assert!(run(&entry, 0).relation().is_none());
     let stopped = run(&entry, 1);
     failure(&stopped);
@@ -174,7 +189,9 @@ fn entered_parallel_regions_describe_possible_prefixes_only_when_executed() {
 }
 #[test]
 fn invocation_and_service_failures_are_not_source_stops() {
-    let entry=entry("fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = 42 / divisor\n");
+    let entry = entry(
+        "fn probe(dst: &mut tensor[2] i32, divisor: i32):\n    dst[0] = 7\n    let unused = 42 / divisor\n",
+    );
     assert!(matches!(
         Interpreter::new(&entry).run(&[]),
         Err(OracleError::InvalidInvocation(_))
@@ -239,7 +256,9 @@ fn extremum_reductions_fold_from_the_first_element() {
 
 #[test]
 fn callee_dimension_extents_bind_in_the_callee_frame() {
-    let single = entry("fn twice[N](x: &tensor[N] i32) -> tensor[N] i32:\n    return x + x\n\nfn probe(input: &tensor[4] i32) -> tensor[4] i32:\n    return twice(input * 1)\n");
+    let single = entry(
+        "fn twice[N](x: &tensor[N] i32) -> tensor[N] i32:\n    return x + x\n\nfn probe(input: &tensor[4] i32) -> tensor[4] i32:\n    return twice(input * 1)\n",
+    );
     let mut interpreter = Interpreter::new(&single);
     let input =
         interpreter.add_tensor(TensorData::dense(DType::I32, vec![4], vec![0., 1., 2., 3.]));
@@ -255,7 +274,9 @@ fn callee_dimension_extents_bind_in_the_callee_frame() {
 
     // One family, two call sites with different actual dimensions: each call
     // frame binds its own formal.
-    let two_sites = entry("fn twice[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return x + x\n\nfn probe[N, M](a: &tensor[N] f32, b: &tensor[M] f32) -> (tensor[N] f32, tensor[M] f32):\n    return (twice(a * 1.0), twice(b * 1.0))\n");
+    let two_sites = entry(
+        "fn twice[N](x: &tensor[N] f32) -> tensor[N] f32:\n    return x + x\n\nfn probe[N, M](a: &tensor[N] f32, b: &tensor[M] f32) -> (tensor[N] f32, tensor[M] f32):\n    return (twice(a * 1.0), twice(b * 1.0))\n",
+    );
     let mut interpreter = Interpreter::new(&two_sites);
     let a = interpreter.add_tensor(TensorData::dense(DType::F32, vec![2], vec![1., 2.]));
     let b = interpreter.add_tensor(TensorData::dense(DType::F32, vec![3], vec![3., 4., 5.]));
@@ -272,4 +293,82 @@ fn callee_dimension_extents_bind_in_the_callee_frame() {
         })
         .collect::<Vec<_>>();
     assert_eq!(results, [vec![2., 4.], vec![6., 8., 10.]]);
+}
+
+#[test]
+fn declared_slice_width_checks_exact_quantity_before_wrapped_view_creation() {
+    let entry = entry(
+        "fn probe(input: &tensor[4] i32, start: i32, width: index[4294967298]) -> i32:\n    return reduce(input[start:start+i32(width)], 0, sum)\n",
+    );
+    for (width, expected) in [(2u64, Some(5)), (4_294_967_297, None)] {
+        let mut interpreter = Interpreter::new(&entry);
+        let input =
+            interpreter.add_tensor(TensorData::dense(DType::I32, vec![4], vec![1., 2., 3., 4.]));
+        let outcome = interpreter
+            .run(&[
+                Arg::Tensor(input),
+                Arg::Scalar(ReferenceScalar::I32(1)),
+                Arg::Index(width.into()),
+            ])
+            .unwrap();
+        match expected {
+            Some(expected) => assert!(matches!(
+                outcome.results().next().unwrap().value(),
+                OutcomeValue::Scalar(ReferenceScalar::I32(value)) if value == expected
+            )),
+            None => assert_eq!(
+                failure(&outcome).cause,
+                SourceFailureCause::Check(crate::entry::CheckReason::Custom(
+                    "slice width differs from its declared quantity".into(),
+                )),
+            ),
+        }
+    }
+}
+
+#[test]
+fn assignment_target_checks_precede_rhs_effects_and_keep_shared_backing() {
+    let entry = entry(
+        "fn effect(dst: &mut tensor[2] i32, divisor: i32) -> i32:\n    dst[0] = 7\n    return 42 / divisor\n\nfn probe(dst: &mut tensor[2] i32, at: i32, divisor: i32):\n    dst[at] = effect(dst, divisor)\n",
+    );
+    for (at, divisor, expected_failure, expected_contents) in [
+        (
+            2,
+            0,
+            Some(SourceFailureCause::Check(
+                crate::entry::CheckReason::IndexBound,
+            )),
+            [2., 3.],
+        ),
+        (
+            1,
+            0,
+            Some(SourceFailureCause::Scalar(
+                ScalarFailure::IntegerDivisionByZero,
+            )),
+            [7., 3.],
+        ),
+        (1, 2, None, [7., 21.]),
+    ] {
+        let mut interpreter = Interpreter::new(&entry);
+        let dst = interpreter.add_tensor(TensorData::dense(DType::I32, vec![2], vec![2., 3.]));
+        let outcome = interpreter
+            .run(&[
+                Arg::Tensor(dst),
+                Arg::Scalar(ReferenceScalar::I32(at)),
+                Arg::Scalar(ReferenceScalar::I32(divisor)),
+            ])
+            .unwrap();
+        if let Some(expected) = expected_failure {
+            assert_eq!(failure(&outcome).cause, expected);
+        } else {
+            assert!(matches!(
+                outcome.termination(),
+                SourceTermination::Returned(_)
+            ));
+        }
+        let input = outcome.inputs().next().unwrap();
+        assert_eq!(input.tensor().read(0).unwrap(), expected_contents[0]);
+        assert_eq!(input.tensor().read(1).unwrap(), expected_contents[1]);
+    }
 }

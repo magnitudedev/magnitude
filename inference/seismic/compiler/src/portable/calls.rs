@@ -24,7 +24,8 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                         .scalar_symbol::<seismic_lang::expr::U32>(symbol);
                     InitializationArgument::Integer(self.builder.arena().int_from_scalar(value))
                 }
-                PreparedArg::Scalar(_, DType::Bool) => InitializationArgument::Predicate {
+                PreparedArg::Scalar(symbol, DType::Bool) => InitializationArgument::Predicate {
+                    scalar: self.builder.arena().scalar_symbol_erased(symbol),
                     value: condition_expr(
                         self.builder.arena(),
                         &self.values.host_conditions,
@@ -32,7 +33,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                     ),
                     binders: self.values.binders.clone(),
                 },
-                _ => InitializationArgument::Unknown,
+                PreparedArg::Scalar(symbol, _) => InitializationArgument::Scalar(
+                    self.builder.arena().scalar_symbol_erased(symbol),
+                ),
             },
             Bound::Range { start, end } => {
                 match (

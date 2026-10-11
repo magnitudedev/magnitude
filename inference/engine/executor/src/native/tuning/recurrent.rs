@@ -12,8 +12,8 @@
 
 use super::cases::projection_shape;
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
-    TuningLimits,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    served_row_points,
 };
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
@@ -267,7 +267,7 @@ impl EntryTuning for RecurrentOutputTuning {
         }
     }
 
-    generated_entry!(attention_output, this => this.elements(), rounded to this.activation);
+    generated_entry!(attention_output, this => this.elements());
 }
 
 /// What both state entries tune over: the gated delta advance of one
@@ -302,7 +302,7 @@ pub(crate) struct SlotTables {
 
 impl SlotTables {
     fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, String> {
-        let tables = inputs.batch(rows, 0, 1, 0)?;
+        let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
         let slots = tables.actual_slots;
         let segments = tables.segments[..=slots]
             .iter()
@@ -627,7 +627,7 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
         AW: this.0.alpha,
         BW: this.0.beta,
         A: this.0.activation,
-    }, rounded to this.0.activation);
+    });
 }
 
 /// `gated_delta_step_convolved`, the convolved step form's state advance,

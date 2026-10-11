@@ -3,19 +3,47 @@
 //! logical coordinates; no runtime storage or compiler-side certificate exists.
 use super::{ir, prove, xfer, CheckedOutcome, Checker};
 use crate::checked::DiagnosticRule;
-use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
+use crate::expr::{
+    AnyExpr, BoolExpr, ErasedScalarExpr, ExprArena, IntExpr, ScalarOperand, SymbolId, SymbolSort,
+};
 pub(super) use crate::initialization::InitializationContract as Contract;
 use crate::initialization::RegionMapping;
 use crate::initialization::{
-    Bound, Condition, Exit, InitializationView, ParameterAccess, ParameterPart, ParameterPath,
-    Path, Region, RegionOps, Requirement, VisitSeparation,
+    successful_paths, Bound, Condition, Exit, InitializationView, ParameterAccess, ParameterPart,
+    ParameterPath, Path, Region, RegionOps, Requirement, VisitSeparation,
 };
 use crate::intrinsics::{AtomicOp, IndexSlot, PrimitiveId};
 use crate::reference_math::ReferenceScalar;
 use crate::span::Span;
 use crate::syntax::ast::{BinaryOp, UnaryOp};
 use crate::types::{DType, ValueType};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+/// Optional region simplification and ordered-loop optimization use established
+/// arithmetic. Required initialization and parallel separation retain full proof.
+struct EstablishedRegionOps<'a, R: RegionOps>(&'a mut R);
+
+impl<R: RegionOps> RegionOps for EstablishedRegionOps<'_, R> {
+    fn arena(&mut self) -> &mut ExprArena {
+        self.0.arena()
+    }
+    fn arena_ref(&self) -> &ExprArena {
+        self.0.arena_ref()
+    }
+    fn fresh_variable(&mut self) -> SymbolId {
+        self.0.fresh_variable()
+    }
+    fn le(&mut self, facts: &prove::Facts, a: IntExpr, b: IntExpr) -> bool {
+        let difference = self.arena().int_sub(b, a);
+        prove::established_nonnegative(self.arena_ref(), facts, difference)
+    }
+    fn lt(&mut self, facts: &prove::Facts, a: IntExpr, b: IntExpr) -> bool {
+        let difference = self.arena().int_sub(b, a);
+        let one = self.arena().int(1);
+        let difference = self.arena().int_sub(difference, one);
+        prove::established_nonnegative(self.arena_ref(), facts, difference)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 struct Place {
@@ -33,11 +61,49 @@ impl std::ops::DerefMut for Place {
         &mut self.view
     }
 }
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Scalar {
-    integer: Option<IntExpr>,
-    condition: Option<Condition>,
-    range: Option<(IntExpr, IntExpr)>,
+#[derive(Clone, Debug, PartialEq)]
+enum Scalar {
+    Quantity(IntExpr),
+    Word {
+        dtype: DType,
+        value: IntExpr,
+        binding: Option<SymbolId>,
+    },
+    Boolean {
+        value: ErasedScalarExpr,
+        condition: Condition,
+    },
+    Floating(ErasedScalarExpr),
+    Range {
+        start: IntExpr,
+        end: IntExpr,
+    },
+}
+impl Scalar {
+    fn integer(&self) -> Option<IntExpr> {
+        match self {
+            Self::Quantity(v) | Self::Word { value: v, .. } => Some(*v),
+            _ => None,
+        }
+    }
+    fn typed(&self) -> Option<ErasedScalarExpr> {
+        match self {
+            Self::Boolean { value, .. } | Self::Floating(value) => Some(*value),
+            _ => None,
+        }
+    }
+    fn condition(&self) -> Option<&Condition> {
+        match self {
+            Self::Boolean { condition, .. } => Some(condition),
+            _ => None,
+        }
+    }
+    fn range(&self) -> Option<(IntExpr, IntExpr)> {
+        match self {
+            Self::Range { start, end } => Some((*start, *end)),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Debug)]
 enum Target {
@@ -51,6 +117,7 @@ enum Value {
     Tensor(Place),
     Tuple(Vec<Value>),
     Void,
+    Opaque,
 }
 impl Value {
     fn at(&self, path: &[usize]) -> &Self {
@@ -110,13 +177,14 @@ struct Access {
     atomic: Option<AtomicOp>,
 }
 impl Access {
+    /// Exact may-access identity; diagnostic placement does not change an
+    /// independence obligation. Borrowed keys retain the actual arena symbols.
+    fn footprint(&self) -> (usize, &Region, &Path, bool, Option<AtomicOp>) {
+        (self.root, &self.region, &self.path, self.write, self.atomic)
+    }
     /// Two accesses the separation proof cannot tell apart.
     fn same_footprint(&self, other: &Access) -> bool {
-        self.root == other.root
-            && self.write == other.write
-            && self.atomic == other.atomic
-            && self.path == other.path
-            && self.region == other.region
+        self.footprint() == other.footprint()
     }
 }
 impl World {
@@ -186,7 +254,17 @@ pub(super) fn check(
         symbols: owner.symbols.clone(),
         ..Contract::empty()
     };
-    for world in worlds {
+    for mut world in worlds {
+        // Exit transfer drops this world's facts. Preserve their write meaning
+        // before closing the contract over public parameter coordinates.
+        let roots = world
+            .roots
+            .iter()
+            .filter_map(|(id, root)| root.parameter.as_ref().map(|_| *id))
+            .collect::<Vec<_>>();
+        for (root, written) in owner.materialized_writes(&world, &roots) {
+            world.roots.get_mut(&root).unwrap().written = written;
+        }
         contract.requirements.extend(world.requirements);
         contract
             .accesses
@@ -275,16 +353,215 @@ impl Initialization<'_, '_> {
                     .collect(),
             ),
             ValueType::Void => Value::Void,
-            ValueType::Scalar(DType::Bool) => Value::Scalar(Scalar {
-                condition: Some(self.fresh_condition()),
-                ..Default::default()
-            }),
-            ValueType::Scalar(DType::U32) | ValueType::Index { .. } => Value::Scalar(Scalar {
-                integer: Some(self.fresh_integer().1),
-                ..Default::default()
-            }),
-            _ => Value::Scalar(Scalar::default()),
+            ValueType::Scalar(DType::Bool) => {
+                let value = self.fresh_scalar(DType::Bool);
+                let condition = self.fresh_condition();
+                Value::Scalar(Scalar::Boolean { value, condition })
+            }
+            ValueType::Integer
+            | ValueType::Scalar(DType::I32 | DType::U32)
+            | ValueType::Index { .. } => {
+                let (symbol, integer) = self.fresh_integer();
+                world.facts.assume_type(self.arena(), symbol, ty);
+                self.integer_value(ty, integer)
+            }
+            ValueType::Scalar(dtype) => Value::Scalar(Scalar::Floating(self.fresh_scalar(*dtype))),
+            ValueType::Range { bound } => {
+                let (s, start) = self.fresh_integer();
+                let (e, end) = self.fresh_integer();
+                let zero = self.arena().int(0);
+                world.facts.set_range(s, zero, *bound);
+                world.facts.set_range(e, start, *bound);
+                Value::Scalar(Scalar::Range { start, end })
+            }
+            _ => Value::Opaque,
         }
+    }
+    fn fresh_scalar(&mut self, dtype: DType) -> ErasedScalarExpr {
+        let symbol = self.arena().checker_variable(SymbolSort::Scalar(dtype));
+        self.arena().scalar_symbol_erased(symbol)
+    }
+    fn integer_value(&self, ty: &ValueType, value: IntExpr) -> Value {
+        Value::Scalar(match ty {
+            ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) => Scalar::Word {
+                dtype: *dtype,
+                value,
+                binding: None,
+            },
+            _ => Scalar::Quantity(value),
+        })
+    }
+    fn boolean_value(&mut self, condition: Condition) -> Value {
+        let value = self.fresh_scalar(DType::Bool);
+        Value::Scalar(Scalar::Boolean { value, condition })
+    }
+    fn literal_value(&mut self, literal: ReferenceScalar) -> Value {
+        match literal {
+            ReferenceScalar::I32(v) => {
+                let value = self.arena().int(i64::from(v));
+                self.integer_value(&ValueType::Scalar(DType::I32), value)
+            }
+            ReferenceScalar::U32(v) => {
+                let value = self.arena().int(i64::from(v));
+                self.integer_value(&ValueType::Scalar(DType::U32), value)
+            }
+            ReferenceScalar::Bool(v) => {
+                let value = self.arena().scalar_const_erased(literal);
+                Value::Scalar(Scalar::Boolean {
+                    value,
+                    condition: Condition::Constant(v),
+                })
+            }
+            _ => Value::Scalar(Scalar::Floating(self.arena().scalar_const_erased(literal))),
+        }
+    }
+    /// An opaque producer owns one value at this source position. Repeated
+    /// uses retain that identity; another producer never inherits it.
+    fn source_result(
+        &mut self,
+        world: &mut World,
+        ty: &ValueType,
+        source: &ir::SourceValue,
+    ) -> Value {
+        match (ty, source) {
+            (ValueType::Tuple(types), ir::SourceValue::Tuple(sources)) => {
+                assert_eq!(types.len(), sources.len(), "checked source result product");
+                Value::Tuple(
+                    types
+                        .iter()
+                        .zip(sources)
+                        .map(|(ty, source)| self.source_result(world, ty, source))
+                        .collect(),
+                )
+            }
+            (
+                ValueType::Scalar(dtype @ (DType::I32 | DType::U32)),
+                ir::SourceValue::Scalar(source),
+            ) => {
+                let binding = source
+                    .binding()
+                    .expect("opaque word result owns its publication");
+                world.facts.assume_type(self.arena(), binding, ty);
+                let value = self.arena().int_symbol(binding);
+                Value::Scalar(Scalar::Word {
+                    dtype: *dtype,
+                    value,
+                    binding: Some(binding),
+                })
+            }
+            (ValueType::Integer | ValueType::Index { .. }, ir::SourceValue::Scalar(source)) => {
+                let value = if let Some(binding) = source.binding() {
+                    world.facts.assume_type(self.arena(), binding, ty);
+                    self.arena().int_symbol(binding)
+                } else {
+                    source
+                        .integer()
+                        .expect("quantity result owns its exact value")
+                };
+                Value::Scalar(Scalar::Quantity(value))
+            }
+            (ValueType::Scalar(DType::Bool), ir::SourceValue::Scalar(source)) => {
+                let value = source
+                    .scalar()
+                    .expect("Boolean result owns an actual typed leaf");
+                let condition = self.fresh_condition();
+                Value::Scalar(Scalar::Boolean { value, condition })
+            }
+            (ValueType::Scalar(_), ir::SourceValue::Scalar(source)) => {
+                Value::Scalar(Scalar::Floating(
+                    source
+                        .scalar()
+                        .expect("floating result owns an actual typed leaf"),
+                ))
+            }
+            (ValueType::Range { bound }, ir::SourceValue::Range { start, end }) => {
+                let start_symbol = start.binding().expect("range result start publication");
+                let end_symbol = end.binding().expect("range result end publication");
+                let start = self.arena().int_symbol(start_symbol);
+                let end = self.arena().int_symbol(end_symbol);
+                let zero = self.arena().int(0);
+                world.facts.set_range(start_symbol, zero, *bound);
+                world.facts.set_range(end_symbol, start, *bound);
+                Value::Scalar(Scalar::Range { start, end })
+            }
+            (_, ir::SourceValue::Untracked) => self.result(world, ty, true),
+            _ => panic!("opaque result preserves its checked source product"),
+        }
+    }
+    fn expression_result(&mut self, world: &mut World, expression: &ir::Expr) -> Value {
+        self.source_result(world, &expression.ty, &expression.value)
+    }
+
+    fn scalar_operation(
+        &mut self,
+        world: &mut World,
+        result_type: &ValueType,
+        source: &ir::SourceValue,
+        id: &PrimitiveId,
+        operands: &[ir::Expr],
+        values: &[Value],
+    ) -> Value {
+        let actual = operands
+            .iter()
+            .zip(values)
+            .map(|(operand, value)| super::scalar_quantity::Operand {
+                ty: &operand.ty,
+                value: match value {
+                    Value::Scalar(scalar) => scalar.integer(),
+                    _ => None,
+                },
+                scalar: match value {
+                    Value::Scalar(scalar) => scalar.typed(),
+                    _ => None,
+                },
+                literal: match &operand.kind {
+                    ir::ExprKind::Literal(value) => Some(*value),
+                    _ => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        let integer = super::scalar_quantity::exact(self.arena(), id, result_type, &actual);
+        match integer {
+            Some(integer) => {
+                world.facts.assume_scalar_defined(self.arena(), integer);
+                if matches!(
+                    self.arena_ref().view(integer.into()),
+                    crate::expr::NodeView::ScalarInteger { .. }
+                ) {
+                    let defined = self.arena().scalar_integer_defined(integer);
+                    let binders = self.arena_ref().free_symbols(defined.into());
+                    assert!(
+                        self.assume(
+                            &mut world.path,
+                            &mut world.facts,
+                            Condition::Actual(defined, binders),
+                            true
+                        ),
+                        "a reached scalar operation has a successful continuation"
+                    );
+                }
+                self.integer_value(result_type, integer)
+            }
+            None => self.source_result(world, result_type, source),
+        }
+    }
+
+    fn quantity_word(&mut self, ty: &ValueType, quantity: IntExpr) -> Value {
+        let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = ty else {
+            return self.integer_value(ty, quantity);
+        };
+        let value = self.arena().int_to_word(quantity, *dtype);
+        self.integer_value(ty, value)
+    }
+    fn parameter_source(&self, local: ir::LocalId, fields: &[usize]) -> &ir::SourceValue {
+        let mut source = &self.checker.locals[local.index()].value;
+        for field in fields {
+            let ir::SourceValue::Tuple(parts) = source else {
+                panic!("checked parameter tuple path")
+            };
+            source = &parts[*field];
+        }
+        source
     }
     fn parameter(
         &mut self,
@@ -308,21 +585,31 @@ impl Initialization<'_, '_> {
                 false,
                 self.checker.sig.params[path.parameter].name.clone(),
             )),
-            ValueType::Index { .. } | ValueType::Scalar(DType::U32) => {
-                let (symbol, value) = if let Some(s) = self.checker.locals[local.index()].symbol {
-                    (s, self.arena().int_symbol(s))
-                } else {
-                    self.fresh_integer()
-                };
+            ValueType::Integer
+            | ValueType::Index { .. }
+            | ValueType::Scalar(DType::I32 | DType::U32) => {
+                let (symbol, value) =
+                    if let Some(s) = self.parameter_source(local, &path.fields).binding() {
+                        (s, self.arena().int_symbol(s))
+                    } else {
+                        self.fresh_integer()
+                    };
                 self.symbols.push((symbol, ParameterPart::Integer(path)));
-                Value::Scalar(Scalar {
-                    integer: Some(value),
-                    ..Default::default()
-                })
+                self.integer_value(ty, value)
             }
             ValueType::Range { bound } => {
-                let (s, start) = self.fresh_integer();
-                let (e, end) = self.fresh_integer();
+                let bindings = match self.parameter_source(local, &path.fields) {
+                    ir::SourceValue::Range { start, end } => (start.binding(), end.binding()),
+                    _ => (None, None),
+                };
+                let (s, start) = bindings
+                    .0
+                    .map(|s| (s, self.arena().int_symbol(s)))
+                    .unwrap_or_else(|| self.fresh_integer());
+                let (e, end) = bindings
+                    .1
+                    .map(|e| (e, self.arena().int_symbol(e)))
+                    .unwrap_or_else(|| self.fresh_integer());
                 self.symbols.extend([
                     (s, ParameterPart::Start(path.clone())),
                     (e, ParameterPart::End(path)),
@@ -330,15 +617,25 @@ impl Initialization<'_, '_> {
                 let zero = self.arena().int(0);
                 world.facts.set_range(s, zero, *bound);
                 world.facts.set_range(e, start, *bound);
-                Value::Scalar(Scalar {
-                    range: Some((start, end)),
-                    ..Default::default()
+                Value::Scalar(Scalar::Range { start, end })
+            }
+            ValueType::Scalar(dtype) => {
+                let symbol = self
+                    .parameter_source(local, &path.fields)
+                    .binding()
+                    .unwrap_or_else(|| self.arena().checker_variable(SymbolSort::Scalar(*dtype)));
+                let value = self.arena().scalar_symbol_erased(symbol);
+                self.symbols
+                    .push((symbol, ParameterPart::Scalar(path.clone())));
+                Value::Scalar(if *dtype == DType::Bool {
+                    Scalar::Boolean {
+                        value,
+                        condition: Condition::Parameter(path),
+                    }
+                } else {
+                    Scalar::Floating(value)
                 })
             }
-            ValueType::Scalar(DType::Bool) => Value::Scalar(Scalar {
-                condition: Some(Condition::Parameter(path)),
-                ..Default::default()
-            }),
             _ => self.result(world, ty, true),
         }
     }
@@ -362,42 +659,151 @@ impl Initialization<'_, '_> {
         }
     }
     fn write_region(&mut self, world: &mut World, root: usize, region: Region) {
-        let Some(data) = world.roots.get(&root).cloned() else {
+        if !world.roots.contains_key(&root) {
             return;
-        };
-        let written = self.normalize(data.written.union(region), &world.facts);
-        let written = if self.covered(
-            &written,
-            &Region::Full,
-            &world.path,
-            &world.facts,
-            &data.axes,
-        ) {
+        }
+        // Capture only this effect while its source-position facts are live.
+        // Earlier effects already own their reached meaning and guards.
+        let region = EstablishedRegionOps(self).normalize(region, &world.facts);
+        // Outside loops no later exit materializes this root, so a write of
+        // every element is recorded as the whole root now, exactly as a loop
+        // exit or join would promote it.
+        let whole = world.defer_depth == 0
+            && !matches!(world.roots[&root].written, Region::Full)
+            && EstablishedRegionOps(self).covered(
+                &region,
+                &Region::Full,
+                &world.path,
+                &world.facts,
+                &world.roots[&root].axes,
+            );
+        let data = world.roots.get_mut(&root).unwrap();
+        let written = std::mem::replace(&mut data.written, Region::Empty);
+        data.written = if whole {
             Region::Full
         } else {
-            written
+            written.union(region)
         };
-        world.roots.get_mut(&root).unwrap().written = written;
+    }
+    /// Simplify accumulated writes before their fact world or coordinate scope
+    /// is projected away. Whole-root promotion is optional; required reads
+    /// retain their full authoritative coverage proof.
+    fn materialized_written(&mut self, world: &World, root: usize) -> Region {
+        self.materialized_writes(world, &[root])
+            .remove(&root)
+            .unwrap()
+    }
+    /// Materialize one world's separate roots before its private facts escape.
+    /// Root geometry owns promotion; only the normalization scopes are shared.
+    fn materialized_writes(&mut self, world: &World, roots: &[usize]) -> HashMap<usize, Region> {
+        let regions = roots
+            .iter()
+            .map(|root| world.roots[root].written.clone())
+            .collect();
+        let regions = EstablishedRegionOps(self).normalize_many(regions, &world.facts);
+        roots
+            .iter()
+            .copied()
+            .zip(regions)
+            .map(|(root, written)| {
+                let written = if EstablishedRegionOps(self).covered(
+                    &written,
+                    &Region::Full,
+                    &world.path,
+                    &world.facts,
+                    &world.roots[&root].axes,
+                ) {
+                    Region::Full
+                } else {
+                    written
+                };
+                (root, written)
+            })
+            .collect()
     }
     fn require(&mut self, world: &mut World, root: usize, region: Region, span: Span) {
         let data = world.roots[&root].clone();
         let axes = &data.axes;
-        if self.covered(
-            &Region::Empty,
-            &Region::Full,
-            &world.path,
-            &world.facts,
-            axes,
-        ) {
+        let zero = self.arena().int(0);
+        if axes
+            .iter()
+            .any(|axis| self.optional_le(&world.facts, *axis, zero))
+        {
             return;
         }
         let available = data.written.clone().union(data.incoming.clone());
+        // Without an incoming assumption, a loop read can retain its exact
+        // source-position state until the loop's authoritative resolution. An
+        // unsuccessful optional elimination is not a failed initialization
+        // proof. Abstract incoming sets (including trial carry invariants)
+        // still follow the full requirement re-export path below.
+        if world.defer_depth > 0 && matches!(data.incoming, Region::Empty) {
+            if EstablishedRegionOps(self).covered(
+                &available,
+                &region,
+                &world.path,
+                &world.facts,
+                axes,
+            ) || EstablishedRegionOps(self).covered(
+                &Region::Empty,
+                &Region::Full,
+                &world.path,
+                &world.facts,
+                axes,
+            ) {
+                return;
+            }
+            world.deferred.push(Read {
+                root,
+                region,
+                available,
+                path: world.path.clone(),
+                facts: world.facts.clone(),
+                span,
+            });
+            return;
+        }
+        // Outside loops, an input read is exported as a call requirement
+        // unless this body's own writes cover it or it is vacuous; whether
+        // earlier requirements already assumed it changes neither outcome.
+        if world.defer_depth == 0 {
+            if let Some(parameter) = data.parameter.clone() {
+                if self.covered(&data.written, &region, &world.path, &world.facts, axes)
+                    || self.covered(
+                        &Region::Empty,
+                        &Region::Full,
+                        &world.path,
+                        &world.facts,
+                        axes,
+                    )
+                {
+                    return;
+                }
+                world.requirements.push(Requirement {
+                    parameter,
+                    region: region.clone(),
+                    path: world.path.clone(),
+                    span,
+                });
+                world.roots.get_mut(&root).unwrap().incoming = data.incoming.union(region);
+                return;
+            }
+        }
         if self.covered(&available, &region, &world.path, &world.facts, axes) {
             // Reads supplied by an abstract incoming parameter remain call
             // requirements. Invariant inference may provisionally supply that
             // incoming set, but cannot turn it into a produced write.
             if let Some(parameter) = data.parameter.clone() {
                 if !self.covered(&data.written, &region, &world.path, &world.facts, axes) {
+                    if self.covered(
+                        &Region::Empty,
+                        &Region::Full,
+                        &world.path,
+                        &world.facts,
+                        axes,
+                    ) {
+                        return;
+                    }
                     world.requirements.push(Requirement {
                         parameter,
                         region: region.clone(),
@@ -406,6 +812,16 @@ impl Initialization<'_, '_> {
                     });
                 }
             }
+            return;
+        }
+        // Required vacuity remains authoritative before diagnostics or effects.
+        if self.covered(
+            &Region::Empty,
+            &Region::Full,
+            &world.path,
+            &world.facts,
+            axes,
+        ) {
             return;
         }
         if world.defer_depth > 0 {
@@ -429,8 +845,11 @@ impl Initialization<'_, '_> {
             world.roots.get_mut(&root).unwrap().incoming = data.incoming.union(region);
             return;
         }
-        let available = self.normalize(available, &world.facts);
-        let region = self.normalize(region, &world.facts);
+        let mut regions = self
+            .normalize_many(vec![available, region], &world.facts)
+            .into_iter();
+        let available = regions.next().unwrap();
+        let region = regions.next().unwrap();
         let demonstrated = matches!(available, Region::Empty)
             && match region {
                 Region::Full => true,
@@ -494,47 +913,79 @@ impl Initialization<'_, '_> {
 
     fn integer(&mut self, value: &Value) -> IntExpr {
         match value {
-            Value::Scalar(Scalar {
-                integer: Some(v), ..
-            }) => *v,
+            Value::Scalar(Scalar::Word {
+                binding: Some(binding),
+                ..
+            }) => self.arena().int_symbol(*binding),
+            Value::Scalar(scalar) => scalar.integer().unwrap_or_else(|| self.fresh_integer().1),
             _ => self.fresh_integer().1,
         }
     }
     fn boolean(&mut self, value: &Value) -> Condition {
         match value {
-            Value::Scalar(Scalar {
-                condition: Some(v), ..
-            }) => v.clone(),
+            Value::Scalar(scalar) => scalar
+                .condition()
+                .cloned()
+                .unwrap_or_else(|| self.fresh_condition()),
             _ => self.fresh_condition(),
         }
     }
     /// Mutable because a call keeps only the alternatives whose contracts
     /// apply at it.
     fn expression(&mut self, world: &mut World, expression: &mut ir::Expr) -> Value {
+        let mut value = self.expression_value(world, expression);
+        if let Value::Scalar(scalar) = &mut value {
+            if let Some(actual) = scalar.integer() {
+                if let Some(binding) = expression.binding() {
+                    assert!(
+                        world.facts.define_scalar(self.arena_ref(), binding, actual),
+                        "reached source occurrence is immutable and acyclic"
+                    );
+                    world
+                        .facts
+                        .assume_type(self.arena(), binding, &expression.ty);
+                    if let Scalar::Word {
+                        binding: actual_binding,
+                        ..
+                    } = scalar
+                    {
+                        *actual_binding = Some(binding);
+                    }
+                }
+            }
+            let produces_scalar = matches!(
+                &expression.kind,
+                ir::ExprKind::Primitive {
+                    id: PrimitiveId::Unary(_)
+                        | PrimitiveId::Binary(_)
+                        | PrimitiveId::Cast(_)
+                        | PrimitiveId::Math(_)
+                        | PrimitiveId::Bitcast(_),
+                    ..
+                }
+            );
+            if let Some(actual) = expression.scalar().filter(|_| produces_scalar) {
+                match scalar {
+                    Scalar::Boolean { value, .. } | Scalar::Floating(value) => *value = actual,
+                    _ => {}
+                }
+            }
+        }
+        value
+    }
+    fn expression_value(&mut self, world: &mut World, expression: &mut ir::Expr) -> Value {
         match &mut expression.kind {
             ir::ExprKind::Local(local) => world
                 .values
                 .get(local)
                 .cloned()
                 .expect("checked local has a source-order value binding"),
-            ir::ExprKind::Literal(value) => {
-                let mut scalar = Scalar::default();
-                match value {
-                    ReferenceScalar::I32(v) => {
-                        scalar.integer = Some(self.arena().int(i64::from(*v)))
-                    }
-                    ReferenceScalar::U32(v) => {
-                        scalar.integer = Some(self.arena().int(i64::from(*v)))
-                    }
-                    ReferenceScalar::Bool(v) => scalar.condition = Some(Condition::Constant(*v)),
-                    _ => {}
-                }
-                Value::Scalar(scalar)
-            }
-            ir::ExprKind::Dimension(_) => Value::Scalar(Scalar {
-                integer: expression.sym,
-                ..Default::default()
-            }),
+            ir::ExprKind::Literal(value) => self.literal_value(*value),
+            ir::ExprKind::Dimension(_) => Value::Scalar(Scalar::Quantity(
+                expression
+                    .integer()
+                    .expect("checked dimension has a quantity"),
+            )),
             ir::ExprKind::Primitive { id, operands, .. } => {
                 let values = operands
                     .iter_mut()
@@ -553,10 +1004,10 @@ impl Initialization<'_, '_> {
                             Some(Value::Tensor(place)) => place.axes.get(*axis as usize).copied(),
                             _ => None,
                         };
-                        Value::Scalar(Scalar {
-                            integer: extent,
-                            ..Default::default()
-                        })
+                        match extent {
+                            Some(extent) => self.quantity_word(&expression.ty, extent),
+                            None => self.expression_result(world, expression),
+                        }
                     }
                     PrimitiveId::SliceView { indices } => {
                         let Some(Value::Tensor(place)) = values.first() else {
@@ -564,20 +1015,31 @@ impl Initialization<'_, '_> {
                         };
                         let mut rest = values[1..].iter();
                         let mut selected = vec![];
-                        for index in indices {
-                            match index {
-                                IndexSlot::Point { .. } => selected.push((
-                                    Some(self.integer(rest.next().unwrap())),
-                                    None,
-                                    true,
-                                )),
-                                IndexSlot::Range { start, end, .. } => selected.push((
-                                    start.then(|| self.integer(rest.next().unwrap())),
-                                    end.then(|| self.integer(rest.next().unwrap())),
-                                    false,
-                                )),
-                                IndexSlot::Full => selected.push((None, None, false)),
-                            }
+                        for (axis, index) in indices.iter().enumerate() {
+                            let (selection, checks) = match index {
+                                IndexSlot::Point { check } => (
+                                    (Some(self.integer(rest.next().unwrap())), None, true),
+                                    (*check, false, false),
+                                ),
+                                IndexSlot::Range {
+                                    start,
+                                    end,
+                                    check_start,
+                                    check_order,
+                                    check_end,
+                                    ..
+                                } => (
+                                    (
+                                        start.then(|| self.integer(rest.next().unwrap())),
+                                        end.then(|| self.integer(rest.next().unwrap())),
+                                        false,
+                                    ),
+                                    (*check_start, *check_order, *check_end),
+                                ),
+                                IndexSlot::Full => ((None, None, false), (false, false, false)),
+                            };
+                            self.assume_access_bounds(world, place.axes[axis], &selection, checks);
+                            selected.push(selection);
                         }
                         Value::Tensor(self.select(place, &selected))
                     }
@@ -596,57 +1058,66 @@ impl Initialization<'_, '_> {
                         }
                         _ => self.result(world, &expression.ty, true),
                     },
-                    PrimitiveId::ElementRead { .. } => {
+                    PrimitiveId::ElementRead { checks }
+                    | PrimitiveId::QuantizedComponentRead { checks, .. } => {
                         if let Some(Value::Tensor(place)) = values.first() {
                             let selected = values[1..]
                                 .iter()
                                 .map(|v| (Some(self.integer(v)), None, true))
                                 .collect::<Vec<_>>();
+                            for (axis, selection) in selected.iter().enumerate() {
+                                self.assume_access_bounds(
+                                    world,
+                                    place.axes[axis],
+                                    selection,
+                                    (checks[axis], false, false),
+                                );
+                            }
                             let place = self.select(place, &selected);
                             let region = self.region(&place);
                             self.read(world, place.root, region, expression.span);
                         }
-                        self.result(world, &expression.ty, true)
+                        self.expression_result(world, expression)
                     }
-                    PrimitiveId::RangeMake => Value::Scalar(Scalar {
-                        range: Some((self.integer(&values[0]), self.integer(&values[1]))),
-                        ..Default::default()
+                    PrimitiveId::RangeMake => Value::Scalar(Scalar::Range {
+                        start: self.integer(&values[0]),
+                        end: self.integer(&values[1]),
                     }),
                     PrimitiveId::RangeStart | PrimitiveId::RangeEnd => {
                         let integer = match values.first() {
-                            Some(Value::Scalar(Scalar {
-                                range: Some((start, end)),
-                                ..
-                            })) => Some(if matches!(id, PrimitiveId::RangeStart) {
-                                *start
-                            } else {
-                                *end
-                            }),
-                            _ => expression.sym,
+                            Some(Value::Scalar(Scalar::Range { start, end })) => {
+                                Some(if matches!(id, PrimitiveId::RangeStart) {
+                                    *start
+                                } else {
+                                    *end
+                                })
+                            }
+                            _ => None,
                         };
-                        Value::Scalar(Scalar {
-                            integer,
-                            ..Default::default()
-                        })
+                        match integer {
+                            Some(integer) => self.quantity_word(&expression.ty, integer),
+                            None => self.expression_result(world, expression),
+                        }
                     }
                     PrimitiveId::Unary(op) => {
                         values
                             .iter()
                             .for_each(|v| self.consume(world, v, expression.span));
-                        if matches!(expression.ty, ValueType::Tensor(_)) {
-                            return self.result(world, &expression.ty, true);
-                        }
-                        let mut scalar = Scalar::default();
-                        match op {
-                            UnaryOp::Not => {
-                                scalar.condition =
-                                    Some(Condition::Not(Box::new(self.boolean(&values[0]))))
+                        if *op == UnaryOp::Not && !matches!(expression.ty, ValueType::Tensor(_)) {
+                            {
+                                let condition = Condition::Not(Box::new(self.boolean(&values[0])));
+                                self.boolean_value(condition)
                             }
-                            UnaryOp::Neg | UnaryOp::BitNot => {
-                                scalar.integer = expression.sym;
-                            }
+                        } else {
+                            self.scalar_operation(
+                                world,
+                                &expression.ty,
+                                &expression.value,
+                                id,
+                                operands,
+                                &values,
+                            )
                         }
-                        Value::Scalar(scalar)
                     }
                     PrimitiveId::Binary(op) => {
                         values
@@ -655,92 +1126,114 @@ impl Initialization<'_, '_> {
                         if matches!(expression.ty, ValueType::Tensor(_)) {
                             return self.result(world, &expression.ty, true);
                         }
-                        let mut scalar = Scalar::default();
-                        let unchanged_symbols =
-                            operands.iter().zip(&values).all(|(source, value)| {
-                                match (source.sym, value) {
-                                    (
-                                        Some(expected),
-                                        Value::Scalar(Scalar {
-                                            integer: Some(actual),
-                                            ..
-                                        }),
-                                    ) => self.same(expected, *actual),
-                                    _ => false,
-                                }
-                            });
                         if matches!(op, BinaryOp::And | BinaryOp::Or) {
                             let a = Box::new(self.boolean(&values[0]));
                             let b = Box::new(self.boolean(&values[1]));
-                            scalar.condition = Some(if *op == BinaryOp::And {
+                            self.boolean_value(if *op == BinaryOp::And {
                                 Condition::And(a, b)
                             } else {
                                 Condition::Or(a, b)
-                            });
-                        } else {
-                            let a = self.integer(&values[0]);
-                            let b = self.integer(&values[1]);
-                            match op {
-                                BinaryOp::Add
-                                | BinaryOp::Sub
-                                | BinaryOp::Mul
-                                | BinaryOp::Div
-                                | BinaryOp::Rem => {
-                                    scalar.integer =
-                                        unchanged_symbols.then_some(expression.sym).flatten()
-                                }
-                                BinaryOp::Eq
+                            })
+                        } else if matches!(
+                            op,
+                            BinaryOp::Eq
                                 | BinaryOp::Ne
                                 | BinaryOp::Lt
                                 | BinaryOp::Le
                                 | BinaryOp::Gt
-                                | BinaryOp::Ge => {
-                                    scalar.condition = Some(
-                                        if values.iter().all(|v| {
-                                            matches!(
-                                                v,
-                                                Value::Scalar(Scalar {
-                                                    integer: Some(_),
-                                                    ..
-                                                })
-                                            )
-                                        }) {
-                                            Condition::Compare(*op, a, b)
-                                        } else {
-                                            self.fresh_condition()
-                                        },
-                                    )
+                                | BinaryOp::Ge
+                        ) {
+                            let condition = match (&values[0], &values[1]) {
+                                (Value::Scalar(a), Value::Scalar(b)) => {
+                                    match (a.integer(), b.integer()) {
+                                        (Some(_), Some(_)) => Condition::Compare(
+                                            *op,
+                                            self.integer(&values[0]),
+                                            self.integer(&values[1]),
+                                        ),
+                                        _ => self.fresh_condition(),
+                                    }
                                 }
-                                _ => {}
-                            }
+                                _ => self.fresh_condition(),
+                            };
+                            self.boolean_value(condition)
+                        } else {
+                            self.scalar_operation(
+                                world,
+                                &expression.ty,
+                                &expression.value,
+                                id,
+                                operands,
+                                &values,
+                            )
                         }
-                        Value::Scalar(scalar)
                     }
-                    PrimitiveId::Constant(_) | PrimitiveId::Symbolic(_) => Value::Scalar(Scalar {
-                        integer: expression.sym,
-                        ..Default::default()
-                    }),
-                    PrimitiveId::Cast(_) => {
+                    PrimitiveId::Constant(value) => self.literal_value(*value),
+                    PrimitiveId::Symbolic(value) => self.integer_value(&expression.ty, *value),
+                    PrimitiveId::Cast(_) | PrimitiveId::Math(_) | PrimitiveId::Bitcast(_) => {
                         values
                             .iter()
                             .for_each(|v| self.consume(world, v, expression.span));
-                        let mut result = self.result(world, &expression.ty, true);
-                        if let Value::Scalar(s) = &mut result {
-                            if expression.sym.is_some() {
-                                s.integer = expression.sym;
-                            }
-                        }
-                        result
+                        self.scalar_operation(
+                            world,
+                            &expression.ty,
+                            &expression.value,
+                            id,
+                            operands,
+                            &values,
+                        )
                     }
-                    PrimitiveId::Copy
-                    | PrimitiveId::RepresentationConvert(_)
-                    | PrimitiveId::Math(_)
-                    | PrimitiveId::Select
-                    | PrimitiveId::Reduce { .. } => {
+                    PrimitiveId::Copy => {
                         values
                             .iter()
                             .for_each(|v| self.consume(world, v, expression.span));
-                        self.result(world, &expression.ty, true)
+                        if matches!(values.first(), Some(Value::Scalar(_))) {
+                            values[0].clone()
+                        } else {
+                            self.expression_result(world, expression)
+                        }
+                    }
+                    PrimitiveId::Select => {
+                        values
+                            .iter()
+                            .for_each(|v| self.consume(world, v, expression.span));
+                        if !matches!(
+                            expression.ty,
+                            ValueType::Scalar(_) | ValueType::Integer | ValueType::Index { .. }
+                        ) {
+                            return self.expression_result(world, expression);
+                        }
+                        match (&values[0], &values[1], &values[2]) {
+                            (
+                                Value::Scalar(Scalar::Boolean {
+                                    condition: Condition::Constant(selected),
+                                    ..
+                                }),
+                                a,
+                                b,
+                            ) => {
+                                if *selected {
+                                    a.clone()
+                                } else {
+                                    b.clone()
+                                }
+                            }
+                            (_, a, b) if matches!(a, Value::Scalar(_)) && a == b => a.clone(),
+                            _ => self.scalar_operation(
+                                world,
+                                &expression.ty,
+                                &expression.value,
+                                id,
+                                operands,
+                                &values,
+                            ),
+                        }
+                    }
+                    PrimitiveId::RepresentationConvert(_) | PrimitiveId::Reduce { .. } => {
+                        values
+                            .iter()
+                            .for_each(|v| self.consume(world, v, expression.span));
+                        self.expression_result(world, expression)
                     }
                     PrimitiveId::Atomic { .. } => {
                         unreachable!("checked source atomics use their place-bearing expression")
@@ -755,7 +1248,11 @@ impl Initialization<'_, '_> {
                 ..
             } => {
                 let place = Self::local_place(world, place);
-                let indices = self.selection(world, indices);
+                let indices = self.selection(
+                    world,
+                    indices,
+                    place.as_ref().map(|place| place.axes.as_slice()),
+                );
                 let value = self.expression(world, value);
                 self.consume(world, &value, expression.span);
                 if let Some(place) = place {
@@ -812,22 +1309,25 @@ impl Initialization<'_, '_> {
                 }
                 // Writable intrinsic operands retain their incoming state unless
                 // the intrinsic explicitly describes a complete destination.
-                self.result(world, &expression.ty, true)
+                self.expression_result(world, expression)
             }
             // L31: the quantity is the word's value.
-            ir::ExprKind::IndexPosition(word) => match self.expression(world, word) {
-                Value::Scalar(Scalar {
-                    integer: Some(integer),
-                    ..
-                }) => Value::Scalar(Scalar {
-                    integer: Some(integer),
-                    ..Default::default()
-                }),
-                _ => Value::Scalar(Scalar {
-                    integer: expression.sym,
-                    ..Default::default()
-                }),
-            },
+            ir::ExprKind::IndexPosition(word) => {
+                let actual = self.expression(world, word);
+                match actual {
+                    Value::Scalar(scalar) => match scalar.integer() {
+                        Some(integer) => {
+                            let quantity = word
+                                .binding()
+                                .map(|binding| self.arena().int_symbol(binding))
+                                .unwrap_or(integer);
+                            Value::Scalar(Scalar::Quantity(quantity))
+                        }
+                        None => self.expression_result(world, expression),
+                    },
+                    _ => self.expression_result(world, expression),
+                }
+            }
             ir::ExprKind::Call { call, args } => {
                 for (_, value) in &mut call.seeds {
                     self.expression(world, value);
@@ -837,10 +1337,80 @@ impl Initialization<'_, '_> {
                     .map(|e| self.expression(world, e))
                     .collect::<Vec<_>>();
                 self.call(world, call, &values, expression.span);
-                self.result(world, &expression.ty, true)
+                self.expression_result(world, expression)
             }
         }
     }
+    /// A frontend occurrence/version and this traversal's reached value name
+    /// the same runtime quantity. The equality is world-local, not a fact
+    /// imported from a later checker state or a new arithmetic assumption.
+    fn bind_actual_value(
+        &mut self,
+        facts: &mut prove::Facts,
+        source: &ir::SourceValue,
+        actual: &mut Value,
+    ) {
+        match (source, actual) {
+            (ir::SourceValue::Scalar(source), Value::Scalar(actual)) => {
+                if let (Some(binding), Some(meaning)) = (source.binding(), actual.integer()) {
+                    assert!(
+                        facts.define_scalar(self.arena_ref(), binding, meaning),
+                        "reached source occurrence is immutable and acyclic"
+                    );
+                    match actual {
+                        Scalar::Word {
+                            dtype,
+                            binding: actual_binding,
+                            ..
+                        } => {
+                            facts.assume_type(self.arena(), binding, &ValueType::Scalar(*dtype));
+                            *actual_binding = Some(binding);
+                        }
+                        Scalar::Quantity(_) => {}
+                        _ => unreachable!("integer meaning belongs to word or quantity"),
+                    }
+                }
+                // Actual typed scalar leaves retain copy/capture identity. A
+                // version's publication is an alias, not another opaque read.
+            }
+            (ir::SourceValue::Tuple(sources), Value::Tuple(actuals)) => {
+                assert_eq!(sources.len(), actuals.len(), "checked source product shape");
+                for (source, actual) in sources.iter().zip(actuals) {
+                    self.bind_actual_value(facts, source, actual);
+                }
+            }
+            (
+                ir::SourceValue::Range {
+                    start: source_start,
+                    end: source_end,
+                },
+                Value::Scalar(Scalar::Range { start, end }),
+            ) => {
+                for (source, meaning) in [(source_start, *start), (source_end, *end)] {
+                    if let Some(binding) = source.binding() {
+                        assert!(
+                            facts.define_scalar(self.arena_ref(), binding, meaning),
+                            "reached source occurrence is immutable and acyclic"
+                        );
+                    }
+                }
+            }
+            (ir::SourceValue::Untracked, _) => {}
+            _ => panic!("checked source value and reached value have one product shape"),
+        }
+    }
+    fn bind_value_bindings(
+        &mut self,
+        world: &mut World,
+        versions: &[(ir::LocalId, ir::SourceValue)],
+    ) {
+        for (local, source) in versions {
+            if let Some(actual) = world.values.get_mut(local) {
+                self.bind_actual_value(&mut world.facts, source, actual);
+            }
+        }
+    }
+
     fn bind(&mut self, world: &mut World, pattern: &ir::Pattern, value: Value) {
         match (pattern, value) {
             (ir::Pattern::Local(local), value) => {
@@ -871,20 +1441,70 @@ impl Initialization<'_, '_> {
             _ => None,
         }
     }
-    /// The per-axis selection of checked indices, evaluated in order.
+    /// The successful continuation of an emitted access check owns these
+    /// bounds. They describe actual view axes and reached source values, not
+    /// a waiver of initialization or an assumed static-width equality.
+    fn assume_access_bounds(
+        &mut self,
+        world: &mut World,
+        extent: IntExpr,
+        selection: &(Option<IntExpr>, Option<IntExpr>, bool),
+        checks: (bool, bool, bool),
+    ) {
+        let zero = self.arena().int(0);
+        let start = selection.0.unwrap_or(zero);
+        if selection.2 {
+            if checks.0 {
+                world.facts.assume_nonnegative(self.arena(), start);
+                let end = self.arena().int_sub(extent, start);
+                let one = self.arena().int(1);
+                let last = self.arena().int_sub(end, one);
+                world.facts.assume_nonnegative(self.arena(), last);
+            }
+        } else {
+            let end = selection.1.unwrap_or(extent);
+            if checks.0 {
+                world.facts.assume_nonnegative(self.arena(), start);
+            }
+            if checks.1 {
+                let width = self.arena().int_sub(end, start);
+                world.facts.assume_nonnegative(self.arena(), width);
+            }
+            if checks.2 {
+                let tail = self.arena().int_sub(extent, end);
+                world.facts.assume_nonnegative(self.arena(), tail);
+            }
+        }
+    }
+    /// Target/atomic checks execute after each selected index, before the next
+    /// index or RHS. Primitive accesses instead evaluate all operands first.
     fn selection(
         &mut self,
         world: &mut World,
         indices: &mut [ir::Index],
+        axes: Option<&[IntExpr]>,
     ) -> Vec<(Option<IntExpr>, Option<IntExpr>, bool)> {
         let mut selected = vec![];
-        for index in indices {
-            match index {
-                ir::Index::Point { value, .. } => {
+        for (axis, index) in indices.iter_mut().enumerate() {
+            let (selection, checks) = match index {
+                ir::Index::Point {
+                    value,
+                    runtime_check,
+                } => {
                     let value = self.expression(world, value);
-                    selected.push((Some(self.integer(&value)), None, true));
+                    (
+                        (Some(self.integer(&value)), None, true),
+                        (*runtime_check, false, false),
+                    )
                 }
-                ir::Index::Range { start, end, .. } => {
+                ir::Index::Range {
+                    start,
+                    end,
+                    check_start,
+                    check_order,
+                    check_end,
+                    ..
+                } => {
                     let start = start.as_mut().map(|e| {
                         let v = self.expression(world, e);
                         self.integer(&v)
@@ -893,10 +1513,17 @@ impl Initialization<'_, '_> {
                         let v = self.expression(world, e);
                         self.integer(&v)
                     });
-                    selected.push((start, end, false));
+                    (
+                        (start, end, false),
+                        (*check_start, *check_order, *check_end),
+                    )
                 }
-                ir::Index::Full => selected.push((None, None, false)),
+                ir::Index::Full => ((None, None, false), (false, false, false)),
+            };
+            if let Some(axes) = axes {
+                self.assume_access_bounds(world, axes[axis], &selection, checks);
             }
+            selected.push(selection);
         }
         selected
     }
@@ -909,7 +1536,7 @@ impl Initialization<'_, '_> {
             ir::Place::Element { root, indices } => {
                 let place = Self::local_place(world, root)
                     .expect("checked element target has a tensor binding");
-                let selected = self.selection(world, indices);
+                let selected = self.selection(world, indices, Some(&place.axes));
                 Target::Tensor(self.select(&place, &selected))
             }
         }
@@ -944,10 +1571,15 @@ impl Initialization<'_, '_> {
         let source = &transfer.source.arena;
         let symbols = &mut transfer.symbols;
         xfer::transfer_int(source, value, self.arena(), &mut |symbol, arena| {
-            AnyExpr::Int(*symbols.entry(symbol).or_insert_with(|| {
-                let s = arena.proof_variable(crate::expr::SymbolSort::Int);
-                arena.int_symbol(s)
-            }))
+            *symbols.entry(symbol).or_insert_with(|| {
+                let sort = source.symbol_sort(symbol);
+                let s = arena.checker_variable(sort);
+                match sort {
+                    SymbolSort::Int => AnyExpr::Int(arena.int_symbol(s)),
+                    SymbolSort::Nat => AnyExpr::Nat(arena.nat_symbol(s)),
+                    SymbolSort::Scalar(_) => AnyExpr::Scalar(arena.scalar_symbol_erased(s)),
+                }
+            })
         })
     }
     fn import_path(&mut self, transfer: &mut Transfer<'_>, path: &Path) -> Path {
@@ -1005,10 +1637,26 @@ impl Initialization<'_, '_> {
         for access in site.accesses {
             world.record_access(access);
         }
-        for (root, path, region) in site.requirements {
-            let mut checked = world.clone();
-            let before = checked.requirements.len();
-            let deferred = checked.deferred.len();
+        // Repeated requirements of one site are one obligation.
+        let mut requirements = Vec::<(usize, Path, Region)>::with_capacity(site.requirements.len());
+        for requirement in site.requirements {
+            if !requirements.contains(&requirement) {
+                requirements.push(requirement);
+            }
+        }
+        for (root, path, region) in requirements {
+            // A requirement reads only its own root under the call's path;
+            // check it in that slice of the world and keep its new effects.
+            let mut checked = World {
+                values: HashMap::new(),
+                roots: HashMap::from([(root, world.roots[&root].clone())]),
+                path: world.path.clone(),
+                facts: world.facts.clone(),
+                requirements: vec![],
+                deferred: vec![],
+                accesses: vec![],
+                defer_depth: world.defer_depth,
+            };
             if !path
                 .iter()
                 .all(|(c, v)| self.assume(&mut checked.path, &mut checked.facts, c.clone(), *v))
@@ -1016,12 +1664,8 @@ impl Initialization<'_, '_> {
                 continue;
             }
             self.require(&mut checked, root, region.clone(), span);
-            world
-                .requirements
-                .extend(checked.requirements.into_iter().skip(before));
-            world
-                .deferred
-                .extend(checked.deferred.into_iter().skip(deferred));
+            world.requirements.extend(checked.requirements);
+            world.deferred.extend(checked.deferred);
             if world.roots[&root].parameter.is_some() {
                 let incoming = world.roots[&root]
                     .incoming
@@ -1032,6 +1676,25 @@ impl Initialization<'_, '_> {
         }
         for (root, region) in site.writes {
             self.write_region(world, root, region);
+            // A call that writes every element leaves the whole root written.
+            let whole = world
+                .roots
+                .get(&root)
+                .is_some_and(|data| !matches!(data.written, Region::Full))
+                && EstablishedRegionOps(self).covered(
+                    &world.roots[&root].written,
+                    &Region::Full,
+                    &world.path,
+                    &world.facts,
+                    &world.roots[&root].axes,
+                );
+            if whole {
+                world.roots.get_mut(&root).unwrap().written = Region::Full;
+            }
+        }
+        let returned = successful_paths(&site.exits);
+        if !self.assume(&mut world.path, &mut world.facts, returned.clone(), true) {
+            world.path.push((returned, true));
         }
     }
     /// Instantiate one member's checked contract at this call, in the
@@ -1053,24 +1716,34 @@ impl Initialization<'_, '_> {
             symbols: HashMap::new(),
         };
         for (dimension, &value) in source.signature.dimensions.iter().zip(dimensions) {
-            transfer.symbols.insert(dimension.symbol, value);
+            transfer
+                .symbols
+                .insert(dimension.symbol, AnyExpr::Int(value));
         }
         for (symbol, part) in &contract.symbols {
             let value = match part {
-                ParameterPart::Integer(p) => self.integer(argument(arguments, p)),
-                ParameterPart::Start(p) | ParameterPart::End(p) => match argument(arguments, p) {
-                    Value::Scalar(Scalar {
-                        range: Some((a, b)),
-                        ..
-                    }) => {
-                        if matches!(part, ParameterPart::Start(_)) {
-                            *a
-                        } else {
-                            *b
-                        }
-                    }
-                    _ => self.fresh_integer().1,
+                ParameterPart::Integer(p) => AnyExpr::Int(self.integer(argument(arguments, p))),
+                ParameterPart::Scalar(p) => match argument(arguments, p) {
+                    Value::Scalar(scalar) => AnyExpr::Scalar(
+                        scalar
+                            .typed()
+                            .expect("checked actual scalar parameter has its typed leaf"),
+                    ),
+                    _ => panic!("checked scalar parameter is not a scalar"),
                 },
+                ParameterPart::Start(p) | ParameterPart::End(p) => {
+                    let integer = match argument(arguments, p) {
+                        Value::Scalar(Scalar::Range { start, end }) => {
+                            if matches!(part, ParameterPart::Start(_)) {
+                                *start
+                            } else {
+                                *end
+                            }
+                        }
+                        _ => self.fresh_integer().1,
+                    };
+                    AnyExpr::Int(integer)
+                }
             };
             transfer.symbols.insert(*symbol, value);
         }
@@ -1078,6 +1751,7 @@ impl Initialization<'_, '_> {
             accesses: vec![],
             requirements: vec![],
             writes: vec![],
+            exits: vec![],
         };
         for access in &contract.accesses {
             let Value::Tensor(place) = argument(&arguments, &access.parameter) else {
@@ -1113,6 +1787,7 @@ impl Initialization<'_, '_> {
         }
         for exit in &contract.exits {
             let path = self.import_path(&mut transfer, &exit.path);
+            site.exits.push(path.clone());
             for (parameter, written) in &exit.written {
                 let Value::Tensor(place) = argument(&arguments, parameter) else {
                     continue;
@@ -1206,18 +1881,29 @@ impl Initialization<'_, '_> {
             let mut next = vec![];
             for mut world in worlds {
                 match statement {
-                    ir::Stmt::Let { pattern, value } => {
+                    ir::Stmt::Let {
+                        pattern,
+                        value,
+                        value_bindings,
+                    } => {
                         let value = self.expression(&mut world, value);
                         self.bind(&mut world, pattern, value);
+                        self.bind_value_bindings(&mut world, value_bindings);
                         next.push(world);
                     }
-                    ir::Stmt::Assign { place, value, .. } => {
+                    ir::Stmt::Assign {
+                        place,
+                        value,
+                        value_bindings,
+                        ..
+                    } => {
                         // Checked addresses and right-hand values precede the
                         // store; element address expressions may themselves read.
                         let target = self.target(&mut world, place);
                         let span = value.span;
                         let value = self.expression(&mut world, value);
                         self.assign(&mut world, target, value, span);
+                        self.bind_value_bindings(&mut world, value_bindings);
                         next.push(world);
                     }
                     ir::Stmt::Evaluate(expression) => {
@@ -1228,9 +1914,11 @@ impl Initialization<'_, '_> {
                         condition,
                         then_body,
                         else_body,
-                        join_symbols,
+                        capture_bindings,
+                        join_bindings,
                         ..
                     } => {
+                        self.bind_value_bindings(&mut world, capture_bindings);
                         let value = self.expression(&mut world, condition);
                         let condition = self.boolean(&value);
                         let mut arms = [vec![], vec![]];
@@ -1254,7 +1942,7 @@ impl Initialization<'_, '_> {
                             &condition,
                             then_worlds,
                             else_worlds,
-                            join_symbols,
+                            join_bindings,
                         ));
                     }
                     ir::Stmt::Loop {
@@ -1263,19 +1951,30 @@ impl Initialization<'_, '_> {
                         start,
                         end,
                         body,
+                        value_versions,
                         initialization,
                         separation,
-                        ..
-                    } => next.extend(self.loop_body(
-                        world,
-                        *kind,
-                        *binder,
-                        start,
-                        end,
-                        body,
-                        initialization,
-                        separation,
-                    )),
+                    } => {
+                        let outcomes = self.loop_body(
+                            world,
+                            *kind,
+                            *binder,
+                            start,
+                            end,
+                            body,
+                            value_versions,
+                            initialization,
+                            separation,
+                        );
+                        let exit_bindings = value_versions
+                            .iter()
+                            .map(|(local, _, exit)| (*local, exit.clone()))
+                            .collect::<Vec<_>>();
+                        for mut outcome in outcomes {
+                            self.bind_value_bindings(&mut outcome, &exit_bindings);
+                            next.push(outcome);
+                        }
+                    }
                 }
             }
             worlds = next;
@@ -1293,14 +1992,27 @@ impl Initialization<'_, '_> {
         condition: &Condition,
         then_worlds: Vec<World>,
         else_worlds: Vec<World>,
-        join_symbols: &[(ir::LocalId, SymbolId)],
+        join_bindings: &[(ir::LocalId, ir::SourceValue)],
     ) -> Vec<World> {
         if let ([then], [els]) = (then_worlds.as_slice(), else_worlds.as_slice()) {
-            if let Some(joined) = self.join_worlds(entry, condition, then, els, join_symbols) {
+            if let Some(mut joined) = self.join_worlds(entry, condition, then, els, join_bindings) {
+                self.bind_value_bindings(&mut joined, join_bindings);
                 return vec![joined];
             }
         }
-        then_worlds.into_iter().chain(else_worlds).collect()
+        then_worlds
+            .into_iter()
+            .chain(else_worlds)
+            .map(|mut world| {
+                // Locals declared inside an arm end with it, as in one
+                // merged world.
+                world
+                    .values
+                    .retain(|local, _| entry.values.contains_key(local));
+                self.bind_value_bindings(&mut world, join_bindings);
+                world
+            })
+            .collect()
     }
     /// One world for both arms: unchanged values stay, a changed integer
     /// becomes its join symbol with the bounds both arms prove, initialized
@@ -1314,7 +2026,7 @@ impl Initialization<'_, '_> {
         condition: &Condition,
         then: &World,
         els: &World,
-        join_symbols: &[(ir::LocalId, SymbolId)],
+        join_bindings: &[(ir::LocalId, ir::SourceValue)],
     ) -> Option<World> {
         let scope = self.scope_symbols(entry);
         let mut joined = World {
@@ -1328,10 +2040,10 @@ impl Initialization<'_, '_> {
             defer_depth: entry.defer_depth,
         };
         for local in entry.values.keys() {
-            let symbol = join_symbols
+            let symbol = join_bindings
                 .iter()
                 .find(|(changed, _)| changed == local)
-                .map(|(_, symbol)| *symbol);
+                .map(|(_, value)| value);
             let value = self.join_value(
                 &mut joined.facts,
                 [then, els],
@@ -1342,10 +2054,53 @@ impl Initialization<'_, '_> {
             )?;
             joined.values.insert(*local, value);
         }
+        // A root neither arm wrote still holds the entry's region; it is
+        // materialized once, in the entry world both arms extend.
+        let unwritten = entry
+            .roots
+            .iter()
+            .filter(|(id, before)| {
+                [then, els].iter().all(|arm| {
+                    arm.roots
+                        .get(id)
+                        .is_some_and(|after| after.written == before.written)
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        let common = self.materialized_writes(entry, &unwritten);
+        let then_roots = then
+            .roots
+            .keys()
+            .copied()
+            .filter(|id| !common.contains_key(id))
+            .collect::<Vec<_>>();
+        let else_roots = els
+            .roots
+            .keys()
+            .copied()
+            .filter(|id| !common.contains_key(id))
+            .collect::<Vec<_>>();
+        let mut then_written = self.materialized_writes(then, &then_roots);
+        let mut else_written = self.materialized_writes(els, &else_roots);
+        then_written.extend(common.clone());
+        else_written.extend(common);
         for (id, root) in &then.roots {
             let root = match els.roots.get(id) {
                 Some(other) => Root {
-                    written: Region::branch(condition, root.written.clone(), other.written.clone()),
+                    // Element overwrites cannot revoke writes established at
+                    // branch entry. Arm normalization may represent those
+                    // regions differently, so retain their original authority
+                    // explicitly rather than relying on syntactic intersection.
+                    written: entry
+                        .roots
+                        .get(id)
+                        .map_or(Region::Empty, |before| before.written.clone())
+                        .union(Region::branch(
+                            condition,
+                            then_written[id].clone(),
+                            else_written[id].clone(),
+                        )),
                     incoming: Region::branch(
                         condition,
                         root.incoming.clone(),
@@ -1353,12 +2108,23 @@ impl Initialization<'_, '_> {
                     ),
                     ..root.clone()
                 },
-                None => root.clone(),
+                None => Root {
+                    written: then_written[id].clone(),
+                    ..root.clone()
+                },
             };
             joined.roots.insert(*id, root);
         }
         for (id, root) in &els.roots {
-            joined.roots.entry(*id).or_insert_with(|| root.clone());
+            if !joined.roots.contains_key(id) {
+                joined.roots.insert(
+                    *id,
+                    Root {
+                        written: else_written[id].clone(),
+                        ..root.clone()
+                    },
+                );
+            }
         }
         for arm in [then, els] {
             joined
@@ -1373,61 +2139,96 @@ impl Initialization<'_, '_> {
         }
         Some(joined)
     }
-    /// The value of one local after a join. `symbol` is the checker's join
-    /// symbol of a changed integer local.
+    /// Join one actual source product, retaining each leaf's publication and
+    /// the bounds established in both arms.
     fn join_value(
         &mut self,
         facts: &mut prove::Facts,
         arms: [&World; 2],
         then_value: &Value,
         else_value: &Value,
-        symbol: Option<SymbolId>,
+        source: Option<&ir::SourceValue>,
         scope: &BTreeSet<SymbolId>,
     ) -> Option<Value> {
         if then_value == else_value {
             return Some(then_value.clone());
         }
+        let symbol = source
+            .and_then(ir::SourceValue::binding)
+            .filter(|symbol| self.arena_ref().symbol_sort(*symbol) == SymbolSort::Int);
         match (then_value, else_value) {
-            (Value::Scalar(a), Value::Scalar(b)) => {
-                let integer = match (a.integer, b.integer, symbol) {
-                    (Some(x), Some(y), _) if x == y => Some(x),
-                    (Some(x), Some(y), symbol) => {
-                        Some(self.join_integer(facts, arms, [x, y], symbol, scope))
+            (Value::Scalar(a), Value::Scalar(b)) => Some(Value::Scalar(match (a, b) {
+                (Scalar::Quantity(a), Scalar::Quantity(b)) => {
+                    Scalar::Quantity(self.join_integer(facts, arms, [*a, *b], symbol, scope))
+                }
+                (
+                    Scalar::Word {
+                        dtype, value: a, ..
+                    },
+                    Scalar::Word {
+                        dtype: other,
+                        value: b,
+                        ..
+                    },
+                ) if dtype == other => Scalar::Word {
+                    dtype: *dtype,
+                    value: self.join_integer(facts, arms, [*a, *b], symbol, scope),
+                    binding: symbol,
+                },
+                (Scalar::Boolean { condition: a, .. }, Scalar::Boolean { condition: b, .. }) => {
+                    let condition = if a == b {
+                        a.clone()
+                    } else {
+                        self.fresh_condition()
+                    };
+                    Scalar::Boolean {
+                        value: source
+                            .and_then(ir::SourceValue::scalar)
+                            .unwrap_or_else(|| self.fresh_scalar(DType::Bool)),
+                        condition,
                     }
-                    (_, _, Some(symbol)) => Some(self.arena().int_symbol(symbol)),
-                    (_, _, None) => None,
-                };
-                let condition = match (&a.condition, &b.condition) {
-                    (Some(x), Some(y)) if x == y => Some(x.clone()),
-                    (Some(_), Some(_)) => Some(self.fresh_condition()),
-                    _ => None,
-                };
-                let range = match (a.range, b.range) {
-                    (Some(x), Some(y)) if x == y => Some(x),
-                    (Some((then_start, then_end)), Some((else_start, else_end))) => Some((
-                        self.join_integer(facts, arms, [then_start, else_start], None, scope),
-                        self.join_integer(facts, arms, [then_end, else_end], None, scope),
-                    )),
-                    _ => None,
-                };
-                Some(Value::Scalar(Scalar {
-                    integer,
-                    condition,
-                    range,
-                }))
-            }
+                }
+                (Scalar::Floating(a), Scalar::Floating(b))
+                    if ScalarOperand::Scalar(*a).dtype(self.arena_ref())
+                        == ScalarOperand::Scalar(*b).dtype(self.arena_ref()) =>
+                {
+                    Scalar::Floating(source.and_then(ir::SourceValue::scalar).unwrap_or_else(
+                        || self.fresh_scalar(ScalarOperand::Scalar(*a).dtype(self.arena_ref())),
+                    ))
+                }
+                (Scalar::Range { start: a, end: b }, Scalar::Range { start: c, end: d }) => {
+                    let (start_binding, end_binding) = match source {
+                        Some(ir::SourceValue::Range { start, end }) => {
+                            (start.binding(), end.binding())
+                        }
+                        _ => (None, None),
+                    };
+                    Scalar::Range {
+                        start: self.join_integer(facts, arms, [*a, *c], start_binding, scope),
+                        end: self.join_integer(facts, arms, [*b, *d], end_binding, scope),
+                    }
+                }
+                _ => panic!("checked join arms bind one scalar kind"),
+            })),
             (Value::Tuple(a), Value::Tuple(b)) => a
                 .iter()
                 .zip(b)
-                .map(|(x, y)| self.join_value(facts, arms, x, y, None, scope))
+                .enumerate()
+                .map(|(index, (x, y))| {
+                    let child = match source {
+                        Some(ir::SourceValue::Tuple(parts)) => Some(&parts[index]),
+                        _ => None,
+                    };
+                    self.join_value(facts, arms, x, y, child, scope)
+                })
                 .collect::<Option<Vec<_>>>()
                 .map(Value::Tuple),
             (Value::Tensor(_), Value::Tensor(_)) => None,
             _ => panic!("checked join arms bind one value kind"),
         }
     }
-    /// A joined integer: `symbol` (or a fresh one) bounded by exactly the
-    /// bounds both arm values prove (`Facts::join_bounds`).
+    /// A joined integer: `symbol` (or a fresh one) bounded by the
+    /// common bounds established for both arm values (`Facts::join_bounds`).
     fn join_integer(
         &mut self,
         facts: &mut prove::Facts,
@@ -1453,7 +2254,7 @@ impl Initialization<'_, '_> {
 struct Transfer<'a> {
     source: &'a CheckedOutcome,
     arguments: &'a [Value],
-    symbols: HashMap<SymbolId, IntExpr>,
+    symbols: HashMap<SymbolId, AnyExpr>,
 }
 
 /// One candidate's contract instantiated at one call: its accesses, its
@@ -1463,6 +2264,7 @@ struct CallSite {
     accesses: Vec<Access>,
     requirements: Vec<(usize, Path, Region)>,
     writes: Vec<(usize, Region)>,
+    exits: Vec<Path>,
 }
 
 /// A callee's initialization contract. It is unavailable when the callee's
@@ -1485,6 +2287,22 @@ struct CallMapping<'borrow, 'checker, 'env, 'source> {
     transfer: &'borrow mut Transfer<'source>,
 }
 impl RegionMapping for CallMapping<'_, '_, '_, '_> {
+    fn boolean(&mut self, value: BoolExpr) -> (BoolExpr, Vec<SymbolId>) {
+        let source = &self.transfer.source.arena;
+        let symbols = &mut self.transfer.symbols;
+        let value = xfer::transfer_bool(source, value, self.owner.arena(), &mut |symbol, arena| {
+            *symbols.entry(symbol).or_insert_with(|| {
+                let sort = source.symbol_sort(symbol);
+                let s = arena.checker_variable(sort);
+                match sort {
+                    SymbolSort::Int => AnyExpr::Int(arena.int_symbol(s)),
+                    SymbolSort::Nat => AnyExpr::Nat(arena.nat_symbol(s)),
+                    SymbolSort::Scalar(_) => AnyExpr::Scalar(arena.scalar_symbol_erased(s)),
+                }
+            })
+        });
+        (value, self.owner.arena_ref().free_symbols(value.into()))
+    }
     fn integer(&mut self, value: IntExpr) -> IntExpr {
         self.owner.import_integer(self.transfer, value)
     }
@@ -1493,10 +2311,11 @@ impl RegionMapping for CallMapping<'_, '_, '_, '_> {
             *value
         } else {
             let (_, value) = self.owner.fresh_integer();
+            let value = AnyExpr::Int(value);
             self.transfer.symbols.insert(symbol, value);
             value
         };
-        match self.owner.arena_ref().view(AnyExpr::Int(value)) {
+        match self.owner.arena_ref().view(value) {
             crate::expr::NodeView::Symbol(s) => s,
             _ => unreachable!("bound coordinate maps to a bound coordinate"),
         }
@@ -1584,23 +2403,33 @@ impl Initialization<'_, '_> {
     /// symbols, enclosing loop binders, the values of its locals and its
     /// path conditions.
     fn scope_symbols(&self, entry: &World) -> BTreeSet<SymbolId> {
-        fn value_symbols(value: &Value, arena: &ExprArena, symbols: &mut BTreeSet<SymbolId>) {
+        fn value_bindings(value: &Value, arena: &ExprArena, symbols: &mut BTreeSet<SymbolId>) {
             match value {
                 Value::Scalar(scalar) => {
-                    if let Some(integer) = scalar.integer {
+                    if let Some(integer) = scalar.integer() {
                         symbols.extend(prove::symbols(arena, integer));
                     }
-                    if let Some((start, end)) = scalar.range {
+                    if let Scalar::Word {
+                        binding: Some(binding),
+                        ..
+                    } = scalar
+                    {
+                        symbols.insert(*binding);
+                    }
+                    if let Some(value) = scalar.typed() {
+                        symbols.extend(arena.free_symbols(AnyExpr::Scalar(value)));
+                    }
+                    if let Some((start, end)) = scalar.range() {
                         symbols.extend(prove::symbols(arena, start));
                         symbols.extend(prove::symbols(arena, end));
                     }
                 }
                 Value::Tuple(parts) => {
                     for part in parts {
-                        value_symbols(part, arena, symbols);
+                        value_bindings(part, arena, symbols);
                     }
                 }
-                Value::Tensor(_) | Value::Void => {}
+                Value::Tensor(_) | Value::Void | Value::Opaque => {}
             }
         }
         let mut symbols = self
@@ -1609,7 +2438,7 @@ impl Initialization<'_, '_> {
             .collect::<BTreeSet<_>>();
         symbols.extend(self.binders.iter().copied());
         for value in entry.values.values() {
-            value_symbols(value, self.arena_ref(), &mut symbols);
+            value_bindings(value, self.arena_ref(), &mut symbols);
         }
         for (condition, _) in &entry.path {
             self.condition_symbols(condition, &mut symbols);
@@ -1628,8 +2457,24 @@ impl Initialization<'_, '_> {
                 .any(|(other, other_value)| condition == other && value != other_value)
         })
     }
+    fn visit_regions_separate(
+        &mut self,
+        kind: ir::LoopKind,
+        left: Region,
+        right: Region,
+        facts: &prove::Facts,
+        extents: &[IntExpr],
+    ) -> bool {
+        match kind {
+            ir::LoopKind::Ordered => {
+                EstablishedRegionOps(self).separated_regions(left, right, facts, extents)
+            }
+            ir::LoopKind::Independent => self.separated_regions(left, right, facts, extents),
+        }
+    }
     fn distinct_visit_accesses_separate(
         &mut self,
+        kind: ir::LoopKind,
         left: &Access,
         right: &Access,
         symbol: SymbolId,
@@ -1645,10 +2490,19 @@ impl Initialization<'_, '_> {
         for (condition, _) in &right.path {
             self.condition_symbols(condition, &mut symbols);
         }
-        let mut rename = HashMap::from([(symbol, other)]);
+        let mut rename = HashMap::from([(symbol, AnyExpr::Int(other))]);
         for local in symbols {
             if local != symbol && !captured.contains(&local) {
-                rename.insert(local, self.fresh_integer().1);
+                let sort = self.arena_ref().symbol_sort(local);
+                let fresh = self.arena().checker_variable(sort);
+                let value = match sort {
+                    SymbolSort::Int => AnyExpr::Int(self.arena().int_symbol(fresh)),
+                    SymbolSort::Nat => AnyExpr::Nat(self.arena().nat_symbol(fresh)),
+                    SymbolSort::Scalar(_) => {
+                        AnyExpr::Scalar(self.arena().scalar_symbol_erased(fresh))
+                    }
+                };
+                rename.insert(local, value);
             }
         }
         let other_region = self.rename_region(&right.region, &rename);
@@ -1663,6 +2517,30 @@ impl Initialization<'_, '_> {
         facts.set_range(other_symbol, start, upper);
         let current = self.arena().int_symbol(symbol);
         for (a, b) in [(current, other), (other, current)] {
+            // Guarded accesses are subsets of these same footprints. If
+            // loop geometry already separates their overapproximations,
+            // their potentially complex path predicates cannot introduce
+            // an overlap. Retain the path-aware proof when geometry alone
+            // is insufficient, including accesses separated only by guards.
+            let mut geometry = facts.clone();
+            let mut geometry_path = vec![];
+            if !self.assume(
+                &mut geometry_path,
+                &mut geometry,
+                Condition::Compare(BinaryOp::Lt, a, b),
+                true,
+            ) {
+                continue;
+            }
+            if self.visit_regions_separate(
+                kind,
+                left.region.clone(),
+                other_region.clone(),
+                &geometry,
+                extents,
+            ) {
+                continue;
+            }
             let mut orientation = facts.clone();
             let mut path = vec![];
             if !left
@@ -1681,7 +2559,8 @@ impl Initialization<'_, '_> {
             {
                 continue;
             }
-            if !self.separated_regions(
+            if !self.visit_regions_separate(
+                kind,
                 left.region.clone(),
                 other_region.clone(),
                 &orientation,
@@ -1710,52 +2589,72 @@ impl Initialization<'_, '_> {
         facts: &prove::Facts,
     ) -> Result<(), VisitOverlap> {
         let captured = self.captured_symbols(entry, start, end);
-        let accesses = outcomes
+        let mut seen = HashSet::new();
+        let mut root_indices = HashMap::new();
+        let mut roots: Vec<Vec<&Access>> = Vec::new();
+        for access in outcomes
             .iter()
             .flat_map(|outcome| outcome.accesses.iter().skip(access_start))
             .filter(|access| entry.roots.contains_key(&access.root))
-            .cloned()
-            .collect::<Vec<_>>();
-        for (left_index, left) in accesses.iter().enumerate() {
-            for right in accesses.iter().skip(left_index) {
-                let commuting = match kind {
-                    ir::LoopKind::Independent => {
-                        left.atomic.is_some() && left.atomic == right.atomic
+        {
+            // Outcome worlds can retain the same prefix accesses. Prove one
+            // obligation for each exact footprint, keeping its first span.
+            if !seen.insert(access.footprint()) {
+                continue;
+            }
+            let index = *root_indices.entry(access.root).or_insert_with(|| {
+                roots.push(Vec::new());
+                roots.len() - 1
+            });
+            roots[index].push(access);
+        }
+        // Distinct roots cannot alias. Preserve first-root encounter order,
+        // and retain self-pairs so one footprint still needs visit separation.
+        for accesses in roots {
+            let extents = entry.roots[&accesses[0].root].axes.clone();
+            for (left_index, left) in accesses.iter().enumerate() {
+                for right in accesses.iter().skip(left_index) {
+                    let commuting = match kind {
+                        ir::LoopKind::Independent => {
+                            left.atomic.is_some() && left.atomic == right.atomic
+                        }
+                        ir::LoopKind::Ordered => false,
+                    };
+                    let atomic = left.atomic.is_some() || right.atomic.is_some();
+                    if (!left.write && !right.write) || commuting {
+                        continue;
                     }
-                    ir::LoopKind::Ordered => false,
-                };
-                let atomic = left.atomic.is_some() || right.atomic.is_some();
-                if (!left.write && !right.write) || commuting {
-                    continue;
-                }
-                // Distinct roots are distinct storage: parameters never alias.
-                if left.root != right.root {
-                    continue;
-                }
-                let overlap = VisitOverlap {
-                    root: left.root,
-                    left: left.span,
-                    right: right.span,
-                };
-                if kind == ir::LoopKind::Ordered && atomic {
-                    return Err(overlap);
-                }
-                let extents = entry.roots[&left.root].axes.clone();
-                if !self.distinct_visit_accesses_separate(
-                    left, right, symbol, start, end, facts, &captured, &extents,
-                ) {
-                    return Err(overlap);
+                    let overlap = VisitOverlap {
+                        root: left.root,
+                        left: left.span,
+                        right: right.span,
+                    };
+                    if kind == ir::LoopKind::Ordered && atomic {
+                        return Err(overlap);
+                    }
+                    if !self.distinct_visit_accesses_separate(
+                        kind, left, right, symbol, start, end, facts, &captured, &extents,
+                    ) {
+                        return Err(overlap);
+                    }
                 }
             }
         }
         Ok(())
     }
-    fn rename_region(&mut self, region: &Region, map: &HashMap<SymbolId, IntExpr>) -> Region {
+    fn rename_integer(&mut self, value: IntExpr, map: &HashMap<SymbolId, AnyExpr>) -> IntExpr {
+        let values = map.iter().map(|(s, v)| (*s, *v)).collect::<Vec<_>>();
+        match self.arena().substitute_any(AnyExpr::Int(value), &values) {
+            AnyExpr::Int(value) => value,
+            _ => unreachable!("typed substitution preserves integer result"),
+        }
+    }
+    fn rename_region(&mut self, region: &Region, map: &HashMap<SymbolId, AnyExpr>) -> Region {
         match region {
             Region::Empty => Region::Empty,
             Region::Full => Region::Full,
             Region::Linear(a, b) => {
-                Region::Linear(self.substitute(*a, map), self.substitute(*b, map))
+                Region::Linear(self.rename_integer(*a, map), self.rename_integer(*b, map))
             }
             Region::Image {
                 domain,
@@ -1764,12 +2663,12 @@ impl Initialization<'_, '_> {
                 domain: self.rename_domain(domain, map),
                 coordinates: coordinates
                     .iter()
-                    .map(|c| self.substitute(*c, map))
+                    .map(|c| self.rename_integer(*c, map))
                     .collect(),
             },
             Region::LinearImage { domain, address } => Region::LinearImage {
                 domain: self.rename_domain(domain, map),
-                address: self.substitute(*address, map),
+                address: self.rename_integer(*address, map),
             },
             Region::Union(parts) => {
                 Region::Union(parts.iter().map(|p| self.rename_region(p, map)).collect())
@@ -1780,8 +2679,8 @@ impl Initialization<'_, '_> {
             Region::Bind(bound, inner) => Region::Bind(
                 Bound {
                     symbol: self.renamed_bound(bound.symbol, map),
-                    start: self.substitute(bound.start, &map),
-                    end: self.substitute(bound.end, &map),
+                    start: self.rename_integer(bound.start, &map),
+                    end: self.rename_integer(bound.end, &map),
                 },
                 Box::new(self.rename_region(inner, map)),
             ),
@@ -1793,26 +2692,26 @@ impl Initialization<'_, '_> {
             ),
         }
     }
-    fn rename_domain(&mut self, domain: &[Bound], map: &HashMap<SymbolId, IntExpr>) -> Vec<Bound> {
+    fn rename_domain(&mut self, domain: &[Bound], map: &HashMap<SymbolId, AnyExpr>) -> Vec<Bound> {
         domain
             .iter()
             .map(|d| Bound {
                 symbol: self.renamed_bound(d.symbol, map),
-                start: self.substitute(d.start, map),
-                end: self.substitute(d.end, map),
+                start: self.rename_integer(d.start, map),
+                end: self.rename_integer(d.end, map),
             })
             .collect()
     }
-    fn renamed_bound(&self, symbol: SymbolId, map: &HashMap<SymbolId, IntExpr>) -> SymbolId {
+    fn renamed_bound(&self, symbol: SymbolId, map: &HashMap<SymbolId, AnyExpr>) -> SymbolId {
         let Some(value) = map.get(&symbol) else {
             return symbol;
         };
-        match self.arena_ref().view(AnyExpr::Int(*value)) {
+        match self.arena_ref().view(*value) {
             crate::expr::NodeView::Symbol(renamed) => renamed,
             _ => unreachable!("bound coordinate maps to a bound coordinate"),
         }
     }
-    fn rename_condition(&mut self, c: &Condition, map: &HashMap<SymbolId, IntExpr>) -> Condition {
+    fn rename_condition(&mut self, c: &Condition, map: &HashMap<SymbolId, AnyExpr>) -> Condition {
         match c {
             Condition::Version(version, binders) => Condition::Version(
                 *version,
@@ -1820,25 +2719,35 @@ impl Initialization<'_, '_> {
                     .iter()
                     .flat_map(|symbol| {
                         map.get(symbol)
-                            .map(|value| prove::symbols(self.arena_ref(), *value))
+                            .map(|value| self.arena_ref().free_symbols(*value))
                             .unwrap_or_else(|| vec![*symbol])
                     })
                     .collect(),
             ),
-            Condition::Actual(value, binders) => Condition::Actual(
-                *value,
-                binders
+            Condition::Actual(value, binders) => {
+                let replacements = map.iter().map(|(s, v)| (*s, *v)).collect::<Vec<_>>();
+                let value = match self
+                    .arena()
+                    .substitute_any(AnyExpr::Bool(*value), &replacements)
+                {
+                    AnyExpr::Bool(value) => value,
+                    _ => unreachable!("predicate substitution preserves Bool sort"),
+                };
+                let binders = binders
                     .iter()
                     .flat_map(|symbol| {
                         map.get(symbol)
-                            .map(|value| prove::symbols(self.arena_ref(), *value))
+                            .map(|value| self.arena_ref().free_symbols(*value))
                             .unwrap_or_else(|| vec![*symbol])
                     })
-                    .collect(),
-            ),
-            Condition::Compare(op, a, b) => {
-                Condition::Compare(*op, self.substitute(*a, map), self.substitute(*b, map))
+                    .collect();
+                Condition::Actual(value, binders)
             }
+            Condition::Compare(op, a, b) => Condition::Compare(
+                *op,
+                self.rename_integer(*a, map),
+                self.rename_integer(*b, map),
+            ),
             Condition::Not(c) => Condition::Not(Box::new(self.rename_condition(c, map))),
             Condition::And(a, b) => Condition::And(
                 Box::new(self.rename_condition(a, map)),
@@ -1903,24 +2812,35 @@ impl Initialization<'_, '_> {
                 .push((symbol, ParameterPart::Integer(metadata.binder.clone())));
         }
         for (path, value) in &captures {
-            if let Value::Scalar(Scalar {
-                integer: Some(value),
-                ..
-            }) = value
-            {
-                if let crate::expr::NodeView::Symbol(symbol) =
-                    self.arena_ref().view(AnyExpr::Int(*value))
-                {
+            if let Value::Scalar(scalar) = value {
+                let value = match scalar {
+                    Scalar::Word {
+                        binding: Some(binding),
+                        ..
+                    } => Some(AnyExpr::Int(self.arena().int_symbol(*binding))),
+                    _ => scalar
+                        .integer()
+                        .map(AnyExpr::Int)
+                        .or_else(|| scalar.typed().map(AnyExpr::Scalar)),
+                };
+                let Some(value) = value else {
+                    continue;
+                };
+                if let crate::expr::NodeView::Symbol(symbol) = self.arena_ref().view(value) {
                     if !metadata
                         .transfer
                         .symbols
                         .iter()
                         .any(|(prior, _)| *prior == symbol)
                     {
-                        metadata
-                            .transfer
-                            .symbols
-                            .push((symbol, ParameterPart::Integer(path.clone())));
+                        metadata.transfer.symbols.push((
+                            symbol,
+                            if scalar.typed().is_some() {
+                                ParameterPart::Scalar(path.clone())
+                            } else {
+                                ParameterPart::Integer(path.clone())
+                            },
+                        ));
                     }
                 }
             }
@@ -1935,21 +2855,52 @@ impl Initialization<'_, '_> {
                     .get(&place.root)
                     .cloned()
                     .unwrap_or(Region::Empty);
-                let logical = self.project_view_region(writes, &place.view, path, &entry.facts);
+                let logical = EstablishedRegionOps(self).project_view_region(
+                    writes,
+                    &place.view,
+                    path,
+                    &entry.facts,
+                );
                 written.push((capture.clone(), logical));
             }
         }
-        metadata.transfer.exits.push(Exit {
-            path: path.clone(),
-            written,
-        });
-        metadata.transfer = self.close_transfer(metadata.transfer.clone(), &allowed);
+        let mut parameter_axes = self.parameter_axes();
+        for (capture, value) in &captures {
+            if let Value::Tensor(place) = value {
+                parameter_axes.insert(capture.clone(), place.view.axes.clone());
+            }
+        }
+        // Close only this outcome's exit, then conjoin it with the exits
+        // already closed: reclosing a closed transfer would expand its
+        // disjunctive success path into one copy of every write per path.
+        let outcome = self.close_transfer(
+            crate::initialization::InitializationContract {
+                exits: vec![Exit {
+                    path: path.clone(),
+                    written,
+                }],
+                symbols: metadata.transfer.symbols.clone(),
+                ..crate::initialization::InitializationContract::empty()
+            },
+            &allowed,
+            &parameter_axes,
+        );
+        let prior = std::mem::replace(
+            &mut metadata.transfer,
+            crate::initialization::InitializationContract::empty(),
+        );
+        metadata.transfer = prior.conjoin_closed(outcome);
         for (local, invariant) in invariants {
             let mut parameter = ParameterPath::root(offset + local.local.index());
             for index in &local.path {
                 parameter = parameter.child(*index);
             }
-            let region = self.boundary_region(invariant.clone(), &allowed, false);
+            let region = self.boundary_region(
+                invariant.clone(),
+                &allowed,
+                false,
+                parameter_axes.get(&parameter).map(Vec::as_slice),
+            );
             if let Some((_, prior)) = metadata.carried.iter_mut().find(|(p, _)| *p == parameter) {
                 *prior = prior.clone().intersection(region);
             } else {
@@ -1960,8 +2911,9 @@ impl Initialization<'_, '_> {
 
     fn carried_region(&mut self, world: &World, place: &Place) -> Region {
         let root = &world.roots[&place.root];
-        self.project_view_region(
-            root.written.clone().union(root.incoming.clone()),
+        let written = self.materialized_written(world, place.root);
+        EstablishedRegionOps(self).project_view_region(
+            written.union(root.incoming.clone()),
             &place.view,
             &world.path,
             &world.facts,
@@ -1981,6 +2933,7 @@ impl Initialization<'_, '_> {
         start: &mut ir::Expr,
         end: &mut ir::Expr,
         body: &mut ir::Block,
+        value_versions: &[(ir::LocalId, ir::SourceValue, ir::SourceValue)],
         metadata: &mut crate::initialization::LoopInitialization,
         separation: &mut VisitSeparation,
     ) -> Vec<World> {
@@ -2004,20 +2957,17 @@ impl Initialization<'_, '_> {
             return empty.into_iter().collect();
         }
         let symbol = self.checker.locals[binder.index()]
-            .symbol
+            .value
+            .binding()
             .expect("checked loop binder has its symbolic identity");
         let current = self.arena().int_symbol(symbol);
         let one = self.arena().int(1);
         let upper = self.arena().int_sub(end, one);
         iteration.facts.set_range(symbol, start, upper);
         let access_facts = iteration.facts.clone();
-        iteration.values.insert(
-            binder,
-            Value::Scalar(Scalar {
-                integer: Some(current),
-                ..Default::default()
-            }),
-        );
+        iteration
+            .values
+            .insert(binder, Value::Scalar(Scalar::Quantity(current)));
         // Carry state is one inductive value contract. Derive a region
         // invariant, verify the body once under it, and preserve that same
         // root/initialization meaning at every next visit.
@@ -2041,34 +2991,60 @@ impl Initialization<'_, '_> {
             .collect::<Vec<_>>();
         if !single {
             for local in &reassigned {
-                if let Some(value) = iteration.values.get_mut(&local.local) {
-                    let value = value.at_mut(&local.path);
-                    if matches!(value, Value::Scalar(_)) {
-                        *value = Value::Scalar(Scalar {
-                            condition: Some(self.fresh_condition()),
-                            ..Default::default()
-                        });
-                    }
+                let mut ty = &self.checker.locals[local.local.index()].ty;
+                for index in &local.path {
+                    let ValueType::Tuple(parts) = ty else {
+                        unreachable!("checked tuple assignment path")
+                    };
+                    ty = &parts.as_slice()[*index];
+                }
+                let ty = ty.clone();
+                if matches!(
+                    iteration
+                        .values
+                        .get(&local.local)
+                        .map(|value| value.at(&local.path)),
+                    Some(Value::Scalar(_))
+                ) {
+                    let unknown = self.result(&mut iteration, &ty, true);
+                    *iteration
+                        .values
+                        .get_mut(&local.local)
+                        .unwrap()
+                        .at_mut(&local.path) = unknown;
                 }
             }
         }
+        let header_bindings = value_versions
+            .iter()
+            .map(|(local, header, _)| (*local, header.clone()))
+            .collect::<Vec<_>>();
+        self.bind_value_bindings(&mut iteration, &header_bindings);
         iteration.defer_depth += 1;
         let deferred_start = iteration.deferred.len();
         let access_start = iteration.accesses.len();
         let mut invariants = Vec::new();
-        let outcomes = if carries.is_empty() || single {
+        let mut outcomes = if carries.is_empty() || single {
             self.block(vec![iteration], body)
         } else {
             let mut allowed = self.dimension_symbols();
             allowed.extend(self.symbols.iter().map(|(symbol, _)| *symbol));
             allowed.extend(self.binders.iter().copied().filter(|s| *s != symbol));
             for value in entry.values.values() {
-                if let Value::Scalar(Scalar {
-                    integer: Some(value),
-                    ..
-                }) = value
-                {
-                    allowed.extend(prove::symbols(self.arena_ref(), *value));
+                if let Value::Scalar(scalar) = value {
+                    if let Some(value) = scalar.integer() {
+                        allowed.extend(prove::symbols(self.arena_ref(), value));
+                    }
+                    if let Scalar::Word {
+                        binding: Some(binding),
+                        ..
+                    } = scalar
+                    {
+                        allowed.push(*binding);
+                    }
+                    if let Some(value) = scalar.typed() {
+                        allowed.extend(self.arena_ref().free_symbols(AnyExpr::Scalar(value)));
+                    }
                 }
             }
             let mut trial = iteration.clone();
@@ -2087,29 +3063,37 @@ impl Initialization<'_, '_> {
             self.checker.diagnostics.truncate(diagnostics);
             for (local, place) in &carries {
                 let initial_root = &iteration.roots[&place.root];
-                let mut initial = initial_root
-                    .written
-                    .clone()
+                let root_axes = initial_root.axes.clone();
+                let mut initial = self
+                    .materialized_written(&iteration, place.root)
                     .union(initial_root.incoming.clone());
                 if let Some(parameter) = &initial_root.parameter {
-                    for outcome in &preliminary {
-                        for required in outcome
-                            .requirements
-                            .iter()
-                            .filter(|r| &r.parameter == parameter)
-                        {
+                    let regions = preliminary
+                        .iter()
+                        .flat_map(|outcome| {
+                            outcome
+                                .requirements
+                                .iter()
+                                .filter(|r| &r.parameter == parameter)
+                        })
+                        .map(|required| {
                             let region = Region::Guard(
                                 required.path.clone(),
                                 Box::new(required.region.clone()),
                             );
-                            let region =
-                                Region::Bind(Bound { symbol, start, end }, Box::new(region));
-                            let region = self.normalize(region, &iteration.facts);
-                            initial = initial.union(self.boundary_region(region, &allowed, true));
-                        }
+                            Region::Bind(Bound { symbol, start, end }, Box::new(region))
+                        })
+                        .collect();
+                    for region in self.normalize_many(regions, &iteration.facts) {
+                        initial = initial.union(self.boundary_region(
+                            region,
+                            &allowed,
+                            true,
+                            Some(&root_axes),
+                        ));
                     }
                 }
-                let mut invariant = self.project_view_region(
+                let mut invariant = EstablishedRegionOps(self).project_view_region(
                     initial,
                     &place.view,
                     &iteration.path,
@@ -2128,7 +3112,8 @@ impl Initialization<'_, '_> {
                     }
                 }
                 invariant = self.normalize(invariant, &entry.facts);
-                invariant = self.boundary_region(invariant, &allowed, false);
+                invariant =
+                    self.boundary_region(invariant, &allowed, false, Some(&place.view.axes));
                 let required = self.map_region(invariant.clone(), place);
                 self.require(&mut iteration, place.root, required, loop_span);
                 let name = iteration.roots[&place.root].name.clone();
@@ -2177,7 +3162,8 @@ impl Initialization<'_, '_> {
                     // Loop-private coordinates cannot escape as the final
                     // value's initialized set. Keep the verified invariant
                     // plus any independently established exit region.
-                    let actual = self.boundary_region(actual, &allowed, false);
+                    let actual =
+                        self.boundary_region(actual, &allowed, false, Some(&next.view.axes));
                     if outcome.roots[&next.root].parameter.is_none()
                         && !matches!(outcome.roots[&next.root].written, Region::Full)
                     {
@@ -2188,6 +3174,39 @@ impl Initialization<'_, '_> {
             }
             verified
         };
+        // Outcomes still own their arm and iteration facts here. Snapshot each
+        // exported root once before matching paths and binding private axes.
+        for outcome in &mut outcomes {
+            // A root this visit never wrote keeps the entry's own region.
+            let roots = entry
+                .roots
+                .iter()
+                .filter(|(root, before)| {
+                    outcome
+                        .roots
+                        .get(root)
+                        .is_some_and(|after| after.written != before.written)
+                })
+                .map(|(root, _)| *root)
+                .collect::<Vec<_>>();
+            for (root, written) in self.materialized_writes(outcome, &roots) {
+                outcome.roots.get_mut(&root).unwrap().written = written;
+            }
+        }
+        // Roots no visit wrote: their completed loop adds nothing.
+        let unwritten = entry
+            .roots
+            .iter()
+            .filter(|(root, before)| {
+                outcomes.iter().all(|outcome| {
+                    outcome
+                        .roots
+                        .get(root)
+                        .is_some_and(|after| after.written == before.written)
+                })
+            })
+            .map(|(root, _)| *root)
+            .collect::<HashSet<_>>();
         self.binders.pop();
         match kind {
             ir::LoopKind::Ordered if self.record_loops => {
@@ -2243,18 +3262,32 @@ impl Initialization<'_, '_> {
                     Self::compatible_paths(&path, &self.independent_path(&other.path, symbol))
                 })
                 .collect::<Vec<_>>();
-            let mut guaranteed = HashMap::new();
-            for root in entry.roots.keys() {
-                let writes = matching.iter().fold(Region::Full, |state, other| {
-                    state.intersection(
-                        other
-                            .roots
-                            .get(root)
-                            .map_or(Region::Empty, |r| r.written.clone()),
-                    )
-                });
-                let writes = self.normalize(writes, &entry.facts);
-                guaranteed.insert(*root, writes);
+            let exported_roots = entry.roots.keys().copied().collect::<Vec<_>>();
+            let written_roots = exported_roots
+                .iter()
+                .copied()
+                .filter(|root| !unwritten.contains(root))
+                .collect::<Vec<_>>();
+            let guaranteed_regions = written_roots
+                .iter()
+                .map(|root| {
+                    matching.iter().fold(Region::Full, |state, other| {
+                        state.intersection(
+                            other
+                                .roots
+                                .get(root)
+                                .map_or(Region::Empty, |r| r.written.clone()),
+                        )
+                    })
+                })
+                .collect();
+            let mut guaranteed = written_roots
+                .iter()
+                .copied()
+                .zip(self.normalize_many(guaranteed_regions, &entry.facts))
+                .collect::<HashMap<_, _>>();
+            for root in &unwritten {
+                guaranteed.insert(*root, entry.roots[root].written.clone());
             }
             if self.record_loops {
                 self.record_loop_initialization(
@@ -2268,16 +3301,67 @@ impl Initialization<'_, '_> {
                 );
             }
             let mut exit = outcome.clone();
-            exit.accesses = entry.accesses.clone();
-            for access in outcome.accesses.iter().skip(access_start) {
-                if !entry.roots.contains_key(&access.root) {
-                    continue;
-                }
-                let region = Region::Bind(
+            // Incoming sets are input assumptions, not produced writes. Do
+            // not carry an iteration-private guard into the next outer world.
+            // Rebuild additions from the quantified requirements below.
+            for (root, before) in &entry.roots {
+                exit.roots.get_mut(root).unwrap().incoming = before.incoming.clone();
+            }
+            // Incoming/trial-contract reads may have been exported immediately
+            // rather than deferred. Their private guards have the same loop
+            // lifetime as recorded accesses and deferred read requirements.
+            let requirements = outcome
+                .requirements
+                .iter()
+                .skip(entry.requirements.len())
+                .collect::<Vec<_>>();
+            let accesses = outcome
+                .accesses
+                .iter()
+                .skip(access_start)
+                .filter(|access| entry.roots.contains_key(&access.root))
+                .collect::<Vec<_>>();
+            let quantified = |path: &Path, region: &Region| {
+                Region::Bind(
                     Bound { symbol, start, end },
-                    Box::new(access.region.clone()),
-                );
-                let region = self.normalize(region, &entry.facts);
+                    Box::new(Region::guarded(path.clone(), region.clone())),
+                )
+            };
+            // One export boundary owns one normalization batch. Each effect
+            // retains its result and metadata, while identical binder/guard
+            // scopes reuse their own reached scalar and derivation state.
+            let regions = requirements
+                .iter()
+                .map(|required| quantified(&required.path, &required.region))
+                .chain(
+                    accesses
+                        .iter()
+                        .map(|access| quantified(&access.path, &access.region)),
+                )
+                .collect();
+            let mut regions = self.normalize_many(regions, &entry.facts).into_iter();
+            exit.requirements = entry.requirements.clone();
+            for required in requirements {
+                let region = regions.next().expect("normalized requirement export");
+                let path = self.independent_path(&required.path, symbol);
+                for root in exit.roots.values_mut() {
+                    if root.parameter.as_ref() == Some(&required.parameter) {
+                        root.incoming = root
+                            .incoming
+                            .clone()
+                            .union(Region::guarded(path.clone(), region.clone()));
+                    }
+                }
+                exit.requirements.push(Requirement {
+                    parameter: required.parameter.clone(),
+                    region,
+                    path,
+                    span: required.span,
+                });
+            }
+            exit.accesses = entry.accesses.clone();
+            for access in accesses {
+                let region = regions.next().expect("normalized access export");
                 let path = self.independent_path(&access.path, symbol);
                 exit.record_access(Access {
                     root: access.root,
@@ -2288,6 +3372,7 @@ impl Initialization<'_, '_> {
                     atomic: access.atomic,
                 });
             }
+            assert!(regions.next().is_none(), "extra normalized loop exports");
             exit.defer_depth = entry.defer_depth;
             exit.deferred = entry.deferred.clone();
             exit.facts = entry.facts.clone();
@@ -2303,12 +3388,14 @@ impl Initialization<'_, '_> {
             }
             // Reads are checked against their own source-position state and,
             // only for ordered loops, completed earlier iterations.
+            let mut exported_reads = Vec::new();
             for read in outcome.deferred.iter().skip(deferred_start) {
                 let mut available = read.available.clone();
                 if kind == ir::LoopKind::Ordered {
                     if let Some(writes) = guaranteed.get(&read.root) {
                         let (prior_symbol, prior) = self.fresh_integer();
-                        let writes = self.rename_region(writes, &HashMap::from([(symbol, prior)]));
+                        let writes = self
+                            .rename_region(writes, &HashMap::from([(symbol, AnyExpr::Int(prior))]));
                         let prefix = Region::Bind(
                             Bound {
                                 symbol: prior_symbol,
@@ -2324,10 +3411,55 @@ impl Initialization<'_, '_> {
                 if self.covered(&available, &read.region, &read.path, &read.facts, axes) {
                     continue;
                 }
-                let region =
-                    Region::Bind(Bound { symbol, start, end }, Box::new(read.region.clone()));
-                let region = self.normalize(region, &exit.facts);
-                let path = self.independent_path(&read.path, symbol);
+                // Resolve vacuity with the original private loop facts before
+                // binding the region or projecting any path symbols away.
+                // This is required at every nesting level, including reads
+                // propagated to an enclosing loop or exported as input effects.
+                if self.covered(&Region::Empty, &Region::Full, &read.path, &read.facts, axes) {
+                    continue;
+                }
+                if entry.defer_depth == 0 {
+                    let Some(root) = exit.roots.get(&read.root) else {
+                        continue;
+                    };
+                    if root.parameter.is_none() {
+                        // A local failure stays at its saved source position;
+                        // it does not produce a quantified input effect.
+                        let mut at_read = exit.clone();
+                        at_read.path = read.path.clone();
+                        at_read.facts = read.facts.clone();
+                        at_read.roots.get_mut(&read.root).unwrap().written = available;
+                        at_read.roots.get_mut(&read.root).unwrap().incoming = Region::Empty;
+                        self.require(&mut at_read, read.root, read.region.clone(), read.span);
+                        continue;
+                    }
+                }
+                // A read's guard is stated over its own source-position
+                // quantities. Reach it in that world, so a condition on an
+                // iteration value names the binder it denotes before the
+                // binder is quantified and independent conditions are kept.
+                let path = read
+                    .path
+                    .iter()
+                    .map(|(condition, truth)| {
+                        (
+                            self.reached_condition(condition.clone(), &read.facts),
+                            *truth,
+                        )
+                    })
+                    .collect::<Path>();
+                exported_reads.push((read, path));
+            }
+            // Each read was resolved against its own saved world. Only the
+            // surviving effects share the exit world at this export boundary.
+            // Keep coordinate-dependent guards inside their quantified domain.
+            let regions = exported_reads
+                .iter()
+                .map(|(read, path)| quantified(path, &read.region))
+                .collect();
+            let regions = self.normalize_many(regions, &exit.facts);
+            for ((read, path), region) in exported_reads.into_iter().zip(regions) {
+                let path = self.independent_path(&path, symbol);
                 if entry.defer_depth > 0 {
                     exit.deferred.push(Read {
                         root: read.root,
@@ -2337,33 +3469,43 @@ impl Initialization<'_, '_> {
                         facts: exit.facts.clone(),
                         span: read.span,
                     });
-                } else if let Some(root) = exit.roots.get(&read.root).cloned() {
-                    if let Some(parameter) = root.parameter {
-                        exit.requirements.push(Requirement {
-                            parameter,
-                            region: region.clone(),
-                            path: path.clone(),
-                            span: read.span,
-                        });
-                        exit.roots.get_mut(&read.root).unwrap().incoming =
-                            root.incoming.union(Region::Guard(path, Box::new(region)));
-                    } else {
-                        // Recheck with the saved source-position state, never
-                        // with writes encountered later while deriving the body.
-                        let mut at_read = exit.clone();
-                        at_read.path = read.path.clone();
-                        at_read.facts = read.facts.clone();
-                        at_read.roots.get_mut(&read.root).unwrap().written = available;
-                        at_read.roots.get_mut(&read.root).unwrap().incoming = Region::Empty;
-                        self.require(&mut at_read, read.root, read.region.clone(), read.span);
-                    }
+                } else {
+                    let root = exit.roots[&read.root].clone();
+                    let parameter = root.parameter.expect("classified loop input requirement");
+                    exit.requirements.push(Requirement {
+                        parameter,
+                        region: region.clone(),
+                        path: path.clone(),
+                        span: read.span,
+                    });
+                    exit.roots.get_mut(&read.root).unwrap().incoming =
+                        root.incoming.union(Region::Guard(path, Box::new(region)));
                 }
             }
-            for (root, before) in &entry.roots {
-                let written = guaranteed.get(root).cloned().unwrap_or(Region::Empty);
-                let completed = Region::Bind(Bound { symbol, start, end }, Box::new(written));
-                exit.roots.get_mut(root).unwrap().written = before.written.clone();
-                self.write_region(&mut exit, *root, completed);
+            let completed = written_roots
+                .iter()
+                .map(|root| {
+                    let written = guaranteed.get(root).cloned().unwrap_or(Region::Empty);
+                    Region::Bind(Bound { symbol, start, end }, Box::new(written))
+                })
+                .collect();
+            // Produced writes use established-only simplification, independently
+            // of mandatory read export; their earlier effects remain intact.
+            let completed = EstablishedRegionOps(self).normalize_many(completed, &exit.facts);
+            for (root, completed) in written_roots.into_iter().zip(completed) {
+                let written = entry.roots[&root].written.clone().union(completed);
+                // A completed write of every element is the whole root, so
+                // later reads need not rediscover it through each geometry.
+                let whole = !matches!(written, Region::Full)
+                    && EstablishedRegionOps(self).covered(
+                        &written,
+                        &Region::Full,
+                        &exit.path,
+                        &exit.facts,
+                        &exit.roots[&root].axes,
+                    );
+                exit.roots.get_mut(&root).unwrap().written =
+                    if whole { Region::Full } else { written };
             }
             exit.values
                 .retain(|local, _| entry.values.contains_key(local));
@@ -2417,7 +3559,7 @@ impl RegionOps for Initialization<'_, '_> {
     fn fresh_variable(&mut self) -> SymbolId {
         self.checker
             .arena
-            .proof_variable(crate::expr::SymbolSort::Int)
+            .checker_variable(crate::expr::SymbolSort::Int)
     }
 }
 
@@ -2445,6 +3587,33 @@ impl Initialization<'_, '_> {
     fn close_contract(&mut self, contract: Contract) -> Contract {
         let mut allowed = self.dimension_symbols();
         allowed.extend(contract.symbols.iter().map(|(symbol, _)| *symbol));
-        self.close_transfer(contract, &allowed)
+        let parameter_axes = self.parameter_axes();
+        self.close_transfer(contract, &allowed, &parameter_axes)
+    }
+    /// Contract coordinates belong to each logical parameter leaf. Selected
+    /// and reshaped captures supply their own view axes at the loop boundary.
+    fn parameter_axes(&self) -> HashMap<ParameterPath, Vec<IntExpr>> {
+        fn leaves(
+            ty: &ValueType,
+            path: ParameterPath,
+            result: &mut HashMap<ParameterPath, Vec<IntExpr>>,
+        ) {
+            match ty {
+                ValueType::Tensor(tensor) => {
+                    result.insert(path, tensor.axes.clone());
+                }
+                ValueType::Tuple(parts) => {
+                    for (ordinal, part) in parts.iter().enumerate() {
+                        leaves(part, path.child(ordinal), result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut result = HashMap::new();
+        for (ordinal, parameter) in self.checker.sig.params.iter().enumerate() {
+            leaves(&parameter.ty, ParameterPath::root(ordinal), &mut result);
+        }
+        result
     }
 }

@@ -353,7 +353,7 @@ tagged_enum!(crate::kernel::ops::BarrierScope, {Workgroup=>b"workgroup",Subgroup
 tagged_enum!(crate::kernel::ops::StoreElection, {GlobalLeader=>b"global-leader"});
 tagged_enum!(crate::schedule::LaunchParticipation, {Independent=>b"independent",CooperativeGrid=>b"cooperative-grid"});
 tagged_enum!(seismic_lang::intrinsics::AtomicOp, {Add=>b"add",Max=>b"max",Min=>b"min"});
-tagged_enum!(seismic_lang::intrinsics::MathOp, {Exp=>b"exp",Fma=>b"fma",Rsqrt=>b"rsqrt",Sqrt=>b"sqrt",Log=>b"log",Sin=>b"sin",Cos=>b"cos",Abs=>b"abs",Max=>b"max",Min=>b"min"});
+tagged_enum!(seismic_lang::intrinsics::MathOp, {Exp=>b"exp",Exp2=>b"exp2",Rint=>b"rint",Fma=>b"fma",Rsqrt=>b"rsqrt",Sqrt=>b"sqrt",Log=>b"log",Sin=>b"sin",Cos=>b"cos",Abs=>b"abs",Max=>b"max",Min=>b"min"});
 tagged_enum!(crate::physical_target::ResourceOwnershipScope, {Participant=>b"participant",Subgroup=>b"subgroup",Workgroup=>b"workgroup"});
 tagged_enum!(crate::physical_target::AddressableResourceRealization, {Native=>b"native"});
 tagged_enum!(crate::physical_target::ResourceLifetime, {Operation=>b"operation",Segment=>b"segment",Launch=>b"launch"});

@@ -1549,6 +1549,20 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             }
         }
     }
+    pub fn tensor_read_component(
+        &mut self,
+        tensor: &PortableTensor,
+        index: &[PortableValue],
+        component: registry::QuantizedComponent,
+    ) -> PortableValue {
+        let (indices, projection) = self.tensor_address(tensor, index);
+        assert!(
+            projection.is_none(),
+            "semantic components use logical packed views"
+        );
+        let place = self.checked_place(tensor.place);
+        super::representation::read_component(self, place, &indices, Some(component))
+    }
     pub fn tensor_write(
         &mut self,
         tensor: &PortableTensor,

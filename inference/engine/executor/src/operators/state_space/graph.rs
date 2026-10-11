@@ -6,12 +6,12 @@
 //! ports.
 
 use crate::operators::gated_delta::graph::{
-    bank_ports, chunked, RecurrentControlPorts, RecurrentStatePorts,
+    RecurrentControlPorts, RecurrentStatePorts, bank_ports, chunked,
 };
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_target_graph::{WeightPort, weight};
 use crate::{
-    native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape,
+    ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels,
 };
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{
@@ -128,8 +128,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 value_weight: (&empty).into(),
                 epsilon: block.epsilon,
                 project_mode: 0,
-            },
-        )?
+            },        )?
         .r0;
     let dimensions = shape.state_dimensions(block.rows, block.slots, banks, tape_rows);
     // The step and chunk entries share one contract, so their inputs have the
@@ -164,8 +163,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                         state: ports.delta.tensor_mut().into(),
                         tape: ports.tape.tensor_mut().into(),
                         slab_banks: block.slab_banks,
-                    },
-                )?
+                    },                )?
                 .value
         };
     }
@@ -186,8 +184,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 projection: (&projection).into(),
                 state_norm: (&state_norm).into(),
                 epsilon: block.norm_epsilon,
-            },
-        )?
+            },        )?
         .value;
     let output = graph
         .enqueue(
@@ -197,8 +194,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
-            },
-        )?
+            },        )?
         .value;
     Ok((output, ports, controls))
 }
@@ -207,14 +203,14 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, source_element, ComponentSelection, ExecutionPath, FeedForwardProgramSlot,
-        MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits,
-        ResourcePlanner,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
+        source_element,
     };
     use crate::{DenseScales, GeneralRoutedScales, PlanError};
     use magnitude_artifacts::{
-        gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+        gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
@@ -518,7 +514,10 @@ mod tests {
                 magnitude_state::KvCodec::Dense,
             )
             .unwrap();
-            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
+            assert!(
+                demand.streamed_bytes > 0 && demand.launches > 0,
+                "{backend:?}"
+            );
         }
     }
 
@@ -635,7 +634,10 @@ mod tests {
             );
             assert!(matches!(
                 plan.target().readout().head,
-                crate::ReadoutHead::Packed { weight_scale: 1, .. }
+                crate::ReadoutHead::Packed {
+                    weight_scale: 1,
+                    ..
+                }
             ));
 
             let state = ResourcePlanner::state_plan(

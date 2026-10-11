@@ -1,6 +1,6 @@
 ---
 applies_to:
-  - inference/validation/reference_matrix.sh
+  - inference-v3/roofline/**
 ---
 
 # Roofline

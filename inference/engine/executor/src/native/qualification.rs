@@ -145,6 +145,7 @@ impl<'a> QualificationView<'a> {
         self.qualify_shape_rows(device)?;
         self.qualify_sample_rows(device)?;
         self.qualify_conditioning_overlay(device)?;
+        self.qualify_feature_copy(device)?;
         self.qualify_target(device)?;
         self.qualify_head(device)?;
         self.qualify_vision(device)?;

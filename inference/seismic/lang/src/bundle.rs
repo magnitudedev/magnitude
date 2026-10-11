@@ -35,7 +35,7 @@
 use crate::check::ir::{Definition, Family};
 use crate::checked::internals::Module;
 use crate::checked::{
-    check_source, CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet,
+    CheckedModule, EntryInfo, NativeImplementation, SourceFile, SourceSet, check_source,
 };
 use crate::registry::BackendName;
 use crate::wire::{self, Scope};
@@ -43,11 +43,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Format version of the bundle wire schema. Bumped on any wire change.
-pub const BUNDLE_FORMAT_VERSION: u32 = 5;
+pub const BUNDLE_FORMAT_VERSION: u32 = 6;
 
 /// Semantic version of the checker whose output this crate can decode.
 /// Bundles produced under a different semantic version are incompatible.
-pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v8";
+pub const COMPILER_SEMANTIC_VERSION: &str = "seismic-semantics-v9";
 
 const MAGIC: &[u8; 8] = b"SEISBND6";
 
@@ -266,11 +266,20 @@ impl CheckedParts {
             && unique(entries.iter().map(|entry| entry.stable))
             && entry_families.len() == entries.len()
             && entry_families.iter().all(|family| *family < families.len())
+            && entries
+                .iter()
+                .all(|entry| entry.element_domain.well_formed())
             && unique(
                 native_implementations
                     .iter()
                     .map(|native| (native.entry, native.backend)),
             );
+        let valid = valid
+            && native_implementations.iter().all(|native| {
+                entries
+                    .get(native.entry.index())
+                    .is_some()
+            });
         if !valid {
             return None;
         }

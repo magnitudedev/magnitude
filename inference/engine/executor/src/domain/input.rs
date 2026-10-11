@@ -42,6 +42,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.input.insert(
             request,
             RequestInput {
+                boundary: None,
                 input,
                 images,
                 resident: false,

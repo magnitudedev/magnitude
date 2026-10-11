@@ -110,7 +110,7 @@ struct OpF16 {
     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
         // 1024 + (code + 128) in each half, then subtract 1152.
         const u32 pair =
-            prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 8));
+            prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 4));
         const u32 biased = prmt(pair, 0x64646464u, 0x4140u);
         u32 value;
         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(biased), "r"(0x3C003C00u), "r"(0xE480E480u));

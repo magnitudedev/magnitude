@@ -3,8 +3,8 @@
 
 use super::{ImportProgram, ReadySubmission};
 use crate::{
-    native::AttestedImport, DeviceError, ImportLaunchCore, ImportWorkspaceLease,
-    ResidentWeightSlot, Stored, SubmitError, ValidatedImportLaunch, WeightStorageIdentity,
+    DeviceError, ImportLaunchCore, ImportWorkspaceLease, ResidentWeightSlot, Stored, SubmitError,
+    ValidatedImportLaunch, WeightStorageIdentity, native::AttestedImport,
 };
 use magnitude_kernels::{import_dense, repack_weight};
 use seismic::{NativeTensorBatch, Tensor};
@@ -82,7 +82,11 @@ impl ImportProgram for NativeImportProgram {
     }
 }
 
-fn fill_staged_source(
+/// Write a staged upload from its stored source, the one way every import
+/// does: host-prepared bytes whole, a weight uploaded as stored through the
+/// device's reader upload, which holds no more of it on the host than one
+/// block at a time.
+pub(crate) fn fill_staged_source(
     stored: &Stored,
     plan: &crate::WeightPlan,
     upload: &mut Tensor,
@@ -308,9 +312,8 @@ mod tests {
 
         // A transformed weight uploads the host's transformed bytes: swapping
         // adjacent elements swaps each pair of words.
-        let swap = vec![magnitude_family_contracts::ImportTransform::PermuteRows {
-            order: vec![1, 0],
-        }];
+        let swap =
+            vec![magnitude_family_contracts::ImportTransform::PermuteRows { order: vec![1, 0] }];
         fill_staged_source(&stored, &plan(swap), &mut upload).unwrap();
         let swapped = values
             .chunks(8)

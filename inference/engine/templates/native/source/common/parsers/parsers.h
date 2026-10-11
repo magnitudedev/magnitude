@@ -39,6 +39,18 @@ std::string common_chat_template_generation_prompt_impl(
     const std::optional<json> & tools_override = std::nullopt,
     const std::optional<json> & additional_context = std::nullopt);
 
+// Adds rule `name`: text that does not begin with `open` and either contains
+// no `close` (`including` false) or ends at its first `close`, inclusive. A
+// parser reads text beginning with `open` another way (an opened value, or
+// reasoning) by ordered choice or a negative lookahead, neither of which GBNF
+// can express; without this the same text reads two ways, which greedy lexing
+// cannot decide.
+void unopened_text_grammar(const common_grammar_builder & builder,
+                           const std::string &            name,
+                           const std::string &            open,
+                           const std::string &            close,
+                           bool                           including);
+
 bool is_lfm2_template(const std::string & src);
 
 namespace workaround {

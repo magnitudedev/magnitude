@@ -47,7 +47,7 @@ pub enum PlaneName {
     Norm,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Codec {
     Dense {
         dtype: DType,
@@ -64,7 +64,7 @@ pub enum Codec {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CodecSpec {
     pub key: Codec,
     pub value: Codec,
@@ -155,7 +155,71 @@ impl KvCodec {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryEncoding {
+    Dense,
+    Affine,
+    Unsupported,
+}
+
+/// Physical extents per head of the affine storage descriptor. Native ABI
+/// names belong to the executor; this state contract names only its planes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineGeometry {
+    pub key_codes: usize,
+    pub key_coefficients: usize,
+    pub value_codes: usize,
+    pub value_coefficients: usize,
+    pub key_bits: u8,
+    pub value_bits: u8,
+}
+
 impl CodecSpec {
+    pub fn encoding(self) -> HistoryEncoding {
+        match (self.key, self.value) {
+            (Codec::Dense { .. }, Codec::Dense { .. }) => HistoryEncoding::Dense,
+            (Codec::Affine { .. }, Codec::Affine { .. }) => HistoryEncoding::Affine,
+            _ => HistoryEncoding::Unsupported,
+        }
+    }
+
+    /// The identical physical plane contract used by state allocation and
+    /// every attention producer/consumer, with widths per head.
+    pub fn planes(self) -> Result<Vec<PlaneDescriptor>, LayoutError> {
+        let mut planes = planes_for(VectorKind::Key, self.key, self.key_width)?;
+        planes.extend(planes_for(VectorKind::Value, self.value, self.value_width)?);
+        Ok(planes)
+    }
+
+    pub fn affine_geometry(self) -> Result<AffineGeometry, LayoutError> {
+        let (
+            Codec::Affine { bits: key_bits, .. },
+            Codec::Affine {
+                bits: value_bits, ..
+            },
+        ) = (self.key, self.value)
+        else {
+            return Err(LayoutError::WrongRepresentation("affine plane geometry"));
+        };
+        let planes = self.planes()?;
+        Ok(AffineGeometry {
+            key_codes: planes[0].row_elements,
+            key_coefficients: planes[1].row_elements,
+            value_codes: planes[2].row_elements,
+            value_coefficients: planes[3].row_elements,
+            key_bits,
+            value_bits,
+        })
+    }
+
+    pub fn bytes_per_head(self) -> Result<usize, LayoutError> {
+        self.planes()?.iter().try_fold(0usize, |total, plane| {
+            total
+                .checked_add(plane.row_bytes)
+                .ok_or(LayoutError::ArithmeticOverflow("history row bytes"))
+        })
+    }
+
     pub fn dense(dtype: DType, key_width: usize, value_width: usize) -> Self {
         Self {
             key: Codec::Dense { dtype },
@@ -198,6 +262,15 @@ pub struct ComponentDescriptor {
 }
 
 impl ComponentDescriptor {
+    /// Causal target attention consumes earlier rows through this codec even
+    /// within one batch. Media and separate draft visibility remain explicit
+    /// properties of their attention rows; this only declares cache semantics.
+    pub fn causal_rows_use_cache(&self) -> bool {
+        matches!(self.layer, LayerRef::Target(_))
+            && (matches!(self.codec.key, Codec::Affine { .. })
+                || matches!(self.codec.value, Codec::Affine { .. }))
+    }
+
     pub fn new(layer: LayerRef, codec: CodecSpec, heads: usize) -> Result<Self, LayoutError> {
         let codec = codec.validate()?;
         if heads == 0 {
@@ -243,6 +316,7 @@ impl ComponentDescriptor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutError {
+    WrongRepresentation(&'static str),
     ZeroWidth(VectorKind),
     ZeroHeads,
     InvalidDType { plane: PlaneName, dtype: DType },
@@ -260,6 +334,9 @@ pub enum LayoutError {
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongRepresentation(operation) => {
+                write!(f, "history descriptor does not support {operation}")
+            }
             Self::ZeroWidth(vector) => write!(f, "{vector:?} width must be positive"),
             Self::ZeroHeads => f.write_str("an attention-history component needs a head"),
             Self::InvalidDType { plane, dtype } => {

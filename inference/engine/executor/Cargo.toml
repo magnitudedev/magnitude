@@ -18,17 +18,14 @@ serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 sha2 = "=0.11.0"
 
 [features]
-# Development-only bounded precision calibration; production uses fixed limits.
-tuning-precision-experiment = []
 # Development-only tuning pin for bit-exact measurement runs
 # (`native::tuning::pinned`). Enabled only through `magnitude-engine`'s
-# `pinned-tuning` feature by the `forward_bench` example; never by a served
-# engine.
+# `pinned-tuning` feature by `magnitude-harness`; never by a served engine.
 pinned-tuning = []
 # Development-only tuning survey (`native::tuning::survey`): every admissible
 # configuration of every tuned entry is measured and recorded for replaying
 # the search. Enabled only through `magnitude-engine`'s `tuning-survey`
-# feature by `forward_bench`; never by a served engine.
+# feature by `magnitude-harness`; never by a served engine.
 tuning-survey = []
 
 # The catalog's families and headers, for the assessment terms of every

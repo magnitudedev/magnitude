@@ -2,7 +2,7 @@
 //! (`operators::vision`) enqueued over one validated image, one graph per
 //! exact patch class.
 
-use super::graph::{draft::GraphDraft, GraphError};
+use super::graph::{GraphError, draft::GraphDraft};
 use super::native_constants::{
     CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
 };
@@ -10,8 +10,8 @@ use super::{ReadySubmission, VisionProgram};
 use crate::error::PlanError;
 use crate::native::{AttestedVision, VisionKernels};
 use crate::operators::vision::{
-    vision_program, VisionKernel, VisionOperands, VisionProgram as VisionOps, VisionRows,
-    VisionValue,
+    VisionKernel, VisionOperands, VisionProgram as VisionOps, VisionRows, VisionValue,
+    vision_program,
 };
 use crate::{
     DeviceError, GraphOutputTensor, InvariantError, ModelLoadPlan, NativeGraphOutputLease,
@@ -75,7 +75,7 @@ trait VisionBindings<G: GraphDraft> {
         kernel: &VisionKernel,
     ) -> Result<G::Binding<'_, vision_patch_stem::Entry>, GraphError>;
     fn norm(&self, kernel: &VisionKernel)
-        -> Result<G::Binding<'_, vision_norm::Entry>, GraphError>;
+    -> Result<G::Binding<'_, vision_norm::Entry>, GraphError>;
     fn linear(
         &self,
         kernel: &VisionKernel,
@@ -89,7 +89,7 @@ trait VisionBindings<G: GraphDraft> {
         kernel: &VisionKernel,
     ) -> Result<G::Binding<'_, vision_attention::Entry>, GraphError>;
     fn pool(&self, kernel: &VisionKernel)
-        -> Result<G::Binding<'_, vision_pool::Entry>, GraphError>;
+    -> Result<G::Binding<'_, vision_pool::Entry>, GraphError>;
     fn position(
         &self,
         kernel: &VisionKernel,
@@ -457,7 +457,11 @@ impl<G: GraphDraft, B: VisionBindings<G>> Draft<'_, G, B> {
                 let (g, h) = (statics("G")?, statics("H")?);
                 // A norm of G > 1 member rows per cell reads patch rows and
                 // publishes cells.
-                let cells = if g == 1 { self.count(*row_kind) } else { self.cells };
+                let cells = if g == 1 {
+                    self.count(*row_kind)
+                } else {
+                    self.cells
+                };
                 let dims = [
                     ("C", cells),
                     ("G", g),

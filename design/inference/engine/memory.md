@@ -70,8 +70,11 @@ Stable fit capacity bounds metadata-only model fit. It is
 the allocation domain's total capacity under applicable process limits and, on Metal, the device's
 recommended working set, less the planning reserve. A live claim uses fresh headroom for that same
 domain, bounded by process limits, and must leave headroom above the planning reserve; on Metal it
-must also fit the working set's remaining bytes. The observation already excludes the engine's own
-charges and other processes' use, so an existing charge is never subtracted again. A load onto a
+must also leave the working set's remaining bytes above the same reserve, so the engine's charge
+never exceeds stable fit capacity. The driver's submission memory lies outside the engine's charge,
+and a working set filled to its end fails a submission as a lost device instead of refusing a claim.
+The observation already excludes the engine's own charges and other processes' use, so an existing
+charge is never subtracted again. A load onto a
 dedicated device also claims its staged uploads against host RAM under the host's reserve.
 
 State is stored in fixed-size history and bank slabs on every backend: one history slab tensor per
@@ -106,7 +109,10 @@ The engine's allocation census reports the charge from its reconciliation agains
 (requests, cached prefixes and submitted work), each byte once: context is surplus, retained, live
 and in-flight state and request media; compute is the committed graph pools and prepared programs,
 plus any charge not attributed to a holder; auxiliary is optional component weights; model is
-target weights, bound constants and the pristine recurrent seed.
+target weights, bound constants and the pristine recurrent seed. Standalone feature storage,
+including an open drafter boundary, is counted once across all physical owners and submitted
+consumers. Weak census observations and generation obligations do not extend its lifetime;
+reclaim estimates exclude allocations still owned by a fork, retained prefix or submitted work.
 
 ## Bands
 
@@ -186,9 +192,9 @@ kill is independent fault containment; it chooses nothing to release.
 - No new device allocation bypasses a fitting claim, and neither a rejected minimum nor a
   failed physical allocation changes accepted numerical state.
 - Reclamation follows the single order and stops when the measured deficit clears.
-- No engine claim leaves any used domain's headroom at or below its planning reserve; a claim
-  never unloads the model; persistent Reclaim ends in the typed unloaded state within the
-  one-second bound.
+- No engine claim leaves any used domain's headroom, or on Metal the working set's remaining bytes,
+  at or below its planning reserve; a claim never unloads the model; persistent Reclaim ends in the
+  typed unloaded state within the one-second bound.
 - Threshold values exist in one policy definition. Host distress is derived only from Seismic's
   host observation; no other code path reads an OS pressure signal.
 - On macOS every engine holding is wired from allocation to release, and no holding is counted in
@@ -219,6 +225,15 @@ Window(n) (a history references its last `n` rows plus tentative rows) or Shared
 layers read a source layer's regions). A history slab contains fixed-offset regions for every
 component of its domain; a bank slab contains complete recurrent banks, whose bytes follow from
 their components (convolution windows, gated delta and F32 state-space states, and their tapes).
+A load resolves the selected history preset into a validated `CodecSpec` per attention
+binding. That descriptor owns each vector's code bitdepth, grouping, coefficient type,
+width and packing; the binding's semantic activation element owns preparation rounding.
+State allocation and every append/attention graph obtain plane extents from the same
+state descriptor. The executor translates affine plane extents into entry dimensions
+once; native consumers derive bitdepth/grouping from those dimensions and declare the
+representations their implementation covers. A native capability is not permission to
+change the load's representation. Tuning fixtures, resource estimates and semantic/cache
+bindings carry the same descriptor rather than separate K8/V4 byte formulas.
 Row numbers identify a slab of their domain and an offset within it. Every history span lies within
 one slab. Rows are placed in pages: a domain's page is the smallest multiple of 256 rows for which
 its span limit below is at most 63; a slab holds a whole number of pages, and a domain reserves a
@@ -228,7 +243,7 @@ only in place after its end within its last page, or as whole free pages (pages 
 referenced row), preferring the page that begins at its end; a fresh history takes the middle page
 of the largest run of free pages. Every page a history references is therefore complete except its
 first and last, so a history of `r` rows presents at most `ceil(r / page) + 1` spans, and a Shared
-reader also sees at most `ceil(advance / page) + 1` spans of rows appended within one advance. The
+reader or a causal target reader with compressed history also sees at most `ceil(advance / page) + 1` spans of rows appended within one advance. The
 domain's span limit is that bound at its row limit. It is exact, guaranteed for every placement
 path (growth, interleaved requests, forks, window release, rollback and Reclaim), and it is the
 limit graphs are sealed to and every launch is checked against: a launch class beyond it is
@@ -240,6 +255,10 @@ one page per domain. Free space is tracked within each slab, and a freed slab in
 A Window(n) history releases its references on rows before `n` behind its accepted position after
 each advance; those rows are free again, a page is reused once none of its rows is referenced, and
 a slab left empty is released by the rules below.
+A launch may read rows its spans do not select (a tile covering several requests reads the
+union of their spans and masks the rest), so every slot of a slab table names device memory of a
+whole slab: a free slot names a backed slab of the same store, and only a store without backed
+slabs has none.
 Callers retain logical identities and published placement snapshots, never mutable physical bank
 indices.
 

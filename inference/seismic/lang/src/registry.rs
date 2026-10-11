@@ -11,8 +11,8 @@ use crate::ids::{CapabilityId, IntrinsicId, RepresentationConversionId, Represen
 use crate::types::DType;
 
 pub use crate::repr::{
-    CodeInterpretation, DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat, PlaneEncoding,
-    PlaneField, PlaneSchema,
+    CodeInterpretation, DecodeComponent, DecodeRecipe, DecodeStep, DecodeTemp, FloatCodeFormat,
+    PlaneEncoding, PlaneField, PlaneSchema, QuantizedComponent,
 };
 
 /// Backends are a closed set.
@@ -469,10 +469,19 @@ pub enum PlaneRepackRecipe {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RepackExpr {
-    SourceBits { bit: u32, width: u8 },
-    ShiftLeft { value: Box<RepackExpr>, bits: u8 },
+    SourceBits {
+        bit: u32,
+        width: u8,
+    },
+    ShiftLeft {
+        value: Box<RepackExpr>,
+        bits: u8,
+    },
     BitOr(Box<RepackExpr>, Box<RepackExpr>),
-    OffsetI32 { value: Box<RepackExpr>, offset: i32 },
+    OffsetI32 {
+        value: Box<RepackExpr>,
+        offset: i32,
+    },
     F16ToF32(Box<RepackExpr>),
     I32ToF32(Box<RepackExpr>),
     MultiplyF32(Box<RepackExpr>, Box<RepackExpr>),
@@ -1240,7 +1249,22 @@ pub fn plane_element_dtype(representation: RepresentationId, plane: &str) -> DTy
 /// Canonical typed decode recipe for a packed representation. Dense
 /// representations need no recipe.
 pub fn decode_recipe(id: RepresentationId, output: DType) -> Option<DecodeRecipe> {
-    internals::packed(id).map(|representation| representation.decode_recipe_to(output))
+    // A recipe is a pure function of the process-global registry; derive
+    // each one once rather than re-evaluating its reference math per query.
+    type Recipes = std::collections::HashMap<(RepresentationId, DType), Option<DecodeRecipe>>;
+    static RECIPES: std::sync::OnceLock<std::sync::RwLock<Recipes>> = std::sync::OnceLock::new();
+    let recipes = RECIPES.get_or_init(Default::default);
+    if let Some(known) = recipes.read().unwrap().get(&(id, output)) {
+        return known.clone();
+    }
+    let recipe =
+        internals::packed(id).map(|representation| representation.decode_recipe_to(output));
+    recipes
+        .write()
+        .unwrap()
+        .entry((id, output))
+        .or_insert(recipe)
+        .clone()
 }
 
 /// Canonical round-to-nearest-even bfloat16 value used by the representation
@@ -1332,8 +1356,8 @@ pub(crate) mod internals {
     //! capability so backend/capability slices are direct sub-slices.
 
     use super::*;
-    use crate::intrinsics::{capability_rows, RowOperand, RowResult};
-    use crate::repr::{PlaneEncoding, Repr, REPRS};
+    use crate::intrinsics::{RowOperand, RowResult, capability_rows};
+    use crate::repr::{PlaneEncoding, REPRS, Repr};
     use std::sync::OnceLock;
 
     pub(crate) struct Tables {
@@ -1807,13 +1831,17 @@ pub(crate) mod internals {
                     }
                     a
                 };
-                planes.iter().fold((block / group).max(1), |multiple, plane| {
-                    let chunk = 16 / gcd(16, plane.bytes_per_group);
-                    match plane.content {
-                        RowPlaneContent::Codes { .. } => multiple / gcd(multiple, chunk) * chunk,
-                        RowPlaneContent::Groups { .. } => multiple,
-                    }
-                })
+                planes
+                    .iter()
+                    .fold((block / group).max(1), |multiple, plane| {
+                        let chunk = 16 / gcd(16, plane.bytes_per_group);
+                        match plane.content {
+                            RowPlaneContent::Codes { .. } => {
+                                multiple / gcd(multiple, chunk) * chunk
+                            }
+                            RowPlaneContent::Groups { .. } => multiple,
+                        }
+                    })
             }
             Layout::Packet => unreachable!("a row layout is never `packet`"),
         };
@@ -2023,7 +2051,8 @@ pub(crate) mod internals {
                             .map(|p| RepackExpr::OffsetI32 {
                                 value: Box::new(RepackExpr::BitOr(
                                     Box::new(RepackExpr::SourceBits {
-                                        bit: (32 + (p / 128) * 32 + p % 32) * 8 + (p % 128 / 32) * 2,
+                                        bit: (32 + (p / 128) * 32 + p % 32) * 8
+                                            + (p % 128 / 32) * 2,
                                         width: 2,
                                     }),
                                     Box::new(RepackExpr::ShiftLeft {
@@ -2244,7 +2273,10 @@ pub(crate) mod internals {
                     PlaneRepackRecipe::BitRoutes(direct_bits(0, 2)),
                 ));
                 if minimum {
-                    push(plane("bias", PlaneRepackRecipe::BitRoutes(direct_bits(2, 2))));
+                    push(plane(
+                        "bias",
+                        PlaneRepackRecipe::BitRoutes(direct_bits(2, 2)),
+                    ));
                 }
             }
             "gguf_nvfp4" => {
@@ -2258,7 +2290,9 @@ pub(crate) mod internals {
                         (0..64)
                             .map(|p| {
                                 let (block, within) = (p / 16, p % 16);
-                                e2m1_positive_zero((4 + 8 * block + within % 8) * 8 + (within / 8) * 4)
+                                e2m1_positive_zero(
+                                    (4 + 8 * block + within % 8) * 8 + (within / 8) * 4,
+                                )
                             })
                             .collect(),
                     ),
@@ -2751,14 +2785,16 @@ mod tests {
             )
             .unwrap();
             assert_eq!(conversion.recipe.converted_f16_fields(), fields, "{source}");
-            let RepresentationKind::External(layout) =
-                &representation_info(conversion.source).kind
+            let RepresentationKind::External(layout) = &representation_info(conversion.source).kind
             else {
                 panic!("{source} is external storage")
             };
             let mut packets = vec![0xffu8; 2 * layout.packet_size as usize];
             conversion.admit_source(&mut packets);
-            for (packet, bytes) in packets.chunks_exact(layout.packet_size as usize).enumerate() {
+            for (packet, bytes) in packets
+                .chunks_exact(layout.packet_size as usize)
+                .enumerate()
+            {
                 for (index, byte) in bytes.iter().enumerate() {
                     let scale_high = fields.iter().any(|field| index as u32 == field / 8 + 1);
                     assert_eq!(
@@ -2956,7 +2992,7 @@ mod tests {
     /// count off the 16-row tile, and matrices of a rank-3 tensor.
     #[test]
     fn every_layout_decodes_exactly_like_the_packet_form() {
-        use crate::interp::{repack, TensorData};
+        use crate::interp::{TensorData, repack};
         for source_info in representations()
             .iter()
             .filter(|info| matches!(info.kind, RepresentationKind::External(_)))
@@ -3073,10 +3109,12 @@ mod tests {
                     occupied[start..start + width].fill(true);
                 }
             }
-            assert!(canonical
-                .iter()
-                .zip(&occupied)
-                .all(|(byte, occupied)| *occupied || *byte == 0));
+            assert!(
+                canonical
+                    .iter()
+                    .zip(&occupied)
+                    .all(|(byte, occupied)| *occupied || *byte == 0)
+            );
         }
     }
 

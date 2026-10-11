@@ -348,23 +348,6 @@ impl Parser {
             constraint = Some(self.expr()?);
             self.expect_newline()?;
         }
-        let mut error_classes = Vec::new();
-        while self.at_word("error_class") {
-            let begin = self.bump().span;
-            let name = self.expect_name()?;
-            let Some(when) = self.native_when()? else {
-                return Err(self.error(format!(
-                    "expected `when <condition>` after the error class name, found {}",
-                    self.peek().describe()
-                )));
-            };
-            self.expect_newline()?;
-            error_classes.push(NativeErrorClassDecl {
-                name,
-                when,
-                span: begin.to(self.prev_span()),
-            });
-        }
         let mut scratch = Vec::new();
         while self.at_word("scratch") {
             let begin = self.bump().span;
@@ -428,7 +411,7 @@ impl Parser {
         }
         if launches.is_empty() {
             return Err(self.error(format!(
-                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `let`, `where`, `error_class`, `scratch`, then one or more launches",
+                "expected `launch <kernel>:`, found {}; a native declaration lists `static`, `params`, `elements`, `let`, `where`, `scratch`, then one or more launches",
                 self.peek().describe()
             )));
         }
@@ -442,7 +425,6 @@ impl Parser {
             elements,
             terms,
             constraint,
-            error_classes,
             scratch,
             launches,
             repeat,
@@ -982,7 +964,7 @@ impl Parser {
                     Some(op) => {
                         if !is_place(&target) {
                             return Err(Diagnostic::with_rule(
-                            DiagnosticRule::Syntax,
+                                DiagnosticRule::Syntax,
                                 target.span,
                                 "cannot assign to this expression; a target is a name, an indexed place or a tuple of them",
                             ));
@@ -1328,28 +1310,6 @@ mod tests {
     }
 
     #[test]
-    fn error_class_declarations_round_trip() {
-        let file = round_trip(
-            "native scale for metal from \"scale.metal\":\n    static (N)\n    params (arithmetic form DEPTH in [0, 1], code PACKED in [0, 1])\n    where N >= 64\n    error_class row_mixing when DEPTH >= 1\n    error_class int8_activations when PACKED == 1 and N >= 128\n    scratch sums bytes (N * 4)\n    launch scale:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (256, 1, 1)\n",
-        );
-        let [Decl::Native(native)] = file.decls.as_slice() else {
-            panic!("expected one native implementation")
-        };
-        assert_eq!(
-            native
-                .error_classes
-                .iter()
-                .map(|class| class.name.name.as_str())
-                .collect::<Vec<_>>(),
-            ["row_mixing", "int8_activations"]
-        );
-        assert!(parse(
-            "native scale for metal from \"scale.metal\":\n    error_class row_mixing\n    launch scale:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (1, 1, 1)\n"
-        )
-        .is_err());
-    }
-
-    #[test]
     fn specialized_native_declarations_round_trip() {
         let file = round_trip(
             "native scale for cuda from \"scale.cu\":\n    static (N)\n    params (arithmetic form PARTS in [1, 2, 4], WIDTH in [64, 128])\n    where PARTS * WIDTH <= N and WIDTH >= 64\n    scratch partials bytes (PARTS * N * 4)\n    launch scale_partial:\n        threadgroups (ceil_div(N, WIDTH), PARTS, 1)\n        threads_per_threadgroup (WIDTH, 1, 1)\n        shared_bytes (max(WIDTH * 4, 256))\n    launch scale_merge:\n        threadgroups (ceil_div(N, 256), 1, 1)\n        threads_per_threadgroup (min(N, 256), 1, 1)\n",
@@ -1679,9 +1639,10 @@ mod tests {
         let err = parse(text).unwrap_err();
         assert_eq!(err.rule, DiagnosticRule::Syntax);
         assert_eq!(&text[err.span.start as usize..err.span.end as usize], "for");
-        assert!(err
-            .message
-            .contains("written as `lower NAME … for BACKEND`"));
+        assert!(
+            err.message
+                .contains("written as `lower NAME … for BACKEND`")
+        );
     }
 
     #[test]

@@ -14,21 +14,20 @@
 //! bound once with the weights.
 
 use crate::operators;
-use crate::operators::output::{post_norm, CheckedPostNormEntries, PostNormShape, TailEntries};
-use crate::programs::graph::{draft::GraphDraft, GraphError};
+use crate::operators::output::{CheckedPostNormEntries, PostNormShape, TailEntries, post_norm};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_target_graph::ScaledWeight;
+use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use crate::{
     native::{AttentionHistoryKernels, AttentionKernels},
     programs::native_constants::GraphConstant,
 };
-use crate::{AttentionBinding, AttentionShape, SublayerTail};
 use magnitude_family_contracts::{Attention, Rotary, WeightKind};
 use magnitude_kernels::{
-    attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
-    attention_prefill_k8v4, attention_project,
+    attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4,
+    attention_output, attention_prefill, attention_prefill_k8v4, attention_project,
 };
-use magnitude_state::KvCodec;
-use magnitude_state::AFFINE_GROUP;
+use magnitude_state::{CodecSpec, HistoryEncoding};
 use seismic::{
     Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor, WorkflowTensorRef,
     WorkflowTensorView,
@@ -55,6 +54,7 @@ pub(crate) enum AttentionHistoryEntries<'a, G: GraphDraft + 'a> {
         prefill: G::Binding<'a, attention_prefill::Entry>,
     },
     AffineK8V4 {
+        codec: CodecSpec,
         append: G::Binding<'a, attention_append_k8v4::Entry>,
         decode: G::Binding<'a, attention_decode_k8v4::Entry>,
         verify: Option<G::Binding<'a, attention_decode_k8v4::Entry>>,
@@ -97,6 +97,7 @@ impl<'a> From<&'a AttentionKernels> for AttentionGraphEntries<'a, NativeGraph> {
                 prefill,
                 prefill_listed,
             } => AttentionHistoryEntries::AffineK8V4 {
+                codec: kernels.codec,
                 append,
                 decode,
                 verify: verify.as_ref(),
@@ -121,7 +122,7 @@ pub(crate) struct CheckedAttentionEntries {
     mix: [(&'static str, Element); 1],
     output: [(&'static str, Element); 2],
     post_norm: Option<CheckedPostNormEntries>,
-    history: KvCodec,
+    history: CodecSpec,
     /// Whether the graphs may list their launch's history row tiles
     /// (`StateResourcePlan::lists_history_tiles`, for a program whose
     /// classes have the listing axis).
@@ -131,7 +132,7 @@ pub(crate) struct CheckedAttentionEntries {
 impl CheckedAttentionEntries {
     pub(crate) fn new(binding: AttentionBinding, lists: bool) -> Self {
         Self {
-            lists: lists && binding.history == KvCodec::AffineK8V4,
+            lists: lists && binding.history.encoding() == HistoryEncoding::Affine,
             project: [
                 ("NW", binding.norm),
                 ("QW", binding.query),
@@ -155,14 +156,15 @@ impl CheckedAttentionEntries {
     }
 
     pub(crate) fn entries(&self) -> Result<AttentionGraphEntries<'_, NativeGraphMetadata>, String> {
-        let history = match self.history {
-            KvCodec::Dense => AttentionHistoryEntries::Dense {
+        let history = match self.history.encoding() {
+            HistoryEncoding::Dense => AttentionHistoryEntries::Dense {
                 append: &self.mix[..],
                 decode: &self.mix[..],
                 verify: None,
                 prefill: &self.mix[..],
             },
-            KvCodec::AffineK8V4 => AttentionHistoryEntries::AffineK8V4 {
+            HistoryEncoding::Affine => AttentionHistoryEntries::AffineK8V4 {
+                codec: self.history,
                 append: &self.mix[..],
                 decode: &self.mix[..],
                 verify: None,
@@ -171,8 +173,8 @@ impl CheckedAttentionEntries {
                 prefill: &self.mix[..],
                 prefill_listed: self.lists.then_some(&self.mix[..]),
             },
-            KvCodec::RotatedK4V4 => {
-                return Err("rotated K4/V4 has no native attention entry".into())
+            HistoryEncoding::Unsupported => {
+                return Err("rotated K4/V4 has no native attention entry".into());
             }
         };
         Ok(AttentionGraphEntries {
@@ -186,6 +188,18 @@ impl CheckedAttentionEntries {
     }
 }
 
+/// One translation from the load-owned plane descriptor to the affine
+/// entry's static dimensions; append, tuning and sealed graphs share it.
+pub(crate) fn affine_dimensions(codec: CodecSpec) -> Result<Vec<(&'static str, u64)>, String> {
+    let geometry = codec.affine_geometry().map_err(|e| e.to_string())?;
+    Ok(vec![
+        ("KC", geometry.key_codes as u64),
+        ("KP", geometry.key_coefficients as u64),
+        ("VC", geometry.value_codes as u64),
+        ("VP", geometry.value_coefficients as u64),
+    ])
+}
+
 /// Row classes up to this size attend with the decode entry; larger classes
 /// use the prefill entry.
 pub(crate) const DECODE_ROWS: u64 = 8;
@@ -193,12 +207,6 @@ pub(crate) const DECODE_ROWS: u64 = 8;
 /// Whether a `rows`-row class attends with the decode entry.
 pub(crate) fn decodes(rows: u64) -> bool {
     rows <= DECODE_ROWS
-}
-
-/// F16 elements of one head vector's affine (scale, zero) pairs: one pair per
-/// codec group of a `width`-wide head.
-pub(crate) const fn affine_coefficients(width: u64) -> u64 {
-    2 * width / AFFINE_GROUP as u64
 }
 
 /// The block's weight tensors, as ports of the graph being built. The
@@ -239,6 +247,8 @@ pub(crate) struct AttentionBlock<'a> {
     pub activation: Element,
     /// Draft priming only publishes K/V history; its attention output is unused.
     pub inject_only: bool,
+    /// Causal target rows consume earlier rows through the cache codec.
+    pub causal_cache: bool,
 }
 
 /// The layer's history planes, bound to the state store's planes per run, in
@@ -287,7 +297,6 @@ pub(crate) fn history_tile_bytes(visible: &[u8], tiles: usize) -> Option<Vec<u8>
         .map(|tiles| tiles.iter().flat_map(|tile| tile.to_le_bytes()).collect())
 }
 
-
 /// The block's attention weights in the order and presence its operator's
 /// form and its sublayer tail define, from a lookup of a role's port.
 pub(crate) fn attention_weights(
@@ -324,28 +333,48 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
     let (rows, width, heads) = (block.rows, shape.width, shape.heads());
     // An absent projection segment reads zero rows of the query weight.
     let empty_weight = weights.query.slice_leading(0, 0);
-    let empty_gate_weight = weights.gate.as_ref().map(|gate| gate.slice_leading(0, 0))
+    let empty_gate_weight = weights
+        .gate
+        .as_ref()
+        .map(|gate| gate.slice_leading(0, 0))
         .unwrap_or_else(|| empty_weight.clone());
     let projected = graph.enqueue(
         kernels.project,
-        &if block.inject_only { shape.key_value_dimensions(rows) } else { shape.project_dimensions(rows) },
+        &if block.inject_only {
+            shape.key_value_dimensions(rows)
+        } else {
+            shape.project_dimensions(rows)
+        },
         attention_project::WorkflowArgs {
             hidden: hidden.into(),
             input_norm: (&weights.input_norm).into(),
-            query_weight: if block.inject_only { (&empty_weight).into() } else { (&weights.query).into() },
-            gate_weight: if block.inject_only { (&empty_gate_weight).into() } else { segment(&weights.gate, &empty_weight) },
+            query_weight: if block.inject_only {
+                (&empty_weight).into()
+            } else {
+                (&weights.query).into()
+            },
+            gate_weight: if block.inject_only {
+                (&empty_gate_weight).into()
+            } else {
+                segment(&weights.gate, &empty_weight)
+            },
             key_weight: segment(&weights.key, &empty_weight),
             value_weight: segment(&weights.value, &empty_weight),
             epsilon: block.epsilon,
             project_mode: 0,
-        },
-    )?;
+        },    )?;
     // The mix entries read the projection per head.
     let projected = ProjectedRows {
-        query: projected
-            .r0
-            .reshape(&[rows, if block.inject_only { 0 } else { heads }, width + shape.interleaved_gate]),
-        gate: projected.r1.reshape(&[rows, if block.inject_only { 0 } else { heads }, shape.separate_gate]),
+        query: projected.r0.reshape(&[
+            rows,
+            if block.inject_only { 0 } else { heads },
+            width + shape.interleaved_gate,
+        ]),
+        gate: projected.r1.reshape(&[
+            rows,
+            if block.inject_only { 0 } else { heads },
+            shape.separate_gate,
+        ]),
         key: projected
             .r2
             .reshape(&[shape.fresh, rows, shape.kv_heads * width]),
@@ -385,8 +414,7 @@ pub(crate) fn attention<'a, G: GraphDraft + 'a>(
                         hidden: hidden.into(),
                         gated: (&attended).into(),
                         output_weight: output_weight.into(),
-                    },
-                )?
+                    },                )?
                 .value
         }
         (TailEntries::PostNorm(entries), Some(norm)) => {
@@ -442,10 +470,22 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
     constants: &mut Vec<GraphConstant>,
     projected: &ProjectedRows,
     block: &AttentionBlock<'_>,
-) -> Result<(Option<WorkflowTensor>, AttentionStatePorts, AttentionControlPorts), GraphError> {
+) -> Result<
+    (
+        Option<WorkflowTensor>,
+        AttentionStatePorts,
+        AttentionControlPorts,
+    ),
+    GraphError,
+> {
     let shape = block.shape;
     let (rows, width) = (block.rows, shape.width);
-    let dimensions = shape.mix_dimensions(rows, block.history_rows, block.segments);
+    let mut dimensions = shape
+        .mix_dimensions(rows, block.history_rows, block.segments)
+        .to_vec();
+    if let AttentionHistoryEntries::AffineK8V4 { codec, .. } = &history {
+        dimensions.extend(affine_dimensions(*codec)?);
+    }
     let input = |graph: &mut G, name: &str| match &history {
         AttentionHistoryEntries::Dense { decode, .. } => {
             graph.input_for(*decode, name, &dimensions)
@@ -485,8 +525,16 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
         .transpose()?;
     let controls = AttentionControlPorts {
         coordinates: input(graph, "coordinates")?,
-        visible: if block.inject_only { None } else { Some(input(graph, "visible")?) },
-        fresh: if block.inject_only { None } else { Some(input(graph, "fresh")?) },
+        visible: if block.inject_only {
+            None
+        } else {
+            Some(input(graph, "visible")?)
+        },
+        fresh: if block.inject_only {
+            None
+        } else {
+            Some(input(graph, "fresh")?)
+        },
         destinations: input(graph, "destinations")?,
         history_tiles,
     };
@@ -525,16 +573,21 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
             plane(block.activation, width)?,
             plane(block.activation, width)?,
         ],
-        AttentionHistoryEntries::AffineK8V4 { .. } => vec![
-            plane(Element::u32(), width / 4)?,
-            plane(Element::f16(), affine_coefficients(width))?,
-            plane(Element::u32(), width / 8)?,
-            plane(Element::f16(), affine_coefficients(width))?,
-        ],
+        AttentionHistoryEntries::AffineK8V4 { codec, .. } => codec
+            .planes()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|descriptor| {
+                plane(
+                    Element::from(descriptor.dtype),
+                    descriptor.row_elements as u64,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let scale = block.operator.scale as f32;
     let gate_function = operators::attention::gate_function(block.operator);
-    let destinations = controls.destinations.tensor().clone();
+    let mut destinations = controls.destinations.tensor().clone();
     // Every entry takes the same arguments but its history planes.
     macro_rules! mix {
         ($kernel:expr, $module:ident, $($plane:ident),*) => {
@@ -609,13 +662,37 @@ pub(crate) fn mix<'a, G: GraphDraft + 'a>(
                 append!(append, attention_append_dense, history_key, history_value);
             }
             AttentionHistoryEntries::AffineK8V4 { append, .. } => {
-                append!(append, attention_append_k8v4,
-                    history_key_codes, history_key_coefficients,
-                    history_value_codes, history_value_coefficients);
+                append!(
+                    append,
+                    attention_append_k8v4,
+                    history_key_codes,
+                    history_key_coefficients,
+                    history_value_codes,
+                    history_value_coefficients
+                );
             }
         }
         constants.extend([components, frequencies, amplitudes, unit]);
         return Ok((None, AttentionStatePorts { planes }, controls));
+    }
+    // Earlier causal rows are already in the visible cache spans. Decode's
+    // fused append cannot publish rows other threadgroups read in the same
+    // launch, so publish once first and suppress its later append. Prefill
+    // already has an ordered prepare launch and needs no additional phase.
+    if block.causal_cache && decode && rows > 1 && shape.fresh > 0 {
+        if let AttentionHistoryEntries::AffineK8V4 { append, .. } = &history {
+            append!(
+                append,
+                attention_append_k8v4,
+                history_key_codes,
+                history_key_coefficients,
+                history_value_codes,
+                history_value_coefficients
+            );
+            let disabled = GraphConstant::i32(graph, &vec![-1; rows as usize])?;
+            destinations = disabled.port().tensor().clone();
+            constants.push(disabled);
+        }
     }
     let attended = match &history {
         AttentionHistoryEntries::Dense {
@@ -812,7 +889,10 @@ mod tests {
         // One request of 64 rows over a 16,384-row history in two spans, the
         // second at a lower address: 64 tiles of 256 rows.
         let request = [[40_960, 49_152], [8_192, 16_384]];
-        let rows = std::iter::repeat(request).take(64).flatten().collect::<Vec<_>>();
+        let rows = std::iter::repeat(request)
+            .take(64)
+            .flatten()
+            .collect::<Vec<_>>();
         let tiles = listed(history_tile_bytes(&visible(&rows), 66).unwrap());
         assert_eq!(tiles[..64], (32..64).chain(160..192).collect::<Vec<_>>());
         assert_eq!(tiles[64..], [-1, -1]);
@@ -829,9 +909,15 @@ mod tests {
             .copied()
             .chain([[40_960, 45_056], [0, 0]])
             .collect::<Vec<_>>();
-        assert_eq!(listed(history_tile_bytes(&visible(&fork), 66).unwrap()), tiles);
+        assert_eq!(
+            listed(history_tile_bytes(&visible(&fork), 66).unwrap()),
+            tiles
+        );
         // Rows that see no history list nothing.
-        assert_eq!(listed(history_tile_bytes(&visible(&[[0, 0]]), 2).unwrap()), [-1, -1]);
+        assert_eq!(
+            listed(history_tile_bytes(&visible(&[[0, 0]]), 2).unwrap()),
+            [-1, -1]
+        );
     }
 
     #[test]

@@ -1345,7 +1345,15 @@ mod internals {
             out.push_str("      let _ = outputs;\n");
         }
         out.push_str("      encoder.finish()\n    }\n");
-        out.push_str("    fn decode(mut results: seismic::generated::DecodedResults) -> Results { Results {\n");
+        // An entry without results has nothing to decode or publish.
+        let (decoded, published) = if entry.results.is_empty() {
+            ("_", "_")
+        } else {
+            ("mut results", "results")
+        };
+        out.push_str(&format!(
+            "    fn decode({decoded}: seismic::generated::DecodedResults) -> Results {{ Results {{\n"
+        ));
         for result in &entry.results {
             let getter = match &result.kind {
                 ResultSummaryKind::Tensor { .. } => "take_tensor",
@@ -1396,7 +1404,9 @@ mod internals {
             }
         }
         out.push_str("      encoder.finish()\n    }\n");
-        out.push_str("    fn decode_workflow(mut results: seismic::generated::PendingWorkflowResults) -> WorkflowResults { WorkflowResults {\n");
+        out.push_str(&format!(
+            "    fn decode_workflow({decoded}: seismic::generated::PendingWorkflowResults) -> WorkflowResults {{ WorkflowResults {{\n"
+        ));
         for result in &entry.results {
             let getter = match &result.kind {
                 ResultSummaryKind::Tensor { .. } => "take_workflow_tensor".to_owned(),
@@ -1414,7 +1424,9 @@ mod internals {
             ));
         }
         out.push_str("    } }\n");
-        out.push_str("    fn workflow_outputs(results: WorkflowResults) -> Vec<seismic::generated::WorkflowResultRef> { vec![\n");
+        out.push_str(&format!(
+            "    fn workflow_outputs({published}: WorkflowResults) -> Vec<seismic::generated::WorkflowResultRef> {{ vec![\n"
+        ));
         for result in &entry.results {
             let getter = match &result.kind {
                 ResultSummaryKind::Tensor { .. } => "workflow_tensor_ref",
@@ -1503,16 +1515,16 @@ mod internals {
             out.push_str("    seismic::generated::bound_entry::<Entry>(&[\n");
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
-            out.push_str("  pub fn native_tune_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: impl Into<seismic::TuningPrecision>, strategy: seismic::Strategy, reference: seismic::TuningReference) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
+            out.push_str("  pub fn native_tune_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::tune_native::<Entry>(device, statics, &[\n");
             element_list(out);
             out.push_str(&format!(
-                "    ], {cpu}, &mut points, validation, strategy, reference)\n  }}\n"
+                "    ], {cpu}, &mut points, validation, strategy)\n  }}\n"
             ));
-            out.push_str("  pub fn native_search_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, validation: impl Into<seismic::TuningPrecision>, reference: seismic::TuningReference) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
+            out.push_str("  pub fn native_search_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::search_native::<Entry>(device, statics, &[\n");
             element_list(out);
-            out.push_str(&format!("    ], {cpu}, validation, reference)\n  }}\n"));
+            out.push_str(&format!("    ], {cpu}, validation)\n  }}\n"));
             out.push_str("  pub fn native_digest_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::digest_native::<Entry>(device, statics, &[\n");
             element_list(out);
@@ -1520,16 +1532,9 @@ mod internals {
         } else {
             out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_entry() -> seismic::BoundEntry<Entry> {{ seismic::generated::bound_entry::<Entry>(&[], {cpu}) }}\n"));
-            out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: impl Into<seismic::TuningPrecision>, strategy: seismic::Strategy, reference: seismic::TuningReference) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy, reference) }}\n"));
-            out.push_str(&format!("  pub fn native_search<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, validation: impl Into<seismic::TuningPrecision>, reference: seismic::TuningReference) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(device, statics, &[], {cpu}, validation, reference) }}\n"));
+            out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
+            out.push_str(&format!("  pub fn native_search<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(device, statics, &[], {cpu}, validation) }}\n"));
             out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
-        }
-        if elements {
-            out.push_str("  pub fn native_numerical_subjects(elements: Elements) -> Result<Vec<(String, seismic::DType)>, seismic::TuneError> { seismic::generated::native_numerical_subjects::<Entry>(&[\n");
-            element_list(out);
-            out.push_str("    ]) }\n");
-        } else {
-            out.push_str("  pub fn native_numerical_subjects() -> Result<Vec<(String, seismic::DType)>, seismic::TuneError> { seismic::generated::native_numerical_subjects::<Entry>(&[]) }\n");
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");
         out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");

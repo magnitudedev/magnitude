@@ -1,7 +1,7 @@
 use crate::error::DeviceError;
 use seismic::NativeGraphCompletion;
 use std::{
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
 };
 
@@ -213,8 +213,8 @@ impl Completion for DeviceCompletion {
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     #[test]

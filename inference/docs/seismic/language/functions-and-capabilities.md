@@ -38,3 +38,9 @@ portable entry contract + authored native asset/launch
 
 This route must remain distinguishable from a [prepared kernel](../compiler/prepared-kernel.md). It is not a silent fallback for failed compiler construction. Both routes must still bind actual arguments and retain native resources through completion.
 
+The engine's [native tuner](../../tuning.md) can search the declaration's legal configurations
+under the [precision policy](../../precision.md), comparing actual execution with the canonical
+native default. Portable bodies and representations supply the facts for that comparison;
+declarations carry no precision permissions or trusted descriptions of native rounding behavior.
+Empirical admission never grants compiler numerical applicability.
+

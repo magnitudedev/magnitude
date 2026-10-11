@@ -1,6 +1,4 @@
 import { parse as parseToml } from "smol-toml"
-import { accessSync, constants, statSync } from "node:fs"
-import { delimiter, resolve } from "node:path"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
 import { HarnessIdSchema, type HarnessId } from "@magnitudedev/client-common"
@@ -14,6 +12,7 @@ import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { isDeepStrictEqual } from "node:util"
 import { parseDocument } from "yaml"
 import { writeFileAtomic } from "./configuration-file"
+import { findExecutable } from "./executable"
 import type { HarnessConnector } from "./contract"
 
 export const OPENAI_BASE_URL = new URL("v1", MAGNITUDE_INFERENCE_BASE_URL).href.replace(/\/$/, "")
@@ -233,19 +232,4 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
       Option.map((executable) => ({ executable })),
     )),
   }
-}
-
-/** Resolve an installed executable without invoking a shell or starting the harness. */
-const findExecutable = (name: string, searchPath: string): string | undefined => {
-  const suffixes = process.platform === "win32" ? ["", ...(process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";")] : [""]
-  for (const directory of searchPath.split(delimiter).filter(Boolean)) {
-    for (const suffix of suffixes) {
-      const candidate = resolve(directory, `${name}${suffix}`)
-      try {
-        accessSync(candidate, process.platform === "win32" ? constants.F_OK : constants.X_OK)
-        if (statSync(candidate).isFile()) return candidate
-      } catch { /* Missing or inaccessible executable is not an installation. */ }
-    }
-  }
-  return undefined
 }

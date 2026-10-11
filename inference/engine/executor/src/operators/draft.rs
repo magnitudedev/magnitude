@@ -6,10 +6,10 @@
 //! step publishes its fused taps as the target's features. Every other draft
 //! weight is the drafter component's, imported when drafting first runs.
 
-use super::{paired_block, role, sublayer_weights, FeedForward, Mixer, PairedBlock};
+use super::{FeedForward, Mixer, PairedBlock, paired_block, role, sublayer_weights};
 use crate::error::PlanError;
 use magnitude_family_contracts::{
-    AttentionGate, Block, DraftDefinition, DraftEmbedding, DraftMethod, KeyValue,
+    AttentionGate, Block, DraftDefinition, DraftEmbedding, DraftMethod, HeadHistory, KeyValue,
     ModelDefinition, OutputForm, SublayerIndex, TapPoint, ValueSource, WeightDescriptor,
     WeightKind, WeightRole, WeightScope,
 };
@@ -18,7 +18,10 @@ use magnitude_family_contracts::{
 /// fusion norm.
 pub(crate) fn fusion_weights(draft: &DraftDefinition) -> [(WeightRole, &WeightDescriptor); 2] {
     [
-        (role(WeightScope::Draft, WeightKind::DraftFusion), &draft.fusion),
+        (
+            role(WeightScope::Draft, WeightKind::DraftFusion),
+            &draft.fusion,
+        ),
         (
             role(WeightScope::Draft, WeightKind::DraftFusionNorm),
             &draft.fusion_norm.weight,
@@ -34,6 +37,9 @@ pub(crate) fn draft_weights(
     if let DraftEmbedding::Own(table) = &draft.embedding {
         weights.push((role(WeightScope::Draft, WeightKind::Embedding), table));
     }
+    if let Some(output) = &draft.output {
+        weights.push((role(WeightScope::Draft, WeightKind::Output), output));
+    }
     for (block, value) in draft.blocks.iter().enumerate() {
         let block = u32::try_from(block).map_err(|_| PlanError::Arithmetic("draft block index"))?;
         for (sublayer, value) in value.sublayers.iter().enumerate() {
@@ -42,9 +48,12 @@ pub(crate) fn draft_weights(
                 sublayer: u32::try_from(sublayer)
                     .map_err(|_| PlanError::Arithmetic("draft sublayer index"))?,
             };
-            sublayer_weights(value, WeightScope::DraftSublayer(index), &mut weights, |_| {
-                unreachable!("admitted draft layers have no parallel branches")
-            });
+            sublayer_weights(
+                value,
+                WeightScope::DraftSublayer(index),
+                &mut weights,
+                |_| unreachable!("admitted draft layers have no parallel branches"),
+            );
         }
     }
     weights.push((
@@ -52,7 +61,10 @@ pub(crate) fn draft_weights(
         &draft.output_norm.weight,
     ));
     if let DraftMethod::DSpark { markov, confidence } = &draft.method {
-        weights.push((role(WeightScope::Draft, WeightKind::MarkovEmbedding), &markov.embedding));
+        weights.push((
+            role(WeightScope::Draft, WeightKind::MarkovEmbedding),
+            &markov.embedding,
+        ));
         weights.push((
             role(WeightScope::Draft, WeightKind::MarkovProjection),
             &markov.projection,
@@ -61,7 +73,10 @@ pub(crate) fn draft_weights(
             role(WeightScope::Draft, WeightKind::ConfidenceWeight),
             &confidence.weight,
         ));
-        weights.push((role(WeightScope::Draft, WeightKind::ConfidenceBias), &confidence.bias));
+        weights.push((
+            role(WeightScope::Draft, WeightKind::ConfidenceBias),
+            &confidence.bias,
+        ));
     }
     if let DraftMethod::DFlash2 {
         convolutions,
@@ -81,7 +96,10 @@ pub(crate) fn draft_weights(
                 ));
             }
         }
-        weights.push((role(WeightScope::Draft, WeightKind::SelectorHidden), &selector.hidden));
+        weights.push((
+            role(WeightScope::Draft, WeightKind::SelectorHidden),
+            &selector.hidden,
+        ));
         weights.push((
             role(WeightScope::Draft, WeightKind::SelectorPredecessor),
             &selector.predecessor,
@@ -94,18 +112,25 @@ pub(crate) fn draft_weights(
     Ok(weights)
 }
 
-/// The blocks of a definition's drafter: its embedded head's, or its separate
-/// draft's layers (an executed definition carries at most one drafter).
+/// The blocks of a definition's drafter that keep their own history: its
+/// draft head's, or its separate draft's layers (an executed definition
+/// carries at most one drafter). A head reading target history keeps none.
 pub(crate) fn drafter_blocks(definition: &ModelDefinition) -> Vec<&Block> {
     match (&definition.head, &definition.draft) {
-        (Some(head), _) => head.blocks.iter().map(|block| &block.block).collect(),
+        (Some(head), _) => match head.history {
+            HeadHistory::Own => head.blocks.iter().flat_map(|block| &block.blocks).collect(),
+            HeadHistory::Target => Vec::new(),
+        },
         (None, Some(draft)) => draft.blocks.iter().collect(),
         (None, None) => Vec::new(),
     }
 }
 
 /// The draft layer `block`'s attention and dense feed-forward.
-pub(crate) fn draft_block(draft: &DraftDefinition, block: usize) -> Result<PairedBlock<'_>, PlanError> {
+pub(crate) fn draft_block(
+    draft: &DraftDefinition,
+    block: usize,
+) -> Result<PairedBlock<'_>, PlanError> {
     let block = draft
         .blocks
         .get(block)
@@ -148,7 +173,9 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
         let paired = draft_block(draft, index)?;
         let (Mixer::Attention(attention), Some(feed_forward)) = (paired.mixer, paired.feed_forward)
         else {
-            return Err(PlanError::Unsupported("draft layer other than attention and feed-forward"));
+            return Err(PlanError::Unsupported(
+                "draft layer other than attention and feed-forward",
+            ));
         };
         if !matches!(feed_forward.op, FeedForward::Dense(_))
             || [paired.mixer_output, feed_forward.output]
@@ -173,10 +200,13 @@ pub(crate) fn admit(definition: &ModelDefinition) -> Result<(), PlanError> {
                 "a DFlash2 draft layer other than ungated attention with projected values",
             ));
         }
-        if [paired.epsilon(), super::attention::head_norm_epsilon(attention, epsilon)?]
-            .into_iter()
-            .chain(feed_forward.epsilons())
-            .any(|value| value != epsilon)
+        if [
+            paired.epsilon(),
+            super::attention::head_norm_epsilon(attention, epsilon)?,
+        ]
+        .into_iter()
+        .chain(feed_forward.epsilons())
+        .any(|value| value != epsilon)
         {
             return Err(PlanError::Unsupported(
                 "normalization epsilons differing within a draft",

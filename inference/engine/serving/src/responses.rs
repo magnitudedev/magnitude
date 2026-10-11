@@ -346,7 +346,14 @@ pub struct ResponseProjection {
     metadata: Map<String, Value>,
 }
 
-type ToolProjection = (usize, String, String, String, String);
+struct ToolProjection {
+    output_index: usize,
+    item_id: String,
+    call_id: String,
+    name: String,
+    arguments: String,
+    finished: bool,
+}
 
 pub(crate) struct StreamProjector {
     id: String,
@@ -447,7 +454,10 @@ impl StreamProjector {
 
     async fn observe(&mut self, event: OutputEvent) -> Result<(), ProjectionError> {
         match event {
-            OutputEvent::Started | OutputEvent::ToolCallFinished { .. } => {}
+            OutputEvent::Started => {}
+            OutputEvent::ToolCallFinished { index } => {
+                self.tool_call(index)?.finished = true;
+            }
             OutputEvent::ReasoningDelta(text) => {
                 let index = match self.reasoning_output_index {
                     Some(index) => index,
@@ -511,13 +521,14 @@ impl StreamProjector {
                 let item_id = format!("fc_{id}");
                 self.tool_calls.insert(
                     index,
-                    (
+                    ToolProjection {
                         output_index,
-                        item_id.clone(),
-                        id.clone(),
-                        name.clone(),
-                        String::new(),
-                    ),
+                        item_id: item_id.clone(),
+                        call_id: id.clone(),
+                        name: name.clone(),
+                        arguments: String::new(),
+                        finished: false,
+                    },
                 );
                 let item = function_call_item(item_id, "in_progress", id, name, String::new());
                 self.send(
@@ -528,13 +539,9 @@ impl StreamProjector {
             }
             OutputEvent::ToolInputDelta { index, fragment } => {
                 let (output_index, item_id) = {
-                    let entry = self.tool_calls.get_mut(&index).ok_or_else(|| {
-                        ProjectionError::Failed(ServingError::Internal(
-                            "tool input arrived before tool start".into(),
-                        ))
-                    })?;
-                    entry.4.push_str(&fragment);
-                    (entry.0, entry.1.clone())
+                    let entry = self.tool_call(index)?;
+                    entry.arguments.push_str(&fragment);
+                    (entry.output_index, entry.item_id.clone())
                 };
                 self.send(
                     "response.function_call_arguments.delta",
@@ -548,8 +555,18 @@ impl StreamProjector {
         Ok(())
     }
 
+    fn tool_call(&mut self, index: usize) -> Result<&mut ToolProjection, ProjectionError> {
+        self.tool_calls.get_mut(&index).ok_or_else(|| {
+            ProjectionError::Failed(ServingError::Internal(
+                "tool event arrived before tool start".into(),
+            ))
+        })
+    }
+
     /// Close every output item in `output_index` order, so the order a client
-    /// observes items concluding is the order of the response's `output`.
+    /// observes items concluding is the order of the response's `output`. A
+    /// call the output limit cut off concludes `incomplete` and, as in a
+    /// complete response, is not part of `output`.
     async fn finish(&mut self, completion: &Completion) -> Result<(), Disconnected> {
         let mut closing: Vec<(usize, Vec<(&'static str, Value)>, Value)> = Vec::new();
         if let Some(index) = self.reasoning_output_index {
@@ -592,22 +609,30 @@ impl StreamProjector {
             ];
             closing.push((index, events, item));
         }
-        for (output_index, item_id, call_id, name, arguments) in self.tool_calls.values() {
+        let mut cut_off = Vec::new();
+        for call in self.tool_calls.values() {
+            let status = if call.finished { "completed" } else { "incomplete" };
             let item = serde_json::to_value(function_call_item(
-                item_id.clone(),
-                "completed",
-                call_id.clone(),
-                name.clone(),
-                arguments.clone(),
+                call.item_id.clone(),
+                status,
+                call.call_id.clone(),
+                call.name.clone(),
+                call.arguments.clone(),
             ))
             .expect("output item is serializable");
-            let events = vec![(
-                "response.function_call_arguments.done",
-                serde_json::json!({
-                    "item_id": item_id, "output_index": output_index, "arguments": arguments,
-                }),
-            )];
-            closing.push((*output_index, events, item));
+            let events = if call.finished {
+                vec![(
+                    "response.function_call_arguments.done",
+                    serde_json::json!({
+                        "item_id": call.item_id, "output_index": call.output_index,
+                        "arguments": call.arguments,
+                    }),
+                )]
+            } else {
+                cut_off.push(call.output_index);
+                Vec::new()
+            };
+            closing.push((call.output_index, events, item));
         }
         closing.sort_by_key(|(index, _, _)| *index);
         let mut items = Vec::with_capacity(closing.len());
@@ -620,7 +645,9 @@ impl StreamProjector {
                 serde_json::json!({ "output_index": index, "item": item }),
             )
             .await?;
-            items.push(item);
+            if !cut_off.contains(&index) {
+                items.push(item);
+            }
         }
         let output = Value::Array(items.clone());
         let incomplete = completion.termination == Termination::OutputLimit;

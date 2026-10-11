@@ -3,7 +3,7 @@
 
 use super::ir::{DefKind, Ownership, Predicate, WhereConjunct};
 use crate::checked::DiagnosticRule;
-use crate::expr::{AnyExpr, ExprArena, IntExpr, SymbolId};
+use crate::expr::{AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, SymbolId};
 use crate::ids::{CapabilityId, FamilyId, FunctionId, ProgramId};
 use crate::registry::{self, BackendName};
 use crate::span::{Diagnostic, Span};
@@ -106,22 +106,33 @@ impl Sig {
             })
             .collect();
         let result = transfer_type(&self.arena, &self.result, &mut arena, &mut map);
-        let predicates = self
-            .predicates
-            .iter()
-            .map(|conjunct| {
-                let mut transfer =
-                    |value| super::xfer::transfer_int(&self.arena, value, &mut arena, &mut map);
-                WhereConjunct {
+        let predicates =
+            self.predicates
+                .iter()
+                .map(|conjunct| WhereConjunct {
                     predicate: match conjunct.predicate {
-                        Predicate::NonNegative(value) => Predicate::NonNegative(transfer(value)),
-                        Predicate::Zero(value) => Predicate::Zero(transfer(value)),
-                        Predicate::NonZero(value) => Predicate::NonZero(transfer(value)),
+                        Predicate::NonNegative(value) => Predicate::NonNegative(
+                            super::xfer::transfer_int(&self.arena, value, &mut arena, &mut map),
+                        ),
+                        Predicate::Zero(value) => Predicate::Zero(super::xfer::transfer_int(
+                            &self.arena,
+                            value,
+                            &mut arena,
+                            &mut map,
+                        )),
+                        Predicate::NonZero(value) => Predicate::NonZero(super::xfer::transfer_int(
+                            &self.arena,
+                            value,
+                            &mut arena,
+                            &mut map,
+                        )),
+                        Predicate::Boolean(value) => Predicate::Boolean(
+                            super::xfer::transfer_bool(&self.arena, value, &mut arena, &mut map),
+                        ),
                     },
                     span: conjunct.span,
-                }
-            })
-            .collect();
+                })
+                .collect();
         (
             BodySig {
                 name: self.name.clone(),
@@ -340,6 +351,11 @@ impl NameCallGraph {
     /// after all of its callees), and one cycle of every recursive strongly
     /// connected component (L20). A recursion therefore never hides the
     /// definitions outside it.
+    /// The definitions `definition` may call.
+    pub(crate) fn callees(&self, definition: usize) -> &BTreeSet<usize> {
+        &self.callees[definition]
+    }
+
     pub(crate) fn bottom_up_order(&self) -> (Vec<usize>, Vec<RecursionCycle>) {
         let components = self.components();
         let mut blocked = vec![false; self.callees.len()];
@@ -580,6 +596,25 @@ pub(crate) fn shape_expr(
                 .expect("shape parameter lookup disagrees with contains");
             Ok(arena.int_symbol(shape_symbols[ordinal]))
         }
+        A::Call {
+            callee,
+            bindings,
+            args,
+        } if bindings.is_empty()
+            && args.len() == 2
+            && args.iter().all(|arg| arg.name.is_none())
+            && matches!(&callee.kind, A::Name(name) if name.name == "min" || name.name == "max") =>
+        {
+            let lhs = shape_expr(&args[0].value, shape_params, shape_symbols, arena)?;
+            let rhs = shape_expr(&args[1].value, shape_params, shape_symbols, arena)?;
+            Ok(
+                if matches!(&callee.kind, A::Name(name) if name.name == "min") {
+                    arena.int_min(lhs, rhs)
+                } else {
+                    arena.int_max(lhs, rhs)
+                },
+            )
+        }
         A::Name(n) => Err(Diagnostic::with_rule(
             DiagnosticRule::Resolution,
             n.span,
@@ -670,7 +705,7 @@ fn type_from_ast(
                 .is_some_and(|c| c.is_ascii_uppercase()) =>
             {
                 Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                    DiagnosticRule::Type,
                     name.span,
                     format!(
                         "element parameter `{}` cannot be a scalar type: scalar values have a concrete dtype",
@@ -679,7 +714,7 @@ DiagnosticRule::Type,
                 ))
             }
             None => Err(Diagnostic::with_rule(
-DiagnosticRule::Resolution,
+                DiagnosticRule::Resolution,
                 name.span,
                 format!("unknown type `{}`", name.name),
             )),
@@ -692,7 +727,11 @@ DiagnosticRule::Resolution,
         }),
         TypeKind::Shaped { head, shape, elem } => {
             if shape.is_empty() {
-                return Err(Diagnostic::with_rule(DiagnosticRule::Type, t.span, "a tensor type needs a shape"));
+                return Err(Diagnostic::with_rule(
+                    DiagnosticRule::Type,
+                    t.span,
+                    "a tensor type needs a shape",
+                ));
             }
             let mut axes = Vec::new();
             for e in shape {
@@ -708,7 +747,7 @@ DiagnosticRule::Resolution,
                 let ty = type_from_ast(item, shape_params, shape_symbols, arena, elem_params)?;
                 if ty.is_void() {
                     return Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                        DiagnosticRule::Type,
                         item.span,
                         "`void` is not a tuple component",
                     ));
@@ -726,6 +765,70 @@ DiagnosticRule::Type,
 
 /// Conjuncts of a `where` clause: comparisons, divisibility and equalities over
 /// shape parameters and integer literals.
+fn shape_bool(
+    e: &ast::Expr,
+    parameters: &[String],
+    symbols: &[SymbolId],
+    arena: &mut ExprArena,
+) -> Result<BoolExpr, Diagnostic> {
+    match &e.kind {
+        A::Bool(value) => Ok(arena.bool(*value)),
+        A::Unary {
+            op: ast::UnaryOp::Not,
+            expr,
+        } => {
+            let value = shape_bool(expr, parameters, symbols, arena)?;
+            Ok(arena.not(value))
+        }
+        A::Binary {
+            op: BinaryOp::And | BinaryOp::Or,
+            lhs,
+            rhs,
+        } => {
+            let l = shape_bool(lhs, parameters, symbols, arena)?;
+            let r = shape_bool(rhs, parameters, symbols, arena)?;
+            Ok(
+                if matches!(
+                    &e.kind,
+                    A::Binary {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ) {
+                    arena.and(l, r)
+                } else {
+                    arena.or(l, r)
+                },
+            )
+        }
+        A::Binary { op, lhs, rhs } => {
+            let comparison = match op {
+                BinaryOp::Eq => CmpOp::Eq,
+                BinaryOp::Ne => CmpOp::Ne,
+                BinaryOp::Ge => CmpOp::Ge,
+                BinaryOp::Gt => CmpOp::Gt,
+                BinaryOp::Le => CmpOp::Le,
+                BinaryOp::Lt => CmpOp::Lt,
+                _ => {
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Type,
+                        e.span,
+                        "a where condition compares integer shape expressions",
+                    ));
+                }
+            };
+            let l = shape_expr(lhs, parameters, symbols, arena)?;
+            let r = shape_expr(rhs, parameters, symbols, arena)?;
+            Ok(arena.int_cmp(comparison, l, r))
+        }
+        _ => Err(Diagnostic::with_rule(
+            DiagnosticRule::Type,
+            e.span,
+            "a where condition is a boolean expression over integer shape parameters",
+        )),
+    }
+}
+
 fn predicates_of(
     e: &ast::Expr,
     shape_params: &[String],
@@ -742,18 +845,44 @@ fn predicates_of(
             predicates_of(lhs, shape_params, shape_symbols, arena, out)?;
             predicates_of(rhs, shape_params, shape_symbols, arena, out)
         }
+        A::Binary {
+            op: BinaryOp::Or, ..
+        }
+        | A::Unary {
+            op: ast::UnaryOp::Not,
+            ..
+        }
+        | A::Bool(_) => {
+            out.push(WhereConjunct {
+                predicate: Predicate::Boolean(shape_bool(e, shape_params, shape_symbols, arena)?),
+                span: e.span,
+            });
+            Ok(())
+        }
         A::Binary { op, lhs, rhs } => {
             let l = shape_expr(lhs, shape_params, shape_symbols, arena)?;
             let r = shape_expr(rhs, shape_params, shape_symbols, arena)?;
             let one = arena.int(1);
             let predicate = match op {
                 BinaryOp::Ge => Predicate::NonNegative(arena.int_sub(l, r)),
-                BinaryOp::Gt => { let d = arena.int_sub(l, r); Predicate::NonNegative(arena.int_sub(d, one)) },
+                BinaryOp::Gt => {
+                    let d = arena.int_sub(l, r);
+                    Predicate::NonNegative(arena.int_sub(d, one))
+                }
                 BinaryOp::Le => Predicate::NonNegative(arena.int_sub(r, l)),
-                BinaryOp::Lt => { let d = arena.int_sub(r, l); Predicate::NonNegative(arena.int_sub(d, one)) },
+                BinaryOp::Lt => {
+                    let d = arena.int_sub(r, l);
+                    Predicate::NonNegative(arena.int_sub(d, one))
+                }
                 BinaryOp::Eq => Predicate::Zero(arena.int_sub(l, r)),
                 BinaryOp::Ne => Predicate::NonZero(arena.int_sub(l, r)),
-                _ => return Err(Diagnostic::with_rule(DiagnosticRule::Type, e.span, "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters")),
+                _ => {
+                    return Err(Diagnostic::with_rule(
+                        DiagnosticRule::Type,
+                        e.span,
+                        "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters",
+                    ));
+                }
             };
             out.push(WhereConjunct {
                 predicate,
@@ -762,7 +891,7 @@ fn predicates_of(
             Ok(())
         }
         _ => Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+            DiagnosticRule::Type,
             e.span,
             "a `where` predicate is a conjunction of comparisons, divisibility and equalities over shape parameters",
         )),
@@ -848,7 +977,7 @@ pub(crate) fn signature_of(
                         != crate::registry::RepresentationAccess::ReadWrite
                     {
                         return Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                            DiagnosticRule::Type,
                             p.ty.span,
                             format!(
                                 "representation `{}` is decode-only and cannot be a mutable tensor parameter",
@@ -1051,7 +1180,7 @@ fn reject_rank_zero_packed(ty: &ValueType, span: Span) -> Result<(), Diagnostic>
             if tensor.axes.is_empty() && matches!(tensor.elem, Elem::Repr(_)) =>
         {
             Err(Diagnostic::with_rule(
-DiagnosticRule::Type,
+                DiagnosticRule::Type,
                 span,
                 "a packed tensor must have at least one axis because packets run along the last axis",
             ))

@@ -10,15 +10,13 @@
 //! [`TILE_ROWS`], so the graph plan charges them to the workspace; nothing is
 //! uploaded per step.
 
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_target_graph::{WeightPort, weight};
 use crate::{
-    native::{RoutedDecodeKernels, RoutedKernels},
     ModelLoadPlan, RoutedBinding,
+    native::{RoutedDecodeKernels, RoutedKernels},
 };
-use magnitude_family_contracts::{
-    RouteNormalization, RoutedFfn, WeightKind, WeightScope,
-};
+use magnitude_family_contracts::{RouteNormalization, RoutedFfn, WeightKind, WeightScope};
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
@@ -310,8 +308,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         scores: scores.tensor_mut().into(),
                         eps: epsilon,
                         normalize,
-                    },
-                )?;
+                    },                )?;
                 let expanded = graph.enqueue(
                     expand,
                     &experts_dims,
@@ -322,8 +319,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         expert_up: (&expert_up).into(),
                         shared_gate: (&shared_gate).into(),
                         shared_up: (&shared_up).into(),
-                    },
-                )?;
+                    },                )?;
                 (expanded.r0, expanded.r1, routed.r1)
             }
             RoutedDecodeEntries::SharedRoute {
@@ -350,8 +346,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         scores: scores.tensor_mut().into(),
                         eps: epsilon,
                         normalize,
-                    },
-                )?;
+                    },                )?;
                 let expert_product = graph
                     .enqueue(
                         gate_up,
@@ -369,8 +364,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                             expert_up: (&expert_up).into(),
                             // SiLU: the fused Qwen form's experts.
                             activation: 0,
-                        },
-                    )?
+                        },                    )?
                     .value;
                 (expert_product, routed.r2, routed.r1)
             }
@@ -388,8 +382,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     coefficient: (&coefficient).into(),
                     expert_down: (&expert_down).into(),
                     shared_down: (&shared_down).into(),
-                },
-            )?
+                },            )?
             .value);
     }
 
@@ -405,8 +398,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             scores: scores.tensor_mut().into(),
             eps: epsilon,
             normalize,
-        },
-    )?;
+        },    )?;
     let (normalized, coefficient) = (routed.r0, routed.r1);
     let blocks = grouped_blocks(rows, shape.count, shape.selected)?;
     let tables = [
@@ -445,8 +437,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             order: order.tensor_mut().into(),
             inverse: inverse.tensor_mut().into(),
             blocks: block_experts.tensor_mut().into(),
-        },
-    )?;
+        },    )?;
     let experts = graph
         .enqueue(
             handle.experts,
@@ -460,8 +451,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 expert_down: (&expert_down).into(),
                 // SiLU: the fused Qwen form's experts.
                 activation: 0,
-            },
-        )?
+            },        )?
         .value;
     Ok(graph
         .enqueue(
@@ -477,8 +467,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 shared_gate: (&shared_gate).into(),
                 shared_up: (&shared_up).into(),
                 shared_down: (&shared_down).into(),
-            },
-        )?
+            },        )?
         .value)
 }
 

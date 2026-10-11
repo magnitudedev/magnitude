@@ -68,16 +68,62 @@ and assessment) consumes the model definition and the adapter contract only, so 
 replacing a family (including a compiled-program family) changes nothing outside the engine.
 
 Separate drafter admission is an optional-component outcome retained by the host,
-not a numerical property of the target. Explicit checkpoint attention semantics
-are required; a missing field disables drafting, and malformed or unsupported draft
-semantics retain their distinct diagnostic while leaving the target available.
-The host surfaces the reason once when resolving a load. Automatic or explicit
-separate-draft selection then resolves to plain target decoding, including when
-the target also has an MTP head; an explicitly requested MTP method remains
-independent. Resolution precedes draft workflows, feature capture, weight imports,
+not a numerical property of the target. The draft's own `general.architecture`
+names the drafter family that interprets it against the already-interpreted
+target: `dflash` is a block drafter whose tapped layers the target family maps
+onto its sublayers; `gemma4-assistant` is a Gemma 4 assistant, bound as the
+target's draft head (it reads the target's history and needs no target-family
+mapping). Any other architecture names no drafter family. Explicit checkpoint
+attention semantics are required of block drafters; a missing field disables
+drafting, and malformed or unsupported draft semantics retain their distinct,
+family-attributed diagnostic while leaving the target available.
+The host surfaces the reason once when resolving a load. A method that would
+draft with the unavailable component then resolves to plain target decoding:
+automatic or explicit separate-draft selection, including when the target also
+has an MTP head, and MTP on a target without its own head. An explicitly
+requested MTP method on a target with its own head remains independent. Resolution precedes draft workflows, feature capture, weight imports,
 state allocation and tuning. Target interpretation errors never become draft
 fallbacks. Header assessment and payload-backed loading use the same admission
 and method resolution.
+
+An explicitly configured draft-budget policy is shared by MTP and separate
+block drafters. It names generated proposal counts and verified prefix counts
+within the admitted method cap. The default retains the fixed method width;
+adaptive candidates are opt-in and validated before worker construction. The
+resolved policy crosses the worker boundary and contributes to generation-method
+identity. Plain fallback discards the optional draft policy. Kernel preparation
+still covers the admitted cap; selecting a budget never triggers compilation.
+The execution owner creates one bounded component-service evidence table for the
+loaded adaptive method and injects it into its method factory. Fixed loads allocate
+no evidence table because their immutable policy cannot consume adaptive estimates. It is not part
+of the manifest, checkpoint, or cross-load cache. Ordinary physical completions
+populate it without extra device work; the request-local adaptive controller can
+only use covered execution classes. The load also owns ordinary host-service
+residuals and committed-prefix evidence, so another request continues the same
+whole-round estimate and incumbent. Physical service learning is keyed by the
+component's execution class and context coverage, never an action-round counter.
+A component curve reports the conditional-mean variance one completion at that
+context can resolve; persistent chronological bias remains uncertainty rather
+than promised information. Prepared service forecasts derive from selected,
+validated kernel measurements and the sealed graph's actual invocation geometry;
+capacity dimensions alone cannot identify a live workload. Untimed work remains
+an explicit multiset of operation families and nonnegative multiplicities. The
+sealed node declares its row axis, independent fixed output count, readonly row
+capacities, visible-history dependence and resolved window. Only these declared
+axes are normalized; artifact and remaining checked geometry stay exact.
+Fixed call overhead, row work, source-declared quadratic row work and stored
+history work have separate unknown prices. Quadratic work is an empirical basis,
+not an assertion about exact causal attention pair counts; fresh-free nodes do
+not declare that term. Ordinary
+isolated completions calibrate its residual under a nonnegative additive empirical
+model. Bounds may transfer across different multiplicities only when the completed
+multiset covers every requested family; unknown geometry remains uncovered. The
+allocation of a measured residual among families remains uncertainty, not promised
+information. A contradictory signed residual invalidates the forecast rather than
+becoming zero service. Residual calibration retains a bounded chronological
+window across all work vectors, including changing history lengths. This forecasting model is not an exact latency guarantee.
+Fixed requests keep their configured widths and add
+no reconciliation timer.
 
 ## Host/worker boundary
 
@@ -98,4 +144,4 @@ define the worker's service contracts.
 Tests cover device-free resolution, unique family recognition, preview without allocation,
 identical in-process and worker-process behavior, readiness mismatch rejection, one terminal
 outcome per request, and worker loss without stranded work. Performance qualification uses the
-[benchmark hierarchy](benchmarking.md), not construction success or an architecture name.
+[measurement boundaries](evaluation.md#measurement-boundaries), not construction success or an architecture name.

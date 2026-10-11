@@ -86,3 +86,29 @@ native conditioning_overlay for cpu from "cpu/conditioning_overlay.rs":
     launch conditioning_overlay:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
+
+# Preserve activation storage across independently owned feature lifetimes.
+fn feature_copy[M, D](input: &tensor[M, D] A, out: &mut tensor[M, D] A):
+    parallel for row in 0..M:
+        parallel for col in 0..D:
+            out[row, col] = input[row, col]
+
+native feature_copy for metal from "metal/feature_copy.metal":
+    launch feature_copy:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native feature_copy for cuda from "cuda/feature_copy.cu":
+    launch feature_copy:
+        threadgroups (ceil_div(M * D, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native feature_copy for vulkan from "vulkan/feature_copy.comp":
+    launch feature_copy:
+        threadgroups (min(ceil_div(M * D, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native feature_copy for cpu from "cpu/feature_copy.rs":
+    launch feature_copy:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

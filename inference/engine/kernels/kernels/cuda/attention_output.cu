@@ -1,9 +1,6 @@
-// attention_output: o_proj of the A-typed gated heads [M, Q * W] with
-// the F32 hidden rows added. GEMV for M <= 16 (`gemv` to 8 rows, `gemv16`
-// beyond) reading the heads in place, GEMM otherwise: `gemm_small` to 64 rows
-// (the heads in place, or the INT8 candidate's q8_1 rows staged by
-// `stage_s8`), `gemm` beyond (the heads in place); up to SPLIT_ROWS rows split
-// over K into SPLIT shares of partials that `finalize` sums in part order.
+// attention_output: the shared projection producer publishes semantic Act rows
+// or explicitly selected matrix operands. GEMV retains semantic inputs;
+// small and large matrix row bands share the same operand eligibility.
 #define KERNEL_W0 SEISMIC_OUTPUT_WEIGHT
 #include "lib/projection/projection.cuh"
 
@@ -35,13 +32,13 @@ __device__ __forceinline__ void output_gemv(const Pro &heads, unsigned M, unsign
                                           D, output, projection::NoWeight{}, epi);
 }
 
-#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_STAGE_S8
-template <unsigned INT8>
-__global__ void attention_output_stage_s8(SEISMIC_KERNEL_PARAMS) {
+#ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_STAGE
+template <unsigned INT8, unsigned OPERAND>
+__global__ void attention_output_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
-    static_assert(!Pro::STAGED, "the 16-bit path reads the heads in place");
-    projection::stage_row<S8>(GATED_ROWS, blockIdx.x, HEADS, STAGING, GROUPS);
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    projection::stage_projection_row<S8, Operands>(GATED_ROWS, blockIdx.x, SEISMIC_DIM_M, HEADS, STAGING, GROUPS);
 }
 #endif
 
@@ -60,31 +57,34 @@ __global__ void attention_output_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM_SMALL
-template <unsigned INT8>
+template <unsigned INT8, unsigned OPERAND>
 __global__ void attention_output_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
     seismic_dependency_start();
     constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<projection::SmallGemm>();
     if (column < projection::gemm_columns(SEISMIC_DIM_D))
-        projection::gemm_run_split<projection::SmallGemm, S8>(
-            reinterpret_cast<projection::u8 *>(dynamic_shared), S8 ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_GATED),
-            S8 ? HEADS : SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, column, SEISMIC_DIM_D,
+        projection::gemm_run_split<projection::SmallGemm, S8, Operands>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared), (S8 || Operands::MATERIALIZE) ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_GATED),
+            (S8 || Operands::MATERIALIZE) ? HEADS : SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, column, SEISMIC_DIM_D,
             OUTPUT, EPILOGUE, PARTIALS);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_GEMM
-template <unsigned ROTATE>
+template <unsigned INT8, unsigned OPERAND, unsigned ROTATE>
 __global__ void attention_output_gemm(SEISMIC_KERNEL_PARAMS) {
+    using Operands = typename projection::GemmOperands<OPERAND>::type;
+    constexpr bool S8 = INT8 == 1 && projection::quantizable<packets::W0>;
     seismic_dependency_start();
     using Shape = projection::LargeGemm<ROTATE>;
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();
     if (column < projection::gemm_columns(SEISMIC_DIM_D))
-        projection::gemm_run_split<Shape, false>(
-            reinterpret_cast<projection::u8 *>(dynamic_shared), SEISMIC_PTR(SEISMIC_BUFFER_GATED),
-            SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, column, SEISMIC_DIM_D, OUTPUT,
+        projection::gemm_run_split<Shape, S8, Operands>(
+            reinterpret_cast<projection::u8 *>(dynamic_shared), (S8 || Operands::MATERIALIZE) ? STAGING : SEISMIC_PTR(SEISMIC_BUFFER_GATED),
+            (S8 || Operands::MATERIALIZE) ? HEADS : SEISMIC_GATED_STRIDE_0, GROUPS, (unsigned)SEISMIC_DIM_M, HEADS, column, SEISMIC_DIM_D, OUTPUT,
             EPILOGUE, PARTIALS);
 }
 #endif

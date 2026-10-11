@@ -26,7 +26,8 @@ fn cuda_decode(
             .with_param("SLICES", slices)
             .with_param("MATRIX", 0)
             .with_param("STAGES", 2)
-            .with_param("COLUMNS", 1),
+            .with_param("COLUMNS", 1)
+            .with_param("QREG", 0),
     )
     .unwrap()
 }

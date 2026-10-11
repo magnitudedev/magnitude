@@ -13,9 +13,9 @@ mod weights;
 
 pub use assessment::{
     AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms,
+    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, SealedGraphHostBytes,
 };
-pub use capabilities::{CapabilityPlan, PlannedMethod, MAX_DRAFT_PROPOSALS};
+pub use capabilities::{CapabilityPlan, MAX_DRAFT_PROPOSALS, PlannedMethod};
 pub use components::{ArtifactComponent, ArtifactComponentKind, ComponentPlan, ComponentSelection};
 pub use execution_plan::{
     BackendPlan, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, PlannedDevice, ResolvedPolicy,
@@ -23,25 +23,28 @@ pub use execution_plan::{
 pub use programs::{
     Dflash2Binding, DraftBlockBinding, DraftProgramPlan, FeedForwardProgramSlot, HeadProgramPlan,
     ImportProgramSlot, MarkovBinding, MixerProgramSlot, ProgramPlan, SelectorBinding,
-    StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, VisionProgramPlan,
+    SharedHeadProgramPlan, StateProgramPlan, TapProgramPlan, TargetBlockProgramSlot,
+    TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    image_cell_limit, reads_decoded_history, GraphSlots, HistoryStorePlan, LayerHistory,
-    NativeGraphCharge, ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan,
-    ResourcePlanner, StartupSlots, StateCapacityPlan, StateResourcePlan, StateStorePlan,
-    TensorOperations, MAX_IMAGE_CELLS,
+    GraphSlots, HistoryStorePlan, LayerHistory, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
+    ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
+    StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
+    reads_decoded_history,
 };
 pub use weights::{
-    resident_element, resident_layout, source_element, AttentionBinding, AttentionShape,
-    DenseBinding, DenseBranchBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, HeadProjection,
-    HostTablePlan, ModelLoadPlan, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding, ReadoutHead,
-    DenseScales, RecurrentBinding, RoutedBinding, ScalableWeight, SublayerTail, WeightPlan, WeightScalePlan,
-    WeightStorageIdentity,
+    AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,
+    EmbeddingBinding, FeaturesBinding, HeadBinding, HostPeak, HostTablePlan, ModelLoadPlan,
+    ParallelBinding,
+    PerLayerBinding, PerLayerEntryBinding, ReadoutBinding, ReadoutClassChoice, ReadoutHead,
+    RecurrentBinding, RoutedBinding, ScalableWeight, SublayerTail, WeightPlan, WeightScalePlan,
+    WeightStorageIdentity, resident_element, resident_layout, source_element,
 };
 
 pub(crate) use weights::activation_dtype;
 use weights::{
-    planned_element, planned_scalable, source_import_peak_bytes, weight_bytes_by_component,
+    planned_element, planned_readout, planned_scalable, source_import_peak_bytes,
+    weight_bytes_by_component,
 };
 #[cfg(test)]
 use weights::{resident_dtype, validate_unique_roles};
@@ -50,16 +53,16 @@ use weights::{resident_dtype, validate_unique_roles};
 pub(crate) mod tests {
     use super::*;
     use magnitude_artifacts::{
-        gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+        gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
         EmbeddingScale, EntryForm, ExitForm, ExitNorm, FeedForwardUp, GateFunction, HeadNorm,
         HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue, MediaRowAttention,
-        ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, SublayerIndex,
-        Sublayer, ValueNorm, ValueSource, WeightDescriptor, WeightKind,
-        WeightRole, WeightScope,
+        ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm, Rotary, Sublayer,
+        SublayerIndex, ValueNorm, ValueSource, WeightDescriptor, WeightKind, WeightRole,
+        WeightScope,
     };
     use magnitude_state::KvCodec;
     use seismic::{DType, Element};
@@ -184,9 +187,7 @@ pub(crate) mod tests {
                 target: ArtifactIdentity([7; 32]),
                 projector: None,
             },
-            inputs: InputSemantics {
-                coordinate_axes: 1,
-            },
+            inputs: InputSemantics { coordinate_axes: 1 },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: HIDDEN,
@@ -269,6 +270,28 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn plain_weight_plan_ignores_an_unadmitted_optional_draft() {
+        let definition = fixture_definition();
+        let mut manifest = fixture_manifest(&definition);
+        let selection = ComponentSelection {
+            head: false,
+            vision: false,
+        };
+        let plain =
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
+                .unwrap();
+        manifest.draft = Some(ComponentManifest {
+            files: Vec::new(),
+            identity: ArtifactIdentity([9; 32]),
+            tensors: Vec::new(),
+        });
+        let fallback =
+            ModelLoadPlan::derive(&manifest, &definition, selection, seismic::Layout::Rows32)
+                .unwrap();
+        assert_eq!(fallback, plain);
+    }
+
     /// The kernel inventory, derived without a device, names exactly the
     /// kernels a load prepares on the selected device.
     #[test]
@@ -323,8 +346,10 @@ pub(crate) mod tests {
                     weights: &crate::ZeroTuningWeights,
                     observer: &crate::UnreportedTuning,
                     cache: None,
-                    error_classes: &crate::NO_ERROR_CLASSES,
+                    numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                    settings: crate::TuningSettings::STANDARD,
                 },
+                crate::UnpreparedUnits::ServeDefaults,
             )
             .unwrap()
         });
@@ -348,7 +373,10 @@ pub(crate) mod tests {
             .collect::<std::collections::HashSet<_>>();
         assert!(!prepared.is_empty());
         let named = |requests: std::collections::hash_set::Difference<'_, _, _>| {
-            requests.map(ToString::to_string).collect::<Vec<_>>().join("\n")
+            requests
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         assert!(
             inventory == prepared,
@@ -356,6 +384,88 @@ pub(crate) mod tests {
             named(prepared.difference(&inventory)),
             named(inventory.difference(&prepared)),
         );
+    }
+
+    /// A search is held to the room it is given, what the platform lets the
+    /// engine claim, and not to what the load is planned to hold.
+    #[test]
+    fn a_search_is_held_to_the_room_it_is_given() {
+        struct Ceiling(std::cell::Cell<Option<Option<u64>>>);
+        impl crate::TuningObserver for Ceiling {
+            fn event(&self, event: &crate::TuningEvent) {
+                if let crate::TuningEvent::Budget(budget) = event {
+                    self.0.set(Some(budget.memory.ceiling_bytes));
+                }
+            }
+        }
+        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+            return;
+        };
+        let Ok(selected) = crate::platform::select_device(
+            &catalog,
+            crate::ExecutionPath::Native,
+            crate::platform::DeviceRequest::Automatic,
+            &crate::platform::MemoryReserves::standard(),
+        ) else {
+            return;
+        };
+        let device = catalog
+            .open(catalog.resolve(selected.info.selector).unwrap())
+            .unwrap();
+        let definition = fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        let draft = ExecutionPlanner::prepare(
+            &selected,
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            crate::ExecutionPath::Native,
+            PlannedMethod::Plain,
+            KvCodec::Dense,
+            ResourceLimits {
+                max_launch_rows: 2,
+                max_launch_slots: 2,
+                max_selected_rows: 2,
+                max_drafting_slots: 2,
+                exported_logits_rows: 0,
+                max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
+                max_image_cells: 0,
+                lookahead: false,
+            },
+        )
+        .unwrap();
+        let observer = Ceiling(std::cell::Cell::new(None));
+        let room = crate::TuningRoom {
+            device_bytes: 1 << 40,
+            host_bytes: None,
+        };
+        crate::AttestedPrograms::search_draft(
+            &draft,
+            &device,
+            crate::TuningContext {
+                definition: &definition,
+                weights: &crate::ZeroTuningWeights,
+                observer: &observer,
+                cache: None,
+                numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                // The ceiling is set with the mandatory phase: no optional
+                // work is needed to read it.
+                settings: crate::TuningSettings {
+                    budget: std::time::Duration::ZERO,
+                    fresh: false,
+                },
+            },
+            Some(room),
+        )
+        .unwrap();
+        let ceiling = observer
+            .0
+            .get()
+            .expect("a search reports what became of its budget");
+        assert_eq!(ceiling, Some(room.device_bytes));
     }
 
     /// Build actual checked Seismic graph families. The engine may choose how
@@ -419,8 +529,10 @@ pub(crate) mod tests {
                 weights: &crate::ZeroTuningWeights,
                 observer: &crate::UnreportedTuning,
                 cache: None,
-                error_classes: &crate::NO_ERROR_CLASSES,
+                numerical_profile: crate::ResolvedNumericalProfile::standard(),
+                settings: crate::TuningSettings::STANDARD,
             },
+            crate::UnpreparedUnits::ServeDefaults,
         )
         .unwrap();
         let target = programs
@@ -431,6 +543,7 @@ pub(crate) mod tests {
                 &state,
                 draft.programs().target(),
                 limits,
+                &seismic::Workers::new(1),
             )
             .unwrap();
         let readout = programs
@@ -475,11 +588,10 @@ pub(crate) mod tests {
                 &device,
                 draft.load(),
                 &definition,
-                draft.programs().vision(),
-                state.target_state(),
-                state.head_state(),
+                draft.programs(),
+                &state,
                 limits,
-                0,
+                PlannedMethod::Plain,
             )
             .unwrap();
         let copy = programs.state_graphs().unwrap();
