@@ -4,8 +4,11 @@
 //! address; an allocation is a range of a block, and its address is the
 //! block's address plus the range's offset. Blocks of one storage kind grow
 //! from 64 MiB to the block cap (min(`maxMemoryAllocationSize`,
-//! `maxBufferSize`, 1 GiB)); a request beyond the cap gets a dedicated block,
-//! released with it. Host-visible blocks are persistently mapped.
+//! `maxBufferSize`, 1 GiB)); a request beyond the cap gets a dedicated block.
+//! A block is freed once it holds no allocation, so released storage returns
+//! to the device's memory budget: the engine reads the budget less usage as
+//! its headroom, and a block kept empty would hide released storage from it.
+//! Host-visible blocks are persistently mapped.
 
 use crate::device::{call, Inner};
 use ash::vk;
@@ -92,6 +95,24 @@ struct Pool {
     memory_type: u32,
     mapped: bool,
     blocks: Mutex<Vec<Arc<Block>>>,
+}
+
+impl Pool {
+    /// Return `range` to its block. A block left without an allocation
+    /// leaves the pool and is returned for the caller to free. The pool
+    /// lock is held across the return, so no allocation can take a range of
+    /// a block being removed.
+    fn give(&self, range: &Range) -> Option<Arc<Block>> {
+        let mut blocks = self.blocks.lock().expect("pool lock is never poisoned");
+        if !range.block.give(range.offset, range.bytes) {
+            return None;
+        }
+        let index = blocks
+            .iter()
+            .position(|block| Arc::ptr_eq(block, &range.block))
+            .expect("a live range's block belongs to its pool");
+        Some(blocks.remove(index))
+    }
 }
 
 pub(crate) struct Memory {
@@ -222,17 +243,11 @@ impl Memory {
         })
     }
 
-    /// Return `range` to its block; a dedicated block is freed with it.
+    /// Return `range` to its block, and free the block once it holds no
+    /// allocation.
     pub(crate) fn release(&self, device: &ash::Device, range: &Range) {
-        let empty = range.block.give(range.offset, range.bytes);
-        if empty && range.block.dedicated {
-            let mut blocks = self
-                .pool(range.kind)
-                .blocks
-                .lock()
-                .expect("pool lock is never poisoned");
-            blocks.retain(|block| !Arc::ptr_eq(block, &range.block));
-            destroy_block(device, &range.block);
+        if let Some(block) = self.pool(range.kind).give(range) {
+            destroy_block(device, &block);
         }
     }
 
@@ -446,5 +461,96 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         self.device.memory.release(&self.device.device, &self.range);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(bytes: u64) -> Arc<Block> {
+        Arc::new(Block {
+            memory: vk::DeviceMemory::null(),
+            buffer: vk::Buffer::null(),
+            address: 0,
+            bytes,
+            mapped: std::ptr::null_mut(),
+            dedicated: false,
+            free: Mutex::new(vec![(0, bytes)]),
+        })
+    }
+
+    fn range(pool: &Pool, block: &Arc<Block>, bytes: u64) -> Range {
+        Range {
+            kind: pool.kind,
+            block: block.clone(),
+            offset: block
+                .take(bytes, MINIMUM_ALIGNMENT)
+                .expect("the block has room"),
+            bytes,
+        }
+    }
+
+    /// What `VK_EXT_memory_budget` reports as the pool's usage: every block
+    /// it holds, whether or not any allocation remains in it.
+    fn usage(pool: &Pool) -> u64 {
+        pool.blocks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|block| block.bytes)
+            .sum()
+    }
+
+    /// Retained state fills blocks; releasing it (the engine's release order
+    /// evicting retained prefixes and shrinking their slabs) must return
+    /// every block it emptied to the device, or the budget less usage the
+    /// engine admits a claim against never grows and a claim larger than the
+    /// headroom is refused although the released bytes are free.
+    #[test]
+    fn released_storage_returns_emptied_blocks_to_the_device() {
+        const SLAB: u64 = 64 << 20;
+        let pool = Pool {
+            kind: StorageKind::Device,
+            memory_type: 0,
+            mapped: false,
+            blocks: Mutex::new(Vec::new()),
+        };
+        let blocks = (0..4).map(|_| block(16 * SLAB)).collect::<Vec<_>>();
+        pool.blocks.lock().unwrap().extend(blocks.iter().cloned());
+        // The model's resident storage occupies the first block; retained
+        // state fills the rest, one slab beside it in the first block.
+        let model = range(&pool, &blocks[0], 15 * SLAB);
+        let retained = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(index, block)| {
+                let slabs = if index == 0 { 1 } else { 16 };
+                (0..slabs)
+                    .map(|_| range(&pool, block, SLAB))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage(&pool), 64 * SLAB);
+
+        let mut freed = Vec::new();
+        for slab in &retained {
+            freed.extend(pool.give(slab));
+        }
+        // Each emptied block left the pool once, for the caller to free; the
+        // block still holding the model stays.
+        assert_eq!(freed.len(), 3);
+        assert!(freed
+            .iter()
+            .all(|block| blocks[1..].iter().any(|other| Arc::ptr_eq(block, other))));
+        assert_eq!(usage(&pool), 16 * SLAB);
+        assert!(Arc::ptr_eq(&pool.blocks.lock().unwrap()[0], &blocks[0]));
+
+        // The block keeps its free space for later allocations until its
+        // last allocation is released too.
+        let reused = range(&pool, &blocks[0], SLAB);
+        assert!(pool.give(&reused).is_none());
+        assert!(pool.give(&model).is_some());
+        assert_eq!(usage(&pool), 0);
     }
 }

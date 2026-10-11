@@ -10,6 +10,7 @@ applies_to:
   - inference/seismic/api/src/**
   - inference/seismic/backends/cuda/src/driver.rs
   - inference/seismic/backends/cuda/src/executor.rs
+  - inference/seismic/backends/vulkan/src/memory.rs
 ---
 
 # Engine memory
@@ -74,7 +75,9 @@ must also leave the working set's remaining bytes above the same reserve, so the
 never exceeds stable fit capacity. The driver's submission memory lies outside the engine's charge,
 and a working set filled to its end fails a submission as a lost device instead of refusing a claim.
 The observation already excludes the engine's own charges and other processes' use, so an existing
-charge is never subtracted again. A load onto a
+charge is never subtracted again. Released storage returns to its domain: a backend that
+sub-allocates device memory frees each underlying allocation once it holds no storage, so a
+released charge reappears in observed headroom and the release order can satisfy a deficit. A load onto a
 dedicated device also claims its staged uploads against host RAM under the host's reserve.
 
 State is stored in fixed-size history and bank slabs on every backend: one history slab tensor per
