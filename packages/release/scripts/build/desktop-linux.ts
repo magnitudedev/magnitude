@@ -63,6 +63,40 @@ export const validateLinuxPayloadPermissions = (format: LinuxPackageFormat, list
   })) return yield* new DesktopBuildFailed({ message: "Linux application payload must be root-owned without group or other write access" })
 })
 
+/** Effective file modes recorded by an mtree manifest, keyed by path without the leading `./`. */
+export const mtreeFileModes = (mtree: string) => {
+  const modes = new Map<string, number>()
+  let defaults = new Map<string, string>()
+  for (const line of mtree.split("\n")) {
+    const [path, ...keywords] = line.trim().split(/\s+/)
+    if (!path || path.startsWith("#")) continue
+    if (path === "/unset") {
+      for (const keyword of keywords) defaults.delete(keyword)
+      continue
+    }
+    const values = new Map(keywords.map(keyword => [keyword.slice(0, keyword.indexOf("=")), keyword.slice(keyword.indexOf("=") + 1)] as const))
+    if (path === "/set") {
+      defaults = new Map([...defaults, ...values])
+      continue
+    }
+    const mode = values.get("mode") ?? defaults.get("mode")
+    if (mode !== undefined) modes.set(path.replace(/^\.\//, ""), Number.parseInt(mode, 8))
+  }
+  return modes
+}
+
+/**
+ * Pacman writes the installed `.INSTALL` itself with mode 0644 and `pacman -Qkk` compares it with
+ * the package mtree, so package metadata must be 0644 root:root in both the archive and its mtree.
+ */
+export const validatePacmanMetadataModes = (entries: ReadonlyMap<string, string>, mtree: string) => Effect.gen(function* () {
+  const recorded = mtreeFileModes(mtree)
+  if (![".PKGINFO", ".INSTALL", ".MTREE"].every(path => entries.get(path) === "-rw-r--r-- root root")
+    || ![".PKGINFO", ".INSTALL"].every(path => recorded.get(path) === 0o644)) {
+    return yield* new DesktopBuildFailed({ message: "Pacman package metadata must be root-owned mode 0644 in the archive and its file manifest" })
+  }
+})
+
 export const validateLinuxDesktopInstaller = (options: {
   readonly file: string
   readonly format: LinuxPackageFormat
@@ -91,6 +125,9 @@ export const validateLinuxDesktopInstaller = (options: {
     if (![".PKGINFO", ".MTREE", ".INSTALL", pacmanHookPath, pacmanBeginScriptPath].every(path => entries.has(path))) {
       return yield* new DesktopBuildFailed({ message: "Pacman installer is missing its metadata or installation admission hook" })
     }
+    const mtree = yield* Command.make("bsdtar", "-xOf", options.file, ".MTREE").pipe(
+      Command.pipeTo(Command.make("gzip", "-dc")), Command.string)
+    yield* validatePacmanMetadataModes(entries, mtree)
     return
   }
   if (options.format === "deb") {
@@ -211,7 +248,7 @@ const buildPacmanPackage = (options: LinuxInstallerOptions, stage: string, paylo
   yield* fs.makeDirectory(join(tree, "usr/share/libalpm/scripts"))
   yield* fs.writeFileString(join(tree, pacmanBeginScriptPath), `#!/bin/sh\nset -eu\n${begin}`)
   yield* fs.writeFileString(join(tree, ".INSTALL"), renderPacmanInstallScript(begin, end))
-  // Files keep the builder's umask; only the hook script and the sandbox helper need special modes.
+  // Files keep the builder's umask until normalized; only the hook script and the sandbox helper need special modes.
   yield* run("Could not protect the pacman package tree", "find", "usr", "-type", "d", "-exec", "chmod", "0755", "{}", "+")
   yield* run("Could not protect the pacman package tree", "find", "usr", "-type", "f", "-exec", "chmod", "go-w", "{}", "+")
   yield* fs.chmod(join(tree, pacmanBeginScriptPath), 0o755)
@@ -226,9 +263,12 @@ const buildPacmanPackage = (options: LinuxInstallerOptions, stage: string, paylo
     ...pacmanDepends.map(name => `depend = ${name}`),
   ]
   yield* fs.writeFileString(join(tree, ".PKGINFO"), `${info.join("\n")}\n`)
+  // The manifest records these modes, and pacman -Qkk checks the installed .INSTALL against it.
+  for (const metadata of [".INSTALL", ".PKGINFO"]) yield* fs.chmod(join(tree, metadata), 0o644)
   const owner = ["--uid", "0", "--gid", "0", "--uname", "root", "--gname", "root"] as const
   yield* run("Could not record the pacman package file manifest", "bsdtar", "-czf", ".MTREE", "--format=mtree",
     "--options=!all,use-set,type,uid,gid,mode,time,size,md5,sha256,link", ...owner, ".PKGINFO", ".INSTALL", "usr")
+  yield* fs.chmod(join(tree, ".MTREE"), 0o644)
   const candidate = join(stage, linuxDesktopInstaller(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", "pacman", options.version, options.revision))
   yield* run("Could not create the pacman package", "bsdtar", "-cf", candidate, "--zstd", "--options=zstd:compression-level=19",
     ...owner, ".MTREE", ".PKGINFO", ".INSTALL", "usr")

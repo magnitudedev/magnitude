@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
-import { buildLinuxDesktopInstaller, validateLinuxPayloadPermissions } from "./desktop-linux"
+import { buildLinuxDesktopInstaller, mtreeFileModes, validateLinuxPayloadPermissions, validatePacmanMetadataModes } from "./desktop-linux"
 import { linuxDesktopInstaller } from "../../src/targets"
 
 describe("Linux prerelease asset names", () => {
@@ -46,10 +46,37 @@ describe("Linux package publisher-trust protection", () => {
   })
 })
 
+describe("pacman package metadata modes", () => {
+  const protectedEntries = new Map([".PKGINFO", ".INSTALL", ".MTREE"].map(path => [path, "-rw-r--r-- root root"] as const))
+  const manifest = (mode: string) => `#mtree\n/set type=file uid=0 gid=0 mode=${mode}\n./.INSTALL time=1 size=1145\n./.PKGINFO time=1 size=830\n/set mode=755\n./usr type=dir\n`
+
+  it("resolves modes from /set defaults and entry overrides", () => {
+    const modes = mtreeFileModes(`${manifest("644")}./usr/lib/magnitude-desktop/chrome-sandbox mode=4755\n`)
+    expect(modes.get(".INSTALL")).toBe(0o644)
+    expect(modes.get("usr")).toBe(0o755)
+    expect(modes.get("usr/lib/magnitude-desktop/chrome-sandbox")).toBe(0o4755)
+  })
+
+  it("accepts makepkg-equivalent metadata", async () => {
+    await expect(Effect.runPromise(validatePacmanMetadataModes(protectedEntries, manifest("644")))).resolves.toBeUndefined()
+  })
+
+  it("rejects metadata the manifest records as group-writable", async () => {
+    await expect(Effect.runPromise(validatePacmanMetadataModes(protectedEntries, manifest("664")))).rejects.toThrow("mode 0644")
+  })
+
+  it.each([".PKGINFO", ".INSTALL", ".MTREE"])("rejects a group-writable %s archive entry", async path => {
+    const entries = new Map<string, string>(protectedEntries).set(path, "-rw-rw-r-- root root")
+    await expect(Effect.runPromise(validatePacmanMetadataModes(entries, manifest("644")))).rejects.toThrow("mode 0644")
+  })
+})
+
 const hasBsdtar = spawnSync("/bin/sh", ["-c", "command -v bsdtar"]).status === 0
 describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package assembly", () => {
   it("produces a root-owned package with admission hook, scriptlets and setuid sandbox", async () => {
     const root = mkdtempSync(join(tmpdir(), "magnitude-pacman-"))
+    // Release build hosts use umask 002; metadata must not inherit its group write bit.
+    const umask = process.umask(0o002)
     try {
       const app = join(root, "app")
       mkdirSync(join(app, "resources"), { recursive: true })
@@ -70,6 +97,15 @@ describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package asse
       expect(mtree).toMatch(/uid=0 gid=0/)
       expect(mtree).not.toMatch(/uid=[1-9]/)
       expect(mtree).toMatch(/^\.\/usr\/lib\/magnitude-desktop\/chrome-sandbox .*mode=4755/m)
-    } finally { rmSync(root, { recursive: true, force: true }) }
+      expect(mtreeFileModes(mtree).get(".INSTALL")).toBe(0o644)
+      expect(mtreeFileModes(mtree).get(".PKGINFO")).toBe(0o644)
+      const listing = spawnSync("bsdtar", ["-tvf", output], { env: { ...process.env, LC_ALL: "C" } }).stdout.toString()
+      for (const member of [".MTREE", ".PKGINFO", ".INSTALL"]) {
+        expect(listing).toMatch(new RegExp(`^-rw-r--r-- +0 root +root .* \\${member}$`, "m"))
+      }
+    } finally {
+      process.umask(umask)
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
