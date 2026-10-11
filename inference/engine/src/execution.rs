@@ -9,7 +9,7 @@ use crate::error::{
 };
 use crate::options::{ExecutionManifest, ResolvedMethod};
 use crate::worker::protocol::LoadProgress;
-use magnitude_artifacts::Package;
+use magnitude_artifacts::{ArtifactIdentity, Package, PackageIdentity};
 use magnitude_batching::Demand;
 use magnitude_executor::{
     AttestedPrograms, ClaimRefusal, ComponentLoader, DEFAULT_KERNEL_CACHE_BYTES, DeviceHeap,
@@ -19,7 +19,7 @@ use magnitude_executor::{
     TokenId, TracedWork, TunedEntry, TuningCacheKey, TuningContext, TuningEvent, TuningObserver,
     TuningOrigin, TuningSettings, TuningTrace, UnpreparedUnits, WeightImportError, WorkKind,
     memory::{ClaimId, HoldingClass},
-    platform::{self, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
+    platform::{self, DeviceRequest, DomainRole, OpenedPlatform, PlatformConfig, PlatformError},
     require_normal,
 };
 use magnitude_family_contracts::{HeadHistory, InputLayout, PreparedModelInput, TokenPlan};
@@ -286,11 +286,20 @@ pub(crate) fn search(
 
 /// The kernel cache key under which a finished Prepare of `manifest` is
 /// recorded ([`KernelCache::prepared`]): everything of the manifest that
-/// decides what a Prepare searches, and the search's version. Where the host
-/// keeps its cache and trace is not part of it, nor whether the Prepare
-/// searched afresh.
+/// decides what a Prepare searches, and the search's version. The key
+/// outlives the process that resolved the manifest, so nothing the process
+/// or the boot names is part of it: not the package's artifact identities,
+/// which are process-local ([`ArtifactIdentity`]; the components' files and
+/// tensors stand for them), and not the device request, whose selector
+/// names the device as this boot enumerated it. The device's part is its
+/// tuning identity, which is in every unit's record key and is known only
+/// once the device is opened: a load on a device whose records are missing
+/// meets that unit and reports it unprepared all the same. Where the host
+/// keeps its cache and trace is not part of the key either, nor whether the
+/// Prepare searched afresh.
 fn prepared_key(manifest: &ExecutionManifest) -> Result<TuningCacheKey, LoadError> {
-    let load = ExecutionManifest {
+    let mut load = ExecutionManifest {
+        device: DeviceRequest::Automatic,
         kernel_cache: None,
         tuning_trace: None,
         tuning: TuningSettings {
@@ -299,6 +308,23 @@ fn prepared_key(manifest: &ExecutionManifest) -> Result<TuningCacheKey, LoadErro
         },
         ..manifest.clone()
     };
+    let unnamed = ArtifactIdentity([0; 32]);
+    let package = &mut load.package;
+    package.identity = PackageIdentity {
+        target: unnamed,
+        projector: package.identity.projector.map(|_| unnamed),
+    };
+    for component in [
+        Some(&mut package.target),
+        package.projector.as_mut(),
+        package.draft.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        component.identity = unnamed;
+    }
+    load.definition.artifact_identity = package.identity;
     let load = serde_json::to_string(&load).map_err(|error| internal(error.to_string()))?;
     Ok(TuningCacheKey::of(&format!(
         "prepared {SEARCH_VERSION}\n{load}"
@@ -1078,5 +1104,38 @@ impl TuningObserver for TuningReport {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::options::tests::manifest_with_kernel_cache;
+    use std::path::PathBuf;
+
+    /// Another process, after a reboot, resolves the same model under other
+    /// artifact identities (they count the packages each process opened)
+    /// and names the same device by another selector (its registry id is
+    /// assigned at boot); its load finds the Prepare this one recorded.
+    /// Another model does not.
+    #[test]
+    fn a_prepare_is_found_by_another_process_resolving_the_same_load() {
+        let prepared = manifest_with_kernel_cache(Some(PathBuf::from("/cache/kernels")));
+        let mut elsewhere = manifest_with_kernel_cache(Some(PathBuf::from("/other/kernels")));
+        let identity = ArtifactIdentity([7; 32]);
+        elsewhere.package.identity.target = identity;
+        elsewhere.package.target.identity = identity;
+        elsewhere.definition.artifact_identity.target = identity;
+        elsewhere.device = "metal:000000010000050f".parse().unwrap();
+        assert_eq!(
+            prepared_key(&prepared).unwrap(),
+            prepared_key(&elsewhere).unwrap()
+        );
+        let mut other = prepared.clone();
+        other.package.target.files[0].size += 1;
+        assert_ne!(
+            prepared_key(&prepared).unwrap(),
+            prepared_key(&other).unwrap()
+        );
     }
 }

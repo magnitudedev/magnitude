@@ -72,6 +72,14 @@ that follows it prepares: each searched unit's canonical artifact and every entr
 parameters, concurrently and before its optional search; a promoted choice publishes its own
 artifact. That load therefore finds each program in the toolchain's store (and the driver's
 caches) rather than forming it, one entry at a time, itself.
+A prepare-only job that runs to its end records its load in the kernel cache, keyed by the
+manifest's content and the tuning version; a later load of the same manifest in any process finds
+that record before it opens a device and starts no further prepare-only job. The key excludes what
+names the load only within a process or a boot: process-local artifact identities (the components'
+files and tensors stand for them) and the device selector (a Metal registry id is assigned at
+boot). The device's tuning identity, known only once it is opened, keys every unit's record, so a
+load on a device without records still meets an unprepared unit and reports it. The key also
+excludes where the host keeps its cache and trace, and fresh tuning.
 Native entries with declared tuning parameters are tuned on the opened device during this
 preparation, on the first preparation for each tuning key, whether by a load or by the prepare-only
 job that follows a catalog installation: each such entry registers a tuning case
