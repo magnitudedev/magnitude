@@ -401,10 +401,15 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::Internal { .. } => "model_load_failed",
     };
     let message = match &error {
-        LoadError::WorkerLost { .. } => match worker.diagnostics() {
-            diagnostics if diagnostics.is_empty() => error.to_string(),
-            diagnostics => format!("{error}; worker diagnostics: {diagnostics}"),
-        },
+        LoadError::WorkerLost { .. } => {
+            let exit = worker
+                .ended_status()
+                .map_or_else(String::new, |status| format!("; worker {status}"));
+            match worker.diagnostics() {
+                diagnostics if diagnostics.is_empty() => format!("{error}{exit}"),
+                diagnostics => format!("{error}{exit}; worker diagnostics: {diagnostics}"),
+            }
+        }
         _ => error.to_string(),
     };
     ModelOperationFailure::new(code, message, retryable)

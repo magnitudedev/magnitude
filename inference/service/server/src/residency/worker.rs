@@ -53,6 +53,19 @@ pub fn run_inference_worker() -> i32 {
     code
 }
 
+/// How long a load failure waits for an ended worker's exit status.
+const EXIT_OBSERVATION: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Record a worker's exit once, when its retirement is first observed: a crash (on Windows an
+/// NTSTATUS such as 0xc0000005) is otherwise visible nowhere.
+fn log_exit(pid: u32, status: ExitStatus) {
+    if status.success() {
+        tracing::info!(worker.pid = pid, %status, "inference worker exited");
+    } else {
+        tracing::warn!(worker.pid = pid, %status, "inference worker exited");
+    }
+}
+
 enum ProcessState {
     Owned(BlockingProcess),
     Retired(ExitStatus),
@@ -148,13 +161,31 @@ impl EngineWorker {
         self.retire()
     }
 
+    /// The exit status of a worker whose protocol stream ended, observed for up to
+    /// [`EXIT_OBSERVATION`]: its stream closes just before the process is reaped. `None` while it
+    /// is still running or cannot be observed.
+    pub fn ended_status(&self) -> Option<ExitStatus> {
+        let started = std::time::Instant::now();
+        loop {
+            match self.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) if started.elapsed() < EXIT_OBSERVATION => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
+
     fn retire(&self) -> std::io::Result<ExitStatus> {
         let mut state = self.process.lock().expect("worker process lock");
         match &mut *state {
             ProcessState::Retired(status) => Ok(*status),
             ProcessState::Owned(process) => {
                 // An error leaves the exact owner in place. Only proof of retirement replaces it.
+                let pid = process_id(process);
                 let status = stop(process)?;
+                log_exit(pid, status);
                 *state = ProcessState::Retired(status);
                 Ok(status)
             }
@@ -231,8 +262,10 @@ impl ResidencyWorker for EngineWorker {
         match &mut *state {
             ProcessState::Retired(status) => Ok(Some(*status)),
             ProcessState::Owned(process) => {
+                let pid = process_id(process);
                 let status = observe_exit(process)?;
                 if let Some(status) = status {
+                    log_exit(pid, status);
                     *state = ProcessState::Retired(status);
                 }
                 Ok(status)
