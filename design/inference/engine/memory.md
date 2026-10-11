@@ -90,7 +90,10 @@ The heap grants a claim only while every domain the load uses is in the Normal b
 preferred charge first, then the minimum. It sets Seismic's enforced limit to current charges plus
 the allocation domain's ceiling (headroom less the planning reserve).
 A limit may fall below retained charges: that forbids further allocation until releases reduce
-the charge. An unclaimed allocation therefore fails within Seismic. A refused minimum leaves
+the charge. An unclaimed allocation therefore fails within Seismic. Beside its high-water mark, Seismic's
+usage reports the largest demand its limit refused since the mark was restarted (what was charged
+with what was asked for), so a consumer such as kernel tuning tells a refusal by the limit from any
+other failure and learns what the refused work needed. A refused minimum leaves
 accepted request state unchanged and returns the required and available bytes as a demand
 deficit for the request owner to resolve.
 

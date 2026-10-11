@@ -68,6 +68,14 @@ Deadline checks also apply to domain traversal, input building and the intervals
 submissions. Noninterruptible work has forecast uncertainty: an actual overrun is a failed
 budget result, not permission to extend the cap or conceal time.
 
+Memory is admitted as time is. A search runs under the room the platform let the engine claim when
+its device was opened, its observed availability above the planning reserve, so a search explores
+less when the host holds more. Work starts only when its forecast bytes fit what is free. An input
+build the device's enforced limit refuses anyway did not fit its room; it is neither the unit's
+failure nor the preparation's. Its point is priced at what the build demanded and is built again
+only once that much is free; otherwise its unit stops for want of room with its terminal choice
+recorded, and the other units continue.
+
 Independent compilation can overlap device measurement, with resources and pending work charged
 to the same load. Elapsed wall time is the budget authority; overlapping phase times do not sum
 to a second budget. A slower device explores less, not longer. No later request, changed traffic

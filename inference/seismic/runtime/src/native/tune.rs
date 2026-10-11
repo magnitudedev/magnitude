@@ -678,6 +678,38 @@ fn held_bytes(device: &DeviceInner, charged: u64, retained: u64, footprint: Opti
     }
 }
 
+/// Build point `index`'s inputs on `device`. A build the device's enforced
+/// memory limit refused is not the unit's failure: its piece was admitted
+/// on a footprint below what the build demands, which an unbuilt point's
+/// price only forecasts. The point's price (`resident`) is raised to what
+/// the build demanded of the ledger, what it had charged when refused with
+/// what it asked for, and `None` ends the piece. Offered again at that
+/// price, it is admitted as any priced piece: once enough is free, so the
+/// same allocation is not refused again, or never, its unit then stopped
+/// for want of room.
+fn build_point<'a>(
+    device: &DeviceInner,
+    source: &mut dyn PointSource<'a>,
+    spec: &PointSpec,
+    index: usize,
+    resident: &mut Observed,
+) -> Result<Option<PointInputs<'a>>, TuneError> {
+    let before = device.memory_usage();
+    match source.build(index) {
+        Ok(inputs) => Ok(Some(inputs)),
+        Err(detail) => match device.memory_usage().refused_demand {
+            Some(demand) if Some(demand) > before.refused_demand => {
+                resident.observe(demand.saturating_sub(before.charged) as f64);
+                Ok(None)
+            }
+            _ => Err(TuneError::Inputs {
+                point: spec.label.clone(),
+                detail,
+            }),
+        },
+    }
+}
+
 /// What a class of operation is taken to add to the bytes held when a
 /// piece is admitted: the most one of its operations has added. A piece is
 /// started only if its bytes fit what is free, and half of a class's
@@ -3693,8 +3725,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
 
     /// Build again the inputs of every timed point that gave its own up,
     /// for the piece about to run. Each build is observed in its point's
-    /// classes, seconds and bytes: what the piece was quoted.
-    fn restore(&mut self, source: &mut dyn PointSource<'a>) -> Result<(), TuneError> {
+    /// classes, seconds and bytes: what the piece was quoted. False when
+    /// the device's memory limit refused a build ([`build_point`]): the
+    /// piece cannot run.
+    fn restore(&mut self, source: &mut dyn PointSource<'a>) -> Result<bool, TuneError> {
         let Self {
             progress,
             ground,
@@ -3706,7 +3740,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             ..
         } = self;
         let Progress::Searching(searching) = progress else {
-            return Ok(());
+            return Ok(true);
         };
         let validator = &ground
             .as_ref()
@@ -3726,17 +3760,23 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             }
             let before = held();
             let building = Instant::now();
-            let inputs = source.build(index).map_err(|detail| TuneError::Inputs {
-                point: specs[index].label.clone(),
-                detail,
-            })?;
+            let Some(inputs) = build_point(
+                device,
+                source,
+                &specs[index],
+                index,
+                &mut resident_bytes[index],
+            )?
+            else {
+                return Ok(false);
+            };
             let built = building.elapsed().as_secs_f64();
             builds[index].observe(built);
             time.building_seconds += built;
             validator.restore(point, TuningPoint::new(&specs[index], inputs)?)?;
             resident_bytes[index].observe(held().saturating_sub(before) as f64);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// What making resident the timed points that are not costs the next
@@ -4175,27 +4215,26 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 .map_or(0, |piece| piece.challengers().len()),
             Progress::Discovering(_) => 0,
         };
-        if work.stage != Stage::Discovery {
-            self.restore(source)?;
-        }
+        // A piece whose inputs the device's memory limit refused ends
+        // there, its point priced at what the build demanded: the piece is
+        // offered again at that price ([`build_point`]).
+        let restored = work.stage == Stage::Discovery || self.restore(source)?;
         // The piece's own operations add to what is held with its unit's
         // inputs resident.
         host = host.max(ProcessMemory::footprint_now());
         let resident = self.held();
-        let promoted = match work.stage {
-            Stage::Discovery => {
-                self.discover(source)?;
-                false
-            }
+        let (built, promoted) = match work.stage {
+            _ if !restored => (false, false),
+            Stage::Discovery => (self.discover(source)?, false),
             Stage::Form | Stage::Measure => {
                 self.measure()?;
-                false
+                (true, false)
             }
-            Stage::Promote | Stage::Confirm => self.promote(source, work.stage)?,
+            Stage::Promote | Stage::Confirm => (true, self.promote(source, work.stage)?),
         };
         // What the piece formed and no longer needs leaves the device with
         // it: only the served choice and a leader keep their kernels.
-        if work.stage != Stage::Discovery {
+        if built && work.stage != Stage::Discovery {
             if let Progress::Searching(searching) = &mut self.progress {
                 // A conversion changed what the challengers are ranked
                 // against: its leader's standing, measurement and rounds,
@@ -4252,6 +4291,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         let operations = memory.peak_bytes.saturating_sub(resident) as f64;
         match work.stage {
+            // The refused point was priced as its build was refused, and
+            // the piece's operations did not run.
+            _ if !built => {}
             Stage::Discovery => {
                 let index = discovered.expect("discovery discovers a point");
                 self.resident_bytes[index].observe(memory.added() as f64);
@@ -4275,17 +4317,24 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     }
 
     /// Build the next discovery point and measure the defaults there; with
-    /// the last, plan the search.
-    fn discover(&mut self, source: &mut dyn PointSource<'a>) -> Result<(), TuneError> {
+    /// the last, plan the search. False when the device's memory limit
+    /// refused the point's build ([`build_point`]): nothing was measured.
+    fn discover(&mut self, source: &mut dyn PointSource<'a>) -> Result<bool, TuneError> {
         let index = self
             .undiscovered()
             .expect("discovery has an unmeasured point");
-        let spec = &self.specs[index];
         let building = Instant::now();
-        let inputs = source.build(index).map_err(|detail| TuneError::Inputs {
-            point: spec.label.clone(),
-            detail,
-        })?;
+        let Some(inputs) = build_point(
+            &self.device,
+            source,
+            &self.specs[index],
+            index,
+            &mut self.resident_bytes[index],
+        )?
+        else {
+            return Ok(false);
+        };
+        let spec = &self.specs[index];
         let built = building.elapsed().as_secs_f64();
         self.builds[index].observe(built);
         self.time.building_seconds += built;
@@ -4346,7 +4395,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             self.longest = self.longest.max(planning.elapsed().as_secs_f64());
             opened?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Every discovery point is measured: fix the objective and plan the

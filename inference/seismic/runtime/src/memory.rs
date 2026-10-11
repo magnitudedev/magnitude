@@ -25,6 +25,11 @@ pub struct MemoryUsage {
     /// was last restarted ([`MemoryDomain::restart_high_water`]): what was
     /// charged and released again in between is seen here and nowhere else.
     pub high_water: u64,
+    /// The most `charged` would have been, over the same span as
+    /// `high_water`, had the enforced limit granted a reservation it
+    /// refused: what was charged then and what was asked for. None when
+    /// the limit refused nothing in that span.
+    pub refused_demand: Option<u64>,
 }
 
 /// Process-wide charges against one physical memory pool.
@@ -50,6 +55,7 @@ struct MemoryState {
     charged: u64,
     limit: Option<u64>,
     high_water: u64,
+    refused_demand: Option<u64>,
 }
 
 /// One opened device's accounting scope within its pool ledger. Lock order
@@ -67,15 +73,18 @@ impl MemoryDomain {
                 charged: 0,
                 limit: None,
                 high_water: 0,
+                refused_demand: None,
             }),
         })
     }
 
-    /// Start the high-water mark again from what is charged now, so that
-    /// the next reading is of the work between the two.
+    /// Start the high-water mark again from what is charged now, and forget
+    /// the refusals before, so that the next reading is of the work between
+    /// the two.
     pub(crate) fn restart_high_water(&self) {
         let mut state = self.state();
         state.high_water = state.charged;
+        state.refused_demand = None;
     }
 
     fn state(&self) -> MutexGuard<'_, MemoryState> {
@@ -92,6 +101,7 @@ impl MemoryDomain {
             limit: state.limit,
             pool_charged,
             high_water: state.high_water,
+            refused_demand: state.refused_demand,
         }
     }
 
@@ -118,6 +128,7 @@ impl MemoryDomain {
         let next = state.charged + bytes;
         if let Some(limit) = state.limit {
             if next > limit {
+                state.refused_demand = state.refused_demand.max(Some(next));
                 return Err(MemoryCapacity {
                     required: bytes,
                     available: limit.saturating_sub(state.charged),
@@ -334,6 +345,23 @@ mod tests {
         drop(charge);
         assert_eq!(domain.usage().charged, 0);
         assert_eq!(domain.usage().pool_charged, 0);
+    }
+
+    #[test]
+    fn a_refused_reservation_is_read_as_the_demand_it_made_until_the_mark_restarts() {
+        let domain = domain();
+        domain.set_limit(Some(10));
+        let held = domain.reserve(6).unwrap();
+        assert_eq!(domain.usage().refused_demand, None);
+        assert!(domain.reserve(7).is_err());
+        assert!(domain.reserve(5).is_err());
+        let usage = domain.usage();
+        assert_eq!((usage.charged, usage.high_water), (6, 6));
+        // The largest refused demand: what was charged and what was asked.
+        assert_eq!(usage.refused_demand, Some(13));
+        domain.restart_high_water();
+        assert_eq!(domain.usage().refused_demand, None);
+        drop(held);
     }
 
     #[test]

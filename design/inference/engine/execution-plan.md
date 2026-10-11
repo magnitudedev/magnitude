@@ -200,6 +200,12 @@ prerequisites are validated as a finite acyclic dependency relation before sched
 prerequisite publishes its final artifact and ends its exploration; dependent alternatives are
 qualified and repriced against that artifact, not a provisional default.
 
+A search's bytes are admitted like its time, under the room its device's platform granted when it
+was opened. A point whose input build the device's memory limit refuses is priced at the build's
+demand and offered again; a unit whose work cannot fit stops for want of room with its terminal
+choice published. Neither fails the preparation, so a preparation that ran to its end is recorded
+as finished and later loads read its records without searching.
+
 Deadline checks apply before each interruptible operation and between submissions. A reference
 call is a call of the canonical kernel, priced by its measured service. Other admitted quotes remain forecasts; submission granularity bounds their
 risk, and receipts report actual overruns honestly. A reserve

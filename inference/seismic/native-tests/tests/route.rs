@@ -3083,3 +3083,102 @@ fn stray_writes_are_observed_where_declared(device: Device) {
         }
     }
 }
+
+/// A point whose build the device's memory limit refuses is a piece that
+/// did not fit its room, not a failure of the unit: the piece ends with
+/// nothing measured, the point is priced at what its build demanded, and
+/// once that is free the same discovery runs.
+#[test]
+fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
+    use seismic::{PointInputs, PointSource, PointSpec};
+
+    /// Points whose inputs are allocated on the device as they are built,
+    /// each with state of `held` bytes the source keeps beside them.
+    struct Allocated<'d> {
+        device: &'d Device,
+        n: u64,
+        held: [u64; 2],
+        kept: [Option<Tensor>; 2],
+    }
+    impl PointSource<'static, split_sum::Entry> for Allocated<'_> {
+        fn release(&mut self, point: usize) {
+            self.kept[point] = None;
+        }
+        fn points(&self) -> Vec<PointSpec> {
+            (0..2)
+                .map(|point| PointSpec {
+                    label: format!("p{point}"),
+                    weight: 1.,
+                    class: None,
+                    cost: (point + 1) as f64,
+                    census: true,
+                })
+                .collect()
+        }
+        fn build(&mut self, point: usize) -> Result<PointInputs<'static>, String> {
+            let state = Tensor::zeros(self.device, Element::f32(), &[self.held[point] / 4])
+                .map_err(|error| error.to_string())?;
+            let x = f32_tensor(self.device, &[self.n], &exact_values(self.n as usize));
+            self.kept[point] = Some(state);
+            Ok(seismic::point_inputs::<split_sum::Entry>(
+                vec![split_sum::Args { x: &x }],
+                seismic::WorkloadRotation::All,
+                None,
+                Default::default(),
+            ))
+        }
+    }
+
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 64;
+    let large = 8u64 << 20;
+    let mut source = Allocated {
+        device: &device,
+        n,
+        held: [16, large],
+        kept: [None, None],
+    };
+    let mut unit =
+        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+    unit.prepare_defaults(&mut source).unwrap();
+    let Strategy::Search(plan) = search() else {
+        unreachable!()
+    };
+    unit.plan(UnitPlan {
+        settings: plan.settings,
+        min_sample_seconds: 0.0002,
+        start: Vec::new(),
+    });
+    assert_eq!(unit.next().unwrap().stage, Stage::Discovery);
+    unit.perform(&mut source).unwrap();
+    // The second point's state is refused by the device's limit.
+    let charged = device.memory_usage().charged;
+    device.set_memory_limit(Some(charged + large / 2));
+    let work = unit.next().unwrap();
+    assert_eq!(work.stage, Stage::Discovery);
+    assert_eq!(work.footprint.unpriced, 1, "an unbuilt point has no price");
+    let performed = unit
+        .perform(&mut source)
+        .expect("a refused build is not the unit's failure");
+    assert_eq!(performed.stage, Stage::Discovery);
+    assert!(!performed.promoted);
+    let work = unit.next().unwrap();
+    assert_eq!(
+        work.stage,
+        Stage::Discovery,
+        "the point is still undiscovered"
+    );
+    assert_eq!(work.footprint.unpriced, 0);
+    assert!(
+        work.footprint.priced >= large,
+        "the point is priced at what its build demanded: {}",
+        work.footprint.priced
+    );
+    // With room for it, the same point is discovered.
+    device.set_memory_limit(None);
+    unit.perform(&mut source).unwrap();
+    assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
+}
