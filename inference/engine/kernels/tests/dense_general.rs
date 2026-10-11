@@ -321,16 +321,31 @@ fn mappings(device: &seismic::Device, launches: Launches) -> Vec<Mapping> {
     }
 }
 
+/// The statics the device's implementation declares: backends fix different
+/// subsets of the entry dimensions (the CPU forms read most of them at run time).
+fn declared(
+    implementation: Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError>,
+) -> Vec<String> {
+    implementation
+        .unwrap()
+        .expect("every test device has a native implementation")
+        .statics
+}
+
+/// `mapping`'s specialization with those of `statics` that `declared` names.
 fn specialization(
     device: &seismic::Device,
+    declared: &[String],
     statics: &[(&str, usize)],
     mapping: &Mapping,
 ) -> seismic::NativeSpecialization {
-    let statics = if is_cpu(device) { &[][..] } else { statics };
-    let specialization = statics.iter().fold(
-        seismic::NativeSpecialization::new(),
-        |spec, (name, value)| spec.with_static(*name, *value as u64),
-    );
+    let specialization = statics
+        .iter()
+        .filter(|(name, _)| declared.iter().any(|declared| declared == name))
+        .fold(
+            seismic::NativeSpecialization::new(),
+            |spec, (name, value)| spec.with_static(*name, *value as u64),
+        );
     let specialization = if device.backend() == seismic::BackendName::Cuda {
         specialization.with_param("OPERAND", 0)
     } else {
@@ -353,7 +368,8 @@ fn project_rows_specialization(
     statics: &[(&str, usize)],
     mapping: &Mapping,
 ) -> seismic::NativeSpecialization {
-    let specialization = specialization(device, statics, mapping);
+    let declared = declared(project_rows::native_implementation(device));
+    let specialization = specialization(device, &declared, statics, mapping);
     if device.backend() != seismic::BackendName::Metal {
         return specialization;
     }
@@ -907,8 +923,13 @@ fn native_dense_up_matches_host_reference() {
                             UW: seismic::Element::bf16(),
                             A: seismic::Element::bf16(),
                         },
-                        &specialization(device, &[("H", h), ("F", f)], &mapping)
-                            .with_static("US", 1),
+                        &specialization(
+                            device,
+                            &declared(dense_up::native_implementation(device)),
+                            &[("H", h), ("F", f)],
+                            &mapping,
+                        )
+                        .with_static("US", 1),
                     )
                     .unwrap()
                     .call(dense_up::Args {
@@ -977,10 +998,15 @@ fn native_short_conv_project_matches_host_reference() {
                             XW: seismic::Element::bf16(),
                             A: seismic::Element::bf16(),
                         },
-                        &specialization(device, &[("H", h), ("CH", ch)], &mapping)
-                            .with_static("BS", 0)
-                            .with_static("CS", 0)
-                            .with_static("XS", 0),
+                        &specialization(
+                            device,
+                            &declared(short_conv_project::native_implementation(device)),
+                            &[("H", h), ("CH", ch)],
+                            &mapping,
+                        )
+                        .with_static("BS", 0)
+                        .with_static("CS", 0)
+                        .with_static("XS", 0),
                     )
                     .unwrap()
                     .call(short_conv_project::Args {
@@ -1047,8 +1073,13 @@ fn native_per_layer_gate_matches_host_reference() {
                             GW: seismic::Element::bf16(),
                             A: seismic::Element::bf16(),
                         },
-                        &specialization(device, &[("D", d), ("L", l), ("P", p)], &mapping)
-                            .with_static("GS", 0),
+                        &specialization(
+                            device,
+                            &declared(per_layer_gate::native_implementation(device)),
+                            &[("D", d), ("L", l), ("P", p)],
+                            &mapping,
+                        )
+                        .with_static("GS", 0),
                     )
                     .unwrap()
                     .call(per_layer_gate::Args {
