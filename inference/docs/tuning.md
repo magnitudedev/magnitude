@@ -78,7 +78,13 @@ recorded, and the other units continue.
 
 Independent compilation can overlap device measurement, with resources and pending work charged
 to the same load. Elapsed wall time is the budget authority; overlapping phase times do not sum
-to a second budget. A slower device explores less, not longer. No later request, changed traffic
+to a second budget. A compile that outruns its forecast does not consume the conclusion reserve:
+when the reserve is reached its piece is abandoned unmeasured, choices publish while it finishes,
+and the abandoned work is reported. A promoted choice's serving artifact is formed as the choice
+is promoted, inside that work's own admission, so the conclusion holds no artifact compiles,
+whose cost a system shader cache makes unpredictable. A compile cannot be interrupted, so it
+starts only if it would end within the deadline at the longest compile the load has observed,
+including one deliberately compiled with nothing to serve it. A slower device explores less, not longer. No later request, changed traffic
 mix or cached incomplete search acquires another tuning allowance.
 
 ## Search and finalization

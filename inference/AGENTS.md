@@ -41,6 +41,22 @@ Stopping to ask halts the work until someone answers.
 on stale target directories at once, without hesitation and without asking. Build output is
 regenerable, and a full disk stops every job on that machine.
 
+## Tuning parameters and defaults
+
+The tuning budget never grows. Keep declared spaces to configurations that could win.
+
+- **Remove a configuration only when both of these hold:**
+  1. *Reason:* reading the kernel explains why it cannot be the fastest, in terms of a quantity
+     computed from the shape and parameters, so the reason covers shapes not yet measured.
+  2. *Evidence:* tuning history shows it was never the fastest on any unit of that backend.
+
+  A reason without evidence, or evidence without a reason, is not enough.
+- **Write a removal as a `where` constraint or shorter value list**, with the reason and numbers in
+  a comment.
+- **The default is the first admitted configuration:** put first the value with the smallest
+  worst-case gap to the measured best.
+- **Judge each backend on its own devices**, and recheck for new GPU or model families.
+
 ## Measurement
 
 - Model quality and speed are measured only through `inference/evaluation`.

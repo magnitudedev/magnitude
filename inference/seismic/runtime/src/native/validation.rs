@@ -11,6 +11,7 @@
 use super::NativePrepared;
 use super::admission::{NumericalObservation, NumericalRequirement, admit};
 use super::comparison::{COMPARISON_VERSION, SubjectMeasurement, compare};
+use super::deadline::{Deadline, WorkError};
 use super::observation::{Observation, ReferencePages, StateRegion, Subject, observe, subjects};
 use super::search::PointKey;
 use super::timing::{PointPrices, PointTiming};
@@ -26,7 +27,7 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 pub(super) type Initializer<'a> = Rc<RefCell<TuningInitializer<'a>>>;
@@ -139,7 +140,7 @@ impl<'a> PreparedPoint<'a> {
     /// Execute the default at the witness rotations it is not observed at
     /// in the point's resident inputs: it never runs twice at a rotation
     /// of inputs that stay.
-    fn ensure_reference(&self) -> Result<(), Exclusion> {
+    fn ensure_reference(&self, deadline: Deadline) -> Result<(), WorkError<Exclusion>> {
         let inputs = self.inputs();
         let missing = (0..inputs.rotation.len())
             .filter(|rotation| inputs.reference.borrow()[*rotation].is_none())
@@ -152,6 +153,7 @@ impl<'a> PreparedPoint<'a> {
         let execution = |error: &dyn std::fmt::Display| Exclusion::Execution(error.to_string());
         let result = (|| {
             for rotation in missing {
+                deadline.check(Duration::ZERO)?;
                 let args = &inputs.rotation[rotation];
                 let witness = Instant::now();
                 // The reset restores every written row before the default
@@ -160,6 +162,7 @@ impl<'a> PreparedPoint<'a> {
                 if let Some(reset) = &inputs.initialize {
                     reset.borrow_mut()().map_err(|e| execution(&e))?;
                 }
+                deadline.check(Duration::ZERO)?;
                 let results = shared
                     .default
                     .call(args.clone())
@@ -185,7 +188,11 @@ impl<'a> PreparedPoint<'a> {
     /// pass over the workload rotation is observed and retained as the
     /// reference there, so no candidate ever needs another default run at
     /// those witnesses.
-    pub(super) fn retain_default(&self, timing: &mut PointTiming<'a>) -> Result<(), Exclusion> {
+    pub(super) fn retain_default(
+        &self,
+        timing: &mut PointTiming<'a>,
+        deadline: Deadline,
+    ) -> Result<(), WorkError<Exclusion>> {
         let shared = &self.shared;
         let inputs = self.inputs();
         if timing.prepared().artifact() != shared.default.artifact()
@@ -199,7 +206,7 @@ impl<'a> PreparedPoint<'a> {
         timing.initialize = inputs.initialize.clone();
         let started = Instant::now();
         let workload = &inputs.workload;
-        let result = timing.observe_first(|position, values, args| {
+        let result = timing.observe_first(deadline, |position, values, args| {
             let expected = observe(
                 values,
                 args,
@@ -215,7 +222,12 @@ impl<'a> PreparedPoint<'a> {
 
     /// Place a kernel's timing at this point: its operations are observed
     /// in the point's classes, and its state is restored.
-    pub(super) fn price_before(&self, timing: &mut PointTiming<'a>) -> Result<(), Exclusion> {
+    pub(super) fn price_before(
+        &self,
+        timing: &mut PointTiming<'a>,
+        deadline: Deadline,
+    ) -> Result<(), WorkError<Exclusion>> {
+        deadline.check(Duration::ZERO)?;
         let inputs = self.inputs();
         timing.track(self.prices.clone());
         let began = Instant::now();
@@ -262,9 +274,10 @@ impl<'a> PreparedPoint<'a> {
         mut timing: Option<&mut PointTiming<'a>>,
         kernel: &Arc<NativePrepared>,
         key: &dyn Fn(Vec<usize>) -> PointKey,
-    ) -> Result<Option<usize>, Exclusion> {
+        deadline: Deadline,
+    ) -> Result<Option<usize>, WorkError<Exclusion>> {
         if let Some(timing) = timing.as_deref_mut() {
-            self.price_before(timing)?;
+            self.price_before(timing, deadline)?;
         }
         let shared = &self.shared;
         let inputs = self.inputs();
@@ -287,7 +300,7 @@ impl<'a> PreparedPoint<'a> {
             shared.evidence.borrow_mut().attribute(artifact, observed);
             return Ok(Some(observed));
         }
-        self.ensure_reference()?;
+        self.ensure_reference(deadline)?;
         let mut rotations: Vec<Option<Vec<SubjectMeasurement>>> = vec![None; all.len()];
         let mut measure_at = |rotation: usize,
                               values: Vec<DecodedValue>,
@@ -312,7 +325,7 @@ impl<'a> PreparedPoint<'a> {
         let workload = &inputs.workload;
         let covered = match timing {
             Some(timing) => {
-                timing.observe_first(|position, values, args| {
+                timing.observe_first(deadline, |position, values, args| {
                     measure_at(workload[position], values, args)
                 })?;
                 workload.clone()
@@ -329,7 +342,7 @@ impl<'a> PreparedPoint<'a> {
                 Some(witnesses) => witnesses,
                 None => self.witnesses(kernel, &rest)?,
             };
-            witnesses.observe_first(|position, values, args| {
+            witnesses.observe_first(deadline, |position, values, args| {
                 measure_at(rest[position], values, args)
             })?;
         }
@@ -356,8 +369,9 @@ impl<'a> PreparedPoint<'a> {
         timing: Option<&mut PointTiming<'a>>,
         kernel: &Arc<NativePrepared>,
         key: &dyn Fn(Vec<usize>) -> PointKey,
-    ) -> Result<(), Exclusion> {
-        let Some(observed) = self.observe_before(timing, kernel, key)? else {
+        deadline: Deadline,
+    ) -> Result<(), WorkError<Exclusion>> {
+        let Some(observed) = self.observe_before(timing, kernel, key, deadline)? else {
             return Ok(());
         };
         let shared = &self.shared;
@@ -365,7 +379,7 @@ impl<'a> PreparedPoint<'a> {
             &shared.evidence.borrow().observations[observed],
             &shared.requirement,
         )
-        .map_err(|violation| violation.exclusion())
+        .map_err(|violation| WorkError::Failed(violation.exclusion()))
     }
 
     /// Whether a candidate formed as `artifact` whose work here is `key`

@@ -1297,6 +1297,8 @@ pub struct NativeSearch<'a, E: Entry> {
 pub type Forming = seismic_runtime::native::tune::Forming<'static>;
 /// The compile of a unit's canonical program ([`NativeSearch::grounding`]).
 pub type Grounding = seismic_runtime::native::tune::Grounding<'static>;
+/// A cold compile of one of a unit's programs ([`NativeSearch::cold_compile`]).
+pub use seismic_runtime::native::tune::ColdCompile;
 
 impl<'a, E: Entry> NativeSearch<'a, E> {
     /// The unit's mandatory work: form the declared canonical program and
@@ -1327,6 +1329,12 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
     /// ahead.
     pub fn forming(&self) -> Option<Forming> {
         self.inner.forming()
+    }
+
+    /// A cold compile of the largest program of the unit's canonical
+    /// default: what compiling one takes when nothing serves it.
+    pub fn cold_compile(&self) -> Option<ColdCompile> {
+        self.inner.cold_compile()
     }
 
     /// Give up what only running work needs: every point's inputs
@@ -1400,9 +1408,14 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
         self.inner.next()
     }
 
-    /// Run the unit's next piece of work to its end.
-    pub fn perform(&mut self, points: &mut dyn PointSource<'a, E>) -> Result<Performed, TuneError> {
-        self.inner.perform(&mut TypedPoints(points))
+    /// Run optional work before the consumer's cutoff. None is for an
+    /// explicitly unbounded caller, such as a kernel survey or test.
+    pub fn perform(
+        &mut self,
+        points: &mut dyn PointSource<'a, E>,
+        before: Option<std::time::Instant>,
+    ) -> Result<Performed, TuneError> {
+        self.inner.perform(&mut TypedPoints(points), before)
     }
 
     /// The longest single operation the unit has completed.
@@ -1410,16 +1423,16 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
         self.inner.longest_operation()
     }
 
-    /// The price of [`NativeSearch::publish_artifact`] when the optional
-    /// work stops: of the served choice as it stands, or, `worked`, as it
+    /// The price of [`NativeSearch::publish_artifact`]: of the served
+    /// choice as it stands, or, `worked`, as it
     /// stands once the unit's next piece has run. Nothing where the store
     /// keeps the choice's programs as a load requests them.
     pub fn artifact_owed(&self, worked: bool) -> Quote {
         self.inner.artifact_owed(worked)
     }
 
-    /// What [`NativeSearch::publish_artifact`] does when the optional work
-    /// stops, known before it runs: what a load's publications are
+    /// What [`NativeSearch::publish_artifact`] does, known before it runs:
+    /// what a load's publications are
     /// observed against.
     pub fn artifact_publication(&self, worked: bool) -> Publication {
         self.inner.artifact_publication(worked)

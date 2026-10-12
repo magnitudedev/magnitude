@@ -52,7 +52,10 @@ use std::time::Instant;
 /// `sample` the first sample of the session behind it, which names that
 /// session's samples in the unit's `finished` record) and the clock's
 /// establishment (`established`, with no bound), which no reader of
-/// version 3 is asked to know.
+/// version 3 is asked to know; nor the `abandoned` pieces of a `budget`
+/// and its ending's `draining_seconds`. A `published` no longer includes a
+/// serving artifact: a promoting `stage` forms it, within its
+/// `publishing_seconds`.
 pub const TRACE_SCHEMA: &str = "tuning-trace/3";
 
 pub struct TuningTrace {
@@ -259,6 +262,7 @@ impl TuningTrace {
                 "raises": stage.raises,
                 "publishing_seconds": stage.publishing_seconds,
                 "promoted": stage.promoted,
+                "interrupted": stage.interrupted,
             }),
             TuningEvent::Published {
                 entry,
@@ -291,6 +295,14 @@ impl TuningTrace {
                     "unpriced_footprints": refused.unpriced_footprints,
                     "reason": refused.reason,
                 })).collect::<Vec<_>>(),
+                "abandoned": budget.abandoned.iter().map(|abandoned| json!({
+                    "unit": abandoned.unit,
+                    "class": stage_name(abandoned.stage),
+                    "priced_seconds": abandoned.priced_seconds,
+                    "unpriced_operations": abandoned.unpriced_operations,
+                    "began_seconds": abandoned.began_seconds,
+                    "formed_seconds": abandoned.formed_seconds,
+                })).collect::<Vec<_>>(),
                 "ending": {
                     "began_seconds": budget.ending.began_seconds,
                     "held_seconds": budget.ending.held_seconds,
@@ -300,6 +312,7 @@ impl TuningTrace {
                     "narrowing_seconds": budget.ending.narrowing_seconds,
                     "released": budget.ending.released,
                     "releasing_seconds": budget.ending.releasing_seconds,
+                    "draining_seconds": budget.ending.draining_seconds,
                 },
                 "memory": {
                     "ceiling_bytes": budget.memory.ceiling_bytes,
@@ -830,6 +843,7 @@ mod tests {
                 unpriced_footprints: 0,
                 reason: "seconds",
             }],
+            abandoned: Vec::new(),
             ending: crate::native::tuning::EndingReport::default(),
             memory: TuningMemory {
                 ceiling_bytes: Some(1 << 30),

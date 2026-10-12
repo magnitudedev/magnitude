@@ -16,14 +16,14 @@
 //! its canonical defaults, replaced only by a challenger whose lead over it
 //! was resolved in matched rounds ([`super::sampling`]) and that was
 //! covered. Its optional work comes in
-//! whole pieces, each priced in full before it starts from this load's
-//! observations of its operations' classes ([`Quote`], [`Footprint`]) and
-//! run to its end. Nothing here reads a deadline or the clock to decide
-//! anything: time is what its consumer admits work on, and a declared
-//! domain is asked only for the configurations the search measures
-//! ([`plan`]).
+//! pieces, each priced before it starts from this load's observations of
+//! its operations' classes ([`Quote`], [`Footprint`]). The consumer owns
+//! admission and the original cutoff. Runtime checks that cutoff between
+//! submissions and witnesses, retaining completed evidence when work is
+//! interrupted. Expiry is neither a numerical nor an execution rejection.
 
 use super::plan::{self, PointShape};
+use super::deadline::{Deadline, WorkError};
 use super::sampling::{Rates, Sequence, Shuffle, Tally, Verdict};
 use super::search::{Cost, ParameterValues, PointKey, SearchSettings};
 use super::timing::{self, OutputPool, PointPrices, PointTiming};
@@ -40,7 +40,9 @@ pub use super::comparison::{
     COMPARISON_VERSION, Difference, StepPower, SubjectComparison, SubjectMeasurement,
 };
 use super::validation::{PreparedPoint, Validator};
-use super::{FormationClass, HeldPrograms, MeasureOptions, NativePrepared, median, median_of};
+use super::{
+    FormationClass, HeldPrograms, MeasureOptions, NativePrepared, Rendered, median, median_of,
+};
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{EncodedArgs, PrepareError};
 use crate::api::{CallError, TensorError};
@@ -823,12 +825,15 @@ impl Spent {
     }
 }
 
-/// A piece of work run to its end.
+/// A piece of work completed or interrupted at the consumer's cutoff.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Performed {
     pub stage: Stage,
     pub quote: Quote,
     pub actual: Duration,
+    /// Optional work stopped at the consumer's cutoff; completed evidence
+    /// remains, and no incomplete witness becomes a rejection.
+    pub interrupted: bool,
     /// Where `actual` went, by operation class; the rest is host work
     /// between operations.
     pub spent: Spent,
@@ -1018,15 +1023,14 @@ struct FormationPrice {
     /// what it formed: what the configurations the next piece measures
     /// record of their formation ([`Programs::records`]).
     calls: Vec<(Formable, FormationRecord)>,
-    /// What each formation asked about since the unit last formed or
-    /// released anything does: it changes only with what is live on the
-    /// device and kept by the store, which this unit's own work changes.
-    classes: BTreeMap<Formable, Formative>,
-    /// What publishing the serving artifact of each choice asked about
-    /// since the unit last formed anything does
-    /// ([`UnitSearch::publication`]): it changes only with what the store
-    /// keeps. With it, how many of the choice's programs it compiles.
-    publications: BTreeMap<NativeSpecialization, (Formative, usize)>,
+    /// The programs each formation asked about since the unit last formed
+    /// anything forms, rendered: its class is read from them whenever it
+    /// is asked ([`Rendered`]).
+    rendered: BTreeMap<Formable, Rendered>,
+    /// The programs publishing the serving artifact of each choice asked
+    /// about since the unit last formed anything forms, rendered
+    /// ([`UnitSearch::publication`]).
+    serving: BTreeMap<NativeSpecialization, Rendered>,
 }
 
 /// What publishing a choice's serving artifact does, known before it runs
@@ -1066,14 +1070,14 @@ impl FormationPrice {
     }
 
     /// A challenger formation that did `formative`, as classed before it
-    /// ran, took `seconds`. What is live and kept changed with it.
+    /// ran, took `seconds`. What it formed is not asked about again.
     fn observe(&mut self, (class, entries): Formative, seconds: Duration) {
         match class {
             FormationClass::Kept => self.kept.observe(seconds.as_secs_f64()),
             FormationClass::Compiled => self.compiled.observe(entries, seconds.as_secs_f64()),
         }
-        self.classes.clear();
-        self.publications.clear();
+        self.rendered.clear();
+        self.serving.clear();
     }
 
     /// The longest formation observed.
@@ -1104,8 +1108,9 @@ pub struct Forming<'m> {
     cpu: Option<&'static CpuNativeKernels>,
     implementation: NativeImplementation,
     served: Vec<BTreeMap<String, u64>>,
-    /// Each formation call, with what it does as it was priced.
-    work: Vec<(Formable, Formative)>,
+    /// Each formation call, with the programs it forms rendered: what it
+    /// does is read from them as it starts ([`Forming::run`]).
+    work: Vec<(Formable, Rendered)>,
 }
 
 impl Forming<'_> {
@@ -1117,7 +1122,11 @@ impl Forming<'_> {
         formation_threads(self.work.len())
     }
 
-    /// Make every formation call, to the end.
+    /// Make every formation call, to the end. What each call does is read
+    /// as it starts, not as it was priced: what other units formed and the
+    /// store kept since may have made a compile priced as one a load, and
+    /// observed in the class it was priced in, a load of 0.04 s priced the
+    /// unit's next compile of 0.5 s at that (a GB10 load, 2026-10-12).
     pub fn run(self) -> Formed {
         let began = Instant::now();
         let held = |device: &DeviceInner| {
@@ -1129,7 +1138,8 @@ impl Forming<'_> {
             )
         };
         let before = held(&self.device);
-        let products = concurrently(&self.device, &self.work, |(formable, _)| {
+        let products = concurrently(&self.device, &self.work, |(formable, rendered)| {
+            let class = rendered.class(&self.device);
             let began = Instant::now();
             let product = match formable {
                 Formable::Launches(sources) => Product::Launches(
@@ -1159,7 +1169,7 @@ impl Forming<'_> {
                     .and_then(|kernel| serving(kernel, &self.served)),
                 ),
             };
-            (product, began.elapsed())
+            (class, product, began.elapsed())
         });
         Formed {
             added_bytes: held(&self.device) as f64 - before as f64,
@@ -1167,7 +1177,7 @@ impl Forming<'_> {
                 .work
                 .into_iter()
                 .zip(products)
-                .map(|((formable, class), (product, elapsed))| FormedCall {
+                .map(|((formable, _), (class, product, elapsed))| FormedCall {
                     formable,
                     class,
                     product,
@@ -1176,6 +1186,34 @@ impl Forming<'_> {
                 .collect(),
             elapsed: began.elapsed(),
         }
+    }
+}
+
+/// What compiling one of a unit's programs takes when nothing the toolchain
+/// formed or kept serves it, the system's caches included
+/// ([`UnitSearch::cold_compile`]): it reads nothing of the unit, so it
+/// runs on any thread. A compile cannot be interrupted, and where a system
+/// cache serves most of a load's compiles the load observes only its hits:
+/// an M6 load (2026-10-12) whose compiles had all taken under 0.17 s
+/// started one at 59.75 s, priced at 0.044 s, that missed the cache and
+/// took 0.39 s past its budget. This is what such a miss takes.
+pub struct ColdCompile {
+    device: Arc<DeviceInner>,
+    source: seismic_native_target::ProgramSource,
+}
+
+impl ColdCompile {
+    /// The length of the program's text: what of a load's units is the
+    /// largest compile.
+    pub fn size(&self) -> usize {
+        self.source.text.len()
+    }
+
+    /// Compile the program cold, and drop it. Returns what it took; none
+    /// if the compile failed, which says nothing of what one takes. The
+    /// program is the canonical default's, which the load has formed.
+    pub fn run(self) -> Option<Duration> {
+        self.device.programs.cold(&self.source).ok()
     }
 }
 
@@ -1189,8 +1227,8 @@ pub struct Formed {
     added_bytes: f64,
 }
 
-/// One formation call that ran: what it was to form, its class as priced,
-/// what it formed and what it took.
+/// One formation call that ran: what it was to form, its class as it
+/// started, what it formed and what it took.
 struct FormedCall {
     formable: Formable,
     class: Formative,
@@ -1226,36 +1264,28 @@ impl UnitSearch<'_, '_> {
     }
 
     /// What publishing the serving artifact of `choice` does, read from
-    /// the store before it runs ([`NativePrepared::publication_class`]).
+    /// the store before it runs ([`Rendered::publication`]).
     fn publication(&self, choice: &NativeSpecialization) -> (Formative, usize) {
-        let known = self
-            .formation_price
-            .lock()
-            .expect("formation price lock")
-            .publications
-            .get(choice)
-            .copied();
-        known.unwrap_or_else(|| {
-            let class = NativePrepared::publication_class(
-                &self.device,
-                self.module,
-                self.entry,
-                &self.logical,
-                &self.bindings,
-                choice,
-                &self.implementation,
-            );
-            self.formation_price
-                .lock()
-                .expect("formation price lock")
-                .publications
-                .insert(choice.clone(), class);
-            class
-        })
+        let mut price = self.formation_price.lock().expect("formation price lock");
+        price
+            .serving
+            .entry(choice.clone())
+            .or_insert_with(|| {
+                NativePrepared::publication_rendered(
+                    &self.device,
+                    self.module,
+                    self.entry,
+                    &self.logical,
+                    &self.bindings,
+                    choice,
+                    &self.implementation,
+                )
+            })
+            .publication(&self.device)
     }
 
-    /// The price of [`UnitSearch::publish_artifact`] when the optional
-    /// work stops: of the served choice as it stands, or, `worked`, as it
+    /// The price of [`UnitSearch::publish_artifact`]: of the served choice
+    /// as it stands, or, `worked`, as it
     /// stands once the unit's next piece has run, which changes it only if
     /// that piece is a conversion and promotes its leader. A choice whose
     /// programs the store keeps as a load requests them (the canonical
@@ -1298,8 +1328,8 @@ impl UnitSearch<'_, '_> {
         owed
     }
 
-    /// What [`UnitSearch::publish_artifact`] does when the optional work
-    /// stops, known before it runs: of the served choice as it stands, or,
+    /// What [`UnitSearch::publish_artifact`] does, known before it runs:
+    /// of the served choice as it stands, or,
     /// `worked`, as it stands once the unit's next piece has run.
     pub fn artifact_publication(&self, worked: bool) -> Publication {
         let choice = worked
@@ -1345,12 +1375,33 @@ impl UnitSearch<'_, '_> {
         built
     }
 
+    /// A cold compile of the largest program of the unit's canonical
+    /// default ([`ColdCompile`]); none where that renders nothing, as on
+    /// the CPU backend.
+    pub fn cold_compile(&self) -> Option<ColdCompile> {
+        let sources = NativePrepared::serving_programs(
+            &self.device,
+            self.module,
+            self.entry,
+            &self.logical,
+            &self.bindings,
+            &self.default,
+            &self.implementation,
+        )
+        .ok()?;
+        let source = sources.into_iter().max_by_key(|source| source.text.len())?;
+        Some(ColdCompile {
+            device: self.device.clone(),
+            source,
+        })
+    }
+
     /// Publish the serving artifact of the unit's served choice: form its
     /// programs exactly as a load requests them, each launch's single
     /// variant, and release them ([`NativePrepared::publish`]). A choice
     /// the search formed among many variants of a launch is served to this
     /// process out of that compile; the artifact a later load requests is
-    /// formed here, once, when the choice is final. The canonical default
+    /// formed here, as the choice is promoted. The canonical default
     /// was formed that way by the mandatory work, and a choice already
     /// published forms nothing. Returns what it took.
     pub fn publish_artifact(&mut self) -> Result<Duration, TuneError> {
@@ -1365,12 +1416,6 @@ impl UnitSearch<'_, '_> {
             &self.implementation,
         )
         .map_err(|error| TuneError::Publication(prepare_message(error)))?;
-        // The store keeps what was published.
-        self.formation_price
-            .get_mut()
-            .expect("formation price lock")
-            .publications
-            .clear();
         let elapsed = began.elapsed();
         self.time.forming_seconds += elapsed.as_secs_f64();
         Ok(elapsed)
@@ -1446,16 +1491,18 @@ impl<'m> Formation<'_, 'm> {
     /// What the one call forming `formable` does, read from the device's
     /// live programs and the artifact store before it starts.
     fn class(&self, formable: &Formable) -> Formative {
-        let known = self
-            .price
-            .lock()
-            .expect("formation price lock")
-            .classes
-            .get(formable)
-            .copied();
-        known.unwrap_or_else(|| {
-            let class = match formable {
-                Formable::Launches(sources) => NativePrepared::launch_variants_class(
+        self.rendered(formable).class(self.device)
+    }
+
+    /// The programs the one call forming `formable` forms, rendered once
+    /// for the unit ([`Rendered`]).
+    fn rendered(&self, formable: &Formable) -> Rendered {
+        let mut price = self.price.lock().expect("formation price lock");
+        price
+            .rendered
+            .entry(formable.clone())
+            .or_insert_with(|| match formable {
+                Formable::Launches(sources) => NativePrepared::launch_variants_rendered(
                     self.device,
                     self.module,
                     self.entry,
@@ -1464,7 +1511,7 @@ impl<'m> Formation<'_, 'm> {
                     self.implementation,
                     sources,
                 ),
-                Formable::Program(specialization) => NativePrepared::implementation_class(
+                Formable::Program(specialization) => NativePrepared::implementation_rendered(
                     self.device,
                     self.module,
                     self.entry,
@@ -1473,14 +1520,8 @@ impl<'m> Formation<'_, 'm> {
                     specialization,
                     self.implementation,
                 ),
-            };
-            self.price
-                .lock()
-                .expect("formation price lock")
-                .classes
-                .insert(formable.clone(), class);
-            class
-        })
+            })
+            .clone()
     }
 
     /// The quote of the calls forming `formables`: the calls of a class run
@@ -1532,8 +1573,8 @@ impl<'m> Formation<'_, 'm> {
             work: formables
                 .into_iter()
                 .map(|formable| {
-                    let class = self.class(&formable);
-                    (formable, class)
+                    let rendered = self.rendered(&formable);
+                    (formable, rendered)
                 })
                 .collect(),
         })
@@ -1658,6 +1699,7 @@ struct Incumbent<'s> {
 
 /// What a session of matched rounds is run with.
 struct Matching<'s> {
+    deadline: Deadline,
     settings: &'s SearchSettings,
     min_sample_seconds: f64,
     /// How the unit's rounds have come out: what its sessions are priced
@@ -1681,14 +1723,15 @@ fn raise(
     placed: &[PointTiming],
     settings: &SearchSettings,
     min_sample_seconds: f64,
-) -> Result<(), CallError> {
+    deadline: Deadline,
+) -> Result<(), WorkError<CallError>> {
     let Some(first) = placed.first() else {
         return Ok(());
     };
     // The device's state is asked the evidence a lead is.
     let stages = Tally::default().fewest(settings.error_rate);
     let clock = timing::Clock::hold(held, first, min_sample_seconds, stages)?;
-    timing::warm(&clock, placed)
+    timing::warm(&clock, placed, deadline)
 }
 
 /// What a challenger new to the unit takes at the timed points besides its
@@ -1964,12 +2007,13 @@ fn measure_matched(
     // The classes a challenger new to the unit is observed in at the timed
     // points; none for one measured before, placed again.
     admission: Option<&mut Admission>,
-) -> Vec<Result<Compared, Exclusion>> {
+) -> Vec<Result<Option<Compared>, Exclusion>> {
     let mut cache = cache;
     let mut admission = admission;
     let minimum = matching.min_sample_seconds;
     let mut measured = vec![baseline.to_vec(); candidates.len()];
     let mut failures = vec![None; candidates.len()];
+    let mut pending = vec![false; candidates.len()];
     let mut placed = Vec::new();
     // By slot: its point, its key and, for a challenger's slot, the
     // candidates it measures. Candidates that run the same launches with
@@ -1980,6 +2024,10 @@ fn measure_matched(
     let mut sampled = vec![Vec::new(); candidates.len()];
     let timed_first = admission.is_some() && matching.sequence.timed_first();
     for (candidate, formed) in candidates.iter().enumerate() {
+        if matching.deadline.expired() {
+            pending[candidate] = true;
+            continue;
+        }
         let mut candidate_placed = Vec::new();
         let mut candidate_slots = Vec::new();
         let admitting = Instant::now();
@@ -1996,16 +2044,20 @@ fn measure_matched(
                 }
             };
             let admitted = if timed_first {
-                workload.price_before(&mut timing)
+                workload.price_before(&mut timing, matching.deadline)
             } else {
                 workload.admit_before(
                     Some(&mut timing),
                     &formed.kernel,
                     &|working| key(working, &formed.specialization),
+                    matching.deadline,
                 )
             };
             if let Err(error) = admitted {
-                failures[candidate] = Some(error);
+                match error {
+                    WorkError::Failed(error) => failures[candidate] = Some(error),
+                    WorkError::Expired => pending[candidate] = true,
+                }
                 break;
             }
             let working = timing.working_launches();
@@ -2044,7 +2096,7 @@ fn measure_matched(
                 );
             }
         }
-        if failures[candidate].is_none() {
+        if failures[candidate].is_none() && !pending[candidate] {
             for (timing, (point, key)) in candidate_placed.into_iter().zip(candidate_slots) {
                 let slot = match slot_by_key.get(&(point, key.clone())) {
                     Some(&slot) => slot,
@@ -2070,18 +2122,25 @@ fn measure_matched(
             continue;
         }
         let workload = &points[point];
+        if matching.deadline.expired() {
+            for &candidate in &slots[slot].2 {
+                pending[candidate] = true;
+            }
+            continue;
+        }
         let beside = PointTiming::reusing_outputs(
             incumbent.kernel,
             workload.workload_rotation(),
             outputs.at(&workload.label),
         )
-        .map_err(|error| measurement_failure(points, point, error))
+        .map_err(|error| WorkError::Failed(measurement_failure(points, point, error)))
         .and_then(|mut timing| {
             // Its admission stands: only its placement is repeated.
             workload.admit_before(
                 Some(&mut timing),
                 incumbent.kernel,
                 &|working| key(working, incumbent.specialization),
+                matching.deadline,
             )?;
             Ok(timing)
         });
@@ -2096,7 +2155,12 @@ fn measure_matched(
             // sampled.
             Err(exclusion) => {
                 for &candidate in &slots[slot].2 {
-                    failures[candidate].get_or_insert(exclusion.clone());
+                    match &exclusion {
+                        WorkError::Failed(exclusion) => {
+                            failures[candidate].get_or_insert(exclusion.clone());
+                        }
+                        WorkError::Expired => pending[candidate] = true,
+                    }
                 }
             }
         }
@@ -2125,7 +2189,8 @@ fn measure_matched(
                     + apart.iter().map(|point| canonical(*point)).sum::<f64>(),
                 complete,
                 evidence,
-                admitted: if failures[candidate].is_some() || terms.is_empty() {
+                admitted: if failures[candidate].is_some() || pending[candidate] || terms.is_empty()
+                {
                     0
                 } else if complete {
                     evidence.fewest(matching.settings.error_rate)
@@ -2148,14 +2213,22 @@ fn measure_matched(
     // device is given nothing but the session's work. A device that cannot
     // be raised samples nothing.
     let sampling = Instant::now();
-    if let Err(error) = raise(matching.clock, &placed, matching.settings, minimum) {
-        let exclusion = Exclusion::Measurement {
-            point: "device clock".into(),
-            detail: error.to_string(),
-        };
-        for (failure, pairing) in failures.iter_mut().zip(&mut rounds.pairings) {
-            failure.get_or_insert(exclusion.clone());
-            pairing.admitted = 0;
+    if let Err(error) = raise(
+        matching.clock,
+        &placed,
+        matching.settings,
+        minimum,
+        matching.deadline,
+    ) {
+        if let WorkError::Failed(error) = error {
+            let exclusion = Exclusion::Measurement {
+                point: "device clock".into(),
+                detail: error.to_string(),
+            };
+            for (failure, pairing) in failures.iter_mut().zip(&mut rounds.pairings) {
+                failure.get_or_insert(exclusion.clone());
+                pairing.admitted = 0;
+            }
         }
     }
     while let Err(failure) = timing::sample(
@@ -2164,13 +2237,19 @@ fn measure_matched(
         &mut rounds,
         matching.shuffle,
         matching.clock.as_deref(),
+        matching.deadline,
     ) {
+        let error = match failure.error {
+            WorkError::Expired => break,
+            WorkError::Failed(error) => error,
+        };
         let exclusion = measurement_failure(
             points,
-            slots
-                .get(failure.point)
-                .map_or_else(|| incumbent_point(&incumbent_slots, failure.point), |slot| slot.0),
-            failure.error,
+            slots.get(failure.point).map_or_else(
+                || incumbent_point(&incumbent_slots, failure.point),
+                |slot| slot.0,
+            ),
+            error,
         );
         for candidate in rounds.fail(failure.point) {
             failures[candidate] = Some(exclusion.clone());
@@ -2195,19 +2274,29 @@ fn measure_matched(
             }
             let witnessing = Instant::now();
             let admitted = points.iter().try_for_each(|workload| {
-                workload.admit_before(None, &formed.kernel, &|working| {
-                    key(working, &formed.specialization)
-                })
+                workload.admit_before(
+                    None,
+                    &formed.kernel,
+                    &|working| key(working, &formed.specialization),
+                    matching.deadline,
+                )
             });
             let seconds = witnessing.elapsed().as_secs_f64();
             if let Some(admission) = admission.as_deref_mut() {
                 admission.witnessed_after.observe(seconds);
             }
-            matching
-                .sequence
-                .witnessed(seconds, !matches!(admitted, Err(Exclusion::Validation { .. })));
+            matching.sequence.witnessed(
+                seconds,
+                !matches!(
+                    admitted,
+                    Err(WorkError::Failed(Exclusion::Validation { .. }))
+                ),
+            );
             if let Err(exclusion) = admitted {
-                failures[candidate] = Some(exclusion);
+                match exclusion {
+                    WorkError::Failed(exclusion) => failures[candidate] = Some(exclusion),
+                    WorkError::Expired => pending[candidate] = true,
+                }
             }
         }
     }
@@ -2239,8 +2328,17 @@ fn measure_matched(
         .into_iter()
         .zip(failures)
         .zip(rounds.pairings)
-        .map(|((measured, failure), pairing)| {
-            failure.map_or(Ok((measured, pairing.evidence)), Err)
+        .zip(pending)
+        .map(|(((measured, failure), pairing), pending)| {
+            failure.map_or_else(
+                || {
+                    Ok(
+                        (!pending && (pairing.terms.is_empty() || pairing.taken > 0))
+                            .then_some((measured, pairing.evidence)),
+                    )
+                },
+                Err,
+            )
         })
         .collect()
 }
@@ -2396,35 +2494,39 @@ fn place<'a>(
     // Whether a challenger its unit's requirement does not admit is
     // excluded here; a survey measures it all the same.
     gated: bool,
-) -> Result<Placed<'a>, Exclusion> {
+    deadline: Deadline,
+) -> Result<Placed<'a>, WorkError<Exclusion>> {
     let began = Instant::now();
     let qualify = admission.is_some();
-    let timings = (|| {
+    let timings = (|| -> Result<Vec<PointTiming<'a>>, WorkError<Exclusion>> {
         let mut timings = points
             .iter()
             .enumerate()
-            .map(|(index, point)| {
-                PointTiming::reusing_outputs(
-                    kernel,
-                    point.workload_rotation(),
-                    outputs.at(&point.label),
-                )
-                .map_err(|error| measurement_failure(points, index, error))
-            })
+            .map(
+                |(index, point)| -> Result<PointTiming<'a>, WorkError<Exclusion>> {
+                    deadline.check(Duration::ZERO)?;
+                    Ok(PointTiming::reusing_outputs(
+                        kernel,
+                        point.workload_rotation(),
+                        outputs.at(&point.label),
+                    )
+                    .map_err(|error| measurement_failure(points, index, error))?)
+                },
+            )
             .collect::<Result<Vec<_>, _>>()?;
         for (point, timing) in points.iter().zip(&mut timings) {
             if !qualify {
-                point.price_before(timing)?;
+                point.price_before(timing, deadline)?;
                 // The defaults' first run is retained as the reference here.
-                point.retain_default(timing)?;
+                point.retain_default(timing, deadline)?;
                 continue;
             }
             let kernel = timing.prepared().clone();
             let key = |working| influence.key(working, values);
             if gated {
-                point.admit_before(Some(timing), &kernel, &key)?;
+                point.admit_before(Some(timing), &kernel, &key, deadline)?;
             } else {
-                point.observe_before(Some(timing), &kernel, &key)?;
+                point.observe_before(Some(timing), &kernel, &key, deadline)?;
             }
         }
         Ok(timings)
@@ -2479,7 +2581,8 @@ impl Measurer {
         options: &MeasureOptions,
         settings: &SearchSettings,
         admission: Option<&mut Observed>,
-    ) -> Result<Vec<PointMeasurement>, Exclusion> {
+        deadline: Deadline,
+    ) -> Result<Vec<PointMeasurement>, WorkError<Exclusion>> {
         let Placed { timings, keys } = place(
             kernel,
             points,
@@ -2488,6 +2591,7 @@ impl Measurer {
             &mut self.outputs,
             admission,
             self.gated,
+            deadline,
         )?;
         let (fresh, mut timings): (Vec<usize>, Vec<PointTiming>) = timings
             .into_iter()
@@ -2504,15 +2608,27 @@ impl Measurer {
             point: "device clock".into(),
             detail: error.to_string(),
         };
-        raise(&mut self.clock, &timings, settings, options.min_sample_seconds).map_err(clock)?;
+        raise(
+            &mut self.clock,
+            &timings,
+            settings,
+            options.min_sample_seconds,
+            deadline,
+        )
+        .map_err(|error| error.map(clock))?;
         timing::sample(
             &mut timings,
             options.min_sample_seconds,
             &mut timing::Counted::new(fresh.len(), options.samples),
             &mut self.shuffle,
             self.clock.as_deref(),
+            deadline,
         )
-        .map_err(|failure| measurement_failure(points, fresh[failure.point], failure.error))?;
+        .map_err(|failure| {
+            failure
+                .error
+                .map(|error| measurement_failure(points, fresh[failure.point], error))
+        })?;
         for (point, timing) in fresh.into_iter().zip(&timings) {
             let key = keys[point].clone();
             let measurement = point_measurement(&points[point].label, key.clone(), timing);
@@ -2928,6 +3044,7 @@ impl Ledger {
 /// of objective weights. Untimed witnesses are constructed and released one at
 /// a time; what is observed at them is the validator's, as at timed points.
 struct ScopeQualification<'s, 'a> {
+    deadline: Deadline,
     source: &'s mut dyn PointSource<'a>,
     specs: &'s [PointSpec],
     indices: &'s [usize],
@@ -2950,7 +3067,7 @@ impl ScopeQualification<'_, '_> {
     /// to its first failing witness: eligibility is published only after
     /// every witness admits, while what was observed before a failure
     /// stays recorded without making its artifact eligible.
-    fn qualify(&mut self, kernel: &Arc<NativePrepared>) -> Result<(), Exclusion> {
+    fn qualify(&mut self, kernel: &Arc<NativePrepared>) -> Result<(), WorkError<Exclusion>> {
         let artifact = &kernel.artifact().0;
         // No check is owed for the reference or an empty witness set.
         if artifact == self.default || self.indices.is_empty() {
@@ -2958,6 +3075,7 @@ impl ScopeQualification<'_, '_> {
             return Ok(());
         }
         for &index in self.indices {
+            self.deadline.check(Duration::ZERO)?;
             let spec = &self.specs[index];
             let began = Instant::now();
             let built = self.source.build(index);
@@ -2969,7 +3087,7 @@ impl ScopeQualification<'_, '_> {
                     .map_err(|error| Exclusion::Execution(error.to_string()))?;
                 let validating = Instant::now();
                 let references_before = self.validator.reference_seconds();
-                let admitted = point.admit_before(None, kernel, self.key);
+                let admitted = point.admit_before(None, kernel, self.key, self.deadline);
                 self.validating_seconds += validating.elapsed().as_secs_f64();
                 self.reference_seconds +=
                     (self.validator.reference_seconds() - references_before).max(0.0);
@@ -2988,7 +3106,7 @@ impl ScopeQualification<'_, '_> {
 
 /// Tune one unit within its budget: its canonical defaults formed, then the
 /// [`UnitSearch`]'s work started piece by piece while each piece's whole
-/// price fits what remains ([`Quote::fits`]), every piece run to its end;
+/// price fits what remains ([`Quote::fits`]), under the original cutoff;
 /// or a survey of every admissible configuration. The result is the unit's
 /// served choice when no further piece fits.
 pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
@@ -3042,7 +3160,7 @@ pub fn tune(request: TuneRequest<'_, '_>) -> Result<TuningResult, TuneError> {
                 if !work.quote.fits(remaining, unit.longest_operation()) {
                     break;
                 }
-                unit.perform(points)?;
+                unit.perform(points, Some(began + plan.allowance))?;
             }
             unit.terminal()
         }
@@ -3209,6 +3327,7 @@ struct Run {
 /// - [`Stage::Confirm`]: more matched rounds for the leader among those
 ///   whose lead is nominal, and its conversion if they resolve it.
 pub struct UnitSearch<'m, 'a> {
+    expired: bool,
     device: Arc<DeviceInner>,
     module: &'m CheckedModule,
     entry: EntryId,
@@ -3256,8 +3375,10 @@ pub struct UnitSearch<'m, 'a> {
     formation_price: Mutex<FormationPrice>,
     time: TuningTime,
     /// The next piece of work as last derived ([`UnitSearch::next`]); none
-    /// since the unit's state last changed.
+    /// since the unit's state last changed. With it, what each formation
+    /// its price read does as it was read then.
     offered: std::cell::Cell<Option<Option<Work>>>,
+    offered_forming: std::cell::RefCell<Vec<(Formable, Formative)>>,
 }
 
 impl<'m, 'a> UnitSearch<'m, 'a> {
@@ -3308,6 +3429,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .default_specialization(&statics)
             .map_err(|error| TuneError::Declaration(error.to_string()))?;
         Ok(Self {
+            expired: false,
             unit: Unit {
                 tuning_identity: device.tuning_identity(),
                 entry: entry_name,
@@ -3344,6 +3466,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             formation_price: Mutex::new(FormationPrice::default()),
             time: TuningTime::default(),
             offered: std::cell::Cell::new(None),
+            offered_forming: std::cell::RefCell::default(),
         })
     }
 
@@ -3696,12 +3819,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         if let Progress::Searching(searching) = &mut self.progress {
             searching.run.programs.clear();
         }
-        // What was live on the device is live no longer.
-        self.formation_price
-            .get_mut()
-            .expect("formation price lock")
-            .classes
-            .clear();
         self.offered.set(None);
     }
 
@@ -3728,7 +3845,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// classes, seconds and bytes: what the piece was quoted. False when
     /// the device's memory limit refused a build ([`build_point`]): the
     /// piece cannot run.
-    fn restore(&mut self, source: &mut dyn PointSource<'a>) -> Result<bool, TuneError> {
+    fn restore(
+        &mut self,
+        source: &mut dyn PointSource<'a>,
+        deadline: Deadline,
+    ) -> Result<bool, WorkError<TuneError>> {
         let Self {
             progress,
             ground,
@@ -3758,6 +3879,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             if point.resident() {
                 continue;
             }
+            deadline.check(Duration::ZERO)?;
             let before = held();
             let building = Instant::now();
             let Some(inputs) = build_point(
@@ -3825,15 +3947,46 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// The unit's next piece of work with its whole price; none when it has
     /// none left. A lead is converted before anything else is measured.
     ///
-    /// The piece and its price follow from the unit's own state alone, so
-    /// they are derived once after each change of it and stand until the
-    /// next: a consumer asking every unit before each piece of any pays for
-    /// the one unit that changed.
+    /// The piece and its price follow from the unit's own state, and its
+    /// compile's from what is live on the device and kept by the store,
+    /// which other units' work changes too ([`Rendered`]). So they are
+    /// derived once after each change of the unit's state and stand while
+    /// every formation the compile's price read does what it did: a
+    /// consumer asking every unit before each piece of any pays for the
+    /// units whose piece changed.
     pub fn next(&self) -> Option<Work> {
+        if self.expired {
+            return None;
+        }
         if let Some(offered) = self.offered.get() {
-            return offered;
+            let formation = self.formation();
+            let standing = self
+                .offered_forming
+                .borrow()
+                .iter()
+                .all(|(formable, class)| formation.class(formable) == *class);
+            if standing {
+                return offered;
+            }
         }
         let offered = self.offer();
+        *self.offered_forming.borrow_mut() = match &self.progress {
+            Progress::Searching(searching) => searching
+                .planned
+                .as_ref()
+                .map(|piece| {
+                    let formation = self.formation();
+                    self.compiled_ahead(searching, piece)
+                        .into_iter()
+                        .map(|formable| {
+                            let class = formation.class(&formable);
+                            (formable, class)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Progress::Discovering(_) => Vec::new(),
+        };
         self.offered.set(Some(offered));
         offered
     }
@@ -4173,8 +4326,14 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         quote
     }
 
-    /// Run the unit's next piece of work ([`UnitSearch::next`]) to its end.
-    pub fn perform(&mut self, source: &mut dyn PointSource<'a>) -> Result<Performed, TuneError> {
+    /// Run the unit's next piece ([`UnitSearch::next`]) before `before`,
+    /// keeping the served choice and completed evidence on interruption.
+    pub fn perform(
+        &mut self,
+        source: &mut dyn PointSource<'a>,
+        before: Option<Instant>,
+    ) -> Result<Performed, TuneError> {
+        let deadline = Deadline::new(before);
         let work = self
             .next()
             .expect("a unit performs the work it named as its next");
@@ -4218,19 +4377,31 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // A piece whose inputs the device's memory limit refused ends
         // there, its point priced at what the build demanded: the piece is
         // offered again at that price ([`build_point`]).
-        let restored = work.stage == Stage::Discovery || self.restore(source)?;
-        // The piece's own operations add to what is held with its unit's
-        // inputs resident.
-        host = host.max(ProcessMemory::footprint_now());
-        let resident = self.held();
-        let (built, promoted) = match work.stage {
-            _ if !restored => (false, false),
-            Stage::Discovery => (self.discover(source)?, false),
-            Stage::Form | Stage::Measure => {
-                self.measure()?;
-                (true, false)
+        let mut resident = self.held();
+        let attempted = (|| -> Result<(bool, bool), WorkError<TuneError>> {
+            deadline.check(Duration::ZERO)?;
+            let restored = work.stage == Stage::Discovery || self.restore(source, deadline)?;
+            host = host.max(ProcessMemory::footprint_now());
+            resident = self.held();
+            Ok(match work.stage {
+                _ if !restored => (false, false),
+                Stage::Discovery => (self.discover(source, deadline)?, false),
+                Stage::Form | Stage::Measure => {
+                    self.measure(deadline)?;
+                    (true, false)
+                }
+                Stage::Promote | Stage::Confirm => {
+                    (true, self.promote(source, work.stage, deadline)?)
+                }
+            })
+        })();
+        let (built, promoted) = match attempted {
+            Ok(performed) => performed,
+            Err(WorkError::Expired) => {
+                self.expired = true;
+                (false, false)
             }
-            Stage::Promote | Stage::Confirm => (true, self.promote(source, work.stage)?),
+            Err(WorkError::Failed(error)) => return Err(error),
         };
         // What the piece formed and no longer needs leaves the device with
         // it: only the served choice and a leader keep their kernels.
@@ -4244,12 +4415,6 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 }
                 searching.ledger.release();
             }
-            // A program a released kernel held is live no longer.
-            self.formation_price
-                .get_mut()
-                .expect("formation price lock")
-                .classes
-                .clear();
         }
         // One reading ends the piece: it is the last the peak is taken
         // over and what was held when the piece ended, so the peak is never
@@ -4308,6 +4473,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             stage: work.stage,
             quote: work.quote,
             actual: began.elapsed(),
+            interrupted: self.expired,
             spent: self.spent().since(before),
             raises: self.raises(),
             promoted,
@@ -4321,7 +4487,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// refused the point's build ([`build_point`]) or the measurement of its
     /// defaults: nothing was measured, and the point is priced at what the
     /// piece demanded.
-    fn discover(&mut self, source: &mut dyn PointSource<'a>) -> Result<bool, TuneError> {
+    fn discover(
+        &mut self,
+        source: &mut dyn PointSource<'a>,
+        deadline: Deadline,
+    ) -> Result<bool, WorkError<TuneError>> {
         let index = self
             .undiscovered()
             .expect("discovery has an unmeasured point");
@@ -4354,9 +4524,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 )))
             })?;
         }
-        let point = ground.validator.point(point)?;
-        let shape = point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?
-            .remove(0);
+        let mut point = ground.validator.point(point)?;
+        let shape =
+            point_shapes(&self.device, &self.logical, std::slice::from_ref(&point))?.remove(0);
         // The defaults' time here is the unit of every time the unit
         // records and the point's weight in what it optimises: the median
         // of three samples, the fewest whose median one sample cannot
@@ -4378,19 +4548,25 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 &options,
                 &settings,
                 None,
+                deadline,
             );
         let defaults = match measured {
             Ok(mut defaults) => defaults.remove(0),
             // The point's inputs fit, but what measuring its defaults needs
             // beside them does not: as a refused build, the point is priced
             // at the piece's demand and offered again.
-            Err(exclusion) => match self.device.memory_usage().refused_demand {
+            Err(WorkError::Expired) => {
+                point.release();
+                source.release(index);
+                return Err(WorkError::Expired);
+            }
+            Err(WorkError::Failed(exclusion)) => match self.device.memory_usage().refused_demand {
                 Some(demand) if Some(demand) > before.refused_demand => {
                     self.resident_bytes[index]
                         .observe(demand.saturating_sub(before.charged) as f64);
                     return Ok(false);
                 }
-                _ => return Err(TuneError::DefaultUnusable(exclusion)),
+                _ => return Err(TuneError::DefaultUnusable(exclusion).into()),
             },
         };
         let measured = measuring.elapsed().as_secs_f64();
@@ -4405,6 +4581,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             shape,
         });
         if self.undiscovered().is_none() {
+            deadline.check(Duration::ZERO)?;
             let planning = Instant::now();
             let opened = self.open_search();
             self.longest = self.longest.max(planning.elapsed().as_secs_f64());
@@ -4519,19 +4696,26 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
 
     /// Form the planned challengers and measure and admit them at the
     /// timed points. Each is recorded, whatever it measures.
-    fn measure(&mut self) -> Result<(), TuneError> {
+    fn measure(&mut self, deadline: Deadline) -> Result<(), WorkError<TuneError>> {
         let Progress::Searching(mut searching) =
             std::mem::replace(&mut self.progress, Progress::Discovering(Vec::new()))
         else {
             unreachable!("challengers are measured by a search");
         };
-        let performed = self.measure_piece(&mut searching);
-        let replanned = performed.and_then(|()| self.replan(&mut searching));
+        let performed = self.measure_piece(&mut searching, deadline);
+        let replanned = performed.and_then(|()| {
+            deadline.check(Duration::ZERO)?;
+            Ok(self.replan(&mut searching)?)
+        });
         self.progress = Progress::Searching(searching);
         replanned
     }
 
-    fn measure_piece(&mut self, searching: &mut Searching<'a>) -> Result<(), TuneError> {
+    fn measure_piece(
+        &mut self,
+        searching: &mut Searching<'a>,
+        deadline: Deadline,
+    ) -> Result<(), WorkError<TuneError>> {
         let piece = searching
             .planned
             .take()
@@ -4549,7 +4733,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             rates,
             ..
         } = searching;
-        run.perform(
+        let performed = run.perform(
             piece,
             &formation,
             points,
@@ -4561,11 +4745,12 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             admission,
             &mut forming,
             &mut measuring,
-        )?;
+            deadline,
+        );
         drop(formation);
         self.time.forming_seconds += forming;
         self.time.measuring_seconds += measuring;
-        Ok(())
+        performed
     }
 
     /// Convert the leader: give its comparison with the served choice the
@@ -4576,7 +4761,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         &mut self,
         source: &mut dyn PointSource<'a>,
         stage: Stage,
-    ) -> Result<bool, TuneError> {
+        deadline: Deadline,
+    ) -> Result<bool, WorkError<TuneError>> {
         let plan = self.planned().clone();
         let ground = self
             .ground
@@ -4677,6 +4863,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 },
                 points,
                 Matching {
+                    deadline,
                     settings: &plan.settings,
                     min_sample_seconds: plan.min_sample_seconds,
                     rates,
@@ -4706,7 +4893,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     contender.standing = ContenderStanding::Rejected(exclusion);
                     return Ok(false);
                 }
-                Ok((measured, evidence)) => {
+                Ok(None) => return Err(WorkError::Expired),
+                Ok(Some((measured, evidence))) => {
                     contender.cost = Weighing::of(points).cost(&measured, canonical);
                     contender.points = measured.clone();
                     contender.confirmed = measured;
@@ -4723,6 +4911,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         }
         let key = |working| keying.key(&self.implementation, working, &leading);
         let mut scope = ScopeQualification {
+            deadline,
             source,
             specs: &self.specs,
             indices: untimed,
@@ -4741,6 +4930,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         self.time.scope_validation_seconds +=
             (scope.validating_seconds - scope.reference_seconds).max(0.0);
         if let Err(exclusion) = covered {
+            let exclusion = match exclusion {
+                WorkError::Expired => return Err(WorkError::Expired),
+                WorkError::Failed(exclusion) => exclusion,
+            };
             ledger.failed += 1;
             ledger
                 .contenders
@@ -4752,6 +4945,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         // Serving prepares the chosen kernel as formed here. The unit's
         // handoff is its one served choice: the leader's replaces the
         // choice's it supersedes, which serving will never take.
+        deadline.check(Duration::ZERO)?;
         kernel
             .hand_off_replacing(ledger.incumbent().kernel.as_deref())
             .map_err(|error| TuneError::Publication(error.to_string()))?;
@@ -6025,7 +6219,9 @@ impl Run {
         admission: &mut Admission,
         forming_seconds: &mut f64,
         measuring_seconds: &mut f64,
-    ) -> Result<(), TuneError> {
+        deadline: Deadline,
+    ) -> Result<(), WorkError<TuneError>> {
+        deadline.check(Duration::ZERO)?;
         let implementation = formation.implementation;
         let (specializations, ahead, group) = match piece {
             Piece::Whole(configurations) => (configurations, Vec::new(), None),
@@ -6092,6 +6288,7 @@ impl Run {
             },
             points,
             Matching {
+                deadline,
                 settings,
                 min_sample_seconds,
                 rates,
@@ -6106,9 +6303,11 @@ impl Run {
             Some(admission),
         );
         *measuring_seconds += began.elapsed().as_secs_f64();
+        let mut interrupted = false;
         for (candidate, outcome) in candidates.into_iter().zip(measured) {
             match outcome {
-                Ok((measured, evidence)) => {
+                Ok(None) => interrupted = true,
+                Ok(Some((measured, evidence))) => {
                     self.search
                         .record(&candidate.specialization, Some(measured.clone()));
                     let cost = weighing.cost(&measured, &self.search.reference);
@@ -6130,7 +6329,11 @@ impl Run {
                 }
             }
         }
-        Ok(())
+        if interrupted {
+            Err(WorkError::Expired)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -6855,12 +7058,14 @@ impl Tuned<'_> {
                             &options,
                             &settings,
                             Some(&mut admission),
+                            Deadline::default(),
                         ) {
                             Ok(measured) => Outcome::Measured {
                                 points: measured,
                                 confirmed: Vec::new(),
                             },
-                            Err(exclusion) => Outcome::Excluded(exclusion),
+                            Err(WorkError::Failed(exclusion)) => Outcome::Excluded(exclusion),
+                            Err(WorkError::Expired) => unreachable!("a survey has no deadline"),
                         },
                     ),
                 };
@@ -8925,7 +9130,13 @@ mod tests {
             )
         );
         assert!(again.priced < Duration::from_millis(2));
+        // Given up by whatever held it, as another unit whose launches
+        // render the same text gives up its compiles, the program is live
+        // no longer: forming it compiles again, and is classed so though
+        // this unit formed and released nothing since it was last asked.
         drop(held);
+        drop(programs);
+        assert_eq!(formation.class(&program), (FormationClass::Compiled, 1));
     }
 
     /// A challenger formation is priced by the formations of its class

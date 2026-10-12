@@ -564,11 +564,47 @@ impl DevicePrograms {
         }
     }
 
+    /// What compiling `source` takes this device's toolchain when nothing
+    /// serves it ([`ProgramFormer::cold`]); nothing on the CPU backend,
+    /// which compiles nothing at run time.
+    pub(crate) fn cold(
+        &self,
+        source: &seismic_native_target::ProgramSource,
+    ) -> Result<std::time::Duration, seismic_native_target::NativeCompilationError> {
+        match self {
+            Self::Cpu => Ok(std::time::Duration::ZERO),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.cold(source),
+            Self::Cuda(former) => former.cold(source),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.cold(source),
+        }
+    }
+
+    /// `sources` as this device's former reads them
+    /// ([`ProgramFormer::keyed`]). The CPU backend forms no programs.
+    pub(crate) fn keyed(
+        &self,
+        sources: Vec<seismic_native_target::ProgramSource>,
+    ) -> Vec<crate::formation::Keyed> {
+        let keyed = |key: &dyn Fn(seismic_native_target::ProgramSource) -> crate::formation::Keyed| {
+            sources.into_iter().map(key).collect()
+        };
+        match self {
+            Self::Cpu => Vec::new(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => keyed(&|source| former.keyed(source)),
+            Self::Cuda(former) => keyed(&|source| former.keyed(source)),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => keyed(&|source| former.keyed(source)),
+        }
+    }
+
     /// What forming `sources` together on this device does, known before
     /// they are formed, and the most entries one source's compile forms.
     pub(crate) fn class(
         &self,
-        sources: &[seismic_native_target::ProgramSource],
+        sources: &[crate::formation::Keyed],
     ) -> (crate::formation::FormationClass, usize) {
         match self {
             Self::Cpu => (crate::formation::FormationClass::Kept, 0),
@@ -584,7 +620,7 @@ impl DevicePrograms {
     /// ([`ProgramFormer::publication`]).
     pub(crate) fn publication(
         &self,
-        sources: &[seismic_native_target::ProgramSource],
+        sources: &[crate::formation::Keyed],
     ) -> (crate::formation::FormationClass, usize) {
         match self {
             Self::Cpu => (crate::formation::FormationClass::Kept, 0),
@@ -598,10 +634,7 @@ impl DevicePrograms {
 
     /// How many of `sources` publishing them on this device compiles
     /// ([`ProgramFormer::publishing_sources`]).
-    pub(crate) fn publishing_sources(
-        &self,
-        sources: &[seismic_native_target::ProgramSource],
-    ) -> usize {
+    pub(crate) fn publishing_sources(&self, sources: &[crate::formation::Keyed]) -> usize {
         match self {
             Self::Cpu => 0,
             #[cfg(target_os = "macos")]
