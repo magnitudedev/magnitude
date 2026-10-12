@@ -5,6 +5,7 @@
 #define KERNEL_W0 SEISMIC_TABLE
 #define KERNEL_W1 SEISMIC_COMBINE
 #include "lib/projection/projection.h"
+#include "lib/core/gathered.h"
 #include "lib/core/reduce.h"
 
 typedef element::Act activation;
@@ -19,6 +20,7 @@ constant constexpr uint draft_outputs = draft_simdgroups * draft_rows_per_simdgr
 
 #define DRAFT_ROWS_ARGUMENTS \
     device const int *tokens [[buffer(SEISMIC_BUFFER_TOKENS)]], \
+    device const int *directory [[buffer(SEISMIC_BUFFER_DIRECTORY)]], \
     device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]], \
     device const uchar *conditioning [[buffer(SEISMIC_BUFFER_CONDITIONING)]], \
     device const uchar *embedding_norm [[buffer(SEISMIC_BUFFER_EMBEDDING_NORM)]], \
@@ -29,7 +31,8 @@ constant constexpr uint draft_outputs = draft_simdgroups * draft_rows_per_simdgr
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 inline void draft_join(
-    device const int *tokens, device const uchar *table, device const uchar *conditioning,
+    device const int *tokens, device const int *directory, device const uchar *table,
+    device const uchar *conditioning,
     device const uchar *embedding_norm, device const uchar *hidden_norm,
     constant ulong *seismic_words, threadgroup uchar *shared, ulong row,
     uint thread_index, uint sg, uint lane) {
@@ -40,8 +43,8 @@ inline void draft_join(
     const float epsilon = as_type<float>(uint(SEISMIC_PARAM_EPSILON));
     // The embedding row in A, packet by packet, and its sum of squares.
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
-    // Column 0 of a (token, status) selection row; a failed selection is -1.
-    const uint token = uint(max(tokens[row * SEISMIC_TOKENS_STRIDE_0], 0));
+    const uint token = uint(gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
+        tokens[row * SEISMIC_TOKENS_STRIDE_0]));
     float embedding_squares = 0.0f;
     for (uint p = thread_index; p * 32u < width; p += draft_threads) {
         typename packets::W0::packet packet = rows.packet(token, p);
@@ -98,7 +101,7 @@ kernel void draft_rows(DRAFT_ROWS_ARGUMENTS,
     typedef typename activation::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
     const ulong row = ulong(group.y);
-    draft_join(tokens, table, conditioning, embedding_norm, hidden_norm, seismic_words,
+    draft_join(tokens, directory, table, conditioning, embedding_norm, hidden_norm, seismic_words,
         shared, row, thread_index, sg, lane);
     threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
     // Four combine rows per simdgroup; lanes own packets of the 2D inputs.
@@ -139,7 +142,7 @@ kernel void draft_rows_join(DRAFT_ROWS_ARGUMENTS,
     typedef typename activation::storage storage;
     const uint width = uint(SEISMIC_DIM_D);
     const ulong row = ulong(group.y);
-    draft_join(tokens, table, conditioning, embedding_norm, hidden_norm, seismic_words,
+    draft_join(tokens, directory, table, conditioning, embedding_norm, hidden_norm, seismic_words,
         shared, row, thread_index, sg, lane);
     threadgroup storage *joined = reinterpret_cast<threadgroup storage *>(shared);
     device storage *out = reinterpret_cast<device storage *>(joined_rows);

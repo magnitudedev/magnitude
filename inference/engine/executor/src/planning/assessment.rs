@@ -736,18 +736,21 @@ mod tests {
             ("M", 2),
             ("V", definition.decoder.vocabulary),
             ("D", definition.decoder.hidden),
+            ("R", 0),
         ];
         let mut invalid = NativeGraphMetadata::new(BackendName::Cpu);
         let wrong_table = invalid.port(Element::f32(), &[1, 1]).unwrap();
         let tokens = invalid
             .input_for::<magnitude_kernels::embedding_rows::Entry>(&elements, "tokens", &dimensions)
             .unwrap();
+        let direct = invalid.port(Element::i32(), &[0]).unwrap();
         let mismatch = invalid.enqueue::<magnitude_kernels::embedding_rows::Entry>(
             &elements,
             &dimensions,
             magnitude_kernels::embedding_rows::WorkflowArgs {
                 table: wrong_table.tensor().into(),
                 tokens: tokens.tensor().into(),
+                directory: direct.tensor().into(),
                 scale: 1.0,
                 normalize: 0,
                 epsilon: 0.0,
@@ -1906,6 +1909,7 @@ mod tests {
                     source_bytes: bytes,
                     resident_bytes: bytes,
                     scale: None,
+                    streamed: None,
                 }
             })
             .collect();

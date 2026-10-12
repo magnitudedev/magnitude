@@ -7,9 +7,11 @@ use super::{
     graph::readout::{
         BoundTargetReadoutGraphs, ReadoutClass, ReadoutKind, certifies, shapes, write_selection,
     },
-    native_target_graph::{BoundTargetGraphs, EntryTokens},
+    native_target_graph::{BoundTargetGraphs, EntryTokens, TokenRow},
 };
+use crate::host_tables::HostTableError;
 use crate::operators::block::{BlockControlPorts, BlockStatePorts};
+use crate::device_table::SelectedRead;
 use crate::{
     ConditioningRef, ConditioningSlice, DeviceError, GraphOutputTensor, InvariantError,
     NativeGraphOutputLease, NativeGraphWorkspaceLease, SubmitError, TargetGraphOutputLease,
@@ -183,6 +185,20 @@ pub struct TargetOutput {
     pub boundary: Option<crate::FeatureRef>,
     pub readout: Option<TargetReadoutGraphResult>,
     pub commits: CommitSpan,
+    /// The step's read of the table rows the device selected its tokens
+    /// for; `None` of a step of the host's tokens.
+    pub selected_rows: Option<SelectedRead>,
+}
+
+impl TargetOutput {
+    /// Whether a step queued ahead of the device's selection found every
+    /// table row it read for `token`, the token then selected. A token's
+    /// embedding row is the token.
+    pub fn found_selected(&self, token: u32) -> bool {
+        self.selected_rows
+            .as_ref()
+            .is_none_or(|rows| rows.found(u64::from(token)))
+    }
 }
 
 /// Runs of one step queued on the device, with the outputs they will fill.
@@ -190,6 +206,7 @@ struct QueuedStep {
     readout: Option<TargetReadoutGraphResult>,
     commits: CommitSpan,
     completions: Vec<NativeGraphCompletion>,
+    selected_rows: Option<SelectedRead>,
 }
 
 impl RowState<'_> {
@@ -572,19 +589,47 @@ impl NativeTargetProgram {
                 }
             })
             .collect::<Vec<_>>();
-        let mut gathered = vec![0; table_rows.len() * per_layer.table.row_bytes()];
-        per_layer
-            .table
-            .gather(&table_rows, &mut gathered)
-            .map_err(|error| invalid(error.to_string()))?;
-        let inputs = per_layer.rows.slice_leading(0, rows).map_err(device)?;
+        let mut inputs = per_layer.rows.slice_leading(0, rows).map_err(device)?;
+        // The token whose per-layer row this step writes into a token
+        // row's slot, and the slot.
+        let mut written = None;
+        {
+            // The token rows' slots are the per-layer rows after the first,
+            // the last row the first slot. This step's entry writes its
+            // leading rows.
+            let last = per_layer.rows.extents()[0] - 1;
+            per_layer
+                .token_rows
+                .overwrite((last + 1 - rows) as usize..last as usize);
+            if let ([token], true) = (batch.tokens, media_rows.is_empty()) {
+                let slot = |slot: usize| {
+                    let row = last - slot as u64;
+                    per_layer.rows.slice_leading(row, row + 1).map_err(device)
+                };
+                let token = u64::try_from(*token)
+                    .map_err(|_| invalid(format!("token {token} has no per-layer row")))?;
+                match per_layer.token_rows.find(token).map_err(invalid)? {
+                    TokenRow::Held(held) => return Ok(Some(slot(held)?)),
+                    TokenRow::Free(free) => {
+                        inputs = slot(free)?;
+                        written = Some((token, free));
+                    }
+                    TokenRow::None => {}
+                }
+            }
+        }
         let mut active = graph_workspace
             .slot_mut()
             .activate(&graph.plan)
             .map_err(device)?;
-        active
-            .write_input(&graph.ports.gathered, &gathered)
-            .map_err(device)?;
+        per_layer
+            .table
+            .gather(&table_rows, |gathered| {
+                active
+                    .write_input(&graph.ports.gathered, gathered)
+                    .map_err(device)
+            })
+            .map_err(|error: HostTableError| invalid(error.to_string()))??;
         let mut bindings = bound.bindings();
         bindings.set(&graph.ports.hidden, hidden).map_err(device)?;
         bindings.set(&graph.ports.rows, &inputs).map_err(device)?;
@@ -592,6 +637,9 @@ impl NativeTargetProgram {
             .attach(bindings, graph.plan.new_outputs().map_err(device)?)
             .map_err(device)?;
         submitter.queue(ready)?;
+        if let Some((token, slot)) = written {
+            per_layer.token_rows.hold(token, slot);
+        }
         Ok(Some(inputs))
     }
 
@@ -671,6 +719,11 @@ impl NativeTargetProgram {
         graph_workspace: &mut TargetGraphWorkspaceLease,
         graph_outputs: &mut [TargetGraphOutputLease; 2],
     ) -> Result<QueuedStep, SubmitError> {
+        // Device-selected tokens name rows of the embedding table, which
+        // the device may not hold of a streamed one: the step's claim asks
+        // (`TargetOutput::found_selected`).
+        let selected_rows = matches!(state.tokens(), TargetTokens::Selected(_))
+            .then(|| self.graphs.embedding.read_selected());
         let mut submitter = StepSubmitter::new(&self.device);
         let queued = self
             .queue_graphs(
@@ -687,6 +740,7 @@ impl NativeTargetProgram {
                 readout,
                 commits,
                 completions: submitter.completions,
+                selected_rows,
             }),
             Err(error) => {
                 // The failure is reported; outcomes of runs submitted before
@@ -723,9 +777,12 @@ impl NativeTargetProgram {
                 .map_err(device)?;
             let mut bindings = entry_bound.bindings();
             match tokens {
-                TargetTokens::Host => active
-                    .write_input(&entry.tokens, &token_rows(batch.tokens))
-                    .map_err(device)?,
+                TargetTokens::Host => {
+                    let rows = self.graphs.embedding.indices(batch.tokens).map_err(invalid)?;
+                    active
+                        .write_input(&entry.tokens, &token_rows(&rows))
+                        .map_err(device)?
+                }
                 TargetTokens::Selected(selected) => bindings
                     .set(&entry.tokens, selected.tensor())
                     .map_err(device)?,
@@ -1291,6 +1348,7 @@ impl TargetProgram for NativeTargetProgram {
                 boundary,
                 readout: queued.readout,
                 commits: queued.commits,
+                selected_rows: queued.selected_rows,
             },
         ))
     }

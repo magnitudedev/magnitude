@@ -4,6 +4,9 @@
 //! their logical descriptor, imports them through the once-prepared execution
 //! path, and owns the sole cache of resulting device tensors.
 
+use crate::device_table::{
+    DeviceTable, KeptRows, ResidentTable, TileRun, TileSource, TilesBrought,
+};
 use crate::domain::ClaimRefusal;
 use crate::programs::ProgramSubmission;
 use crate::programs::native_import::NativeImportProgram;
@@ -220,9 +223,17 @@ pub struct ResidentWeight {
     /// The resident second-level scale (`WeightPlan::scale`): one F32 value
     /// per matrix, bound to its entries' accumulator-scale ports.
     scale: Option<Tensor>,
+    /// The weight as a gathered table. Of a streamed one `tensor` is the
+    /// slots, and every reader of the weight shares the device table.
+    table: ResidentTable,
 }
 
 impl ResidentWeight {
+    /// The weight as its row-gathering readers find it.
+    pub fn table(&self) -> &ResidentTable {
+        &self.table
+    }
+
     pub fn belongs_to(&self, device: &Device) -> bool {
         self.tensor.belongs_to(device)
     }
@@ -243,9 +254,85 @@ impl ResidentWeight {
         self.scale.as_ref()
     }
 
-    /// Every allocation of the weight: its representation and its scale.
+    /// The weight of a streamed table: the slots that hold some of its
+    /// rows, and the device table they are.
+    fn streamed(descriptor: WeightDescriptor, table: Rc<DeviceTable>) -> Self {
+        Self {
+            descriptor,
+            tensor: table.slots_tensor().clone(),
+            scale: None,
+            table: ResidentTable::streamed(table),
+        }
+    }
+
+    /// Every allocation of the weight: its representation, its scale and a
+    /// streamed table's directory and staging.
     pub(crate) fn storage_bytes(&self) -> u64 {
-        self.tensor.storage_bytes() + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
+        self.tensor.storage_bytes()
+            + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
+            + self.table.streamed_bytes()
+    }
+}
+
+/// Brings a streamed table's tiles from its artifact: read as stored and
+/// converted by the entry that would import the whole weight, queued ahead
+/// of the step that names them. The device converts them before it runs
+/// that step's graphs, and the host does not wait.
+struct TileImport {
+    table: crate::host_tables::HostTable,
+    import: crate::native::AttestedImport,
+    device: Rc<Device>,
+}
+
+impl TileSource for TileImport {
+    fn bring(&self, runs: &[TileRun<'_>], staging: &mut Tensor) -> Result<TilesBrought, String> {
+        let failed = |error: &dyn fmt::Display| format!("streamed table rows: {error}");
+        let tiles = runs
+            .iter()
+            .flat_map(|run| run.tiles.iter().copied())
+            .collect::<Vec<_>>();
+        let tile = staging.extents()[0] / tiles.len() as u64;
+        let tile_bytes = tile as usize * self.table.row_bytes();
+        let mut bytes = vec![0; tiles.len() * tile_bytes];
+        // Tiles that follow one another in the table are read together.
+        let mut at = 0;
+        while at < tiles.len() {
+            let run = (at..tiles.len())
+                .take_while(|next| tiles[*next] == tiles[at] + (*next - at) as u64 * tile)
+                .count();
+            self.table
+                .gather_run(
+                    tiles[at],
+                    &mut bytes[at * tile_bytes..(at + run) * tile_bytes],
+                )
+                .map_err(|error| failed(&error))?;
+            at += run;
+        }
+        staging
+            .write_from_host(&bytes)
+            .map_err(|error| failed(&error))?;
+        // Every run's conversion is queued in one batch.
+        let mut batch = NativeTensorBatch::new(&self.device);
+        let mut staged = 0;
+        for run in runs {
+            let rows = run.tiles.len() as u64 * tile;
+            let source = staging
+                .slice_leading(staged, staged + rows)
+                .map_err(|error| failed(&error))?;
+            crate::programs::native_import::enqueue_into(
+                &self.import,
+                &mut batch,
+                &source,
+                &run.slots,
+            )
+            .map_err(|error| failed(&error))?;
+            staged += rows;
+        }
+        let queued = batch.submit().map_err(|error| failed(&error))?;
+        Ok(Box::new(move || {
+            seismic::NativeTensorBatchCompletion::wait(queued)
+                .map_err(|error| format!("streamed table rows: {error}"))
+        }))
     }
 }
 
@@ -312,6 +399,8 @@ pub struct ResidencyStore {
     resident: HashMap<ResidencyKey, ResidentWeight>,
     mapped_import: MappedImportReport,
     import_progress: Option<ImportProgress>,
+    /// Where the rows steps name of streamed tables are kept, when they are.
+    kept_table_rows: Option<std::path::PathBuf>,
 }
 
 impl ResidencyStore {
@@ -337,6 +426,7 @@ impl ResidencyStore {
             resident: HashMap::new(),
             mapped_import: MappedImportReport::default(),
             import_progress: None,
+            kept_table_rows: None,
         })
     }
 
@@ -388,6 +478,108 @@ impl ResidencyStore {
 
     pub fn mapped_import_report(&self) -> MappedImportReport {
         self.mapped_import
+    }
+
+    /// Keep the rows steps name of this store's streamed tables in
+    /// `directory`, a file per table, for the next time each is served.
+    pub fn keep_table_rows(&mut self, directory: std::path::PathBuf) {
+        self.kept_table_rows = Some(directory);
+    }
+
+    /// The resident weight of `descriptor` when its plan streams it
+    /// (`WeightPlan::streamed`): a streamed table is not imported. Its
+    /// device table is made and seeded the first time a reader asks for the
+    /// weight, and shared by every reader after.
+    fn streamed(
+        &mut self,
+        artifact: &GgufArtifact,
+        descriptor: &WeightDescriptor,
+    ) -> Result<Option<ResidentWeight>, WeightImportError> {
+        let Some(plan) = self
+            .execution
+            .weights()
+            .find(|weight| {
+                weight.component.identity == artifact.identity()
+                    && weight.descriptor == *descriptor
+                    && weight.streamed.is_some()
+            })
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let key = ResidencyKey {
+            artifact: artifact.identity(),
+            name: descriptor.name.clone(),
+            transforms: descriptor.transforms.clone(),
+            resident: plan.resident,
+        };
+        if let Some(weight) = self.resident.get(&key) {
+            return Ok(Some(weight.clone()));
+        }
+        let table = self.stream_table(artifact, &plan)?;
+        let weight = ResidentWeight::streamed(descriptor.clone(), table);
+        // The plan charged the slots, the directory and the staging.
+        let planned = plan.storage_bytes().map_err(invalid)?;
+        if weight.storage_bytes() != planned {
+            return Err(invalid(format!(
+                "streamed table {:?} allocates {} bytes but its plan charged {planned}",
+                descriptor.name,
+                weight.storage_bytes()
+            )));
+        }
+        self.publish(key, weight.clone())?;
+        Ok(Some(weight))
+    }
+
+    /// The device table of the streamed gathered table `plan`, its slots
+    /// filled with the rows worth holding before any step names one.
+    fn stream_table(
+        &self,
+        artifact: &GgufArtifact,
+        plan: &WeightPlan,
+    ) -> Result<Rc<DeviceTable>, WeightImportError> {
+        let streamed = plan
+            .streamed
+            .ok_or_else(|| invalid("a weight held whole has no device table"))?;
+        let stored = Stored::from_gguf(artifact, &plan.descriptor)
+            .map_err(|error| invalid(error.to_string()))?;
+        let table = crate::host_tables::HostTable::open(&stored)
+            .map_err(|error| invalid(error.to_string()))?;
+        // The kept rows are the table's in this artifact file, by where it
+        // lies there, in these slots.
+        let kept = self.kept_table_rows.as_ref().map(|directory| {
+            let (source, offset, length) = stored.file_range();
+            KeptRows::of(
+                directory,
+                &format!(
+                    "{}\n{offset}\n{length}\n{:?}\n{:?}",
+                    source.path().display(),
+                    plan.resident,
+                    plan.shape
+                ),
+            )
+        });
+        let table = DeviceTable::new(
+            &self.device,
+            plan.resident,
+            table.source(),
+            streamed.table_rows,
+            &plan.shape[1..],
+            plan.shape[0],
+            streamed.staging_rows,
+            Box::new(TileImport {
+                import: self
+                    .programs
+                    .import_entry(plan)
+                    .map_err(|error| invalid(error.to_string()))?,
+                device: self.device.clone(),
+                table,
+            }),
+            kept,
+        )
+        .map_err(invalid)?;
+        table.seed().map_err(invalid)?;
+        Ok(Rc::new(table))
     }
 
     /// The imported physical view selected for an explicit semantic weight role.
@@ -453,6 +645,7 @@ impl ResidencyStore {
             descriptor: descriptor.clone(),
             tensor,
             scale: None,
+            table: ResidentTable::whole(),
         };
         self.publish(key, weight.clone())?;
         Ok(weight)
@@ -486,6 +679,9 @@ impl ResidencyStore {
         descriptor: &WeightDescriptor,
         target: DType,
     ) -> Result<ResidentWeight, WeightImportError> {
+        if let Some(weight) = self.streamed(artifact, descriptor)? {
+            return Ok(weight);
+        }
         let (key, descriptor, scale, launch, mut program) =
             match self.prepare_gguf(artifact, descriptor, target, None)? {
                 ImportPreparation::Resident(weight) => return Ok(weight),
@@ -506,6 +702,7 @@ impl ResidencyStore {
             descriptor,
             tensor: destination.into_tensor(),
             scale,
+            table: ResidentTable::whole(),
         };
         self.publish(key, weight.clone())?;
         Ok(weight)
@@ -714,7 +911,12 @@ impl ResidencyStore {
         let mut seen = HashSet::<WeightStorageIdentity>::new();
         let mut ordered = Vec::new();
         // A host-placed weight takes no import entry (`import_progressive`).
-        for plan in weights.iter().filter(|plan| !plan.placed_on_host()) {
+        // Nor is a streamed table imported: its rows reach the device as
+        // steps name them (`stream_table`).
+        for plan in weights
+            .iter()
+            .filter(|plan| !plan.placed_on_host() && plan.streamed.is_none())
+        {
             if !seen.insert(plan.storage_identity()) {
                 continue;
             }
@@ -739,9 +941,14 @@ impl ResidencyStore {
                 .cmp(right.source.path())
                 .then(left.offset.cmp(&right.offset))
         });
-        let largest = ordered
+        // A window maps at most the component's largest stored tensor. A
+        // streamed table counts though it is not imported here, so the
+        // tensors around it are mapped in the windows a load that imports it
+        // maps them in.
+        let largest = weights
             .iter()
-            .map(|item| item.plan.source_bytes)
+            .filter(|plan| !plan.placed_on_host())
+            .map(WeightPlan::stored_bytes)
             .max()
             .unwrap_or(0);
         let mut report = MappedImportReport::default();
@@ -845,6 +1052,7 @@ impl ResidencyStore {
                             descriptor,
                             tensor: destination.into_tensor(),
                             scale,
+                            table: ResidentTable::whole(),
                         },
                     )?;
                 }

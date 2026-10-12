@@ -190,7 +190,9 @@ pub(crate) fn import_into(
     .map_err(|error| SubmitError::Device(DeviceError::Execution(error.to_string())))
 }
 
-fn enqueue_into(
+/// Queue one import entry from an uploaded source tensor into its resident
+/// destination: `import_into`, completed with the batch.
+pub(crate) fn enqueue_into(
     handle: &AttestedImport,
     batch: &mut NativeTensorBatch,
     source: &Tensor,
@@ -303,6 +305,7 @@ mod tests {
             source_bytes: values.len() as u64,
             resident_bytes: values.len() as u64,
             scale: None,
+            streamed: None,
         };
         // SAFETY: fill_staged_source writes every physical upload byte.
         let mut upload =

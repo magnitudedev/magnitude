@@ -82,6 +82,7 @@ pub(crate) mod tests {
             source_bytes: 2,
             resident_bytes: 2,
             scale: None,
+            streamed: None,
         }
     }
 

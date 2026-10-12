@@ -1248,6 +1248,8 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
                             .map(|_| rng.below(VOCABULARY_SLICE) as i32)
                             .collect::<Vec<_>>(),
                     ),
+                    // An empty directory: the tokens are the table's rows.
+                    ctx.ints(&[0], &[]),
                     Arg::Shared(table.clone()),
                     ctx.dense(
                         a,
@@ -1304,6 +1306,8 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                             .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
                             .collect::<Vec<_>>(),
                     ),
+                    // An empty directory: the tokens are the table's rows.
+                    ctx.ints(&[0], &[]),
                     // The Qwen entry: unscaled, not normalized.
                     f32s(1.0),
                     i32s(0),

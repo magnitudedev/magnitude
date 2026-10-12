@@ -2,8 +2,9 @@
 //! topology and external state; checked entry contracts derive every stage
 //! edge and intermediate allocation.
 
-use crate::host_tables::HostTable;
 use crate::operators::{self, MixerKind, PairedBlock, paired_block};
+use crate::device_table::ResidentTable;
+use crate::streamed_table::StreamedTable;
 use crate::{
     ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot,
     TargetProgramPlan,
@@ -1252,9 +1253,20 @@ impl PreparedTargetGraphs {
         self: &Arc<Self>,
         resident: &ResidentTarget,
     ) -> Result<BoundTargetGraphs, String> {
+        let embedding = resident.embedding.table().clone();
+        let direct =
+            seismic::Tensor::from_host(&resident.embedding.tensor().device(), Element::i32(), &[0], &[])
+                .map_err(|error| error.to_string())?;
         let mut entry_bound = BTreeMap::new();
         for (key, entry) in &self.entries {
-            let fixed = [(&entry.table, resident.embedding.tensor())];
+            let directory = match (key.1, embedding.directory()) {
+                (EntryTokens::Selected, Some(directory)) => directory,
+                _ => &direct,
+            };
+            let fixed = [
+                (&entry.table, resident.embedding.tensor()),
+                (&entry.directory, directory),
+            ];
             entry_bound.insert(
                 *key,
                 entry
@@ -1337,7 +1349,10 @@ impl PreparedTargetGraphs {
                             .map_err(|error| format!("per-layer entry graph rows {rows}: {error}"))
                     })
                     .collect::<Result<_, String>>()?,
-                table: weights.table.clone(),
+                // The rows a single-row step leaves unwritten hold tokens'
+                // rows.
+                token_rows: TokenRows::new(weights.table.rows(), extents[0] as usize - 1),
+                table: StreamedTable::new(weights.table.clone()),
                 rows: seismic::Tensor::zeros(
                     &resident.embedding.tensor().device(),
                     Element::f32(),
@@ -1354,6 +1369,7 @@ impl PreparedTargetGraphs {
             constants: constants.into_tensors(),
             taps,
             per_layer,
+            embedding,
         };
         // A binding that holds another heap than the plan counted is a
         // defect of the plan's accounting: an error in a debug build.
@@ -1458,6 +1474,8 @@ pub(crate) struct BoundTargetGraphs {
     /// column blocks of a step's leading rows, and the readout fuses them.
     pub taps: Option<seismic::Tensor>,
     pub per_layer: Option<BoundPerLayerEntry>,
+    /// The token embedding as the entries gather it.
+    pub embedding: ResidentTable,
 }
 
 impl BoundTargetGraphs {
@@ -1495,11 +1513,104 @@ impl BoundTargetGraphs {
 pub(crate) struct BoundPerLayerEntry {
     /// The graph per row class, bound to its weights.
     bound: BTreeMap<u64, BoundNativeGraphPlan>,
-    /// The host table whose rows each step gathers.
-    pub table: HostTable,
+    /// The table whose rows each step gathers, streamed.
+    pub table: StreamedTable,
     /// The per-layer rows: the entry writes a step's leading rows, and every
     /// per-layer input sublayer reads them.
     pub rows: seismic::Tensor,
+    /// The per-layer rows the entry computed for single tokens, kept in the
+    /// rows a single-row step leaves unwritten.
+    pub token_rows: TokenRows,
+}
+
+/// Where a single-row step of a text token finds its per-layer row. A text
+/// token's per-layer row is its own alone, so the row a step computed for a
+/// token stays where the step wrote it, and a later single-row step of the
+/// token reads it there instead of running the entry. The rows held are the
+/// per-layer rows after the first, the last row the first slot; a step of
+/// more rows writes over the ones its rows cover.
+pub(crate) struct TokenRows(std::sync::Mutex<crate::slot_directory::SlotDirectory>);
+
+/// Where a single-row step of a token finds its per-layer row.
+pub(crate) enum TokenRow {
+    /// An earlier step wrote it into this slot.
+    Held(usize),
+    /// No slot holds it, and this one is free: the step that writes it
+    /// there holds it (`TokenRows::hold`).
+    Free(usize),
+    /// No slot holds it, and none is free.
+    None,
+}
+
+impl TokenRows {
+    /// Rows of `tokens` tokens, in `slots` slots.
+    fn new(tokens: u64, slots: usize) -> Self {
+        Self(std::sync::Mutex::new(
+            crate::slot_directory::SlotDirectory::new(tokens, slots as u64, 1),
+        ))
+    }
+
+    /// Where a single-row step of `token` finds its per-layer row.
+    pub(crate) fn find(&self, token: u64) -> Result<TokenRow, String> {
+        let mut slots = self.0.lock().expect("token rows lock");
+        if !slots.has_row(token) {
+            return Err(format!("token {token} has no per-layer row"));
+        }
+        Ok(match slots.use_slot(token) {
+            Some(slot) => TokenRow::Held(slot as usize),
+            None => slots
+                .free(|_| false)
+                .map_or(TokenRow::None, |(slot, _)| TokenRow::Free(slot)),
+        })
+    }
+
+    /// The step that writes `token`'s row into the free slot `slot` is
+    /// queued: steps after it find the row there.
+    pub(crate) fn hold(&self, token: u64, slot: usize) {
+        self.0.lock().expect("token rows lock").hold(token, slot, true);
+    }
+
+    /// A step writes other rows over the slots `slots`.
+    pub(crate) fn overwrite(&self, slots: std::ops::Range<usize>) {
+        let mut held = self.0.lock().expect("token rows lock");
+        for slot in slots {
+            held.release(slot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod token_rows_tests {
+    use super::{TokenRow, TokenRows};
+
+    #[test]
+    fn a_token_row_is_held_from_the_step_that_writes_it_until_overwritten() {
+        assert!(matches!(TokenRows::new(8, 0).find(3).unwrap(), TokenRow::None));
+        assert!(TokenRows::new(8, 2).find(8).is_err());
+
+        let rows = TokenRows::new(8, 2);
+        let TokenRow::Free(first) = rows.find(3).unwrap() else {
+            panic!("a token no step wrote has a free slot")
+        };
+        // The slot is the token's only once the writing step is queued.
+        assert!(matches!(rows.find(3).unwrap(), TokenRow::Free(_)));
+        rows.hold(3, first);
+        assert!(matches!(rows.find(3).unwrap(), TokenRow::Held(slot) if slot == first));
+        let TokenRow::Free(second) = rows.find(4).unwrap() else {
+            panic!("the other slot is free")
+        };
+        assert_ne!(second, first);
+        rows.hold(4, second);
+        assert!(matches!(rows.find(4).unwrap(), TokenRow::Held(slot) if slot == second));
+        // A third token takes a slot from one of the two.
+        let TokenRow::Free(third) = rows.find(5).unwrap() else {
+            panic!("a full directory frees a slot")
+        };
+        rows.hold(5, third);
+        assert!(matches!(rows.find(5).unwrap(), TokenRow::Held(slot) if slot == third));
+        rows.overwrite(0..2);
+        assert!(matches!(rows.find(5).unwrap(), TokenRow::Free(_)));
+    }
 }
 
 impl BoundTargetGraphs {
@@ -1600,6 +1711,9 @@ pub(crate) enum EntryTokens {
 pub(crate) struct PreparedTargetEntryGraph {
     pub plan: NativeGraphPlan,
     pub table: NativePort,
+    /// The directory the embedding addresses the table through: a streamed
+    /// table's for selected tokens, else empty (`RowDirectory`).
+    pub directory: NativePort,
     pub tokens: NativePort,
     pub hidden: WorkflowTensor,
 }
@@ -1614,22 +1728,21 @@ impl PreparedTargetEntryGraph {
         source: EntryTokens,
         layout: &NativeGraphLayout,
     ) -> Result<Self, String> {
-        let weight = embedding_weight(load)?;
-        let (graph, table, tokens, hidden) = entry_graph_topology(
+        let draft = entry_graph_topology(
             device.native_graph_with_layout(layout),
             embedding,
-            weight,
+            embedding_weight(load)?,
             geometry,
             rows,
             source,
         )
         .map_err(|error| error.to_string())?;
-        let plan = GraphDraft::seal(graph).map_err(|error| error.to_string())?;
         Ok(Self {
-            plan,
-            table,
-            tokens,
-            hidden,
+            plan: GraphDraft::seal(draft.graph).map_err(|error| error.to_string())?,
+            table: draft.table,
+            directory: draft.directory,
+            tokens: draft.tokens,
+            hidden: draft.hidden,
         })
     }
 }
@@ -1648,6 +1761,15 @@ fn target_weight(load: &ModelLoadPlan, kind: WeightKind) -> Result<&crate::Weigh
         .ok_or_else(|| format!("target weight {kind:?} is absent"))
 }
 
+/// An entry graph before it is sealed, and its external ports.
+struct EntryGraphDraft<G> {
+    graph: G,
+    table: NativePort,
+    directory: NativePort,
+    tokens: NativePort,
+    hidden: WorkflowTensor,
+}
+
 fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     embedding: G::Binding<'a, embedding_rows::Entry>,
@@ -1655,12 +1777,20 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     geometry: &Decoder,
     rows: u64,
     source: EntryTokens,
-) -> Result<(G, NativePort, NativePort, WorkflowTensor), GraphError> {
+) -> Result<EntryGraphDraft<G>, GraphError> {
     let table = graph.port(weight.resident, &weight.shape)?;
+    // Uploaded tokens are the host's: of a streamed table it writes their
+    // slots. Selected tokens are the device's, which finds their slots in
+    // the directory.
+    let entries = match source {
+        EntryTokens::Uploaded => 0,
+        EntryTokens::Selected => weight.directory_entries(),
+    };
     let dimensions = [
         ("M", rows),
-        ("V", geometry.vocabulary),
+        ("V", weight.shape[0]),
         ("D", geometry.hidden),
+        ("R", entries),
     ];
     let tokens = match source {
         EntryTokens::Uploaded => graph.input_for(embedding, "tokens", &dimensions)?,
@@ -1668,6 +1798,7 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
             graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?
         }
     };
+    let directory = graph.port(Element::i32(), &[entries])?;
     let (scale, normalize, epsilon) = embedding_transform(geometry);
     let result = graph.enqueue::<embedding_rows::Entry>(
         embedding,
@@ -1675,13 +1806,20 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         embedding_rows::WorkflowArgs {
             table: table.tensor().into(),
             tokens: tokens.tensor().into(),
+            directory: directory.tensor().into(),
             scale,
             normalize,
             epsilon,
         },
     )?;
     graph.export(&result.r1)?;
-    Ok((graph, table, tokens, result.r1))
+    Ok(EntryGraphDraft {
+        graph,
+        table,
+        directory,
+        tokens,
+        hidden: result.r1,
+    })
 }
 
 /// `embedding_rows`' (`scale`, `normalize`, `epsilon`) for the decoder's
@@ -1708,7 +1846,7 @@ pub(crate) fn checked_entry_graph_storage(
 ) -> Result<NativeGraphStorageBytes, GraphError> {
     let weight = embedding_weight(load)?;
     let elements = [("EW", weight.resident), ("A", activation(geometry))];
-    let (graph, _, _, _) = entry_graph_topology(
+    let draft = entry_graph_topology(
         NativeGraphMetadata::new(backend),
         &elements,
         weight,
@@ -1720,7 +1858,7 @@ pub(crate) fn checked_entry_graph_storage(
             EntryTokens::Selected
         },
     )?;
-    GraphDraft::seal(graph)
+    GraphDraft::seal(draft.graph)
 }
 
 #[derive(Clone)]
@@ -1753,6 +1891,9 @@ pub(crate) enum WeightPart {
     Values,
     /// Its resident second-level scale (`WeightPlan::scale`).
     Scale,
+    /// A streamed gathered table's directory of every row's slot
+    /// (`WeightPlan::streamed`).
+    Directory,
 }
 
 impl WeightPart {
@@ -1760,6 +1901,12 @@ impl WeightPart {
     pub(crate) fn of(self, weight: &crate::ResidentWeight) -> Result<&seismic::Tensor, String> {
         match self {
             Self::Values => Ok(weight.tensor()),
+            Self::Directory => weight.table().directory().ok_or_else(|| {
+                format!(
+                    "resident weight {:?} is held whole and has no directory",
+                    weight.descriptor().name
+                )
+            }),
             Self::Scale => weight.scale().ok_or_else(|| {
                 format!(
                     "resident weight {:?} has no second-level scale",
@@ -1788,9 +1935,131 @@ fn weight_port<G: GraphDraft>(
         (WeightPart::Scale, None) => {
             return Err(format!("planned weight {role:?} has no second-level scale").into());
         }
+        (WeightPart::Directory, _) => match plan.streamed {
+            Some(streamed) => graph.port(Element::i32(), &[streamed.table_rows]),
+            None => {
+                return Err(
+                    format!("planned weight {role:?} is held whole and has no directory").into(),
+                );
+            }
+        },
     }?;
     ports.push((WeightPort { role, part }, port.clone()));
     Ok(port)
+}
+
+/// What a reader of a gathered table addresses its rows through
+/// (`gathered_row`): a directory of every row's slot, or an empty one under
+/// which the reader reads each row it is given.
+#[derive(Clone)]
+pub(crate) struct RowDirectory {
+    pub tensor: WorkflowTensor,
+    /// Its entries: the readers' `R`.
+    pub entries: u64,
+}
+
+impl RowDirectory {
+    /// The empty directory, a constant of the graph.
+    pub(crate) fn direct<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        let directory = GraphConstant::i32(graph, &[])?;
+        let tensor = directory.port().tensor().clone();
+        constants.push(directory);
+        Ok(Self { tensor, entries: 0 })
+    }
+}
+
+/// A gathered table as a graph's reads find it: the tensor they gather from
+/// (the table's rows, or the slots of a streamed one) and the directory they
+/// address it through. A read of rows the host knows gathers by the indices
+/// the host writes (`ResidentTable::indices`): `by_rows`. A read of rows the
+/// device selected finds their slots in the table's directory: `selected`.
+pub(crate) struct GatheredTable {
+    pub table: WorkflowTensor,
+    /// The rows of `table`: the readers' `V`.
+    pub rows: u64,
+    role: WeightRole,
+    /// The entries of a streamed table's directory; 0 of a table held whole.
+    entries: u64,
+    /// The empty directory, declared by the graph's first read by rows.
+    direct: Option<RowDirectory>,
+    /// The directory's port, declared by the graph's first read of selected
+    /// rows: a graph that reads none has no such port.
+    directory: Option<RowDirectory>,
+}
+
+impl GatheredTable {
+    /// The planned table of `scope` and `kind`.
+    pub(crate) fn of<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        scope: WeightScope,
+        kind: WeightKind,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+    ) -> Result<Self, GraphError> {
+        let role = WeightRole { scope, kind };
+        let plan = load
+            .weights()
+            .find(|plan| plan.role == role)
+            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
+        let rows = plan.shape[0];
+        let table = weight_port(graph, load, role, WeightPart::Values, ports)?
+            .tensor()
+            .clone();
+        Ok(Self {
+            table,
+            rows,
+            role,
+            entries: plan.directory_entries(),
+            direct: None,
+            directory: None,
+        })
+    }
+
+    /// The directory of a read of the table's own rows, as the host gives
+    /// them: empty.
+    pub(crate) fn by_rows<G: GraphDraft>(
+        &mut self,
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<RowDirectory, GraphError> {
+        if let Some(direct) = &self.direct {
+            return Ok(direct.clone());
+        }
+        Ok(self
+            .direct
+            .insert(RowDirectory::direct(graph, constants)?)
+            .clone())
+    }
+
+    /// The directory of a read of rows the device selected: empty of a table
+    /// held whole, a streamed table's directory of every row's slot.
+    pub(crate) fn selected<G: GraphDraft>(
+        &mut self,
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<RowDirectory, GraphError> {
+        if self.entries == 0 {
+            return self.by_rows(graph, constants);
+        }
+        if let Some(directory) = &self.directory {
+            return Ok(directory.clone());
+        }
+        let tensor = weight_port(graph, load, self.role, WeightPart::Directory, ports)?
+            .tensor()
+            .clone();
+        Ok(self
+            .directory
+            .insert(RowDirectory {
+                tensor,
+                entries: self.entries,
+            })
+            .clone())
+    }
 }
 
 /// The port of a weight an entry binds without an accumulator-scale port
@@ -2360,14 +2629,15 @@ fn certify_target_family(
     for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
         let weight = embedding_weight(load)?;
         let elements = [("EW", weight.resident), ("A", activation(geometry))];
-        let (graph, _, _, _) = entry_graph_topology(
+        let graph = entry_graph_topology(
             NativeGraphMetadata::new_template(backend),
             &elements,
             weight,
             geometry,
             largest_rows,
             source,
-        )?;
+        )?
+        .graph;
         let layout = graph
             .seal_template()
             .and_then(|template| {
@@ -2956,7 +3226,7 @@ mod resource_template_tests {
                     .map(|rows| rows as u64)
                 {
                     for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
-                        let (graph, _, _, _) = entry_graph_topology(
+                        let graph = entry_graph_topology(
                             NativeGraphMetadata::new(backend),
                             &elements,
                             weight,
@@ -2964,7 +3234,8 @@ mod resource_template_tests {
                             rows,
                             source,
                         )
-                        .unwrap();
+                        .unwrap()
+                        .graph;
                         seals(graph.plan_heap());
                         fits(
                             graph,

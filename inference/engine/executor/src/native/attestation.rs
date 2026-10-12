@@ -2088,34 +2088,36 @@ impl AttestedPrograms {
                 .clone(),
         )
     }
+    /// The import entry that converts `weight`'s uploaded rows into its
+    /// resident storage.
+    pub(crate) fn import_entry(
+        &self,
+        weight: &crate::WeightPlan,
+    ) -> Result<AttestedImport, CatalogError> {
+        let requested = match (weight.upload.dtype(), weight.resident.dtype()) {
+            (Some(source), Some(resident)) => ImportProgramSlot::Dense { source, resident },
+            _ => ImportProgramSlot::Repack {
+                source: weight.upload,
+                resident: weight.resident,
+            },
+        };
+        self.imports
+            .iter()
+            .find(|(slot, _)| *slot == requested)
+            .map(|(_, handle)| handle.clone())
+            .ok_or_else(|| CatalogError::native(self.backend, missing("weight_import", requested)))
+    }
+
     /// Bind one already planned semantic weight to its exact import entry.
     /// This happens during loader construction, never during a numerical call.
     pub(crate) fn bind_import(
         &self,
         weight: &crate::WeightPlan,
     ) -> Result<crate::programs::native_import::NativeImportProgram, CatalogError> {
-        (|| -> Result<crate::programs::native_import::NativeImportProgram, CatalogFailure> {
-            let requested = if let (Some(source), Some(resident)) =
-                (weight.upload.dtype(), weight.resident.dtype())
-            {
-                ImportProgramSlot::Dense { source, resident }
-            } else {
-                ImportProgramSlot::Repack {
-                    source: weight.upload,
-                    resident: weight.resident,
-                }
-            };
-            let (_, handle) = self
-                .imports
-                .iter()
-                .find(|(slot, _)| *slot == requested)
-                .ok_or_else(|| missing("weight_import", requested))?;
-            Ok(crate::programs::native_import::NativeImportProgram::new(
-                weight.storage_identity(),
-                handle.clone(),
-            ))
-        })()
-        .map_err(|failure| CatalogError::native(self.backend, failure))
+        Ok(crate::programs::native_import::NativeImportProgram::new(
+            weight.storage_identity(),
+            self.import_entry(weight)?,
+        ))
     }
     pub fn invocation_workspace_bytes(&self) -> u64 {
         self.invocation_workspace_bytes

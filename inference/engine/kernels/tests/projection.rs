@@ -5528,6 +5528,124 @@ fn timing_on(device: &Device) {
     }
 }
 
+/// A read of a gathered table through a directory reads, for each selected
+/// row, its slot (row 0 for a row without one and for a failed selection),
+/// exactly as a direct read of that slot does, on every rows16 backend the
+/// host has, over packed and dense tables; the portable body reads the same
+/// rows. (CUDA's mma16 tables: `cuda_projection.rs`.)
+#[test]
+fn embedding_rows_read_the_slots_their_directory_names() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let module = module();
+    let act = Act::Bf16;
+    let (v, d) = (300usize, 512usize);
+    // Logical rows past the table's slots; every third has a slot.
+    let logical = 1000usize;
+    let directory_values = (0..logical)
+        .map(|row| {
+            if row % 3 == 0 {
+                ((7 * row + 3) % v) as i32
+            } else {
+                -1
+            }
+        })
+        .collect::<Vec<_>>();
+    for backend in [BackendName::Metal, BackendName::Vulkan, BackendName::Cpu] {
+        let device = match catalog.open_backend(backend) {
+            Ok(device) => device,
+            Err(error) if backend != BackendName::Cpu => {
+                eprintln!("gathered rows: {backend:?} unavailable: {error}");
+                continue;
+            }
+            Err(error) => panic!("gathered rows: CPU unavailable: {error}"),
+        };
+        eprintln!("gathered rows: testing {backend:?}");
+        let directory = i32_tensor(&device, &[logical], &directory_values);
+        let direct = i32_tensor(&device, &[0], &[]);
+        for repr in [Repr::Q4k, Repr::Q6k, Repr::Bf16] {
+            let table = weight(repr, v, d, 91, 8.0);
+            let resident = table.tensor(&device);
+            let kernel = embedding_rows::native_for_device_with(
+                &device,
+                embedding_rows::Elements {
+                    EW: repr.resident(&device),
+                    A: act.element(),
+                },
+                &statics_on(&device, &[("D", d)]),
+            )
+            .unwrap();
+            for rows in [1usize, 3, 8, 64, 513] {
+                // The second pair is a failed selection; statuses vary.
+                let selected = (0..rows)
+                    .flat_map(|i| match i {
+                        1 => [-1, 7],
+                        _ => [((i * 97 + 6) % logical) as i32, (i % 2) as i32],
+                    })
+                    .collect::<Vec<_>>();
+                let slots = selected
+                    .chunks_exact(2)
+                    .flat_map(|pair| {
+                        let slot =
+                            usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                        [slot, pair[1]]
+                    })
+                    .collect::<Vec<_>>();
+                let read = |pairs: &[i32], directory: &Tensor| {
+                    let out = kernel
+                        .call(embedding_rows::Args {
+                            table: &resident,
+                            tokens: &i32_tensor(&device, &[rows, 2], pairs),
+                            directory,
+                            scale: 1.0,
+                            normalize: 0,
+                            epsilon: 0.0,
+                        })
+                        .unwrap();
+                    (
+                        out.r0.read_to_host().unwrap(),
+                        out.r1.read_to_host().unwrap(),
+                    )
+                };
+                assert_eq!(
+                    read(&selected, &directory),
+                    read(&slots, &direct),
+                    "{backend:?} {repr:?} rows {rows}: a read through the directory"
+                );
+                if rows == 3 && backend == BackendName::Cpu {
+                    let expected = slots
+                        .chunks_exact(2)
+                        .flat_map(|pair| {
+                            table
+                                .row(pair[0] as usize)
+                                .iter()
+                                .map(|value| act.round(*value))
+                        })
+                        .collect::<Vec<_>>();
+                    let outcome = interpret(
+                        &module,
+                        "embedding_rows",
+                        &[("EW", repr.storage()), ("A", registry::dense(DType::BF16))],
+                        vec![
+                            Input::Data(table.oracle()),
+                            ints(&[rows, 2], &selected),
+                            ints(&[logical], &directory_values),
+                            Input::F32(1.0),
+                            Input::I32(0),
+                            Input::F32(0.0),
+                        ],
+                    );
+                    assert_within(
+                        &format!("gathered {repr:?} portable"),
+                        &result(&outcome, 1),
+                        &expected,
+                        &vec![0.0; expected.len()],
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn embedding_rows_decode_exactly_as_the_portable_body() {
     for device in devices() {
@@ -5569,6 +5687,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
             .call(embedding_rows::Args {
                 table: &table.tensor(&device),
                 tokens: &i32_tensor(&device, &[rows, 2], &pairs),
+                directory: &i32_tensor(&device, &[0], &[]),
                 scale: 1.0,
                 normalize: 0,
                 epsilon: 0.0,
@@ -5593,6 +5712,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                 .call(embedding_rows::Args {
                     table: &table.tensor(&device),
                     tokens: &i32_tensor(&device, &[rows, 2], &pairs),
+                    directory: &i32_tensor(&device, &[0], &[]),
                     scale,
                     normalize,
                     epsilon: 1e-5,
@@ -5648,6 +5768,7 @@ fn embedding_rows_decode_exactly_as_the_portable_body_on(device: &Device) {
                     vec![
                         Input::Data(table.oracle()),
                         ints(&[rows, 2], &pairs),
+                        ints(&[0], &[]),
                         Input::F32(1.0),
                         Input::I32(0),
                         Input::F32(0.0),

@@ -6,7 +6,7 @@
 // combine weight rows, which it projects against every joined row into the
 // F32 result.
 
-use lib::core::activation;
+use lib::core::{activation, gathered};
 use lib::projection::projection;
 
 fn draft_rows_join<L: Isa, E: Elements>(
@@ -21,8 +21,9 @@ fn draft_rows_join<L: Isa, E: Elements>(
     // SAFETY: each work item writes its own row of the scratch.
     let joined = unsafe { cx.scratch_joined().slice_mut::<f32>(4 * row * 2 * d, 2 * d) };
     let (embedding, hidden) = joined.split_at_mut(d);
-    // A failed selection (token -1) embeds token 0.
-    let token = cx.arg_tokens().get([row, 0]).max(0) as usize;
+    let token = gathered::row(cx.arg_tokens().get([row, 0]), cx.dim_r(), |selected| {
+        cx.arg_directory().get([selected])
+    });
     cx.arg_table().decode_row(token, values);
     for value in values.iter_mut() {
         *value = activation::publish::<E::A>(*value);

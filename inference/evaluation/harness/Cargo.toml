@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+libc.workspace = true
 magnitude-chat = { path = "../../engine/chat" }
 magnitude-engine = { path = "../../engine" }
 magnitude-executor = { path = "../../engine/executor" }

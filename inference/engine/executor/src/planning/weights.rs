@@ -3,6 +3,7 @@ use super::{
     ProgramPlan,
 };
 use crate::error::PlanError;
+use crate::streamed_table::STREAMED_TABLE_ROWS;
 use crate::{ExecutionPath, operators};
 use magnitude_artifacts::{
     ArtifactIdentity, PackageHeaders, PackageIdentity, PackageManifest,
@@ -36,6 +37,20 @@ pub struct WeightPlan {
     /// The weight's resident second-level scale (`ImportTransform::
     /// ScaleByTensor`), when it has one.
     pub scale: Option<WeightScalePlan>,
+    /// A gathered table that is streamed (`device_table`): `shape` is then
+    /// its slots', which hold only some of the table's rows. `None` for a
+    /// weight held whole.
+    pub streamed: Option<StreamedRows>,
+}
+
+/// The rows of a streamed gathered table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamedRows {
+    /// The rows of the stored table: the entries of its device directory.
+    pub table_rows: u64,
+    /// The rows one step may bring: the rows of the device staging its
+    /// tiles pass through, as stored.
+    pub staging_rows: u64,
 }
 
 impl WeightPlan {
@@ -65,10 +80,55 @@ impl WeightPlan {
         }
     }
 
-    /// Every resident byte of the weight: its representation and its scale.
+    /// The shape of the stored tensor this weight is made of: `shape`, with
+    /// a streamed table's rows in place of its slots.
+    pub fn stored_shape(&self) -> Vec<u64> {
+        let mut shape = self.shape.clone();
+        if let Some(streamed) = self.streamed {
+            shape[0] = streamed.table_rows;
+        }
+        shape
+    }
+
+    /// The bytes of the stored tensor in the upload representation:
+    /// `source_bytes`, or a streamed table's whole rows, of which a load
+    /// uploads only its slots'.
+    pub fn stored_bytes(&self) -> u64 {
+        match self.streamed {
+            Some(streamed) => self.source_bytes / self.shape[0] * streamed.table_rows,
+            None => self.source_bytes,
+        }
+    }
+
+    /// The entries of a streamed table's device directory: one per row of
+    /// the stored table. 0 for a weight held whole.
+    pub fn directory_entries(&self) -> u64 {
+        self.streamed.map_or(0, |streamed| streamed.table_rows)
+    }
+
+    /// The device allocations a streamed table holds beside its slots: the
+    /// directory (one I32 slot per table row) and the staging its tiles
+    /// pass through, as stored. `[0, 0]` for a weight held whole.
+    pub fn streamed_bytes(&self) -> Result<[u64; 2], String> {
+        let Some(streamed) = self.streamed else {
+            return Ok([0, 0]);
+        };
+        let mut staging = self.shape.clone();
+        staging[0] = streamed.staging_rows;
+        Ok([
+            representation_bytes(Element::i32(), &[streamed.table_rows])?,
+            representation_bytes(self.upload, &staging)?,
+        ])
+    }
+
+    /// Every resident byte of the weight: its representation, its scale and
+    /// a streamed table's directory and staging.
     pub fn storage_bytes(&self) -> Result<u64, String> {
+        let [directory, staging] = self.streamed_bytes()?;
         self.resident_bytes
             .checked_add(self.scale.as_ref().map_or(0, |scale| scale.resident_bytes))
+            .and_then(|bytes| bytes.checked_add(directory))
+            .and_then(|bytes| bytes.checked_add(staging))
             .ok_or_else(|| "resident weight byte count overflows".into())
     }
 
@@ -545,11 +605,14 @@ impl ModelLoadPlan {
         &self.host_tables
     }
 
-    /// The host tables' claim in the system-RAM domain.
+    /// The host tables' claim in the system-RAM domain: each is streamed,
+    /// and claims its row cache.
     pub fn host_table_bytes(&self) -> Result<u64, String> {
         self.host_tables.iter().try_fold(0u64, |total, table| {
+            let bytes =
+                table.bytes / table.shape[0] * crate::streamed_table::cached_rows(table.shape[0]);
             total
-                .checked_add(table.bytes)
+                .checked_add(bytes)
                 .ok_or_else(|| "host table bytes overflow".to_owned())
         })
     }
@@ -836,7 +899,10 @@ impl ModelLoadPlan {
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
-        for (role, descriptor) in
+        push_weights(
+            &mut target,
+            target_tensors,
+            target_component,
             std::iter::once((target_role(WeightKind::Embedding), &decoder.entry.embedding))
                 .chain(per_layer_weights)
                 .chain(operators::decoder_weights(decoder))
@@ -847,17 +913,9 @@ impl ModelLoadPlan {
                     ),
                     (target_role(WeightKind::Output), &decoder.exit.output),
                 ])
-        {
-            push_weight(
-                &mut target,
-                target_tensors,
-                target_component,
-                role.scope,
-                role.kind,
-                descriptor,
-                target_form,
-            )?;
-        }
+                .collect(),
+            target_form,
+        )?;
 
         // The executed definition carries at most one drafter.
         if selection.head && definition.head.is_some() == definition.draft.is_some() {
@@ -886,18 +944,7 @@ impl ModelLoadPlan {
                         tensors: &[TensorDescriptor],
                         component: ArtifactComponent,
                         weights: Vec<(WeightRole, &WeightDescriptor)>| {
-            for (role, descriptor) in weights {
-                push_weight(
-                    plans,
-                    tensors,
-                    component,
-                    role.scope,
-                    role.kind,
-                    descriptor,
-                    target_form,
-                )?;
-            }
-            Ok::<_, String>(())
+            push_weights(plans, tensors, component, weights, target_form)
         };
         let head = match (selection.head, &definition.head, &definition.draft, draft) {
             (false, ..) => None,
@@ -1062,6 +1109,7 @@ impl ModelLoadPlan {
                         },
                         shape,
                         scale: None,
+                        streamed: None,
                     });
                 }
             }
@@ -1315,6 +1363,108 @@ fn host_table(
     })
 }
 
+/// Whether every reader of a weight of `kind` gathers it by row index: a
+/// gathered table, which is streamed where it can be.
+fn gathered_table(kind: WeightKind) -> bool {
+    matches!(kind, WeightKind::Embedding)
+}
+
+/// Plan the weights of one component's roles. A gathered table whose stored
+/// tensor no other of these roles reads is planned streamed
+/// (`push_gathered_table`); a tied output projection reads the whole table.
+fn push_weights(
+    out: &mut Vec<WeightPlan>,
+    inventory: &[TensorDescriptor],
+    component: ArtifactComponent,
+    weights: Vec<(WeightRole, &WeightDescriptor)>,
+    form: ResidentForm,
+) -> Result<(), String> {
+    for (role, descriptor) in &weights {
+        if gathered_table(role.kind) {
+            let read_whole = weights
+                .iter()
+                .any(|(other, stored)| other != role && stored.name == descriptor.name);
+            push_gathered_table(out, inventory, component, *role, descriptor, form, read_whole)?;
+        } else {
+            push_weight(
+                out,
+                inventory,
+                component,
+                role.scope,
+                role.kind,
+                descriptor,
+                form,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Plan a gathered table: a weight its readers gather by row index
+/// (`device_table`). It is streamed, the device holding slots for
+/// `STREAMED_TABLE_ROWS` of its rows, unless:
+/// - a reader reads it whole (`read_whole`);
+/// - it has no more rows than that;
+/// - its rows are not whole tiles of the streamed layout;
+/// - its rows do not reach the device as stored (the host prepares them, or
+///   a second-level scale accompanies them).
+///
+/// Then it is planned as any weight is.
+fn push_gathered_table(
+    out: &mut Vec<WeightPlan>,
+    inventory: &[TensorDescriptor],
+    component: ArtifactComponent,
+    role: WeightRole,
+    descriptor: &WeightDescriptor,
+    form: ResidentForm,
+    read_whole: bool,
+) -> Result<(), String> {
+    let plan = |form| {
+        let mut planned = Vec::with_capacity(1);
+        push_weight(
+            &mut planned,
+            inventory,
+            component,
+            role.scope,
+            role.kind,
+            descriptor,
+            form,
+        )?;
+        Ok::<_, String>(planned.remove(0))
+    };
+    let mut streamed = plan(ResidentForm {
+        layout: streamed_layout(form.layout),
+        ..form
+    })?;
+    let tile = streamed.resident.tile_rows();
+    let slots = STREAMED_TABLE_ROWS - STREAMED_TABLE_ROWS % tile;
+    let table_rows = streamed.shape[0];
+    if read_whole
+        || slots == 0
+        || slots >= table_rows
+        || table_rows % tile != 0
+        || streamed.host_prepared()
+        || streamed.placed_on_host()
+        || streamed.scale.is_some()
+    {
+        out.push(plan(form)?);
+        return Ok(());
+    }
+    streamed.shape[0] = slots;
+    streamed.resident_bytes = representation_bytes(streamed.resident, &streamed.shape)?;
+    // The load uploads the rows that fill the slots; nothing more of the
+    // table is ever uploaded at once.
+    streamed.source_bytes = representation_bytes(streamed.upload, &streamed.shape)?;
+    streamed.streamed = Some(StreamedRows {
+        table_rows,
+        // The largest step any backend admits, each row of which may bring
+        // its tile.
+        staging_rows: slots.min(magnitude_batching::MAX_CLASS_ROWS as u64 * tile),
+    });
+    out.push(streamed);
+    Ok(())
+}
+
 fn push_weight(
     out: &mut Vec<WeightPlan>,
     inventory: &[TensorDescriptor],
@@ -1403,6 +1553,7 @@ fn push_weight(
         source_bytes: representation_bytes(upload, &logical)?,
         resident_bytes,
         scale,
+        streamed: None,
     });
     Ok(())
 }
@@ -1571,6 +1722,18 @@ pub(super) fn planned_scalable(
 struct ResidentForm {
     activation: DType,
     layout: Layout,
+}
+
+/// The layout of a streamed table's slots where whole resident weights use
+/// `layout`: the layout the backend's row-gathering kernels read that lays
+/// out the fewest rows together, so that a slot holds as few rows beyond the
+/// one a step names as the backend allows. Metal's gather reads `rows16`,
+/// one row to a tile, besides its `rows32`.
+pub fn streamed_layout(layout: Layout) -> Layout {
+    match layout {
+        Layout::Rows32 => Layout::Rows16,
+        layout => layout,
+    }
 }
 
 /// The layout resident packed weights use for an execution path on a device

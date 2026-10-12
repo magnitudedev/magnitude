@@ -1175,6 +1175,7 @@ fn cuda_embedding_rows_decode_table_rows() {
         .call(embedding_rows::Args {
             table: &table.tensor,
             tokens: &tokens,
+            directory: &i32_tensor(&device, &[0], &[]),
             scale: 1.0,
             normalize: 0,
             epsilon: 0.0,
@@ -1196,6 +1197,68 @@ fn cuda_embedding_rows_decode_table_rows() {
                     "{format:?} row {row} col {column}"
                 );
             }
+        }
+    }
+}
+
+/// A read through a directory reads each selected row's slot (row 0 for a
+/// row without one and for a failed selection), exactly as a direct read of
+/// that slot does (`projection.rs` covers the rows16 backends).
+#[test]
+fn cuda_embedding_rows_read_the_slots_their_directory_names() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(6);
+    let (v, d, logical) = (40, 512, 130);
+    // Every third logical row has a slot.
+    let directory_values = (0..logical)
+        .map(|row| if row % 3 == 0 { ((7 * row + 3) % v) as i32 } else { -1 })
+        .collect::<Vec<_>>();
+    let directory = i32_tensor(&device, &[logical as u64], &directory_values);
+    let direct = i32_tensor(&device, &[0], &[]);
+    for format in Format::ALL {
+        let table = weight(&device, format, v, d, &mut rng);
+        let kernel = embedding_rows::native_for_device_with(
+            &device,
+            embedding_rows::Elements {
+                EW: format.resident(),
+                A: Element::bf16(),
+            },
+            &NativeSpecialization::new().with_static("D", d as u64),
+        )
+        .unwrap();
+        for rows in [1usize, 3, 64, 513] {
+            // The second pair is a failed selection; statuses vary.
+            let selected = (0..rows)
+                .flat_map(|i| match i {
+                    1 => [-1, 7],
+                    _ => [((i * 97 + 6) % logical) as i32, (i % 2) as i32],
+                })
+                .collect::<Vec<_>>();
+            let slots = selected
+                .chunks_exact(2)
+                .flat_map(|pair| {
+                    let slot = usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                    [slot, pair[1]]
+                })
+                .collect::<Vec<_>>();
+            let read = |pairs: &[i32], directory: &Tensor| {
+                let out = kernel
+                    .call(embedding_rows::Args {
+                        table: &table.tensor,
+                        tokens: &i32_tensor(&device, &[rows as u64, 2], pairs),
+                        directory,
+                        scale: 1.0,
+                        normalize: 0,
+                        epsilon: 0.0,
+                    })
+                    .unwrap();
+                (out.r0.read_to_host().unwrap(), out.r1.read_to_host().unwrap())
+            };
+            assert_eq!(
+                read(&selected, &directory),
+                read(&slots, &direct),
+                "{format:?} rows {rows}: a read through the directory"
+            );
         }
     }
 }

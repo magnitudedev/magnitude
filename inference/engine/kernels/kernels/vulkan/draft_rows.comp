@@ -7,6 +7,7 @@
 // Shared: the joined row (2D A elements, 4D bytes), then 16 floats of
 // subgroup partials.
 #include "lib/core/activation.glsl"
+#include "lib/core/gathered.glsl"
 #include <seismic/packets.glsl>
 
 #if defined(SEISMIC_ELEMENT_A_REPRESENTATION_BF16) || defined(SEISMIC_ELEMENT_A_REPRESENTATION_F16)
@@ -149,9 +150,8 @@ void draft_rows() {
 
     // The embedding row in A, packet by packet, and its sum of squares.
     const packets_rows16 table_geometry = TABLE_GEOMETRY;
-    // Column 0 of a (token, status) selection row; a failed selection is -1.
-    const uint64_t token = uint64_t(max(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS),
-        row * SEISMIC_TOKENS_STRIDE_0), 0));
+    const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+        SEISMIC_DIM_R, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
     const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + token * table_geometry.stride;
     float embedding_squares = 0.0;
     for (uint p = thread; p * 32u < width; p += threads) {

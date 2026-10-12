@@ -894,13 +894,16 @@ impl<'a> Preparation<'a> {
                 rows: selected_rows,
             });
         }
+        // A count or a listing forms no kernels, the canonical projection
+        // among them: the class choice above is all such a pass records. A
+        // search over a cache that already stores this recipe's choice
+        // reaches here in its count.
+        let Some(packed) = canonical else {
+            return Ok(None);
+        };
         let state = state.borrow();
         Ok(Some(ProjectionKernels::Qualified {
-            packed: Box::new(canonical.ok_or_else(|| CatalogFailure::Preparation {
-                entry: "readout_recipe",
-                bindings: format!("{scope:?}"),
-                outcome: "qualified recipe has no ordinary canonical projection".into(),
-            })?),
+            packed: Box::new(packed),
             progressive: state
                 .progressive
                 .clone()

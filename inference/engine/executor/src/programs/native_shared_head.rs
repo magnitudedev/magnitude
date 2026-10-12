@@ -35,8 +35,8 @@ use crate::{
             distinct_storage_bytes,
         },
         native_target_graph::{
-            WeightPort, embedding_transform, projection_ports, scaled_weight, scaled_weight_ports,
-            weight,
+            GatheredTable, WeightPort, embedding_transform, projection_ports, scaled_weight,
+            scaled_weight_ports, weight,
         },
     },
 };
@@ -255,7 +255,9 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
     let mut weights = Vec::new();
     let mut constants = Vec::new();
 
-    let table = weight(
+    // The first pass embeds the host's tokens, a chained pass the tokens
+    // the device selected.
+    let mut table = GatheredTable::of(
         &mut graph,
         load,
         WeightScope::Target,
@@ -332,7 +334,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         })
         .transpose()?;
 
-    let embedding_dims = [("M", slots), ("V", vocabulary), ("D", hidden)];
+    let embedding_dims = [("M", slots), ("V", table.rows), ("D", hidden), ("R", 0)];
     let join_dims = [("M", slots), ("D", hidden), ("T", 2)];
     let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
     let conditioning = graph.input_for(entries.join, "residual", &join_dims)?;
@@ -352,34 +354,43 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
     // The hidden rows the next pass conditions on.
     let mut chained: Option<WorkflowTensor> = None;
     for step in 0..class.steps {
-        let embedded = match step {
-            0 => graph.enqueue(
+        // The first pass embeds the host's rows, a chained pass the rows
+        // the device selected.
+        let selected;
+        let (tokens, directory): (seismic::WorkflowTensorRef<'_>, _) = match step {
+            0 => (
+                tokens.tensor().into(),
+                table.by_rows(&mut graph, &mut constants)?,
+            ),
+            _ => {
+                selected = selections
+                    .tensor()
+                    .slice_leading((step - 1) * slots, step * slots);
+                (
+                    (&selected).into(),
+                    table.selected(&mut graph, load, &mut weights, &mut constants)?,
+                )
+            }
+        };
+        let embedded = graph
+            .enqueue(
                 entries.embedding,
-                &embedding_dims,
+                &[
+                    ("M", slots),
+                    ("V", table.rows),
+                    ("D", hidden),
+                    ("R", directory.entries),
+                ],
                 embedding_rows::WorkflowArgs {
-                    table: (&table).into(),
-                    tokens: tokens.tensor().into(),
+                    table: (&table.table).into(),
+                    tokens,
+                    directory: (&directory.tensor).into(),
                     scale,
                     normalize,
                     epsilon: embedding_epsilon,
-                },            )?,
-            _ => {
-                let selected = selections
-                    .tensor()
-                    .slice_leading((step - 1) * slots, step * slots);
-                graph.enqueue(
-                    entries.embedding,
-                    &embedding_dims,
-                    embedding_rows::WorkflowArgs {
-                        table: (&table).into(),
-                        tokens: (&selected).into(),
-                        scale,
-                        normalize,
-                        epsilon: embedding_epsilon,
-                    },                )?
-            }
-        }
-        .r1;
+                },
+            )?
+            .r1;
         let mut joined = graph.local_for(entries.join, "taps", &join_dims)?;
         graph.enqueue(
             entries.join,
@@ -806,6 +817,9 @@ pub(crate) struct BoundSharedHeadGraphs {
     prepared: Rc<PreparedSharedHeadGraphs>,
     bound: BTreeMap<SharedHeadGraphClass, BoundNativeGraphPlan>,
     constants: Vec<Tensor>,
+    /// The token embedding as the passes gather it: the first pass by the
+    /// host's tokens, a chained pass by the device's selections.
+    embedding: crate::device_table::ResidentTable,
 }
 
 impl PreparedSharedHeadGraphs {
@@ -944,6 +958,7 @@ impl PreparedSharedHeadGraphs {
             prepared: self.clone(),
             bound,
             constants: uploaded.into_tensors(),
+            embedding: resident.embedding.table().clone(),
         })
     }
 }
@@ -1138,20 +1153,30 @@ impl NativeSharedHeadProgram {
         active
             .write_input(&graph.conditioning, &conditioning)
             .map_err(device)?;
+        // The first pass's tokens gather by table row: of a streamed table,
+        // by the slots their rows are brought to. A chained pass gathers
+        // the device's selections through the table's directory.
+        let tokens = (0..slots)
+            .map(|slot| {
+                entry
+                    .tokens
+                    .get(slot)
+                    .copied()
+                    .filter(|_| slot < actual_slots)
+                    .unwrap_or(0)
+            })
+            .collect::<Vec<_>>();
+        let rows = self.graphs.embedding.indices(&tokens).map_err(invalid)?;
+        // A chained pass embeds the device's selection. One the device
+        // does not hold embeds another row, and the target rejects the
+        // proposal that follows.
+        if !chain.is_empty() {
+            self.graphs.embedding.read_selected();
+        }
         active
             .write_input(
                 &graph.tokens,
-                &i32_bytes((0..slots).flat_map(|slot| {
-                    [
-                        entry
-                            .tokens
-                            .get(slot)
-                            .copied()
-                            .filter(|_| slot < actual_slots)
-                            .unwrap_or(0),
-                        0,
-                    ]
-                })),
+                &i32_bytes(rows.iter().flat_map(|row| [*row, 0])),
             )
             .map_err(device)?;
         let words = self.geometry.vocabulary.div_ceil(32) as usize;

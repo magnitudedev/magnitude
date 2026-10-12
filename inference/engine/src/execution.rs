@@ -648,6 +648,11 @@ pub(crate) fn build(
         resource_identity.clone(),
     )
     .map_err(|error| internal(error.to_string()))?;
+    // The rows steps name of a streamed table are kept beside the kernels,
+    // for the next load of the model.
+    if let Some(cache) = &manifest.kernel_cache {
+        residency.keep_table_rows(cache.join("table-rows"));
+    }
     let target_upload = execution_plan
         .load()
         .target_upload_peak_bytes()

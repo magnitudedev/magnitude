@@ -11,6 +11,7 @@
 #define KERNEL_W1 SEISMIC_COMBINE
 #endif
 #include "lib/core/activation.cuh"
+#include "lib/core/gathered.cuh"
 #include <seismic/packets.cuh>
 #include "lib/core/reduce.cuh"
 
@@ -35,8 +36,9 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 row = blockIdx.y;
     const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
     const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
-    // Column 0 of a (token, status) selection row; a failed selection is -1.
-    const u64 token = (u64)max(tokens[row * SEISMIC_TOKENS_STRIDE_0], 0);
+    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
+                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
 
     // The embedding row rounded to A, and its sum of squares.
     float embedding_squares = 0.0f;
