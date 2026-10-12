@@ -1558,6 +1558,28 @@ fn compile_steps<B: seismic_native_target::TargetFamily>(
 pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + 'static {
     type Buffer: Clone + Send + Sync + 'static;
     fn allocate(&self, bytes: u64, alignment: u64) -> Result<Self::Buffer, ExecutionError>;
+    /// Allocate where the device may add at most `room` bytes of device
+    /// memory beyond what it already holds, when given. A service that takes
+    /// device memory exactly per allocation ignores it.
+    fn allocate_within(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        _room: Option<u64>,
+    ) -> Result<Self::Buffer, ExecutionError> {
+        self.allocate(bytes, alignment)
+    }
+    /// Device memory the service holds beyond its live allocations (free
+    /// space of blocks, driver objects); zero for a service that takes
+    /// device memory exactly per allocation.
+    fn held_beyond_allocations(&self) -> u64 {
+        0
+    }
+    /// The part of [`Self::held_beyond_allocations`] later allocations can
+    /// take without the device holding more: its blocks' free space.
+    fn unallocated(&self) -> u64 {
+        0
+    }
     fn write(&self, buffer: &Self::Buffer, offset: u64, bytes: &[u8])
         -> Result<(), ExecutionError>;
     fn read(

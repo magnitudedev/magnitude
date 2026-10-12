@@ -16,6 +16,14 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub struct MemoryUsage {
     /// Bytes charged by allocations made through this opened device.
     pub charged: u64,
+    /// Device memory this opened device holds: `charged` plus what its
+    /// backend holds beyond its allocations (the free space of the blocks it
+    /// sub-allocates from, and driver objects such as instantiated CUDA
+    /// graphs). What the device's memory pool actually loses to Seismic.
+    pub held: u64,
+    /// The part of `held` beyond `charged` that later allocations take
+    /// without the device holding more: the free space of its blocks.
+    pub unallocated: u64,
     /// The device's enforced allocation limit.
     pub limit: Option<u64>,
     /// Bytes charged by every opened device in this process whose
@@ -98,6 +106,8 @@ impl MemoryDomain {
         let pool_charged = *self.pool.charged();
         MemoryUsage {
             charged: state.charged,
+            held: state.charged,
+            unallocated: 0,
             limit: state.limit,
             pool_charged,
             high_water: state.high_water,
@@ -188,6 +198,11 @@ pub(crate) struct MemoryReservation {
 }
 
 impl MemoryReservation {
+    /// Reserved bytes not yet taken by an allocation.
+    pub(crate) fn remaining(&self) -> u64 {
+        self.remaining
+    }
+
     pub(crate) fn take(&mut self, bytes: u64) -> MemoryCharge {
         self.remaining = self
             .remaining

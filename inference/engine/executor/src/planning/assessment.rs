@@ -139,6 +139,9 @@ pub struct AssessmentGraphResourceBounds {
     pub state: NativeGraphCharge,
     pub binding_constant_bytes: u64,
     pub total_bytes: u64,
+    /// The most device memory the backend's recorded graphs hold beyond
+    /// every allocation (`seismic::recorded_graph_device_bytes`).
+    pub recorded_graph_bytes: u64,
     /// The target graphs a load seals and the host heap they hold, from
     /// the sealer's own enumeration: one count, or bounds from both sides
     /// where blocks that read a layer scale could share a plan
@@ -360,6 +363,7 @@ impl AssessmentGraphResourceBounds {
             state,
             binding_constant_bytes,
             total_bytes,
+            recorded_graph_bytes: seismic::recorded_graph_device_bytes(backend),
             sealed_target_graphs,
             sealed_state_graphs,
         })
@@ -404,6 +408,7 @@ impl AssessmentHeaderBounds {
             prepared_resource_bytes: self
                 .prepared_program_bytes
                 .checked_add(graph.total_bytes)
+                .and_then(|bytes| bytes.checked_add(graph.recorded_graph_bytes))
                 .ok_or("assessment prepared resource bound overflow")?,
             startup_additional_bytes: self.startup_additional_bytes,
             staging_upload_bytes: self.staging_upload_bytes,

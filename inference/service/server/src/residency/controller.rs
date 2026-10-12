@@ -106,7 +106,9 @@ impl ModelInstances {
         let host_capacity = environment.catalog.topology().host_pool().capacity_bytes;
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),
-            environment.reserves.for_domain(host_capacity),
+            environment
+                .reserves
+                .for_domain(seismic::MemoryPoolKind::HostRam, host_capacity),
             client.notifier(),
         );
         let preparations = PreparationJobs::default();

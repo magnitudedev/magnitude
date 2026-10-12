@@ -103,6 +103,9 @@ pub enum MemoryConstraint {
     HostRam,
     /// A device-local pool.
     DeviceLocal,
+    /// The device memory its driver lets this process use, as discovery
+    /// measured it: the engine's charge never exceeds stable fit capacity.
+    DeviceCapacity,
     /// Metal's recommended working set for the device.
     DeviceWorkingSet,
 }
@@ -112,6 +115,7 @@ impl fmt::Display for MemoryConstraint {
         formatter.write_str(match self {
             Self::HostRam => "host RAM",
             Self::DeviceLocal => "device memory",
+            Self::DeviceCapacity => "the device memory this process may use",
             Self::DeviceWorkingSet => "the device's recommended working set",
         })
     }
@@ -159,16 +163,35 @@ fn established(device: &DeviceInfo) -> Result<&DeviceMemoryInfo, MemoryPolicyErr
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
 /// The threshold policy: how much of each memory domain a loaded model may
 /// not use. The host (service or CLI) chooses it and passes it to the engine;
 /// the engine never defaults it. `standard` is the only place the values live.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemoryReserves {
-    planning_fraction_divisor: u64,
-    planning_floor_bytes: u64,
-    emergency_fraction_divisor: u64,
-    emergency_floor_bytes: u64,
+    host: KindReserves,
+    device: KindReserves,
+}
+
+/// The planning and emergency reserves of one kind of memory domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct KindReserves {
+    planning: Reserve,
+    emergency: Reserve,
+}
+
+/// `max(capacity / fraction_divisor, floor_bytes)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Reserve {
+    fraction_divisor: u64,
+    floor_bytes: u64,
+}
+
+impl Reserve {
+    fn of(&self, capacity_bytes: u64) -> u64 {
+        (capacity_bytes / self.fraction_divisor).max(self.floor_bytes)
+    }
 }
 
 /// One domain's thresholds. Stable fit and every engine claim keep headroom
@@ -181,34 +204,58 @@ pub struct DomainThresholds {
 }
 
 impl MemoryReserves {
-    /// Planning reserve `max(capacity / 10, 2 GiB)`; emergency reserve
-    /// `max(capacity / 20, 1 GiB)`.
+    /// Host RAM, unified memory included: planning reserve
+    /// `max(capacity / 10, 2 GiB)` and emergency reserve
+    /// `max(capacity / 20, 1 GiB)`. A dedicated device's own memory, whose
+    /// capacity is already what its driver grants this process: planning
+    /// reserve `max(capacity / 20, 512 MiB)` and emergency reserve
+    /// `max(capacity / 40, 256 MiB)`.
     pub fn standard() -> Self {
         Self {
-            planning_fraction_divisor: 10,
-            planning_floor_bytes: 2 * GIB,
-            emergency_fraction_divisor: 20,
-            emergency_floor_bytes: GIB,
+            host: KindReserves {
+                planning: Reserve {
+                    fraction_divisor: 10,
+                    floor_bytes: 2 * GIB,
+                },
+                emergency: Reserve {
+                    fraction_divisor: 20,
+                    floor_bytes: GIB,
+                },
+            },
+            device: KindReserves {
+                planning: Reserve {
+                    fraction_divisor: 20,
+                    floor_bytes: 512 * MIB,
+                },
+                emergency: Reserve {
+                    fraction_divisor: 40,
+                    floor_bytes: 256 * MIB,
+                },
+            },
         }
     }
 
-    pub fn for_domain(&self, capacity_bytes: u64) -> DomainThresholds {
+    /// The thresholds of a domain of `kind` with `capacity_bytes`.
+    pub fn for_domain(&self, kind: MemoryPoolKind, capacity_bytes: u64) -> DomainThresholds {
+        let reserves = match kind {
+            MemoryPoolKind::HostRam => self.host,
+            MemoryPoolKind::DeviceLocal => self.device,
+        };
         DomainThresholds {
-            planning_bytes: (capacity_bytes / self.planning_fraction_divisor)
-                .max(self.planning_floor_bytes),
-            emergency_bytes: (capacity_bytes / self.emergency_fraction_divisor)
-                .max(self.emergency_floor_bytes),
+            planning_bytes: reserves.planning.of(capacity_bytes),
+            emergency_bytes: reserves.emergency.of(capacity_bytes),
         }
     }
 
     /// Stable identity of the policy for assessment cache keys.
     pub fn identity(&self) -> String {
+        let reserve = |reserve: Reserve| format!("{}:{}", reserve.fraction_divisor, reserve.floor_bytes);
         format!(
-            "reserves-v1:{}:{}:{}:{}",
-            self.planning_fraction_divisor,
-            self.planning_floor_bytes,
-            self.emergency_fraction_divisor,
-            self.emergency_floor_bytes
+            "reserves-v2:{}:{}:{}:{}",
+            reserve(self.host.planning),
+            reserve(self.host.emergency),
+            reserve(self.device.planning),
+            reserve(self.device.emergency)
         )
     }
 }
@@ -262,7 +309,9 @@ pub fn fit_capacities(
         domain: host_pool.id,
         kind: MemoryPoolKind::HostRam,
         capacity_bytes: host_capacity,
-        reserve_bytes: reserves.for_domain(host_pool.capacity_bytes).planning_bytes,
+        reserve_bytes: reserves
+            .for_domain(MemoryPoolKind::HostRam, host_pool.capacity_bytes)
+            .planning_bytes,
     };
     if memory.allocates_host_memory() {
         let capacity_bytes = device
@@ -288,7 +337,7 @@ pub fn fit_capacities(
                 domain: pool.id,
                 kind: pool.kind,
                 capacity_bytes: pool.capacity_bytes,
-                reserve_bytes: reserves.for_domain(pool.capacity_bytes).planning_bytes,
+                reserve_bytes: reserves.for_domain(pool.kind, pool.capacity_bytes).planning_bytes,
             },
         ),
         (DomainRole::Staging, host_fit),
@@ -353,6 +402,14 @@ impl DomainReading {
         }
     }
 
+    /// Add memory the engine already holds that a claim can take without
+    /// the device holding more (its blocks' free space); the band stays the
+    /// domain's.
+    fn with_unallocated(mut self, bytes: u64) -> Self {
+        self.ceiling_bytes += bytes;
+        self
+    }
+
     /// Bound the claimable ceiling by a further device constraint with
     /// `remaining_bytes` left, keeping the domain's planning reserve inside
     /// it too; the band stays the domain's.
@@ -379,11 +436,16 @@ pub fn band_of(readings: &[DomainReading]) -> MemoryBand {
     }
 }
 
-/// A dedicated device's own memory domain.
+/// A dedicated device's own memory domain, the device memory the engine
+/// holds in it (Seismic's `held`: its charges and what its backend holds
+/// beyond them) and the part of that its allocations can still take (the
+/// free space of the backend's blocks).
 #[derive(Clone, Copy, Debug)]
 struct DedicatedDomain {
     id: MemoryPoolId,
     capacity_bytes: u64,
+    held_bytes: u64,
+    unallocated_bytes: u64,
 }
 
 /// The pure core of [`observe_domains`]: readings from one host sample and
@@ -403,7 +465,7 @@ fn domain_readings(
         .iter()
         .map(|limit| limit.remaining_bytes())
         .fold(host.headroom.bytes, u64::min);
-    let host_thresholds = reserves.for_domain(host_capacity_bytes);
+    let host_thresholds = reserves.for_domain(MemoryPoolKind::HostRam, host_capacity_bytes);
     let host_distress = host_distress(host);
     let mismatched = || MemoryPolicyError::MismatchedObservation {
         device: selector.to_string(),
@@ -449,15 +511,24 @@ fn domain_readings(
         } => heap_budget_bytes.saturating_sub(heap_usage_bytes),
         DeviceMeasurements::Host | DeviceMeasurements::Metal { .. } => return Err(mismatched()),
     };
+    // Claims are bounded by the stable capacity less the device memory the
+    // engine holds, as well as by headroom, so what the engine holds never
+    // exceeds stable fit capacity whatever a driver's live figure later
+    // reports (a Vulkan budget may grow).
     Ok(vec![
         DomainReading::new(
             DomainRole::Allocation,
             dedicated.id,
             headroom,
             MemoryConstraint::DeviceLocal,
-            reserves.for_domain(dedicated.capacity_bytes),
+            reserves.for_domain(MemoryPoolKind::DeviceLocal, dedicated.capacity_bytes),
             None,
-        ),
+        )
+        .bounded(
+            dedicated.capacity_bytes.saturating_sub(dedicated.held_bytes),
+            MemoryConstraint::DeviceCapacity,
+        )
+        .with_unallocated(dedicated.unallocated_bytes),
         DomainReading::new(
             DomainRole::Staging,
             host_pool,
@@ -488,6 +559,7 @@ pub fn observe_domains(
         .memory_status()
         .map_err(MemoryPolicyError::Observation)?;
     let host_pool = topology.host_pool();
+    let usage = device.memory_usage();
     let dedicated = (!memory.allocates_host_memory()).then(|| {
         let pool = topology
             .pool(memory.allocation_pool)
@@ -495,6 +567,8 @@ pub fn observe_domains(
         DedicatedDomain {
             id: pool.id,
             capacity_bytes: pool.capacity_bytes,
+            held_bytes: usage.held,
+            unallocated_bytes: usage.unallocated,
         }
     });
     domain_readings(
@@ -695,7 +769,12 @@ mod tests {
             host,
             id,
             host_capacity,
-            dedicated_capacity.map(|capacity_bytes| DedicatedDomain { id, capacity_bytes }),
+            dedicated_capacity.map(|capacity_bytes| DedicatedDomain {
+                id,
+                capacity_bytes,
+                held_bytes: 0,
+                unallocated_bytes: 0,
+            }),
             &measurements,
             &MemoryReserves::standard(),
         )
@@ -704,20 +783,150 @@ mod tests {
     #[test]
     fn standard_reserves_use_the_larger_of_fraction_and_floor() {
         let reserves = MemoryReserves::standard();
+        let host = |capacity| reserves.for_domain(MemoryPoolKind::HostRam, capacity);
         assert_eq!(
-            reserves.for_domain(16 * GIB),
+            host(16 * GIB),
             DomainThresholds {
                 planning_bytes: 2 * GIB,
                 emergency_bytes: GIB,
             }
         );
         assert_eq!(
-            reserves.for_domain(64 * GIB),
+            host(64 * GIB),
             DomainThresholds {
                 planning_bytes: 64 * GIB / 10,
                 emergency_bytes: 64 * GIB / 20,
             }
         );
+        let device = |capacity| reserves.for_domain(MemoryPoolKind::DeviceLocal, capacity);
+        assert_eq!(
+            device(6 * GIB),
+            DomainThresholds {
+                planning_bytes: 512 * MIB,
+                emergency_bytes: 256 * MIB,
+            }
+        );
+        assert_eq!(
+            device(22 * GIB),
+            DomainThresholds {
+                planning_bytes: 22 * GIB / 20,
+                emergency_bytes: 22 * GIB / 40,
+            }
+        );
+    }
+
+    /// The A10-8Q vGPU slice: WDDM's per-process budget less the CUDA
+    /// context leaves 6,298 MiB of its 8 GiB. The device keeps 512 MiB above any claim, not the
+    /// 2 GiB host floor that left the engine under 4 GiB.
+    #[test]
+    fn a_small_dedicated_device_keeps_512_mib_above_its_claims() {
+        let capacity = 6_298 * MIB;
+        let reading = readings(
+            &host(64 * GIB, vec![]),
+            128 * GIB,
+            Some(capacity),
+            DeviceMeasurements::Cuda {
+                free_bytes: capacity - 2 * GIB,
+                total_bytes: 8 * GIB,
+            },
+        )
+        .unwrap();
+        assert_eq!(reading[0].thresholds.planning_bytes, 512 * MIB);
+        assert_eq!(reading[0].ceiling_bytes, capacity - 2 * GIB - 512 * MIB);
+        assert_eq!(reading[0].band, MemoryBand::Normal);
+        let at_line = readings(
+            &host(64 * GIB, vec![]),
+            128 * GIB,
+            Some(capacity),
+            DeviceMeasurements::Cuda {
+                free_bytes: 512 * MIB,
+                total_bytes: 8 * GIB,
+            },
+        )
+        .unwrap();
+        assert_eq!(at_line[0].band, MemoryBand::Reclaim);
+        assert_eq!(at_line[0].ceiling_bytes, 0);
+    }
+
+    /// A live figure above the capacity (a grown Vulkan budget) does not
+    /// enlarge what the engine may claim: its charge stays within stable fit
+    /// capacity, which is what assessment promised.
+    #[test]
+    fn dedicated_claims_stay_within_the_granted_capacity() {
+        let (capacity, charged) = (6 * GIB, 4 * GIB);
+        let reserve = 512 * MIB;
+        let reading = |free_bytes| {
+            domain_readings(
+                DeviceSelector::HostCpu,
+                &host(64 * GIB, vec![]),
+                pool(),
+                128 * GIB,
+                Some(DedicatedDomain {
+                    id: pool(),
+                    capacity_bytes: capacity,
+                    held_bytes: charged,
+                    unallocated_bytes: 0,
+                }),
+                &DeviceMeasurements::Cuda {
+                    free_bytes,
+                    total_bytes: 8 * GIB,
+                },
+                &MemoryReserves::standard(),
+            )
+            .unwrap()[0]
+        };
+        // Headroom 3 GiB above the charge, but the capacity leaves 2 GiB.
+        let freed = reading(3 * GIB);
+        assert_eq!(freed.ceiling_bytes, capacity - charged - reserve);
+        assert_eq!(freed.constraint, MemoryConstraint::DeviceCapacity);
+        assert_eq!(freed.band, MemoryBand::Normal);
+        // Untracked driver growth: headroom is tighter than the capacity.
+        let grown = reading(GIB);
+        assert_eq!(grown.ceiling_bytes, GIB - reserve);
+        assert_eq!(grown.constraint, MemoryConstraint::DeviceLocal);
+        // A charge at stable fit capacity grants nothing more, but only
+        // headroom decides the band.
+        let full = domain_readings(
+            DeviceSelector::HostCpu,
+            &host(64 * GIB, vec![]),
+            pool(),
+            128 * GIB,
+            Some(DedicatedDomain {
+                id: pool(),
+                capacity_bytes: capacity,
+                held_bytes: capacity - reserve,
+                unallocated_bytes: 0,
+            }),
+            &DeviceMeasurements::Cuda {
+                free_bytes: 2 * GIB,
+                total_bytes: 8 * GIB,
+            },
+            &MemoryReserves::standard(),
+        )
+        .unwrap()[0];
+        assert_eq!(full.ceiling_bytes, 0);
+        assert_eq!(full.band, MemoryBand::Normal);
+        // Free space the device's blocks already hold is claimable on top:
+        // an allocation into it adds nothing to what the device holds.
+        let blocks = domain_readings(
+            DeviceSelector::HostCpu,
+            &host(64 * GIB, vec![]),
+            pool(),
+            128 * GIB,
+            Some(DedicatedDomain {
+                id: pool(),
+                capacity_bytes: capacity,
+                held_bytes: charged,
+                unallocated_bytes: GIB / 2,
+            }),
+            &DeviceMeasurements::Cuda {
+                free_bytes: 3 * GIB,
+                total_bytes: 8 * GIB,
+            },
+            &MemoryReserves::standard(),
+        )
+        .unwrap()[0];
+        assert_eq!(blocks.ceiling_bytes, capacity - charged - reserve + GIB / 2);
     }
 
     #[test]
@@ -816,7 +1025,7 @@ mod tests {
     fn metal_claims_stop_at_stable_fit_below_the_working_set() {
         let working_set = 16 * GIB;
         let reserve = MemoryReserves::standard()
-            .for_domain(24 * GIB)
+            .for_domain(MemoryPoolKind::HostRam, 24 * GIB)
             .planning_bytes;
         let stable_fit = working_set - reserve;
         for allocated in [
@@ -882,9 +1091,9 @@ mod tests {
         let (allocation, staging) = (normal[0], normal[1]);
         assert_eq!(allocation.role, DomainRole::Allocation);
         assert_eq!(allocation.constraint, MemoryConstraint::DeviceLocal);
-        // 24 GiB card: planning reserve 2.4 GiB.
-        assert_eq!(allocation.thresholds.planning_bytes, 24 * GIB / 10);
-        assert_eq!(allocation.ceiling_bytes, 10 * GIB - 24 * GIB / 10);
+        // 24 GiB card: planning reserve 1.2 GiB.
+        assert_eq!(allocation.thresholds.planning_bytes, 24 * GIB / 20);
+        assert_eq!(allocation.ceiling_bytes, 10 * GIB - 24 * GIB / 20);
         assert_eq!(allocation.band, MemoryBand::Normal);
         assert_eq!(staging.role, DomainRole::Staging);
         assert_eq!(staging.constraint, MemoryConstraint::HostRam);
@@ -897,7 +1106,7 @@ mod tests {
             &host(8 * GIB, vec![]),
             64 * GIB,
             Some(24 * GIB),
-            cuda(2 * GIB),
+            cuda(GIB),
         )
         .unwrap();
         assert_eq!(card_reclaim[0].band, MemoryBand::Reclaim);
@@ -938,13 +1147,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(normal[0].headroom_bytes, 8 * GIB);
-        assert_eq!(normal[0].ceiling_bytes, 6 * GIB);
+        // 16 GiB heap budget: planning reserve 819 MiB.
+        assert_eq!(normal[0].ceiling_bytes, 8 * GIB - 16 * GIB / 20);
         assert_eq!(normal[0].band, MemoryBand::Normal);
         let reclaim = readings(
             &host(8 * GIB, vec![]),
             32 * GIB,
             Some(16 * GIB),
-            vulkan(13 * GIB),
+            vulkan(13 * GIB + GIB / 4),
         )
         .unwrap();
         assert_eq!(reclaim[0].band, MemoryBand::Reclaim);
@@ -1005,7 +1215,10 @@ mod tests {
         assert_eq!(fit.capacity_bytes, bounded);
         assert_eq!(
             fit.fit_bytes(),
-            bounded - reserves.for_domain(capacity).planning_bytes
+            bounded
+                - reserves
+                    .for_domain(MemoryPoolKind::HostRam, capacity)
+                    .planning_bytes
         );
     }
 
@@ -1036,7 +1249,7 @@ mod tests {
             fits[0].1.fit_bytes(),
             host_capacity.min(working_set)
                 - reserves
-                    .for_domain(topology.host_pool().capacity_bytes)
+                    .for_domain(MemoryPoolKind::HostRam, topology.host_pool().capacity_bytes)
                     .planning_bytes
         );
     }

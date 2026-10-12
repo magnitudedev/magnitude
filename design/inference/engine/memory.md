@@ -8,8 +8,15 @@ applies_to:
   - inference/engine/src/worker/execution.rs
   - inference/seismic/runtime/src/**
   - inference/seismic/api/src/**
+  - inference/seismic/compiler/src/blocks.rs
+  - inference/seismic/backends/cuda/src/blocks.rs
+  - inference/seismic/backends/cuda/src/direct.rs
   - inference/seismic/backends/cuda/src/driver.rs
   - inference/seismic/backends/cuda/src/executor.rs
+  - inference/seismic/backends/cuda/src/open.rs
+  - inference/seismic/backends/vulkan/src/device.rs
+  - inference/seismic/backends/vulkan/src/direct.rs
+  - inference/seismic/backends/vulkan/src/lib.rs
   - inference/seismic/backends/vulkan/src/memory.rs
 ---
 
@@ -23,10 +30,27 @@ holdings and memory decisions; the request owner chooses release victims and run
 order. The hosting service supplies one threshold policy (the planning and emergency reserves);
 no caller supplies a memory budget or retention percentage.
 
+A dedicated device's capacity is its usable memory: the device's total less the driver and runtime
+overhead the process cannot use for its own allocations, namely the driver's reserve, what the
+operating system withholds from a process (WDDM), and the process's own context. One function per
+device computes it, once per process and physical device, before the process allocates anything;
+the topology's pool carries it, and stable fit, assessment, the catalog's fit verdict,
+recommendations and the engine's claim ceiling all read that one figure:
+
+| Device | Usable capacity |
+|---|---|
+| A GPU with a CUDA view | `cuMemGetInfo` free bytes once the process's context exists: the device total less the reserve, the WDDM share and the context, which the driver reports as one figure. Under WDDM it is per process and does not change with other programs; outside WDDM (Linux, TCC) it is the whole device's, so memory other programs hold at discovery is not yet separated there |
+| A GPU with only a Vulkan view, under WDDM | The device-local heap's `VK_EXT_memory_budget` budget, WDDM's per-process budget |
+| A GPU with only a Vulkan view, elsewhere | The device-local heap, which excludes the driver's reserve |
+
+The device's total memory is descriptive only. The live free-memory reading (CUDA free bytes, Vulkan
+budget less usage) is only the guard against other programs; it adds no capacity.
+
 CUDA and Vulkan views with the same physical GPU UUID share one device-local memory domain and
 charge ledger. They remain separate execution devices, but hardware inventory counts their
-capacity once and presents both backends under that GPU, regardless of model name, device count,
-or enumeration order. Distinct UUIDs retain distinct domains even when their names match.
+capacity once, as its CUDA view's usable capacity when it has one, and presents both backends under
+that GPU, regardless of model name, device count, or enumeration order. Distinct UUIDs retain
+distinct domains even when their names match.
 
 ## Who guarantees what
 
@@ -41,11 +65,31 @@ containment; in correct operation it never fires.
 
 ## Thresholds
 
-Every memory domain has two thresholds from its own capacity: the planning reserve
-`P = max(capacity / 10, 2 GiB)` and the emergency reserve `E = max(capacity / 20, 1 GiB)`. The
-values are defined once, in the policy the host passes to the engine. They apply equally to host
-RAM and to a dedicated device's own memory; there is no other reserve. Host distress (Bands) is the
-only other condition that moves a domain's band.
+Every memory domain has two thresholds from its own capacity, the planning reserve `P` and the
+emergency reserve `E`:
+
+| Domain | Planning reserve `P` | Emergency reserve `E` |
+|---|---|---|
+| Host RAM, unified memory included | `max(capacity / 10, 2 GiB)` | `max(capacity / 20, 1 GiB)` |
+| A dedicated device's own memory | `max(capacity / 20, 512 MiB)` | `max(capacity / 40, 256 MiB)` |
+
+Host RAM keeps room for the operating system and other programs whatever the machine's size. A
+dedicated device's capacity already excludes the driver's reserve, the operating system's share and
+the process's own context, and everything the engine's work takes of it later is charged or held,
+so its reserve is a small margin over the measured residual. The values are defined once, in the
+policy the host passes to the engine; there is no other reserve. Host distress (Bands) is the only
+other condition that moves a domain's band.
+
+The device reserve is sized by measurement on the smallest supported devices. With every byte of
+the engine's device usage charged or held (Standing and claims), what remains is the residual: the
+capacity less observed headroom less `held`. On an 8 GiB A10-8Q vGPU (CUDA, WDDM) it stayed within
+−50 to +20 MiB across first-load tuning, 8-way bursts after long prompts, 78K-token contexts, Gemma 4
+images and perf runs; on an 8 GiB Radeon PRO V710 slice (Vulkan, WDDM) within −65 to +5 MiB through
+the 104K-token Qwen3.5 4B sequence (`specs/26-10-11/gpu-memory/notes.md`). The 512 MiB floor is
+therefore not a margin for untracked growth: it covers one recorded graph's instantiation between
+two observations, a block's granule rounding, and on a device without WDDM other programs'
+allocations between observations, with the residual 25 times over. A device whose residual
+approaches the floor raises it here, never a per-backend constant elsewhere.
 
 ## Standing and claims
 
@@ -67,12 +111,31 @@ names its holding class, its minimum physical peak charge and any preferred char
 headroom. Seismic's
 charge ledger remains the byte authority: the sum of classified holdings equals its charge.
 
+Beside the charge, Seismic reports what each opened device holds of its memory domain (`held`): the
+charge plus the device memory its backend holds beyond its allocations, so nothing the engine's
+work takes from the device grows outside it. CUDA and Vulkan take device memory from the driver in
+blocks (64 MiB, doubling to 1 GiB, a larger request in a dedicated block of whole driver granules)
+and sub-allocate every allocation from them, so a model's many tensors cost no per-allocation driver
+rounding (under WDDM every `cuMemAlloc` takes whole 2 MiB pages); a block is freed once it holds no
+allocation. `held` counts the blocks' free space (`unallocated`, which later allocations take
+without the device holding more) and the driver memory the engine's work takes outside every block,
+each measured as the change in the driver's own figure across the operation that takes it: a CUDA
+graph's instantiation (free memory); a Vulkan device's creation, pipeline creation, the recording of
+a graph and of a submission (the process's heap usage, less blocks the operation created), and its
+own argument and staging ranges. A device's recorded graphs hold at most a fixed 192 MiB, the least
+recently replayed dropped beyond it, and assessment plans that bound as a term of every CUDA and
+Vulkan load. A new block is sized within the room the limit grants less the free space blocks
+already hold, and holds only its allocation when a doubled block does not fit that room.
+
 Stable fit capacity bounds metadata-only model fit. It is
-the allocation domain's total capacity under applicable process limits and, on Metal, the device's
+the allocation domain's capacity under applicable process limits and, on Metal, the device's
 recommended working set, less the planning reserve. A live claim uses fresh headroom for that same
 domain, bounded by process limits, and must leave headroom above the planning reserve; on Metal it
-must also leave the working set's remaining bytes above the same reserve, so the engine's charge
-never exceeds stable fit capacity. The driver's submission memory lies outside the engine's charge,
+must also leave the working set's remaining bytes above the same reserve, and on a dedicated device
+the capacity less what the device holds (`held`) above it, so what the engine holds never exceeds
+stable fit capacity: fit and the live ceiling share one capacity basis, and a live figure that later
+grows never lets a load outgrow what assessment promised. A claim may also take the device's
+`unallocated` block space, which it fills without the device holding more. The driver's submission memory lies outside the engine's charge,
 and a working set filled to its end fails a submission as a lost device instead of refusing a claim.
 The observation already excludes the engine's own charges and other processes' use, so an existing
 charge is never subtracted again. Released storage returns to its domain: a backend that
@@ -195,6 +258,9 @@ kill is independent fault containment; it chooses nothing to release.
 ## Acceptance criteria
 
 - Classified holdings sum to Seismic's device charge after every claim, release and unload.
+- On a dedicated device the capacity less observed headroom differs from `held` by no more than the
+  measured residual recorded below (driver state neither charged nor held), across load, tuning,
+  serving bursts, long context and media.
 - No new device allocation bypasses a fitting claim, and neither a rejected minimum nor a
   failed physical allocation changes accepted numerical state.
 - Reclamation follows the single order and stops when the measured deficit clears.
@@ -213,7 +279,8 @@ kill is independent fault containment; it chooses nothing to release.
   one-second bound.
 - A host that reports no displacement has the bands its headroom alone gives.
 - Stable fit capacity is capacity under process limits (and the Metal working set) less the
-  planning reserve.
+  planning reserve; a dedicated device's capacity is the memory its driver lets the process use,
+  measured on the basis its live headroom is read on and independent of other programs.
 - State growth allocates exactly one claimed slab per growing domain without copying existing
   history or banks.
 - Reclaim releases empty slabs and compacts referenced rows and banks into free space in held slabs

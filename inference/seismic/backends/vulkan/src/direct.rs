@@ -175,6 +175,8 @@ fn begin(
 /// their argument blocks fixed, in one or more segments.
 pub struct DirectGraphBuilder {
     device: Device,
+    /// Heap usage and held memory when recording began.
+    mark: (u64, u64),
     /// Becomes the graph; dropping an abandoned builder retires it (and the
     /// chunks it wrote) unsubmitted.
     graph: Option<GraphInner>,
@@ -186,6 +188,7 @@ impl DirectGraphBuilder {
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
         let mut builder = Self {
             device: device.clone(),
+            mark: device.inner.unheld_mark(),
             graph: Some(GraphInner {
                 device: device.clone(),
                 commands: Vec::new(),
@@ -273,12 +276,21 @@ impl DirectGraphBuilder {
         Ok(())
     }
 
+    /// Finish recording. The device memory recording took beyond blocks
+    /// (command memory) is the graph's; the device keeps it after the graph
+    /// is dropped, for the command buffers it reuses, so it stays held.
     pub fn instantiate(mut self) -> Result<DirectGraph, ExecutionError> {
         self.end_segment()?;
         let mut graph = self.graph.take().expect("a live builder holds its graph");
         graph.arguments = std::mem::take(&mut self.arguments.chunks);
+        let device_bytes = self.device.inner.unheld_since(self.mark);
+        self.device
+            .inner
+            .graphs
+            .fetch_add(device_bytes, Ordering::Relaxed);
         Ok(DirectGraph {
             inner: std::sync::Arc::new(graph),
+            device_bytes,
         })
     }
 }
@@ -296,13 +308,20 @@ impl Drop for DirectGraphBuilder {
 /// individual recording.
 pub struct DirectGraph {
     inner: std::sync::Arc<GraphInner>,
+    device_bytes: u64,
 }
 
 impl DirectGraph {
     pub fn segments(&self) -> usize {
         self.inner.commands.len()
     }
+
+    /// Device memory recording the graph took beyond blocks.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
 }
+
 
 /// Shared by the graph and the submissions replaying it, so its buffers and
 /// argument blocks outlive every replay.

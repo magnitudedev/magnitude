@@ -27,8 +27,9 @@ pub use memory::Buffer;
 /// Enumerate the physical devices against the whole floor, so a device
 /// discovery reports available opens: one meeting the static floor whose
 /// numerics only a probe establishes is opened briefly, once per process,
-/// to run it (`device::numerical_floor`). GPUs come first, so the first
-/// device of the backend is a GPU when there is one.
+/// to run it (`device::numerical_floor`). A device meeting the static floor
+/// reports its heap budget. GPUs come first, so the first device of the
+/// backend is a GPU when there is one.
 pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let instance = instance::instance()?;
     let mut descriptions = instance
@@ -37,6 +38,8 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
         .map(|physical| {
             let mut description = facts::describe(instance, physical);
             if description.floor.is_ok() {
+                description.heap_budget_bytes =
+                    Some(device::memory_budget(instance, physical).heap_budget_bytes);
                 description.floor = device::numerical_floor(instance, physical, &description.facts)
                     .map_err(|error| {
                         error.floor_reason().unwrap_or_else(|| {

@@ -176,6 +176,7 @@ pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
 pub use seismic_runtime::api::HostRegion;
+pub use seismic_runtime::native::recorded_graph_device_bytes;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
 mod slab;
 pub use seismic_runtime::devices::{

@@ -374,12 +374,14 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One enumerated physical device: its facts, and whether it meets the floor
-/// (`Err` names the first missing item).
+/// One enumerated physical device: its facts, whether it meets the floor
+/// (`Err` names the first missing item), and for a device meeting it, the
+/// budget of its device-local heap when discovered (`VK_EXT_memory_budget`).
 #[derive(Clone, Debug)]
 pub struct Description {
     pub facts: Facts,
     pub floor: Result<(), String>,
+    pub heap_budget_bytes: Option<u64>,
 }
 
 /// Device extensions of the floor.
@@ -607,7 +609,11 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         Some((missing, _)) => Err(format!("missing {missing}")),
         None => Ok(()),
     };
-    Description { facts, floor }
+    Description {
+        facts,
+        floor,
+        heap_budget_bytes: None,
+    }
 }
 
 /// Whether the device offers subgroup-scope 16x16x16 cooperative matrix

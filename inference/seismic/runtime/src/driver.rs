@@ -170,7 +170,10 @@ where
             .expect("Opened preparation-cache lock poisoned while mutating private cache state")
     }
     pub(crate) fn memory_usage(&self) -> MemoryUsage {
-        self.memory.usage()
+        let mut usage = self.memory.usage();
+        usage.held += self.service.held_beyond_allocations();
+        usage.unallocated = self.service.unallocated();
+        usage
     }
     pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {
         self.memory.set_limit(limit)
@@ -183,8 +186,12 @@ where
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
+        // The device memory this allocation may add: the limit's room before
+        // its own charge.
+        let usage = self.memory.usage();
+        let room = usage.limit.map(|limit| limit.saturating_sub(usage.charged));
         self.allocate_storage_with(bytes, alignment, |service| {
-            service.allocate(bytes, alignment)
+            service.allocate_within(bytes, alignment, room)
         })
     }
 
@@ -297,8 +304,13 @@ where
         alignment: u64,
         reservation: &mut MemoryReservation,
     ) -> Result<Arc<Allocation>, ExecutionError> {
+        // The limit's room before the reservation's untaken bytes.
+        let usage = self.memory.usage();
+        let room = usage
+            .limit
+            .map(|limit| limit.saturating_sub(usage.charged) + reservation.remaining());
         self.allocate_reserved_with(bytes, alignment, reservation, false, |service| {
-            service.allocate(bytes, alignment)
+            service.allocate_within(bytes, alignment, room)
         })
     }
 

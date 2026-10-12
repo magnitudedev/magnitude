@@ -15,6 +15,19 @@ use std::sync::{Arc, Mutex};
 /// and workspace slot, plus the runs submitted alone.
 const REPLAY_CAPACITY: usize = 1024;
 
+/// The most device memory one device's recorded graphs hold (CUDA graph
+/// instantiation takes driver memory, 2 to 4 MiB a graph under WDDM; a
+/// Vulkan graph's secondary command buffers take command memory); the least
+/// recently replayed graphs are dropped beyond it. Assessment plans it as a
+/// fixed term of every CUDA and Vulkan load
+/// ([`super::recorded_graph_device_bytes`]).
+pub(super) const GRAPH_DEVICE_BYTES: u64 = 192 << 20;
+
+/// A recorded graph and the device memory it holds.
+pub(crate) trait RecordedGraph {
+    fn device_bytes(&self) -> u64;
+}
+
 pub(crate) struct Replays<G> {
     entries: Mutex<ReplayEntries<G>>,
 }
@@ -43,7 +56,7 @@ struct Replay<G> {
     _retained: Arc<dyn Any + Send + Sync>,
 }
 
-impl<G> Replays<G> {
+impl<G: RecordedGraph> Replays<G> {
     /// Run `replay` with the graph of `key`, recording it with `record` when
     /// it is absent (dropping the least recently replayed graph at
     /// capacity).
@@ -71,6 +84,28 @@ impl<G> Replays<G> {
                 entries.graphs.remove(&oldest);
             }
             let graph = record()?;
+            // Drop the least recently replayed graphs until the new one fits
+            // the device memory graphs may hold.
+            let mut held = entries
+                .graphs
+                .values()
+                .map(|replay| replay.graph.device_bytes())
+                .sum::<u64>()
+                + graph.device_bytes();
+            while held > GRAPH_DEVICE_BYTES && !entries.graphs.is_empty() {
+                let oldest = entries
+                    .graphs
+                    .iter()
+                    .min_by_key(|(_, replay)| replay.used)
+                    .map(|(key, _)| key.clone())
+                    .expect("a non-empty replay set has an entry");
+                held -= entries
+                    .graphs
+                    .remove(&oldest)
+                    .expect("the oldest graph is recorded")
+                    .graph
+                    .device_bytes();
+            }
             entries.graphs.insert(
                 key.clone(),
                 Replay {

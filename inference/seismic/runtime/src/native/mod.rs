@@ -39,6 +39,17 @@ mod validation;
 #[cfg(not(target_os = "macos"))]
 mod vulkan;
 
+/// The most device memory a device's recorded native graphs hold beyond
+/// every allocation: a fixed term of every load's footprint on `backend`.
+pub fn recorded_graph_device_bytes(backend: seismic_lang::registry::BackendName) -> u64 {
+    match backend {
+        seismic_lang::registry::BackendName::Cuda | seismic_lang::registry::BackendName::Vulkan => {
+            graph_replays::GRAPH_DEVICE_BYTES
+        }
+        _ => 0,
+    }
+}
+
 use crate::api::device::DeviceInner;
 use crate::api::kernel::{DecodedResults, DecodedValue, EncodedArgs, EncodedOutputs, PrepareError};
 use crate::api::tensor::TensorInner;

@@ -27,7 +27,8 @@ use seismic_lang::checked::CheckedModule;
 use seismic_lang::entry::{ElementBindings, LogicalEntry};
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_native_target::TargetFamily;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 type CpuExecutor = seismic_cpu::Executor;
 pub(crate) type CpuOpened = Opened<seismic_cpu::Cpu, CpuExecutor>;
@@ -98,9 +99,12 @@ pub(crate) enum DiscoveredMemory {
     Host {
         max_allocation_bytes: u64,
     },
-    /// Allocations consume a device-local pool with its own capacity.
+    /// Allocations consume a device-local pool: `capacity_bytes` is what the
+    /// driver lets this process use ([`granted_bytes`]), `total_bytes` the
+    /// memory the backend reports for the device.
     Dedicated {
         capacity_bytes: u64,
+        total_bytes: u64,
         basis: CapacityBasis,
         ledger: LedgerKey,
         max_allocation_bytes: u64,
@@ -362,23 +366,38 @@ pub(crate) fn discover() -> BackendDiscovery {
                         continue;
                     }
                 };
+                let max_allocation_bytes =
+                    seismic_cuda::max_allocation_bytes(descriptor.total_memory_bytes);
+                let mut availability = Availability::Available;
                 // An integrated GPU (GB10) allocates from the host RAM pool,
                 // like Apple silicon: it shares the host memory domain and
-                // budget instead of contributing a device pool.
+                // budget instead of contributing a device pool. A dedicated
+                // device's capacity is the memory the driver lets this
+                // process use once its context exists
+                // (`usable_memory_bytes`); a device whose context cannot be
+                // created cannot be opened either.
                 let memory = if descriptor.integrated {
                     DiscoveredMemory::Host {
-                        max_allocation_bytes: seismic_cuda::max_allocation_bytes(
-                            descriptor.total_memory_bytes,
-                        ),
+                        max_allocation_bytes,
                     }
                 } else {
+                    let granted = granted_bytes(BackendName::Cuda, descriptor.uuid, || {
+                        seismic_cuda::usable_memory_bytes(ordinal).map_err(|error| error.to_string())
+                    });
                     DiscoveredMemory::Dedicated {
-                        capacity_bytes: descriptor.total_memory_bytes,
-                        basis: CapacityBasis::CudaDeviceTotal,
+                        capacity_bytes: match granted {
+                            Ok(bytes) => bytes.min(descriptor.total_memory_bytes),
+                            Err(error) => {
+                                availability = Availability::Unavailable {
+                                    reason: format!("its CUDA context could not be created: {error}"),
+                                };
+                                descriptor.total_memory_bytes
+                            }
+                        },
+                        total_bytes: descriptor.total_memory_bytes,
+                        basis: CapacityBasis::CudaUsable,
                         ledger: LedgerKey::PhysicalGpu(descriptor.uuid),
-                        max_allocation_bytes: seismic_cuda::max_allocation_bytes(
-                            descriptor.total_memory_bytes,
-                        ),
+                        max_allocation_bytes,
                     }
                 };
                 devices.push(DiscoveredDevice {
@@ -388,7 +407,7 @@ pub(crate) fn discover() -> BackendDiscovery {
                     name: descriptor.name,
                     kind: DeviceKind::Gpu,
                     backend: BackendName::Cuda,
-                    availability: Availability::Available,
+                    availability,
                     memory,
                     memory_bandwidth: descriptor.memory_bandwidth,
                     descriptor: Descriptor::Cuda {
@@ -420,6 +439,30 @@ pub(crate) fn discover() -> BackendDiscovery {
         devices,
         diagnostics,
     }
+}
+
+/// The memory a dedicated GPU's driver lets this process use through
+/// `backend`, measured once per process, backend and physical device: the
+/// first measurement precedes any allocation of this process, so a later
+/// discovery (a refresh, or another catalog) keeps it rather than measuring
+/// the process's own holdings. A failed measurement is not kept.
+pub(crate) fn granted_bytes(
+    backend: seismic_lang::registry::BackendName,
+    uuid: [u8; 16],
+    measure: impl FnOnce() -> Result<u64, String>,
+) -> Result<u64, String> {
+    type Granted = HashMap<(seismic_lang::registry::BackendName, [u8; 16]), u64>;
+    static GRANTED: OnceLock<Mutex<Granted>> = OnceLock::new();
+    let mut granted = GRANTED
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("the granted-memory registry lock is never poisoned");
+    if let Some(bytes) = granted.get(&(backend, uuid)) {
+        return Ok(*bytes);
+    }
+    let bytes = measure()?;
+    granted.insert((backend, uuid), bytes);
+    Ok(bytes)
 }
 
 /// Opens one catalog device, revalidating its native identity, with its
@@ -1165,4 +1208,22 @@ where
         prepared,
         device: public_device.clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::granted_bytes;
+    use seismic_lang::registry::BackendName;
+
+    /// The first successful measurement stands for the process; a failure
+    /// is measured again.
+    #[test]
+    fn a_granted_measurement_is_kept_for_the_process_and_a_failure_is_not() {
+        let uuid = [0xa5; 16];
+        let failed = granted_bytes(BackendName::Cuda, uuid, || Err("busy".to_owned()));
+        assert_eq!(failed, Err("busy".to_owned()));
+        assert_eq!(granted_bytes(BackendName::Cuda, uuid, || Ok(6 << 30)), Ok(6 << 30));
+        assert_eq!(granted_bytes(BackendName::Cuda, uuid, || Ok(1 << 30)), Ok(6 << 30));
+        assert_eq!(granted_bytes(BackendName::Vulkan, uuid, || Ok(7 << 30)), Ok(7 << 30));
+    }
 }

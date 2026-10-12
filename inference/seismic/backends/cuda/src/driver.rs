@@ -617,6 +617,25 @@ fn memory_management_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError
     })
 }
 
+/// The granularity in which the driver backs device memory
+/// (`cuMemGetAllocationGranularity`, recommended): what one allocation's
+/// size is rounded up to. 2 MiB when the driver predates the query.
+pub(crate) fn allocation_granularity(context: &Context) -> u64 {
+    const FALLBACK: u64 = 2 << 20;
+    let Some(granularity_of) = context.driver.memory_granularity else {
+        return FALLBACK;
+    };
+    let properties = AllocationProperties::device(context.ordinal());
+    let mut granularity = 0usize;
+    // CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+    let queried = unsafe { granularity_of(&mut granularity, &properties, 1) } == 0;
+    if queried && granularity > 0 {
+        granularity as u64
+    } else {
+        FALLBACK
+    }
+}
+
 /// A device address range reserved once, with physical memory mapped over a
 /// leading prefix of it in granules (CUDA virtual memory management). The
 /// base address never changes while the backed prefix grows and shrinks, so

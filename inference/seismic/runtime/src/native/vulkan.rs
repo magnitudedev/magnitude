@@ -60,6 +60,12 @@ pub(crate) struct VulkanReplays {
 /// into consecutive parts, recorded as one graph with a segment per part;
 /// `measured` says whether every launch had a measured time when the parts
 /// were formed.
+impl super::graph_replays::RecordedGraph for Divided {
+    fn device_bytes(&self) -> u64 {
+        self.graph.as_ref().map_or(0, DirectGraph::device_bytes)
+    }
+}
+
 struct Divided {
     launches: Vec<LaunchKind>,
     parts: Vec<Part>,
@@ -78,6 +84,17 @@ struct Part {
 /// sealed plans and is not timed, else launch by launch. `timed` carries
 /// the launch count of a launch-detail trace.
 pub(super) fn encode(
+    device: &seismic_vulkan::Device,
+    replays: &VulkanReplays,
+    list: &impl DispatchList,
+    repetitions: usize,
+    timed: Option<usize>,
+    retained: &Arc<dyn Any + Send + Sync>,
+) -> Result<RouteSubmission, CallError> {
+    device.measured(|| encode_measured(device, replays, list, repetitions, timed, retained))
+}
+
+fn encode_measured(
     device: &seismic_vulkan::Device,
     replays: &VulkanReplays,
     list: &impl DispatchList,

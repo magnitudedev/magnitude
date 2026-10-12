@@ -287,9 +287,20 @@ impl DirectGraphBuilder {
             .map_err(submission)
     }
 
+    /// Instantiate the graph. The driver memory instantiation takes, which
+    /// no allocation charges, is measured as the change in the device's free
+    /// memory across it and counted as memory the device holds until the
+    /// graph is dropped.
     pub fn instantiate(self) -> Result<DirectGraph, ExecutionError> {
+        let before = self.device.memory_info()?.free_bytes;
+        let exec = self.graph.instantiate().map_err(submission)?;
+        let device_bytes = before.saturating_sub(self.device.memory_info()?.free_bytes);
+        let held = self.device.graph_bytes().clone();
+        held.fetch_add(device_bytes, std::sync::atomic::Ordering::Relaxed);
         Ok(DirectGraph {
-            exec: self.graph.instantiate().map_err(submission)?,
+            exec,
+            device_bytes,
+            held,
         })
     }
 }
@@ -299,6 +310,22 @@ impl DirectGraphBuilder {
 /// runs them in order, as the stream would.
 pub struct DirectGraph {
     exec: driver::GraphExec,
+    device_bytes: u64,
+    held: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DirectGraph {
+    /// Driver memory the graph's instantiation took.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
+}
+
+impl Drop for DirectGraph {
+    fn drop(&mut self) {
+        self.held
+            .fetch_sub(self.device_bytes, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Launches issued in order on the device's stream. The stream orders each

@@ -21,6 +21,7 @@
 //! use seismic_compiler::solve::RawAssignment;
 //! ```
 
+pub mod blocks;
 pub mod candidate_domain;
 pub mod errors;
 pub mod evaluation;

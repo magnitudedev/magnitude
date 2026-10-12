@@ -18,7 +18,7 @@ use magnitude_service_contracts::{
 };
 use seismic::{
     BackendName, DeviceCatalog, DeviceInfo, DeviceKind, DeviceMemory, DeviceTopology,
-    HostMemoryStatus,
+    HostMemoryStatus, MemoryPoolKind,
 };
 use sha2::{Digest, Sha256};
 
@@ -164,7 +164,7 @@ fn snapshot(
     machine: &MachineDescription,
 ) -> HardwareSnapshot {
     let host_pool = topology.host_pool();
-    let host_thresholds = reserves.for_domain(host_pool.capacity_bytes);
+    let host_thresholds = reserves.for_domain(MemoryPoolKind::HostRam, host_pool.capacity_bytes);
     let allocation_capacity_bytes = host
         .limits
         .iter()
@@ -228,17 +228,28 @@ fn snapshot(
         devices: system_devices,
     }];
     for device in topology.devices().iter().filter(|device| !host_backed(device)) {
-        let (id, total_capacity_bytes) = match &device.memory {
+        // The domain's total is the memory the device has; its stable capacity is what the
+        // driver grants this process, less the device's planning reserve.
+        let (id, total_capacity_bytes, stable_capacity_bytes) = match &device.memory {
             DeviceMemory::Established(memory) => {
                 let pool = topology
                     .pool(memory.allocation_pool)
                     .expect("a device's pools belong to its topology");
-                (pool_domain_id(topology, pool.id), pool.capacity_bytes)
+                (
+                    pool_domain_id(topology, pool.id),
+                    pool.total_bytes,
+                    pool.capacity_bytes.saturating_sub(
+                        reserves
+                            .for_domain(pool.kind, pool.capacity_bytes)
+                            .planning_bytes,
+                    ),
+                )
             }
             // A device whose memory Seismic cannot normalize has no assessable capacity; its
             // unavailable reason says why.
             DeviceMemory::Unsupported { .. } => (
                 magnitude_service_contracts::MemoryDomainId::new(device.selector.to_string()),
+                0,
                 0,
             ),
         };
@@ -250,8 +261,7 @@ fn snapshot(
             id,
             kind: HardwareMemoryDomainKind::PhysicalDevice,
             total_capacity_bytes,
-            stable_capacity_bytes: total_capacity_bytes
-                .saturating_sub(reserves.for_domain(total_capacity_bytes).planning_bytes),
+            stable_capacity_bytes,
             current_free_bytes: None,
             shares_system_memory: false,
             devices: vec![public_device(device, None)],
@@ -463,7 +473,7 @@ mod tests {
         let system = &snapshot.memory_domains[0];
         assert!(system.id.is_system());
         let thresholds =
-            MemoryReserves::standard().for_domain(system.total_capacity_bytes);
+            MemoryReserves::standard().for_domain(MemoryPoolKind::HostRam, system.total_capacity_bytes);
         assert_eq!(snapshot.system_memory.assess_reserve_bytes, thresholds.planning_bytes);
         assert_eq!(snapshot.system_memory.abort_reserve_bytes, thresholds.emergency_bytes);
         assert!(system.stable_capacity_bytes <= system.total_capacity_bytes - thresholds.planning_bytes);

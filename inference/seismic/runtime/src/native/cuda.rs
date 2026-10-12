@@ -28,6 +28,12 @@ type Executor = seismic_cuda::Executor;
 /// A device's CUDA graphs of sealed-plan submissions.
 pub(crate) type CudaReplays = Replays<DirectGraph>;
 
+impl super::graph_replays::RecordedGraph for DirectGraph {
+    fn device_bytes(&self) -> u64 {
+        DirectGraph::device_bytes(self)
+    }
+}
+
 /// Encode `list` on the device's stream: a replay when the list is made of
 /// sealed plans and is not timed, else launch by launch.
 pub(super) fn encode(

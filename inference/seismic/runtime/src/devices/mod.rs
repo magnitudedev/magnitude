@@ -179,7 +179,11 @@ pub enum MemoryPoolKind {
     DeviceLocal,
 }
 
-/// The definition of a pool's capacity figure.
+/// The definition of a pool's capacity figure. A dedicated device's capacity
+/// is its usable memory: the device's total less what the driver reserves,
+/// what the operating system withholds from a process and the process's own
+/// context, computed once per process by discovery before the process
+/// allocates. Other programs' use is not subtracted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapacityBasis {
     /// macOS `hw.memsize`: installed physical RAM.
@@ -187,17 +191,25 @@ pub enum CapacityBasis {
     /// Linux `MemTotal` / Windows `ullTotalPhys`: RAM usable by the OS after
     /// firmware and kernel reservations.
     OsUsableRam,
-    /// CUDA `cuDeviceTotalMem`: memory of the exposed device or partition.
-    CudaDeviceTotal,
+    /// CUDA `cuMemGetInfo` free bytes once this process's context exists,
+    /// before it allocates.
+    CudaUsable,
+    /// The `VK_EXT_memory_budget` budget of the Vulkan device's largest
+    /// device-local heap: WDDM's per-process budget.
+    VulkanHeapBudget,
     /// The size of the Vulkan device's largest device-local heap.
     VulkanDeviceLocalHeap,
 }
 
+/// One physical memory pool. `capacity_bytes` is what memory policy plans
+/// against; `total_bytes` is the memory the pool has, a descriptive figure
+/// that never bounds an allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPoolInfo {
     pub id: MemoryPoolId,
     pub kind: MemoryPoolKind,
     pub capacity_bytes: u64,
+    pub total_bytes: u64,
     pub basis: CapacityBasis,
     pub(crate) ledger: LedgerKey,
 }

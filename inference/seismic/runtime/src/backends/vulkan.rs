@@ -20,13 +20,33 @@ use std::sync::Arc;
 const MAX_ALLOCATION_ALIGNMENT: u64 = 4096;
 
 /// A discovered physical device. Integrated GPUs and software devices
-/// allocate from host RAM; a discrete GPU has its device-local heap.
+/// allocate from host RAM; a discrete GPU has its device-local heap. Under
+/// WDDM the driver grants a process the heap's budget, the operating
+/// system's per-process budget, which other programs' use does not change;
+/// elsewhere the budget follows other programs, and the heap, which already
+/// excludes memory the driver reserves, is the capacity. A device below the
+/// floor reports no budget and is never opened; its heap stands in.
 pub(super) fn discovered(description: seismic_vulkan::Description) -> DiscoveredDevice {
     let facts = description.facts;
     let memory = if facts.device_type == seismic_vulkan::DeviceType::Discrete {
+        let granted = if cfg!(target_os = "windows") {
+            super::granted_bytes(BackendName::Vulkan, facts.uuid, || {
+                description
+                    .heap_budget_bytes
+                    .ok_or_else(|| "the device reports no heap budget".to_owned())
+            })
+            .unwrap_or(facts.device_local_bytes)
+        } else {
+            facts.device_local_bytes
+        };
         DiscoveredMemory::Dedicated {
-            capacity_bytes: facts.device_local_bytes,
-            basis: CapacityBasis::VulkanDeviceLocalHeap,
+            capacity_bytes: granted.min(facts.device_local_bytes),
+            total_bytes: facts.device_local_bytes,
+            basis: if cfg!(target_os = "windows") {
+                CapacityBasis::VulkanHeapBudget
+            } else {
+                CapacityBasis::VulkanDeviceLocalHeap
+            },
             ledger: LedgerKey::PhysicalGpu(facts.uuid),
             max_allocation_bytes: facts.limits.max_allocation_bytes,
         }
@@ -92,7 +112,10 @@ impl VulkanOpened {
     }
 
     pub(crate) fn memory_usage(&self) -> MemoryUsage {
-        self.memory.usage()
+        let mut usage = self.memory.usage();
+        usage.unallocated = self.service.unallocated_bytes();
+        usage.held += self.service.held_beyond_allocations();
+        usage
     }
 
     pub(crate) fn set_memory_limit(&self, limit: Option<u64>) {

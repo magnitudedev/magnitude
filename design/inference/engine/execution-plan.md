@@ -47,7 +47,8 @@ decode allowance, bounds the rows a launch selects a token for and the requests 
 drafts for; every vocabulary-wide buffer is sized by it. A decode round never meets it, the
 scheduler admits no prefill round beyond it, and execution refuses any launch beyond it or any
 logits demand the load does not export.
-Device assessment uses the allocation domain's total capacity, bounded by
+Device assessment uses the allocation domain's capacity (for a dedicated device, the memory its
+driver lets one process use; see engine memory), bounded by
 applicable process limits and Metal's recommended working set, less the domain's planning reserve;
 a dedicated device's load also fits its staged uploads in host RAM less the host's planning
 reserve. Admission of new holdings uses fresh available memory observations for each used domain
