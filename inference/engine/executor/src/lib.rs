@@ -6,6 +6,7 @@ mod device_resources;
 mod domain;
 mod error;
 mod execution_path;
+mod device_table;
 mod host_tables;
 mod import_transforms;
 mod inventory;
@@ -18,6 +19,8 @@ mod operators;
 mod planning;
 pub mod programs;
 mod progressive;
+mod slot_directory;
+mod streamed_table;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
     CompletedVisionWork, GraphError, HeadProgram, ImportProgram, PlannedSealedGraphs,

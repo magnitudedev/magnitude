@@ -377,8 +377,7 @@ impl DecodeDemand {
             WeightKind::Embedding,
             embedding.table,
         )?;
-        let vocabulary = definition.decoder.vocabulary;
-        step.launch(table.resident_bytes / vocabulary)?;
+        step.launch(table.resident_bytes / table.shape[0])?;
         if let Some(entry) = target.per_layer() {
             per_layer_entry(&mut step, load, entry)?;
         }
@@ -607,7 +606,9 @@ impl DecodeDemand {
             }
         }
         step.launch(
-            vocabulary
+            definition
+                .decoder
+                .vocabulary
                 .checked_mul(4)
                 .ok_or_else(|| demand_error("logits bytes overflow"))?,
         )?;
@@ -670,7 +671,8 @@ mod tests {
         .map(|kind| resident(&load, *kind).resident_bytes)
         .sum::<u64>();
         let vocabulary = definition.decoder.vocabulary;
-        let embedding_row = resident(&load, WeightKind::Embedding).resident_bytes / vocabulary;
+        let embedding = resident(&load, WeightKind::Embedding);
+        let embedding_row = embedding.resident_bytes / embedding.shape[0];
         assert_eq!(
             demand.streamed_bytes,
             weights + embedding_row + vocabulary * 4

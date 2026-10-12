@@ -113,6 +113,36 @@ impl HostTable {
         self.row_bytes
     }
 
+    pub fn rows(&self) -> u64 {
+        self.rows
+    }
+
+    /// The index of table row `row`, when the table has it.
+    pub fn row_index(&self, row: i64) -> Result<u64, HostTableError> {
+        u64::try_from(row)
+            .ok()
+            .filter(|index| *index < self.rows)
+            .ok_or(HostTableError::Row {
+                row,
+                rows: self.rows,
+            })
+    }
+
+    /// Copy the source bytes of the rows from `first` into `out`, which
+    /// holds a whole number of them, in one read.
+    pub fn gather_run(&self, first: u64, out: &mut [u8]) -> Result<(), HostTableError> {
+        let rows = (out.len() / self.row_bytes) as u64;
+        if out.len() % self.row_bytes != 0 || first + rows > self.rows {
+            return Err(HostTableError::Row {
+                row: (first + rows) as i64,
+                rows: self.rows,
+            });
+        }
+        self.file
+            .read_into(self.offset + first * self.row_bytes as u64, out)
+            .map_err(HostTableError::Read)
+    }
+
     /// Copy the source bytes of `rows` (table row indices, one per batch
     /// row, in batch order) into `out`, which holds exactly that many rows.
     pub fn gather(&self, rows: &[i64], out: &mut [u8]) -> Result<(), HostTableError> {
@@ -124,13 +154,7 @@ impl HostTable {
             });
         }
         for (&row, destination) in rows.iter().zip(out.chunks_exact_mut(self.row_bytes)) {
-            let index = u64::try_from(row)
-                .ok()
-                .filter(|index| *index < self.rows)
-                .ok_or(HostTableError::Row {
-                    row,
-                    rows: self.rows,
-                })?;
+            let index = self.row_index(row)?;
             self.file
                 .read_into(self.offset + index * self.row_bytes as u64, destination)
                 .map_err(HostTableError::Read)?;

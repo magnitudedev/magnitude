@@ -21,6 +21,7 @@ impl<'a> QualificationView<'a> {
             );
             // One (token, status) selection row.
             let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
+            let direct = semantic_zeros(device, Element::i32(), &[0], "head", &label)?;
             let table = semantic_pattern(
                 device,
                 binding.embedding_table,
@@ -54,6 +55,7 @@ impl<'a> QualificationView<'a> {
                 .input
                 .call(draft_rows::Args {
                     tokens: &tokens,
+                    directory: &direct,
                     table: &table,
                     conditioning: &conditioning,
                     embedding_norm: &embedding_norm,

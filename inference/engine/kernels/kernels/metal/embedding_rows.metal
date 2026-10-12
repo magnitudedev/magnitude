@@ -5,6 +5,7 @@
 // of that value.
 #define KERNEL_W0 SEISMIC_TABLE
 #include "lib/projection/projection.h"
+#include "lib/core/gathered.h"
 #include "lib/core/reduce.h"
 
 typedef element::Act activation;
@@ -15,6 +16,7 @@ constant constexpr uint embedding_threads = 256;
 kernel void embedding_rows(
     device const uchar *table [[buffer(SEISMIC_BUFFER_TABLE)]],
     device const int *tokens [[buffer(SEISMIC_BUFFER_TOKENS)]],
+    device const int *directory [[buffer(SEISMIC_BUFFER_DIRECTORY)]],
     device uchar *embedded [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *widened [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
@@ -26,8 +28,8 @@ kernel void embedding_rows(
     const uint width = uint(SEISMIC_DIM_D);
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
-    // (token, status) rows; a failed selection (-1) embeds token 0.
-    uint token = uint(max(tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0], 0));
+    const uint token = uint(gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
+        tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]));
     float inverse = 1.0f;
     if (SEISMIC_PARAM_NORMALIZE != 0) {
         float squares = 0.0f;

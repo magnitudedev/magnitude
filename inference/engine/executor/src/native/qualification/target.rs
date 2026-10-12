@@ -27,6 +27,7 @@ impl<'a> QualificationView<'a> {
                 &label,
             )?;
             let tokens = semantic_i32(device, &[1, 2], &[0, 0], "embedding_rows", &label)?;
+            let direct = semantic_i32(device, &[0], &[], "embedding_rows", &label)?;
             let result = self
                 .programs
                 .target
@@ -34,6 +35,7 @@ impl<'a> QualificationView<'a> {
                 .call(embedding_rows::Args {
                     table: &table,
                     tokens: &tokens,
+                    directory: &direct,
                     scale: 1.0,
                     normalize: 0,
                     epsilon: 0.0,

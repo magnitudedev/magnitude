@@ -525,6 +525,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout: output,
             commits,
             boundary,
+            selected_rows: _,
         } = output;
         let batch = core.batch();
         if batch.actual_slots() != flight.requests.len() {

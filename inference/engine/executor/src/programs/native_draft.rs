@@ -42,7 +42,7 @@ use crate::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
         },
-        native_target_graph::{WeightPort, weight, weight_scale_port},
+        native_target_graph::{GatheredTable, RowDirectory, WeightPort, weight, weight_scale_port},
     },
 };
 use magnitude_batching::{TargetBatchUpload, row_class};
@@ -838,31 +838,35 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     let block_rows = draft.block_rows(proposals);
     let rows = slots * block_rows;
     let outputs = proposals * slots;
-    let table = match &draft.embedding {
-        DraftEmbedding::Target => weight(
-            &mut graph,
-            load,
-            WeightScope::Target,
-            WeightKind::Embedding,
-            &mut weights,
-        )?,
-        DraftEmbedding::Own(_) => weight(
-            &mut graph,
-            load,
-            WeightScope::Draft,
-            WeightKind::Embedding,
-            &mut weights,
-        )?,
-    };
-    let embedding_dims = [("M", rows), ("V", vocabulary), ("D", hidden)];
+    // The block's tokens are the host's (`BoundDraftGraphs::embedding`).
+    let mut table = GatheredTable::of(
+        &mut graph,
+        load,
+        match &draft.embedding {
+            DraftEmbedding::Target => WeightScope::Target,
+            DraftEmbedding::Own(_) => WeightScope::Draft,
+        },
+        WeightKind::Embedding,
+        &mut weights,
+    )?;
+    // The empty directory: every table this graph gathers, it gathers by
+    // the host's rows or the rows of a table held whole (`gathered_table`).
+    let direct = table.by_rows(&mut graph, &mut constants)?;
+    let embedding_dims = [
+        ("M", rows),
+        ("V", table.rows),
+        ("D", hidden),
+        ("R", direct.entries),
+    ];
     let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
     let mut residual = graph
         .enqueue(
             entries.embedding,
             &embedding_dims,
             embedding_rows::WorkflowArgs {
-                table: (&table).into(),
+                table: (&table.table).into(),
                 tokens: tokens.tensor().into(),
+                directory: (&direct.tensor).into(),
                 scale: draft.embedding_scale as f32,
                 normalize: 0,
                 epsilon,
@@ -1117,7 +1121,12 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 rank,
                 &mut leading,
             )?;
-            let memory_dims = [("M", slots), ("V", vocabulary), ("D", rank)];
+            let memory_dims = [
+                ("M", slots),
+                ("V", vocabulary),
+                ("D", rank),
+                ("R", direct.entries),
+            ];
             let anchors = graph.input_for(chain.embedding, "tokens", &memory_dims)?;
             for step in 0..proposals {
                 let rows_of_step = GraphConstant::i32(
@@ -1139,6 +1148,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                         embedding_rows::WorkflowArgs {
                             table: (&markov_table).into(),
                             tokens: (&previous).into(),
+                            directory: (&direct.tensor).into(),
                             scale: 1.0,
                             normalize: 0,
                             epsilon,
@@ -1202,6 +1212,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &mut weights,
                 &absent_scale,
                 Dflash2Path {
+                    direct: &direct,
                     residual: &residual,
                     output_norm: &output_norm,
                     head_rows: head_rows.tensor(),
@@ -1536,6 +1547,8 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
 
 /// The block pass's rows DFlash2's candidate path reads.
 struct Dflash2Path<'t> {
+    /// The empty directory the codebooks are read through.
+    direct: &'t RowDirectory,
     residual: &'t WorkflowTensor,
     output_norm: &'t WorkflowTensor,
     /// The block row of each proposal, step-major.
@@ -1638,16 +1651,27 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
     let successors = graph
         .enqueue(
             entries.successor,
-            &[("M", outputs * top_k), ("V", vocabulary), ("D", rank)],
+            &[
+                ("M", outputs * top_k),
+                ("V", vocabulary),
+                ("D", rank),
+                ("R", path.direct.entries),
+            ],
             embedding_rows::WorkflowArgs {
                 table: (&successor_codes).into(),
                 tokens: (&candidates).into(),
+                directory: (&path.direct.tensor).into(),
                 scale: 1.0,
                 normalize: 0,
                 epsilon: path.epsilon,
             },        )?
         .r0;
-    let code_dims = [("M", slots), ("V", vocabulary), ("D", rank)];
+    let code_dims = [
+        ("M", slots),
+        ("V", vocabulary),
+        ("D", rank),
+        ("R", path.direct.entries),
+    ];
     let anchors = graph.input_for(entries.predecessor, "tokens", &code_dims)?;
     for step in 0..path.proposals {
         let (first, last) = (step * slots, (step + 1) * slots);
@@ -1662,6 +1686,7 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                 embedding_rows::WorkflowArgs {
                     table: (&predecessor_codes).into(),
                     tokens: (&previous).into(),
+                    directory: (&path.direct.tensor).into(),
                     scale: 1.0,
                     normalize: 0,
                     epsilon: path.epsilon,
@@ -1696,6 +1721,8 @@ pub(crate) struct BoundDraftGraphs {
     prepared: Rc<PreparedDraftGraphs>,
     bound: BTreeMap<DraftGraphClass, BoundNativeGraphPlan>,
     constants: Vec<Tensor>,
+    /// The block embedding as the block's tokens gather it.
+    embedding: crate::device_table::ResidentTable,
 }
 
 impl PreparedDraftGraphs {
@@ -1808,6 +1835,7 @@ impl PreparedDraftGraphs {
             prepared: self.clone(),
             bound,
             constants: uploaded.into_tensors(),
+            embedding: resident.embedding.table().clone(),
         })
     }
 }
@@ -2142,20 +2170,23 @@ impl NativeDraftProgram {
         if let (Some(ports), Some(block)) = (&graph.block, &block) {
             let block_rows = slots * draft.block_rows(steps as u64) as usize;
             let segments = self.graphs.prepared.segments as usize;
+            // The block's tokens gather by table row: of a streamed table,
+            // by the slots their rows are brought to.
+            let tokens = (0..block_rows)
+                .map(|row| {
+                    block
+                        .tokens
+                        .get(row)
+                        .copied()
+                        .filter(|_| row < block.actual_rows)
+                        .unwrap_or(0)
+                })
+                .collect::<Vec<_>>();
+            let rows = self.graphs.embedding.indices(&tokens).map_err(invalid)?;
             active
                 .write_input(
                     &ports.tokens,
-                    &i32_bytes((0..block_rows).flat_map(|row| {
-                        [
-                            block
-                                .tokens
-                                .get(row)
-                                .copied()
-                                .filter(|_| row < block.actual_rows)
-                                .unwrap_or(0),
-                            0,
-                        ]
-                    })),
+                    &i32_bytes(rows.iter().flat_map(|row| [*row, 0])),
                 )
                 .map_err(device)?;
             for (index, ((layer, &domain), &attention)) in ports

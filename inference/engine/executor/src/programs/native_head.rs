@@ -35,7 +35,7 @@ use crate::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
         },
-        native_target_graph::{WeightPart, WeightPort},
+        native_target_graph::{GatheredTable, WeightPart, WeightPort},
     },
 };
 use magnitude_batching::{TargetBatchUpload, row_class};
@@ -371,6 +371,9 @@ pub(crate) struct BoundHeadGraphs {
     prepared: Rc<PreparedHeadGraphs>,
     bound: BTreeMap<HeadGraphClass, BoundNativeGraphPlan>,
     constants: Vec<Tensor>,
+    /// The token embedding as the passes gather it: the entry pass by the
+    /// host's tokens, a chained pass by the device's selections.
+    embedding: crate::device_table::ResidentTable,
 }
 
 fn planned_weight<G: GraphDraft>(
@@ -469,7 +472,15 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     let head = WeightScope::HeadBlock(0);
     let [attention_scope, feed_forward_scope] =
         [0, 1].map(|sublayer| WeightScope::HeadSublayer(SublayerIndex { block: 0, sublayer }));
-    let table = weight!(WeightScope::Target, WeightKind::Embedding);
+    // The entry pass embeds the host's tokens, a chained pass the tokens
+    // the device selected.
+    let mut table = GatheredTable::of(
+        &mut graph,
+        load,
+        WeightScope::Target,
+        WeightKind::Embedding,
+        &mut weights,
+    )?;
     let embedding_norm = weight!(head, WeightKind::HeadEmbeddingNorm);
     let hidden_norm = weight!(head, WeightKind::HeadHiddenNorm);
     let combine = weight!(head, WeightKind::HeadCombine);
@@ -508,7 +519,12 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         })
         .transpose()?;
 
-    let entry_dims = [("M", class.entry_rows), ("V", vocabulary), ("D", hidden)];
+    let entry_dims = [
+        ("M", class.entry_rows),
+        ("V", table.rows),
+        ("D", hidden),
+        ("R", 0),
+    ];
     graph.set_class_scope(Some("head-entry"));
     let tokens = graph.input_for(entries.input, "tokens", &entry_dims)?;
     // The host writes the entry rows' conditioning, or a device-conditioned
@@ -601,13 +617,20 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
         };
         let input = match &previous {
             None => {
+                let directory = table.by_rows(&mut graph, &mut constants)?;
                 graph
                     .enqueue(
                         entries.input,
-                        &[("M", rows), ("V", vocabulary), ("D", hidden)],
+                        &[
+                            ("M", rows),
+                            ("V", table.rows),
+                            ("D", hidden),
+                            ("R", directory.entries),
+                        ],
                         draft_rows::WorkflowArgs {
                             tokens: tokens.tensor().into(),
-                            table: (&table).into(),
+                            directory: (&directory.tensor).into(),
+                            table: (&table.table).into(),
                             conditioning: assembled
                                 .as_ref()
                                 .or(conditioning.as_ref())
@@ -627,13 +650,20 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     .ok_or_else(|| "chained pass without selections".to_owned())?
                     .tensor()
                     .slice_leading((pass - 1) * class.slots, pass * class.slots);
+                let directory = table.selected(&mut graph, load, &mut weights, &mut constants)?;
                 graph
                     .enqueue(
                         entries.input,
-                        &[("M", rows), ("V", vocabulary), ("D", hidden)],
+                        &[
+                            ("M", rows),
+                            ("V", table.rows),
+                            ("D", hidden),
+                            ("R", directory.entries),
+                        ],
                         draft_rows::WorkflowArgs {
                             tokens: (&selected).into(),
-                            table: (&table).into(),
+                            directory: (&directory.tensor).into(),
+                            table: (&table.table).into(),
                             conditioning: features.into(),
                             embedding_norm: (&embedding_norm).into(),
                             hidden_norm: (&hidden_norm).into(),
@@ -1232,6 +1262,7 @@ impl PreparedHeadGraphs {
             prepared: self.clone(),
             bound,
             constants: uploaded.into_tensors(),
+            embedding: resident.embedding.table().clone(),
         })
     }
 }
@@ -1495,10 +1526,17 @@ impl NativeHeadProgram {
                 }
             }
         }
+        let rows = self.graphs.embedding.indices(entry.tokens).map_err(invalid)?;
+        // A chained pass embeds the device's selection. One the device
+        // does not hold embeds another row, and the target rejects the
+        // proposal that follows.
+        if graph.passes.len() > 1 {
+            self.graphs.embedding.read_selected();
+        }
         active
             .write_input(
                 &graph.tokens,
-                &i32_bytes(entry.tokens.iter().flat_map(|token| [*token, 0])),
+                &i32_bytes(rows.iter().flat_map(|row| [*row, 0])),
             )
             .map_err(device)?;
         if let Some(out_rows) = &graph.out_rows {

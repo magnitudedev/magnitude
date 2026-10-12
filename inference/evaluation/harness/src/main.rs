@@ -531,9 +531,12 @@ fn run(command: Command) -> Result<(), String> {
             if contexts.is_empty()
                 || concurrency.is_empty()
                 || concurrency.contains(&0)
-                || steps == 0
+                || steps < 2
             {
-                return Err("time needs contexts, positive concurrency and measured steps".into());
+                return Err(
+                    "time needs contexts, positive concurrency and at least two measured steps"
+                        .into(),
+                );
             }
             if prefill_samples < 2 {
                 return Err("--prefill-samples needs a cold and a warm sample".into());
@@ -566,6 +569,7 @@ fn run(command: Command) -> Result<(), String> {
             let digest = inputs.write_rendered(&timed.rendered)?;
             let (mut measurements, traces) = tuned(&engine, &options)?;
             measurements.insert("speed".into(), Value::from(timed.speed));
+            measurements.insert("load".into(), timed.load);
             if let Some(drafting) = timed.drafting {
                 measurements.insert("drafting".into(), drafting);
             }

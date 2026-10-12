@@ -478,6 +478,7 @@ impl ProgramFamily for TestFamily {
                     first: now,
                     last: now,
                 },
+                selected_rows: None,
             },
         ))
     }

@@ -4,6 +4,7 @@
 // activation type and as F32 of that value. One workgroup per token row. The
 // Vulkan form of `metal/embedding_rows.metal`.
 #include "lib/core/activation.glsl"
+#include "lib/core/gathered.glsl"
 #include "lib/core/reduce.glsl"
 #include <seismic/packets.glsl>
 
@@ -68,8 +69,8 @@ void embedding_rows_inverse() {
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = TABLE_LAYOUT;
-    const uint64_t token = uint64_t(max(element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS),
-        row * SEISMIC_TOKENS_STRIDE_0), 0));
+    const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+        SEISMIC_DIM_R, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
     const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + token * geometry.stride;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     float squares = 0.0;
@@ -94,8 +95,8 @@ void embedding_rows() {
     const uint width = uint(SEISMIC_DIM_D);
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = TABLE_LAYOUT;
-    // A failed selection (token -1) embeds token 0 (the contract).
-    const uint64_t token = uint64_t(max(element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0), 0));
+    const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+        SEISMIC_DIM_R, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
     const uint64_t table_row = table + token * geometry.stride;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {

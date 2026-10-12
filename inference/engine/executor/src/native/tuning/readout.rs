@@ -37,6 +37,8 @@ pub(crate) struct DraftRowsTuning {
 
 pub(crate) struct DraftRowsCase {
     tokens: Tensor,
+    /// Empty: the tokens are the table's rows.
+    directory: Tensor,
     table: Tensor,
     conditioning: Tensor,
     embedding_norm: Tensor,
@@ -104,6 +106,7 @@ impl EntryTuning for DraftRowsTuning {
                     .collect::<Vec<_>>();
                 Ok(DraftRowsCase {
                     tokens: inputs.i32s(&[point.rows, 2], &tokens)?,
+                    directory: inputs.i32s(&[0], &[])?,
                     table: table.clone(),
                     conditioning: inputs.activation(
                         self.activation,
@@ -122,6 +125,7 @@ impl EntryTuning for DraftRowsTuning {
     fn args<'a>(case: &'a mut Self::Case) -> draft_rows::Args<'a> {
         draft_rows::Args {
             tokens: &case.tokens,
+            directory: &case.directory,
             table: &case.table,
             conditioning: &case.conditioning,
             embedding_norm: &case.embedding_norm,

@@ -124,7 +124,11 @@ drafter priming, is the only work that holds state between flights and lives in 
 right. Its tentative rows are indistinguishable from another history's in every layout question
 (a blocked last page, rows in place, growth), so it lives only until the next operation that
 uses the binding right: a matching submission claims it, and every other such operation orphans
-it on entry, before asking any layout question. Growth has no blocked outcome: it succeeds or
+it on entry, before asking any layout question. A lookahead that embeds a device-selected row of
+a streamed table ([residency](residency.md)) is queued before the host knows whether the device
+holds that row. One whose row the device did not hold is not the continuation: no submission
+claims it, it is orphaned, and the step is submitted again with the row brought. Growth has no
+blocked outcome: it succeeds or
 returns a memory deficit. Reservation recomputes its row requirements after
 provisioning relocates shared tails, so availability is checked against the new
 layout rather than charging again for the page relocation already consumed.

@@ -4,6 +4,10 @@ applies_to:
   - inference/engine/executor/src/import_transforms.rs
   - inference/engine/executor/src/residency.rs
   - inference/engine/executor/src/resident_weights.rs
+  - inference/engine/executor/src/streamed_table.rs
+  - inference/engine/executor/src/device_table.rs
+  - inference/engine/executor/src/slot_directory.rs
+  - inference/engine/executor/src/host_tables.rs
   - inference/engine/executor/src/planning/weights.rs
   - inference/engine/kernels/kernels/*/repack_weight.*
   - inference/seismic/native-cpu/src/repack.rs
@@ -76,6 +80,47 @@ engine holding ([engine memory](memory.md)); the mapped window is file-backed an
 upload, also without a prefill. The source file streams into that upload in bounded chunks, without
 a second whole-tensor host copy. Residency publishes each weight
 only after its submission completes; failed imports leave no cache entry.
+
+A gathered table (a weight a step reads by row index: the token embedding, a per-layer input table)
+is streamed instead of held whole wherever it can be. There is no setting: the weight plan decides,
+from the artifact alone, and admission charges what the plan says. A streamed table's results equal
+the whole table's bit for bit.
+- **A table the host gathers** claims a row cache of at most 16,384 rows in system RAM instead of
+  its byte range. Its steps run the graphs and the reads of the whole table's steps; a held row is
+  not read again.
+- **A table the device gathers** is streamed unless:
+  - another role of its component reads the same stored tensor (a tied output projection reads
+    every row);
+  - it has no more than 16,384 rows;
+  - its rows are not whole tiles of the backend's row-gathering layout that lays out the fewest
+    rows together;
+  - its rows do not reach the device as stored (the host prepares them, or a second-level scale
+    accompanies them).
+
+  Otherwise it is held whole, as planned for any weight.
+- **A streamed device table** is one resident weight: slots for 16,384 rows, a directory of every
+  row's slot, and staging for the rows one step brings, all charged to the weight. Its plan's shape
+  is its slots'. Every program that reads the table (the target, an executed drafter, a head)
+  shares it through the residency cache. A row reaches a slot the first time a step names it, read
+  from the artifact and converted by the weight's own import entry, queued ahead of that step.
+- **Readers are the same for both.** Every reader of a gathered table addresses its rows through
+  a directory (`gathered_row`): an empty one, under which it reads each row it is given, or the
+  table's directory of every row's slot. A step whose rows the host knows is given their slots,
+  as a whole table's step is given the rows, under the empty directory. A step whose rows the
+  device selected reads a streamed table through its directory, in the reader's own address
+  calculation: no entry runs before the reader and no reader knows a table is streamed.
+- **A device-selected row the device does not hold** is a miss: the target's lookahead is orphaned
+  and resubmitted with the row brought ([state transactions](state-transactions.md)); a
+  head's chained proposal embeds another row, and target verification rejects what follows.
+- **Replacement** takes the slot of a row no step named since the replacement last passed it,
+  never one the current step names. A directory change that follows a queued read of selected rows
+  waits for the fill it belongs to.
+- **Rows at load.** Before readiness the slots are filled, most valuable first: the rows steps
+  named when the table was last served, then the table's first rows. Load waits for their
+  conversion. The rows steps name are kept in a file beside the kernel cache after the table's
+  first 256 steps and when the engine releases it.
+- **Mapped windows** are bounded by the component's largest stored tensor whether or not that
+  tensor is imported, so a streamed table does not change the windows of the weights around it.
 
 The target component is imported before engine readiness. Enabled optional head and vision
 components are held by typed one-shot ComponentLoaders. Each loader owns its import store and

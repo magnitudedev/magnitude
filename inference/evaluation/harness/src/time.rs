@@ -54,6 +54,8 @@ pub struct TimeOptions {
 pub struct Timed {
     pub rendered: Vec<Rendered>,
     pub speed: Vec<Value>,
+    /// The target load's wall and processor time.
+    pub load: Value,
     pub drafting: Option<Value>,
     pub devices: Vec<String>,
 }
@@ -82,6 +84,7 @@ pub fn run(
         .max()
         .expect("a fixture set is nonempty");
     let widest = time.concurrency.iter().copied().max().unwrap_or(1);
+    let opening = (host_seconds(), process_cpu_seconds());
     let mut engine = Engine::open(
         artifacts,
         options,
@@ -94,6 +97,13 @@ pub fn run(
             lookahead: time.lookahead,
         },
     )?;
+    // The whole load as this process ran it: a load that finds tuning units
+    // unprepared also waits for the worker process that prepares them, whose
+    // processor time is not this process's.
+    let load = json!({
+        "wall_ms": (host_seconds() - opening.0) * MS,
+        "process_cpu_ms": (process_cpu_seconds() - opening.1) * MS,
+    });
     let devices = vec![engine.device().info().name.clone()];
     let mut speed = Vec::new();
     for (context, rendered) in &by_context {
@@ -152,6 +162,7 @@ pub fn run(
     Ok(Timed {
         rendered,
         speed,
+        load,
         drafting,
         devices,
     })
@@ -329,6 +340,9 @@ fn measure(
     time: &TimeOptions,
     make: &dyn Fn(&[Sequence]) -> Result<Vec<Operation>, String>,
 ) -> Result<Value, String> {
+    // Every warm and measured step's selections, per sequence in order: two
+    // runs that decode the same tokens have the same digest.
+    let selected = std::cell::RefCell::new(Vec::<u8>::new());
     let run = |engine: &mut Engine,
                sequences: &mut [Sequence],
                trace: &SubmissionTrace|
@@ -338,9 +352,13 @@ fn measure(
         // Under lookahead the trace is collected once per window: a per-step
         // collect would wait for the step queued behind this one.
         let per_step = (!engine.lookahead).then_some(trace);
-        engine
-            .step(operations, &mut refs, per_step)
-            .map(|(step, _)| step)
+        let (step, _) = engine.step(operations, &mut refs, per_step)?;
+        selected.borrow_mut().extend(
+            sequences
+                .iter()
+                .flat_map(|sequence| sequence.selected.map_or(u32::MAX, |token| token.0).to_le_bytes()),
+        );
+        Ok(step)
     };
     let collect = |trace: &SubmissionTrace| trace.collect().map_err(|error| error.to_string());
     let trace = traced(engine, TraceDetail::Submissions)?;
@@ -351,10 +369,21 @@ fn measure(
     let mut summaries = Vec::with_capacity(time.steps);
     let mut previous = None;
     let mut submissions = Vec::new();
-    let mut span = (f64::INFINITY, f64::NEG_INFINITY);
-    for _ in 0..time.steps {
+    // The window opens at the end of the first measured step. Collecting the
+    // warm steps' trace waited for everything queued, which under lookahead
+    // includes the first measured step itself: it finished before any clock
+    // here started, so a window opened at its start would cover one step
+    // more than the device ran.
+    let mut span = (f64::NAN, f64::NAN);
+    let mut cpu = (0.0, 0.0);
+    for index in 0..time.steps {
         let step = run(engine, sequences, &trace)?;
-        span = (span.0.min(step.start), span.1.max(step.end));
+        if index == 0 {
+            span.0 = step.end;
+            cpu.0 = process_cpu_seconds();
+        }
+        span.1 = step.end;
+        cpu.1 = process_cpu_seconds();
         if engine.lookahead {
             summaries.push(json!({ "wall_ms": (step.end - step.start) * MS }));
         } else {
@@ -388,15 +417,31 @@ fn measure(
         .iter()
         .map(|summary| summary["wall_ms"].as_f64().expect("wall"))
         .collect::<Vec<_>>();
+    let mut window = window(time.steps - 1, span, &submissions);
+    window["process_cpu_ms_per_step"] = json!((cpu.1 - cpu.0) * MS / (time.steps - 1) as f64);
     Ok(json!({
         "warm_steps": time.warm,
         "lookahead": engine.lookahead,
         "median_ms": median(&mut wall),
         "median_step": medians(&summaries),
-        "window": window(time.steps, span, &submissions),
+        "window": window,
+        "selected_sha256": crate::digest::sha256_hex(&selected.borrow()),
         "steps": summaries,
         "attribution": attributed,
     }))
+}
+
+/// Processor time this process has used, on every thread, in seconds.
+pub fn process_cpu_seconds() -> f64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes a whole `timespec` to the pointer it is
+    // given; the process clock exists on every supported host.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut time) };
+    assert_eq!(read, 0, "the process has a processor-time clock");
+    time.tv_sec as f64 + time.tv_nsec as f64 * 1e-9
 }
 
 /// Drive a future on this thread; the engine client is executor-agnostic.

@@ -1,19 +1,34 @@
 # Target input rows: the token embedding and the conditioning overlay.
 
+# The row a reader of a gathered table reads for `selected`, a row of a
+# (row, status) selection: `selected` itself through an empty directory
+# (R = 0: the table is held whole, or the host gave its slots), else its slot
+# in `directory`, every row's slot (or -1) of a streamed table that holds only
+# some of its rows. A failed selection (-1) and a row without a slot read row
+# 0; the step that reads it is never used. Every reader of a gathered table
+# addresses its rows through this (`<backend>/lib/core/gathered.*`).
+fn gathered_row[R](directory: &tensor[R] i32, selected: i32) -> i32 where R >= 0:
+    let mut row = max(selected, 0)
+    if R > 0:
+        if selected >= 0:
+            row = max(directory[selected], 0)
+    return row
+
 # Token embedding (K2): gather one table row per token and decode it with the
 # K1 packet decoders; one threadgroup per token row.
 # `tokens` has the `sample_rows` result layout (token, status), so a step can
-# embed the previous step's selection directly on the device. A failed
-# selection (token -1) embeds token 0; its step is never used.
+# embed the previous step's selection directly on the device; `directory`
+# addresses the table's rows (`gathered_row`).
 # The decoded row is multiplied by `scale` (√D for Gemma's text rows, 1
 # elsewhere) and, with `normalize` nonzero, RMS-normalized without a weight
 # (`epsilon`; Muse) before its one rounding to A. Both results hold that
 # rounded row.
-fn embedding_rows[M, V, D](table: &tensor[V, D] EW, tokens: &tensor[M, 2] i32,
-    scale: f32, normalize: i32, epsilon: f32) -> (tensor[M, D] A, tensor[M, D] f32):
+fn embedding_rows[M, V, D, R](table: &tensor[V, D] EW, tokens: &tensor[M, 2] i32,
+    directory: &tensor[R] i32, scale: f32, normalize: i32, epsilon: f32)
+    -> (tensor[M, D] A, tensor[M, D] f32) where R >= 0:
     let mut embedded = tensor[M, D] A
     parallel for row in 0..M:
-        let token = max(tokens[row, 0], 0)
+        let token = gathered_row(directory, tokens[row, 0])
         let value = f32(table[token]) * scale
         let mut inverse = f32(1.0)
         if normalize != 0:
@@ -36,7 +51,6 @@ native embedding_rows for cuda from "cuda/embedding_rows.cu":
     launch embedding_rows:
         threadgroups (M, 1, 1)
         threads_per_threadgroup (128, 1, 1)
-
 
 # Conditioned features are already F32 model-width rows. This entry owns the
 # device-to-device publication into the selected embedding rows.

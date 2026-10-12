@@ -102,6 +102,14 @@ fn half_to_f32(bits: u16) -> f32 {
     }
 }
 
+fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
+}
+
 fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
     let bytes = values
         .iter()
@@ -258,9 +266,12 @@ fn draft_rows_match_on(device: &Device) {
         let conditioning = bf16_tensor(&device, &[rows as u64, width as u64], &conditioning_values);
         let embedding_norm = bf16_tensor(&device, &[width as u64], &embedding_norm_values);
         let hidden_norm = bf16_tensor(&device, &[width as u64], &hidden_norm_values);
+        // An empty directory: the selections are the table's rows.
+        let direct = i32_tensor(device, &[0], &[]);
         let result = kernel
             .call(draft_rows::Args {
                 tokens: &tokens,
+                directory: &direct,
                 table: &table,
                 conditioning: &conditioning,
                 embedding_norm: &embedding_norm,
@@ -298,10 +309,64 @@ fn draft_rows_match_on(device: &Device) {
                 device.backend()
             );
         }
+        // Through a directory of a table's slots: a selection reads its
+        // row's slot, exactly as a direct read of that slot does. Every
+        // other logical row has a slot; a row without one and a failed
+        // selection read slot 0.
+        let logical = 3 * vocabulary;
+        let directory_values = (0..logical)
+            .map(|row| {
+                if row % 2 == 0 {
+                    ((row / 2 + 1) % vocabulary) as i32
+                } else {
+                    -1
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = (0..rows)
+            .map(|row| match row % 4 {
+                3 => [-1, 1],
+                _ => [((row * 5 + 1) % logical) as i32, (row % 2) as i32],
+            })
+            .collect::<Vec<_>>();
+        let slots = selected
+            .iter()
+            .map(|[row, status]| {
+                let slot = usize::try_from(*row).map_or(0, |row| directory_values[row].max(0));
+                [slot, *status]
+            })
+            .collect::<Vec<_>>();
+        let read = |tokens: &[[i32; 2]], directory: &Tensor| {
+            kernel
+                .call(draft_rows::Args {
+                    tokens: &i32_tensor(device, &[rows as u64, 2], tokens.as_flattened()),
+                    directory,
+                    table: &table,
+                    conditioning: &conditioning,
+                    embedding_norm: &embedding_norm,
+                    hidden_norm: &hidden_norm,
+                    combine: &combine,
+                    epsilon,
+                })
+                .unwrap()
+                .value
+                .read_to_host()
+                .unwrap()
+        };
+        assert_eq!(
+            read(
+                &selected,
+                &i32_tensor(device, &[logical as u64], &directory_values)
+            ),
+            read(&slots, &direct),
+            "{:?} width {width} rows {rows}: a read through the directory",
+            device.backend()
+        );
         if device.backend() == seismic::BackendName::Cpu {
             let quantized = prepare(width, true)
                 .call(draft_rows::Args {
                     tokens: &tokens,
+                    directory: &direct,
                     table: &table,
                     conditioning: &conditioning,
                     embedding_norm: &embedding_norm,
