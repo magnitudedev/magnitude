@@ -10,7 +10,7 @@
 //! slot reads, the bank it publishes to), filled with pseudo-random state; the
 //! published bank is the case state restored before each validation run.
 
-use super::cases::projection_shape;
+use super::cases::{packing_statics, projection_shape};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
@@ -95,6 +95,8 @@ pub(crate) struct RecurrentProjectCase {
     alpha: Tensor,
     beta: Tensor,
     epsilon: f32,
+    qkv_bound: Tensor,
+    gate_bound: Tensor,
 }
 
 impl RecurrentProjectTuning {
@@ -131,7 +133,17 @@ impl EntryTuning for RecurrentProjectTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        self.shape.projection_statics(inputs)
+        let scopes = &self.shape.scopes;
+        let mut statics = self.shape.projection_statics(inputs)?;
+        statics.extend(packing_statics(
+            inputs,
+            scopes,
+            &[
+                ("QB", Some(WeightKind::RecurrentQueryKeyValue)),
+                ("ZB", Some(WeightKind::RecurrentGate)),
+            ],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -159,6 +171,8 @@ impl EntryTuning for RecurrentProjectTuning {
                     gate: inputs.weight(scope, WeightKind::RecurrentGate)?,
                     alpha: inputs.weight(scope, WeightKind::RecurrentAlpha)?,
                     beta: inputs.weight(scope, WeightKind::RecurrentBeta)?,
+                    qkv_bound: inputs.bound(scope, WeightKind::RecurrentQueryKeyValue)?,
+                    gate_bound: inputs.bound(scope, WeightKind::RecurrentGate)?,
                     qkv,
                     epsilon: self.epsilon,
                 })
@@ -175,6 +189,8 @@ impl EntryTuning for RecurrentProjectTuning {
             alpha_weight: &case.alpha,
             beta_weight: &case.beta,
             epsilon: case.epsilon,
+            qkv_bound: &case.qkv_bound,
+            gate_bound: &case.gate_bound,
         }
     }
 
@@ -194,6 +210,7 @@ pub(crate) struct RecurrentOutputCase {
     hidden: Tensor,
     gated: Tensor,
     output: Tensor,
+    bound: Tensor,
 }
 
 impl RecurrentOutputTuning {
@@ -223,11 +240,17 @@ impl EntryTuning for RecurrentOutputTuning {
         if columns != self.shape.value_heads * self.shape.width {
             return Err("the recurrent output projection disagrees with the binding".into());
         }
-        Ok(vec![
+        let mut statics = vec![
             ("D", hidden),
             ("Q", self.shape.value_heads),
             ("W", self.shape.width),
-        ])
+        ];
+        statics.extend(packing_statics(
+            inputs,
+            &self.shape.scopes,
+            &[("OB", Some(WeightKind::RecurrentOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -253,6 +276,7 @@ impl EntryTuning for RecurrentOutputTuning {
                         &[point.rows, self.shape.value_heads, self.shape.width],
                         seed + 2,
                     )?,
+                    bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                     output,
                 })
             })
@@ -264,6 +288,7 @@ impl EntryTuning for RecurrentOutputTuning {
             hidden: &case.hidden,
             gated: &case.gated,
             output_weight: &case.output,
+            output_bound: &case.bound,
         }
     }
 

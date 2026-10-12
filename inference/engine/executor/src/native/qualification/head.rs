@@ -111,6 +111,20 @@ impl<'a> QualificationView<'a> {
                             activation: 0,
                             gate_scale: &absent_scale,
                             up_scale: &absent_scale,
+                            gate_bound: &any_row_bound(
+                                device,
+                                &kernels.expand,
+                                "GB",
+                                "dense_expand",
+                                &label,
+                            )?,
+                            up_bound: &any_row_bound(
+                                device,
+                                &kernels.expand,
+                                "UB",
+                                "dense_expand",
+                                &label,
+                            )?,
                         })
                         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                         .value;
@@ -128,6 +142,13 @@ impl<'a> QualificationView<'a> {
                             down_weight: &down,
                             out_rows: &out_rows,
                             down_scale: &absent_scale,
+                            down_bound: &any_row_bound(
+                                device,
+                                output,
+                                "DB",
+                                "dense_output",
+                                &label,
+                            )?,
                         })
                         .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                         .value

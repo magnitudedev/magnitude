@@ -47,8 +47,8 @@ use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, Wei
 use magnitude_kernels::{
     attention_append_dense, cluster_token_rows, conditioning_overlay, draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
-    feature_rows, import_dense, moe_tail, per_layer_inputs, place_logits_rows, post_norm_residual,
-    repack_weight, tap_rows, widen_rows,
+    feature_rows, import_dense, moe_tail, packing_bound, per_layer_inputs, place_logits_rows,
+    post_norm_residual, repack_weight, tap_rows, widen_rows,
 };
 use seismic::KernelRequest;
 use std::collections::HashSet;
@@ -467,6 +467,7 @@ fn imports(
     let mut import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     for slot in plan.imports() {
         match *slot {
@@ -488,6 +489,20 @@ fn imports(
                 }
             }
             ImportProgramSlot::Repack { source, resident } => {
+                // A resident element with a packing bound makes it with its
+                // own entry after every import into it.
+                if crate::planning::packing_run(resident).is_some()
+                    && !import.packing_bound.contains_key(&resident)
+                {
+                    if let Some(kernel) = fixed!(
+                        spec,
+                        packing_bound,
+                        resident.name().to_owned(),
+                        packing_bound::Elements { W: resident }
+                    ) {
+                        import.packing_bound.insert(resident, kernel);
+                    }
+                }
                 if import.repack_weight.contains_key(&(source, resident)) {
                     continue;
                 }

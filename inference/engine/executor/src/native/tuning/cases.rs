@@ -55,6 +55,44 @@ pub(crate) fn scale_extent(
     }
 }
 
+/// The packing statics of a projection entry's weights: each named bound's
+/// port extent `scopes` share (`WeightPlan::bound`; 0 for a weight the
+/// entry does not read, `None`), and the `RESIDUE` parameter fixed at 1
+/// unless a bounded weight's codes take the residue.
+pub(crate) fn packing_statics(
+    inputs: &ModelInputs<'_>,
+    scopes: &[WeightScope],
+    bounds: &[(&'static str, Option<WeightKind>)],
+) -> Result<Vec<(&'static str, u64)>, String> {
+    let mut residue = false;
+    let mut statics = Vec::with_capacity(bounds.len() + 1);
+    for &(name, kind) in bounds {
+        let Some(kind) = kind else {
+            statics.push((name, 0));
+            continue;
+        };
+        let mut packings = scopes
+            .iter()
+            .map(|&scope| inputs.packing(scope, kind))
+            .collect::<Result<Vec<_>, _>>()?;
+        packings.dedup();
+        let [(extent, takes_residue)] = packings[..] else {
+            return Err(match packings.is_empty() {
+                true => "a tuning case needs at least one layer".into(),
+                false => format!(
+                    "layers sharing one specialization disagree on {kind:?}'s packing: {packings:?}"
+                ),
+            });
+        };
+        residue |= takes_residue;
+        statics.push((name, extent));
+    }
+    if !residue {
+        statics.push(("RESIDUE", 1));
+    }
+    Ok(statics)
+}
+
 /// `dense_expand`: RMS prologue, paired gate/up projection, act·mul, over
 /// the `gate_kind`/`up_kind` weights (a dense feed-forward's or a routed
 /// operator's shared expert).
@@ -81,6 +119,8 @@ pub(crate) struct DenseExpandCase {
     up: Tensor,
     gate_scale: Tensor,
     up_scale: Tensor,
+    gate_bound: Tensor,
+    up_bound: Tensor,
     epsilon: f32,
     function: i32,
 }
@@ -120,12 +160,18 @@ impl EntryTuning for DenseExpandTuning {
         if projection_shape(inputs, &self.scopes, self.up_kind)? != (features, hidden) {
             return Err("dense gate and up shapes differ".into());
         }
-        Ok(vec![
+        let mut statics = vec![
             ("H", hidden),
             ("F", features),
             ("GS", scale_extent(inputs, &self.scopes, self.gate_kind)?),
             ("US", scale_extent(inputs, &self.scopes, self.up_kind)?),
-        ])
+        ];
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("GB", Some(self.gate_kind)), ("UB", Some(self.up_kind))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -154,6 +200,8 @@ impl EntryTuning for DenseExpandTuning {
                     up: inputs.weight(scope, self.up_kind)?,
                     gate_scale: inputs.unit_scale(inputs.scale_extent(scope, self.gate_kind)?)?,
                     up_scale: inputs.unit_scale(inputs.scale_extent(scope, self.up_kind)?)?,
+                    gate_bound: inputs.bound(scope, self.gate_kind)?,
+                    up_bound: inputs.bound(scope, self.up_kind)?,
                     gate,
                     epsilon: self.epsilon,
                     function: self.function,
@@ -173,6 +221,8 @@ impl EntryTuning for DenseExpandTuning {
             activation: case.function,
             gate_scale: &case.gate_scale,
             up_scale: &case.up_scale,
+            gate_bound: &case.gate_bound,
+            up_bound: &case.up_bound,
         }
     }
 
@@ -298,6 +348,7 @@ pub(crate) struct DenseOutputCase {
     down: Tensor,
     out_rows: Tensor,
     down_scale: Tensor,
+    down_bound: Tensor,
 }
 
 impl DenseOutputTuning {
@@ -323,11 +374,17 @@ impl EntryTuning for DenseOutputTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (hidden, features) = projection_shape(inputs, &self.scopes, self.down_kind)?;
-        Ok(vec![
+        let mut statics = vec![
             ("H", hidden),
             ("F", features),
             ("DS", scale_extent(inputs, &self.scopes, self.down_kind)?),
-        ])
+        ];
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("DB", Some(self.down_kind))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -358,6 +415,7 @@ impl EntryTuning for DenseOutputTuning {
                     )?,
                     out_rows: inputs.every_row(point.rows)?,
                     down_scale: inputs.unit_scale(inputs.scale_extent(scope, self.down_kind)?)?,
+                    down_bound: inputs.bound(scope, self.down_kind)?,
                     down,
                 })
             })
@@ -371,6 +429,7 @@ impl EntryTuning for DenseOutputTuning {
             down_weight: &case.down,
             out_rows: &case.out_rows,
             down_scale: &case.down_scale,
+            down_bound: &case.down_bound,
         }
     }
 

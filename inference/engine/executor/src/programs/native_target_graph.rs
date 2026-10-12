@@ -1337,11 +1337,18 @@ impl PreparedTargetGraphs {
                             &[],
                         )
                         .map_err(|error| error.to_string())?;
-                        let fixed = [
+                        let mut fixed = vec![
                             (&graph.ports.projection, weights.projection.tensor()),
                             (&graph.ports.norm, weights.norm.tensor()),
                             (&graph.ports.absent_scale, &absent_scale),
                         ];
+                        if let Some(port) = &graph.ports.projection_bound {
+                            let bound = weights
+                                .projection
+                                .bound()
+                                .ok_or("the per-layer projection has no packing bound")?;
+                            fixed.push((port, bound));
+                        }
                         graph
                             .plan
                             .bind_static(&fixed)
@@ -1891,6 +1898,8 @@ pub(crate) enum WeightPart {
     Values,
     /// Its resident second-level scale (`WeightPlan::scale`).
     Scale,
+    /// Its resident packing bound (`WeightPlan::bound`).
+    Bound,
     /// A streamed gathered table's directory of every row's slot
     /// (`WeightPlan::streamed`).
     Directory,
@@ -1910,6 +1919,12 @@ impl WeightPart {
             Self::Scale => weight.scale().ok_or_else(|| {
                 format!(
                     "resident weight {:?} has no second-level scale",
+                    weight.descriptor().name
+                )
+            }),
+            Self::Bound => weight.bound().ok_or_else(|| {
+                format!(
+                    "resident weight {:?} has no packing bound",
                     weight.descriptor().name
                 )
             }),
@@ -1934,6 +1949,10 @@ fn weight_port<G: GraphDraft>(
         (WeightPart::Scale, Some(scale)) => graph.port(Element::f32(), &[scale.extent]),
         (WeightPart::Scale, None) => {
             return Err(format!("planned weight {role:?} has no second-level scale").into());
+        }
+        (WeightPart::Bound, _) if plan.bound != 0 => graph.port(Element::f32(), &[plan.bound]),
+        (WeightPart::Bound, _) => {
+            return Err(format!("planned weight {role:?} has no packing bound").into());
         }
         (WeightPart::Directory, _) => match plan.streamed {
             Some(streamed) => graph.port(Element::i32(), &[streamed.table_rows]),
@@ -2082,8 +2101,9 @@ pub(crate) fn weight<G: GraphDraft>(
 }
 
 /// A projection weight and the tensor its entry's accumulator-scale port
-/// binds: its resident second-level scale, else an absent scale (zero
-/// extent, never read), and that port's static extent.
+/// binds: its resident second-level scale, else the graph's absent operand
+/// (`GraphConstant::absent`: zero extent, never read), and that port's
+/// static extent.
 pub(crate) struct ScaledWeight {
     pub weight: WorkflowTensor,
     pub scale: WorkflowTensor,
@@ -2099,6 +2119,60 @@ impl ScaledWeight {
             extent: 0,
         }
     }
+}
+
+/// A weight's packing bound as the bound port of an entry with a packed
+/// form binds it (`WeightPlan::bound`, `[B] f32`): its resident bound and
+/// the B runs it holds, or the graph's absent operand at B = 0 where the
+/// weight has none.
+#[derive(Clone)]
+pub(crate) struct PackingBound {
+    pub tensor: WorkflowTensor,
+    pub extent: u64,
+}
+
+impl PackingBound {
+    /// The packing bound of the planned weight of `role`.
+    pub(crate) fn planned<G: GraphDraft>(
+        graph: &mut G,
+        load: &ModelLoadPlan,
+        role: WeightRole,
+        ports: &mut Vec<(WeightPort, NativePort)>,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        let extent = load
+            .weights()
+            .find(|plan| plan.role == role)
+            .map(|plan| plan.bound)
+            .ok_or_else(|| format!("missing planned weight {role:?}"))?;
+        match extent {
+            0 => Self::absent(graph, constants),
+            _ => Ok(Self {
+                tensor: weight_port(graph, load, role, WeightPart::Bound, ports)?
+                    .tensor()
+                    .clone(),
+                extent,
+            }),
+        }
+    }
+
+    /// No bound: the graph's absent operand.
+    pub(crate) fn absent<G: GraphDraft>(
+        graph: &mut G,
+        constants: &mut Vec<GraphConstant>,
+    ) -> Result<Self, GraphError> {
+        Ok(Self {
+            tensor: GraphConstant::absent(graph, constants)?.tensor().clone(),
+            extent: 0,
+        })
+    }
+}
+
+/// A projection weight an entry with a packed form binds: its scaled operand
+/// and its packing bound.
+pub(crate) struct PackedWeight {
+    pub scaled: ScaledWeight,
+    pub bound: PackingBound,
 }
 
 /// Register one scope-owned readout representation and its scale lifetime.
@@ -2168,6 +2242,22 @@ pub(crate) fn scaled_weight<G: GraphDraft>(
     })
 }
 
+/// [`scaled_weight`] of an entry with a packed form, with the weight's
+/// packing bound.
+pub(crate) fn packed_weight<G: GraphDraft>(
+    graph: &mut G,
+    load: &ModelLoadPlan,
+    scope: WeightScope,
+    kind: WeightKind,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+) -> Result<PackedWeight, GraphError> {
+    Ok(PackedWeight {
+        scaled: scaled_weight(graph, load, scope, kind, ports, constants)?,
+        bound: PackingBound::planned(graph, load, WeightRole { scope, kind }, ports, constants)?,
+    })
+}
+
 /// The same scope-owned scaled operand as graph ports, for common projection
 /// builders. Registration and absent-scale lifetime have one authority.
 pub(crate) fn scaled_weight_ports<G: GraphDraft>(
@@ -2194,12 +2284,7 @@ pub(crate) fn weight_scale_port<G: GraphDraft>(
 ) -> Result<(NativePort, u64), GraphError> {
     let extent = planned_scale_extent(load, role)?;
     let scale = match extent {
-        0 => {
-            let absent = GraphConstant::f32(graph, &[])?;
-            let port = absent.port().clone();
-            constants.push(absent);
-            port
-        }
+        0 => GraphConstant::absent(graph, constants)?,
         1 => weight_port(graph, load, role, WeightPart::Scale, ports)?,
         _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
     };

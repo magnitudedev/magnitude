@@ -366,6 +366,16 @@ impl fmt::Debug for Device {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Element(RepresentationId);
 
+/// The integer codes of a packed representation ([`Element::integer_codes`]):
+/// every code is a value in `min ..= max`, and `group` consecutive values
+/// along the packing axis share one scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntegerCodes {
+    pub min: i32,
+    pub max: i32,
+    pub group: u64,
+}
+
 impl Element {
     /// The storage registered under a unique storage name (`q4k`,
     /// `q4k@rows16`, `f32`, `gguf_q4_k`).
@@ -402,6 +412,24 @@ impl Element {
                 Some(u64::from(layout.logical_group))
             }
         }
+    }
+    /// The integer codes of packed storage, as the registry decodes them:
+    /// the values a code takes and the columns that share one scale. `None`
+    /// for dense storage and for floating codes.
+    pub fn integer_codes(&self) -> Option<IntegerCodes> {
+        use seismic_lang::reference_math::ReferenceScalar;
+        use seismic_lang::registry::{DecodeComponent, QuantizedComponent};
+        let recipe = seismic_lang::registry::decode_recipe(self.0, DType::F32)?;
+        recipe.component(QuantizedComponent::Code)?;
+        let constant = |role| match recipe.component(role) {
+            Some(DecodeComponent::Constant(ReferenceScalar::I32(value))) => Some(value),
+            _ => None,
+        };
+        Some(IntegerCodes {
+            min: constant(QuantizedComponent::CodeMin)?,
+            max: constant(QuantizedComponent::CodeMax)?,
+            group: u64::try_from(constant(QuantizedComponent::GroupSize)?).ok()?,
+        })
     }
     /// Rows of one row tile of row-layout storage (`rows8`: 8); 1 for every
     /// other storage. A matrix view of tiled storage selects whole tiles, or

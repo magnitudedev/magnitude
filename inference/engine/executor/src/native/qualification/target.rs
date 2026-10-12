@@ -197,6 +197,8 @@ impl<'a> QualificationView<'a> {
                     alpha_weight: &alpha,
                     beta_weight: &beta,
                     epsilon: 1.0e-5,
+                    qkv_bound: &any_row_bound(device, &kernels.project, "QB", "gated_delta_project", &label)?,
+                    gate_bound: &any_row_bound(device, &kernels.project, "ZB", "gated_delta_project", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("gated_delta_project", &label, error))?
                 .value;
@@ -298,6 +300,7 @@ impl<'a> QualificationView<'a> {
                     hidden: &hidden_residual,
                     gated: &gated,
                     output_weight: &output,
+                    output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("attention_output", &label, error))?
                 .value;
@@ -392,6 +395,8 @@ impl<'a> QualificationView<'a> {
                     activation: 0,
                     gate_scale: &scale(binding.scales.gate)?,
                     up_scale: &scale(binding.scales.up)?,
+                    gate_bound: &any_row_bound(device, &kernels.expand, "GB", "dense_expand", &label)?,
+                    up_bound: &any_row_bound(device, &kernels.expand, "UB", "dense_expand", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                 .value;
@@ -404,6 +409,7 @@ impl<'a> QualificationView<'a> {
                             down_weight: &down,
                             out_rows: &out_rows,
                             down_scale: &scale(binding.scales.down)?,
+                            down_bound: &any_row_bound(device, output, "DB", "dense_output", &label)?,
                         })
                         .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                         .value
@@ -816,6 +822,8 @@ fn qualify_parallel(
             activation: 0,
             gate_scale: &absent_scale,
             up_scale: &absent_scale,
+            gate_bound: &any_row_bound(device, &kernels.expand, "GB", "dense_expand", &label)?,
+            up_bound: &any_row_bound(device, &kernels.expand, "UB", "dense_expand", &label)?,
         })
         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
         .value;
@@ -825,6 +833,7 @@ fn qualify_parallel(
             source: &product,
             weight: &zeros(dense.down, &[hidden, features], "project_rows")?,
             weight_scale: &absent_scale,
+            weight_bound: &any_row_bound(device, &kernels.down, "WB", "project_rows", &label)?,
         })
         .map_err(|error| qualification_dynamic("project_rows", &label, error))?
         .value;
@@ -911,6 +920,8 @@ fn qualify_general_routed(
                                 activation: expansion_shape.activation,
                                 gate_scale: &scale(scales.shared.gate)?,
                                 up_scale: &scale(scales.shared.up)?,
+                                gate_bound: &any_row_bound(device, kernel, "GB", "dense_expand", &label)?,
+                                up_bound: &any_row_bound(device, kernel, "UB", "dense_expand", &label)?,
                             })
                             .map_err(failed!("dense_expand"))?
                             .value
@@ -944,6 +955,7 @@ fn qualify_general_routed(
                         down_weight: &zeros(down, &[h, s])?,
                         out_rows: &out_rows,
                         down_scale: &scale(scales.shared.down)?,
+                        down_bound: &any_row_bound(device, output, "DB", "dense_output", &label)?,
                     })
                     .map_err(failed!("dense_output"))?
                     .value
@@ -985,6 +997,7 @@ fn qualify_general_routed(
                         source: &normalized,
                         weight: &zeros(down, &[x, h])?,
                         weight_scale: &scale(scales.latent.0)?,
+                        weight_bound: &any_row_bound(device, project, "WB", "project_rows", &label)?,
                     })
                     .map_err(failed!("project_rows"))?
                     .value,
@@ -1098,6 +1111,7 @@ fn qualify_general_routed(
                         down_weight: &zeros(up, &[h, x])?,
                         out_rows: &out_rows,
                         down_scale: &scale(scales.latent.1)?,
+                        down_bound: &any_row_bound(device, up_kernel, "DB", "dense_output", &label)?,
                     })
                     .map_err(failed!("dense_output"))?
                     .value
@@ -1190,6 +1204,7 @@ fn qualify_short_conv(
             hidden: hidden_residual,
             gated: &gated,
             output_weight: &output,
+            output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
         .value;
@@ -1275,6 +1290,10 @@ fn qualify_state_space(
             value_weight: &empty,
             epsilon: 1.0e-5,
             project_mode: 0,
+            query_bound: &any_row_bound(device, &kernels.project, "QB", "attention_project", &label)?,
+            gate_bound: &any_row_bound(device, &kernels.project, "GB", "attention_project", &label)?,
+            key_bound: &any_row_bound(device, &kernels.project, "KB", "attention_project", &label)?,
+            value_bound: &any_row_bound(device, &kernels.project, "VB", "attention_project", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_project", &label, error))?
         .r0;
@@ -1320,6 +1339,7 @@ fn qualify_state_space(
             hidden: hidden_residual,
             gated: &gated,
             output_weight: &output,
+            output_bound: &any_row_bound(device, &kernels.output, "OB", "attention_output", &label)?,
         })
         .map_err(|error| qualification_dynamic("attention_output", &label, error))?
         .value;
@@ -1372,6 +1392,7 @@ impl QualificationView<'_> {
                         .map_err(|error| qualification_dynamic("project_rows", &label, error))?,
                     weight: &projection,
                     weight_scale: &absent_scale,
+                    weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", &label)?,
                 })
                 .map_err(|error| qualification_dynamic("project_rows", &label, error))?
                 .value;

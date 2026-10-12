@@ -272,7 +272,14 @@ mod qualification_tests {
                 BW: binding.beta,
                 A: binding.activation,
             },
-            &defaults::<gated_delta_project::Entry>(&device, &projections),
+            // Unbounded projections (no packing bound).
+            &defaults::<gated_delta_project::Entry>(
+                &device,
+                &projections
+                    .clone()
+                    .with_static("QB", 0)
+                    .with_static("ZB", 0),
+            ),
         )
         .unwrap();
         let step = defaults::<gated_delta_step::Entry>(&device, &statics);
@@ -331,7 +338,8 @@ mod qualification_tests {
         let output = seismic::NativeSpecialization::new()
             .with_static("D", 2560)
             .with_static("Q", binding.value_heads)
-            .with_static("W", binding.width);
+            .with_static("W", binding.width)
+            .with_static("OB", 0);
         attention_output::native_for_device_with(
             &device,
             attention_output::Elements {

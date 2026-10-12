@@ -19,8 +19,8 @@ use crate::{
     completion::CompletionWaiter,
     native::{AttestedFeedForward, AttestedHead, AttestedHeadBlock},
     operators::attention::graph::{
-        self as attention_graph, AttentionBlock, AttentionGraphEntries, CheckedAttentionEntries,
-        attention_weights,
+        self as attention_graph, AttentionBlock, AttentionBounds, AttentionGraphEntries,
+        CheckedAttentionEntries, attention_weights,
     },
     operators::dense_ffn::graph::{
         CheckedDenseEntries, DenseGraphEntries, dimensions as dense_dimensions,
@@ -35,7 +35,7 @@ use crate::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
         },
-        native_target_graph::{GatheredTable, WeightPart, WeightPort},
+        native_target_graph::{GatheredTable, PackingBound, WeightPart, WeightPort},
     },
 };
 use magnitude_batching::{TargetBatchUpload, row_class};
@@ -492,9 +492,20 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
     // nothing reads their attention output, so its pass ends at the append
     // and binds none of the weights after it.
     let inject_only = class.steps == 0;
+    let mut constants = Vec::new();
+    let bounds = AttentionBounds::planned(
+        &mut graph,
+        load,
+        attention_scope,
+        attention,
+        &attention_shape,
+        !inject_only,
+        &mut weights,
+        &mut constants,
+    )?;
     // Draft head sublayers add their outputs to the residual (admission).
     let attention_weights =
-        attention_weights(&attention_shape, attention, !inject_only, false, |kind| {
+        attention_weights(&attention_shape, attention, !inject_only, false, bounds, |kind| {
             planned_weight(
                 &mut graph,
                 load,
@@ -600,10 +611,6 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 &[("M", class.steps * class.slots), ("V", vocabulary)],
             )
         })
-        .transpose()?;
-    let mut constants = Vec::new();
-    let absent_scale = (!inject_only && matches!(feed_forward, FeedForwardProgramSlot::Dense(_)))
-        .then(|| GraphConstant::absent_scale(&mut graph, &mut constants))
         .transpose()?;
     let mut passes = Vec::new();
     let mut entry_features = None;
@@ -745,10 +752,36 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 else {
                     return Err("draft head dense entries without a dense feed-forward".into());
                 };
+                let absent_scale =
+                    GraphConstant::absent(&mut graph, &mut constants)?.tensor().clone();
+                let mut bound = |kind| {
+                    PackingBound::planned(
+                        &mut graph,
+                        load,
+                        WeightRole {
+                            scope: feed_forward_scope,
+                            kind,
+                        },
+                        &mut weights,
+                        &mut constants,
+                    )
+                };
+                let gate_bound = bound(WeightKind::DenseGate)?;
+                let up_bound = bound(WeightKind::DenseUp)?;
+                let down_bound = bound(WeightKind::DenseDown)?;
                 let product = graph
                     .enqueue(
                         entries.expand,
-                        &[dense_dims.as_slice(), &[("GS", 0), ("US", 0)]].concat(),
+                        &[
+                            dense_dims.as_slice(),
+                            &[
+                                ("GS", 0),
+                                ("US", 0),
+                                ("GB", gate_bound.extent),
+                                ("UB", up_bound.extent),
+                            ],
+                        ]
+                        .concat(),
                         dense_expand::WorkflowArgs {
                             residual: (&attended).into(),
                             norm: (&feedforward_norm).into(),
@@ -759,11 +792,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                             activation: operators::dense_ffn::activation_code(
                                 dense_operator.up.activation(),
                             ),
-                            gate_scale: absent_scale
-                                .as_ref()
-                                .ok_or("dense scale is absent")?
-                                .into(),
-                            up_scale: absent_scale.as_ref().ok_or("dense scale is absent")?.into(),
+                            gate_scale: (&absent_scale).into(),
+                            up_scale: (&absent_scale).into(),
+                            gate_bound: (&gate_bound.tensor).into(),
+                            up_bound: (&up_bound.tensor).into(),
                         },                    )?
                     .value;
                 let TailEntries::Residual(dense_output) = entries.output else {
@@ -772,16 +804,18 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                 let output = graph
                     .enqueue(
                         dense_output,
-                        &[dense_dims.as_slice(), &[("DS", 0)]].concat(),
+                        &[
+                            dense_dims.as_slice(),
+                            &[("DS", 0), ("DB", down_bound.extent)],
+                        ]
+                        .concat(),
                         dense_output::WorkflowArgs {
                             residual: (&attended).into(),
                             product: (&product).into(),
                             down_weight: (&down_weight).into(),
                             out_rows: dense_rows.port().tensor().into(),
-                            down_scale: absent_scale
-                                .as_ref()
-                                .ok_or("dense scale is absent")?
-                                .into(),
+                            down_scale: (&absent_scale).into(),
+                            down_bound: (&down_bound.tensor).into(),
                         },                    )?
                     .value;
                 constants.push(dense_rows);

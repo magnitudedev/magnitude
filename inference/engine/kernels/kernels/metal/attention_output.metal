@@ -19,6 +19,7 @@ typedef element::Act activation;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *output_bound [[buffer(SEISMIC_BUFFER_OUTPUT_BOUND)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 // `gated` is [M, Q, W] and canonical, so a row is Q*W contiguous values.
@@ -178,6 +179,8 @@ kernel void attention_output_tall(ATTENTION_OUTPUT_ARGUMENTS,
     const projection::packing_scratch scratch{packed, token_factors, token_scales, weight_factors, weight_scales}
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_PACK
+// RESIDUE: the operand's residue width for weights with residue bits.
+template <uint RESIDUE>
 kernel void attention_output_pack(ATTENTION_OUTPUT_ARGUMENTS,
     uint pairs [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -188,9 +191,12 @@ kernel void attention_output_pack(ATTENTION_OUTPUT_ARGUMENTS,
     threadgroup float4 peaks[8];
     ATTENTION_OUTPUT_OPERANDS;
     ATTENTION_OUTPUT_PACKING_SCRATCH;
-    projection::packing_operand<projection::packing_codes<packets::W0>::centre,
-        projection::packing_codes<packets::W0>::folds>(in, scratch, uint(SEISMIC_DIM_M), k, pairs, peaks,
-        thread_index, sg, lane);
+    typedef projection::packing_codes<packets::W0> coded;
+    constexpr uint BOUNDS = SEISMIC_DIM_OB != 0 ? 1 : 0;
+    const projection::packing_bounds<BOUNDS> bounds{{output_bound}};
+    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,
+        scratch, bounds,
+        uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -207,7 +213,7 @@ kernel void attention_output_pack_coefficients(ATTENTION_OUTPUT_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_OUTPUT_PACKED
-template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+template <uint RESIDUE, uint PACK_TOKENS, uint WEIGHTS_AHEAD>
 kernel void attention_output_packed(ATTENTION_OUTPUT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -217,7 +223,7 @@ kernel void attention_output_packed(ATTENTION_OUTPUT_ARGUMENTS,
     ATTENTION_OUTPUT_OPERANDS;
     ATTENTION_OUTPUT_PACKING_SCRATCH;
     const uint m = uint(SEISMIC_DIM_M);
-    projection::gemm_packed<packets::W0, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,
+    projection::gemm_packed<packets::W0, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,
         (m + 127u) / 128u * 128u, uint(SEISMIC_DIM_D), k, tile * projection::packing_simdgroups + sg, lane);
 }
 #endif

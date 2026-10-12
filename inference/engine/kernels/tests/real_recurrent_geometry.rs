@@ -240,6 +240,8 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         alpha_weight: &alpha,
         beta_weight: &beta,
         epsilon: 1e-6,
+        qkv_bound: &f32_tensor(device, &[0], &[]),
+        gate_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()
     .value;
@@ -284,6 +286,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         hidden: &hidden,
         gated: &gated,
         output_weight: &output,
+        output_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()
     .value;

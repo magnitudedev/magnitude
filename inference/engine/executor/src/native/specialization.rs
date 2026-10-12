@@ -254,7 +254,7 @@ fn failure(entry: &'static str, bindings: &str, outcome: String) -> CatalogFailu
 /// domain (some configuration admits them) or the model cannot run on this
 /// backend. `values` supplies this model's value of every dimension the call
 /// site can fix; each dimension the implementation declares static must be
-/// among them.
+/// among them, and a declared parameter among them is fixed at its value.
 fn domain_statics(
     implementation: &NativeImplementation,
     entry: &'static str,
@@ -277,6 +277,13 @@ fn domain_statics(
                 )
             })?;
         specialization = specialization.with_static(name.clone(), value);
+    }
+    // A value the engine fixes for a declared parameter (one only a single
+    // value of applies at these bindings) holds it at that value.
+    for (name, value) in values {
+        if implementation.params.iter().any(|parameter| parameter.name == *name) {
+            specialization = specialization.with_param(*name, *value);
+        }
     }
     match implementation.default_specialization(&specialization) {
         Ok(_) => Ok(specialization),

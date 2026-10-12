@@ -37,6 +37,9 @@ pub struct WeightPlan {
     /// The weight's resident second-level scale (`ImportTransform::
     /// ScaleByTensor`), when it has one.
     pub scale: Option<WeightScalePlan>,
+    /// The extent of the weight's resident packing bound (`packing_bound`):
+    /// one F32 value per run of its columns, or 0 without one.
+    pub bound: u64,
     /// A gathered table that is streamed (`device_table`): `shape` is then
     /// its slots', which hold only some of the table's rows. `None` for a
     /// weight held whole.
@@ -121,12 +124,13 @@ impl WeightPlan {
         ])
     }
 
-    /// Every resident byte of the weight: its representation, its scale and
-    /// a streamed table's directory and staging.
+    /// Every resident byte of the weight: its representation, its scale, its
+    /// packing bound and a streamed table's directory and staging.
     pub fn storage_bytes(&self) -> Result<u64, String> {
         let [directory, staging] = self.streamed_bytes()?;
         self.resident_bytes
             .checked_add(self.scale.as_ref().map_or(0, |scale| scale.resident_bytes))
+            .and_then(|bytes| bytes.checked_add(self.bound.checked_mul(4)?))
             .and_then(|bytes| bytes.checked_add(directory))
             .and_then(|bytes| bytes.checked_add(staging))
             .ok_or_else(|| "resident weight byte count overflows".into())
@@ -138,6 +142,42 @@ impl WeightPlan {
     pub fn scale_extent(&self) -> u64 {
         self.scale.as_ref().map_or(0, |scale| scale.extent)
     }
+}
+
+/// The columns of one run of a resident weight's packing bound, the columns
+/// that share a scale: a weight whose resident codes are integers (the
+/// registry's), in the layout the token-packing projection forms read
+/// (Metal's `rows32`); `None` for any other.
+pub fn packing_run(resident: Element) -> Option<u64> {
+    (resident.layout() == Layout::Rows32)
+        .then(|| resident.integer_codes())
+        .flatten()
+        .map(|codes| codes.group)
+}
+
+/// The extent of a weight's packing bound (the `packing_bound` entry), the
+/// runs of its K columns for a matrix with a packing run, else 0. Per run it
+/// holds the largest squared l2 norm of a row's codes minus their centre
+/// over the matrix's rows, made with the weight on the device when it is
+/// imported: the packed projection forms
+/// (`kernels/metal/lib/projection/packing.h`) certify their activation gains
+/// against it rather than against every row of the format.
+fn packing_bound(resident: Element, logical: &[u64]) -> u64 {
+    match (logical, packing_run(resident)) {
+        ([_, columns], Some(run)) if columns % run == 0 => columns / run,
+        _ => 0,
+    }
+}
+
+/// Whether a weight's packed sums take residue bits beside their 16-bit
+/// fields: its codes are values of 8 bits (Q8_0 and iq4g32), whose sums 16
+/// bits a token do not hold at a useful gain. Only such weights make the
+/// packed forms' second residue width (`RESIDUE` 2) apply.
+pub fn packing_residue(resident: Element) -> bool {
+    packing_run(resident).is_some()
+        && resident
+            .integer_codes()
+            .is_some_and(|codes| codes.max - codes.min > i32::from(i8::MAX))
 }
 
 /// A packed weight's second-level scale (NVFP4's per-tensor or per-matrix
@@ -1109,6 +1149,7 @@ impl ModelLoadPlan {
                         },
                         shape,
                         scale: None,
+                        bound: 0,
                         streamed: None,
                     });
                 }
@@ -1451,6 +1492,8 @@ fn push_gathered_table(
         return Ok(());
     }
     streamed.shape[0] = slots;
+    // A streamed table is read by row, never through a packed projection.
+    streamed.bound = 0;
     streamed.resident_bytes = representation_bytes(streamed.resident, &streamed.shape)?;
     // The load uploads the rows that fill the slots; nothing more of the
     // table is ever uploaded at once.
@@ -1540,7 +1583,7 @@ fn push_weight(
             descriptor.name
         ));
     }
-    out.push(WeightPlan {
+    let mut plan = WeightPlan {
         role,
         component,
         source,
@@ -1553,8 +1596,14 @@ fn push_weight(
         source_bytes: representation_bytes(upload, &logical)?,
         resident_bytes,
         scale,
+        bound: 0,
         streamed: None,
-    });
+    };
+    // The import makes the bound: a weight the host places has none.
+    if !plan.placed_on_host() {
+        plan.bound = packing_bound(resident, &logical);
+    }
+    out.push(plan);
     Ok(())
 }
 

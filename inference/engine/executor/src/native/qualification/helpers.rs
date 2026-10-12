@@ -73,6 +73,10 @@ pub(super) fn qualify_attention(
             value_weight: &value,
             epsilon: 1.0e-5,
             project_mode: 0,
+            query_bound: &any_row_bound(device, &kernels.project, "QB", ENTRY, label)?,
+            gate_bound: &any_row_bound(device, &kernels.project, "GB", ENTRY, label)?,
+            key_bound: &any_row_bound(device, &kernels.project, "KB", ENTRY, label)?,
+            value_bound: &any_row_bound(device, &kernels.project, "VB", ENTRY, label)?,
         })
         .map_err(|e| qualification_dynamic("attention_project", label, e))?;
     let per_head = |tensor: &Tensor, extents: &[u64]| {
@@ -193,6 +197,7 @@ pub(super) fn qualify_attention(
                         hidden: &residual,
                         gated,
                         output_weight: &output,
+                        output_bound: &any_row_bound(device, output_kernel, "OB", ENTRY, label)?,
                     })
                     .map_err(|e| qualification_dynamic("attention_output", label, e))?
                     .value
@@ -243,6 +248,7 @@ pub(super) fn qualify_post_norm(
             source,
             weight,
             weight_scale: &weight_scale,
+            weight_bound: &any_row_bound(device, &kernels.project, "WB", "project_rows", label)?,
         })
         .map_err(|e| qualification_dynamic("project_rows", label, e))?
         .value;
@@ -295,6 +301,22 @@ pub(super) fn semantic_zeros(
 ) -> Result<Tensor, CatalogFailure> {
     Tensor::zeros(device, element, extents)
         .map_err(|error| qualification_dynamic(entry, bindings, error))
+}
+
+/// A packing bound for `kernel`'s bound port whose static is `name`: its
+/// static extent (0 where the native has no such static) of the largest
+/// squared run norm any packable format has (32 centred 8-bit codes of
+/// magnitude 128), which bounds whatever weights a qualification binds.
+pub(super) fn any_row_bound<E: seismic::Entry>(
+    device: &Device,
+    kernel: &NativeKernel<E>,
+    name: &str,
+    entry: &'static str,
+    bindings: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let extent = kernel.specialization().static_value(name).unwrap_or(0);
+    let count = usize::try_from(extent).map_err(|error| qualification_dynamic(entry, bindings, error))?;
+    semantic_f32(device, &[extent], &vec![32.0 * 128.0 * 128.0; count], entry, bindings)
 }
 
 pub(super) fn semantic_f32(

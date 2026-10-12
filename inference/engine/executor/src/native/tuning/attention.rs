@@ -14,7 +14,7 @@
 //! rows another point appends, so every configuration sees the same inputs
 //! whatever the point order.
 
-use super::cases::projection_shape;
+use super::cases::{packing_statics, projection_shape};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, across_sequences,
     history_placement, longest_history, row_points, served_row_points, with_contexts,
@@ -286,9 +286,26 @@ pub(crate) struct AttentionProjectCase {
     key: Tensor,
     value: Tensor,
     epsilon: f32,
+    /// The segments' packing bounds, query, gate, key, value.
+    bounds: [Tensor; 4],
 }
 
 impl AttentionProjectTuning {
+    /// The segments' weight kinds whose packing bounds the projection binds,
+    /// in `attention_project`'s bound order; none for an absent segment (and
+    /// for the query and gate of a key-value-only projection), as the block's
+    /// graph binds them.
+    fn bound_kinds(&self, query: WeightKind) -> [Option<WeightKind>; 4] {
+        let shape = self.binding.shape;
+        let projects = !self.binding.key_value_only;
+        [
+            projects.then_some(query),
+            (projects && shape.gate_rows() > 0).then_some(WeightKind::AttentionGate),
+            (shape.key_rows() > 0).then_some(WeightKind::Key),
+            (shape.value_rows() > 0).then_some(WeightKind::Value),
+        ]
+    }
+
     fn elements(&self) -> attention_project::Elements {
         let b = self.binding;
         attention_project::Elements {
@@ -345,7 +362,14 @@ impl EntryTuning for AttentionProjectTuning {
         } else {
             shape.project_dimensions(0)
         };
-        Ok(statics.to_vec())
+        let mut statics = statics.to_vec();
+        let [query, gate, key, value] = self.bound_kinds(query);
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("QB", query), ("GB", gate), ("KB", key), ("VB", value)],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -398,6 +422,19 @@ impl EntryTuning for AttentionProjectTuning {
                         query
                     },
                     epsilon: self.epsilon,
+                    bounds: {
+                        let kinds = self.bound_kinds(query_kind);
+                        let mut bound = |kind: Option<WeightKind>| match kind {
+                            Some(kind) => inputs.bound(scope, kind),
+                            None => inputs.unit_scale(0),
+                        };
+                        [
+                            bound(kinds[0])?,
+                            bound(kinds[1])?,
+                            bound(kinds[2])?,
+                            bound(kinds[3])?,
+                        ]
+                    },
                 })
             })
             .collect()
@@ -413,6 +450,10 @@ impl EntryTuning for AttentionProjectTuning {
             value_weight: &case.value,
             epsilon: case.epsilon,
             project_mode: 0,
+            query_bound: &case.bounds[0],
+            gate_bound: &case.bounds[1],
+            key_bound: &case.bounds[2],
+            value_bound: &case.bounds[3],
         }
     }
 
@@ -432,6 +473,7 @@ pub(crate) struct AttentionOutputCase {
     hidden: Tensor,
     gated: Tensor,
     output: Tensor,
+    bound: Tensor,
 }
 
 impl AttentionOutputTuning {
@@ -463,7 +505,13 @@ impl EntryTuning for AttentionOutputTuning {
         {
             return Err("the attention output projection disagrees with the binding".into());
         }
-        Ok(vec![("D", shape.hidden), ("Q", heads), ("W", shape.width)])
+        let mut statics = vec![("D", shape.hidden), ("Q", heads), ("W", shape.width)];
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("OB", Some(WeightKind::AttentionOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -493,6 +541,7 @@ impl EntryTuning for AttentionOutputTuning {
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::AttentionOutput)?,
+                    bound: inputs.bound(scope, WeightKind::AttentionOutput)?,
                 })
             })
             .collect()
@@ -503,6 +552,7 @@ impl EntryTuning for AttentionOutputTuning {
             hidden: &case.hidden,
             gated: &case.gated,
             output_weight: &case.output,
+            output_bound: &case.bound,
         }
     }
 

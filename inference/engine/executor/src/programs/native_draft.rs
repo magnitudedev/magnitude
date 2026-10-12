@@ -31,8 +31,8 @@ use crate::{
     native::AttestedDraft,
     operators::attention::graph::{
         self as attention_graph, AttentionBlock, AttentionControlPorts, AttentionGraphEntries,
-        AttentionHistoryEntries, AttentionWeights, CheckedAttentionEntries, ProjectedRows,
-        attention_weights,
+        AttentionBounds, AttentionHistoryEntries, AttentionWeights, CheckedAttentionEntries,
+        ProjectedRows, attention_weights,
     },
     operators::dense_ffn::graph::{self as dense_graph, CheckedDenseEntries, DenseGraphEntries},
     programs::{
@@ -42,7 +42,9 @@ use crate::{
             CheckedGraphFamilyResources, CheckedGraphResources, ConstantTensors, GraphConstant,
             distinct_storage_bytes,
         },
-        native_target_graph::{GatheredTable, RowDirectory, WeightPort, weight, weight_scale_port},
+        native_target_graph::{
+            GatheredTable, PackingBound, RowDirectory, WeightPort, weight, weight_scale_port,
+        },
     },
 };
 use magnitude_batching::{TargetBatchUpload, row_class};
@@ -649,20 +651,6 @@ struct DraftGraphParts<P> {
     output: WorkflowTensor,
 }
 
-/// The graph's absent scale, declared on its first read (`slot`).
-fn absent<G: GraphDraft>(
-    graph: &mut G,
-    constants: &mut Vec<GraphConstant>,
-    slot: &mut Option<WorkflowTensor>,
-) -> Result<WorkflowTensor, GraphError> {
-    if let Some(absent) = slot {
-        return Ok(absent.clone());
-    }
-    let absent = GraphConstant::absent_scale(graph, constants)?;
-    *slot = Some(absent.clone());
-    Ok(absent)
-}
-
 fn draft_sublayer(block: usize, sublayer: u32) -> Result<WeightScope, String> {
     Ok(WeightScope::DraftSublayer(SublayerIndex {
         block: u32::try_from(block).map_err(|_| "draft block index exceeds u32")?,
@@ -712,12 +700,23 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let shape =
             operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
         let scope = draft_sublayer(index, 0)?;
+        let bounds = AttentionBounds::planned(
+            &mut graph,
+            load,
+            scope,
+            attention,
+            &shape,
+            class.slots > 0,
+            &mut weights,
+            &mut constants,
+        )?;
         let injection =
             attention_weights(
                 &shape,
                 attention,
                 class.slots > 0,
                 false,
+                bounds,
                 |kind| match kind {
                     WeightKind::InputNorm => Ok(fusion_norm.clone()),
                     kind => weight(&mut graph, load, scope, kind, &mut weights),
@@ -758,11 +757,12 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
     // The host writes the rows (an input of the first injection's
     // projection; every layer's projection reads the same rows), or a
     // device-conditioned class widens its bound target features.
-    let (first, (_, first_shape, _)) = layer_weights
+    let (first, (_, first_shape, first_weights)) = layer_weights
         .iter()
         .enumerate()
         .find_map(|(index, layer)| layer.as_ref().map(|layer| (index, layer)))
         .ok_or("a draft has no injected layers")?;
+    let first_bounds = first_weights.bounds.project_dimensions(true);
     let (conditioning, conditioning_rows) = if class.device {
         let features =
             graph.port_with_class_extent(activation, &[class.entry_rows, hidden], 0, "M")?;
@@ -779,7 +779,11 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let rows = graph.input_for(
             entries.layers[first].injection.project,
             "hidden",
-            &first_shape.key_value_dimensions(class.entry_rows),
+            &[
+                first_shape.key_value_dimensions(class.entry_rows).as_slice(),
+                first_bounds.as_slice(),
+            ]
+            .concat(),
         )?;
         let tensor = rows.tensor().clone();
         (DraftConditioning::Rows(rows), tensor)
@@ -828,11 +832,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         });
     }
 
-    // The block pass. Its unscaled weights bind the absent scale, declared
-    // by its first reader: an injection-only graph, or one whose every
-    // reader binds a resident scale, reads none, and a sealed graph binds no
-    // unread port.
-    let mut absent_scale = None;
+    // The block pass. Its unscaled weights bind the graph's absent operand
+    // (`GraphConstant::absent`).
     let slots = class.slots;
     let proposals = class.proposals;
     let block_rows = draft.block_rows(proposals);
@@ -893,7 +894,6 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             .as_ref()
             .ok_or("a drafting class skips a layer's injection")?;
         if let Some((dflash2, kernel, group, rows_map)) = &dflash2 {
-            let absent_scale = absent(&mut graph, &mut constants, &mut absent_scale)?;
             let ports;
             (residual, ports) = dflash2_layer(
                 &mut graph,
@@ -922,7 +922,6 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 load,
                 &mut weights,
                 &mut constants,
-                &absent_scale,
                 &residual,
             )?;
             layers.push(ports);
@@ -945,6 +944,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             key_norm: injection_weights.key_norm.clone(),
             output: injection_weights.output.clone(),
             post_norm: None,
+            bounds: injection_weights.bounds.clone(),
         };
         let (mixed, state, controls) = attention_graph::attention(
             &mut graph,
@@ -1128,6 +1128,18 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 ("R", direct.entries),
             ];
             let anchors = graph.input_for(chain.embedding, "tokens", &memory_dims)?;
+            // The projection's packing bound (a bound of all its rows bounds
+            // the readout vocabulary's).
+            let markov_bound = PackingBound::planned(
+                &mut graph,
+                load,
+                WeightRole {
+                    scope: WeightScope::Draft,
+                    kind: WeightKind::MarkovProjection,
+                },
+                &mut weights,
+                &mut constants,
+            )?;
             for step in 0..proposals {
                 let rows_of_step = GraphConstant::i32(
                     &mut graph,
@@ -1154,7 +1166,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             epsilon,
                         },                    )?
                     .r0;
-                let absent_scale = absent(&mut graph, &mut constants, &mut absent_scale)?;
+                let absent_scale = GraphConstant::absent(&mut graph, &mut constants)?.tensor().clone();
                 let mut biased = graph
                     .enqueue(
                         chain.projection,
@@ -1164,6 +1176,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             ("H", readout_vocabulary),
                             ("F", rank),
                             ("DS", 0),
+                            ("DB", markov_bound.extent),
                         ],
                         dense_output::WorkflowArgs {
                             residual: (&logits).into(),
@@ -1171,7 +1184,9 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             down_weight: (&markov_projection).into(),
                             out_rows: rows_of_step.port().tensor().into(),
                             down_scale: (&absent_scale).into(),
-                        },                    )?
+                            down_bound: (&markov_bound.tensor).into(),
+                        },
+                    )?
                     .value;
                 let mut step_result = result
                     .tensor()
@@ -1204,13 +1219,12 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             let (path, ..) = dflash2
                 .as_ref()
                 .ok_or("a DFlash2 draft graph has no DFlash2 entries")?;
-            let absent_scale = absent(&mut graph, &mut constants, &mut absent_scale)?;
             Some(dflash2_path(
                 &mut graph,
                 path,
                 load,
                 &mut weights,
-                &absent_scale,
+                &mut constants,
                 Dflash2Path {
                     direct: &direct,
                     residual: &residual,
@@ -1306,7 +1320,6 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-    absent_scale: &WorkflowTensor,
     residual: &WorkflowTensor,
 ) -> Result<(WorkflowTensor, LayerPorts), GraphError> {
     let Dflash2Layer {
@@ -1316,6 +1329,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         epsilon,
         ..
     } = layer;
+    let absent_scale = &GraphConstant::absent(graph, constants)?.tensor().clone();
     let groups = hidden / layer.group;
     let coefficients = 2 * layer.kernel * groups;
     let convolution_dims = [
@@ -1325,26 +1339,45 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         ("K", layer.kernel),
     ];
     let block = u32::try_from(layer.block_rows).map_err(|_| "draft block exceeds u32")?;
+    // A projection binds the graph's absent scale and its weight's packing
+    // bound.
     let project = |graph: &mut G,
                    entry: G::Binding<'a, project_rows::Entry>,
                    source: seismic::WorkflowTensorRef<'_>,
                    weight: &WorkflowTensor,
+                   bound: &PackingBound,
                    (inputs, outputs): (u64, u64)| {
         graph
             .enqueue(
                 entry,
-                &[("M", rows), ("K", inputs), ("N", outputs), ("WS", 0)],
+                &[
+                    ("M", rows),
+                    ("K", inputs),
+                    ("N", outputs),
+                    ("WS", 0),
+                    ("WB", bound.extent),
+                ],
                 project_rows::WorkflowArgs {
                     source,
                     weight: weight.into(),
                     weight_scale: absent_scale.into(),
-                },            )
+                    weight_bound: (&bound.tensor).into(),
+                },
+            )
             .map(|projected| projected.value)
+    };
+    let bound = |graph: &mut G,
+                 weights: &mut Vec<(WeightPort, NativePort)>,
+                 constants: &mut Vec<GraphConstant>,
+                 scope: WeightScope,
+                 kind: WeightKind| {
+        PackingBound::planned(graph, load, WeightRole { scope, kind }, weights, constants)
     };
     // One sublayer's prologue: its normed rows, their coefficients and the
     // half-0 convolution the operator reads.
     let prologue = |graph: &mut G,
                     weights: &mut Vec<(WeightPort, NativePort)>,
+                    constants: &mut Vec<GraphConstant>,
                     residual: &WorkflowTensor,
                     sublayer: u32,
                     norm_entry: G::Binding<'a, readout_features_rows::Entry>,
@@ -1370,11 +1403,14 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                     epsilon,
                 },            )?
             .value;
+        let projection_bound =
+            bound(graph, weights, constants, scope, WeightKind::ConvolutionProjection)?;
         let dynamic = project(
             graph,
             coefficient_entry,
             (&normed).into(),
             &projection,
+            &projection_bound,
             (hidden, coefficients),
         )?;
         let dynamic = dynamic.reshape(&[rows, 2, layer.kernel, groups]);
@@ -1415,6 +1451,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     let (convolved, dynamic, base) = prologue(
         graph,
         weights,
+        constants,
         residual,
         0,
         entries.attention_norm,
@@ -1432,6 +1469,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         entries.query,
         (&convolved).into(),
         &attention.query,
+        &attention.bounds.query,
         (hidden, heads * width),
     )?;
     let key = project(
@@ -1439,6 +1477,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         entries.key,
         (&convolved).into(),
         key_weight,
+        &attention.bounds.key,
         (hidden, key_width),
     )?;
     let value = project(
@@ -1446,6 +1485,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         entries.value,
         (&convolved).into(),
         value_weight,
+        &attention.bounds.value,
         (hidden, key_width),
     )?;
     let (attended, state, controls) = attention_graph::mix(
@@ -1486,6 +1526,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             .output
             .as_ref()
             .ok_or("draft block output weight is absent")?,
+        &attention.bounds.output,
         (heads * width, hidden),
     )?;
     let residual = finish(graph, residual, &output, (&dynamic, &base))?;
@@ -1495,6 +1536,7 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     let (convolved, dynamic, base) = prologue(
         graph,
         weights,
+        constants,
         &residual,
         1,
         entries.feed_forward_norm,
@@ -1505,18 +1547,22 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
     let up_weight = weight(graph, load, scope, WeightKind::DenseUp, weights)?;
     let down_weight = weight(graph, load, scope, WeightKind::DenseDown, weights)?;
     let features = layer.intermediate;
+    let gate_bound = bound(graph, weights, constants, scope, WeightKind::DenseGate)?;
     let gate = project(
         graph,
         entries.gate,
         (&convolved).into(),
         &gate_weight,
+        &gate_bound,
         (hidden, features),
     )?;
+    let up_bound = bound(graph, weights, constants, scope, WeightKind::DenseUp)?;
     let up = project(
         graph,
         entries.up,
         (&convolved).into(),
         &up_weight,
+        &up_bound,
         (hidden, features),
     )?;
     let product = graph
@@ -1528,11 +1574,13 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                 up: (&up).into(),
             },        )?
         .value;
+    let down_bound = bound(graph, weights, constants, scope, WeightKind::DenseDown)?;
     let down = project(
         graph,
         entries.down,
         (&product).into(),
         &down_weight,
+        &down_bound,
         (features, hidden),
     )?;
     let residual = finish(graph, &residual, &down, (&dynamic, &base))?;
@@ -1580,7 +1628,7 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
     entries: &Dflash2Entries<'a, G>,
     load: &ModelLoadPlan,
     weights: &mut Vec<(WeightPort, NativePort)>,
-    absent_scale: &WorkflowTensor,
+    constants: &mut Vec<GraphConstant>,
     path: Dflash2Path<'_>,
 ) -> Result<NativePort, GraphError> {
     let Dflash2Path {
@@ -1638,15 +1686,34 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                 epsilon: path.epsilon,
             },        )?
         .value;
+    let hidden_bound = PackingBound::planned(
+        graph,
+        load,
+        WeightRole {
+            scope: WeightScope::Draft,
+            kind: WeightKind::SelectorHidden,
+        },
+        weights,
+        constants,
+    )?;
+    let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
     let projected = graph
         .enqueue(
             entries.hidden,
-            &[("M", outputs), ("K", hidden), ("N", rank), ("WS", 0)],
+            &[
+                ("M", outputs),
+                ("K", hidden),
+                ("N", rank),
+                ("WS", 0),
+                ("WB", hidden_bound.extent),
+            ],
             project_rows::WorkflowArgs {
                 source: (&features).into(),
                 weight: (&selector_hidden).into(),
-                weight_scale: absent_scale.into(),
-            },        )?
+                weight_scale: (&absent_scale).into(),
+                weight_bound: (&hidden_bound.tensor).into(),
+            },
+        )?
         .value;
     let successors = graph
         .enqueue(

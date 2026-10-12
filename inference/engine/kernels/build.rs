@@ -33,6 +33,11 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         &[BackendName::Metal],
         "the convolved recurrent decode form's step over the projection's convolved channels; the other backends convolve in `gated_delta_step`",
     ),    (
+        "packing_bound",
+        &[BackendName::Metal],
+        "a weight's packing bound, which only Metal's token-packing projection forms read",
+    ),
+    (
         "readout_top_rows",
         &[BackendName::Metal, BackendName::Cuda],
         "level one of the progressive head's certified selection (decode rows)",

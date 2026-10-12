@@ -33,6 +33,19 @@ pub enum ImportProgramSlot {
     Repack { source: Element, resident: Element },
 }
 
+impl ImportProgramSlot {
+    /// The import that makes `weight` resident from its upload.
+    pub fn of(weight: &WeightPlan) -> Self {
+        match (weight.upload.dtype(), weight.resident.dtype()) {
+            (Some(source), Some(resident)) => Self::Dense { source, resident },
+            _ => Self::Repack {
+                source: weight.upload,
+                resident: weight.resident,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MixerProgramSlot {
     Attention(AttentionBinding),
@@ -468,18 +481,14 @@ pub(super) fn derive_program_plan(
     let lookup = |weights: &[WeightPlan], scope, kind| planned_element(weights, scope, kind);
     let mut seen_imports = HashSet::new();
     let mut imports = Vec::new();
-    for (source, resident) in target
+    for slot in target
         .iter()
         .chain(head.unwrap_or_default())
         .chain(vision.unwrap_or_default())
         // A host-placed weight needs no import entry.
         .filter(|weight| !weight.placed_on_host())
-        .map(|weight| (weight.upload, weight.resident))
+        .map(ImportProgramSlot::of)
     {
-        let slot = match (source.dtype(), resident.dtype()) {
-            (Some(source), Some(resident)) => ImportProgramSlot::Dense { source, resident },
-            _ => ImportProgramSlot::Repack { source, resident },
-        };
         if seen_imports.insert(slot) {
             imports.push(slot);
         }

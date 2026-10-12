@@ -41,7 +41,7 @@ pub use weights::{
     WeightStorageIdentity, resident_element, resident_layout, source_element,
 };
 
-pub(crate) use weights::activation_dtype;
+pub(crate) use weights::{activation_dtype, packing_residue, packing_run};
 use weights::{
     planned_element, planned_readout, planned_scalable, source_import_peak_bytes,
     weight_bytes_by_component,
@@ -82,6 +82,7 @@ pub(crate) mod tests {
             source_bytes: 2,
             resident_bytes: 2,
             scale: None,
+            bound: 0,
             streamed: None,
         }
     }

@@ -9,11 +9,12 @@ use crate::operators::gated_delta::graph::{
     RecurrentControlPorts, RecurrentStatePorts, bank_ports, chunked,
 };
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
 use crate::{
     ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels,
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     attention_output, attention_project, state_space_chunk, state_space_gate, state_space_step,
 };
@@ -96,10 +97,18 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
     block: StateSpaceBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
+    let mut bound = |graph: &mut G, kind| {
+        PackingBound::planned(graph, load, WeightRole { scope, kind }, weights, constants)
+    };
+    let projection_bound = bound(graph, WeightKind::StateSpaceProjection)?;
+    let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
+    // The projection's other segments are absent, and so are their bounds.
+    let absent = PackingBound::absent(graph, constants)?;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
     let projection_weight = weight(graph, WeightKind::StateSpaceProjection)?;
@@ -118,7 +127,11 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let projection = graph
         .enqueue(
             kernels.project,
-            &shape.project_dimensions(block.rows),
+            &[
+                shape.project_dimensions(block.rows).as_slice(),
+                &[("QB", projection_bound.extent), ("GB", 0), ("KB", 0), ("VB", 0)],
+            ]
+            .concat(),
             attention_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&input_norm).into(),
@@ -128,7 +141,12 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 value_weight: (&empty).into(),
                 epsilon: block.epsilon,
                 project_mode: 0,
-            },        )?
+                query_bound: (&projection_bound.tensor).into(),
+                gate_bound: (&absent.tensor).into(),
+                key_bound: (&absent.tensor).into(),
+                value_bound: (&absent.tensor).into(),
+            },
+        )?
         .r0;
     let dimensions = shape.state_dimensions(block.rows, block.slots, banks, tape_rows);
     // The step and chunk entries share one contract, so their inputs have the
@@ -189,12 +207,18 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let output = graph
         .enqueue(
             kernels.output,
-            &shape.output_dimensions(block.rows),
+            &[
+                shape.output_dimensions(block.rows).as_slice(),
+                &[("OB", output_bound.extent)],
+            ]
+            .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
-            },        )?
+                output_bound: (&output_bound.tensor).into(),
+            },
+        )?
         .value;
     Ok((output, ports, controls))
 }

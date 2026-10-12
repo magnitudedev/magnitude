@@ -21,6 +21,38 @@ native import_dense for cuda from "cuda/import_dense.cu":
         threads_per_threadgroup (256, 1, 1)
 
 
+# The packing bound of a resident [N, K] weight (`WeightPlan::bound`): per run
+# of the K / R columns that share a scale, the largest sum over one row's run
+# of (code - centre)^2, an exact integer held in F32. Codes are the
+# registry's integer codes; a representation with negative codes is centred at
+# zero, an unsigned one at half its code range. The packed projection forms
+# certify their activation gains against it (`metal/lib/projection/packing.h`),
+# which only Metal has.
+fn packing_bound[N, K, R](weight: &tensor[N, K] W, bound: &mut tensor[R] f32) where R > 0 and K % R == 0:
+    parallel for run in 0..R:
+        let first = run * (K / R)
+        let low = quantized_code_min(weight, 0, first)
+        let mut centre = i32(0)
+        if low >= 0:
+            centre = (quantized_code_max(weight, 0, first) + 1) / 2
+        let mut largest = i32(0)
+        for n in 0..N:
+            let mut squares = i32(0)
+            for c in 0..K / R:
+                let centred = quantized_code(weight, n, first + c) - centre
+                squares = squares + centred * centred
+            largest = max(largest, squares)
+        bound[run] = f32(largest)
+
+# Metal: the format's packed codes (`projection::packing_codes`), one
+# threadgroup per 32-column block, its threads taking rows in turn; R is the
+# block's runs per 32 columns.
+native packing_bound for metal from "metal/packing_bound.metal":
+    launch packing_bound:
+        threadgroups (K / 32, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+
 # The registered exact conversion of an external GGUF source into resident
 # storage U = (representation, layout). One threadgroup converts one 16-row by
 # 32-column tile; the grid covers every stored column of every k-quant packet.

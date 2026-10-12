@@ -6,8 +6,8 @@ use crate::{
     DeviceError, ImportLaunchCore, ImportWorkspaceLease, ResidentWeightSlot, Stored, SubmitError,
     ValidatedImportLaunch, WeightStorageIdentity, native::AttestedImport,
 };
-use magnitude_kernels::{import_dense, repack_weight};
-use seismic::{NativeTensorBatch, Tensor};
+use magnitude_kernels::{import_dense, packing_bound, repack_weight};
+use seismic::{NativeKernel, NativeTensorBatch, Tensor};
 use std::io::{Seek, SeekFrom};
 
 pub struct NativeImportProgram {
@@ -39,12 +39,8 @@ impl NativeImportProgram {
             if let Some(upload) = workspace.staged_mut() {
                 fill_staged_source(core.source().stored(), core.plan(), upload)?;
             }
-            enqueue_into(
-                &self.handle,
-                batch,
-                workspace.source(),
-                destination.tensor(),
-            )
+            let (resident, bound) = destination.parts_mut();
+            enqueue_into(&self.handle, batch, workspace.source(), resident, bound)
         })();
         if let Err(error) = result {
             return Err((error, launch));
@@ -71,8 +67,8 @@ impl ImportProgram for NativeImportProgram {
             if let Some(upload) = workspace.staged_mut() {
                 fill_staged_source(core.source().stored(), core.plan(), upload)?;
             }
-            import_into(&self.handle, workspace.source(), destination.tensor())?;
-            Ok(())
+            let (resident, bound) = destination.parts_mut();
+            import_into(&self.handle, workspace.source(), resident, bound)
         })();
         if let Err(error) = result {
             return Err((error, launch));
@@ -156,68 +152,111 @@ pub(crate) fn stored_source_bytes(stored: &Stored) -> Result<Vec<u8>, SubmitErro
     }
 }
 
-/// Run one import entry from an uploaded source tensor into its resident
-/// destination. The entries see a weight as its `[B, N, K]` view: `K` the
-/// packing (last) axis, `N` the row axis, `B` every leading matrix. That view
-/// keeps the row geometry of every resident layout (a `rows16` row, an
-/// `mma16` row tile) and the source's packets.
+/// Run one import from an uploaded source tensor into its resident
+/// destination, then make the weight's packing bound (`bound`, where its
+/// plan has one) from the resident weight. The import entries see a weight
+/// as its `[B, N, K]` view: `K` the packing (last) axis, `N` the row axis,
+/// `B` every leading matrix. That view keeps the row geometry of every
+/// resident layout (a `rows16` row, an `mma16` row tile) and the source's
+/// packets.
 pub(crate) fn import_into(
     handle: &AttestedImport,
     source: &Tensor,
     destination: &Tensor,
+    bound: Option<&mut Tensor>,
 ) -> Result<(), SubmitError> {
     let view = import_view(destination.extents())?;
     let source = shaped(source, &view, "source")?;
-    let mut destination = shaped(destination, &view, "resident")?;
+    let mut resident = shaped(destination, &view, "resident")?;
     match handle {
         AttestedImport::Dense(handle) => handle
             .call_into(
                 import_dense::Args { source: &source },
                 import_dense::OutputArgs {
-                    value: &mut destination,
+                    value: &mut resident,
                 },
             )
             .map(|_| ()),
-        AttestedImport::Repack(handle) => handle
+        AttestedImport::Repack { repack, .. } => repack
             .call_into(
                 repack_weight::Args { source: &source },
                 repack_weight::OutputArgs {
-                    value: &mut destination,
+                    value: &mut resident,
                 },
             )
             .map(|_| ()),
     }
-    .map_err(|error| SubmitError::Device(DeviceError::Execution(error.to_string())))
+    .map_err(execution)?;
+    match bound {
+        Some(bound) => bound_entry(handle)?
+            .call(packing_bound::Args {
+                weight: destination,
+                bound,
+            })
+            .map(|_| ())
+            .map_err(execution),
+        None => Ok(()),
+    }
 }
 
-/// Queue one import entry from an uploaded source tensor into its resident
-/// destination: `import_into`, completed with the batch.
+/// Queue one import and the weight's packing bound: `import_into`,
+/// completed with the batch.
 pub(crate) fn enqueue_into(
     handle: &AttestedImport,
     batch: &mut NativeTensorBatch,
     source: &Tensor,
     destination: &Tensor,
+    bound: Option<&mut Tensor>,
 ) -> Result<(), SubmitError> {
     let view = import_view(destination.extents())?;
     let source = shaped(source, &view, "source")?;
-    let mut destination = shaped(destination, &view, "resident")?;
-    let queued = match handle {
+    let mut resident = shaped(destination, &view, "resident")?;
+    match handle {
         AttestedImport::Dense(handle) => batch.push(
             handle,
             import_dense::Args { source: &source },
             import_dense::OutputArgs {
-                value: &mut destination,
+                value: &mut resident,
             },
         ),
-        AttestedImport::Repack(handle) => batch.push(
-            handle,
+        AttestedImport::Repack { repack, .. } => batch.push(
+            repack,
             repack_weight::Args { source: &source },
             repack_weight::OutputArgs {
-                value: &mut destination,
+                value: &mut resident,
             },
         ),
-    };
-    queued.map_err(|error| SubmitError::Device(DeviceError::Execution(error.to_string())))
+    }
+    .map_err(execution)?;
+    match bound {
+        Some(bound) => batch
+            .push(
+                bound_entry(handle)?,
+                packing_bound::Args {
+                    weight: destination,
+                    bound,
+                },
+                packing_bound::OutputArgs,
+            )
+            .map_err(execution),
+        None => Ok(()),
+    }
+}
+
+/// The entry that makes the packing bound of a weight `handle` imports.
+fn bound_entry(handle: &AttestedImport) -> Result<&NativeKernel<packing_bound::Entry>, SubmitError> {
+    match handle {
+        AttestedImport::Repack {
+            bound: Some(bound), ..
+        } => Ok(bound),
+        _ => Err(invariant(
+            "a weight with a packing bound is imported without its bound's entry".into(),
+        )),
+    }
+}
+
+fn execution(error: impl std::fmt::Display) -> SubmitError {
+    SubmitError::Device(DeviceError::Execution(error.to_string()))
 }
 
 fn invariant(detail: String) -> SubmitError {
@@ -305,6 +344,7 @@ mod tests {
             source_bytes: values.len() as u64,
             resident_bytes: values.len() as u64,
             scale: None,
+            bound: 0,
             streamed: None,
         };
         // SAFETY: fill_staged_source writes every physical upload byte.
@@ -366,7 +406,11 @@ mod tests {
                 &seismic::NativeSpecialization::new(),
             )
             .unwrap();
-            import_into(&AttestedImport::Repack(kernel), &source, &resident).unwrap();
+            let repack = AttestedImport::Repack {
+                repack: kernel,
+                bound: None,
+            };
+            import_into(&repack, &source, &resident, None).unwrap();
             assert_eq!(resident.extents(), shape);
             assert_eq!(
                 resident.read_to_host().unwrap(),
@@ -431,7 +475,11 @@ mod tests {
             &seismic::NativeSpecialization::new(),
         )
         .unwrap();
-        import_into(&AttestedImport::Repack(kernel), &source, &resident).unwrap();
+        let repack = AttestedImport::Repack {
+            repack: kernel,
+            bound: None,
+        };
+        import_into(&repack, &source, &resident, None).unwrap();
         assert_eq!(
             resident.read_to_host().unwrap(),
             resident_element
@@ -515,10 +563,14 @@ mod tests {
         .unwrap();
         let mut batch = NativeTensorBatch::new(&device);
         enqueue_into(
-            &AttestedImport::Repack(packed_kernel),
+            &AttestedImport::Repack {
+                repack: packed_kernel,
+                bound: None,
+            },
             &mut batch,
             &packed,
             &packed_result,
+            None,
         )
         .unwrap();
         enqueue_into(
@@ -526,6 +578,7 @@ mod tests {
             &mut batch,
             &dense,
             &dense_result,
+            None,
         )
         .unwrap();
         drop(region);

@@ -6,7 +6,7 @@
 
 use crate::native::{PostNormKernels, SublayerOutput};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::ScaledWeight;
+use crate::programs::native_target_graph::PackedWeight;
 use magnitude_kernels::{post_norm_residual, project_rows};
 use seismic::{
     Element, Entry, NativeGraph, NativeGraphMetadata, NativeKernel, WorkflowTensor,
@@ -85,7 +85,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
     entries: PostNormEntries<'a, G>,
     residual: &WorkflowTensor,
     source: WorkflowTensorRef<'_>,
-    weight: &ScaledWeight,
+    weight: &PackedWeight,
     norm: &WorkflowTensor,
     out_rows: &WorkflowTensor,
     shape: PostNormShape,
@@ -98,6 +98,7 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
         inputs,
         outputs,
     } = shape;
+    let PackedWeight { scaled, bound } = weight;
     let projected = graph
         .enqueue(
             entries.project,
@@ -105,13 +106,16 @@ pub(crate) fn post_norm<'a, G: GraphDraft + 'a>(
                 ("M", out),
                 ("K", inputs),
                 ("N", outputs),
-                ("WS", weight.extent),
+                ("WS", scaled.extent),
+                ("WB", bound.extent),
             ],
             project_rows::WorkflowArgs {
                 source,
-                weight: (&weight.weight).into(),
-                weight_scale: (&weight.scale).into(),
-            },        )?
+                weight: (&scaled.weight).into(),
+                weight_scale: (&scaled.scale).into(),
+                weight_bound: (&bound.tensor).into(),
+            },
+        )?
         .value;
     Ok(graph
         .enqueue(

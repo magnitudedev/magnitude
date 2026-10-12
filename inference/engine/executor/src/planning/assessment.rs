@@ -650,7 +650,7 @@ mod tests {
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
             "down_weight",
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0)],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0), ("DB", 0)],
         )
         .unwrap();
         assert_eq!(
@@ -664,7 +664,7 @@ mod tests {
         let results = seismic::generated::checked_native_tensor_results::<dense_output::Entry>(
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0)],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0), ("DB", 0)],
         )
         .unwrap();
         assert_eq!(
@@ -678,7 +678,7 @@ mod tests {
         let call = seismic::generated::checked_native_graph_call::<dense_output::Entry>(
             BackendName::Cpu,
             &[("DW", Element::f32()), ("A", Element::f32())],
-            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0)],
+            &[("M", 4), ("O", 2), ("H", 16), ("F", 32), ("DS", 0), ("DB", 0)],
         )
         .unwrap();
         let seismic::generated::CheckedNativeGraphCall::Checked {
@@ -1914,6 +1914,7 @@ mod tests {
                     source_bytes: bytes,
                     resident_bytes: bytes,
                     scale: None,
+                    bound: 0,
                     streamed: None,
                 }
             })

@@ -7,11 +7,12 @@
 
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
 use crate::{
     ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, native::ShortConvKernels,
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -81,11 +82,24 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
-    weight_scale: &WorkflowTensor,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
     block: ShortConvBlock,
 ) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
+    // The weights have no second-level scales: their scale ports bind the
+    // absent operand.
+    let weight_scale = &GraphConstant::absent(graph, constants)?.tensor().clone();
+    let output_bound = PackingBound::planned(
+        graph,
+        load,
+        WeightRole {
+            scope,
+            kind: WeightKind::RecurrentOutput,
+        },
+        weights,
+        constants,
+    )?;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
     let input_gate = weight(graph, WeightKind::ShortConvInputGate)?;
@@ -167,12 +181,18 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     let output = graph
         .enqueue(
             kernels.output,
-            &shape.output_dimensions(block.rows),
+            &[
+                shape.output_dimensions(block.rows).as_slice(),
+                &[("OB", output_bound.extent)],
+            ]
+            .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
-            },        )?
+                output_bound: (&output_bound.tensor).into(),
+            },
+        )?
         .value;
     Ok((output, window, controls))
 }

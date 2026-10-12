@@ -1900,6 +1900,8 @@ fn step_form(
         .with_static("NK", g.key_heads as u64)
         .with_static("NV", g.value_heads as u64)
         .with_static("W", g.width as u64)
+        .with_static("QB", 0)
+        .with_static("ZB", 0)
         .with_param("BATCH_FROM", mapping.batch_from)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
@@ -1936,6 +1938,8 @@ fn step_form(
         alpha_weight: &inputs.weights[2],
         beta_weight: &inputs.weights[3],
         epsilon: 1e-6,
+        qkv_bound: &Tensor::from_host(device, Element::f32(), &[0], &[]).unwrap(),
+        gate_bound: &Tensor::from_host(device, Element::f32(), &[0], &[]).unwrap(),
     })
     .unwrap()
     .value;

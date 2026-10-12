@@ -11,7 +11,7 @@
 //! state; the published bank is the case state restored before each
 //! validation run.
 
-use super::cases::projection_shape;
+use super::cases::{packing_statics, projection_shape};
 use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
@@ -46,6 +46,8 @@ pub(crate) struct StateSpaceProjectCase {
     projection: Tensor,
     empty: Tensor,
     epsilon: f32,
+    bound: Tensor,
+    no_bound: Tensor,
 }
 
 impl StateSpaceProjectTuning {
@@ -91,7 +93,18 @@ impl EntryTuning for StateSpaceProjectTuning {
             return Err("the state-space projection disagrees with the binding".into());
         }
         let [_, statics @ ..] = shape.project_dimensions(0);
-        Ok(statics.to_vec())
+        let mut statics = statics.to_vec();
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[
+                ("QB", Some(WeightKind::StateSpaceProjection)),
+                ("GB", None),
+                ("KB", None),
+                ("VB", None),
+            ],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -121,6 +134,8 @@ impl EntryTuning for StateSpaceProjectTuning {
                         .map_err(|error| error.to_string())?,
                     projection,
                     epsilon: self.epsilon,
+                    bound: inputs.bound(scope, WeightKind::StateSpaceProjection)?,
+                    no_bound: inputs.unit_scale(0)?,
                 })
             })
             .collect()
@@ -136,6 +151,10 @@ impl EntryTuning for StateSpaceProjectTuning {
             value_weight: &case.empty,
             epsilon: case.epsilon,
             project_mode: 0,
+            query_bound: &case.bound,
+            gate_bound: &case.no_bound,
+            key_bound: &case.no_bound,
+            value_bound: &case.no_bound,
         }
     }
 
@@ -153,6 +172,7 @@ pub(crate) struct StateSpaceOutputCase {
     hidden: Tensor,
     gated: Tensor,
     output: Tensor,
+    bound: Tensor,
 }
 
 impl EntryTuning for StateSpaceOutputTuning {
@@ -179,7 +199,13 @@ impl EntryTuning for StateSpaceOutputTuning {
             return Err("the state-space output projection disagrees with the binding".into());
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
-        Ok(statics.to_vec())
+        let mut statics = statics.to_vec();
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("OB", Some(WeightKind::RecurrentOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -209,6 +235,7 @@ impl EntryTuning for StateSpaceOutputTuning {
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
+                    bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                 })
             })
             .collect()
@@ -219,6 +246,7 @@ impl EntryTuning for StateSpaceOutputTuning {
             hidden: &case.hidden,
             gated: &case.gated,
             output_weight: &case.output,
+            output_bound: &case.bound,
         }
     }
 

@@ -126,15 +126,26 @@ impl GraphConstant {
         )
     }
 
-    /// A zero-extent scale port for a weight without a second-level scale.
-    pub(crate) fn absent_scale<G: GraphDraft>(
+    /// The graph's absent operand: a zero-extent F32 constant, which every
+    /// port of a weight's second-level scale or packing bound binds where the
+    /// weight has none. Its first reader declares it in `constants`, the
+    /// graph's (an unread port is unbound), and every later one shares it.
+    pub(crate) fn absent<G: GraphDraft>(
         graph: &mut G,
         constants: &mut Vec<Self>,
-    ) -> Result<seismic::WorkflowTensor, GraphError> {
-        let scale = Self::f32(graph, &[])?;
-        let tensor = scale.port().tensor().clone();
-        constants.push(scale);
-        Ok(tensor)
+    ) -> Result<NativePort, GraphError> {
+        let declared = constants.iter().find_map(|constant| {
+            (constant.value.element == Element::f32() && constant.value.extents == [0])
+                .then(|| constant.port.clone())
+                .flatten()
+        });
+        if let Some(port) = declared {
+            return Ok(port);
+        }
+        let absent = Self::f32(graph, &[])?;
+        let port = absent.port().clone();
+        constants.push(absent);
+        Ok(port)
     }
 
     /// An `f32` constant of the given extents, possibly empty.
