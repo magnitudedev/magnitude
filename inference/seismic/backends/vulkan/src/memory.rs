@@ -8,6 +8,10 @@
 //! A block is freed once it holds no allocation, so released storage returns
 //! to the device's memory budget: the engine reads the budget less usage as
 //! its headroom, and a block kept empty would hide released storage from it.
+//! A block's unallocated space counts against that budget too, so a new
+//! device-local block never exceeds the room the caller grants beyond the
+//! free space device-local blocks already hold: an allocation that fits its
+//! grant never grows the device's usage past it.
 //! Host-visible blocks are persistently mapped.
 
 use crate::device::{call, Inner};
@@ -94,6 +98,7 @@ struct Pool {
     kind: StorageKind,
     memory_type: u32,
     mapped: bool,
+    device_local: bool,
     blocks: Mutex<Vec<Arc<Block>>>,
 }
 
@@ -165,6 +170,7 @@ impl Memory {
             kind,
             memory_type,
             mapped: flags.contains(visible),
+            device_local: flags.contains(local),
             blocks: Mutex::new(Vec::new()),
         };
         Ok(Self {
@@ -185,12 +191,42 @@ impl Memory {
             .expect("every storage kind has a pool")
     }
 
+    /// Free space held by device-local blocks: device usage that no
+    /// allocation charges.
+    fn device_local_slack(&self) -> u64 {
+        self.pools
+            .iter()
+            .filter(|pool| pool.device_local)
+            .map(|pool| {
+                pool.blocks
+                    .lock()
+                    .expect("pool lock is never poisoned")
+                    .iter()
+                    .map(|block| {
+                        block
+                            .free
+                            .lock()
+                            .expect("block free list lock is never poisoned")
+                            .iter()
+                            .map(|(_, bytes)| bytes)
+                            .sum::<u64>()
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// A range of `bytes`. `room`, when given, is the device usage the
+    /// caller may add: a new device-local block is sized within it less the
+    /// free space device-local blocks already hold, and an allocation that
+    /// needs a block larger than that is refused as a capacity shortfall.
     pub(crate) fn allocate(
         &self,
         device: &ash::Device,
         kind: StorageKind,
         bytes: u64,
         alignment: u64,
+        room: Option<u64>,
     ) -> Result<Range, ExecutionError> {
         if bytes > self.max_allocation {
             return Err(ExecutionError::AllocationCapacity {
@@ -201,6 +237,10 @@ impl Memory {
         let bytes = bytes.max(1);
         let alignment = alignment.max(MINIMUM_ALIGNMENT);
         let pool = self.pool(kind);
+        // Read before taking this pool's lock: the slack spans every pool.
+        let room = room
+            .filter(|_| pool.device_local)
+            .map(|room| room.saturating_sub(self.device_local_slack()));
         let mut blocks = pool.blocks.lock().expect("pool lock is never poisoned");
         let found = blocks
             .iter()
@@ -218,9 +258,7 @@ impl Memory {
                     .filter(|block| !block.dedicated)
                     .map(|block| block.bytes)
                     .max();
-                let size = largest
-                    .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
-                    .min(self.block_cap);
+                let size = block_bytes(largest, self.block_cap, bytes, room)?;
                 let dedicated = bytes > size;
                 let block = create_block(
                     device,
@@ -263,6 +301,28 @@ impl Memory {
                 destroy_block(device, &block);
             }
         }
+    }
+}
+
+/// The size of a new block for an allocation of `bytes`: double the largest
+/// block of the pool (64 MiB first) up to `cap`, within `room` when given. An
+/// allocation larger than the room is a capacity shortfall.
+fn block_bytes(
+    largest: Option<u64>,
+    cap: u64,
+    bytes: u64,
+    room: Option<u64>,
+) -> Result<u64, ExecutionError> {
+    let size = largest
+        .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
+        .min(cap);
+    match room {
+        Some(room) if bytes > room => Err(ExecutionError::AllocationCapacity {
+            required: bytes.into(),
+            available: room,
+        }),
+        Some(room) => Ok(size.min(room)),
+        None => Ok(size),
     }
 }
 
@@ -502,6 +562,24 @@ mod tests {
             .sum()
     }
 
+    /// A new block never grows device usage past the room granted: near the
+    /// limit it is cut to the room (an allocation still fits whole), and an
+    /// allocation beyond the room is refused with the room as available.
+    #[test]
+    fn new_blocks_stay_within_the_granted_room() {
+        const MIB: u64 = 1 << 20;
+        let cap = 1024 * MIB;
+        assert_eq!(block_bytes(None, cap, MIB, None).unwrap(), FIRST_BLOCK_BYTES);
+        assert_eq!(block_bytes(Some(512 * MIB), cap, MIB, None).unwrap(), cap);
+        assert_eq!(block_bytes(Some(512 * MIB), cap, MIB, Some(4096 * MIB)).unwrap(), cap);
+        assert_eq!(block_bytes(Some(512 * MIB), cap, 300 * MIB, Some(400 * MIB)).unwrap(), 400 * MIB);
+        assert_eq!(block_bytes(Some(512 * MIB), cap, 400 * MIB, Some(400 * MIB)).unwrap(), 400 * MIB);
+        assert!(matches!(
+            block_bytes(Some(512 * MIB), cap, 401 * MIB, Some(400 * MIB)),
+            Err(ExecutionError::AllocationCapacity { available, .. }) if available == 400 * MIB
+        ));
+    }
+
     /// Retained state fills blocks; releasing it (the engine's release order
     /// evicting retained prefixes and shrinking their slabs) must return
     /// every block it emptied to the device, or the budget less usage the
@@ -514,6 +592,7 @@ mod tests {
             kind: StorageKind::Device,
             memory_type: 0,
             mapped: false,
+            device_local: true,
             blocks: Mutex::new(Vec::new()),
         };
         let blocks = (0..4).map(|_| block(16 * SLAB)).collect::<Vec<_>>();

@@ -107,17 +107,21 @@ impl VulkanOpened {
         &self,
         bytes: u64,
         alignment: u64,
-        make: impl FnOnce(&seismic_vulkan::Device) -> Result<seismic_vulkan::Buffer, ExecutionError>,
+        make: impl FnOnce(&seismic_vulkan::Device, Option<u64>) -> Result<seismic_vulkan::Buffer, ExecutionError>,
     ) -> Result<Arc<Allocation>, ExecutionError> {
         let limits = AllocationLimits {
             max_allocation_bytes: self.service.facts().limits.max_allocation_bytes,
             max_allocation_alignment: MAX_ALLOCATION_ALIGNMENT,
         };
+        // The device usage this allocation may add: the limit's room before
+        // its own charge.
+        let usage = self.memory.usage();
+        let room = usage.limit.map(|limit| limit.saturating_sub(usage.charged));
         let mut reservation = driver::reserve(&self.memory, bytes)?;
         driver::allocate_reserved(limits, bytes, alignment, &mut reservation, || {
             Ok(Box::new(VulkanStorage {
                 service: self.service.clone(),
-                buffer: make(&self.service)?,
+                buffer: make(&self.service, room)?,
             }))
         })
     }
@@ -127,8 +131,8 @@ impl VulkanOpened {
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_with(bytes, alignment, |service| {
-            service.allocate(bytes, alignment)
+        self.allocate_with(bytes, alignment, |service, room| {
+            service.allocate(bytes, alignment, room)
         })
     }
 
@@ -137,8 +141,8 @@ impl VulkanOpened {
         bytes: u64,
         alignment: u64,
     ) -> Result<Arc<Allocation>, ExecutionError> {
-        self.allocate_with(bytes, alignment, |service| {
-            service.allocate_upload(bytes, alignment)
+        self.allocate_with(bytes, alignment, |service, room| {
+            service.allocate_upload(bytes, alignment, room)
         })
     }
 }

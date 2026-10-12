@@ -308,15 +308,27 @@ impl Device {
         &self.inner.facts
     }
 
-    /// Device-local storage.
-    pub fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        self.allocate_kind(StorageKind::Device, bytes, alignment)
+    /// Device-local storage. `room`, when given, bounds the device usage the
+    /// allocation may add, block slack included.
+    pub fn allocate(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        room: Option<u64>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_kind(StorageKind::Device, bytes, alignment, room)
     }
 
     /// Storage the host writes before each submission with plain memory
-    /// writes that never wait for device work.
-    pub fn allocate_upload(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        self.allocate_kind(StorageKind::Upload, bytes, alignment)
+    /// writes that never wait for device work; `room` as for
+    /// [`Device::allocate`].
+    pub fn allocate_upload(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        room: Option<u64>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_kind(StorageKind::Upload, bytes, alignment, room)
     }
 
     fn allocate_kind(
@@ -324,11 +336,12 @@ impl Device {
         kind: StorageKind,
         bytes: u64,
         alignment: u64,
+        room: Option<u64>,
     ) -> Result<Buffer, ExecutionError> {
         let range = self
             .inner
             .memory
-            .allocate(&self.inner.device, kind, bytes, alignment)?;
+            .allocate(&self.inner.device, kind, bytes, alignment, room)?;
         Ok(Buffer::new(self.inner.clone(), range))
     }
 
@@ -601,6 +614,7 @@ impl Device {
                 StorageKind::Upload,
                 ARGUMENT_CHUNK_BYTES,
                 256,
+                None,
             ),
         }
     }
@@ -852,7 +866,7 @@ impl Inner {
         };
         let range = match self
             .memory
-            .allocate(device, StorageKind::Staging, STAGING_BYTES, 256)
+            .allocate(device, StorageKind::Staging, STAGING_BYTES, 256, None)
         {
             Ok(range) => range,
             Err(error) => {

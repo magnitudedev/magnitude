@@ -59,7 +59,7 @@ fn run(
         )
         .map_err(|error| failed(&format!("{error:?}")))?;
     let bytes = ((input.len() + outputs) * 4) as u64;
-    let values = device.allocate(bytes, 16).map_err(|error| failed(&error))?;
+    let values = device.allocate(bytes, 16, None).map_err(|error| failed(&error))?;
     let input_bytes = input
         .iter()
         .flat_map(|word| word.to_le_bytes())

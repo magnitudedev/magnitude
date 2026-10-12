@@ -1232,6 +1232,12 @@ impl<F: ProgramFamily> Service<F> {
                     unload |= self
                         .observe(Some(&mut bindings))
                         .map_err(|error| (None, error))?;
+                    // Unloading terminated every request: nothing is left to
+                    // select, and observing again would decide it again.
+                    if unload {
+                        self.publish_ready().map_err(|error| (None, error))?;
+                        return Ok((Pipeline::Idle(bindings), self.ran(false, true)));
+                    }
                     self.publish_ready().map_err(|error| (None, error))?;
                     match self.select(&mut bindings)? {
                         Selected::Round(round) => {
@@ -1303,6 +1309,23 @@ impl<F: ProgramFamily> Service<F> {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// A group refused because memory is in the Reclaim band, or could not
+    /// be observed, is a memory observation: enter its condition now. A
+    /// memory wait ends only when memory is Normal again, so without this the
+    /// refused request would be selected again at once, within the same run,
+    /// before the next timed observation could see the band.
+    fn refused_for_memory(&mut self, error: &DomainError) {
+        let observation = match error {
+            DomainError::Reclaim => MemoryObservation::Reclaim,
+            DomainError::Blind(_) => MemoryObservation::Blind,
+            _ => return,
+        };
+        self.enter_memory_condition(self.memory_condition.observe(observation, self.now));
+        if matches!(self.memory_condition, MemoryCondition::Reclaim { .. }) {
+            self.release_owed = true;
+        }
     }
 
     /// Enter `next`. Memory returning to Normal is an availability change,
@@ -2123,6 +2146,7 @@ impl<F: ProgramFamily> Service<F> {
                     bindings = returned;
                     match error {
                         DomainError::Blind(_) | DomainError::Reclaim => {
+                            self.refused_for_memory(&error);
                             self.park(&mut round, group_, Wait::Memory);
                         }
                         DomainError::Input(error) => {
@@ -2243,7 +2267,8 @@ impl<F: ProgramFamily> Service<F> {
         }
         match current {
             Ok(()) => Ok(Provisioned::Fits(group_)),
-            Err(DomainError::Blind(_) | DomainError::Reclaim) => {
+            Err(error @ (DomainError::Blind(_) | DomainError::Reclaim)) => {
+                self.refused_for_memory(&error);
                 Ok(Provisioned::Short(group_, Wait::Memory))
             }
             Err(DomainError::Capacity(deficit)) => {

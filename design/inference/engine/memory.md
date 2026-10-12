@@ -200,7 +200,9 @@ kill is independent fault containment; it chooses nothing to release.
 - Reclamation follows the single order and stops when the measured deficit clears.
 - No engine claim leaves any used domain's headroom, or on Metal the working set's remaining bytes,
   at or below its planning reserve; a claim never unloads the model; persistent Reclaim ends in the
-  typed unloaded state within the one-second bound.
+  typed unloaded state within the one-second bound. A backend's allocation granularity counts: a
+  block allocator never adds device usage, its unallocated block space included, beyond the room
+  Seismic's limit grants, so a growth that would cross the reserve is a demand deficit, not Reclaim.
 - Threshold values exist in one policy definition. Host distress is derived only from Seismic's
   host observation; no other code path reads an OS pressure signal.
 - On macOS every engine holding is wired from allocation to release, and no holding is counted in

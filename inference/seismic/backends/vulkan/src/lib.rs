@@ -96,7 +96,7 @@ mod tests {
             let device = Device::open(description.facts.uuid).unwrap_or_else(|error| {
                 panic!("a device discovery reports available opens: {error}")
             });
-            let buffer = device.allocate(1 << 20, 256).expect("allocation");
+            let buffer = device.allocate(1 << 20, 256, None).expect("allocation");
             let bytes = (0..1u32 << 18)
                 .flat_map(|word| word.to_le_bytes())
                 .collect::<Vec<_>>();

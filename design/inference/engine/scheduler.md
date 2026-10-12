@@ -84,7 +84,9 @@ capacity at an availability epoch, or memory. A started round is a value that ow
 
 Provisioning a group first applies the [release order](memory.md#release-order). If the group
 still doesn't fit, each of its requests leaves the round with its operations, parked or pending,
-with a capacity wait at the current epoch, or a memory wait in Blind or Reclaim.
+with a capacity wait at the current epoch, or a memory wait in Blind or Reclaim. A Blind or Reclaim
+refusal, in provisioning or at submission, is itself a memory observation: the owner enters that condition
+at once, so the memory wait does not end before memory is observed Normal again.
 
 **The availability epoch advances exactly when capacity is freed:** a reconciled completion, a
 request ending or being evicted, a release or shrink, memory returning to Normal, or memory freed
