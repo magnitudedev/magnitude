@@ -330,7 +330,7 @@ void main() {
             }
         }
         let total = bytes.len() + cases.len() * 16;
-        let data = device.allocate(total as u64, 256).expect("allocation");
+        let data = device.allocate(total as u64, 256, None).expect("allocation");
         device.write(&data, 0, &bytes).expect("upload");
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
@@ -500,7 +500,7 @@ void main() {
             bytes.extend_from_slice(&input.to_le_bytes());
         }
         let total = bytes.len() + inputs.len() * 8;
-        let data = device.allocate(total as u64, 256).expect("allocation");
+        let data = device.allocate(total as u64, 256, None).expect("allocation");
         device.write(&data, 0, &bytes).expect("upload");
         let mut batch = DirectBatch::new(&device).expect("batch");
         batch
