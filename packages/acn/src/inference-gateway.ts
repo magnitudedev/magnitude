@@ -1,3 +1,4 @@
+import { zstdDecompress } from "node:zlib"
 import * as IcnSchemas from "@magnitudedev/icn-protocol/schemas"
 import { Context, Data, Effect, Schema } from "effect"
 import { parseTree, type Node, type ParseError } from "jsonc-parser"
@@ -192,6 +193,22 @@ const readBoundedBody = async (
   }
   return bytes
 }
+
+/**
+ * Decode zstd content, stopping once the output exceeds `limit`. A few
+ * kilobytes of zstd can expand to gigabytes, and `Bun.zstdDecompress` has no
+ * output bound, so it would allocate all of it before any size check.
+ */
+const decodeBoundedZstd = (
+  bytes: Uint8Array,
+  limit: number,
+): Promise<Uint8Array | undefined> => new Promise((resolve, reject) => {
+  zstdDecompress(bytes, { maxOutputLength: limit }, (error, decoded) => {
+    if (!error) resolve(decoded)
+    else if ((error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") resolve(undefined)
+    else reject(error)
+  })
+})
 
 const propertyName = (node: Node): unknown => node.children?.[0]?.value
 
@@ -515,13 +532,13 @@ const classifyCodexRoutingBody = async (source: Request): Promise<RoutingBodyRes
     return invalidCodex("Request body exceeds the 128 MB routing limit", 413)
   }
   if (encoding !== "zstd") return classifyRoutingBytes(original, invalidCodex)
-  let decoded: Uint8Array
+  let decoded: Uint8Array | undefined
   try {
-    decoded = await Bun.zstdDecompress(original)
+    decoded = await decodeBoundedZstd(original, MAX_CODEX_ROUTING_BODY_BYTES)
   } catch {
     return invalidCodex("Request body is not valid zstd content")
   }
-  if (decoded.byteLength > MAX_CODEX_ROUTING_BODY_BYTES) {
+  if (decoded === undefined) {
     return invalidCodex("Decoded request body exceeds the 128 MB routing limit", 413)
   }
   const classified = classifyRoutingBytes(decoded, invalidCodex)
