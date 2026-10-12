@@ -424,6 +424,36 @@ fn eviction_resumes_from_a_retained_prefix_and_replays_the_rest() {
     assert_eq!(decode.round_forward().kind, WorkKind::Decode);
 }
 
+/// A request evicted after it decoded, then resumed from a prefix inside its
+/// prompt, replays the prompt's tail and its generated rows in separate
+/// rounds: the executor admits target rows only within, or wholly past, the
+/// prepared input.
+#[test]
+fn replay_from_a_prompt_prefix_stops_at_the_prompt_end() {
+    let mut generation = prefill(generation(None), 10);
+    let checkpoint = generation.method_checkpoint().unwrap();
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    (generation, _) = resolve(decode, &[11], None);
+    assert_eq!(generation.resident_position(), 3);
+    generation.evicted().unwrap();
+    generation.resume_at(Some((1, &checkpoint))).unwrap();
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(2)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 2);
+    let replay = start(generation, 4);
+    assert_eq!(replay.round_forward().kind, WorkKind::Replay);
+    assert_eq!(replay.round_forward().tokens, [TokenId(10)]);
+    let (generation, _) = resolve(replay, &[], None);
+    assert_eq!(generation.resident_position(), 3);
+    assert_eq!(generation.generated(), [TokenId(10), TokenId(11)]);
+    let decode = start(generation, 1);
+    assert_eq!(decode.round_forward().kind, WorkKind::Decode);
+    assert_eq!(decode.round_forward().tokens, [TokenId(11)]);
+}
+
 /// An admitted MTP generation that is not yet resident.
 fn mtp_fresh(prompt: &[u32], proposals: u8) -> Generation {
     let mut configured = options();

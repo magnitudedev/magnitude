@@ -545,9 +545,14 @@ impl Generation {
         }
         let position = self.resident_position;
         if position < self.reconciliation_target {
-            let end = self
-                .layout
-                .chunk_end(position, self.reconciliation_target, allowance)?;
+            // A replay from inside the prompt ends at the prompt end: the executor admits
+            // target rows only within, or wholly past, the prepared input.
+            let target = if position < self.prompt.len() {
+                self.reconciliation_target.min(self.prompt.len())
+            } else {
+                self.reconciliation_target
+            };
+            let end = self.layout.chunk_end(position, target, allowance)?;
             return Ok(RoundPlan::Replay { end });
         }
         if position < self.prompt.len() {

@@ -55,7 +55,9 @@ path it holds and are not part of an entry's identity.
   request** all become resident through that one transition, when rounds are formed. They differ
   only in when it runs.
 - **Eviction** releases numerical state and encoded features; the input stays, so replay is
-  conditioned exactly as the first pass.
+  conditioned exactly as the first pass. A replay that resumes inside the prompt ends at the
+  prompt end, and the generated rows replay in a later round: a round's target rows lie wholly
+  within or wholly past the prepared input.
 - **Resume bound**: a resumed request still computes the row it next samples from, so only
   prefixes strictly below it qualify: the prompt length before the first token, the accepted
   length after.
