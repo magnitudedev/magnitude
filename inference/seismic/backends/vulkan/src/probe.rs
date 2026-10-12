@@ -92,11 +92,13 @@ fn run(
         .collect())
 }
 
-/// a = b = 1 + 2^-12, c = -(1 + 2^-11): a*b = 1 + 2^-11 + 2^-24 exactly, so
-/// the fused result is 2^-24 while a rounded product gives 0.
-const MULTIPLY_ADD_WITNESS: [u32; 3] = [0x3f80_0800, 0x3f80_0800, 0xbf80_1000];
-const FUSED: u32 = 0x3380_0000;
-const ROUNDED_TWICE: u32 = 0;
+/// a = b = 1 + 2^-12, c = -1: a*b = 1 + 2^-11 + 2^-24 exactly, a tie that
+/// rounds to the even 1 + 2^-11, so the fused result is 2^-11 + 2^-24 while
+/// a rounded product gives 2^-11. Neither is zero, so a probe whose writes
+/// never land (zeroed storage) is not mistaken for either.
+const MULTIPLY_ADD_WITNESS: [u32; 3] = [0x3f80_0800, 0x3f80_0800, 0xbf80_0000];
+pub(crate) const FUSED: u32 = 0x3a00_0400;
+pub(crate) const ROUNDED_TWICE: u32 = 0x3a00_0000;
 
 /// `fma` beside `a * b + c` of the same operands; the seal pass makes the
 /// latter `NoContraction` (the GLSL `precise` of the failing pattern).
@@ -189,6 +191,19 @@ pub(crate) fn rounding(device: &Device) -> Result<(), OpenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The multiply-add witness's fused and twice-rounded results are the
+    /// host's, distinct, and neither is the zero of unwritten storage.
+    #[test]
+    fn multiply_add_witness_distinguishes_fused_from_rounded_twice() {
+        let [a, b, c] = MULTIPLY_ADD_WITNESS.map(f32::from_bits);
+        // The product of two 13-bit significands is exact in f64.
+        let fused = (f64::from(a) * f64::from(b) + f64::from(c)) as f32;
+        assert_eq!(f64::from(fused), f64::from(a) * f64::from(b) + f64::from(c));
+        assert_eq!(fused.to_bits(), FUSED);
+        assert_eq!((a * b + c).to_bits(), ROUNDED_TWICE);
+        assert!(FUSED != ROUNDED_TWICE && FUSED != 0 && ROUNDED_TWICE != 0);
+    }
 
     /// Every non-exact witness result differs from rounding toward zero.
     #[test]

@@ -106,6 +106,9 @@ The CPU backend is always available as the fallback.
   - fp32 round-to-nearest-even
   - fp32 signed zero, Inf, and NaN preservation
   - a fused `fma`, either through `VK_KHR_shader_fma` or confirmed by a probe
+  - the probes (`fma`, and fp32 rounding where `RoundingModeRTE 32` is not declared) run at
+    discovery, once per process, so a device failing one is unavailable and selection falls
+    back to CPU
 - **Limits:**
   - 32 KiB of shared memory
   - 1024 invocations per workgroup, with workgroup size at least (1024, 1024, 64)

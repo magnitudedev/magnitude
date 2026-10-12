@@ -292,7 +292,11 @@ impl AdmittedWorkflowKind {
 }
 
 /// Enumerates every enabled backend. Only cheap native queries run here:
-/// no context, queue, stream, worker pool, probe or profile is created.
+/// no context, queue, stream, worker pool or profile is created, with one
+/// exception that keeps discovery the authority on availability: a Vulkan
+/// device meeting its static floor whose numerics only a probe establishes
+/// (no `RoundingModeRTE 32` or `VK_KHR_shader_fma`) is opened briefly, once
+/// per process, to run the probe, and is unavailable when it fails.
 pub(crate) fn discover() -> BackendDiscovery {
     use seismic_lang::registry::BackendName;
     let mut devices = Vec::new();

@@ -209,10 +209,11 @@ fn snapshot(
             )
         })
         .collect::<Vec<_>>();
-    let unified = topology
-        .devices()
-        .iter()
-        .any(|device| device.kind == DeviceKind::Gpu && host_backed(device));
+    // Host RAM is unified memory only when a usable GPU allocates from it: an integrated GPU below
+    // its backend's floor never runs a model, so the machine is CPU-only.
+    let unified = topology.devices().iter().any(|device| {
+        device.kind == DeviceKind::Gpu && host_backed(device) && unusable_reason(device).is_none()
+    });
     let mut memory_domains = vec![HardwareMemoryDomain {
         id: pool_domain_id(topology, host_pool.id),
         kind: if unified {
@@ -473,6 +474,13 @@ mod tests {
             .flat_map(|domain| &domain.devices)
             .count();
         assert_eq!(listed, topology.devices().len());
+        // Host RAM is unified memory only beside a usable integrated GPU.
+        let usable_integrated = topology.devices().iter().any(|device| {
+            device.kind == DeviceKind::Gpu
+                && unusable_reason(device).is_none()
+                && matches!(&device.memory, DeviceMemory::Established(memory) if memory.allocates_host_memory())
+        });
+        assert_eq!(system.kind == HardwareMemoryDomainKind::UnifiedMemory, usable_integrated);
         for device in topology.devices() {
             assert!(snapshot.memory_domains.iter().flat_map(|domain| &domain.devices).any(
                 |public| public.id.as_str() == device.selector.to_string()

@@ -75,15 +75,42 @@ impl FormationFacts {
             SUBGROUP_WIDTH
         };
         [
-            Self { subgroup_lanes: other_lanes, ..*self },
-            Self { float16: !float16, ..*self },
-            Self { matrix: !matrix, ..*self },
-            Self { wide_accumulators: !wide_accumulators, ..*self },
-            Self { mixed_dot: !mixed_dot, ..*self },
-            Self { f32_atomic_add: !f32_atomic_add, ..*self },
-            Self { shared_int64_atomics: !shared_int64_atomics, ..*self },
-            Self { rounding_rte_32: !rounding_rte_32, ..*self },
-            Self { denorm_preserve_32: !denorm_preserve_32, ..*self },
+            Self {
+                subgroup_lanes: other_lanes,
+                ..*self
+            },
+            Self {
+                float16: !float16,
+                ..*self
+            },
+            Self {
+                matrix: !matrix,
+                ..*self
+            },
+            Self {
+                wide_accumulators: !wide_accumulators,
+                ..*self
+            },
+            Self {
+                mixed_dot: !mixed_dot,
+                ..*self
+            },
+            Self {
+                f32_atomic_add: !f32_atomic_add,
+                ..*self
+            },
+            Self {
+                shared_int64_atomics: !shared_int64_atomics,
+                ..*self
+            },
+            Self {
+                rounding_rte_32: !rounding_rte_32,
+                ..*self
+            },
+            Self {
+                denorm_preserve_32: !denorm_preserve_32,
+                ..*self
+            },
         ]
         .into_iter()
         .filter(Self::consistent)
