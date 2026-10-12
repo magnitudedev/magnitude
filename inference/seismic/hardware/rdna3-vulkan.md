@@ -84,6 +84,19 @@ Check at least:
   - `OpFmaKHR` always gives `v_fma_f32`.
   - glslang cannot emit `OpFmaKHR` from GLSL. See spec §16.1.
 
+## The AMD Windows driver (V710 MxGPU, 32.0.21017.2052)
+
+- Driver id `AMD_PROPRIETARY`, compiler LLPC (`amdvlk64.dll`). Cooperative matrix is reported and works.
+  `VK_KHR_shader_fma` is absent, so kernels keep GLSL `fma()`.
+- LLPC faults (access violation inside `vkCreateComputePipelines`) when one cooperative-matrix constant,
+  such as the zero accumulator, is used by two functions of a module. glslang emits one constant per value
+  and type, so two `coopmat(0.0)` clears in different functions share it. The Vulkan kernels therefore take
+  every zero accumulator from one function (`lib/core/matrix.glsl`). A minimal repro is a compute shader
+  with two functions that each clear an accumulator with `coopmat<float, …, gl_MatrixUseAccumulator>(0.0)`.
+- Neither RADV nor the NVIDIA driver has this fault, so only a Windows AMD machine catches a regression. The
+  kernel crate's `vulkan_kernels_form` coverage does not: it passes with and without the workaround. Load a model
+  (prefill attention forms on every load) on such a machine instead.
+
 ## Baselines
 
 For llama.cpp comparisons on the same GPU, use an official llama.cpp Vulkan release binary, and

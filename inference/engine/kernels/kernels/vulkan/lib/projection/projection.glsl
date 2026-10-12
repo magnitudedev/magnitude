@@ -63,6 +63,7 @@
 #include <seismic/packets.glsl>
 #include "../core/reduce.glsl"
 #include "../core/functions.glsl"
+#include "../core/matrix.glsl"
 
 #include "stage.glsl"
 
@@ -570,12 +571,6 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 #define PROJECTION_GEMM_ROW_MAXIMUM 16u
 #define PROJECTION_GEMM_ROW_EXPONENT 17u
 
-#if SEISMIC_HAS_MATRIX
-#define PROJECTION_FRAGMENT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define PROJECTION_FRAGMENT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
-#define PROJECTION_FRAGMENT_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
-#endif
-
 // The accumulators of one subgroup's WM x WN sub-tile: (WM / 16) x (WN / 16)
 // fragments (fragment (i, j) at i * (WN / 16) + j), or per 32 x 32 block
 // (bi, bj) (block bi * (WN / 32) + bj) a 4 x 8 register tile per lane (rows 4
@@ -583,7 +578,7 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 // each of the lane's output rows (see `projection_gemm_pair`).
 struct projection_gemm_acc {
 #if SEISMIC_HAS_MATRIX
-    PROJECTION_FRAGMENT_C c[PROJECTION_GEMM_MAX_FRAGMENTS];
+    MATRIX_FRAGMENT_C c[PROJECTION_GEMM_MAX_FRAGMENTS];
 #else
     float c[32 * PROJECTION_GEMM_MAX_BLOCKS];
 #endif
@@ -798,13 +793,13 @@ void projection_gemm_multiply(const uint tm, const uint tn, const uint wm, const
 #if SEISMIC_HAS_MATRIX
     const uint fm = wm / 16u, fn = wn / 16u;
     [[unroll]] for (uint kk = 0u; kk < PROJECTION_GEMM_K; kk += 16u) {
-        PROJECTION_FRAGMENT_B b[4];
+        MATRIX_FRAGMENT_B b[4];
         [[unroll]] for (uint j = 0u; j < fn; ++j)
             coopMatLoad(b[j], seismic_shared_f16, b0 + (column0 + 16u * j) * PROJECTION_GEMM_LDA + kk,
                 PROJECTION_GEMM_LDA, gl_CooperativeMatrixLayoutColumnMajor);
         [[unroll]] for (uint i = 0u; i < fm; ++i) {
             if (i < live) {
-                PROJECTION_FRAGMENT_A a;
+                MATRIX_FRAGMENT_A a;
                 coopMatLoad(a, seismic_shared_f16, (row0 + 16u * i) * PROJECTION_GEMM_LDA + kk, PROJECTION_GEMM_LDA,
                     gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint j = 0u; j < fn; ++j)
@@ -852,7 +847,7 @@ void projection_gemm_accumulate(const int wk, const int uk, const bool paired, c
     const uint b_word = tm * (PROJECTION_GEMM_LDA / 8u);
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint i = 0u; i < (wm / 16u) * (wn / 16u); ++i)
-        acc.c[i] = PROJECTION_FRAGMENT_C(0.0);
+        acc.c[i] = matrix_zero();
     const uint scales = wm / 16u;
 #else
     [[unroll]] for (uint i = 0u; i < wm * wn / 32u; ++i)

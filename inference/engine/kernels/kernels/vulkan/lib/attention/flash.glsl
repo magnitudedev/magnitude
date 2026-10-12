@@ -20,6 +20,7 @@
 // This file is independent of any entry ABI.
 #include <seismic/element.glsl>
 #include <seismic/slab.glsl>
+#include "../core/matrix.glsl"
 
 #define FLASH_KEYS 32u
 #define FLASH_MAX_W 256u
@@ -37,12 +38,6 @@
 #define FLASH_WINDOW FLASH_MAX_W
 #else
 #define FLASH_WINDOW 64u
-#endif
-
-#if SEISMIC_HAS_MATRIX
-#define FLASH_FRAGMENT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define FLASH_FRAGMENT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
-#define FLASH_FRAGMENT_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
 #endif
 
 layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer flash_f16_rows { float16_t v[]; };
@@ -105,7 +100,7 @@ void flash_stage_slab(const int kind, uint64_t table, uint64_t slab_rows, uint r
 // published to the block's shared scratch (row-major, 32 floats per row).
 struct flash_scores_state {
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_C s[2];
+    MATRIX_FRAGMENT_C s[2];
 #else
     float s[16];
 #endif
@@ -113,8 +108,8 @@ struct flash_scores_state {
 
 void flash_scores_clear(out flash_scores_state state) {
 #if SEISMIC_HAS_MATRIX
-    state.s[0] = FLASH_FRAGMENT_C(0.0);
-    state.s[1] = FLASH_FRAGMENT_C(0.0);
+    state.s[0] = matrix_zero();
+    state.s[1] = matrix_zero();
 #else
     [[unroll]] for (uint j = 0u; j < 16u; ++j)
         state.s[j] = 0.0;
@@ -129,10 +124,10 @@ void flash_scores_add(uint64_t q, uint64_t q_stride, const uint w, uint k_base, 
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W; d += 16u) {
         if (d < w) {
-            FLASH_FRAGMENT_A a;
+            MATRIX_FRAGMENT_A a;
             coopMatLoad(a, flash_f16_rows(q).v, d, uint(q_stride), gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
-                FLASH_FRAGMENT_B b;
+                MATRIX_FRAGMENT_B b;
                 coopMatLoad(b, seismic_shared_f16, k_base + j * 16u * pitch + d, pitch, gl_CooperativeMatrixLayoutColumnMajor);
                 state.s[j] = coopMatMulAdd(a, b, state.s[j]);
             }
@@ -176,10 +171,10 @@ void flash_scores_add_shared(uint q_half, uint q_pitch, const uint w, uint k_bas
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W; d += 16u) {
         if (d < w) {
-            FLASH_FRAGMENT_A a;
+            MATRIX_FRAGMENT_A a;
             coopMatLoad(a, seismic_shared_f16, q_half + d, q_pitch, gl_CooperativeMatrixLayoutRowMajor);
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
-                FLASH_FRAGMENT_B b;
+                MATRIX_FRAGMENT_B b;
                 coopMatLoad(b, seismic_shared_f16, k_base + j * 16u * pitch + d, pitch, gl_CooperativeMatrixLayoutColumnMajor);
                 state.s[j] = coopMatMulAdd(a, b, state.s[j]);
             }
@@ -273,7 +268,7 @@ uint flash_window(const uint w, const uint window) { return min(window, w); }
 
 struct flash_output {
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_C c[FLASH_MAX_W / 16u];
+    MATRIX_FRAGMENT_C c[FLASH_MAX_W / 16u];
 #else
     float c[FLASH_MAX_W / 2u];
 #endif
@@ -284,7 +279,7 @@ void flash_output_clear(const uint w, const uint window, inout flash_output o) {
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
         if (d < flash_window(w, window) / 16u)
-            o.c[d] = FLASH_FRAGMENT_C(0.0);
+            o.c[d] = matrix_zero();
 #else
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 2u; ++d)
         if (d < flash_window(w, window) / 2u)
@@ -306,7 +301,7 @@ void flash_rescale(uint scratch, float alpha, const uint w, const uint window, i
         seismic_shared_f32[scratch + FLASH_FACTORS + (lane % 16u) * 16u + 8u * (lane / 16u) + i] = alpha;
     subgroupMemoryBarrierShared();
     subgroupBarrier();
-    FLASH_FRAGMENT_C factors;
+    MATRIX_FRAGMENT_C factors;
     coopMatLoad(factors, seismic_shared_f32, scratch + FLASH_FACTORS, 16u, gl_CooperativeMatrixLayoutRowMajor);
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d)
         if (d < flash_window(w, window) / 16u)
@@ -325,13 +320,13 @@ void flash_accumulate(uint p_half, uint v_base, const uint w, const uint window,
     const uint pitch = flash_pitch(w);
     const uint width = flash_window(w, window);
 #if SEISMIC_HAS_MATRIX
-    FLASH_FRAGMENT_A p[2];
+    MATRIX_FRAGMENT_A p[2];
     coopMatLoad(p[0], seismic_shared_f16, p_half, 32u, gl_CooperativeMatrixLayoutRowMajor);
     coopMatLoad(p[1], seismic_shared_f16, p_half + 16u, 32u, gl_CooperativeMatrixLayoutRowMajor);
     [[unroll]] for (uint d = 0u; d < FLASH_MAX_W / 16u; ++d) {
         if (d < width / 16u) {
             [[unroll]] for (uint j = 0u; j < 2u; ++j) {
-                FLASH_FRAGMENT_B v;
+                MATRIX_FRAGMENT_B v;
                 coopMatLoad(v, seismic_shared_f16, v_base + j * 16u * pitch + column0 + 16u * d, pitch,
                     gl_CooperativeMatrixLayoutRowMajor);
                 o.c[d] = coopMatMulAdd(p[j], v, o.c[d]);

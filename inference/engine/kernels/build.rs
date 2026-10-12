@@ -77,6 +77,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "prefill attention body (CUDA tensor-core flash, Vulkan tiled); Metal keeps its prefill in `attention.h`",
     ),
     (
+        "lib/core/matrix",
+        &[BackendName::Vulkan],
+        "cooperative-matrix fragment types and the one zero accumulator every Vulkan matrix body clears with",
+    ),
+    (
         "lib/attention/flash",
         &[BackendName::Vulkan],
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
