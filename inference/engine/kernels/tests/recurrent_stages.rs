@@ -1696,6 +1696,14 @@ fn convolved_step_form_gives_the_step_bits() {
         banks: 11,
         tape: 3,
     };
+    let q27 = Geometry {
+        key_heads: 16,
+        value_heads: 48,
+        width: 128,
+        convolution: 4,
+        banks: 11,
+        tape: 3,
+    };
     let small = Geometry {
         banks: 11,
         tape: 3,
@@ -1771,6 +1779,31 @@ fn convolved_step_form_gives_the_step_bits() {
             ],
             true,
             512,
+        ),
+        ("27B one row", q27, 1, vec![slot(1, 1, 1, 6)], true, 5120),
+        (
+            "27B four-row verify",
+            q27,
+            4,
+            vec![version(4, 1, 2, 6, 2)],
+            true,
+            5120,
+        ),
+        (
+            "27B eight-row verify",
+            q27,
+            8,
+            vec![version(8, 1, 2, 6, 2)],
+            true,
+            5120,
+        ),
+        (
+            "27B two slots of four",
+            q27,
+            8,
+            vec![version(4, 1, 1, 6, 1), version(4, 2, 2, 7, 0)],
+            true,
+            5120,
         ),
         ("35B one row", big, 1, vec![slot(1, 1, 1, 6)], true, 2048),
         (

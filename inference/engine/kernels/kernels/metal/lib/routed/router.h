@@ -10,6 +10,7 @@
 // This file is independent of any entry ABI.
 
 #include "../projection/projection.h"
+#include "../core/arrive.h"
 
 namespace routing {
 
@@ -77,7 +78,7 @@ struct Rows {
 
 // Logit column first + n of row m, rows `pitch` apart.
 struct Logits {
-    device float *logits;
+    arrive::coherent_device<float> logits;
     ulong pitch;
     ulong first;
     void store(uint m, uint n, float value) const { logits[ulong(m) * pitch + first + n] = value; }

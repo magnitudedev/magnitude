@@ -28,7 +28,7 @@ kernel void routed_route_shared(
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device uchar *shared_product [[buffer(SEISMIC_RESULT_2_BUFFER)]],
-    device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],

@@ -309,7 +309,13 @@ dispatches a block more than once: the checker rejects `repeat` on every other b
 A scratch buffer declared `sync` (`scratch S bytes (E) sync`) holds arrival counters: it is zero
 whenever one of the call's launches starts, and the call's kernels restore every counter they use
 to zero before the call ends. Kernels use it for "the last threadgroup to arrive finishes the
-work", in which no threadgroup waits for another, so it needs no co-residency.
+work", in which no threadgroup waits for another, so it needs no co-residency. The counter only
+orders the arrivals: every buffer the last threadgroup reads that other threadgroups of the same
+launch wrote must be device-coherent in the kernel's declaration: Metal `coherent(device)`
+(`arrive::coherent_device`), CUDA loads that bypass L1 (`__ldcg`). Device-scope fences order the
+counter but do not make plain loads see another core's stores; M1 Max-class GPUs serve them from a
+stale cache. The engine kernels' build rejects a Metal entry that binds atomic scratch and declares
+any other writable scratch without `coherent(device)`.
 
 ## Backend capabilities
 

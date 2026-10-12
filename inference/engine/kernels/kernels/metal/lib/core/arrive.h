@@ -1,12 +1,23 @@
 // Arrival counting across the threadgroups of one launch, over `sync`
 // scratch (zero whenever a launch starts; see the `sync` scratch contract).
 // A threadgroup that has finished its device stores arrives; exactly one
-// threadgroup, the last to arrive, is told so. It sees every other arrived
-// threadgroup's device stores, and it restores the counter to zero, so the
-// next launch over the same scratch starts from zero. No threadgroup ever
-// waits for another, so the threadgroups need not be co-resident.
+// threadgroup, the last to arrive, is told so, and it restores the counter
+// to zero, so the next launch over the same scratch starts from zero. No
+// threadgroup ever waits for another, so the threadgroups need not be
+// co-resident.
+//
+// The last threadgroup sees the other threadgroups' stores only through
+// memory declared `coherent_device`: the fences order the counter, but a
+// plain device load may be served from the reading core's non-coherent cache
+// and miss another core's stores. M1 Max-class GPUs (g13s, g13d) do miss
+// them, deterministically.
 
 namespace arrive {
+
+// A buffer that a launch's threadgroups store to and its last-arriving
+// threadgroup then loads from.
+template <typename T>
+using coherent_device = coherent(device) device T *;
 
 // Whether this threadgroup is the last of `expected` to arrive at `counter`.
 // Every thread of the threadgroup must call it, after its device stores;

@@ -9,6 +9,7 @@
 // rows are contiguous (unit stride).
 
 #include "../core/activation.h"
+#include "../core/arrive.h"
 #include <seismic/slab.h>
 
 namespace recurrent {
@@ -151,10 +152,10 @@ inline ulong raw_index(ulong row, ulong head, ulong state_row, constant ulong *s
 // forms a whole q or k row's convolved channels (`Inputs`) and L2-normalizes
 // it with one simd_sum, threads form the value channels of its state rows;
 // after one barrier the rows advance in order.
-template <uint LANE_ROWS, uint BLOCK_ROWS, uint SPAN, uint QK_STRIDE, uint V_STRIDE, typename Inputs>
+template <uint LANE_ROWS, uint BLOCK_ROWS, uint SPAN, uint QK_STRIDE, uint V_STRIDE, typename Inputs, typename Mixed>
 inline void advance_rows(device const Storage *projection, Inputs inputs,
     device const float *rate, device const float *time_bias,
-    device const ulong *delta, device const ulong *tape, device Storage *mixed, Slot slot, long begin, ulong head,
+    device const ulong *delta, device const ulong *tape, Mixed mixed, Slot slot, long begin, ulong head,
     ulong block_row0, ulong row0, threadgroup float *query_block, threadgroup float *key_block,
     threadgroup float *value_block, threadgroup float *beta_block, threadgroup float *decay_block,
     uint thread_index, uint threads, uint simdgroup, uint lane, constant ulong *seismic_words) {
@@ -329,9 +330,10 @@ struct Gated8 {
     float4 raw_even, raw_odd, z_even, z_odd, norm_even, norm_odd;
 };
 
-inline Gated8 gated_inputs8(device const Storage *mixed, device const Storage *projection,
+template <typename Mixed>
+inline Gated8 gated_inputs8(Mixed mixed, device const Storage *projection,
     device const uchar *norm, ulong row, ulong head, uint i, constant ulong *seismic_words) {
-    device const Storage *raw = mixed + raw_index(row, head, i, seismic_words);
+    const auto raw = mixed + raw_index(row, head, i, seismic_words);
     device const Storage *z = projection + row * SEISMIC_PROJECTION_STRIDE_0
         + (2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV + head) * SEISMIC_DIM_W + i;
     Gated8 v;
@@ -365,7 +367,7 @@ inline void store_gated8(thread const Gated8 &v, float inverse, device Storage *
 // raw values in column order, and a butterfly over the lanes gives each the
 // head's square sum. This is the lane grouping of the projection GEMV
 // staging. All threads of the threadgroup (whole simdgroups) call it.
-inline void gate_head(device const Storage *mixed, device const Storage *projection, device const uchar *norm,
+inline void gate_head(arrive::coherent_device<const Storage> mixed, device const Storage *projection, device const uchar *norm,
     device Storage *gated, ulong head, uint thread_index, uint threads, constant ulong *seismic_words) {
     constexpr uint LANES = SEISMIC_DIM_W / 8;
     static_assert(SEISMIC_DIM_W % 8 == 0 && LANES <= 32 && (LANES & (LANES - 1)) == 0,

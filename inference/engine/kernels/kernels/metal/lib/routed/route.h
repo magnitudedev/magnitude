@@ -15,7 +15,6 @@
 // gate logit (normalized . shared_router), formed like an expert's logit.
 
 #include "router.h"
-#include "../core/arrive.h"
 #include "../core/reduce.h"
 
 typedef element::Act Act;
@@ -134,7 +133,8 @@ inline routing::Rows<Norm> decode_rows(device const float *residual, device cons
 // Every thread calls it; `last` is one threadgroup word.
 inline void route_group(thread const routing::Rows<Norm> &in, device const uchar *router,
     device const float *shared_router, device int *routes, device float *scores, device uchar *normalized,
-    device float *coefficient, device float *logits, device atomic_uint *arrivals, constant ulong *seismic_words,
+    device float *coefficient, arrive::coherent_device<float> logits, device atomic_uint *arrivals,
+    constant ulong *seismic_words,
     threadgroup uchar *shared, threadgroup uint *last, uint group, uint tid, uint simd, uint lane) {
     const uint rows = uint(SEISMIC_DIM_M);
     const uint k = uint(SEISMIC_DIM_H);
