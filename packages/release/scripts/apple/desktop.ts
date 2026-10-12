@@ -9,7 +9,7 @@ import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { appleRequirement } from "../../src/trust"
 import { desktopInstaller, desktopUpdateArchive } from "../../src/targets"
 import * as Command from "@effect/platform/Command"
-import { AppleDistributionFailed, appleCommand, appleSigning } from "./signing"
+import { AppleDistributionFailed, appleCommand, appleNetworkCommand, appleSigning } from "./signing"
 import { notarizeAppleUnit } from "./distribution"
 import { verifyAppleDeploymentTarget } from "../build/common"
 
@@ -86,7 +86,7 @@ export const validateDesktopDistribution = (options: { readonly image: string; r
   yield* appleCommand("/usr/bin/diff", "-qr", join(mount, "Magnitude.app"), installedApp)
   for (const app of [installedApp, join(extracted, "Magnitude.app")]) {
     yield* appleCommand("/usr/bin/codesign", "--verify", "--deep", "--strict", "-R", `=${appleRequirement("dev.magnitude.desktop", signing.team)}`, app)
-    if (signing.mode === "developer-id") yield* appleCommand("/usr/bin/xcrun", "stapler", "validate", app)
+    if (signing.mode === "developer-id") yield* appleNetworkCommand("/usr/bin/xcrun", "stapler", "validate", app)
     const version = yield* appleCommand(join(app, "Contents/Resources", ACN_EXECUTABLE_NAME), "version")
     if (version.trim() !== options.version) return yield* new AppleDistributionFailed({ message: "Desktop contains a different service release" })
     const code = yield* Command.make(process.env.MAGNITUDE_TEST_NODE ?? "node", resolve(import.meta.dir, "../../../../desktop/src/fixtures/packaged-lifecycle.mjs")).pipe(
@@ -162,8 +162,8 @@ export const buildDesktopDmg = (options: {
   yield* signDesktopApplication(options.app)
   const notarization = yield* notarizeAppleUnit("desktop", options.output, [options.app])
   if (signing.mode === "developer-id") {
-    yield* appleCommand("/usr/bin/xcrun", "stapler", "staple", options.app)
-    yield* appleCommand("/usr/bin/xcrun", "stapler", "validate", options.app)
+    yield* appleNetworkCommand("/usr/bin/xcrun", "stapler", "staple", options.app)
+    yield* appleNetworkCommand("/usr/bin/xcrun", "stapler", "validate", options.app)
   }
   yield* fs.makeDirectory(options.output, { recursive: true })
   const filename = desktopInstaller(options.host)
