@@ -164,6 +164,9 @@ jobs:
         run: |
           choco install nsis --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'NSIS installation failed' }
+      - name: Install Rosetta for the x64 Mac target
+        if: matrix.id == 'darwin-x64'
+        run: /usr/bin/pgrep -q oahd || sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -317,6 +320,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ env.BUN_VERSION }}
+      - name: Install Rosetta for the x64 Mac target
+        if: matrix.id == 'darwin-x64'
+        run: /usr/bin/pgrep -q oahd || sudo /usr/sbin/softwareupdate --install-rosetta --agree-to-license
       - run: bun install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
