@@ -1395,6 +1395,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
     fn perform(
         &mut self,
         points: &mut dyn seismic::PointSource<'static, dense_output::Entry>,
+        _before: Option<Instant>,
     ) -> Result<seismic::Performed, TuneError> {
         let work = self.next().expect("a unit performs the work it named");
         let began = Instant::now();
@@ -1421,6 +1422,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
             stage: work.stage,
             quote: work.quote,
             actual: began.elapsed(),
+            interrupted: false,
             spent: seismic::Spent::default(),
             raises: Vec::new(),
             promoted: work.stage == seismic::Stage::Promote,
@@ -1763,9 +1765,10 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
     );
 }
 
-/// A unit's record is stored when its served choice changes and once when
-/// the optional work stops, not with every piece: the record a later load
-/// reads is the mandatory phase's until a promotion, and a unit that
+/// A unit's record is stored when its served choice changes, with that
+/// choice's serving artifact formed, and once when the optional work stops
+/// if a piece changed it since, not with every piece: the record a later
+/// load reads is the mandatory phase's until a promotion, and a unit that
 /// measured without promoting publishes its measurements once, at the stop.
 #[test]
 fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
@@ -1876,12 +1879,10 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
             // when the work stops.
             expected.push(("published", 2));
         } else {
-            // The promotion publishes the record with everything measured.
-            // When the work stops the promoted choice is final: its
-            // serving artifact is formed, once, and the record published
-            // with it.
+            // The promotion forms the promoted choice's serving artifact
+            // and publishes the record with everything measured. Nothing
+            // changed it after, so nothing is owed when the work stops.
             expected.push(("promoted", 2));
-            expected.push(("published", 2));
         }
         assert_eq!(*stored.seen.borrow(), expected);
         // Only a promoted choice has an artifact to publish: the canonical
@@ -1920,7 +1921,11 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
         ) -> Result<Option<ComposedCensus>, CatalogFailure> {
             panic!("an unused recipe must not construct inputs");
         }
-        fn qualify(&mut self, _: &mut TuningInputs<'_, 'a>) -> Result<bool, CatalogFailure> {
+        fn qualify(
+            &mut self,
+            _: &mut TuningInputs<'_, 'a>,
+            _before: Instant,
+        ) -> Result<bool, CatalogFailure> {
             panic!("an unused recipe must not qualify");
         }
         fn conclude(&mut self, selected: bool) -> Result<(), CatalogFailure> {
@@ -2039,7 +2044,11 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
                 qualification: Duration::from_millis(1),
             }))
         }
-        fn qualify(&mut self, inputs: &mut TuningInputs<'_, 'a>) -> Result<bool, CatalogFailure> {
+        fn qualify(
+            &mut self,
+            inputs: &mut TuningInputs<'_, 'a>,
+            _before: Instant,
+        ) -> Result<bool, CatalogFailure> {
             assert_eq!(inputs.choice(&self.dependency), Some(&self.expected));
             self.qualified.set(true);
             Ok(false)

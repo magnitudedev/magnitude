@@ -13,9 +13,11 @@
 //! owed ([`Unit::settle`]) inside the budget. The budget is used in full,
 //! to the smallest piece that still fits: a unit runs out of work only
 //! when its domain is exhausted.
-//! Work begun runs to its end. A forecast that was wrong leaves less for
-//! what follows; time past the budget is reported with the work that ran
-//! into it, its forecast and what it took, and fails nothing.
+//! A piece runs to its end or to its cutoff: the instant past which what
+//! is owed after it would no longer fit the budget ([`Unit::perform`]). A
+//! forecast that was wrong leaves less for what follows; time past the
+//! budget is reported with the work that ran into it, its forecast and
+//! what it took, and fails nothing.
 //!
 //! # The ending is work
 //!
@@ -78,7 +80,24 @@
 //! is still the unit of admission. It is admitted whole, on its whole
 //! price, when its compile starts, and from then it is in flight: its
 //! measurement runs when its compile has ended, before anything new is
-//! admitted, and nothing admitted is given up.
+//! admitted.
+//!
+//! A compile cannot be interrupted, and one that outruns its price must
+//! not take the time held back for the ending, nor run past the budget.
+//! A piece that compiles is started only if its compile ends within the
+//! budget at the most a compile has taken as far as the load has seen:
+//! the longest that has ended, and one that nothing served
+//! ([`Unit::cold_compile`]). Where a system cache serves most compiles, the
+//! compiles a load observes are its hits, and a miss's cost is seen only
+//! in the compile that nothing served. The ending begins at the
+//! cutoff of the pieces in flight, whatever their compiles are doing: the
+//! allocator waits for a compile no later than that, and from it nothing
+//! more is admitted or measured. A piece whose measurement has not run by
+//! then is abandoned ([`Abandoned`]), its unit's choice and record as they
+//! were. A compile selects nothing, and every unit holds a legal published
+//! choice, so what the units owe is settled while the abandoned compiles
+//! still run; they are waited for only once it is, and what they formed is
+//! dropped.
 //!
 //! Three resources are contended, and each is counted as itself.
 //!
@@ -114,11 +133,14 @@
 //! it might outrank, and gain nothing: its piece would wait its turn. With
 //! compiles of one second and measurements of a fifth, five compiles are
 //! in flight at once, each started a fifth of a second after the last.
-//! Until a compile is due the allocator waits, for that moment or for a
-//! compile to end, whichever is first ([`Workers::wait`]).
+//! Until a compile is due the allocator waits, for that moment, for a
+//! compile to end or for the ending, whichever is first
+//! ([`Workers::wait`]).
 //!
-//! Time past the budget is at most what the pieces in flight when the
-//! budget ended took: nothing is admitted after it.
+//! Time past the budget is at most what work in flight when the budget
+//! ended took: a piece performed across the budget's end because its
+//! runtime could not stop it sooner, or an abandoned compile that ran past
+//! the settling. Nothing is admitted after it.
 //!
 //! # Bytes are admitted like seconds
 //!
@@ -231,9 +253,15 @@ pub(crate) trait Unit {
         took: Duration,
         context: &mut Self::Context,
     ) -> Result<(), Self::Failure>;
-    /// Run the unit's next piece of work to its end. Returns the longest
-    /// single operation the unit has completed.
-    fn perform(&mut self, context: &mut Self::Context) -> Result<Duration, Self::Failure>;
+    /// Run the unit's next piece of work to its end, or until `before`, the
+    /// piece's cutoff, whichever is first: what the piece has completed by
+    /// then is kept, and nothing incomplete becomes evidence. Returns the
+    /// longest single operation the unit has completed.
+    fn perform(
+        &mut self,
+        context: &mut Self::Context,
+        before: Duration,
+    ) -> Result<Duration, Self::Failure>;
     /// The bytes of the inputs the unit holds, built for its work; zero
     /// when it holds none.
     fn holding(&self) -> u64 {
@@ -243,13 +271,6 @@ pub(crate) trait Unit {
     /// them up is held to before the load has observed inputs given up.
     fn built(&self) -> Quote {
         Quote::default()
-    }
-    /// The price of settling now what the unit owes ([`Unit::owed`]), when
-    /// that would be the load's first observation of a class of owed work
-    /// that until then is priced by a stand-in; none otherwise. A unit
-    /// that works again after it owes again, at the class's own price.
-    fn sample(&self) -> Option<Quote> {
-        None
     }
     /// Give up the inputs the unit holds. Its next piece builds them again
     /// and is priced with that, in seconds and in bytes.
@@ -335,6 +356,16 @@ pub(crate) trait Unit {
     fn host_footprint(&self, _context: &Self::Context) -> Option<u64> {
         Some(0)
     }
+    /// What a compile took that nothing served, once the load has run one
+    /// ([`Workers`] compiles may be served by a cache the load cannot see):
+    /// with the longest compile the load has run, what a compile is held
+    /// to end within ([`allocate`]); nothing before it has run.
+    fn cold_compile(_context: &Self::Context) -> Duration
+    where
+        Self: Sized,
+    {
+        Duration::ZERO
+    }
     /// The host bytes one thread of a compile holds while it runs, as this
     /// load observed its compiles; nothing where the host is not a domain
     /// apart.
@@ -403,6 +434,20 @@ struct Flight {
     unpriced: bool,
 }
 
+/// A piece of work admitted whose measurement never ran: the allocator's
+/// ending began before it could.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Abandoned {
+    pub unit: usize,
+    pub stage: Stage,
+    /// Its price when it was started.
+    pub quote: Quote,
+    /// When it was started.
+    pub began: Duration,
+    /// What its compile took on a worker.
+    pub formed: Duration,
+}
+
 /// What a piece of work that was not started did not fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -432,6 +477,8 @@ pub(crate) struct Report {
     pub admitted: Vec<Admitted>,
     /// The work still offered when the allocator stopped: none of it fit.
     pub refused: Vec<Refused>,
+    /// The pieces in flight when the ending began, never measured.
+    pub abandoned: Vec<Abandoned>,
     /// What settling the units' owed publications took, those settled
     /// when their units ran out of work with those settled at the stop.
     pub settling: Duration,
@@ -461,6 +508,9 @@ pub(crate) struct Ending {
     /// The units that gave their inputs up since, and what that took.
     pub released: usize,
     pub releasing: Duration,
+    /// Waiting, once everything owed was settled, for the compiles of
+    /// abandoned pieces to end.
+    pub draining: Duration,
 }
 
 /// The allocator's own operations by class, each priced by what it has
@@ -587,6 +637,8 @@ pub(crate) fn allocate<U: Unit>(
     let mut alone = vec![false; units.len()];
     // In the order admitted.
     let mut flights = Vec::<Flight>::new();
+    // The longest compile that has ended.
+    let mut compiled = Duration::ZERO;
     // The allocator's own operations, priced as they are observed.
     let mut own = Own::default();
     // Units settled since their last piece of work.
@@ -612,9 +664,10 @@ pub(crate) fn allocate<U: Unit>(
             crowded.fill(false);
             alone.fill(false);
         }
-        let landed = ended
-            .into_iter()
-            .try_for_each(|ended| land(units, context, &mut flights, ended));
+        let landed = ended.into_iter().try_for_each(|ended| {
+            compiled = compiled.max(ended.2);
+            land(units, context, &mut flights, ended)
+        });
         if let Err(failure) = landed {
             break Err(failure);
         }
@@ -654,36 +707,6 @@ pub(crate) fn allocate<U: Unit>(
         }
         if let Some(failure) = failed {
             break Err(failure);
-        }
-        // Owed work of a class the load has not run is priced by a
-        // stand-in, and a stand-in held back for every unit to the stop is
-        // budget no piece can use. The first unit to owe such work has it
-        // settled now, as a piece: at its price, when everything owed as
-        // things stand and the pass after it fit what remains. Settling
-        // it moves no time, since it was owed; from then the class is
-        // priced by what it took. One per class: once observed, no unit
-        // offers a first observation of it.
-        let standing = units
-            .iter()
-            .fold(own.pass(longest), |sum, unit| {
-                sum.saturating_add(forecast(&unit.owed(false), longest))
-            });
-        let sampled = (0..units.len()).find(|unit| {
-            !flying(*unit)
-                && units[*unit]
-                    .sample()
-                    .is_some_and(|quote| quote.fits(total.saturating_sub(clock.now()), longest))
-        });
-        if let Some(unit) = sampled.filter(|_| clock.now().saturating_add(standing) <= total) {
-            let settling = clock.now();
-            let outcome = units[unit].settle(context);
-            let took = clock.now().saturating_sub(settling);
-            report.settling += took;
-            apart += took;
-            match outcome {
-                Ok(()) => continue,
-                Err(failure) => break Err(failure),
-            }
         }
         let now = clock.now();
         let remaining = total.saturating_sub(now);
@@ -726,6 +749,13 @@ pub(crate) fn allocate<U: Unit>(
                     })
             })
             .collect::<Vec<_>>();
+        // The ending begins at the earliest cutoff of the pieces in flight
+        // ([`Unit::perform`]): from then what they would measure and what
+        // is owed after it no longer fit, whatever their compiles do.
+        let concluding = flights
+            .iter()
+            .map(|flight| total.saturating_sub(owed[flight.unit]))
+            .min();
         // A piece that needs more bytes than the load's optional work may
         // ever hold, its own unit's inputs with what it adds to them, is
         // refused for the load: nothing another unit gives up changes it.
@@ -830,19 +860,34 @@ pub(crate) fn allocate<U: Unit>(
                 (now, whole)
             }
         };
+        // A compile cannot be interrupted, and abandoned at the ending it is
+        // waited for. So beside its forecast it is held to end within the
+        // budget at the most a compile can take as far as the load has
+        // seen: the longest that has ended, and one that nothing served.
+        let cold = compiled.max(U::cold_compile(context));
         // The one admission rule over the whole queue: everything admitted,
         // the new piece in its place among it, and what is owed after end
-        // within the budget.
+        // within the budget; and a piece's compile, at the most a compile
+        // has taken, ends within it.
         let fits = |unit: usize, work: &Work| {
             let mut jobs = queue.clone();
             jobs.push(job(work));
             device_ends(now, jobs).saturating_add(owed[unit]) <= total
+                && (!ahead(work)
+                    || now.saturating_add(forecast(&work.forming, longest).max(cold)) <= total)
         };
         let (fitting, refused): (Vec<_>, Vec<_>) = offers
             .iter()
             .copied()
             .filter(|(unit, work)| work.stage == Stage::Discovery || settled(*unit))
             .partition(|(unit, work)| !starved[*unit] && !barred[*unit] && fits(*unit, work));
+        // At the ending nothing more is admitted or measured: what is in
+        // flight is abandoned, and every offer still standing is refused.
+        if concluding.is_some_and(|concluding| now >= concluding) {
+            let standing = fitting.into_iter().chain(refused).collect();
+            report.refused = refuse(units, context, standing, |unit| starved[unit] || barred[unit]);
+            break Ok(());
+        }
         // When a piece's compile is due to start: so that the piece is
         // ready when the device is done with the pieces ready before it.
         let due = |work: &Work| {
@@ -1127,42 +1172,25 @@ pub(crate) fn allocate<U: Unit>(
                 if narrowed {
                     continue;
                 }
-                // Nothing more starts: every refusal is final.
-                report.refused = refused
-                    .into_iter()
-                    .map(|(unit, work)| Refused {
-                        unit,
-                        stage: work.stage,
-                        quote: work.quote,
-                        footprint: work.footprint,
-                        refusal: if starved[unit] || barred[unit] {
-                            Refusal::Bytes
-                        } else {
-                            Refusal::Seconds
-                        },
-                    })
-                    .collect();
-                // A unit refused for its bytes is told before what it
-                // owes is settled: its record states what stopped it.
-                for refused in &report.refused {
-                    if refused.refusal == Refusal::Bytes {
-                        units[refused.unit].refused_for_bytes(context);
-                    }
-                }
+                report.refused = refuse(units, context, refused, |unit| {
+                    starved[unit] || barred[unit]
+                });
                 break Ok(());
             }
             // Work is in flight and nothing can start now: wait for a
-            // compile to end, or for the first compile that waits to be
-            // due.
+            // compile to end, for the first compile that waits to be due,
+            // or for the ending.
             (None, None, None) => {
                 let waiting = clock.now();
-                let ended = workers.wait(earliest.map(|due| due.saturating_sub(now)));
+                let until = earliest.into_iter().chain(concluding).min();
+                let ended = workers.wait(until.map(|until| until.saturating_sub(now)));
                 apart += clock.now().saturating_sub(waiting);
                 let Some(ended) = ended else {
                     continue;
                 };
                 crowded.fill(false);
                 alone.fill(false);
+                compiled = compiled.max(ended.2);
                 match land(units, context, &mut flights, ended) {
                     Ok(()) => continue,
                     Err(failure) => break Err(failure),
@@ -1171,7 +1199,9 @@ pub(crate) fn allocate<U: Unit>(
         };
         let held = ending[unit];
         let performing = clock.now();
-        let performed = units[unit].perform(context);
+        // Preserve the original cutoff and terminal obligations even when
+        // admitted work waits behind an underestimated piece.
+        let performed = units[unit].perform(context, total.saturating_sub(owed[unit]));
         starved.fill(false);
         alone.fill(false);
         published[unit] = false;
@@ -1202,7 +1232,7 @@ pub(crate) fn allocate<U: Unit>(
         report.ending.deciding += clock.now().saturating_sub(opened).saturating_sub(apart);
     }
     // Every unit's record is published as it stands, whatever became of
-    // the work.
+    // the work, while the compiles of the pieces abandoned in flight run.
     let settling = clock.now();
     let settled = units
         .iter_mut()
@@ -1215,8 +1245,64 @@ pub(crate) fn allocate<U: Unit>(
             give_up_inputs(units, unit, context, clock, &mut own, &mut report.ending);
         }
     }
+    // A compile runs to its end: those still running are waited for, and
+    // what they formed is dropped.
+    let draining = clock.now();
+    while flights.iter().any(|flight| flight.formed.is_none()) {
+        let (unit, _, took) = workers
+            .wait(None)
+            .expect("a compile in flight ends");
+        flights
+            .iter_mut()
+            .find(|flight| flight.unit == unit)
+            .expect("a compile that ended was started")
+            .formed = Some(took);
+    }
+    report.ending.draining = clock.now().saturating_sub(draining);
+    report.abandoned = flights
+        .into_iter()
+        .map(|flight| Abandoned {
+            unit: flight.unit,
+            stage: flight.work.stage,
+            quote: flight.work.quote,
+            began: flight.began,
+            formed: flight.formed.expect("every compile in flight has ended"),
+        })
+        .collect();
     report.ended = clock.now();
     (report, outcome.and(settled))
+}
+
+/// Nothing more starts: every offer still `standing` is refused for good,
+/// for its bytes where `bytes` says so and otherwise for its seconds. A
+/// unit refused for its bytes is told before what it owes is settled: its
+/// record states what stopped it.
+fn refuse<U: Unit>(
+    units: &mut [U],
+    context: &mut U::Context,
+    standing: Vec<(usize, Work)>,
+    bytes: impl Fn(usize) -> bool,
+) -> Vec<Refused> {
+    let refused = standing
+        .into_iter()
+        .map(|(unit, work)| Refused {
+            unit,
+            stage: work.stage,
+            quote: work.quote,
+            footprint: work.footprint,
+            refusal: if bytes(unit) {
+                Refusal::Bytes
+            } else {
+                Refusal::Seconds
+            },
+        })
+        .collect::<Vec<_>>();
+    for refused in &refused {
+        if refused.refusal == Refusal::Bytes {
+            units[refused.unit].refused_for_bytes(context);
+        }
+    }
+    refused
 }
 
 /// `unit`'s compile ended: the unit holds what it formed, and its piece
@@ -1227,13 +1313,13 @@ fn land<U: Unit>(
     flights: &mut [Flight],
     (unit, formed, took): (usize, U::Formed, Duration),
 ) -> Result<(), U::Failure> {
-    units[unit].formed(formed, took, context)?;
+    // The compile ended whether or not its unit can hold what it formed.
     flights
         .iter_mut()
         .find(|flight| flight.unit == unit)
         .expect("a compile that ended was started")
         .formed = Some(took);
-    Ok(())
+    units[unit].formed(formed, took, context)
 }
 
 /// The load's worker threads ([`seismic::Workers`]): each compile runs on
@@ -1444,14 +1530,18 @@ mod tests {
         points: usize,
         discovery: Duration,
         measurement: Duration,
-        /// What each challenger's compile takes, ahead of its measurement.
+        /// What each challenger's compile takes, ahead of its measurement,
+        /// and how many times that its compile takes besides `slow`.
         compile: Duration,
+        compile_slow: f64,
         /// The next challenger's compile has run.
         compiled: bool,
         promotion: Duration,
         /// Discovery is of classes never observed: it has no price.
         unpriced_discovery: bool,
         slow: f64,
+        interruptible: bool,
+        stopped: bool,
         challengers: Vec<f64>,
         /// A lead whose coverage check fails is not promoted.
         covers: bool,
@@ -1527,6 +1617,9 @@ mod tests {
     }
 
     thread_local! {
+        /// What a compile that nothing served took ([`Unit::cold_compile`]):
+        /// nothing unless a test sets it.
+        static COLD: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         static MEMORY: Cell<Memory> = const {
             Cell::new(Memory {
                 held: 0,
@@ -1553,6 +1646,7 @@ mod tests {
         fn new(name: usize, clock: &Fake, share: f64, challengers: &[f64]) -> Self {
             Self {
                 compile: Duration::ZERO,
+                compile_slow: 1.,
                 compiled: false,
                 name,
                 clock: clock.clone(),
@@ -1563,6 +1657,8 @@ mod tests {
                 promotion: SECOND * 2,
                 unpriced_discovery: false,
                 slow: 1.,
+                interruptible: false,
+                stopped: false,
                 challengers: challengers.to_vec(),
                 covers: true,
                 prerequisites: Vec::new(),
@@ -1640,6 +1736,9 @@ mod tests {
         }
 
         fn next(&self) -> Option<Work> {
+            if self.stopped {
+                return None;
+            }
             if self.discovered < self.points {
                 return Some(Work {
                     stage: Stage::Discovery,
@@ -1755,6 +1854,10 @@ mod tests {
             MEMORY.with(Cell::get).ceiling
         }
 
+        fn cold_compile(_: &Log) -> Duration {
+            COLD.with(Cell::get)
+        }
+
         fn owed(&self, worked: bool) -> Quote {
             let mut owed = Duration::ZERO;
             // Only a conversion changes the served choice.
@@ -1780,7 +1883,8 @@ mod tests {
 
         fn forming(&self) -> Option<Duration> {
             let work = self.next()?;
-            (work.forming != Quote::default()).then(|| self.uncompiled().mul_f64(self.slow))
+            (work.forming != Quote::default())
+                .then(|| self.uncompiled().mul_f64(self.slow * self.compile_slow))
         }
 
         fn formed(&mut self, (): (), took: Duration, _: &mut Log) -> Result<(), String> {
@@ -1789,7 +1893,7 @@ mod tests {
             Ok(())
         }
 
-        fn perform(&mut self, log: &mut Log) -> Result<Duration, String> {
+        fn perform(&mut self, log: &mut Log, before: Duration) -> Result<Duration, String> {
             let work = self.next().expect("a unit performs the work it named");
             log.borrow_mut()
                 .push((self.name, work.stage, self.clock.now()));
@@ -1815,6 +1919,13 @@ mod tests {
                 Stage::Promote | Stage::Confirm => self.promotion,
             };
             let actual = quoted.mul_f64(self.slow);
+            let remaining = before.saturating_sub(self.clock.now());
+            if self.interruptible && actual > remaining {
+                self.clock.pass(remaining);
+                self.stopped = true;
+                self.changed = true;
+                return Ok(self.longest);
+            }
             // Work begun runs to its end, whatever the clock reads.
             self.clock.pass(actual);
             self.longest = self.longest.max(actual);
@@ -2192,9 +2303,9 @@ mod tests {
     }
 
     /// Every compile and measurement takes ten times its quote: nothing is
-    /// admitted once the budget has ended, nothing admitted is given up,
-    /// and the time past the budget is at most what the pieces in flight
-    /// when it ended took.
+    /// admitted once the budget has ended, and the time past the budget is
+    /// at most what the work in flight when it ended took: pieces performed
+    /// across it, and compiles abandoned at the ending.
     #[test]
     fn overlapping_work_overruns_by_at_most_the_pieces_in_flight() {
         let clock = Fake::default();
@@ -2202,16 +2313,22 @@ mod tests {
         let budget = SECOND * 100;
         let (log, report) = run(&mut units, &clock, 100);
         assert_eq!(log.len(), report.admitted.len());
-        assert!(report.overrun() > Duration::ZERO);
         assert!(report.admitted.iter().all(|admitted| admitted.began < budget));
-        let in_flight = report
+        assert!(report.abandoned.iter().all(|abandoned| abandoned.began < budget));
+        let performed = report
             .admitted
             .iter()
             .filter(|admitted| admitted.performed + admitted.actual > budget)
             .map(|admitted| admitted.formed.unwrap_or_default() + admitted.actual)
             .sum::<Duration>();
-        assert!(report.overrun() <= in_flight, "{report:?}");
-        // Each piece admitted was measured: none was left compiled only.
+        let abandoned = report
+            .abandoned
+            .iter()
+            .map(|abandoned| abandoned.formed)
+            .sum::<Duration>();
+        assert!(report.overrun() <= performed + abandoned, "{report:?}");
+        // Each piece measured was admitted, and no abandoned piece was
+        // measured.
         assert_eq!(
             report
                 .admitted
@@ -2219,6 +2336,110 @@ mod tests {
                 .filter(|admitted| admitted.stage == Stage::Measure)
                 .count(),
             units.iter().map(|unit| unit.measured.len()).sum::<usize>()
+        );
+    }
+
+    /// A compile priced at 1 s takes 5.5 s. Its piece was admitted at 14 s,
+    /// forecast to end at 16 s with 2 s of publication after, but its
+    /// compile ends at 19.5 s. Waiting for it and then measuring would take
+    /// the time held back for the publication and end at 22.5 s. Instead
+    /// the ending begins at the piece's cutoff, 18 s: the piece is
+    /// abandoned unmeasured, and the publication runs while its compile
+    /// still does. The budget ends with the publication, the compile
+    /// having ended inside it.
+    #[test]
+    fn an_underpriced_compile_does_not_take_the_time_held_for_the_ending() {
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            compile: SECOND,
+            compile_slow: 5.5,
+            publication: SECOND * 2,
+            ..Synthetic::new(0, &clock, 1., &[1.; 100])
+        }];
+        let (log, report) = run(&mut units, &clock, 20);
+        // Discovery, then two pieces of 5.5 s compiles and 1 s measurements.
+        assert_eq!(log.len(), 3);
+        assert_eq!(units[0].measured.len(), 2);
+        assert_eq!(
+            report.abandoned,
+            [Abandoned {
+                unit: 0,
+                stage: Stage::Measure,
+                quote: priced(SECOND * 2),
+                began: SECOND * 14,
+                formed: SECOND * 11 / 2,
+            }]
+        );
+        assert_eq!(units[0].published, 1);
+        assert_eq!(report.settling, SECOND * 2);
+        assert_eq!(report.ended, SECOND * 20);
+        assert_eq!(report.overrun(), Duration::ZERO);
+        // The unit was in flight: it offered nothing to refuse.
+        assert!(report.refused.is_empty());
+    }
+
+    /// A compile priced at 1 s takes 12 s. Once it has ended, no compile
+    /// starts that would run past the budget were it to take as long: the
+    /// next piece, forecast to fit at 14 s, is not started, where started
+    /// it would have compiled to 26 s.
+    #[test]
+    fn a_compile_starts_only_if_the_longest_seen_ends_within_the_budget() {
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            compile: SECOND,
+            compile_slow: 12.,
+            publication: SECOND * 2,
+            ..Synthetic::new(0, &clock, 1., &[1.; 100])
+        }];
+        let (log, report) = run(&mut units, &clock, 20);
+        // Discovery to 1 s, then a piece whose compile runs from 1 s to
+        // 13 s and measures to 14 s; its publication is settled then.
+        assert_eq!(log.len(), 2);
+        assert!(report.abandoned.is_empty());
+        assert_eq!(report.ended, SECOND * 16);
+        assert_eq!(report.overrun(), Duration::ZERO);
+        assert_eq!(report.refused.len(), 1);
+    }
+
+    /// Compiles a system cache serves take a tenth of what one it does not
+    /// serve takes, and every compile the load runs is served: the load
+    /// sees only quick compiles. A compile that nothing served
+    /// ([`Unit::cold_compile`]) took 5 s, and no compile starts that would
+    /// run past the budget were it to take that long.
+    #[test]
+    fn a_compile_is_held_to_one_no_cache_served() {
+        COLD.with(|cold| cold.set(SECOND * 5));
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            compile: SECOND / 2,
+            measurement: SECOND / 2,
+            ..Synthetic::new(0, &clock, 1., &[1.; 100])
+        }];
+        let (_, report) = run(&mut units, &clock, 20);
+        COLD.with(|cold| cold.set(Duration::ZERO));
+        assert!(
+            report
+                .admitted
+                .iter()
+                .filter(|admitted| admitted.formed.is_some())
+                .all(|admitted| admitted.began + SECOND * 5 <= SECOND * 20),
+            "{report:?}"
+        );
+        assert!(report.abandoned.is_empty());
+        assert_eq!(report.overrun(), Duration::ZERO);
+        // Without it, the same load compiles until its last second.
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            compile: SECOND / 2,
+            measurement: SECOND / 2,
+            ..Synthetic::new(0, &clock, 1., &[1.; 100])
+        }];
+        let (_, report) = run(&mut units, &clock, 20);
+        assert!(
+            report
+                .admitted
+                .iter()
+                .any(|admitted| admitted.formed.is_some() && admitted.began > SECOND * 15)
         );
     }
 
@@ -2311,6 +2532,34 @@ mod tests {
             assert!(unit.served == 1. || unit.measured.contains(&unit.served));
             assert!(unit.served <= 1.);
         }
+    }
+
+    #[test]
+    fn interrupted_work_keeps_the_original_cutoff_and_publication_reserve() {
+        let clock = Fake::default();
+        let mut units = [Synthetic {
+            slow: 10.,
+            interruptible: true,
+            publication: SECOND,
+            ..Synthetic::new(0, &clock, 1., &[1.; 100])
+        }];
+        let (_, report) = run(&mut units, &clock, 55);
+        assert!(
+            units[0].stopped,
+            "the underestimated piece reached its cutoff"
+        );
+        assert_eq!(report.overrun(), Duration::ZERO);
+        assert_eq!(
+            report.ended,
+            SECOND * 55,
+            "publication stays inside the allowance"
+        );
+        assert_eq!(
+            units[0].served, 1.,
+            "the incomplete challenger cannot replace the choice"
+        );
+        assert!(units[0].published > 0);
+        assert!(units[0].measured.len() < 100);
     }
 
     /// A measured lead is converted before any new challenger is measured,

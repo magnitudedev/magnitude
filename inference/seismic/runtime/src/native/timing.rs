@@ -117,6 +117,7 @@
 //! is then at a sustained clock by the first kind of evidence, its level
 //! joins the reference, and no level costs an allowance twice.
 
+use super::deadline::{Deadline, WorkError};
 use super::sampling::Shuffle;
 use super::{
     CallError, MeasureOptions, Measurement, NativeBoundCall, NativePrepared, NativeSubmission,
@@ -385,6 +386,7 @@ pub(crate) struct PointTiming<'a> {
     pub(super) initialize: Option<super::validation::Initializer<'a>>,
     /// Passes over the rotation per sample; `None` until calibrated.
     repetitions: Option<usize>,
+    pass_seconds: Option<f64>,
     rotation_bytes: u64,
     samples: Vec<f64>,
     placement_seconds: f64,
@@ -493,6 +495,7 @@ impl<'a> PointTiming<'a> {
             arguments,
             initialize: None,
             repetitions: None,
+            pass_seconds: None,
             rotation_bytes: distinct.into_iter().map(|(_, bytes)| bytes).sum(),
             samples: Vec::new(),
             placement_seconds: began.elapsed().as_secs_f64(),
@@ -549,7 +552,14 @@ impl<'a> PointTiming<'a> {
     /// Writable state is not restored between timed passes: every
     /// configuration is timed the same way, and only the first, validated
     /// invocation ([`PointTiming::observe_first`]) needs pristine state.
-    fn submit_passes(&self, passes: usize) -> Result<PendingSample, CallError> {
+    fn submit_passes(
+        &self,
+        passes: usize,
+        deadline: Deadline,
+    ) -> Result<PendingSample, WorkError<CallError>> {
+        deadline.check(Duration::from_secs_f64(
+            self.pass_seconds.unwrap_or(0.) * passes as f64,
+        ))?;
         let submission = StandaloneCalls {
             kernel: &self.kernel,
             calls: &self.calls,
@@ -573,13 +583,15 @@ impl<'a> PointTiming<'a> {
     /// a sample runs (module documentation).
     pub(super) fn observe_first(
         &mut self,
+        deadline: Deadline,
         mut observe: impl FnMut(
             usize,
             Vec<crate::api::kernel::DecodedValue>,
             &EncodedArgs,
         ) -> Result<(), super::tune::Exclusion>,
-    ) -> Result<(), super::tune::Exclusion> {
+    ) -> Result<(), WorkError<super::tune::Exclusion>> {
         for (rotation, call) in self.calls.iter().enumerate() {
+            deadline.check(Duration::ZERO)?;
             let witness = Instant::now();
             if let Some(initialize) = &self.initialize {
                 initialize.borrow_mut()()
@@ -599,6 +611,7 @@ impl<'a> PointTiming<'a> {
             self.kernel
                 .reset_scalar_results()
                 .map_err(|e| super::tune::Exclusion::Execution(e.to_string()))?;
+            deadline.check(Duration::ZERO)?;
             StandaloneCalls {
                 kernel: &self.kernel,
                 calls: std::slice::from_ref(call),
@@ -633,10 +646,19 @@ impl<'a> PointTiming<'a> {
     /// same challenger read 8% to 11% faster on an M4 Pro and 4% faster on
     /// a GB10 (prefill units, two complete recordings of each, 2026-10-10),
     /// and where the repetitions agreed the two sessions agreed to 1%.
-    fn calibrate(&mut self, min_sample_seconds: f64) -> Result<usize, CallError> {
-        let lead = self.submit_passes(1)?;
-        let seconds = self.submit_passes(1)?.seconds()? * self.calls.len() as f64;
-        lead.submission.wait()?;
+    fn calibrate(
+        &mut self,
+        min_sample_seconds: f64,
+        deadline: Deadline,
+    ) -> Result<usize, WorkError<CallError>> {
+        let lead = self.submit_passes(1, deadline)?;
+        let measured = self
+            .submit_passes(1, deadline)
+            .and_then(|sample| Ok(sample.seconds()? * self.calls.len() as f64));
+        let drained = lead.submission.wait();
+        let seconds = measured?;
+        drained?;
+        self.pass_seconds = Some(seconds);
         let repetitions = if seconds > 0.0 {
             ((min_sample_seconds / seconds).ceil() as usize).max(1)
         } else {
@@ -651,29 +673,47 @@ impl<'a> PointTiming<'a> {
     /// An uncalibrated placement's sample is first one pass, which gives
     /// its repetitions, and is the sample itself when they are one;
     /// otherwise the sample follows it at once.
-    fn sample(&mut self, min_sample_seconds: f64) -> Result<f64, CallError> {
-        let lead = self.submit_passes(1)?;
-        let repetitions = match self.repetitions {
-            Some(repetitions) => repetitions,
-            None => {
-                let pass = self.submit_passes(1)?.seconds()?;
-                let seconds = pass * self.calls.len() as f64;
-                let repetitions = if seconds > 0.0 {
-                    ((min_sample_seconds / seconds).ceil() as usize).max(1)
-                } else {
-                    1
-                };
-                self.repetitions = Some(repetitions);
-                if repetitions == 1 {
-                    lead.submission.wait()?;
-                    return Ok(pass);
-                }
-                // The calibrating pass just ran: it leads the sample.
-                repetitions
+    fn sample(
+        &mut self,
+        min_sample_seconds: f64,
+        deadline: Deadline,
+    ) -> Result<f64, WorkError<CallError>> {
+        let lead = self.submit_passes(1, deadline)?;
+        let measured = (|| -> Result<f64, WorkError<CallError>> {
+            if self.pass_seconds.is_none() {
+                // A challenger can inherit the incumbent's repetitions,
+                // but not its latency. Price the already submitted lead
+                // before admitting that first repeated batch.
+                self.pass_seconds = Some(lead.submission.device_seconds()?);
             }
-        };
-        let seconds = self.submit_passes(repetitions)?.seconds()?;
-        lead.submission.wait()?;
+            let repetitions = match self.repetitions {
+                Some(repetitions) => repetitions,
+                None => {
+                    let pass = self.submit_passes(1, deadline)?.seconds()?;
+                    let seconds = pass * self.calls.len() as f64;
+                    self.pass_seconds = Some(seconds);
+                    let repetitions = if seconds > 0.0 {
+                        ((min_sample_seconds / seconds).ceil() as usize).max(1)
+                    } else {
+                        1
+                    };
+                    self.repetitions = Some(repetitions);
+                    if repetitions == 1 {
+                        return Ok(pass);
+                    }
+                    // The calibrating pass just ran: it leads the sample.
+                    repetitions
+                }
+            };
+            let seconds = self.submit_passes(repetitions, deadline)?.seconds()?;
+            // PendingSample already divides by repetitions and call count.
+            // Multiplying by the rotation length recovers one pass.
+            self.pass_seconds = Some(seconds * self.calls.len() as f64);
+            Ok(seconds)
+        })();
+        let drained = lead.submission.wait();
+        let seconds = measured?;
+        drained?;
         Ok(seconds)
     }
 
@@ -699,7 +739,7 @@ impl<'a> PointTiming<'a> {
 /// A point whose sample failed, and why.
 pub(crate) struct PointFailure {
     pub(crate) point: usize,
-    pub(crate) error: CallError,
+    pub(crate) error: WorkError<CallError>,
 }
 
 /// What a sampling session takes of its slots (the placed points it was
@@ -756,12 +796,13 @@ fn collect(
     points: &mut [PointTiming],
     order: &[usize],
     min_sample_seconds: f64,
+    deadline: Deadline,
 ) -> Result<Vec<(usize, f64)>, PointFailure> {
     let mut round = Vec::with_capacity(order.len());
     for &point in order {
         let began = Instant::now();
         let seconds = points[point]
-            .sample(min_sample_seconds)
+            .sample(min_sample_seconds, deadline)
             .map_err(|error| PointFailure { point, error })?;
         points[point].observe(|prices| prices.sample.observe(began.elapsed().as_secs_f64()));
         points[point].samples.push(seconds);
@@ -778,26 +819,39 @@ struct Saturation<'g> {
     kernel: &'g Arc<NativePrepared>,
     calls: &'g [NativeBoundCall],
     ahead: Option<(usize, NativeSubmission)>,
+    deadline: Deadline,
 }
 
 impl Saturation<'_> {
-    fn submit(&self, passes: usize) -> Result<NativeSubmission, CallError> {
-        StandaloneCalls {
+    fn submit(&self, passes: usize) -> Result<NativeSubmission, WorkError<CallError>> {
+        self.deadline.check(Duration::ZERO)?;
+        Ok(StandaloneCalls {
             kernel: self.kernel,
             calls: self.calls,
         }
-        .submit(passes)
+        .submit(passes)?)
     }
 
     /// The device seconds of the next reading of `passes` passes.
-    fn read(&mut self, passes: usize) -> Result<f64, CallError> {
+    fn read(&mut self, passes: usize) -> Result<f64, WorkError<CallError>> {
+        self.deadline.check(Duration::ZERO)?;
         let reading = match self.ahead.take() {
             Some((queued, reading)) if queued == passes => reading,
             // A reading of another length queued ahead runs as work alone.
             _ => self.submit(passes)?,
         };
-        self.ahead = Some((passes, self.submit(passes)?));
-        reading.device_seconds()
+        let queued = self.submit(passes);
+        match queued {
+            Ok(queued) => {
+                self.ahead = Some((passes, queued));
+                Ok(reading.device_seconds()?)
+            }
+            Err(error) => {
+                // Expiry between readings still drains the admitted one.
+                reading.wait()?;
+                Err(error)
+            }
+        }
     }
 
     /// The reading still queued completes: a placement's work runs beside
@@ -1270,34 +1324,39 @@ impl Clock {
     /// at once, with the clock's work queued reading behind reading
     /// ([`SustainedClock::raise`]). What it did is recorded
     /// ([`Clock::raises`]).
-    pub(crate) fn raise(&self) -> Result<(), CallError> {
+    pub(crate) fn raise(&self, deadline: Deadline) -> Result<(), WorkError<CallError>> {
         let mut sustained = self.sustained.lock().expect("clock lock is never poisoned");
         let mut saturation = Saturation {
             kernel: &self.kernel,
             calls: &self.calls,
             ahead: None,
+            deadline,
         };
-        let raise = sustained.raise(|passes| saturation.read(passes))?;
+        let raised = sustained.raise(|passes| saturation.read(passes));
         // The reading queued behind the last one read is of the device at
         // a sustained clock, whatever the readings before it were.
         if let Some((passes, seconds)) = saturation.finish()? {
             sustained.observe(passes, seconds);
         }
+        let raise = raised?;
         self.raises
             .lock()
             .expect("raise record lock is never poisoned")
             .push(raise);
         Ok(())
     }
-
 }
 
 /// Raise `clock`'s device for a session over `points`, whose first slot's
 /// point the raise is observed at (its `warm` class). The session's
 /// [`sample`] follows at once.
-pub(crate) fn warm(clock: &Clock, points: &[PointTiming]) -> Result<(), CallError> {
+pub(crate) fn warm(
+    clock: &Clock,
+    points: &[PointTiming],
+    deadline: Deadline,
+) -> Result<(), WorkError<CallError>> {
     let began = Instant::now();
-    let raised = clock.raise();
+    let raised = clock.raise(deadline);
     if let Some(first) = points.first() {
         first.observe(|prices| prices.warm.observe(began.elapsed().as_secs_f64()));
     }
@@ -1310,13 +1369,15 @@ pub(crate) fn warm(clock: &Clock, points: &[PointTiming]) -> Result<(), CallErro
 /// in a random order, and each group's slots in a random order of their own
 /// (`shuffle`, which its caller keeps from session to session: the sessions
 /// of one comparison must not all open in the same order), until it names
-/// none. A round begun runs to its end.
+/// none or the cutoff interrupts it. Only complete rounds reach the
+/// comparison; a prefix of a matched round is never sampling evidence.
 pub(crate) fn sample(
     points: &mut [PointTiming],
     min_sample_seconds: f64,
     rounds: &mut dyn Rounds,
     shuffle: &mut Shuffle,
     clock: Option<&Clock>,
+    deadline: Deadline,
 ) -> Result<(), PointFailure> {
     loop {
         let mut groups = rounds.next();
@@ -1330,8 +1391,11 @@ pub(crate) fn sample(
             let repetitions = match points[first].repetitions {
                 Some(repetitions) => repetitions,
                 None => points[first]
-                    .calibrate(min_sample_seconds)
-                    .map_err(|error| PointFailure { point: first, error })?,
+                    .calibrate(min_sample_seconds, deadline)
+                    .map_err(|error| PointFailure {
+                        point: first,
+                        error,
+                    })?,
             };
             for &slot in &group[1..] {
                 points[slot].repetitions.get_or_insert(repetitions);
@@ -1344,7 +1408,7 @@ pub(crate) fn sample(
             shuffle.shuffle(&mut groups[turn]);
             order.append(&mut groups[turn]);
         }
-        let round = collect(points, &order, min_sample_seconds)?;
+        let round = collect(points, &order, min_sample_seconds, deadline)?;
         if let (Some(clock), Some(&(_, seconds))) = (clock, round.first()) {
             clock.followed(seconds);
         }
@@ -1371,8 +1435,12 @@ impl NativePrepared {
             &mut Counted::new(1, options.samples),
             &mut Shuffle::default(),
             None,
+            Deadline::default(),
         )
-        .map_err(|failure| failure.error)?;
+        .map_err(|failure| match failure.error {
+            WorkError::Failed(error) => error,
+            WorkError::Expired => unreachable!("a standalone measurement has no deadline"),
+        })?;
         Ok(points[0].measurement())
     }
 }

@@ -627,6 +627,16 @@ fn metal_matrix_configs(
     admitted
 }
 
+/// Whether the vector form's declaration admits `slices` at `geometry`: a
+/// lane holds at most `limit` elements unless the group cannot be split
+/// further.
+fn lane_admits(geometry: Geometry, slices: u64, limit: u64) -> bool {
+    let group = geometry.g as u64;
+    (group / slices) * (geometry.w() as u64 / 32) <= limit
+        || slices == 8
+        || group % (2 * slices) != 0
+}
+
 /// Declared decode configurations of `backend` at `geometry`.
 fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
     let group = geometry.g;
@@ -640,6 +650,7 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
                 .unwrap();
             let mut configs = [(12, 4, 1), (24, 8, 1), (48, 4, 1), (48, 8, slices)]
                 .into_iter()
+                .filter(|&(_, _, slices)| lane_admits(geometry, slices, 64))
                 .map(|(parts, warps, slices)| {
                     vec![
                         ("PARTS", parts),
@@ -676,6 +687,7 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
                 (32, 16, 8, slices),
             ]
             .into_iter()
+            .filter(|&(_, _, _, slices)| lane_admits(geometry, slices, 32))
             .map(|(span, parts, simds, slices)| {
                 vec![
                     ("SPAN", span),
@@ -3338,7 +3350,7 @@ fn gemma_head_geometry_matches_synthetic_reference() {
     }];
     let encoded = Encoded::new(Case::new(geometry, 272, 2, &rows, 73));
     let expected = encoded.expected();
-    for (simds, slices) in [(8, 4), (4, 1), (8, 1), (4, 4)] {
+    for (simds, slices) in [(8, 4), (8, 8), (4, 4)] {
         let configuration = [
             ("PARTS", 16),
             ("SPAN", 32),
@@ -3460,7 +3472,7 @@ fn gemma_form_decode_configurations_agree() {
         }];
         let encoded = Encoded::new(Case::new(geometry, history as usize + 1, 1, &rows, 73));
         let mut baseline: Option<(Vec<f32>, Vec<Vec<u8>>)> = None;
-        for (simds, slices) in [(4, 1), (8, 4), (8, 1), (4, 4)] {
+        for (simds, slices) in [(4, 4), (8, 4), (8, 8)] {
             let mut bound = Bound::new(&device, &encoded);
             let w = geometry.w();
             let query: Vec<_> = encoded
@@ -3626,7 +3638,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
                 ("PARTS", vec![16]),
                 ("SPAN", vec![32]),
                 ("SIMDS", vec![4, 8]),
-                ("SLICES", vec![1, 4]),
+                ("SLICES", vec![2, 4]),
             ]
             .into_iter()
             .map(|(k, v)| (k.into(), v))
@@ -3884,7 +3896,7 @@ fn metal_gemma_fresh_scalar_preserves_bf16_values() {
                 ("PARTS", 16),
                 ("SPAN", 32),
                 ("SIMDS", 4),
-                ("SLICES", 1),
+                ("SLICES", 2),
                 ("MATRIX", 0),
                 ("KEYS", 16),
                 ("TOKENS", 1),

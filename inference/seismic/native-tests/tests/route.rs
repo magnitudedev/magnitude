@@ -317,7 +317,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
             assert_eq!(rest.stage, Stage::Measure);
             assert_eq!(rest.forming, seismic::Quote::default());
             assert!(unit.forming().is_none());
-            let performed = unit.perform(&mut source).unwrap();
+            let performed = unit.perform(&mut source, None).unwrap();
             assert_eq!(performed.spent.compiling, 0.);
             ahead += 1;
             // The piece's high-water mark is no less than either end.
@@ -326,7 +326,7 @@ fn metal_compiles_run_ahead_on_another_thread_and_the_piece_then_compiles_nothin
             performed.memory.ended_bytes
         } else {
             assert_eq!(work.forming, seismic::Quote::default());
-            unit.perform(&mut source).unwrap().memory.ended_bytes
+            unit.perform(&mut source, None).unwrap().memory.ended_bytes
         };
         // What a piece holds is the device's charges and the process's
         // host bytes: no less than the charges.
@@ -821,7 +821,56 @@ fn a_search_freezes_all_positive_demand_representatives_before_candidates() {
 }
 
 #[test]
-fn a_measurement_begun_runs_to_its_end_and_is_recorded() {
+fn already_expired_work_keeps_an_unmeasured_default_without_running_witnesses() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Instant;
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let n = 64u64;
+    let x = f32_tensor(&device, &[n], &vec![1.; n as usize]);
+    let resets = Rc::new(Cell::new(0));
+    let counted = resets.clone();
+    let mut source = vec![TuningPoint {
+        label: "expired-before-start".into(),
+        weight: 1.,
+        class: None,
+        cost: 1.,
+        workload: seismic::WorkloadRotation::All,
+        rotation: vec![split_sum::Args { x: &x }],
+        initialize: Some(Box::new(move || {
+            counted.set(counted.get() + 1);
+            Ok(())
+        })),
+        written: Default::default(),
+    }];
+    let mut unit =
+        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+    unit.prepare_defaults(&mut source).unwrap();
+    let Strategy::Search(plan) = search() else {
+        unreachable!()
+    };
+    unit.plan(UnitPlan {
+        settings: plan.settings,
+        min_sample_seconds: 0.0002,
+        start: Vec::new(),
+    });
+    let before = unit.terminal().unwrap();
+    let performed = unit.perform(&mut source, Some(Instant::now())).unwrap();
+    assert!(performed.interrupted);
+    assert!(!performed.promoted);
+    assert_eq!(resets.get(), 0);
+    assert!(unit.next().is_none());
+    let after = unit.terminal().unwrap();
+    assert_eq!(after.overall, before.overall);
+    assert!(after.configurations.is_empty());
+    assert!(after.observations.is_empty());
+}
+
+#[test]
+fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
     use std::cell::Cell;
     use std::rc::Rc;
     use std::time::Instant;
@@ -875,31 +924,35 @@ fn a_measurement_begun_runs_to_its_end_and_is_recorded() {
         .next()
         .is_some_and(|work| work.stage == Stage::Discovery)
     {
-        unit.perform(&mut source).unwrap();
+        unit.perform(&mut source, None).unwrap();
     }
     let started = unit.standing();
     let work = unit.next().expect("a challenger is planned");
     assert_eq!(work.stage, Stage::Measure);
     // Placing the challenger restores the state once; the next reset is its
-    // first numerical witness. Run that witness past the instant its budget
-    // would end: the measurement begun completes and is recorded.
+    // first numerical witness. Its reset crosses the cutoff: the
+    // subsequent reference/candidate submission must not start.
     let overrun_until = Instant::now() + Duration::from_millis(300);
     deadline.set(Some(overrun_until));
     countdown.set(2);
-    let performed = unit.perform(&mut source).unwrap();
+    let before = unit.terminal().unwrap();
+    let performed = unit.perform(&mut source, Some(overrun_until)).unwrap();
     assert_eq!(countdown.get(), 0, "the witness was reached");
     assert!(Instant::now() > overrun_until);
     assert_eq!(performed.stage, Stage::Measure);
+    assert!(performed.interrupted);
+    assert!(!performed.promoted);
     assert!(performed.actual >= Duration::from_millis(300));
     let measured = unit.standing();
-    let challengers = measured.measured - started.measured;
+    assert_eq!(measured.measured, started.measured);
+    assert!(unit.next().is_none());
+    let after = unit.terminal().unwrap();
+    assert_eq!(after.overall, before.overall);
+    assert_eq!(after.configurations, before.configurations);
     assert!(
-        challengers >= 1,
-        "work begun is never abandoned for the time it took"
+        after.observations.is_empty(),
+        "an incomplete witness is not evidence"
     );
-    assert_eq!(measured.programs, started.programs + challengers);
-    // The measurement is in the unit's record at once, whatever it leads to.
-    assert_eq!(unit.terminal().unwrap().configurations.len(), measured.measured);
 }
 
 /// What a candidate publishes at a point is determined by the work it runs
@@ -1032,7 +1085,7 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
             start: Vec::new(),
         });
         assert_eq!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
-        unit.perform(&mut points).unwrap();
+        unit.perform(&mut points, None).unwrap();
         // Placing initializes once; the default's retained run initializes
         // before each performance invocation.
         assert_eq!(resets.get(), 1 + invocations);
@@ -1113,7 +1166,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
         let work = unit.next().unwrap();
         assert_eq!(work.stage, Stage::Discovery);
         assert_eq!(work.quote.forecast(), None);
-        let performed = unit.perform(&mut source).unwrap();
+        let performed = unit.perform(&mut source, None).unwrap();
         assert!(!performed.promoted);
         assert_eq!(timed(&unit.terminal().unwrap()).len(), discovered);
     }
@@ -1144,7 +1197,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
     assert_eq!(work.stage, Stage::Measure);
     assert!(work.gain > 0.);
     assert!(work.forming != seismic::Quote::default());
-    let performed = unit.perform(&mut source).unwrap();
+    let performed = unit.perform(&mut source, None).unwrap();
     assert!(performed.spent.compiling > 0.);
     let measured = unit.standing();
     let challengers = measured.measured - started.measured;
@@ -1168,7 +1221,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
             assert_eq!(unit.next().unwrap().forming, seismic::Quote::default());
             unit.standing().programs - before.programs
         });
-        let performed = unit.perform(&mut source).unwrap();
+        let performed = unit.perform(&mut source, None).unwrap();
         let after = unit.standing();
         if let Some(formed) = formed {
             ahead += 1;
@@ -3153,7 +3206,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
         start: Vec::new(),
     });
     assert_eq!(unit.next().unwrap().stage, Stage::Discovery);
-    unit.perform(&mut source).unwrap();
+    unit.perform(&mut source, None).unwrap();
     // The second point's state is refused by the device's limit.
     let charged = device.memory_usage().charged;
     device.set_memory_limit(Some(charged + large / 2));
@@ -3161,7 +3214,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     assert_eq!(work.stage, Stage::Discovery);
     assert_eq!(work.footprint.unpriced, 1, "an unbuilt point has no price");
     let performed = unit
-        .perform(&mut source)
+        .perform(&mut source, None)
         .expect("a refused build is not the unit's failure");
     assert_eq!(performed.stage, Stage::Discovery);
     assert!(!performed.promoted);
@@ -3179,7 +3232,7 @@ fn a_build_the_memory_limit_refuses_prices_its_point_and_is_offered_again() {
     );
     // With room for it, the same point is discovered.
     device.set_memory_limit(None);
-    unit.perform(&mut source).unwrap();
+    unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }
 
@@ -3254,12 +3307,12 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
         start: Vec::new(),
     });
     assert_eq!(unit.next().unwrap().stage, Stage::Discovery);
-    unit.perform(&mut source).unwrap();
+    unit.perform(&mut source, None).unwrap();
     source.clamp = Some(1);
     let work = unit.next().unwrap();
     assert_eq!(work.stage, Stage::Discovery);
     let performed = unit
-        .perform(&mut source)
+        .perform(&mut source, None)
         .expect("a refused measurement of the defaults is not the unit's failure");
     assert_eq!(performed.stage, Stage::Discovery);
     let work = unit.next().unwrap();
@@ -3273,6 +3326,6 @@ fn a_defaults_measurement_the_memory_limit_refuses_prices_its_point_and_is_offer
     // With room for it, the same point is discovered.
     source.clamp = None;
     device.set_memory_limit(None);
-    unit.perform(&mut source).unwrap();
+    unit.perform(&mut source, None).unwrap();
     assert_ne!(unit.next().map(|work| work.stage), Some(Stage::Discovery));
 }

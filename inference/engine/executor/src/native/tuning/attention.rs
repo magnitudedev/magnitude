@@ -1289,13 +1289,18 @@ mod tests {
                     .iter()
                     .filter(|choice| choice.get("MATRIX") == Some(&0))
                     .collect::<Vec<_>>();
-                assert_eq!(scalar.len(), usize::from(group % 2 == 0));
+                // The start is the next split above the default's: the
+                // affine entry already defaults to two slices of an even
+                // group.
+                let default_slices = defaults.param("SLICES").unwrap();
+                let split = 2 * default_slices;
+                assert_eq!(scalar.len(), usize::from(group % split == 0));
                 for values in scalar {
                     let mut expected = defaults.params().clone();
-                    expected.insert("SLICES".into(), 2);
+                    expected.insert("SLICES".into(), split);
                     assert_eq!(*values, expected);
                     implementation
-                        .validate(&defaults.clone().with_param("SLICES", 2))
+                        .validate(&defaults.clone().with_param("SLICES", split))
                         .unwrap();
                 }
                 mix.decode_rows = Some(1..2);
@@ -1463,12 +1468,14 @@ mod tests {
                 assert_eq!(choice.param("WARPS"), Some(expected_warps));
                 assert_eq!(choice.param("COLUMNS"), Some(1));
                 assert_eq!(choice.param("STAGES"), Some(2));
+                // The default is the vector form, except on the affine entry
+                // where a lane of the whole group would hold more than 64
+                // elements and the group splits further.
+                let affine = implementation.statics.iter().any(|name| name == "KC");
+                let default = implementation.default_specialization(&statics).unwrap();
                 assert_eq!(
-                    implementation
-                        .default_specialization(&statics)
-                        .unwrap()
-                        .param("QREG"),
-                    Some(0)
+                    default.param("MATRIX"),
+                    Some(u64::from(affine && group * width / 32 > 64))
                 );
 
                 mix.decode_rows = Some(1..2);

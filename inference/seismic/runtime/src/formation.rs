@@ -96,6 +96,14 @@ pub(crate) struct ProgramFormer<T: Toolchain> {
     /// Compiles formed by the toolchain (compiled, or loaded from the
     /// store) rather than found live.
     formed: std::sync::atomic::AtomicUsize,
+    /// What the store was read to keep, by the key of a text and the entry
+    /// list asked: the compile that serves them ([`ProgramFormer::kept`]),
+    /// and whether it keeps a compile of exactly that list
+    /// ([`ProgramFormer::publishing`]). A class is read whenever a price
+    /// is asked, and these reads would otherwise load a compile's bytes
+    /// each time. Only this former writes the store while it lives, and
+    /// every write forgets them.
+    stored: Mutex<Stored>,
     /// Held while a text's kept entry lists are read and rewritten.
     listing: Mutex<()>,
     /// What this toolchain's compiles have taken in this process, each with
@@ -106,6 +114,27 @@ pub(crate) struct ProgramFormer<T: Toolchain> {
     /// ([`ProgramFormer::staff`]); without them every source is formed in
     /// turn on the thread that asks.
     workers: Mutex<Option<Arc<Workers>>>,
+}
+
+/// What a former read the store to keep ([`ProgramFormer::stored`]), by the
+/// key of a text and the entry list asked.
+#[derive(Default)]
+struct Stored {
+    kept: HashMap<ArtifactKey, HashMap<String, Option<ArtifactKey>>>,
+    exact: HashMap<ArtifactKey, HashMap<String, bool>>,
+}
+
+/// A source as the former reads it: with the key of its text and the
+/// listing of its entries. Keying hashes the whole text, and a source
+/// tuning prices is asked about again at every price, so it is keyed once
+/// ([`ProgramFormer::keyed`]); a hash of every rendered source at every
+/// price took 0.17 s of each of the allocator's passes (a GB10 load,
+/// 2026-10-12).
+#[derive(Clone)]
+pub(crate) struct Keyed {
+    source: ProgramSource,
+    key: ArtifactKey,
+    list: String,
 }
 
 /// The store's bytes for one key in one toolchain's namespace.
@@ -142,6 +171,7 @@ impl<T: Toolchain> ProgramFormer<T> {
             store,
             live: Mutex::new(HashMap::new()),
             formed: std::sync::atomic::AtomicUsize::new(0),
+            stored: Mutex::default(),
             listing: Mutex::new(()),
             compiled: Mutex::new(Linear::default()),
             workers: Mutex::new(None),
@@ -235,7 +265,34 @@ impl<T: Toolchain> ProgramFormer<T> {
     /// a text keyed `key` that no live compile holds: the compile of
     /// exactly that entry list, or one of a list that holds them all, as
     /// the toolchain says of the bytes kept ([`Toolchain::keeps`]).
-    fn kept(&self, key: &ArtifactKey, source: &ProgramSource) -> Option<ArtifactKey> {
+    /// `list` is the listing of the source's entries, and `source` makes
+    /// the source when the store must be read.
+    fn kept(
+        &self,
+        key: &ArtifactKey,
+        list: &str,
+        source: impl FnOnce() -> ProgramSource,
+    ) -> Option<ArtifactKey> {
+        if let Some(kept) = self.stored().kept.get(key).and_then(|lists| lists.get(list)) {
+            return kept.clone();
+        }
+        let kept = self.read_kept(key, &source());
+        self.stored()
+            .kept
+            .entry(key.clone())
+            .or_default()
+            .insert(list.to_owned(), kept.clone());
+        kept
+    }
+
+    fn stored(&self) -> std::sync::MutexGuard<'_, Stored> {
+        self.stored
+            .lock()
+            .expect("store reading lock is never poisoned")
+    }
+
+    /// [`ProgramFormer::kept`], read from the store.
+    fn read_kept(&self, key: &ArtifactKey, source: &ProgramSource) -> Option<ArtifactKey> {
         let store = self.store.as_deref()?;
         let namespace = self.toolchain.identity().namespace;
         let keeps = |kept_key: &ArtifactKey| {
@@ -265,12 +322,47 @@ impl<T: Toolchain> ProgramFormer<T> {
             .find(keeps)
     }
 
+    /// What compiling `source` takes this toolchain when nothing it has
+    /// formed or kept serves it: `source` is compiled with a comment no
+    /// compile has carried, so neither the store, nor a live compile, nor a
+    /// cache of the system's (Metal's shader cache) answers it, and the
+    /// program is dropped. Where a system cache serves most compiles, the
+    /// compiles a load observes are its hits; this is what one of its
+    /// misses takes.
+    pub(crate) fn cold(&self, source: &ProgramSource) -> Result<std::time::Duration, NativeCompilationError> {
+        static PROBES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let salt = format!(
+            "\n// cold compile {} {} {}\n",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_nanos()),
+            PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        let salted = ProgramSource {
+            text: format!("{}{salt}", source.text),
+            entries: source.entries.clone(),
+        };
+        let began = std::time::Instant::now();
+        drop(self.toolchain.compile(&salted, None)?);
+        Ok(began.elapsed())
+    }
+
+    /// `source` as the former reads it ([`Keyed`]).
+    pub(crate) fn keyed(&self, source: ProgramSource) -> Keyed {
+        Keyed {
+            key: self.key(&source),
+            list: listed(&source.entries),
+            source,
+        }
+    }
+
     /// What forming `sources` together does: compiled when the toolchain
     /// compiles any of them, and then the most entries one source's
     /// compile forms (the sources compile at once, so the call takes what
     /// its largest compile does). It reads the device's live compiles and
     /// the store and forms nothing.
-    pub(crate) fn class(&self, sources: &[ProgramSource]) -> (FormationClass, usize) {
+    pub(crate) fn class(&self, sources: &[Keyed]) -> (FormationClass, usize) {
         let entries = sources
             .iter()
             .map(|source| self.compiling(source))
@@ -284,19 +376,24 @@ impl<T: Toolchain> ProgramFormer<T> {
 
     /// How many entries of `source` the toolchain compiles: those no live
     /// compile holds, unless the store keeps what serves them.
-    fn compiling(&self, source: &ProgramSource) -> usize {
-        let key = self.key(source);
-        let (_, missing) = self.held(&key, &source.entries);
+    fn compiling(&self, keyed: &Keyed) -> usize {
+        let (_, missing) = self.held(&keyed.key, &keyed.source.entries);
         if missing.is_empty() {
             return 0;
         }
-        let missing = ProgramSource {
-            text: source.text.clone(),
-            entries: missing,
+        let list = if missing.len() == keyed.source.entries.len() {
+            std::borrow::Cow::Borrowed(keyed.list.as_str())
+        } else {
+            std::borrow::Cow::Owned(listed(&missing))
         };
-        match self.kept(&key, &missing) {
+        let count = missing.len();
+        let kept = self.kept(&keyed.key, &list, || ProgramSource {
+            text: keyed.source.text.clone(),
+            entries: missing,
+        });
+        match kept {
             Some(_) => 0,
-            None => missing.entries.len(),
+            None => count,
         }
     }
 
@@ -335,8 +432,8 @@ impl<T: Toolchain> ProgramFormer<T> {
             text: source.text.clone(),
             entries: missing,
         };
-        let kept = self.kept(&key, &missing);
         let list = listed(&missing.entries);
+        let kept = self.kept(&key, &list, || missing.clone());
         let new = kept.is_none();
         let kept_key = kept.unwrap_or_else(|| Self::kept_key(&key, &list));
         let cache = self.store.as_deref().map(|store| StoreCache {
@@ -384,15 +481,29 @@ impl<T: Toolchain> ProgramFormer<T> {
     /// ([`ProgramFormer::publish`]): all of them, unless the store keeps a
     /// compile of exactly its entry list; none without a store, which
     /// keeps nothing for a later process to find.
-    fn publishing(&self, source: &ProgramSource) -> usize {
+    fn publishing(&self, keyed: &Keyed) -> usize {
         let Some(store) = self.store.as_deref() else {
             return 0;
         };
-        let exact = Self::kept_key(&self.key(source), &listed(&source.entries));
-        let kept = store
-            .get(self.toolchain.identity().namespace, &exact)
-            .is_some_and(|kept| self.toolchain.keeps(source, &kept));
-        if kept { 0 } else { source.entries.len() }
+        let read = self
+            .stored()
+            .exact
+            .get(&keyed.key)
+            .and_then(|lists| lists.get(&keyed.list))
+            .copied();
+        let kept = read.unwrap_or_else(|| {
+            let exact = Self::kept_key(&keyed.key, &keyed.list);
+            let kept = store
+                .get(self.toolchain.identity().namespace, &exact)
+                .is_some_and(|kept| self.toolchain.keeps(&keyed.source, &kept));
+            self.stored()
+                .exact
+                .entry(keyed.key.clone())
+                .or_default()
+                .insert(keyed.list.clone(), kept);
+            kept
+        });
+        if kept { 0 } else { keyed.source.entries.len() }
     }
 
     /// What publishing `sources` together does ([`ProgramFormer::publish`]),
@@ -401,7 +512,7 @@ impl<T: Toolchain> ProgramFormer<T> {
     /// source's compile forms (the sources compile at once). A choice whose
     /// programs the store keeps as a load requests them is published by
     /// reading that, and no compiler runs.
-    pub(crate) fn publication(&self, sources: &[ProgramSource]) -> (FormationClass, usize) {
+    pub(crate) fn publication(&self, sources: &[Keyed]) -> (FormationClass, usize) {
         let entries = sources
             .iter()
             .map(|source| self.publishing(source))
@@ -417,7 +528,7 @@ impl<T: Toolchain> ProgramFormer<T> {
     /// ([`ProgramFormer::publish`]): each takes a thread of the former's
     /// while it does, so with what [`ProgramFormer::publication`] says of
     /// their size this is what a publication's time is observed against.
-    pub(crate) fn publishing_sources(&self, sources: &[ProgramSource]) -> usize {
+    pub(crate) fn publishing_sources(&self, sources: &[Keyed]) -> usize {
         sources
             .iter()
             .filter(|source| self.publishing(source) > 0)
@@ -448,14 +559,14 @@ impl<T: Toolchain> ProgramFormer<T> {
     }
 
     fn publish_one(&self, source: &ProgramSource) -> Result<(), NativeCompilationError> {
-        if self.publishing(source) == 0 {
+        let keyed = self.keyed(source.clone());
+        if self.publishing(&keyed) == 0 {
             return Ok(());
         }
         let Some(store) = self.store.as_deref() else {
             return Ok(());
         };
-        let key = self.key(source);
-        let list = listed(&source.entries);
+        let Keyed { key, list, .. } = keyed;
         let kept_key = Self::kept_key(&key, &list);
         let cache = StoreCache {
             store,
@@ -494,6 +605,9 @@ impl<T: Toolchain> ProgramFormer<T> {
             lists.push('\n');
             store.put(namespace, &lists_key, lists.as_bytes());
         }
+        // The store keeps the compile listed here: what it was read to
+        // keep is read again.
+        *self.stored.lock().expect("store reading lock is never poisoned") = Stored::default();
     }
 }
 
@@ -596,6 +710,24 @@ mod tests {
         former.toolchain().entries.load(Ordering::SeqCst)
     }
 
+    fn keyed(former: &ProgramFormer<Echo>, sources: &[ProgramSource]) -> Vec<Keyed> {
+        sources
+            .iter()
+            .map(|source| former.keyed(source.clone()))
+            .collect()
+    }
+
+    fn class(former: &ProgramFormer<Echo>, sources: &[ProgramSource]) -> (FormationClass, usize) {
+        former.class(&keyed(former, sources))
+    }
+
+    fn publication(
+        former: &ProgramFormer<Echo>,
+        sources: &[ProgramSource],
+    ) -> (FormationClass, usize) {
+        former.publication(&keyed(former, sources))
+    }
+
     #[test]
     fn a_live_compile_serves_every_entry_it_holds() {
         let former = former(None);
@@ -653,6 +785,28 @@ mod tests {
         assert_eq!(compiles(&former), 4);
     }
 
+    /// A class is what is live and kept when it is asked, whoever changed
+    /// them since it was last asked: a compile another caller held and
+    /// gave up is compiled again, and what the store came to keep is kept,
+    /// though the same class was read before either.
+    #[test]
+    fn a_class_read_again_follows_what_others_hold_and_the_store_keeps() {
+        use FormationClass::{Compiled, Kept};
+        let former = former(None);
+        let wide = source("launch", &["k<16>", "k<32>"]);
+        let held = former.form(&[wide.clone()]).unwrap();
+        assert_eq!(class(&former, &[wide.clone()]), (Kept, 0));
+        drop(held);
+        assert_eq!(class(&former, &[wide.clone()]), (Compiled, 2));
+        let former = self::former(Some(Arc::new(Memory::default())));
+        let other = source("other", &["k"]);
+        assert_eq!(class(&former, &[other.clone()]), (Compiled, 1));
+        assert_eq!(publication(&former, &[other.clone()]), (Compiled, 1));
+        former.publish(&[other.clone()]).unwrap();
+        assert_eq!(class(&former, &[other.clone()]), (Kept, 0));
+        assert_eq!(publication(&former, &[other]), (Kept, 0));
+    }
+
     /// Another process is served from whichever kept compile of the same
     /// text holds what it asks for.
     #[test]
@@ -689,13 +843,13 @@ mod tests {
             .unwrap();
         let chosen = source("launch", &["k<16>"]);
         use FormationClass::Kept;
-        assert_eq!(first.class(&[chosen.clone()]), (Kept, 0));
-        assert_eq!(first.publishing(&chosen), 1);
+        assert_eq!(class(&first, &[chosen.clone()]), (Kept, 0));
+        assert_eq!(first.publishing(&first.keyed(chosen.clone())), 1);
         first.publish(&[chosen.clone()]).unwrap();
         // One more call of the toolchain, for the one entry, though a live
         // compile holds it; nothing more of it is live.
         assert_eq!((compiles(&first), entries(&first)), (2, 4));
-        assert_eq!(first.publishing(&chosen), 0);
+        assert_eq!(first.publishing(&first.keyed(chosen.clone())), 0);
         first.publish(&[chosen.clone()]).unwrap();
         assert_eq!(compiles(&first), 2);
         drop(many);
@@ -707,13 +861,13 @@ mod tests {
         assert_eq!(store.get(namespace, &exact).unwrap(), b"k<16>");
         // A later process asking for the choice is given that compile.
         let later = former(Some(store));
-        assert_eq!(later.class(&[chosen.clone()]), (Kept, 0));
+        assert_eq!(class(&later, &[chosen.clone()]), (Kept, 0));
         later.form(&[chosen]).unwrap();
         assert_eq!(compiles(&later), 0);
         // Without a store there is nothing to publish to.
         let alone = former(None);
         let source = source("launch", &["k<16>"]);
-        assert_eq!(alone.publishing(&source), 0);
+        assert_eq!(alone.publishing(&alone.keyed(source.clone())), 0);
         alone.publish(&[source]).unwrap();
         assert_eq!(compiles(&alone), 0);
     }
@@ -732,7 +886,7 @@ mod tests {
         // The canonical default, formed as a load requests it.
         let default = source("launch", &["k<8>"]);
         let _canonical = former.form(&[default.clone()]).unwrap();
-        assert_eq!(former.publication(&[default.clone()]), (Kept, 0));
+        assert_eq!(publication(&former, &[default.clone()]), (Kept, 0));
         let before = compiles(&former);
         former.publish(&[default.clone()]).unwrap();
         assert_eq!(compiles(&former), before);
@@ -742,18 +896,18 @@ mod tests {
             .form(&[source("launch", &["k<8>", "k<16>", "k<32>"])])
             .unwrap();
         let chosen = source("launch", &["k<16>"]);
-        assert_eq!(former.class(&[chosen.clone()]), (Kept, 0));
-        assert_eq!(former.publication(&[chosen.clone()]), (Compiled, 1));
+        assert_eq!(class(&former, &[chosen.clone()]), (Kept, 0));
+        assert_eq!(publication(&former, &[chosen.clone()]), (Compiled, 1));
         // Sources are published at once: the call is its largest compile.
         let other = source("other", &["a", "b"]);
         assert_eq!(
-            former.publication(&[default, chosen.clone(), other]),
+            publication(&former, &[default, chosen.clone(), other]),
             (Compiled, 2)
         );
         let before = compiles(&former);
         former.publish(&[chosen.clone()]).unwrap();
         assert_eq!(compiles(&former), before + 1);
-        assert_eq!(former.publication(&[chosen]), (Kept, 0));
+        assert_eq!(publication(&former, &[chosen]), (Kept, 0));
     }
 
     /// What forming a source does is known before it is formed, and is
@@ -765,31 +919,31 @@ mod tests {
         let first = former(Some(store.clone()));
         let wide = source("launch", &["k<16>", "k<32>"]);
         use FormationClass::{Compiled, Kept};
-        assert_eq!(first.class(&[wide.clone()]), (Compiled, 2));
+        assert_eq!(class(&first, &[wide.clone()]), (Compiled, 2));
         let held = first.form(&[wide.clone()]).unwrap();
         assert_eq!(compiles(&first), 1);
         // What the toolchain's compiles took is observed with what they
         // formed.
         assert!(first.compiled().price(2).is_some());
         // Live on the device, and kept by the store once dropped.
-        assert_eq!(first.class(&[wide.clone()]), (Kept, 0));
+        assert_eq!(class(&first, &[wide.clone()]), (Kept, 0));
         // A wider request compiles only what is not live.
         assert_eq!(
-            first.class(&[source("launch", &["k<16>", "k<64>"])]),
+            class(&first, &[source("launch", &["k<16>", "k<64>"])]),
             (Compiled, 1)
         );
         drop(held);
-        assert_eq!(first.class(&[wide.clone()]), (Kept, 0));
+        assert_eq!(class(&first, &[wide.clone()]), (Kept, 0));
         // Another process with the same store: what the store keeps is
         // loaded, an entry it lacks is compiled, and a call forming both
         // compiles.
         let fresh = former(Some(store));
         let narrow = source("launch", &["k<32>"]);
         let lacking = source("launch", &["k<64>"]);
-        assert_eq!(fresh.class(&[narrow.clone()]), (Kept, 0));
-        assert_eq!(fresh.class(&[lacking.clone()]), (Compiled, 1));
+        assert_eq!(class(&fresh, &[narrow.clone()]), (Kept, 0));
+        assert_eq!(class(&fresh, &[lacking.clone()]), (Compiled, 1));
         assert_eq!(
-            fresh.class(&[narrow.clone(), source("other", &["k"])]),
+            class(&fresh, &[narrow.clone(), source("other", &["k"])]),
             (Compiled, 1)
         );
         fresh.form(&[narrow]).unwrap();
@@ -797,7 +951,7 @@ mod tests {
         fresh.form(&[lacking]).unwrap();
         assert_eq!(compiles(&fresh), 1);
         // Without a store nothing is kept between processes.
-        assert_eq!(former(None).class(&[wide]), (Compiled, 2));
-        assert_eq!(former(None).class(&[]), (Kept, 0));
+        assert_eq!(class(&former(None), &[wide]), (Compiled, 2));
+        assert_eq!(class(&former(None), &[]), (Kept, 0));
     }
 }

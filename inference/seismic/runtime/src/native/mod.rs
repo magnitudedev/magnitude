@@ -21,12 +21,13 @@ pub mod coverage;
 pub(crate) use batch::{NativeTensorBatch, NativeTensorBatchCompletion};
 #[cfg(test)]
 mod bundle_identity_tests;
-#[cfg(test)]
-mod handoff_tests;
 pub mod cpu;
 mod cuda;
+mod deadline;
 pub mod graph;
 mod graph_replays;
+#[cfg(test)]
+mod handoff_tests;
 mod observation;
 pub mod plan;
 pub mod replay;
@@ -60,7 +61,7 @@ use crate::driver::{
 };
 pub(crate) use crate::formation::FormationClass;
 use crate::artifacts::ArtifactKey;
-use crate::formation::{Compile, ProgramFormer};
+use crate::formation::{Compile, Keyed, ProgramFormer};
 use seismic_compiler::errors::{ExecutionError, InvocationError, PreparationError};
 use seismic_compiler::prepared::{
     validate_invocation, ArgumentValue, DeviceIdentity, InvocationContract,
@@ -844,6 +845,45 @@ fn rendered_programs(
     }
 }
 
+/// The programs a formation or a publication forms, rendered: what its
+/// class is read from ([`ProgramFormer::class`]). Rendering depends only on
+/// what is formed, so it is kept; the class is read again whenever it is
+/// asked, because what is live on the device and kept by the store changes
+/// with every unit's work, not only with the work of the unit asking. Units
+/// whose launches render the same text share its live compiles: a class
+/// kept from when another unit held such a compile read as kept after that
+/// unit had given it up (a GB10 load, 2026-10-12, priced compiles that took
+/// 0.45 s at nothing). Programs that cannot be rendered are classed as
+/// compiled with every entry they name: forming them fails as it starts,
+/// and nothing was learned of what it would have taken.
+#[derive(Clone)]
+pub(crate) enum Rendered {
+    Sources(Vec<Keyed>),
+    Unrendered(usize),
+}
+
+impl Rendered {
+    /// What forming the programs on `device` does now.
+    pub(crate) fn class(&self, device: &DeviceInner) -> (FormationClass, usize) {
+        match self {
+            Self::Sources(sources) => device.programs.class(sources),
+            Self::Unrendered(entries) => (FormationClass::Compiled, *entries),
+        }
+    }
+
+    /// What publishing the programs on `device` does now, and how many of
+    /// them it compiles ([`ProgramFormer::publication`]).
+    pub(crate) fn publication(&self, device: &DeviceInner) -> ((FormationClass, usize), usize) {
+        match self {
+            Self::Sources(sources) => (
+                device.programs.publication(sources),
+                device.programs.publishing_sources(sources),
+            ),
+            Self::Unrendered(entries) => ((FormationClass::Compiled, *entries), *entries),
+        }
+    }
+}
+
 /// The programs `sources` of a launch-scoped implementation are formed
 /// from, one per launch with all its variants; none on a backend without
 /// launch-scoped programs.
@@ -1002,13 +1042,10 @@ impl NativePrepared {
         }))
     }
 
-    /// What [`NativePrepared::hold_launch_variants`] of `sources` does,
-    /// known before it runs: whether the device's toolchain compiles, and
-    /// then the most variants one launch's compile forms. A formation that
-    /// cannot be rendered is classed as compiled with everything it names:
-    /// it fails as it starts, and nothing was learned of what it would
-    /// have taken.
-    pub(crate) fn launch_variants_class(
+    /// The programs [`NativePrepared::hold_launch_variants`] of `sources`
+    /// forms, what its class is read from ([`Rendered`]). A formation that
+    /// cannot be rendered names every variant of its launches.
+    pub(crate) fn launch_variants_rendered(
         device: &Arc<DeviceInner>,
         module: &CheckedModule,
         entry: EntryId,
@@ -1016,7 +1053,7 @@ impl NativePrepared {
         statics: &NativeSpecialization,
         implementation: &NativeImplementation,
         sources: &[plan::LaunchSource],
-    ) -> (FormationClass, usize) {
+    ) -> Rendered {
         match launch_programs(
             device,
             module,
@@ -1026,10 +1063,8 @@ impl NativePrepared {
             implementation,
             sources,
         ) {
-            Ok(Some(programs)) => device.programs.class(&programs),
-            Ok(None) => (FormationClass::Kept, 0),
-            Err(_) => (
-                FormationClass::Compiled,
+            Ok(programs) => Rendered::Sources(device.programs.keyed(programs.unwrap_or_default())),
+            Err(_) => Rendered::Unrendered(
                 sources
                     .iter()
                     .map(|source| source.variants.len())
@@ -1039,11 +1074,10 @@ impl NativePrepared {
         }
     }
 
-    /// What [`NativePrepared::prepare_implementation`] of `specialization`
-    /// does, known before it runs: whether the device's toolchain
-    /// compiles, and then the most entries one of its programs' compiles
-    /// forms. The CPU backend compiles nothing at run time.
-    pub(crate) fn implementation_class(
+    /// The programs [`NativePrepared::prepare_implementation`] of
+    /// `specialization` forms, what its class is read from ([`Rendered`]):
+    /// none on the CPU backend, which compiles nothing at run time.
+    pub(crate) fn implementation_rendered(
         device: &Arc<DeviceInner>,
         module: &CheckedModule,
         entry: EntryId,
@@ -1051,9 +1085,9 @@ impl NativePrepared {
         bindings: &ElementBindings,
         specialization: &NativeSpecialization,
         implementation: &NativeImplementation,
-    ) -> (FormationClass, usize) {
+    ) -> Rendered {
         if matches!(device.kind, OpenedKind::Cpu(_)) {
-            return (FormationClass::Kept, 0);
+            return Rendered::Sources(Vec::new());
         }
         let implementation = on_device(device, implementation.clone());
         let specialization = implementation.with_owned_defaults(specialization.clone());
@@ -1066,8 +1100,8 @@ impl NativePrepared {
             &implementation,
             &specialization,
         ) {
-            Ok((sources, _)) => device.programs.class(&sources),
-            Err(_) => (FormationClass::Compiled, implementation.launches.len()),
+            Ok((sources, _)) => Rendered::Sources(device.programs.keyed(sources)),
+            Err(_) => Rendered::Unrendered(implementation.launches.len()),
         }
     }
 
@@ -1100,13 +1134,10 @@ impl NativePrepared {
         .map(|(sources, _)| sources)
     }
 
-    /// What [`NativePrepared::publish`] of `specialization` does, known
-    /// before it runs: whether the device's toolchain compiles, and then
-    /// the most entries one of its programs' compiles forms; and how many
-    /// of its programs it compiles. A choice that cannot be rendered is
-    /// classed as compiled with every launch: its publication fails as it
-    /// starts.
-    pub(crate) fn publication_class(
+    /// The programs [`NativePrepared::publish`] of `specialization` forms,
+    /// what its class is read from ([`Rendered::publication`]). A choice
+    /// that cannot be rendered names every launch.
+    pub(crate) fn publication_rendered(
         device: &Arc<DeviceInner>,
         module: &CheckedModule,
         entry: EntryId,
@@ -1114,7 +1145,7 @@ impl NativePrepared {
         bindings: &ElementBindings,
         specialization: &NativeSpecialization,
         implementation: &NativeImplementation,
-    ) -> ((FormationClass, usize), usize) {
+    ) -> Rendered {
         match Self::serving_programs(
             device,
             module,
@@ -1124,14 +1155,8 @@ impl NativePrepared {
             specialization,
             implementation,
         ) {
-            Ok(sources) => (
-                device.programs.publication(&sources),
-                device.programs.publishing_sources(&sources),
-            ),
-            Err(_) => (
-                (FormationClass::Compiled, implementation.launches.len()),
-                implementation.launches.len(),
-            ),
+            Ok(sources) => Rendered::Sources(device.programs.keyed(sources)),
+            Err(_) => Rendered::Unrendered(implementation.launches.len()),
         }
     }
 

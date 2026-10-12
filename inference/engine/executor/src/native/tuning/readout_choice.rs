@@ -730,12 +730,26 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 + measured.elapsed() * (QUALIFICATION_SEEDS.len() as u32 * (2 + 2 * rounds)),
         }))
     }
-    fn qualify(&mut self, inputs: &mut TuningInputs<'_, 'a>) -> Result<bool, CatalogFailure> {
+    fn qualify(
+        &mut self,
+        inputs: &mut TuningInputs<'_, 'a>,
+        before: std::time::Instant,
+    ) -> Result<bool, CatalogFailure> {
+        macro_rules! check_deadline {
+            () => {
+                if std::time::Instant::now() >= before {
+                    self.receipt.reason = "first-load tuning allowance expired".into();
+                    return Ok(false);
+                }
+            };
+        }
+        check_deadline!();
         let Some(specialization) = inputs.choice(&self.dependency).cloned() else {
             self.receipt.reason = "canonical dependency has no finalized choice".into();
             return Ok(false);
         };
         let packed = self.recipe.canonical(inputs.device, &specialization)?;
+        check_deadline!();
         let canonical_specification = format!("{specialization:?}");
         self.receipt.canonical_specification = Some(canonical_specification.clone());
         self.state.borrow_mut().canonical_specification = Some(canonical_specification);
@@ -755,6 +769,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         .map_err(fail)?;
         let mut cases = Vec::new();
         for seed in QUALIFICATION_SEEDS {
+            check_deadline!();
             let mut case = match RecipeCase::new(inputs, self.recipe, self.point.rows, seed) {
                 Ok(case) => case,
                 Err(error) => {
@@ -763,13 +778,17 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 }
             };
             if self.recipe.prepared {
+                check_deadline!();
                 case.prepare_features(inputs.device, self.recipe, &feature)?;
             }
             // Noise rows: every level keeps and reads the whole head, so
             // every bound is tested. Both recipes also write their outputs
             // here for the first time, outside the timed pairs.
+            check_deadline!();
             case.packed(inputs.device, self.recipe, &packed)?;
+            check_deadline!();
             case.bounded(inputs.device, self.recipe, progressive)?;
+            check_deadline!();
             if !case.same_winners(self.point.rows, self.recipe.vocabulary)? {
                 self.receipt.reason = "canonical and bounded selection disagree".into();
                 return Ok(false);
@@ -781,12 +800,16 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                     return Ok(false);
                 }
             };
+            check_deadline!();
             case.set_hidden(inputs.device, self.recipe, &feature, resolved)?;
             // The timed rows select the same tokens too. Checked here, before
             // any round: reading the logits back idles the device, and the
             // run that follows an idle device is the slower for it.
+            check_deadline!();
             case.packed(inputs.device, self.recipe, &packed)?;
+            check_deadline!();
             case.bounded(inputs.device, self.recipe, progressive)?;
+            check_deadline!();
             if !case.same_winners(self.point.rows, self.recipe.vocabulary)? {
                 self.receipt.reason = "canonical and bounded selection disagree".into();
                 return Ok(false);
@@ -808,24 +831,42 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
         // rounds read their samples.
         let mut clock = SustainedClock::new(super::MIN_SAMPLE_SECONDS, tally.fewest(rate));
         for _ in 0..tally.fewest(rate) {
-            clock.raise(|passes| {
+            check_deadline!();
+            let raised = clock.raise(|passes| {
                 let mut seconds = 0.;
                 for _ in 0..passes {
-                    seconds += cases[0].packed(inputs.device, self.recipe, &packed)?;
+                    if std::time::Instant::now() >= before {
+                        return Err(None);
+                    }
+                    seconds += cases[0]
+                        .packed(inputs.device, self.recipe, &packed)
+                        .map_err(Some)?;
                 }
-                Ok::<f64, CatalogFailure>(seconds)
-            })?;
+                Ok::<f64, Option<CatalogFailure>>(seconds)
+            });
+            match raised {
+                Ok(_) => {}
+                Err(Some(error)) => return Err(error),
+                Err(None) => {
+                    self.receipt.reason = "first-load tuning allowance expired".into();
+                    return Ok(false);
+                }
+            }
             let mut difference = 0.;
             for case in &mut cases {
+                check_deadline!();
                 let mut order = [0, 1];
                 shuffle.shuffle(&mut order);
                 let mut seconds = [0.; 2];
                 for recipe in order {
+                    check_deadline!();
                     seconds[recipe] = if recipe == 0 {
                         case.packed(inputs.device, self.recipe, &packed)?;
+                        check_deadline!();
                         case.packed(inputs.device, self.recipe, &packed)?
                     } else {
                         case.bounded(inputs.device, self.recipe, progressive)?;
+                        check_deadline!();
                         case.bounded(inputs.device, self.recipe, progressive)?
                     };
                 }
