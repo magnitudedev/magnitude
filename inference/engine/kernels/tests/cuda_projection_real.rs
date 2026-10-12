@@ -337,6 +337,8 @@ fn real_4b_projections_match_their_operand_emulation() {
                                 activation: 0,
                                 gate_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
                                 up_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
+                                gate_bound: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
+                                up_bound: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
                             })
                             .unwrap()
                             .value,
@@ -429,6 +431,7 @@ fn real_12b_physical_f16_projection_operands() {
         residual: &residual, norm: &norm, gate_weight: &gate,
         up_weight: &up, out_rows: &out_rows, eps: 1e-6,
         activation: 1, gate_scale: &absent, up_scale: &absent,
+        gate_bound: &absent, up_bound: &absent,
     };
     let baseline = kernel(0);
     let physical = kernel(1);
@@ -479,7 +482,12 @@ fn real_12b_physical_f16_projection_operands() {
             .with_launch_param(1, "KSPLIT", 4).with_launch_param(2, "KSPLIT", 4)
             .with_launch_param(4, "ROTATE", 2),
     ).unwrap();
-    let down_args = || project_rows::Args { source: &product, weight: &down, weight_scale: &absent };
+    let down_args = || project_rows::Args {
+        source: &product,
+        weight: &down,
+        weight_scale: &absent,
+        weight_bound: &absent,
+    };
     let exact_down = down_kernel(0);
     let physical_down = down_kernel(1);
     let expected = read_f32(&exact_down.call(down_args()).unwrap().value);
@@ -513,7 +521,12 @@ fn real_12b_physical_f16_projection_operands() {
                 .with_param("INT8", 0).with_param("OPERAND", operand)
                 .with_launch_param(1, "KSPLIT", 4).with_launch_param(2, "KSPLIT", 4)
                 .with_launch_param(4, "ROTATE", 2)).unwrap();
-        let args = || project_rows::Args { source: &input, weight: &down, weight_scale: &absent };
+        let args = || project_rows::Args {
+            source: &input,
+            weight: &down,
+            weight_scale: &absent,
+            weight_bound: &absent,
+        };
         let left = read_f32(&form(0).call(args()).unwrap().value);
         let right = read_f32(&form(1).call(args()).unwrap().value);
         if count == 1 { assert_eq!(left, right, "operand policy must preserve exact decode"); }

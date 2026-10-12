@@ -5,8 +5,8 @@
 //! the mixer, the feed-forward and the per-layer input in order.
 
 use super::attention::graph::{
-    AttentionBlock, AttentionGraphEntries, CheckedAttentionEntries, HistoryTilesPort, attention,
-    attention_weights,
+    AttentionBlock, AttentionBounds, AttentionGraphEntries, CheckedAttentionEntries,
+    HistoryTilesPort, attention, attention_weights,
 };
 use super::dense_ffn::graph::{CheckedDenseEntries, DenseGraphEntries, dense};
 use super::gated_delta::graph::{
@@ -37,7 +37,7 @@ use super::{
 use crate::native::{AttestedFeedForward, AttestedMixer, OutputScales};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, activation, weight};
+use crate::programs::native_target_graph::{PackingBound, WeightPort, activation, weight};
 use crate::{
     FeedForwardProgramSlot, GeneralRoutedShape, MixerProgramSlot, ModelLoadPlan, PerLayerBinding,
     ShortConvShape, StateResourcePlan, StateSpaceShape,
@@ -314,11 +314,15 @@ impl BlockSublayers<'_> {
                 let shape = attention_operator::shape(geometry.hidden, operator)
                     .map_err(|error| error.to_string())?;
                 let post_norm_epsilon = post_norm_epsilon(paired.mixer_output);
+                let bounds = AttentionBounds::planned(
+                    graph, load, scope, operator, &shape, true, weights, constants,
+                )?;
                 let attention_weights = attention_weights(
                     &shape,
                     operator,
                     true,
                     post_norm_epsilon.is_some(),
+                    bounds,
                     |kind| weight(graph, load, scope, kind, weights),
                 )?;
                 // The block reads its history domain's slab tensor, a Shared
@@ -379,6 +383,7 @@ impl BlockSublayers<'_> {
                     load,
                     scope,
                     weights,
+                    constants,
                     hidden,
                     RecurrentBlock {
                         rows,
@@ -404,6 +409,7 @@ impl BlockSublayers<'_> {
                     load,
                     scope,
                     weights,
+                    constants,
                     hidden,
                     StateSpaceBlock {
                         rows,
@@ -419,7 +425,6 @@ impl BlockSublayers<'_> {
                 (mixed, ports.into(), BlockControlPorts::Recurrent(controls))
             }
             (Mixer::ShortConv(operator), MixerEntries::ShortConv(entries)) => {
-                let absent_scale = GraphConstant::absent_scale(graph, constants)?;
                 let (mixed, window, controls) = short_conv(
                     graph,
                     entries,
@@ -427,7 +432,7 @@ impl BlockSublayers<'_> {
                     load,
                     scope,
                     weights,
-                    &absent_scale,
+                    constants,
                     hidden,
                     ShortConvBlock {
                         rows,
@@ -570,6 +575,16 @@ impl BlockSublayers<'_> {
                         WeightKind::PerLayerProjection,
                         weights,
                     )?,
+                    projection_bound: PackingBound::planned(
+                        graph,
+                        load,
+                        magnitude_family_contracts::WeightRole {
+                            scope,
+                            kind: WeightKind::PerLayerProjection,
+                        },
+                        weights,
+                        constants,
+                    )?,
                     post_norm: weight(graph, load, scope, WeightKind::PostNorm, weights)?,
                 };
                 let rows_port = graph.port_with_class_extent(
@@ -579,7 +594,7 @@ impl BlockSublayers<'_> {
                     "M",
                 )?;
                 let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-                let absent_scale = GraphConstant::absent_scale(graph, constants)?;
+                let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
                 let advanced = per_layer_graph(
                     graph,
                     entries,

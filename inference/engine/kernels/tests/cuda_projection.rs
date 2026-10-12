@@ -197,6 +197,8 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
                         activation: 0,
                         gate_scale: &f32_tensor(&device, &[0], &[]),
                         up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        up_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -280,6 +282,7 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
                         down_scale: &f32_tensor(&device, &[0], &[]),
+                        down_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -353,6 +356,8 @@ fn cuda_gemm_row_bands_match_host_model() {
                         activation: 0,
                         gate_scale: &f32_tensor(&device, &[0], &[]),
                         up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        up_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -396,6 +401,7 @@ fn cuda_gemm_row_bands_match_host_model() {
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
                         down_scale: &f32_tensor(&device, &[0], &[]),
+                        down_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -461,6 +467,8 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
                 activation: 0,
                 gate_scale: &absent_scale,
                 up_scale: &absent_scale,
+                gate_bound: &absent_scale,
+                up_bound: &absent_scale,
             }],
             initialize: None,
             written: Default::default(),
@@ -549,6 +557,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
                     down_weight: &down.tensor,
                     out_rows,
                     down_scale: &absent_scale,
+                    down_bound: &absent_scale,
                 }],
                 initialize: None,
                 written: Default::default(),
@@ -639,6 +648,8 @@ fn cuda_dense_weights_match_host_model() {
                 activation: 0,
                 gate_scale: &f32_tensor(&device, &[0], &[]),
                 up_scale: &f32_tensor(&device, &[0], &[]),
+                gate_bound: &f32_tensor(&device, &[0], &[]),
+                up_bound: &f32_tensor(&device, &[0], &[]),
             })
             .unwrap()
             .value;
@@ -675,6 +686,7 @@ fn cuda_dense_weights_match_host_model() {
                 down_weight: &down.tensor,
                 out_rows: &out_rows,
                 down_scale: &f32_tensor(&device, &[0], &[]),
+                down_bound: &f32_tensor(&device, &[0], &[]),
             })
             .unwrap()
             .value;
@@ -752,6 +764,8 @@ fn cuda_gemv_rows_match_single_row_bits() {
                         activation: 0,
                         gate_scale: &f32_tensor(&device, &[0], &[]),
                         up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        up_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -763,6 +777,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
                         down_scale: &f32_tensor(&device, &[0], &[]),
+                        down_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -1628,6 +1643,8 @@ fn cuda_gemm_timings() {
                                 activation: 0,
                                 gate_scale: &absent_scale,
                                 up_scale: &absent_scale,
+                                gate_bound: &absent_scale,
+                                up_bound: &absent_scale,
                             })
                             .collect();
                         expand_times.push(expand.measure(args, &options).unwrap().median);
@@ -1638,6 +1655,7 @@ fn cuda_gemm_timings() {
                                 down_weight: &downs[r],
                                 out_rows: &out_rows,
                                 down_scale: &absent_scale,
+                                down_bound: &absent_scale,
                             })
                             .collect();
                         output_times.push(output.measure(args, &options).unwrap().median);
@@ -1707,6 +1725,8 @@ fn cuda_projection_timings() {
                         activation: 0,
                         gate_scale: &absent_scale,
                         up_scale: &absent_scale,
+                        gate_bound: &absent_scale,
+                        up_bound: &absent_scale,
                     })
                     .collect();
                 let measured = expand.measure(args, &options).unwrap();
@@ -1724,6 +1744,7 @@ fn cuda_projection_timings() {
                         down_weight: &downs[r],
                         out_rows: &out_rows,
                         down_scale: &absent_scale,
+                        down_bound: &absent_scale,
                     })
                     .collect();
                 let measured = output.measure(args, &options).unwrap();

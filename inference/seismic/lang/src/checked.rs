@@ -2110,17 +2110,30 @@ impl NativeImplementation {
                     }),
             )
             .collect::<Vec<_>>();
+        // The values each parameter is walked over: an entry-wide parameter
+        // `statics` values is walked at that value alone.
+        let values = domains
+            .iter()
+            .map(|(launch, parameter)| {
+                match launch.is_none().then(|| statics.param(&parameter.name)).flatten() {
+                    Some(value) if parameter.values.contains(&value) => Ok(vec![value]),
+                    Some(value) => Err(NativeSpecializationError::OutsideDomain {
+                        parameter: parameter.name.clone(),
+                        value,
+                    }),
+                    None => Ok(parameter.values.clone()),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         // Walk the product of the parameter domains in place (the last
         // parameter varies fastest), keeping each admissible configuration.
         let mut configuration = base;
-        for (launch, parameter) in &domains {
+        for ((launch, parameter), values) in domains.iter().zip(&values) {
             configuration = match launch {
-                None => configuration.with_param(parameter.name.clone(), parameter.values[0]),
-                Some(launch) => configuration.with_launch_param(
-                    *launch,
-                    parameter.name.clone(),
-                    parameter.values[0],
-                ),
+                None => configuration.with_param(parameter.name.clone(), values[0]),
+                Some(launch) => {
+                    configuration.with_launch_param(*launch, parameter.name.clone(), values[0])
+                }
             };
         }
         // The `where` condition's top-level conjuncts, each with the last
@@ -2223,7 +2236,7 @@ impl NativeImplementation {
             }
             let Some(position) = (0..rejected.map_or(domains.len(), |last| last + 1))
                 .rev()
-                .find(|&position| steps[position] + 1 < domains[position].1.values.len())
+                .find(|&position| steps[position] + 1 < values[position].len())
             else {
                 return Ok(());
             };
@@ -2231,18 +2244,19 @@ impl NativeImplementation {
             let mut set = |position: usize, step: usize| {
                 steps[position] = step;
                 let (launch, parameter) = domains[position];
+                let value = values[position][step];
                 match launch {
                     None => {
                         *configuration
                             .params
                             .get_mut(&parameter.name)
-                            .expect("every parameter was valued") = parameter.values[step];
+                            .expect("every parameter was valued") = value;
                     }
                     Some(_) => {
                         *configuration
                             .launch_params
                             .get_mut(launch_keys[position].as_ref().expect("a launch parameter"))
-                            .expect("every launch parameter was valued") = parameter.values[step];
+                            .expect("every launch parameter was valued") = value;
                     }
                 }
             };

@@ -9,12 +9,13 @@
 //! bank it publishes to.
 
 use crate::programs::graph::{GraphError, draft::GraphDraft};
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
 use crate::{
     ModelLoadPlan, RecurrentBinding, StateResourcePlan,
     native::{RecurrentKernels, RecurrentStepKernels},
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     attention_output, gated_delta_chunk, gated_delta_project, gated_delta_project_convolved,
     gated_delta_step, gated_delta_step_convolved,
@@ -235,9 +236,25 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
     block: RecurrentBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
+    // The packed projections' bounds. The convolved decode form has no
+    // packed form and reads none, so the input projection's are only where
+    // `gated_delta_project` runs (an unread port is unbound).
+    let projects = chunked(block.rows) || matches!(kernels.step, RecurrentStepEntries::Step(_));
+    let mut bound = |graph: &mut G, kind| {
+        PackingBound::planned(graph, load, WeightRole { scope, kind }, weights, constants)
+    };
+    let projection_bounds = match projects {
+        true => Some((
+            bound(graph, WeightKind::RecurrentQueryKeyValue)?,
+            bound(graph, WeightKind::RecurrentGate)?,
+        )),
+        false => None,
+    };
+    let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
     let input_norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
     let qkv_weight = weight(
         graph,
@@ -271,18 +288,22 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         tape_rows,
     ) = bank_ports(graph, state, block.component_index)?;
 
-    let projection_dimensions = [
-        ("M", block.rows),
-        ("H", block.hidden),
-        ("NK", block.key_heads),
-        ("NV", block.value_heads),
-        ("W", block.width),
-    ];
     let project = |graph: &mut G| {
+        let Some((qkv_bound, gate_bound)) = &projection_bounds else {
+            return Err("the recurrent projection's packing bounds are absent".into());
+        };
         graph
             .enqueue(
                 kernels.project,
-                &projection_dimensions,
+                &[
+                    ("M", block.rows),
+                    ("H", block.hidden),
+                    ("NK", block.key_heads),
+                    ("NV", block.value_heads),
+                    ("W", block.width),
+                    ("QB", qkv_bound.extent),
+                    ("ZB", gate_bound.extent),
+                ],
                 gated_delta_project::WorkflowArgs {
                     hidden: hidden.into(),
                     input_norm: (&input_norm).into(),
@@ -291,7 +312,10 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     alpha_weight: (&alpha_weight).into(),
                     beta_weight: (&beta_weight).into(),
                     epsilon: block.epsilon,
-                },            )
+                    qkv_bound: (&qkv_bound.tensor).into(),
+                    gate_bound: (&gate_bound.tensor).into(),
+                },
+            )
             .map(|projection| projection.value)
     };
     let dimensions = [
@@ -446,12 +470,15 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                 ("D", block.hidden),
                 ("Q", block.value_heads),
                 ("W", block.width),
+                ("OB", output_bound.extent),
             ],
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
-            },        )?
+                output_bound: (&output_bound.tensor).into(),
+            },
+        )?
         .value;
     Ok((
         output,

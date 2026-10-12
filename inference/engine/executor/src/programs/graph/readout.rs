@@ -343,6 +343,9 @@ pub(crate) struct ReadoutTapPorts {
     pub taps: NativePort,
     pub fusion: NativePort,
     pub fusion_scale: NativePort,
+    /// The fusion's packing bound port (`WeightPlan::bound`; empty where
+    /// the plan has none).
+    pub fusion_bound: NativePort,
 }
 
 #[derive(Clone)]
@@ -635,6 +638,10 @@ impl PreparedTargetReadoutGraphs {
                     &taps.fusion_scale,
                     fusion.projection.scale().unwrap_or(&absent_scale),
                 ));
+                fixed.push((
+                    &taps.fusion_bound,
+                    fusion.projection.bound().unwrap_or(&absent_scale),
+                ));
             }
             bound.insert(
                 *class,
@@ -879,6 +886,8 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
             // The fusion's resident second-level scale, or an absent scale.
             let scale_extent = plan.scale_extent();
             let fusion_scale = graph.port(Element::f32(), &[scale_extent])?;
+            // Its packing bound (`WeightPlan::bound`), or an absent one.
+            let fusion_bound = graph.port(Element::f32(), &[plan.bound])?;
             let fused = graph
                 .enqueue::<project_rows::Entry>(
                     fusion,
@@ -887,11 +896,13 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                         ("K", width),
                         ("N", geometry.hidden),
                         ("WS", scale_extent),
+                        ("WB", plan.bound),
                     ],
                     project_rows::WorkflowArgs {
                         source: taps.tensor().into(),
                         weight: weight.tensor().into(),
                         weight_scale: fusion_scale.tensor().into(),
+                        weight_bound: fusion_bound.tensor().into(),
                     },                )?
                 .value;
             let out_rows = graph.input_for(features, "out_rows", &dimensions)?;
@@ -916,6 +927,7 @@ fn feature_topology<'a, G: GraphDraft + 'a>(
                     taps,
                     fusion: weight,
                     fusion_scale,
+                    fusion_bound,
                 }),
             )
         }

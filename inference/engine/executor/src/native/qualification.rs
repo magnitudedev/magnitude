@@ -99,7 +99,7 @@ impl<'a> QualificationView<'a> {
                     source: source_element,
                     resident: target_element,
                 },
-                AttestedImport::Repack(handle),
+                AttestedImport::Repack { repack: handle, .. },
             ) = (slot, handle)
             else {
                 continue;

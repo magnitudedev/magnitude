@@ -48,6 +48,9 @@ fn packed_stages_on(device: &seismic::Device) {
                 let value = match name.as_str() {
                     "H" | "D" | "W" => 32,
                     "NK" | "NV" | "Q" => 1,
+                    // No packing bounds: the packed forms certify against
+                    // the format's.
+                    "QB" | "ZB" | "OB" => 0,
                     _ => panic!("unexpected static {name}"),
                 };
                 statics.with_static(name.clone(), value)
@@ -145,6 +148,8 @@ fn packed_stages_on(device: &seismic::Device) {
         alpha_weight: &alpha_weight,
         beta_weight: &beta_weight,
         epsilon,
+        qkv_bound: &tensor(&device, &[0], &[]),
+        gate_bound: &tensor(&device, &[0], &[]),
     })
     .unwrap()
     .value;
@@ -203,6 +208,7 @@ fn packed_stages_on(device: &seismic::Device) {
         hidden: &hidden,
         gated: &gated,
         output_weight: &zero_weight,
+        output_bound: &tensor(&device, &[0], &[]),
     })
     .unwrap()
     .value;

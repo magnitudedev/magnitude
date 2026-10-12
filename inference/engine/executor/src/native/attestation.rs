@@ -14,8 +14,9 @@ use crate::{
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
     attention_append_dense, cluster_token_rows, draft_convolve_input, draft_convolve_residual,
-    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, place_logits_rows,
-    post_norm_residual, project_rows, readout_project_rows, repack_weight, tap_rows, widen_rows,
+    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, packing_bound,
+    place_logits_rows, post_norm_residual, project_rows, readout_project_rows, repack_weight,
+    tap_rows, widen_rows,
 };
 use std::{collections::HashSet, rc::Rc};
 
@@ -303,10 +304,16 @@ pub(crate) struct AttestedState {
     pub conditioning: Option<NativeKernel<conditioning_overlay::Entry>>,
 }
 
+/// The entries that make a weight resident: its import, and for a repacked
+/// weight with a packing bound (`WeightPlan::bound`) the entry that makes
+/// the bound from the imported weight.
 #[derive(Clone)]
 pub(crate) enum AttestedImport {
     Dense(NativeKernel<import_dense::Entry>),
-    Repack(NativeKernel<repack_weight::Entry>),
+    Repack {
+        repack: NativeKernel<repack_weight::Entry>,
+        bound: Option<NativeKernel<packing_bound::Entry>>,
+    },
 }
 
 fn missing(entry: &'static str, binding: impl fmt::Debug) -> CatalogFailure {
@@ -639,12 +646,18 @@ impl AttestedPrograms {
         // The native catalog's one-word device identity owner is retained
         // with every prepared group.
         let mut bytes = 4u128;
+        let mut charged_bounds = HashSet::new();
         for slot in plan.imports() {
             if charged_imports.insert(*slot) {
                 bytes += match slot {
                     ImportProgramSlot::Dense { .. } => bytes!(import_dense),
                     ImportProgramSlot::Repack { .. } => bytes!(repack_weight),
                 };
+            }
+            if let ImportProgramSlot::Repack { resident, .. } = slot {
+                if crate::planning::packing_run(*resident).is_some() && charged_bounds.insert(*resident) {
+                    bytes += bytes!(packing_bound);
+                }
             }
         }
         for &element in plan.state().copies() {
@@ -1513,18 +1526,10 @@ impl AttestedPrograms {
         };
         let mut imports = Vec::with_capacity(topology.imports().len());
         for &binding in topology.imports() {
-            let handle = match binding {
-                ImportProgramSlot::Dense { source, resident } => AttestedImport::Dense(slot(
-                    &prepared.import.import_dense,
-                    (source, resident),
-                    "import_dense",
-                )?),
-                ImportProgramSlot::Repack { source, resident } => AttestedImport::Repack(slot(
-                    &prepared.import.repack_weight,
-                    (source, resident),
-                    "repack_weight",
-                )?),
-            };
+            let handle = prepared
+                .import
+                .attested(binding)
+                .ok_or_else(|| missing("weight_import", binding))?;
             imports.push((binding, handle));
         }
         let invocation_workspace_bytes = Self::sum_invocation_workspace_bytes(&prepared)?;
@@ -1605,6 +1610,7 @@ impl AttestedPrograms {
         }
         charge!(prepared.import.import_dense.values());
         charge!(prepared.import.repack_weight.values());
+        charge!(prepared.import.packing_bound.values());
         charge!(prepared.target.embedding.values());
         for handles in prepared.target.attention.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
@@ -2094,13 +2100,7 @@ impl AttestedPrograms {
         &self,
         weight: &crate::WeightPlan,
     ) -> Result<AttestedImport, CatalogError> {
-        let requested = match (weight.upload.dtype(), weight.resident.dtype()) {
-            (Some(source), Some(resident)) => ImportProgramSlot::Dense { source, resident },
-            _ => ImportProgramSlot::Repack {
-                source: weight.upload,
-                resident: weight.resident,
-            },
-        };
+        let requested = ImportProgramSlot::of(weight);
         self.imports
             .iter()
             .find(|(slot, _)| *slot == requested)
@@ -2479,7 +2479,12 @@ impl AttestedPrograms {
         for (_, import) in &self.imports {
             match import {
                 AttestedImport::Dense(handle) => charge!(handle),
-                AttestedImport::Repack(handle) => charge!(handle),
+                AttestedImport::Repack { repack, bound } => {
+                    charge!(repack);
+                    if let Some(bound) = bound {
+                        charge!(bound);
+                    }
+                }
             }
         }
         Ok(bytes)

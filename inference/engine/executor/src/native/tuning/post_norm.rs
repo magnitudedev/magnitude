@@ -2,7 +2,7 @@
 //! publishing F32 for the `post_norm_residual` row op). The row op itself has
 //! no tuning parameters.
 
-use super::cases::{projection_shape, scale_extent};
+use super::cases::{packing_statics, projection_shape, scale_extent};
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::project_rows;
@@ -26,6 +26,7 @@ pub(crate) struct ProjectRowsCase {
     source: Tensor,
     weight: Tensor,
     weight_scale: Tensor,
+    weight_bound: Tensor,
 }
 
 impl ProjectRowsTuning {
@@ -57,11 +58,17 @@ impl EntryTuning for ProjectRowsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (outputs, inputs_width) = projection_shape(inputs, &self.scopes, self.kind)?;
-        Ok(vec![
+        let mut statics = vec![
             ("K", inputs_width),
             ("N", outputs),
             ("WS", scale_extent(inputs, &self.scopes, self.kind)?),
-        ])
+        ];
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("WB", Some(self.kind))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -87,6 +94,7 @@ impl EntryTuning for ProjectRowsTuning {
                     )?,
                     weight,
                     weight_scale: inputs.unit_scale(inputs.scale_extent(scope, self.kind)?)?,
+                    weight_bound: inputs.bound(scope, self.kind)?,
                 })
             })
             .collect()
@@ -97,6 +105,7 @@ impl EntryTuning for ProjectRowsTuning {
             source: &case.source,
             weight: &case.weight,
             weight_scale: &case.weight_scale,
+            weight_bound: &case.weight_bound,
         }
     }
 

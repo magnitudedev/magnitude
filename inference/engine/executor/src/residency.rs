@@ -223,6 +223,9 @@ pub struct ResidentWeight {
     /// The resident second-level scale (`WeightPlan::scale`): one F32 value
     /// per matrix, bound to its entries' accumulator-scale ports.
     scale: Option<Tensor>,
+    /// The resident packing bound (`WeightPlan::bound`), which the import
+    /// makes, bound to the packed projection entries' `<weight>_bound` ports.
+    bound: Option<Tensor>,
     /// The weight as a gathered table. Of a streamed one `tensor` is the
     /// slots, and every reader of the weight shares the device table.
     table: ResidentTable,
@@ -254,6 +257,10 @@ impl ResidentWeight {
         self.scale.as_ref()
     }
 
+    pub fn bound(&self) -> Option<&Tensor> {
+        self.bound.as_ref()
+    }
+
     /// The weight of a streamed table: the slots that hold some of its
     /// rows, and the device table they are.
     fn streamed(descriptor: WeightDescriptor, table: Rc<DeviceTable>) -> Self {
@@ -261,15 +268,17 @@ impl ResidentWeight {
             descriptor,
             tensor: table.slots_tensor().clone(),
             scale: None,
+            bound: None,
             table: ResidentTable::streamed(table),
         }
     }
 
-    /// Every allocation of the weight: its representation, its scale and a
-    /// streamed table's directory and staging.
+    /// Every allocation of the weight: its representation, its scale, its
+    /// packing bound and a streamed table's directory and staging.
     pub(crate) fn storage_bytes(&self) -> u64 {
         self.tensor.storage_bytes()
             + self.scale.as_ref().map_or(0, Tensor::storage_bytes)
+            + self.bound.as_ref().map_or(0, Tensor::storage_bytes)
             + self.table.streamed_bytes()
     }
 }
@@ -319,11 +328,13 @@ impl TileSource for TileImport {
             let source = staging
                 .slice_leading(staged, staged + rows)
                 .map_err(|error| failed(&error))?;
+            // A streamed table has no packing bound.
             crate::programs::native_import::enqueue_into(
                 &self.import,
                 &mut batch,
                 &source,
                 &run.slots,
+                None,
             )
             .map_err(|error| failed(&error))?;
             staged += rows;
@@ -645,6 +656,7 @@ impl ResidencyStore {
             descriptor: descriptor.clone(),
             tensor,
             scale: None,
+            bound: None,
             table: ResidentTable::whole(),
         };
         self.publish(key, weight.clone())?;
@@ -698,10 +710,12 @@ impl ResidencyStore {
             .map_err(|(error, _launch)| WeightImportError::Submit(error))?;
         let completed = submission.finish().map_err(WeightImportError::Completion)?;
         let (_, destination) = completed.into_parts();
+        let (tensor, bound) = destination.into_parts();
         let weight = ResidentWeight {
             descriptor,
-            tensor: destination.into_tensor(),
+            tensor,
             scale,
+            bound,
             table: ResidentTable::whole(),
         };
         self.publish(key, weight.clone())?;
@@ -1046,12 +1060,14 @@ impl ResidencyStore {
                 for (key, descriptor, scale, launch) in pending {
                     let (_, workspace, destination) = launch.into_submission_parts();
                     drop(workspace);
+                    let (tensor, bound) = destination.into_parts();
                     self.publish(
                         key,
                         ResidentWeight {
                             descriptor,
-                            tensor: destination.into_tensor(),
+                            tensor,
                             scale,
+                            bound,
                             table: ResidentTable::whole(),
                         },
                     )?;

@@ -374,8 +374,10 @@ fn project_rows_specialization(
         return specialization;
     }
     specialization
+        .with_static("WB", 0)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
+        .with_param("RESIDUE", 1)
         .with_launch_param(7, "TALL_M", 128)
         .with_launch_param(7, "TALL_K", 64)
         .with_launch_param(7, "STAGERS", 2)
@@ -687,6 +689,8 @@ fn portable_entries_match_host_reference() {
                 floats(DType::BF16, &[m, k], &x),
                 floats(DType::BF16, &[n, k], &w),
                 floats(DType::F32, &[0], &[]),
+                // No packing bound.
+                floats(DType::F32, &[0], &[]),
             ],
         );
         let (expected, magnitudes) = project(&x, &w, k, n);
@@ -859,6 +863,7 @@ fn native_project_rows_matches_host_reference() {
                             source: &source,
                             weight: &weight,
                             weight_scale: &weight_scale,
+                            weight_bound: &tensor(device, DType::F32, &[0], &[]),
                         })
                         .unwrap()
                         .value;

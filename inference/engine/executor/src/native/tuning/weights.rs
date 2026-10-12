@@ -4,13 +4,14 @@
 //! released when its entry is tuned.
 
 use crate::{
-    ArtifactComponent, ArtifactComponentKind, ModelLoadPlan, Stored, WeightPlan,
-    native::{AttestedImport, import::ImportKernels},
+    ArtifactComponent, ArtifactComponentKind, ImportProgramSlot, ModelLoadPlan, Stored,
+    WeightPlan,
+    native::import::ImportKernels,
     resources::{ImportSource, ImportWindow},
 };
 use magnitude_artifacts::{Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
-use seismic::{Device, Tensor};
+use seismic::{Device, Element, Tensor};
 use std::collections::HashMap;
 
 /// Where tuning reads weights from.
@@ -139,6 +140,10 @@ pub(crate) struct TuningWeights<'a> {
     source: &'a dyn TuningWeightSource,
     import: &'a ImportKernels,
     resident: HashMap<WeightRole, Tensor>,
+    /// The packing bounds the imports made (`WeightPlan::bound`), kept for
+    /// the tuning's duration: a bound is a few values, and outlives its
+    /// weight's release.
+    bounds: HashMap<WeightRole, Tensor>,
 }
 
 impl<'a> TuningWeights<'a> {
@@ -154,6 +159,7 @@ impl<'a> TuningWeights<'a> {
             source,
             import,
             resident: HashMap::new(),
+            bounds: HashMap::new(),
         }
     }
 
@@ -174,6 +180,19 @@ impl<'a> TuningWeights<'a> {
         weight_plan(self.load, scope, kind)
     }
 
+    /// The packing bound of a weight, as its import makes it; `None` for a
+    /// weight without one.
+    pub fn bound(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Option<Tensor>, String> {
+        let role = WeightRole { scope, kind };
+        if self.plan(scope, kind)?.bound == 0 {
+            return Ok(None);
+        }
+        if !self.bounds.contains_key(&role) {
+            self.weight(scope, kind)?;
+        }
+        Ok(self.bounds.get(&role).cloned())
+    }
+
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
         let role = WeightRole { scope, kind };
         if let Some(tensor) = self.resident.get(&role) {
@@ -192,29 +211,25 @@ impl<'a> TuningWeights<'a> {
         let source = self.source.import_source(self.device, plan)?;
         let destination = Tensor::zeros(self.device, plan.resident, &plan.shape)
             .map_err(|error| error.to_string())?;
-        let handle = match (plan.upload.dtype(), plan.resident.dtype()) {
-            (Some(source), Some(resident)) => self
-                .import
-                .import_dense
-                .get(&(source, resident))
-                .cloned()
-                .map(AttestedImport::Dense),
-            _ => self
-                .import
-                .repack_weight
-                .get(&(plan.upload, plan.resident))
-                .cloned()
-                .map(AttestedImport::Repack),
-        }
-        .ok_or_else(|| {
-            format!(
-                "no import entry was prepared for {} -> {}",
-                plan.source.name(),
-                plan.resident.name()
-            )
-        })?;
-        crate::programs::native_import::import_into(&handle, &source, &destination)
+        let mut bound = (plan.bound != 0)
+            .then(|| Tensor::zeros(self.device, Element::f32(), &[plan.bound]))
+            .transpose()
             .map_err(|error| error.to_string())?;
+        let handle = self
+            .import
+            .attested(ImportProgramSlot::of(plan))
+            .ok_or_else(|| {
+                format!(
+                    "no import entry was prepared for {} -> {}",
+                    plan.source.name(),
+                    plan.resident.name()
+                )
+            })?;
+        crate::programs::native_import::import_into(&handle, &source, &destination, bound.as_mut())
+            .map_err(|error| error.to_string())?;
+        if let Some(bound) = bound {
+            self.bounds.insert(role, bound);
+        }
         self.resident.insert(role, destination.clone());
         Ok(destination)
     }

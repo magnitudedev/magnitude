@@ -35,8 +35,8 @@ use crate::{
             distinct_storage_bytes,
         },
         native_target_graph::{
-            GatheredTable, WeightPort, embedding_transform, projection_ports, scaled_weight,
-            scaled_weight_ports, weight,
+            GatheredTable, WeightPort, embedding_transform, packed_weight,
+            projection_ports, scaled_weight_ports, weight,
         },
     },
 };
@@ -264,7 +264,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         WeightKind::Embedding,
         &mut weights,
     )?;
-    let input = scaled_weight(
+    let input = packed_weight(
         &mut graph,
         load,
         head,
@@ -323,7 +323,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
     // A one-step graph chains nothing, and a sealed graph reads every port.
     let chain = (class.steps > 1)
         .then(|| {
-            scaled_weight(
+            packed_weight(
                 &mut graph,
                 load,
                 head,
@@ -418,12 +418,14 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     ("M", slots),
                     ("K", 2 * hidden),
                     ("N", width),
-                    ("WS", input.extent),
+                    ("WS", input.scaled.extent),
+                    ("WB", input.bound.extent),
                 ],
                 project_rows::WorkflowArgs {
                     source: joined.tensor().into(),
-                    weight: (&input.weight).into(),
-                    weight_scale: (&input.scale).into(),
+                    weight: (&input.scaled.weight).into(),
+                    weight_scale: (&input.scaled.scale).into(),
+                    weight_bound: (&input.bound.tensor).into(),
                 },            )?
             .value;
         let mut blocks = Vec::with_capacity(geometry.sources.len());
@@ -661,12 +663,14 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                             ("M", slots),
                             ("K", width),
                             ("N", hidden),
-                            ("WS", chain.extent),
+                            ("WS", chain.scaled.extent),
+                            ("WB", chain.bound.extent),
                         ],
                         project_rows::WorkflowArgs {
                             source: (&features).into(),
-                            weight: (&chain.weight).into(),
-                            weight_scale: (&chain.scale).into(),
+                            weight: (&chain.scaled.weight).into(),
+                            weight_scale: (&chain.scaled.scale).into(),
+                            weight_bound: (&chain.bound.tensor).into(),
                         },                    )?
                     .value,
             )

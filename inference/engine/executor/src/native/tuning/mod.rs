@@ -2015,6 +2015,17 @@ impl ModelInputs<'_> {
     pub fn scale_extent(&self, scope: WeightScope, kind: WeightKind) -> Result<u64, String> {
         Ok(weights::weight_plan(self.load, scope, kind)?.scale_extent())
     }
+
+    /// The planned packing of one weight role: its bound port's extent (0
+    /// without a bound) and whether a bounded weight's codes take the residue
+    /// (`planning::packing_residue`).
+    pub fn packing(&self, scope: WeightScope, kind: WeightKind) -> Result<(u64, bool), String> {
+        let plan = weights::weight_plan(self.load, scope, kind)?;
+        Ok((
+            plan.bound,
+            plan.bound > 0 && crate::planning::packing_residue(plan.resident),
+        ))
+    }
 }
 
 pub(crate) struct TuningInputs<'w, 'a> {
@@ -2071,6 +2082,15 @@ impl TuningInputs<'_, '_> {
     /// resident representation and layout.
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
         self.weights.weight(scope, kind)
+    }
+
+    /// A weight's packing bound operand, as loading binds it: its bound, or
+    /// an absent one (zero extent).
+    pub fn bound(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
+        match self.weights.bound(scope, kind)? {
+            Some(bound) => Ok(bound),
+            None => self.unit_scale(0),
+        }
     }
 
     /// Retain a requested shared readout operand by physical storage identity.

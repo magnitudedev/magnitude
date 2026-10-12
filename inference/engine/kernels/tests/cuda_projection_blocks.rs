@@ -144,6 +144,8 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                     alpha_weight: &weights[2].tensor,
                     beta_weight: &weights[3].tensor,
                     epsilon: EPSILON,
+                    qkv_bound: &f32_tensor(&device, &[0], &[]),
+                    gate_bound: &f32_tensor(&device, &[0], &[]),
                 })
                 .unwrap()
                 .value;
@@ -228,6 +230,10 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     value_weight: &weights[2].tensor,
                     epsilon: EPSILON,
                     project_mode: 0,
+                    query_bound: &f32_tensor(&device, &[0], &[]),
+                    gate_bound: &f32_tensor(&device, &[0], &[]),
+                    key_bound: &f32_tensor(&device, &[0], &[]),
+                    value_bound: &f32_tensor(&device, &[0], &[]),
                 })
                 .unwrap();
                 for (name, tensor, (values, tolerance)) in [
@@ -289,6 +295,7 @@ fn cuda_attention_output_matches_host_model() {
                     hidden: &hidden,
                     gated: &gated_tensor,
                     output_weight: &output.tensor,
+                    output_bound: &f32_tensor(&device, &[0], &[]),
                 })
                 .unwrap()
                 .value;
@@ -339,6 +346,7 @@ fn cuda_projection_block_timings() {
             &[m as u64, nv as u64, w as u64],
             &vec![0.25; m * z],
         );
+        let no_bound = f32_tensor(&device, &[0], &[]);
         for &mapping in mappings(m) {
             let kernel = gated_delta_project::native_for_device_with(
                 &device,
@@ -368,6 +376,8 @@ fn cuda_projection_block_timings() {
                     alpha_weight: &weights[2],
                     beta_weight: &weights[3],
                     epsilon: EPSILON,
+                    qkv_bound: &no_bound,
+                    gate_bound: &no_bound,
                 })
                 .collect();
             let measured = kernel.measure(args, &options).unwrap();
@@ -397,6 +407,7 @@ fn cuda_projection_block_timings() {
                     hidden: &hidden,
                     gated: &gated,
                     output_weight: weight,
+                    output_bound: &no_bound,
                 })
                 .collect();
             let measured = kernel.measure(args, &options).unwrap();

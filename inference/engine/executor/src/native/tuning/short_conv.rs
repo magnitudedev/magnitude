@@ -3,7 +3,7 @@
 //! projection (`attention_output` over one head of `channels`).
 //! `short_conv_rows` declares no parameters.
 
-use super::cases::projection_shape;
+use super::cases::{packing_statics, projection_shape};
 use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -140,6 +140,7 @@ pub(crate) struct ShortConvOutputCase {
     hidden: Tensor,
     gated: Tensor,
     output: Tensor,
+    bound: Tensor,
 }
 
 impl EntryTuning for ShortConvOutputTuning {
@@ -168,7 +169,13 @@ impl EntryTuning for ShortConvOutputTuning {
             );
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
-        Ok(statics.to_vec())
+        let mut statics = statics.to_vec();
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("OB", Some(WeightKind::RecurrentOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -198,6 +205,7 @@ impl EntryTuning for ShortConvOutputTuning {
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
+                    bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                 })
             })
             .collect()
@@ -208,6 +216,7 @@ impl EntryTuning for ShortConvOutputTuning {
             hidden: &case.hidden,
             gated: &case.gated,
             output_weight: &case.output,
+            output_bound: &case.bound,
         }
     }
 

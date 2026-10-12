@@ -3415,6 +3415,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                     ))
                 })?,
         );
+        fix(&mut implementation, statics.params())?;
         widen(&mut implementation, domains)?;
         // Every configuration formed is this one entry at these bindings.
         let logical = Arc::new(
@@ -6955,6 +6956,30 @@ fn update_declaration_digest(
     digest.update(name.as_bytes());
 }
 
+/// Fix the parameters a unit's statics value (a parameter its bindings
+/// leave inapplicable beyond one value): the search takes each at that value
+/// alone, which must be one the declaration offers.
+fn fix(
+    implementation: &mut NativeImplementation,
+    params: &BTreeMap<String, u64>,
+) -> Result<(), TuneError> {
+    for (name, value) in params {
+        let parameter = implementation
+            .params
+            .iter_mut()
+            .find(|parameter| parameter.name == *name)
+            .ok_or_else(|| TuneError::Domain(format!("no parameter `{name}` is declared")))?;
+        if !parameter.values.contains(value) {
+            return Err(TuneError::Domain(format!(
+                "`{name}` is fixed at {value}, which its declared values {:?} do not offer",
+                parameter.values
+            )));
+        }
+        parameter.values = vec![*value];
+    }
+    Ok(())
+}
+
 /// Replace parameter domains for a survey. Each keeps its default first.
 fn widen(
     implementation: &mut NativeImplementation,
@@ -8097,7 +8122,8 @@ mod tests {
         let statics = NativeSpecialization::new()
             .with_static("H", 1024)
             .with_static("F", 4096)
-            .with_static("DS", 0);
+            .with_static("DS", 0)
+            .with_static("DB", 0);
         let seed = implementation.default_specialization(&statics).unwrap();
         let rows = [1u64, 8, 128];
         let shapes = rows

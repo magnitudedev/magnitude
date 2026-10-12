@@ -479,6 +479,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let tuner = Tuner::count(
@@ -1098,7 +1099,7 @@ impl EntryTuning for FakeCase {
         self.bindings.clone()
     }
     fn statics(&self, _inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        Ok(vec![("H", 8), ("F", 16), ("DS", 0)])
+        Ok(vec![("H", 8), ("F", 16), ("DS", 0), ("DB", 0)])
     }
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
         row_points(limits)
@@ -1127,6 +1128,7 @@ impl EntryTuning for FakeCase {
             down_weight: &case.down,
             out_rows: &case.out_rows,
             down_scale: &case.absent_scale,
+            down_bound: &case.absent_scale,
         }
     }
 
@@ -1510,6 +1512,7 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let context = TuningContext {
@@ -1534,7 +1537,7 @@ fn abandoning_the_tuner_after_the_mandatory_phase_leaves_a_cache_a_second_load_c
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -1667,7 +1670,7 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     1024
@@ -1779,6 +1782,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let limits = TuningLimits {
         max_rows: 64,
@@ -1794,7 +1798,7 @@ fn a_record_is_published_with_a_promotion_and_once_when_the_work_stops() {
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -1941,6 +1945,7 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     for delayed in [false, true] {
@@ -2064,6 +2069,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
@@ -2073,7 +2079,7 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else { 8 })
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
         });
     let defaults = implementation.default_specialization(&statics).unwrap();
     let case = FakeCase::new(&implementation, &statics, "pinned-prerequisite");
@@ -2149,6 +2155,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
         .unwrap()
@@ -2157,7 +2164,7 @@ fn ordinary_and_zero_demand_units_outlasting_the_budget_fail_nothing() {
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else { 8 })
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
         });
     for launches in [0, 1] {
         let mut case = FakeCase::new(&implementation, &statics, "late-publication");
@@ -2202,6 +2209,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let context = TuningContext {
@@ -2226,7 +2234,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -2392,6 +2400,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let root = std::env::temp_dir().join(format!("magnitude-tuning-cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -2405,7 +2414,7 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -2613,6 +2622,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let root = std::env::temp_dir().join(format!("magnitude-tuning-alpha-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -2626,7 +2636,7 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -2749,6 +2759,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let root = std::env::temp_dir().join(format!(
         "magnitude-tuning-unqualified-{}",
@@ -2766,7 +2777,7 @@ fn unqualified_terminal_choices_are_reused_with_their_disposition_and_without_se
             spec.with_static(
                 name.clone(),
                 match name.as_str() {
-                    "DS" => 0,
+                    "DS" | "DB" => 0,
                     "H" => 8,
                     _ => 16,
                 },
@@ -2848,6 +2859,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
@@ -2857,7 +2869,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else { 8 })
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
         });
     let mut first = FakeCase::new(&implementation, &statics, "prerequisite-first");
     first.bindings = "first".into();
@@ -2949,6 +2961,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
@@ -2958,7 +2971,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
         .statics
         .iter()
         .fold(NativeSpecialization::new(), |spec, name| {
-            spec.with_static(name.clone(), if name == "DS" { 0 } else { 8 })
+            spec.with_static(name.clone(), if name == "DS" || name == "DB" { 0 } else { 8 })
         });
     let case = DenseOutputTuning {
         down: Element::bf16(),
@@ -3061,6 +3074,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
@@ -3167,6 +3181,7 @@ fn case_state_restores_its_written_rows() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let mut weights = TuningWeights::new(&device, &load, &ZeroTuningWeights, &import);
     let mut shared = HashMap::new();
@@ -3225,6 +3240,7 @@ fn units_start_by_their_share_of_step_time() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let recorder = Recorder::default();
     let implementation = seismic::generated::native_implementation::<dense_output::Entry>(&device)
@@ -3236,7 +3252,7 @@ fn units_start_by_their_share_of_step_time() {
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8
@@ -3328,6 +3344,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let case = AttentionPrefillK8V4Tuning(AttentionMix {
         codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 128, 128),
@@ -3539,6 +3556,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     let import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     let root = std::env::temp_dir().join(format!("magnitude-tuning-serve-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -3552,7 +3570,7 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
         .fold(NativeSpecialization::new(), |spec, name| {
             spec.with_static(
                 name.clone(),
-                if name == "DS" {
+                if name == "DS" || name == "DB" {
                     0
                 } else if name == "H" {
                     8

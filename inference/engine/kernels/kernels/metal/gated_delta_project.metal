@@ -25,6 +25,8 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *qkv_bound [[buffer(SEISMIC_BUFFER_QKV_BOUND)]],                 \
+    device const float *gate_bound [[buffer(SEISMIC_BUFFER_GATE_BOUND)]],               \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define RECURRENT_PROJECT_OPERANDS                                                      \
@@ -221,11 +223,19 @@ kernel void gated_delta_project_tall(RECURRENT_PROJECT_ARGUMENTS,
         weight_scales};                                                                 \
     const projection::packing_scratch gate_scratch{packed, token_factors, token_scales, \
         weight_factors + ulong(qkv_rows) * (k / 32u) * 2u, weight_scales + qkv_rows}
-#define RECURRENT_PROJECT_PACKING projection::packing_shared<packets::W0, packets::W1>
+// The shared operand coded for WIDTH residue bits where it has them; its
+// layout (folds, centre, the weights it serves) is every width's.
+#define RECURRENT_PROJECT_PACKING_OF(WIDTH)                                             \
+    projection::packing_shared<WIDTH, packets::W0, uint((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W), \
+        packets::W1, uint(SEISMIC_DIM_NV * SEISMIC_DIM_W)>
+#define RECURRENT_PROJECT_PACKING RECURRENT_PROJECT_PACKING_OF(1)
 #define RECURRENT_PROJECT_PACKED(SLOT)                                                  \
-    projection::packing_serves<packets::SLOT, RECURRENT_PROJECT_PACKING::folds>::value
+    projection::packing_serves<packets::SLOT, RECURRENT_PROJECT_PACKING::folds,         \
+        RECURRENT_PROJECT_PACKING::residue>::value
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_PACK
+// RESIDUE: the operand's residue width for weights with residue bits.
+template <uint RESIDUE>
 kernel void gated_delta_project_pack(RECURRENT_PROJECT_ARGUMENTS,
     uint pairs [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -237,8 +247,15 @@ kernel void gated_delta_project_pack(RECURRENT_PROJECT_ARGUMENTS,
     RECURRENT_PROJECT_OPERANDS;
     RECURRENT_PROJECT_PACKING_SCRATCH;
     projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
-    projection::packing_operand<RECURRENT_PROJECT_PACKING::centre, RECURRENT_PROJECT_PACKING::folds>(x,
-        qkv_scratch, uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
+    // The bounds of the segments the operand serves, where each has one.
+    constexpr uint SERVED = (RECURRENT_PROJECT_PACKED(W0) ? 1u : 0u) | (RECURRENT_PROJECT_PACKED(W1) ? 2u : 0u);
+    constexpr uint BOUNDED = (SEISMIC_DIM_QB != 0 ? 1u : 0u) | (SEISMIC_DIM_ZB != 0 ? 2u : 0u);
+    constexpr uint BOUNDS = projection::packing_bounded<SERVED, BOUNDED>::value;
+    const projection::packing_bounds<BOUNDS> bounds{{qkv_bound, gate_bound}};
+    projection::packing_operand<RECURRENT_PROJECT_PACKING::centre, RECURRENT_PROJECT_PACKING::folds,
+        RECURRENT_PROJECT_PACKING_OF(RESIDUE)::residue, BOUNDS>(x, qkv_scratch, bounds, uint(SEISMIC_DIM_M), k,
+        pairs, peaks,
+        thread_index, sg, lane);
 }
 #endif
 
@@ -259,7 +276,7 @@ kernel void gated_delta_project_pack_coefficients(RECURRENT_PROJECT_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_GATED_DELTA_PROJECT_PACKED
-template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+template <uint RESIDUE, uint PACK_TOKENS, uint WEIGHTS_AHEAD>
 kernel void gated_delta_project_packed(RECURRENT_PROJECT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -268,11 +285,11 @@ kernel void gated_delta_project_packed(RECURRENT_PROJECT_ARGUMENTS,
     RECURRENT_PROJECT_PACKING_SCRATCH;
     const uint m = uint(SEISMIC_DIM_M), padded = (m + 127u) / 128u * 128u;
     uint group = tile;
-    constexpr uint FOLDS = RECURRENT_PROJECT_PACKING::folds;
-    if (projection::gemm_packed_segment<packets::W0, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(qkv_out, qkv,
+    constexpr uint FOLDS = RECURRENT_PROJECT_PACKING::folds, CODED = RECURRENT_PROJECT_PACKING_OF(RESIDUE)::residue;
+    if (projection::gemm_packed_segment<packets::W0, FOLDS, CODED, PACK_TOKENS, WEIGHTS_AHEAD>(qkv_out, qkv,
             qkv_scratch, m, padded, qkv_rows, k, group, projection::packing_simdgroups, sg, lane))
         return;
-    projection::gemm_packed_segment<packets::W1, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(gate_out, gate,
+    projection::gemm_packed_segment<packets::W1, FOLDS, CODED, PACK_TOKENS, WEIGHTS_AHEAD>(gate_out, gate,
         gate_scratch, m, padded, gate_rows, k, group, projection::packing_simdgroups, sg, lane);
 }
 #endif
