@@ -71,7 +71,7 @@ export const releaseHosts = [
   },
   {
     id: "darwin-x64",
-    runner: "blacksmith-12vcpu-macos-15",
+    runner: "macos-15-large",
     bunTarget: "bun-darwin-x64",
     rustTarget: "x86_64-apple-darwin",
     executableExtension: "",
