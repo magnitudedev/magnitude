@@ -1,5 +1,24 @@
 # @magnitudedev/cli
 
+## 0.2.8
+
+### Patch Changes
+
+- [#182](https://github.com/magnitudedev/magnitude/pull/182) [`cee4780`](https://github.com/magnitudedev/magnitude/commit/cee47802fadac4632e7d27b453650d84644777f2) Thanks [@Fazmin](https://github.com/Fazmin)! - Stop decoding a zstd Codex request once it passes the 128 MB routing limit, so a few kilobytes of compressed input can no longer expand to gigabytes of memory before being rejected.
+
+- [`16021a5`](https://github.com/magnitudedev/magnitude/commit/16021a53aecb0efa39eed257a61b8aad0830e7bd) Thanks [@anerli](https://github.com/anerli)! - - Gemma 4 models are now paired with their assistant models in the catalog, so they use them as a draft head for faster generation.
+
+  - Embedding tables are streamed instead of held whole in memory, so large models use less memory (Qwen3.8 27B about 600 MB less).
+  - Faster Gemma decoding after the first-load optimization, and the first load stays within its time budget, so it no longer runs partly unoptimized after an upgrade.
+
+- [`157ab94`](https://github.com/magnitudedev/magnitude/commit/157ab941334644745dc91a006470768e04a07197) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Fix Qwen 3.5, 3.6 and 3.8 models failing with "sampling distribution is nonfinite" on M1 Max and M1 Ultra Macs.
+  - Fix 8 GB NVIDIA and AMD GPUs unloading the model when several requests run together after a long prompt. Long prompts also go much further on these GPUs (MiniCPM5 2B now handles about 78K tokens instead of failing near 26K).
+  - Model recommendations and "Fits" labels on NVIDIA and AMD GPUs now match what actually loads, because memory the GPU driver keeps for itself is no longer counted as available.
+  - Fix requests occasionally failing with "target rows differ" when several run at once.
+  - Fix every model load crashing on AMD GPUs on Windows.
+  - Fix long prompts hanging on 8 GB AMD GPUs.
+  - Computers whose integrated GPU doesn't meet Magnitude's requirements, such as Intel UHD 770, now run models on the CPU instead of failing to load.
+
 ## 0.2.7
 
 ### Patch Changes
