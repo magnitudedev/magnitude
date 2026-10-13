@@ -9,7 +9,7 @@ import { makeOwnedService, type OwnerAgent } from "./owned-service"
 import { previousInstallationUpgrade } from "./previous-installation-live"
 import { checkServicePort, requireServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
-import { SERVER_DATA_DIRECTORY } from "./server-profile"
+import { SERVER_DATA_DIRECTORY, SERVER_PORT } from "./server-profile"
 
 export const ApplicationRuntime = Schema.Union(
   Schema.TaggedStruct("Installed", { resourcesDirectory: Schema.String }),
@@ -55,7 +55,7 @@ export const resolveApplicationProfile = (options: {
 }): ApplicationProfile => {
   const { runtime, environment, acceptance } = options
   if (options.server && runtime._tag === "Installed" && !acceptance) {
-    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", groupAccess: true }
+    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: SERVER_PORT, endpoint: `http://127.0.0.1:${SERVER_PORT}`, groupAccess: true }
   }
   const isolated = acceptance || runtime._tag === "Development" || environment.MAGNITUDE_DEV_DATA_DIR !== undefined
   const dataDirectory = environment.MAGNITUDE_DEV_DATA_DIR ?? paths(options.platform).join(options.home,

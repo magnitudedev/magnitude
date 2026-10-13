@@ -313,7 +313,9 @@ recognizably Magnitude's own: a uid and primary group in the system ranges of `/
 `/var/lib/magnitude` and no login shell. Any other account or group with that name, such as a
 person's, makes setup refuse before changing anything, and removal never deletes it. A failed root
 step undoes what that run created, so no marker points the CLI at a server that was never enabled;
-re-running setup over a complete or partial setup finishes the remaining steps. The marker selects the server profile for the service and for every CLI command: a marker
+re-running setup over a complete or partial setup finishes the remaining steps. When firewalld is running, the root step also opens the server's TCP port 10100 in its default
+zone, at runtime and permanently, and says so; if that fails it prints the `firewall-cmd` command
+instead and setup continues. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
 that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
 The desktop app always uses the person's own profile. The server profile's ownership directory is
 group-traversable (0710) and its control socket is group-accessible (0660), so group members reach

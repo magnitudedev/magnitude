@@ -173,9 +173,13 @@ them. The scripts take no options and install the stable channel. Each fetches t
 offer for its target from the landing server's `/api/installer`, which counts the request like a
 website download, and verifies it before downloading. On Linux the script first asks, from the
 terminal and with a 60-second timeout, whether to run Magnitude as a server (no answer or no
-terminal means No), then obtains sudo before any download and keeps it fresh, so nothing asks for
-input afterwards; Yes runs `magnitude server setup` with that sudo session. Re-running it on a set-up
-server upgrades the package around a stopped service without asking again. macOS and Windows
+terminal means No; so do an empty answer and end of input), then obtains sudo before any download
+and keeps it fresh, so nothing asks for input afterwards; Yes runs `magnitude server setup` with that
+sudo session. Sudo is obtained and refreshed by running a command, never `sudo -v`: under sudo's
+default `verifypw=all`, validation asks a NOPASSWD account for a password whenever another of its
+rules needs one. It asks for a password only when `sudo -n` cannot run a command, and only from the
+terminal. Re-running it on a set-up server upgrades the package around a stopped service without
+asking again; however the installer ends, a service it stopped is started again. macOS and Windows
 install the desktop app without a question. Linux bootstrap requires curl, coreutils `timeout`,
 Python 3 and OpenSSL with Ed25519 support; Windows bootstrap uses the publisher-signed CLI from the
 selected release.
@@ -203,4 +207,6 @@ installed. Other command names and directories are untouched. Removal deletes on
 targeting this installation and unchanged managed shell blocks, or a Windows PATH entry recorded
 as added by this installer. Other user configuration is preserved. New terminals pick up PATH
 changes; existing terminals may retain their old environment. macOS Finder deletion has no uninstall
-callback, so the app provides explicit command-link removal. Successful registration is silent.
+callback, so the app provides explicit command-link removal. Successful registration is silent. The
+macOS installation script's registration failing (an unwritable shell profile, for instance) does
+not fail the installation: it warns and says which directory to add to PATH.

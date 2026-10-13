@@ -16,7 +16,19 @@ case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64) arch=x64 ;; *) fail '
 umask 077
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-install.XXXXXXXX")
 keepalive=''
-cleanup() { [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
+stopped_server=''
+privilege=''
+# A server stopped for its upgrade is started again however the installer ends.
+restore_server() {
+  [ -n "$stopped_server" ] || return 0
+  stopped_server=''
+  if ${privilege:+$privilege -n} systemctl start magnitude.service; then
+    printf '%s\n' 'The Magnitude server was started again.' >&2
+  else
+    printf '%s\n' 'The Magnitude server could not be started again. Start it with: sudo systemctl start magnitude' >&2
+  fi
+}
+cleanup() { restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
@@ -78,7 +90,8 @@ case "$(uname -s)" in
       printf '%s\n%s ' 'Run Magnitude as a server? It starts on boot, runs without the desktop app,' \
         'and you can use it from a browser on another computer. [y/N]' >/dev/tty
       # --foreground keeps the reader in the terminal's process group, so it may read the terminal.
-      if line=$(timeout --foreground 60 sh -c 'IFS= read -r line </dev/tty && printf "%s" "$line"'); then
+      # End of input (Ctrl-D) reads as an empty answer, which means No.
+      if line=$(timeout --foreground 60 sh -c 'IFS= read -r line </dev/tty || printf "\n" >/dev/tty; printf "%s" "$line"'); then
         case "$line" in [Yy]|[Yy][Ee][Ss]) answer=yes ;; *) answer=no ;; esac
       else
         status=$?
@@ -89,15 +102,17 @@ case "$(uname -s)" in
     fi
 
     # 2. Get sudo up front and keep it fresh, instead of waiting at a password prompt later.
-    if [ "$(id -u)" -eq 0 ]; then privilege=''
-    else
+    # Running a command, never `sudo -v`: with sudo's default verifypw=all, -v asks for a password
+    # whenever any matching rule needs one, even from accounts that also have NOPASSWD.
+    if [ "$(id -u)" -ne 0 ]; then
       command -v sudo >/dev/null 2>&1 || fail 'Installing Magnitude needs sudo. Install it, or run this installer as root.'
-      if has_terminal; then sudo -v </dev/tty || fail 'Installing Magnitude needs administrator access.'
-      else sudo -n -v 2>/dev/null || fail 'Installing Magnitude needs administrator access, and there is no terminal to ask for a password. Run it in a terminal, or allow passwordless sudo.'
+      if sudo -n true 2>/dev/null; then :
+      elif has_terminal; then sudo true </dev/tty || fail 'Installing Magnitude needs administrator access.'
+      else fail 'Installing Magnitude needs administrator access, and there is no terminal to ask for a password. Run it in a terminal, or allow passwordless sudo.'
       fi
       privilege=sudo
       # Detached from the terminal so the installer's session ends when it does.
-      ( while sleep 50; do sudo -n -v 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
+      ( while sleep 50; do sudo -n true 2>/dev/null || exit 0; done ) </dev/null >/dev/null 2>&1 &
       keepalive=$!
     fi
 
@@ -149,10 +164,15 @@ PY
     actual_digest=$(sha256sum "$scratch/magnitude.$package" | cut -d ' ' -f 1)
     [ "$actual_digest" = "$(cat "$scratch/digest")" ] || fail 'The application checksum does not match.'
     # A running server holds the installation lock the package checks, so upgrade it stopped.
-    [ "$answer" != configured ] || $privilege systemctl stop magnitude.service
+    if [ "$answer" = configured ] && systemctl is-active --quiet magnitude.service; then
+      stopped_server=1
+      $privilege systemctl stop magnitude.service
+    fi
     if [ "$package" = deb ]; then $privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y "$scratch/magnitude.deb"
     elif [ "$package" = rpm ]; then $privilege dnf install -y "$scratch/magnitude.rpm"
-    else $privilege pacman -U --noconfirm "$scratch/magnitude.pacman"; fi
+    else $privilege pacman -U --noconfirm "$scratch/magnitude.pacman"
+    fi || fail 'The Magnitude package could not be installed; see the package manager output above.'
+    stopped_server=''
 
     # 4. Set up the server, reusing the sudo session from step 2, or say how to later.
     case "$answer" in

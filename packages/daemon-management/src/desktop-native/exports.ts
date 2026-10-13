@@ -42,7 +42,8 @@ export { makeUnixProcessContinuation, ForegroundContinuationFailed } from "./uni
 export { acquireMacApplicationInstallationLease, nativeMacUpdateAdmission } from "./mac-update-lease"
 export type { OwnerAgent } from "./owned-service"
 export { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"
-export { SERVER_DATA_DIRECTORY, SERVER_USER, SERVER_MARKER_PATH, SERVER_MARKER_CONTENT, SERVER_SUDOERS_PATH, SERVER_SUDOERS_RULE, MAC_SERVER_LABEL, MAC_SERVER_PLIST, isServerProfileActive } from "./server-profile"
+export { SERVER_DATA_DIRECTORY, SERVER_USER, SERVER_PORT, SERVER_MARKER_PATH, SERVER_MARKER_CONTENT, SERVER_SUDOERS_PATH, SERVER_SUDOERS_RULE, MAC_SERVER_LABEL, MAC_SERVER_PLIST, isServerProfileActive } from "./server-profile"
 export { TerminalCommand, TerminalCommandFailed, nodeTerminalCommand } from "./terminal-command"
+export { openServerFirewall } from "./server-firewall"
 export { ServerInstallationFailed, installedServerCli, parseServerInstallation, requireInstalledRoot, installLinuxServer, removeLinuxServer, installMacServer, removeMacServer, macServerPlist,
   classifyServerAccounts, inspectServerAccounts, hasLinuxServerRemnants, systemIdRange } from "./server-installation"

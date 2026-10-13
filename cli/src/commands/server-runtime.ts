@@ -1,7 +1,7 @@
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
-import { ServerInstallationFailed, installLinuxServer, installMacServer, parseServerInstallation, removeLinuxServer, removeMacServer,
-  requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
+import { ServerInstallationFailed, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, removeLinuxServer,
+  removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
 import { ServerSetupHostLive } from "../server/server-setup-live"
 import { serverRemove, serverSetup } from "../server/server-setup"
 
@@ -24,4 +24,6 @@ export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(
   }
   if (request._tag === "Remove") return yield* removeLinuxServer
   yield* installLinuxServer(request.user)
+  const firewall = yield* openServerFirewall
+  if (Option.isSome(firewall)) yield* Effect.sync(() => { process.stdout.write(`${firewall.value}\n`) })
 }).pipe(Effect.provide(BunContext.layer)))
