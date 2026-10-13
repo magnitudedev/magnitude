@@ -1,6 +1,6 @@
-import { Effect, Either, Option } from "effect"
+import { Effect, Either, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
+import { SERVER_START_TIMEOUT, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
 
 const harness = (overrides: Partial<ServerSetupHost> = {}) => {
   const events: string[] = []
@@ -10,6 +10,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     hasServiceManager: Effect.succeed(true),
     personalOwner: Effect.succeed(Option.none()),
     isSetUp: Effect.succeed(true),
+    hasRemnants: Effect.succeed(true),
     hasTerminal: Effect.succeed(true),
     sudoWithoutPrompt: Effect.succeed(false),
     confirm: () => Effect.sync(() => { events.push("confirm"); return true }),
@@ -19,7 +20,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     ...overrides,
   }
   const run = (program: typeof serverSetup) => Effect.runPromise(program.pipe(Effect.provideService(ServerSetupHost, host), Effect.either))
-  return { events, output: () => output.join(""), run }
+  return { events, host, output: () => output.join(""), run }
 }
 
 describe("magnitude server setup", () => {
@@ -39,11 +40,33 @@ describe("magnitude server setup", () => {
     expect(h.events).toEqual([])
   })
   it.each([["Desktop", "Quit the Magnitude desktop app"], ["Headless", "Stop `magnitude serve`"]] as const)("refuses while %s runs in the person's profile", async (owner, message) => {
-    const h = harness({ personalOwner: Effect.succeed(Option.some(owner)) })
+    const h = harness({ personalOwner: Effect.succeed(Option.some(owner)), isSetUp: Effect.succeed(false) })
     const result = await h.run(serverSetup)
     expect(Either.isLeft(result) && result.left.message).toContain(message)
     expect(h.events).toEqual([])
   })
+  it("finishes a macOS setup whose service is already serving, instead of asking to stop it", async () => {
+    const h = harness({ platform: "darwin", personalOwner: Effect.succeed(Option.some("Headless")) })
+    expect(Either.isRight(await h.run(serverSetup))).toBe(true)
+    expect(h.events).toEqual(["root _server-install ada", "network"])
+  })
+  it("still refuses the desktop app when the service is registered", async () => {
+    const h = harness({ platform: "darwin", personalOwner: Effect.succeed(Option.some("Desktop")) })
+    expect(Either.isLeft(await h.run(serverSetup))).toBe(true)
+    expect(h.events).toEqual([])
+  })
+  it.each([["linux", "journalctl -u magnitude"], ["darwin", "~/.magnitude/logs/server.log"]] as const)(
+    "gives up on a %s service that never becomes ready, even mid-request, and says where its log is", async (platform, logs) => {
+      const h = harness({ platform, enableNetworkAccess: Effect.uninterruptible(Effect.never) })
+      const result = await Effect.runPromise(Effect.gen(function* () {
+        const fiber = yield* Effect.fork(serverSetup.pipe(Effect.provideService(ServerSetupHost, h.host), Effect.either))
+        yield* TestClock.adjust(SERVER_START_TIMEOUT)
+        return yield* Fiber.join(fiber)
+      }).pipe(Effect.provide(TestContext.TestContext)))
+      expect(Either.isLeft(result) && result.left.message).toBe(`The Magnitude server did not become ready within 2 minutes. See its log: ${logs}\n`
+        + "Once it's fixed, run `magnitude server setup` again to finish, or `magnitude server remove` to undo setup.")
+      expect(h.output()).toBe("Waiting for the Magnitude server to start…\n")
+    })
   it("fails at once without a terminal or passwordless sudo, instead of waiting at a prompt", async () => {
     const h = harness({ hasTerminal: Effect.succeed(false) })
     const result = await h.run(serverSetup)
@@ -95,8 +118,14 @@ describe("magnitude server remove", () => {
     expect(h.events).toEqual([])
     expect(h.output()).toBe("Nothing was changed.\n")
   })
-  it("reports when no server is set up", async () => {
+  it("cleans up what a partial setup or removal left, even without the marker", async () => {
     const h = harness({ isSetUp: Effect.succeed(false) })
+    expect(Either.isRight(await h.run(serverRemove))).toBe(true)
+    expect(h.events).toEqual(["confirm", "root _server-remove"])
+    expect(h.output()).toContain("Its data is still in /var/lib/magnitude, now owned by root.")
+  })
+  it("reports when nothing of a server exists", async () => {
+    const h = harness({ isSetUp: Effect.succeed(false), hasRemnants: Effect.succeed(false) })
     expect(Either.isRight(await h.run(serverRemove))).toBe(true)
     expect(h.events).toEqual([])
   })

@@ -100,15 +100,18 @@ package reinstallation to restore dependencies and clear the gate.
 bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
 automatically open a window.
-Every Linux package also ships, root-owned, the `magnitude.service` system unit, the
-`/etc/sudoers.d/magnitude` rule (mode 0440) and the `dev.magnitude.update` Polkit action. The unit
-and sudoers rule are inert until `magnitude server setup` creates the `magnitude` system account
-(home and data in `/var/lib/magnitude`) and enables the unit; a desktop that never opts in has no
-such account or service. The unit starts the CLI through a `bin_t` program, so on SELinux systems
+Every Linux package also ships, root-owned, the `magnitude.service` system unit and the
+`dev.magnitude.update` Polkit action. The unit is inert until `magnitude server setup` creates the
+`magnitude` system account (home and data in `/var/lib/magnitude`) and enables the unit; a desktop
+that never opts in has no such account or service. No package ships a sudoers rule, and build
+validation rejects one: installing the package must never grant anything to an existing account that
+happens to be named `magnitude`. Setup writes `/etc/sudoers.d/magnitude` (root, 0440, checked with
+`visudo -cf` before it is moved into place) only for the system account it created or verified;
+`server remove` and package removal (not upgrade) delete it. The unit starts the CLI through a `bin_t` program, so on SELinux systems
 the service runs as `unconfined_service_t` like any packaged daemon; the `lib_t` CLI started
 directly would stay in confined `init_t`, which cannot reach its own engine over loopback.
 The sudoers rule lets only that account run the installed update helper
-without a password. The Polkit action admits the same helper, matched on its exact first argument,
+without a password; without sudo installed, setup writes none and the service only notices updates. The Polkit action admits the same helper, matched on its exact first argument,
 without a password for the active local session and with admin authentication for inactive and
 remote sessions; it authorizes no other CLI entry. On macOS `server setup` writes the root-owned
 `dev.magnitude.server` LaunchDaemon instead; no package ships it. Native DEB/RPM/pacman consumption and upgrade acceptance precede

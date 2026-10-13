@@ -38,7 +38,7 @@ itself when idle.
 No owner installs at startup: Desktop launch and `serve` start normally with a prepared update
 retained, and Desktop offers Restart. A running Headless owner installs a downloaded update at an
 idle point, when the service reports no working session and no inference request in flight. It
-first checks that it may install unattended (the Linux server's sudoers rule, or a writable macOS
+first checks that it may install unattended (the Linux server's sudoers rule, written by setup, or a writable macOS
 application folder); otherwise it keeps serving and prints one line naming `magnitude update
 install`, recording no outcome. To install it ends its owner scope, which releases its leases, runs
 the platform installer, and on success replaces its own process with the new version (same PID);

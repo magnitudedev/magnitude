@@ -4,10 +4,14 @@ import { join } from "node:path"
 import { MagnitudeClient, type NetworkAccessSettings } from "@magnitudedev/sdk"
 import { makeFirstPartyConnection } from "@magnitudedev/client-common"
 
-/** One request to the service on this machine's loopback port, without starting or observing an owner. */
+/**
+ * One request to the service on this machine's loopback port, without starting or observing an owner.
+ * The bound covers connecting and closing too, which cannot be interrupted, so a service that accepts
+ * the connection and never answers cannot hold the caller.
+ */
 export const withLocalService = <A, E>(origin: string, use: (client: MagnitudeClient) => Effect.Effect<A, E>) => Effect.scoped(
   makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(
-    Effect.flatMap(connection => use(connection.client)), Effect.timeout("5 seconds")))
+    Effect.flatMap(connection => use(connection.client)))).pipe(Effect.disconnect, Effect.timeout("5 seconds"))
 
 export interface ServerReach {
   readonly endpoint: string
