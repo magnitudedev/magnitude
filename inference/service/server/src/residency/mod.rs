@@ -443,7 +443,7 @@ fn memory_shortage_message(shortage: &MemoryShortage) -> String {
             "not enough memory right now: the model requires {required_bytes} bytes and {available_bytes} bytes are available"
         ),
         MemoryShortage::UnderPressure {} => {
-            "not enough memory right now: loading stopped because the system is under memory pressure".to_owned()
+            "the system is under heavy memory pressure: loading stopped to keep other programs responsive; close apps you aren't using or try again in a moment".to_owned()
         }
     }
 }

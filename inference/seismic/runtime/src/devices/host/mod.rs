@@ -125,21 +125,26 @@ pub struct DisplacementWindow {
     pub swapped_in_pages: u64,
 }
 
-/// The two most recent completed displacement windows. They are contiguous:
-/// `previous` ends where `latest` begins.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The completed displacement windows of the last [`DISPLACEMENT_HISTORY`],
+/// most recent first. They are contiguous: each ends where the one before it
+/// in the list begins.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostDisplacement {
-    pub latest: Option<DisplacementWindow>,
-    pub previous: Option<DisplacementWindow>,
+    pub windows: Vec<DisplacementWindow>,
 }
 
 /// The least span of one displacement window. Rates over a shorter span are
 /// dominated by when the kernel happened to run its pageout work.
 const MIN_DISPLACEMENT_WINDOW: Duration = Duration::from_millis(500);
 
+/// How far back completed windows are kept: at least the longest span a
+/// memory policy judges displacement over.
+pub const DISPLACEMENT_HISTORY: Duration = Duration::from_secs(60);
+
 /// The completed displacement windows of one catalog's host samples. Windows
 /// tumble: the first sample at least [`MIN_DISPLACEMENT_WINDOW`] after a
-/// window opened completes it and opens the next.
+/// window opened completes it and opens the next. A window that ended more
+/// than [`DISPLACEMENT_HISTORY`] ago is dropped.
 #[derive(Debug, Default)]
 pub(crate) struct DisplacementHistory {
     open: Option<(Instant, DisplacementCounters)>,
@@ -150,12 +155,13 @@ impl DisplacementHistory {
     pub(crate) fn record(&mut self, at: Instant, counters: DisplacementCounters) -> HostDisplacement {
         let Some((opened_at, opening)) = self.open else {
             self.open = Some((at, counters));
-            return self.completed;
+            return self.completed.clone();
         };
         let duration = at.saturating_duration_since(opened_at);
         if duration >= MIN_DISPLACEMENT_WINDOW {
-            self.completed = HostDisplacement {
-                latest: Some(DisplacementWindow {
+            self.completed.windows.insert(
+                0,
+                DisplacementWindow {
                     duration,
                     compressed_pages: counters
                         .compressed_pages
@@ -169,12 +175,25 @@ impl DisplacementHistory {
                     swapped_in_pages: counters
                         .swapped_in_pages
                         .saturating_sub(opening.swapped_in_pages),
-                }),
-                previous: self.completed.latest,
-            };
+                },
+            );
+            // Windows are contiguous, so the ones after the first that ends
+            // beyond the history are older still.
+            let mut ended = at;
+            let kept = self
+                .completed
+                .windows
+                .iter()
+                .take_while(|window| {
+                    let within = at.saturating_duration_since(ended) <= DISPLACEMENT_HISTORY;
+                    ended = ended.checked_sub(window.duration).unwrap_or(ended);
+                    within
+                })
+                .count();
+            self.completed.windows.truncate(kept);
             self.open = Some((at, counters));
         }
-        self.completed
+        self.completed.clone()
     }
 }
 
@@ -303,25 +322,48 @@ mod tests {
         let early = history.record(start + Duration::from_millis(499), counters(40, 0));
         assert_eq!(early, HostDisplacement::default());
         let first = history.record(start + Duration::from_millis(700), counters(110, 3));
-        let latest = first.latest.unwrap();
+        let [latest] = first.windows[..] else {
+            panic!("one window completed");
+        };
         assert_eq!(latest.duration, Duration::from_millis(700));
         assert_eq!(latest.compressed_pages, 100);
         assert_eq!(latest.swapped_out_pages, 3);
-        assert_eq!(first.previous, None);
     }
 
     #[test]
-    fn completed_windows_are_contiguous_and_keep_the_previous_one() {
+    fn completed_windows_are_contiguous_most_recent_first() {
         let start = Instant::now();
         let mut history = DisplacementHistory::default();
         history.record(start, counters(0, 0));
         history.record(start + Duration::from_millis(500), counters(5, 1));
         let second = history.record(start + Duration::from_millis(1100), counters(5, 4));
-        assert_eq!(second.previous.unwrap().swapped_out_pages, 1);
-        let latest = second.latest.unwrap();
+        let [latest, previous] = second.windows[..] else {
+            panic!("two windows completed");
+        };
+        assert_eq!(previous.swapped_out_pages, 1);
         assert_eq!(latest.duration, Duration::from_millis(600));
         assert_eq!(latest.compressed_pages, 0);
         assert_eq!(latest.swapped_out_pages, 3);
+    }
+
+    #[test]
+    fn windows_that_ended_beyond_the_history_are_dropped() {
+        let start = Instant::now();
+        let mut history = DisplacementHistory::default();
+        let mut at = start;
+        history.record(at, counters(0, 0));
+        let mut displacement = HostDisplacement::default();
+        for _ in 0..200 {
+            at += Duration::from_millis(500);
+            displacement = history.record(at, counters(0, 0));
+        }
+        // Every kept window ended within the history; the next older one
+        // would not have.
+        let kept = displacement.windows.len() as u32;
+        assert_eq!(
+            Duration::from_millis(500) * (kept - 1),
+            DISPLACEMENT_HISTORY
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -348,7 +390,7 @@ mod tests {
         assert_eq!(first.displacement, Some(HostDisplacement::default()));
         std::thread::sleep(MIN_DISPLACEMENT_WINDOW);
         let second = status(&mut history).unwrap();
-        let window = second.displacement.unwrap().latest.unwrap();
+        let window = second.displacement.unwrap().windows[0];
         assert!(window.duration >= MIN_DISPLACEMENT_WINDOW);
     }
 
@@ -359,8 +401,7 @@ mod tests {
         history.record(start, counters(100, 100));
         let window = history
             .record(start + Duration::from_secs(1), counters(0, 0))
-            .latest
-            .unwrap();
+            .windows[0];
         assert_eq!(window.compressed_pages, 0);
         assert_eq!(window.swapped_out_pages, 0);
     }

@@ -14,20 +14,26 @@ import { formatMemorySize } from "./format-bytes"
 
 export const MEMORY_SHORTAGE_TITLE = "Not enough memory right now"
 
+export const MEMORY_PRESSURE_TITLE = "Your computer is under heavy memory pressure"
+
+/** A memory shortage's headline: a blocked load lacks memory, a load under pressure met a system that was struggling. */
+export const memoryShortageTitle = (shortage: MemoryShortage): string =>
+  shortage._tag === "Blocked" ? MEMORY_SHORTAGE_TITLE : MEMORY_PRESSURE_TITLE
+
 /** What a memory shortage means for the user and what they can do about it. */
 export const describeMemoryShortage = (shortage: MemoryShortage): string => {
   switch (shortage._tag) {
     case "Blocked":
       return `This model needs ${formatMemorySize(shortage.requiredBytes, { rounding: "up" })} and ${formatMemorySize(shortage.availableBytes)} is available. Quit apps you aren’t using, or choose a smaller model.`
     case "UnderPressure":
-      return "Loading stopped because your computer ran low on memory. Quit apps you aren’t using, or choose a smaller model."
+      return "Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment."
   }
 }
 
 /** A load failure in the user's terms: a shortage is described, anything else is the service's message. */
 export const describeModelLoadFailure = (failure: ModelInstanceFailure): string =>
   "_tag" in failure
-    ? `${MEMORY_SHORTAGE_TITLE}. ${describeMemoryShortage(failure.shortage)}`
+    ? `${memoryShortageTitle(failure.shortage)}. ${describeMemoryShortage(failure.shortage)}`
     : failure.message
 
 /** Whether the model was loaded and the machine running low on memory stopped it. */

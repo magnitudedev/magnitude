@@ -1,13 +1,13 @@
 import { Option } from "effect"
 import type { ModelAcquisitionFailure, ModelInstanceFailure, ModelFailure } from "@magnitudedev/sdk"
-import { MEMORY_SHORTAGE_TITLE, describeMemoryShortage, formatStorageSize, type LocalModelCommandFailure } from "@magnitudedev/client-common"
+import { MEMORY_SHORTAGE_TITLE, describeMemoryShortage, formatStorageSize, memoryShortageTitle, type LocalModelCommandFailure } from "@magnitudedev/client-common"
 import { ErrorNotice, type NoticeContent } from "./error-notice"
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../web/src/components/ui/tooltip"
 import { WarningCircleIcon } from "@phosphor-icons/react"
 import type { ReactNode } from "react"
 
 export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent => {
-  if ("_tag" in failure) return { title: MEMORY_SHORTAGE_TITLE, description: describeMemoryShortage(failure.shortage) }
+  if ("_tag" in failure) return { title: memoryShortageTitle(failure.shortage), description: describeMemoryShortage(failure.shortage) }
   return { title: "This model couldn’t start", description: "Try loading it again. If it still won’t start, choose another model." }
 }
 

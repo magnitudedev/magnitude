@@ -15,8 +15,9 @@ mod host;
 pub use crate::memory::MemoryUsage;
 pub use catalog::Catalog;
 pub use host::{
-    DisplacementWindow, HeadroomBasis, HeadroomEstimate, HostDisplacement, HostMeasurements,
-    HostMemoryStatus, KernelPressure, LimitVisibility, ProcessLimitKind, ProcessMemoryLimit,
+    DISPLACEMENT_HISTORY, DisplacementWindow, HeadroomBasis, HeadroomEstimate, HostDisplacement,
+    HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility, ProcessLimitKind,
+    ProcessMemoryLimit,
 };
 
 use seismic_compiler::errors::TargetError;

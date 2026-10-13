@@ -180,7 +180,7 @@ pub use seismic_runtime::native::recorded_graph_device_bytes;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
 mod slab;
 pub use seismic_runtime::devices::{
-    Availability, CapacityBasis, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
+    Availability, CapacityBasis, DISPLACEMENT_HISTORY, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
     DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
     DiscoveryDiagnostic, DiscoveryError, DisplacementWindow, HeadroomBasis, HeadroomEstimate,
     HostDisplacement, HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility,

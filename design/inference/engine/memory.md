@@ -56,7 +56,7 @@ distinct domains even when their names match.
 
 | Layer | Guarantee | Fires when |
 |---|---|---|
-| Engine prevention | The engine never causes an out-of-memory condition: every claim leaves headroom above the planning reserve, enforced by Seismic's limit, and a load stops when it puts its host in distress | Always |
+| Engine prevention | The engine never causes an out-of-memory condition: every claim leaves headroom above the planning reserve, enforced by Seismic's limit, and a load stops when its host is in distress | Always |
 | Engine graceful response | When a domain enters Reclaim, the engine releases in the least destructive order and unloads if the domain does not recover | Reclaim band |
 | Service guard | The hosting service kills the worker process on the first observation at or below the emergency reserve or at critical kernel pressure, independent of the engine's state | The engine is stuck, too slow, or cannot free enough |
 
@@ -203,14 +203,26 @@ only when it cannot fit beside wired and compressed memory.
 
 Taking a movable page another program holds displaces it: the kernel compresses it or writes it to
 swap. A host that counts displacement reports it over displacement windows, contiguous spans of at
-least 500 ms between that process's host samples. Compression of other programs' data is the
-accepted cost of a claim. Host distress is displacement the system is not absorbing, whoever caused
-it. Displacement is distress only when the two most recent windows both show it:
+least 500 ms between that process's host samples; Seismic keeps the last 60 s of them. Compression
+of other programs' data is the accepted cost of a claim. Host distress is displacement the system is
+not absorbing, whoever caused it. Displacement is distress only when every window of the last 30 s
+shows it:
 
 - Swapping: pages were written to swap in each window.
 - Thrashing: each window compressed at least 2,000 and decompressed at least 5,000 pages per
   second, the kernel's own rates.
 - Critical: the kernel classifies memory pressure as critical (no window needed).
+
+Displacement costs other programs speed, not the system's survival. Headroom at the planning
+reserve, headroom at the emergency reserve and critical kernel pressure are the out-of-memory
+backstops, and each acts on its first observation. Displacement is judged over a span longer than
+the bursts the system absorbs. A load wires its weights for as long as its import runs, and on a host
+whose memory is full of compressible data that wiring compresses other programs' pages, and faults
+some back, for most of the import: about 10 s for a 22 GB import on an M4 Max, and 14 to 16 s at both
+thrashing rates for the same import on an M1 Ultra whose memory a program had filled. Two half-second windows of that refused the load
+itself. The 30 s span is about twice the longest burst measured. The same rule holds for a load, a
+loaded model's growth and residency, and Reclaim and unload, whether the engine or another program
+caused the displacement.
 
 Only macOS reports displacement and kernel pressure. A host that reports neither is never in
 distress, and a dedicated device's own memory has none.
@@ -274,9 +286,10 @@ kill is independent fault containment; it chooses nothing to release.
 - On macOS every engine holding is wired from allocation to release, and no holding is counted in
   host headroom; a mapped import window stays file-backed.
 - macOS host headroom is never below the free and inactive pages of the same sample.
-- A load that puts its host in distress fails with `MemoryPressure` within two displacement
-  windows and returns its charge; a loaded model in persistent distress unloads within the
-  one-second bound.
+- A load whose host is in distress fails with `MemoryPressure` within one observation of the
+  distress and returns its charge; a loaded model in persistent distress unloads within the
+  one-second bound. Displacement shorter than the sustained span, such as a load's own import
+  burst, refuses no claim and drives no Reclaim.
 - A host that reports no displacement has the bands its headroom alone gives.
 - Stable fit capacity is capacity under process limits (and the Metal working set) less the
   planning reserve; a dedicated device's capacity is the memory its driver lets the process use,
