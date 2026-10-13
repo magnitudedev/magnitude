@@ -4,7 +4,7 @@ import { Effect, Option, Schema } from "effect"
 import { spawn } from "node:child_process"
 import type { Readable } from "node:stream"
 import { isAbsolute, join, resolve } from "node:path"
-import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
+import { LINUX_DESKTOP_EXECUTABLE_PATH, LINUX_UPDATE_INSTALLER_PATH } from "@magnitudedev/release/executables"
 import { UpdateRelease } from "@magnitudedev/release/hosted-update"
 import { recordPreparedUpdateFailure } from "./prepared-update"
 import { LinuxPackageUpdateFailed, linuxUpdateFailureReason } from "./linux-update-package"
@@ -50,12 +50,12 @@ export const startLinuxUpdateHandoff = (request: LinuxUpdateHandoffRequest) =>
     return Effect.sync(() => { helper.kill(); helper.stdin!.destroy(); ready.destroy() })
   })), Effect.timeoutFail({ duration: "10 seconds", onTimeout: failed }))
 
-/** Runs as the desktop user; only the narrow package operation receives Polkit authorization. */
+/** Runs as the desktop user; Polkit admits only the installer wrapper, never the CLI itself, without a password. */
 export const completeLinuxUpdateHandoff = (request: LinuxUpdateHandoffRequest) => Effect.gen(function* () {
   const executor = yield* CommandExecutor.CommandExecutor
   if (process.platform !== "linux" || process.getuid?.() === 0) return yield* failed()
-  const result = yield* executor.exitCode(Command.make("/usr/bin/pkexec", "--disable-internal-agent", cli,
-    "_install-application-update", join(request.dataDirectory, "updates", "update.json")).pipe(Command.stdout("inherit"), Command.stderr("inherit"))).pipe(Effect.either)
+  const result = yield* executor.exitCode(Command.make("/usr/bin/pkexec", "--disable-internal-agent", LINUX_UPDATE_INSTALLER_PATH,
+    join(request.dataDirectory, "updates", "update.json")).pipe(Command.stdout("inherit"), Command.stderr("inherit"))).pipe(Effect.either)
   if (result._tag === "Right" && result.right === 0) return
   const reason = result._tag === "Left" ? "authorization" : linuxUpdateFailureReason(result.right)
   const message = result._tag === "Left" ? "System authorization could not be started. Try the update again from your desktop session."

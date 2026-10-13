@@ -74,7 +74,7 @@ describe("Linux update handoff", () => {
           expect(command._tag).toBe("StandardCommand")
           if (command._tag === "StandardCommand") {
             expect(command.command).toBe("/usr/bin/pkexec")
-            expect(command.args).toEqual(["--disable-internal-agent", "/usr/lib/magnitude-desktop/resources/magnitude", "_install-application-update", join(directory, "updates", "update.json")])
+            expect(command.args).toEqual(["--disable-internal-agent", "/usr/lib/magnitude-desktop/resources/magnitude-install-update", join(directory, "updates", "update.json")])
           }
           return CommandExecutor.ExitCode(code)
         }),

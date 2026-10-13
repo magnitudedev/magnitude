@@ -83,7 +83,7 @@ Linux retains the signed package for an explicit handoff to the system package m
 helper acknowledges readiness before owner exit, then waits on the inherited lifetime channel.
 An explicit update action may request authorization even while the window is hidden; background
 startup defers that prompt. Relaunch window intent is independent of authorization permission.
-Polkit authorizes only the privileged package operation. That operation verifies installed,
+Polkit authorizes only the privileged package operation, through its dedicated installer wrapper. That operation verifies installed,
 root-owned publisher trust, target/version, copied package bytes and native package identity before
 invoking the package manager. Existing installation admission excludes another running app owner;
 an authorization or package-manager failure never means success. The helper relaunches as the

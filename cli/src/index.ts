@@ -7,6 +7,12 @@ import { registerServeCommand } from "./commands/serve"
 import { registerInferenceCommands } from "./commands/inference"
 import { registerConnectionsCommand } from "./commands/connections"
 import { registerServerCommand } from "./commands/server"
+import { admitsPkexecCommand } from "./startup/pkexec-admission"
+
+if (!admitsPkexecCommand(process.argv.slice(2), process.getuid?.(), process.env)) {
+  process.stderr.write("Under pkexec, Magnitude runs only its update installer and server removal.\n")
+  process.exit(1)
+}
 
 const program = new Command()
   .name("magnitude")
@@ -28,7 +34,7 @@ program.command("_verify-windows-installation", { hidden: true }).argument("<off
     const { verifyInstallationDownload } = await import("./startup/verify-installation")
     await verifyInstallationDownload(offer, artifact, channel)
   })
-// Runs as root through sudo or Polkit. It validates the raw arguments itself instead of commander's parsing.
+// Runs as root through sudo, or Polkit's installer wrapper. It validates the raw arguments itself instead of commander's parsing.
 program.command("_install-application-update", { hidden: true }).argument("[arguments...]").allowUnknownOption().helpOption(false).action(async () => {
   const { runLinuxUpdateInstallation } = await import("./startup/linux-update-installation")
   await runLinuxUpdateInstallation(process.argv.slice(2))

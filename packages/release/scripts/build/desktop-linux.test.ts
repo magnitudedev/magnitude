@@ -1,12 +1,12 @@
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
 import { spawnSync } from "node:child_process"
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
-import { buildLinuxDesktopInstaller, mtreeFileModes, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validatePacmanMetadataModes } from "./desktop-linux"
+import { buildLinuxDesktopInstaller, mtreeFileModes, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxUpdatePolicy, validatePacmanMetadataModes } from "./desktop-linux"
 import { linuxSystemFiles } from "./linux-system-files"
 import { linuxDesktopInstaller } from "../../src/targets"
 
@@ -51,10 +51,13 @@ describe("Linux system files", () => {
   const listing = new Map<string, { mode: number; owner: string }>(linuxSystemFiles.map(file => [file.path, { mode: file.mode, owner: "root/root" }]))
   const validate = (entries: Map<string, { mode: number; owner: string }>) =>
     Effect.runPromise(validateLinuxSystemFiles(path => Option.fromNullable(entries.get(path))))
-  it("accepts the root-owned unit, Polkit action and 0440 sudoers rule", async () => {
+  it("accepts the root-owned unit, Polkit action, installer wrapper and 0440 sudoers rule", async () => {
     await expect(validate(listing)).resolves.toBeUndefined()
   })
   it.each([
+    ["a group-writable installer wrapper", "usr/lib/magnitude-desktop/resources/magnitude-install-update", { mode: 0o775, owner: "root/root" }],
+    ["a setuid installer wrapper", "usr/lib/magnitude-desktop/resources/magnitude-install-update", { mode: 0o4755, owner: "root/root" }],
+    ["a foreign-owned installer wrapper", "usr/lib/magnitude-desktop/resources/magnitude-install-update", { mode: 0o755, owner: "builder/root" }],
     ["a group-readable sudoers rule", "etc/sudoers.d/magnitude", { mode: 0o640, owner: "root/root" }],
     ["a writable sudoers rule", "etc/sudoers.d/magnitude", { mode: 0o644, owner: "root/root" }],
     ["a foreign-owned sudoers rule", "etc/sudoers.d/magnitude", { mode: 0o440, owner: "builder/root" }],
@@ -62,13 +65,69 @@ describe("Linux system files", () => {
   ] as const)("rejects %s", async (_, path, entry) => {
     await expect(validate(new Map([...listing, [path, entry]]))).rejects.toThrow("root-owned")
   })
-  it("rejects a missing Polkit action", async () => {
-    await expect(validate(new Map([...listing].filter(([path]) => !path.includes("polkit"))))).rejects.toThrow("root-owned")
+  it.each(["polkit", "magnitude-install-update"])("rejects a package missing %s", async name => {
+    await expect(validate(new Map([...listing].filter(([path]) => !path.includes(name))))).rejects.toThrow("root-owned")
   })
   it("passes visudo", () => {
     const visudo = ["/usr/sbin/visudo", "/usr/bin/visudo"].find(path => spawnSync(path, ["-V"]).status === 0)
     if (!visudo) return
     expect(spawnSync(visudo, ["-cf", linuxSystemFiles.find(file => file.path.startsWith("etc/"))!.source]).status).toBe(0)
+  })
+})
+
+describe("Linux update Polkit action", () => {
+  const source = (name: string) => linuxSystemFiles.find(file => file.path.endsWith(name))!.source
+  const policy = readFileSync(source(".policy"), "utf8")
+  const annotation = (key: string, value: string) => `<annotate key="org.freedesktop.policykit.exec.${key}">${value}</annotate>`
+  const wrapperPath = "/usr/lib/magnitude-desktop/resources/magnitude-install-update"
+  it("names only the installer wrapper for password-free authorization", async () => {
+    expect(policy).toContain("<allow_active>yes</allow_active>")
+    await expect(Effect.runPromise(validateLinuxUpdatePolicy(policy))).resolves.toBeUndefined()
+  })
+  it.each([
+    ["the CLI itself", policy.replace(wrapperPath, "/usr/lib/magnitude-desktop/resources/magnitude")],
+    ["an argument annotation polkit 0.105 ignores", policy.replace("</annotate>", `</annotate>\n    ${annotation("argv1", "_install-application-update")}`)],
+    ["no program", policy.replace(/\s*<annotate[^\n]*\n/, "\n")],
+  ])("rejects an action naming %s", async (_, candidate) => {
+    await expect(Effect.runPromise(validateLinuxUpdatePolicy(candidate))).rejects.toThrow("must name only")
+  })
+
+  describe("installer wrapper", () => {
+    const root = mkdtempSync(join(tmpdir(), "magnitude-wrapper-"))
+    const cli = join(root, "magnitude")
+    const wrapper = join(root, "magnitude-install-update")
+    writeFileSync(cli, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+    chmodSync(cli, 0o755)
+    const text = readFileSync(source("magnitude-install-update"), "utf8")
+    writeFileSync(wrapper, text.replace("exec /usr/lib/magnitude-desktop/resources/magnitude ", `exec ${cli} `))
+    const run = (...args: string[]) => {
+      const result = spawnSync("/bin/sh", [wrapper, ...args], { env: {} })
+      return { status: result.status, stdout: result.stdout.toString() }
+    }
+    it("runs the installed CLI by absolute path", () => {
+      expect(text.startsWith("#!/bin/sh\n")).toBe(true)
+      expect(text).toMatch(/^set -eu$/m)
+      expect(text.match(/^exec .*$/gm)).toEqual(['exec /usr/lib/magnitude-desktop/resources/magnitude _install-application-update "$@"'])
+    })
+    it.each([
+      [["/home/ada/.magnitude/updates/update.json"]],
+      [["/home/ada/.magnitude/updates/update.json", "--parent-stdin"]],
+    ])("passes %j to the installer entry", args => {
+      expect(run(...args)).toEqual({ status: 0, stdout: `${["_install-application-update", ...args].join("\n")}\n` })
+    })
+    it.each([
+      [[]],
+      [["updates/update.json"]],
+      [["--help"]],
+      [["_server-remove"]],
+      [["serve", "/a"]],
+      [["/a/updates/update.json", "--force"]],
+      [["/a/updates/update.json", "--parent-stdin", "x"]],
+      [["--parent-stdin", "/a/updates/update.json"]],
+      [["-c", "id"]],
+    ])("refuses %j without running the CLI", args => {
+      expect(run(...args)).toEqual({ status: 3, stdout: "" })
+    })
   })
 })
 
@@ -128,6 +187,8 @@ describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package asse
       expect(read("etc/sudoers.d/magnitude").toString()).toContain("magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update *")
       expect(read("usr/lib/systemd/system/magnitude.service").toString()).toContain("ExecStart=/usr/bin/env /usr/lib/magnitude-desktop/resources/magnitude serve")
       expect(read("usr/share/polkit-1/actions/dev.magnitude.update.policy").toString()).toContain("<allow_active>yes</allow_active>")
+      expect(read("usr/lib/magnitude-desktop/resources/magnitude-install-update").toString()).toContain("_install-application-update")
+      expect(mtreeFileModes(mtree).get("usr/lib/magnitude-desktop/resources/magnitude-install-update")).toBe(0o755)
       expect(mtreeFileModes(mtree).get(".INSTALL")).toBe(0o644)
       expect(mtreeFileModes(mtree).get(".PKGINFO")).toBe(0o644)
       const listing = spawnSync("bsdtar", ["-tvf", output], { env: { ...process.env, LC_ALL: "C" } }).stdout.toString()

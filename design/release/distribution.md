@@ -101,16 +101,22 @@ bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
 automatically open a window.
 Every Linux package also ships, root-owned, the `magnitude.service` system unit, the
-`/etc/sudoers.d/magnitude` rule (mode 0440) and the `dev.magnitude.update` Polkit action. The unit
+`/etc/sudoers.d/magnitude` rule (mode 0440), the `dev.magnitude.update` Polkit action and its
+installer wrapper `resources/magnitude-install-update` (mode 0755). The unit
 and sudoers rule are inert until `magnitude server setup` creates the `magnitude` system account
 (home and data in `/var/lib/magnitude`) and enables the unit; a desktop that never opts in has no
 such account or service. The unit starts the CLI through a `bin_t` program, so on SELinux systems
 the service runs as `unconfined_service_t` like any packaged daemon; the `lib_t` CLI started
 directly would stay in confined `init_t`, which cannot reach its own engine over loopback.
 The sudoers rule lets only that account run the installed update helper
-without a password. The Polkit action admits the same helper, matched on its exact first argument,
+without a password. The Polkit action names only the installer wrapper, which accepts exactly the
+installer's arguments and executes the CLI's installer entry by absolute path; it is admitted
 without a password for the active local session and with admin authentication for inactive and
-remote sessions; it authorizes no other CLI entry. On macOS `server setup` writes the root-owned
+remote sessions. The action never names the CLI itself and carries no argument annotation, since
+Polkit before 0.106 ignores those: the program path alone is its restriction on every Polkit
+version, and pkexec of the CLI falls back to Polkit's generic administrator authentication. As
+defense in depth, the CLI run as root under pkexec refuses every command except the update
+installer and server removal. Packaging validation requires the wrapper and this exact policy. On macOS `server setup` writes the root-owned
 `dev.magnitude.server` LaunchDaemon instead; no package ships it. Native DEB/RPM/pacman consumption and upgrade acceptance precede
 inclusion in the published artifact graph.
 

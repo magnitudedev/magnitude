@@ -1,0 +1,16 @@
+#!/bin/sh
+# Polkit lets the active desktop user run this program as root without a password, so it is the
+# only program the dev.magnitude.update action names. It accepts exactly the update installer's
+# grammar, `<request> [--parent-stdin]`, and runs nothing but the installed CLI's installer entry,
+# by absolute path. Exit status 3 is the installer's own verification failure.
+set -eu
+case $# in
+  1) ;;
+  2) [ "$2" = --parent-stdin ] || exit 3 ;;
+  *) exit 3 ;;
+esac
+case $1 in
+  /*) ;;
+  *) exit 3 ;;
+esac
+exec /usr/lib/magnitude-desktop/resources/magnitude _install-application-update "$@"

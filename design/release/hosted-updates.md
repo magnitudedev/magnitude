@@ -56,9 +56,10 @@ command. Startup only completes an interrupted macOS transaction from its receip
 interrupted attempts are never automatically retried.
 
 The person at a Linux desktop installs without a password: the package's Polkit action admits the
-installed helper's exact update entry for active local sessions and requires admin authentication
-for inactive and remote sessions. The action matches the helper's first argument, so it authorizes
-no other CLI entry. Restart remains the explicit installation step.
+installed update installer wrapper for active local sessions and requires admin authentication
+for inactive and remote sessions. The wrapper is the only program the action names and runs only
+the CLI's update entry, so no other CLI entry is authorized on any Polkit version, including those
+that ignore argument annotations. Restart remains the explicit installation step.
 
 Every installation path records its outcome with the prepared release; only that exact version running counts as applied, and a download superseded by a newer version installed another way is dropped with its own attempt's outcome, if any. Success records `applied`
 before retiring the preparation, so a terminal installation that executes the new version is still
@@ -74,7 +75,8 @@ check. Other outcomes are sent once with the next check.
 Every request names its `owner`: `desktop`, `headless` (`serve` run by hand, or a finite CLI
 command), or `service` (the system service). Requests from older clients have no owner. The
 privileged Linux helper accepts exactly its request path and an optional `--parent-stdin`, since
-sudo and Polkit admit any arguments after its name; anything else is refused before work starts.
+sudo and Polkit admit any arguments after its name; anything else is refused before work starts,
+by both the Polkit wrapper and the helper itself.
 
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before

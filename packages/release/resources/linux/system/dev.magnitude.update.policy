@@ -12,7 +12,6 @@
       <allow_inactive>auth_admin</allow_inactive>
       <allow_active>yes</allow_active>
     </defaults>
-    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/magnitude-desktop/resources/magnitude</annotate>
-    <annotate key="org.freedesktop.policykit.exec.argv1">_install-application-update</annotate>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/magnitude-desktop/resources/magnitude-install-update</annotate>
   </action>
 </policyconfig>

@@ -55,6 +55,8 @@ The CLI does not install or download ACN, elect a daemon owner, kill a predecess
 independent OS daemon. The one exception is `server setup`, which at the person's explicit request
 registers the system service that runs the foreground serving host at boot; `server remove` undoes it.
 Missing installation and missing graphical session produce actionable errors.
+Run as root under pkexec, the CLI refuses every command before parsing except the Linux update
+installer and server removal, whatever a Polkit policy admitted.
 Windows cold launch checks the native assigned desktop; a noninteractive caller may control an
 existing desktop owner but cannot create an invisible owner in its own session.
 Development uses its isolated desktop, service endpoint, data, and harness configuration.

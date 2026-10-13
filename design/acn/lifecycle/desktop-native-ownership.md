@@ -325,7 +325,8 @@ unit is distinct from the per-user unit that previous-installation retirement in
 data directory is kept. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
 it runs, the whole window is one screen offering to keep the server, which opens it in the browser
-and quits, or to stop it with administrator authorization and continue. A background launch leaves
+and quits, or to stop it with administrator authorization (on Linux, pkexec of the CLI's removal
+step under Polkit's generic administrator action) and continue. A background launch leaves
 a running server alone, and a server that stops lets the app continue. Windows has no server
 mode; its command launcher ignores logoff, which Windows sends only to services, so a third-party
 service wrapper keeps serving.
