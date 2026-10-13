@@ -23,19 +23,17 @@ pub use seismic_lang::checked::{
     NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
-pub use seismic_lang::precision::{
-    Limit, PrecisionPolicy, SpecialPolicy, Tolerance,
-};
+pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
-    pub use seismic_compiler::numerics::{compare_element, ElementComparison};
+    pub use seismic_compiler::numerics::{ElementComparison, compare_element};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 /// Offline formation coverage of a generated module's native
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]
 pub mod coverage {
-    use crate::{generated::Module, BackendName, KernelRequest, NativeSpecialization};
+    use crate::{BackendName, KernelRequest, NativeSpecialization, generated::Module};
     pub use seismic_runtime::native::coverage::{
         Configuration, Coverage, CoverageError, FormationFailure, GroupSite, RequestFailure,
     };
@@ -111,22 +109,19 @@ pub use seismic_runtime::native::search::{
     Cost, ParameterValues, PointKey, SearchSettings, SearchStop,
 };
 pub use seismic_runtime::native::trace::{
-    host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry,
-    TracedSubmission,
+    SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry, TracedSubmission,
+    host_seconds,
 };
 pub use seismic_runtime::native::tune::{
-    admit, governing_ratio, reselect, Configuration, ConfigurationRecord, Constraint,
-    CoverageCheck, CoverageOutcome, DeclaredParameter, Difference, Exclusion, FormationRecord,
-    Formed,
-    Footprint, GoverningStep, Grounded, Narrowed, NumericalObservation,
-    NumericalRequirement, Observed, Outcome, Performed, PieceMemory, PointInputs,
-    PointMeasurement, PointRecord, PointSpec, ProcessMemory, Publication, Quote, Raise,
-    RaiseOutcome, SustainedClock,
-    Reselection,
-    SearchPlan, Spent, Stage, Standing, StepPower, Strategy, SubjectComparison,
-    SubjectMeasurement, SurveyPlan, TuneError, TuningDisposition, TuningInitializer, TuningMethod,
-    TuningResult, TuningTime, UnitPlan, Violation, Work, WorkloadRotation, Workers, WrittenRows,
-    return_freed_pages, COMPARISON_VERSION, GOVERNING_STEP,
+    COMPARISON_VERSION, Configuration, ConfigurationRecord, Constraint, CoverageCheck,
+    CoverageOutcome, DeclaredParameter, Difference, Exclusion, Footprint, FormationRecord, Formed,
+    GOVERNING_STEP, GoverningStep, Grounded, Narrowed, NumericalObservation, NumericalRequirement,
+    Observed, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement, PointRecord,
+    PointSpec, ProcessMemory, Publication, Quote, Raise, RaiseOutcome, Reselection, SearchPlan,
+    Spent, Stage, Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan,
+    SustainedClock, TuneError, TuningDisposition, TuningInitializer, TuningMethod, TuningResult,
+    TuningTime, UnitPlan, Violation, Work, Workers, WorkloadRotation, WrittenRows, admit,
+    governing_ratio, reselect, return_freed_pages,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 
@@ -171,13 +166,13 @@ pub mod native_cpu {
 
 pub use seismic_lang::expr::{BigInt, BigUint};
 pub use seismic_lang::ids::StableEntryId;
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout};
+pub use seismic_lang::registry::{BackendName, Layout, f16_bits, f16_to_f32};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
 pub use seismic_runtime::api::HostRegion;
-pub use seismic_runtime::native::recorded_graph_device_bytes;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
+pub use seismic_runtime::native::recorded_graph_device_bytes;
 mod slab;
 pub use seismic_runtime::devices::{
     Availability, CapacityBasis, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
@@ -1483,6 +1478,18 @@ impl<'a, E: Entry> NativeSearch<'a, E> {
     /// The defaults' measurements at the points discovered so far.
     pub fn service_measurements(&self) -> Vec<PointMeasurement> {
         self.inner.service_measurements()
+    }
+
+    /// Weigh the unit's points by `weights`, in the order its source gave
+    /// them, before anything of its search is measured against the weights
+    /// it opened with ([`UnitSearch::reweigh`]). False once it has.
+    pub fn reweigh(&mut self, weights: &[f64]) -> bool {
+        self.inner.reweigh(weights)
+    }
+
+    /// Whether the unit's defaults are measured at every discovery point.
+    pub fn discovered(&self) -> bool {
+        self.inner.discovered()
     }
 
     /// Where the unit's tuning stands.
@@ -3343,7 +3350,7 @@ pub mod generated {
     #[cfg(test)]
     mod logical_entry_cache_tests {
         use super::*;
-        use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+        use seismic_lang::checked::{SourceFile, SourceSet, check_source};
 
         #[test]
         fn reuses_one_semantic_entry_per_element_binding() {

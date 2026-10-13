@@ -54,6 +54,25 @@ impl PlannedMethod {
         }
     }
 
+    /// The draft widths a load of this method decodes at, any of which its
+    /// adaptive controller may run a round at (`draft_control`): none, a
+    /// plain step, and each width of the method's ladder; nothing beside
+    /// the plain step without drafting.
+    pub fn draft_widths(self) -> Vec<u64> {
+        let ladder = match self {
+            Self::Plain => return Vec::new(),
+            Self::Mtp {
+                greedy_proposals,
+                sampled_proposals,
+            } => draft_ladder(usize::from(greedy_proposals.max(sampled_proposals)))
+                .into_iter()
+                .map(|width| width as u64)
+                .collect::<Vec<_>>(),
+            Self::DFlash { .. } => self.block_widths().into_iter().map(u64::from).collect(),
+        };
+        std::iter::once(0).chain(ladder).collect()
+    }
+
     /// The proposal counts a block pass of a separate draft may generate, in
     /// increasing order: none when the method drafts no block.
     pub fn block_widths(self) -> Vec<u8> {

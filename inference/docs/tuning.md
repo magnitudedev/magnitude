@@ -27,15 +27,32 @@ and coupled parameter values. The serving graph binds that exact choice to its c
 Two descriptions of a unit must remain distinct:
 
 - **Numerical scope:** every required shape and witness for its served contract, including edge
-  cases and shapes with no estimated performance demand. This scope does not shrink during search.
-- **Performance workload:** representative invocations and their demand, including real weight
-  rotations where reuse would otherwise distort timing. Adversarial numerical cases do not
-  automatically count as additional serving traffic.
+  cases and shapes with no performance demand. This scope does not shrink during search.
+- **Performance workload:** the measurements the engine is held to, run as the load runs them:
+  prefill of a 4k and of a 64k prompt (the load's context limit where it is shorter) and one
+  decode step at 4k and at 64k of history, with drafting as the load drafts (the drafter's
+  launches and the target's verification at each width the load prepares). The load's graph
+  supplies each unit's launches for every such term, with their rows, sequences and histories;
+  real weight rotations stand in where reuse would otherwise distort timing. Adversarial
+  numerical cases do not count as serving traffic. A launch is demand of the kernel that serves
+  it alone: where two kernels are alternatives for the same layers (the attention prefill that
+  lists the history tiles its rows see, and the one that lists none), each takes only the
+  launches the graph gives it. A history-dependent unit is timed at three histories: empty (all
+  fixed costs), 4k, and the longest its layers see (the context limit or their window). A
+  launch's intermediate history is represented by demand split between its neighboring
+  points. This representative-workload approximation is explicit; it does not establish
+  linear latency at unmeasured histories. Every candidate is timed at every selected point,
+  including the longest history. No candidate timing is inferred from a shorter point.
+  Intermediate numerical history witnesses remain required even when they carry no timing demand.
 
-For a configuration c, the objective is:
+Every term counts by its relative change: tuning minimizes the weighted mean over terms of
+`time / time at the defaults`. A unit's baseline contribution is the mean over
+terms of the unit's fraction of the term's time at the defaults, and a point's weight within a
+unit is the same for the point. For a configuration c of a unit, the objective is:
 
 ```text
-service_cost(c) = Σₚ invocation_demand(p) × median_device_time(c, p)
+service_cost(c) = Σₚ weight(p) × median_device_time(c, p)
+weight(p)       = Σₜ term_weight(t) × launches(t, p) / time_at_defaults(t)
 ```
 
 Candidates are compared on the same workload, normalized by the canonical default's service
@@ -56,12 +73,30 @@ are established inside the clock before optional work can consume their capacity
 no performance demand still obtains its canonical artifact, but does not build numerical inputs
 or open a search merely to manufacture evidence for that default.
 
-Time allocation follows measured serving importance and observed work costs. Runtime forecasts
-include the next operation and any extra obligation it creates for concluding a valid choice.
-The allocator admits optional work only when that work and all outstanding obligations fit the
-remaining deadline. Already completed formation or coverage is not charged again.
+Baseline discovery measures every demanded unit before candidate search begins. Unknown
+units share discovery by elapsed effort, with declaration order breaking ties. Incomplete
+discovery is reported explicitly; it never contributes invented latency or zero service to a
+candidate objective. Once discovery completes, the measured baseline term totals normalize
+point weights, which remain fixed throughout the search.
 
-Unknown work receives bounded discovery time, not a guessed candidate price. Confirmation,
+Search effort follows measured remaining service. Each available piece is ranked by its
+virtual finish time `(effort + price) / (share × opportunity)`, smallest first. `effort` is the
+unit's completed search work, including compilation even when it overlaps device work;
+`share` is its measured fraction of the baseline objective. For exploration, `opportunity`
+is the incumbent's remaining cost relative to its default; for a pending conversion it is
+the observed lead. This is an explicit allocation policy, not a probability of discovering a
+faster configuration. Neither model identities, reference-operation counts, nor the spread of
+previous winners predicts a candidate's value. A unit explores distinct forms before refining
+one. Resolved promotions take priority over further exploration so established gains
+reach serving before the allowance ends. Other stages impose no global barrier after discovery.
+
+Prices use this load's observed operation costs. Unobserved operations use the conservative
+admission forecast until observations exist; coverage costs are shared only within the same
+entry. Every admission still protects the original deadline, numerical coverage and publication
+obligations. A chosen kernel must establish a lead through matched measurements of the full
+performance cohort and satisfy its complete numerical scope.
+
+Unknown work is admitted at a bound, never a guessed candidate price. Confirmation,
 winner coverage and publication have protected reserves. A reserve is part of the original
 allowance, not a grace period; the same coverage obligation is not reserved once per rival.
 Deadline checks also apply to domain traversal, input building and the intervals between device
@@ -93,8 +128,9 @@ mix or cached incomplete search acquires another tuning allowance.
    cohort, and measure its service. Retain the inputs and default outputs needed for comparisons.
    The default supplies the numerical recipe without self-qualification. Missing discovery can
    remain incomplete, but candidates cannot be ranked on different workload cohorts.
-2. **Cover different forms.** Explore representatives of structurally distinct implementations
-   before spending the allowance refining one form. High-share units receive priority. Domain
+2. **Cover different forms.** Within a unit, explore representatives of structurally distinct
+   implementations before refining one form. Across units, measured service and allocated effort decide: a high-share unit's
+   refinement can precede a low-share unit's forms. Domain
    traversal remains lazy and bounded; a large Cartesian product is not materialized just to
    identify the useful structural choices.
 3. **Measure and admit together.** The candidate's first initialized execution produces its

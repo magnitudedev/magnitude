@@ -43,12 +43,12 @@ pub(crate) use target::{
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
+pub(crate) use tuning::workload as tuning_workload;
 pub use tuning::{
-    NumericalProfile, PointShape, ROTATION_LAYERS, Receipt,
-    PinnedChoice, ResolvedNumericalProfile, SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress,
-    TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent,
-    TuningLimits, UnpreparedUnits,
-    TuningObserver, TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource,
+    NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
+    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
+    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
+    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
     UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
 };
 pub(crate) use vision::VisionKernels;

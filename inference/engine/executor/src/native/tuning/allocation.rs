@@ -43,31 +43,23 @@
 //!   fit, the piece worth the most first. Units keep their inputs while
 //!   pieces are narrowed to what is left.
 //!
-//! Each unit names its next piece of work with its price and the share of
-//! its default service the work is expected to recover ([`seismic::Work`]).
-//! The allocator starts, of the pieces that fit:
+//! Baseline discovery precedes candidate search: all demanded units must
+//! contribute actual measurements before their relative service costs are
+//! known. Discovery is shared by elapsed effort, with preparation order
+//! breaking ties; it never assigns an invented latency to an unknown unit.
 //!
-//! 1. a conversion ([`Stage::Promote`]) before anything else: a measured
-//!    lead not yet served is budget already spent with nothing to show;
-//! 2. then discovery ([`Stage::Discovery`]), the work whose classes this
-//!    load has not observed and so cannot price: a unit never started
-//!    first, then the largest share first (preparation order while no
-//!    share is known). Discovery is ahead of every challenger because
-//!    nothing can be valued without it: a unit's challenger has no price
-//!    and no gain before its defaults are measured, and a unit's share is
-//!    its defaults' time against every unit's, so until every unit is
-//!    discovered the shares that rank challengers overstate the units
-//!    measured so far and rank the others at nothing;
-//! 3. then the first representatives of structurally different forms
-//!    ([`Stage::Form`]), the piece worth the most per second first: no
-//!    refinement inside one form, of any unit, says whether another form
-//!    is faster, so every unit's forms that fit are measured before any
-//!    unit refines one. (A unit whose forms are compiling is in flight;
-//!    the device meanwhile takes other work rather than wait.)
-//! 4. then the challenger ([`Stage::Measure`]) or the conversion of a
-//!    lead not yet resolved ([`Stage::Confirm`]) worth the most per second
-//!    of its price: the unit's share of served time, times the gain the
-//!    unit expects of it.
+//! Search effort is divided by measured remaining service. A unit's next
+//! piece has virtual finish `(effort + price) / (share * opportunity)`:
+//! effort is the time already spent on its search, share is its measured
+//! fraction of the workload, and opportunity is remaining measured cost
+//! (or a measured lead awaiting conversion). The smallest virtual finish
+//! runs first. This is an allocation policy, not a prediction that the next
+//! candidate wins. Resolved promotions precede further exploration; forms
+//! precede refinements within each unit only.
+//!
+//! Prices come from this load's observed operations ([`Unpriced`]); deadline
+//! admission still uses conservative forecasts and reserves. Compilation
+//! effort is charged as well as device work, even when they overlap.
 //!
 //! A unit composed of other units' choices reads them as they stand when
 //! its own work starts; from then they are sealed and receive no more work.
@@ -184,6 +176,7 @@
 //! ends.
 
 use seismic::{Quote, Stage, Work};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// What is free of host RAM where it is a memory domain of its own.
@@ -234,12 +227,26 @@ pub(crate) trait Unit {
         Self: Sized,
     {
     }
+    /// Whether every baseline needed to compare candidates is measured.
+    fn objective_ready(_units: &[Self]) -> bool
+    where
+        Self: Sized,
+    {
+        true
+    }
+
     /// The units whose current choices this unit's work reads.
     fn prerequisites(&self) -> Vec<usize> {
         Vec::new()
     }
-    /// The unit's share of expected step time at its defaults.
+    /// The unit's share of expected step time at its defaults: measured
+    /// once baseline discovery is complete; unknown before then.
     fn share(&self) -> f64;
+    /// The kind of unit: units of one kind check the same untimed points
+    /// in their conversions ([`Unpriced`]).
+    fn kind(&self) -> &'static str {
+        ""
+    }
     /// The unit's next piece of work, priced in full; none when it has
     /// none left.
     fn next(&self) -> Option<Work>;
@@ -555,6 +562,73 @@ impl Own {
     }
 }
 
+/// What the operations the units' quotes leave unpriced have taken in this
+/// load, by the stage of the work they were part of. A quote's unpriced
+/// operation is one the unit has not observed, and is admitted at the
+/// longest operation the load has completed ([`forecast`]): a bound, which
+/// keeps admission safe and ranks nothing. Discovery and a unit's forms
+/// are wholly unpriced (every point's and form's classes are first
+/// observed by that very work) while challengers are mostly priced, so
+/// work is ranked at what its stage's unpriced operations have taken in
+/// this load, and at the bound until its stage has run one.
+///
+/// A conversion's unpriced operation is its coverage of the untimed points
+/// it has not checked before ([`Stage::Promote`]): what it takes follows
+/// the points, which the units of one kind ([`Unit::kind`]) share and units
+/// of other kinds do not. A unit's conversions are ranked at what those of
+/// its kind have taken, and at the bound until one of its kind has run: a
+/// conversion of decode attention whose coverage builds histories of many
+/// requests took 7.6 s ranked at the 0.05 s the projections' had taken.
+#[derive(Default)]
+struct Unpriced {
+    classes: BTreeMap<(usize, &'static str), seismic::Observed>,
+}
+
+impl Unpriced {
+    fn class(stage: Stage, kind: &'static str) -> (usize, &'static str) {
+        match stage {
+            Stage::Discovery => (0, ""),
+            Stage::Form => (1, ""),
+            Stage::Measure => (2, ""),
+            Stage::Promote => (3, kind),
+            Stage::Confirm => (4, kind),
+        }
+    }
+
+    /// What work of `stage` of a unit of `kind` quoted `quote` is expected
+    /// to take.
+    fn expected(
+        &self,
+        stage: Stage,
+        kind: &'static str,
+        quote: &Quote,
+        longest: Duration,
+    ) -> Duration {
+        match self
+            .classes
+            .get(&Self::class(stage, kind))
+            .and_then(seismic::Observed::price)
+        {
+            Some(price) => quote
+                .priced
+                .saturating_add(Duration::from_secs_f64(price * quote.unpriced as f64)),
+            None => forecast(quote, longest),
+        }
+    }
+
+    /// Work of `stage` of a unit of `kind` quoted `quote` took `took`, its
+    /// compile included: what it took past its priced part is its unpriced
+    /// operations'.
+    fn observe(&mut self, stage: Stage, kind: &'static str, quote: &Quote, took: Duration) {
+        if quote.unpriced > 0 {
+            self.classes
+                .entry(Self::class(stage, kind))
+                .or_default()
+                .observe(took.saturating_sub(quote.priced).as_secs_f64() / quote.unpriced as f64);
+        }
+    }
+}
+
 /// `unit` gives up its inputs: an operation of the allocator's own, timed
 /// in its class. Returns what it took.
 fn give_up_inputs<U: Unit>(
@@ -593,7 +667,9 @@ fn forecast(quote: &Quote, longest: Duration) -> Duration {
     u32::try_from(quote.unpriced)
         .ok()
         .and_then(|unpriced| longest.checked_mul(unpriced))
-        .map_or(Duration::MAX, |unpriced| quote.priced.saturating_add(unpriced))
+        .map_or(Duration::MAX, |unpriced| {
+            quote.priced.saturating_add(unpriced)
+        })
 }
 
 /// When the device, free at `now`, is done with `jobs`, each ready for it
@@ -623,7 +699,6 @@ pub(crate) fn allocate<U: Unit>(
         budget: total,
         ..Report::default()
     };
-    let mut started = vec![false; units.len()];
     let mut sealed = vec![false; units.len()];
     // Units whose next piece does not fit the bytes free with every other
     // unit's inputs given up: nothing changes that until a piece runs.
@@ -641,6 +716,11 @@ pub(crate) fn allocate<U: Unit>(
     let mut compiled = Duration::ZERO;
     // The allocator's own operations, priced as they are observed.
     let mut own = Own::default();
+    // What an operation the units' quotes leave unpriced has taken, by
+    // stage: what such work is expected to take when it is ranked.
+    let mut expected = Unpriced::default();
+    let mut effort = vec![Duration::ZERO; units.len()];
+    let mut discovery_effort = vec![Duration::ZERO; units.len()];
     // Units settled since their last piece of work.
     let mut published = vec![false; units.len()];
     // When the pass before this one began, and what of the time since was
@@ -793,14 +873,8 @@ pub(crate) fn allocate<U: Unit>(
         if !flights.is_empty() || startable.iter().any(|startable| *startable) {
             for unit in 0..units.len() {
                 if !flying(unit) && !startable[unit] && units[unit].holding() > 0 {
-                    apart += give_up_inputs(
-                        units,
-                        unit,
-                        context,
-                        clock,
-                        &mut own,
-                        &mut report.ending,
-                    );
+                    apart +=
+                        give_up_inputs(units, unit, context, clock, &mut own, &mut report.ending);
                 }
             }
         }
@@ -876,6 +950,10 @@ pub(crate) fn allocate<U: Unit>(
                 && (!ahead(work)
                     || now.saturating_add(forecast(&work.forming, longest).max(cold)) <= total)
         };
+        let objective_ready = U::objective_ready(units);
+        let discovering = offers.iter().any(|(unit, work)| {
+            work.stage == Stage::Discovery && !starved[*unit] && !barred[*unit] && fits(*unit, work)
+        });
         let (fitting, refused): (Vec<_>, Vec<_>) = offers
             .iter()
             .copied()
@@ -885,7 +963,9 @@ pub(crate) fn allocate<U: Unit>(
         // flight is abandoned, and every offer still standing is refused.
         if concluding.is_some_and(|concluding| now >= concluding) {
             let standing = fitting.into_iter().chain(refused).collect();
-            report.refused = refuse(units, context, standing, |unit| starved[unit] || barred[unit]);
+            report.refused = refuse(units, context, standing, |unit| {
+                starved[unit] || barred[unit]
+            });
             break Ok(());
         }
         // When a piece's compile is due to start: so that the piece is
@@ -909,41 +989,31 @@ pub(crate) fn allocate<U: Unit>(
             .min();
         let fitting = fitting
             .into_iter()
+            .filter(|(_, work)| work.stage == Stage::Discovery || (!discovering && objective_ready))
             .filter(|(unit, work)| !ahead(work) || (!crowded[*unit] && due(work) <= now))
             .filter(|(unit, _)| !alone[*unit])
             .collect::<Vec<_>>();
-        let value = |(unit, work): &(usize, Work)| {
-            units[*unit].share() * work.gain
-                / forecast(&work.quote, longest)
-                    .as_secs_f64()
-                    .max(f64::MIN_POSITIVE)
+        let priority = |(unit, work): &(usize, Work)| {
+            let price = expected.expected(work.stage, units[*unit].kind(), &work.quote, longest);
+            if work.stage == Stage::Discovery {
+                return discovery_effort[*unit].as_secs_f64();
+            }
+            let opportunity = units[*unit].share() * work.opportunity;
+            if opportunity > 0. {
+                effort[*unit].saturating_add(price).as_secs_f64() / opportunity
+            } else {
+                f64::INFINITY
+            }
         };
-        let most_valuable = |stages: &[Stage]| {
-            fitting
-                .iter()
-                .filter(|(_, work)| stages.contains(&work.stage))
-                // The first of equals: preparation order.
-                .fold(None, |best: Option<&(usize, Work)>, offer| match best {
-                    Some(best) if value(best) >= value(offer) => Some(best),
-                    _ => Some(offer),
-                })
-        };
-        let discovery = fitting
+        let value = |offer: &(usize, Work)| -priority(offer);
+        let promoting = fitting.iter().any(|(_, work)| work.stage == Stage::Promote);
+        let choice = fitting
             .iter()
-            .filter(|(_, work)| work.stage == Stage::Discovery)
+            .filter(|(_, work)| !promoting || work.stage == Stage::Promote)
             .fold(None, |best: Option<&(usize, Work)>, offer| match best {
-                Some(best)
-                    if (!started[best.0], units[best.0].share())
-                        >= (!started[offer.0], units[offer.0].share()) =>
-                {
-                    Some(best)
-                }
+                Some(best) if priority(best) <= priority(offer) => Some(best),
                 _ => Some(offer),
-            });
-        let choice = most_valuable(&[Stage::Promote])
-            .or(discovery)
-            .or_else(|| most_valuable(&[Stage::Form]))
-            .or_else(|| most_valuable(&[Stage::Measure, Stage::Confirm]))
+            })
             .copied();
         // The chosen piece starts only if its bytes fit what is free. When
         // they do not, the unit whose own next work is worth least gives
@@ -961,8 +1031,7 @@ pub(crate) fn allocate<U: Unit>(
                 && units[unit].largest_footprint() == 0;
             let host = U::host_free(context) != HostRoom::Unbounded
                 && (units[unit].host_footprint(context).is_none()
-                    || (ahead(&work)
-                        && U::compile_host(context).max(workers.compile_host()) == 0));
+                    || (ahead(&work) && U::compile_host(context).max(workers.compile_host()) == 0));
             device || host
         });
         if let Some((unit, _)) = choice {
@@ -1053,7 +1122,6 @@ pub(crate) fn allocate<U: Unit>(
                     sealed[prerequisite] = true;
                 }
             }
-            started[unit] = true;
         };
         // The chosen piece's compile starts; the device then takes the
         // admitted work that is ready for it before anything new.
@@ -1222,6 +1290,22 @@ pub(crate) fn allocate<U: Unit>(
             held,
             ..Ending::default()
         };
+        let charged = ended
+            .saturating_sub(now)
+            .saturating_add(formed.unwrap_or_default());
+        if work.stage == Stage::Discovery {
+            discovery_effort[unit] += charged;
+        } else {
+            effort[unit] += charged;
+        }
+        expected.observe(
+            work.stage,
+            units[unit].kind(),
+            &work.quote,
+            ended
+                .saturating_sub(now)
+                .saturating_add(formed.unwrap_or_default()),
+        );
         match performed {
             Ok(observed) => longest = longest.max(observed),
             Err(failure) => break Err(failure),
@@ -1234,9 +1318,7 @@ pub(crate) fn allocate<U: Unit>(
     // Every unit's record is published as it stands, whatever became of
     // the work, while the compiles of the pieces abandoned in flight run.
     let settling = clock.now();
-    let settled = units
-        .iter_mut()
-        .try_for_each(|unit| unit.settle(context));
+    let settled = units.iter_mut().try_for_each(|unit| unit.settle(context));
     report.settling += clock.now().saturating_sub(settling);
     // Everything owed is settled: what the units still hold of their
     // inputs leaves with the optional work.
@@ -1249,9 +1331,7 @@ pub(crate) fn allocate<U: Unit>(
     // what they formed is dropped.
     let draining = clock.now();
     while flights.iter().any(|flight| flight.formed.is_none()) {
-        let (unit, _, took) = workers
-            .wait(None)
-            .expect("a compile in flight ends");
+        let (unit, _, took) = workers.wait(None).expect("a compile in flight ends");
         flights
             .iter_mut()
             .find(|flight| flight.unit == unit)
@@ -1751,7 +1831,8 @@ mod tests {
                         priced(self.discovery)
                     },
                     forming: Quote::default(),
-                    gain: 0.,
+                    // Discovery shares time by elapsed effort, before value is known.
+                    opportunity: 0.,
                     footprint: self.footprint(),
                 });
             }
@@ -1760,7 +1841,7 @@ mod tests {
                     stage: Stage::Promote,
                     quote: priced(self.promotion),
                     forming: Quote::default(),
-                    gain: self.served - lead,
+                    opportunity: self.served - lead,
                     footprint: self.footprint(),
                 });
             }
@@ -1770,11 +1851,9 @@ mod tests {
                 } else {
                     Stage::Measure
                 },
-                quote: priced(
-                    self.measurement * self.challenging() as u32 + self.uncompiled(),
-                ),
+                quote: priced(self.measurement * self.challenging() as u32 + self.uncompiled()),
                 forming: priced(self.uncompiled()),
-                gain: self.served / (self.measured.len() + 2) as f64,
+                opportunity: self.served,
                 footprint: self.measuring(),
             })
         }
@@ -2005,8 +2084,7 @@ mod tests {
         }
 
         fn start(&mut self, unit: usize, takes: Duration) {
-            self.compiling
-                .push((unit, self.clock.now() + takes, takes));
+            self.compiling.push((unit, self.clock.now() + takes, takes));
             self.most = self.most.max(self.compiling.len());
         }
 
@@ -2055,7 +2133,10 @@ mod tests {
         }
 
         fn ended(&mut self) -> Vec<(usize, (), Duration)> {
-            self.1.drain(..).map(|(unit, took)| (unit, (), took)).collect()
+            self.1
+                .drain(..)
+                .map(|(unit, took)| (unit, (), took))
+                .collect()
         }
 
         fn wait(&mut self, _: Option<Duration>) -> Option<(usize, (), Duration)> {
@@ -2063,7 +2144,21 @@ mod tests {
         }
     }
 
-    fn run(units: &mut [Synthetic], clock: &Fake, total: u64) -> (Vec<(usize, Stage, Duration)>, Report) {
+    fn run(
+        units: &mut [Synthetic],
+        clock: &Fake,
+        total: u64,
+    ) -> (Vec<(usize, Stage, Duration)>, Report) {
+        run_after(units, clock, total, Duration::ZERO)
+    }
+
+    /// [`run`], the load having completed an operation of `longest` before.
+    fn run_after(
+        units: &mut [Synthetic],
+        clock: &Fake,
+        total: u64,
+        longest: Duration,
+    ) -> (Vec<(usize, Stage, Duration)>, Report) {
         let mut log = Log::default();
         let (report, outcome) = allocate(
             units,
@@ -2071,7 +2166,7 @@ mod tests {
             clock,
             &mut Overlapping::new(clock, usize::MAX),
             SECOND * total as u32,
-            Duration::ZERO,
+            longest,
         );
         outcome.expect("no synthetic work fails");
         (log.into_inner(), report)
@@ -2120,7 +2215,10 @@ mod tests {
             .filter(|(_, stage, _)| *stage == Stage::Measure)
             .map(|(_, _, began)| *began)
             .collect::<Vec<_>>();
-        assert_eq!(measured, (7..19).map(|second| SECOND * second).collect::<Vec<_>>());
+        assert_eq!(
+            measured,
+            (7..19).map(|second| SECOND * second).collect::<Vec<_>>()
+        );
         for admitted in &report.admitted {
             if admitted.stage == Stage::Measure {
                 assert_eq!(admitted.formed, Some(SECOND * 3));
@@ -2148,7 +2246,10 @@ mod tests {
         // the others, and measures from 11 s: it ends with the budget, and
         // nothing more does.
         assert_eq!(report.ended, SECOND * 12);
-        assert_eq!((report.unused(), report.overrun()), (Duration::ZERO, Duration::ZERO));
+        assert_eq!(
+            (report.unused(), report.overrun()),
+            (Duration::ZERO, Duration::ZERO)
+        );
         let compiles = report
             .admitted
             .iter()
@@ -2157,7 +2258,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(compiles, [4, 5, 6, 7, 8].map(|second| SECOND * second));
         assert_eq!(
-            units.iter().map(|unit| unit.measured.len()).collect::<Vec<_>>(),
+            units
+                .iter()
+                .map(|unit| unit.measured.len())
+                .collect::<Vec<_>>(),
             [2, 1, 1, 1]
         );
         assert_eq!(report.refused.len(), 4);
@@ -2220,10 +2324,16 @@ mod tests {
         // 14 s to 15 s.
         let (log, report, most) = threaded(&mut units, &clock, SECOND * 15, usize::MAX);
         assert_eq!(
-            units.iter().map(|unit| unit.measured.len()).collect::<Vec<_>>(),
+            units
+                .iter()
+                .map(|unit| unit.measured.len())
+                .collect::<Vec<_>>(),
             [1, 3, 3, 3]
         );
-        assert_eq!((report.ended, report.overrun()), (SECOND * 15, Duration::ZERO));
+        assert_eq!(
+            (report.ended, report.overrun()),
+            (SECOND * 15, Duration::ZERO)
+        );
         let long = report
             .admitted
             .iter()
@@ -2234,7 +2344,10 @@ mod tests {
         for admitted in &report.admitted {
             if admitted.unit != 0 && admitted.stage == Stage::Measure {
                 assert!(admitted.began >= long.began, "{admitted:?}");
-                assert!(admitted.performed + admitted.actual <= long.performed, "{admitted:?}");
+                assert!(
+                    admitted.performed + admitted.actual <= long.performed,
+                    "{admitted:?}"
+                );
                 assert_eq!(admitted.formed, Some(SECOND));
             }
         }
@@ -2248,7 +2361,10 @@ mod tests {
             .map(|(_, _, began)| *began)
             .collect::<Vec<_>>();
         assert_eq!(measured[0], SECOND * 5);
-        assert_eq!(measured[..3], [50, 52, 54].map(|tenths| SECOND * tenths / 10));
+        assert_eq!(
+            measured[..3],
+            [50, 52, 54].map(|tenths| SECOND * tenths / 10)
+        );
     }
 
     /// Compiles overlap as far as the worker threads there are, and no
@@ -2270,7 +2386,10 @@ mod tests {
         assert_eq!(two, 2);
         let (one, latest) = most(1);
         assert_eq!(one, 1);
-        assert!(sooner < later && later < latest, "{sooner:?} {later:?} {latest:?}");
+        assert!(
+            sooner < later && later < latest,
+            "{sooner:?} {later:?} {latest:?}"
+        );
     }
 
     /// Compiles overlap as far as their pieces' bytes fit under the ceiling
@@ -2313,8 +2432,18 @@ mod tests {
         let budget = SECOND * 100;
         let (log, report) = run(&mut units, &clock, 100);
         assert_eq!(log.len(), report.admitted.len());
-        assert!(report.admitted.iter().all(|admitted| admitted.began < budget));
-        assert!(report.abandoned.iter().all(|abandoned| abandoned.began < budget));
+        assert!(
+            report
+                .admitted
+                .iter()
+                .all(|admitted| admitted.began < budget)
+        );
+        assert!(
+            report
+                .abandoned
+                .iter()
+                .all(|abandoned| abandoned.began < budget)
+        );
         let performed = report
             .admitted
             .iter()
@@ -2461,7 +2590,10 @@ mod tests {
         // No challenger leads: only discovery and measurement run.
         let (_, report) = run(&mut units, &clock, 20);
         assert_eq!(report.ended, SECOND * 20);
-        assert_eq!((report.unused(), report.overrun()), (Duration::ZERO, Duration::ZERO));
+        assert_eq!(
+            (report.unused(), report.overrun()),
+            (Duration::ZERO, Duration::ZERO)
+        );
         assert!(
             report
                 .admitted
@@ -2562,9 +2694,10 @@ mod tests {
         assert!(units[0].measured.len() < 100);
     }
 
-    /// A measured lead is converted before any new challenger is measured,
-    /// whatever the other units' shares, and the challenger that measured
-    /// faster and passed its conversion is the unit's served choice.
+    /// A measured lead is converted before its unit measures any new
+    /// challenger, and the challenger that measured faster and passed its
+    /// conversion is the unit's served choice. Other units' work competes
+    /// with the conversion by value.
     #[test]
     fn a_lead_is_converted_before_new_measurement_and_the_promoted_challenger_serves() {
         let clock = Fake::default();
@@ -2579,9 +2712,9 @@ mod tests {
             .position(|step| *step == (0, Stage::Measure))
             .unwrap();
         assert_eq!(
-            log[lead + 1],
-            (0, Stage::Promote),
-            "the conversion follows its measurement at once: {log:?}"
+            log[lead + 1..].iter().find(|(unit, _)| *unit == 0),
+            Some(&(0, Stage::Promote)),
+            "the unit's next piece converts its lead: {log:?}"
         );
         assert_eq!(units[0].served, 0.5, "the promoted challenger is served");
         assert_eq!(units[1].served, 1.);
@@ -2620,10 +2753,7 @@ mod tests {
         // Discovery and one measurement leave 4 s: less than the 5 s
         // conversion.
         let (log, report) = run(&mut units, &clock, 6);
-        assert_eq!(
-            stages(&log),
-            [(0, Stage::Discovery), (0, Stage::Measure)]
-        );
+        assert_eq!(stages(&log), [(0, Stage::Discovery), (0, Stage::Measure)]);
         assert_eq!(report.ended, SECOND * 2);
         assert_eq!(
             report.refused,
@@ -2641,13 +2771,12 @@ mod tests {
         assert_eq!(report.overrun(), Duration::ZERO);
     }
 
-    /// Discovery comes before any challenger: every unit's first piece
-    /// before any unit's second, a unit never started first.
+    /// No candidate receives an objective built from incomplete baseline
+    /// measurements. Unknown units share discovery effort in stable order.
     #[test]
-    fn every_unit_is_discovered_before_any_challenger_is_measured() {
+    fn discovery_completes_before_candidates_are_ranked() {
         let clock = Fake::default();
-        // Preparation order is not share order.
-        let mut units = [0.1, 0.5, 0.15, 0.25]
+        let mut units = [0.05, 0.5, 0.15, 0.3]
             .into_iter()
             .enumerate()
             .map(|(name, share)| Synthetic {
@@ -2657,13 +2786,17 @@ mod tests {
             .collect::<Vec<_>>();
         let (log, _) = run(&mut units, &clock, 60);
         let log = stages(&log);
-        // Each unit's first point before any unit's second, the largest
-        // share first both times.
         assert_eq!(
-            log[..8],
-            [1, 3, 2, 0, 1, 3, 2, 0].map(|unit| (unit, Stage::Discovery))
+            &log[..4],
+            &[
+                (0, Stage::Discovery),
+                (1, Stage::Discovery),
+                (2, Stage::Discovery),
+                (3, Stage::Discovery)
+            ]
         );
-        assert!(log[8..].iter().all(|(_, stage)| *stage == Stage::Measure));
+        assert!(log[..8].iter().all(|(_, stage)| *stage == Stage::Discovery));
+        assert!(log[8..].iter().all(|(_, stage)| *stage != Stage::Discovery));
     }
 
     /// Challengers go where a second of their price recovers most: by
@@ -2679,8 +2812,16 @@ mod tests {
             .collect::<Vec<_>>();
         let (log, _) = run(&mut units, &clock, 103);
         // The largest share measures first.
-        assert_eq!(stages(&log)[3], (0, Stage::Measure));
-        let measured = units.iter().map(|unit| unit.measured.len()).collect::<Vec<_>>();
+        assert_eq!(
+            stages(&log)
+                .into_iter()
+                .find(|(_, stage)| *stage == Stage::Measure),
+            Some((0, Stage::Measure))
+        );
+        let measured = units
+            .iter()
+            .map(|unit| unit.measured.len())
+            .collect::<Vec<_>>();
         assert_eq!(measured.iter().sum::<usize>(), 100);
         for (unit, share) in [0.5, 0.3, 0.2].into_iter().enumerate() {
             assert!(
@@ -2699,7 +2840,10 @@ mod tests {
             Synthetic::new(1, &clock, 0.5, &[1.; 1000]),
         ];
         run(&mut units, &clock, 202);
-        let (slow, fast) = (units[0].measured.len() as f64, units[1].measured.len() as f64);
+        let (slow, fast) = (
+            units[0].measured.len() as f64,
+            units[1].measured.len() as f64,
+        );
         assert!((fast / slow - 4.).abs() < 0.5, "{slow} {fast}");
     }
 
@@ -2736,8 +2880,9 @@ mod tests {
         );
     }
 
-    /// Work of a class never observed has no price. It is started while
-    /// the longest operation completed fits what remains, and not after.
+    /// Work of a class never observed has no price. It is ranked and
+    /// admitted at the longest operation completed until its stage has run
+    /// such work, and is started while that fits what remains, not after.
     #[test]
     fn unpriced_work_is_not_started_late() {
         let unit = |clock: &Fake, name, challengers: &[f64]| Synthetic {
@@ -2745,20 +2890,28 @@ mod tests {
             discovery: if name == 1 { SECOND } else { SECOND * 3 },
             ..Synthetic::new(name, clock, 0.5, challengers)
         };
-        // With the whole budget left the unpriced discovery runs first
-        // among the never-started units' pieces it shares the order with.
+        // Unknown discovery receives no invented importance or free price.
+        // Equal elapsed effort starts in preparation order.
         let clock = Fake::default();
         let mut units = [unit(&clock, 0, &[]), unit(&clock, 1, &[])];
         let (log, _) = run(&mut units, &clock, 10);
-        assert_eq!(
-            stages(&log),
-            [(0, Stage::Discovery), (1, Stage::Discovery)]
-        );
-        // The first unit's 3 s discovery is the longest operation the load
-        // has completed; with 2 s left the unpriced discovery is late.
+        assert_eq!(stages(&log), [(0, Stage::Discovery), (1, Stage::Discovery)]);
+        // The load has completed a 1 s operation: the unpriced discovery is
+        // ranked at 1 s, behind the 3 s discovery of a unit worth nine
+        // times as much. That makes 3 s the longest operation completed:
+        // with 2 s left the unpriced discovery is late.
         let clock = Fake::default();
-        let mut units = [unit(&clock, 0, &[]), unit(&clock, 1, &[])];
-        let (log, report) = run(&mut units, &clock, 5);
+        let mut units = [
+            Synthetic {
+                share: 0.9,
+                ..unit(&clock, 0, &[])
+            },
+            Synthetic {
+                share: 0.1,
+                ..unit(&clock, 1, &[])
+            },
+        ];
+        let (log, report) = run_after(&mut units, &clock, 5, SECOND);
         assert_eq!(stages(&log), [(0, Stage::Discovery)]);
         assert_eq!(report.ended, SECOND * 3);
         assert_eq!(report.refused.len(), 1);
@@ -2766,8 +2919,53 @@ mod tests {
         assert_eq!(units[1].served, 1., "the unit keeps its published defaults");
     }
 
+    /// Unpriced operations are ranked at the bound until their stage has
+    /// run one, then at what that stage's took past their priced part.
+    #[test]
+    fn unpriced_work_is_ranked_at_what_its_stage_has_taken() {
+        let mut expected = Unpriced::default();
+        let quote = Quote {
+            priced: SECOND / 2,
+            unpriced: 2,
+        };
+        assert_eq!(
+            expected.expected(Stage::Discovery, "a", &quote, SECOND * 10),
+            SECOND / 2 + SECOND * 20
+        );
+        let one = Quote {
+            priced: SECOND / 2,
+            unpriced: 1,
+        };
+        expected.observe(Stage::Discovery, "a", &one, SECOND * 3 / 2);
+        // Discovery of any kind of unit is priced alike.
+        assert_eq!(
+            expected.expected(Stage::Discovery, "b", &quote, SECOND * 10),
+            SECOND / 2 + SECOND * 2
+        );
+        // Another stage is still at the bound.
+        assert_eq!(
+            expected.expected(Stage::Form, "a", &quote, SECOND * 10),
+            SECOND / 2 + SECOND * 20
+        );
+        // A conversion is priced by those of its kind alone.
+        expected.observe(Stage::Promote, "a", &one, SECOND * 3 / 2);
+        assert_eq!(
+            expected.expected(Stage::Promote, "a", &quote, SECOND * 10),
+            SECOND / 2 + SECOND * 2
+        );
+        assert_eq!(
+            expected.expected(Stage::Promote, "b", &quote, SECOND * 10),
+            SECOND / 2 + SECOND * 20
+        );
+    }
+
     /// Run `units` under `ceiling` bytes and return what they held at most.
-    fn bounded(units: &mut [Synthetic], clock: &Fake, total: u64, ceiling: u64) -> (Memory, Report) {
+    fn bounded(
+        units: &mut [Synthetic],
+        clock: &Fake,
+        total: u64,
+        ceiling: u64,
+    ) -> (Memory, Report) {
         MEMORY.with(|memory| {
             memory.set(Memory {
                 ceiling: Some(ceiling),
@@ -2860,11 +3058,17 @@ mod tests {
             assert!(formed > batch * (calls - 1), "{formed} in {calls} calls");
             if budget >= 20 {
                 let each_alone = (budget - 1) / (call + challenger).as_secs();
-                assert!(formed as u64 >= 2 * each_alone, "{formed} against {each_alone}");
+                assert!(
+                    formed as u64 >= 2 * each_alone,
+                    "{formed} against {each_alone}"
+                );
             }
             measured.push(formed);
         }
-        assert!(measured.windows(2).all(|pair| pair[0] < pair[1]), "{measured:?}");
+        assert!(
+            measured.windows(2).all(|pair| pair[0] < pair[1]),
+            "{measured:?}"
+        );
         // A domain the budget exhausts: everything is measured, nothing is
         // refused, and the time left is the domain's doing.
         let clock = Fake::default();
@@ -2982,7 +3186,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, Refusal::Bytes)]
         );
-        assert!(clock.now() < SECOND * 600, "the budget was not what ended it");
+        assert!(
+            clock.now() < SECOND * 600,
+            "the budget was not what ended it"
+        );
         // What the compiles left for good is still held when the unit has
         // given everything else up.
         assert_eq!(memory.held - memory.freed, formed * residue);
@@ -3014,7 +3221,10 @@ mod tests {
         ];
         let (memory, report) = bounded(&mut units, &clock, 60, 300);
         assert!(memory.peak <= 300);
-        assert_eq!(units[0].discovered, 0, "the piece that does not fit never ran");
+        assert_eq!(
+            units[0].discovered, 0,
+            "the piece that does not fit never ran"
+        );
         assert_eq!(units[0].built, 0);
         assert_eq!(units[0].served, 1.);
         assert_eq!(units[1].served, 0.5, "the unit that fits was tuned");
@@ -3069,7 +3279,11 @@ mod tests {
         let (_, report) = run(&mut units, &clock, 600);
         let memory = MEMORY.with(Cell::take);
         assert!(memory.peak <= 300, "the device was never near its ceiling");
-        assert!(memory.host_peak <= 300, "{} host bytes held", memory.host_peak);
+        assert!(
+            memory.host_peak <= 300,
+            "{} host bytes held",
+            memory.host_peak
+        );
         assert_eq!(memory.host_peak, 200, "one unit's inputs at a time");
         assert_eq!((units[0].served, units[1].served), (0.5, 0.5));
         assert_eq!(units[2].built, 0, "the unit the host cannot hold never ran");
@@ -3132,13 +3346,11 @@ mod tests {
         assert_eq!(overlap(true), 1);
     }
 
-    /// Every unit's other forms are measured before any unit refines a
-    /// form, the more valuable unit's first: a low-share unit's form
-    /// representative comes before the refinement of a unit worth nine
-    /// times as much, and no refinement of the lesser unit precedes a form
-    /// of the greater.
+    /// A unit's other forms are measured before it refines any of them;
+    /// across units only value decides: a refinement of a unit worth six
+    /// times as much comes before a lesser unit's forms.
     #[test]
-    fn forms_are_measured_by_value_before_any_refinement() {
+    fn a_units_forms_precede_its_refinements_and_value_orders_units() {
         let clock = Fake::default();
         let mut units = [0.1, 0.6, 0.3]
             .into_iter()
@@ -3155,24 +3367,21 @@ mod tests {
             .filter(|(_, stage)| matches!(stage, Stage::Form | Stage::Measure))
             .copied()
             .collect::<Vec<_>>();
-        // Six form representatives, the largest share's first, then
-        // refinement.
-        assert_eq!(
-            measured[..6],
-            [1, 1, 2, 2, 0, 0].map(|unit| (unit, Stage::Form)),
+        for unit in 0..3 {
+            let own = measured
+                .iter()
+                .filter(|(owner, _)| *owner == unit)
+                .map(|(_, stage)| *stage)
+                .collect::<Vec<_>>();
+            assert_eq!(own[..2], [Stage::Form, Stage::Form], "{measured:?}");
+            assert!(own[2..].iter().all(|stage| *stage == Stage::Measure));
+        }
+        let first =
+            |wanted: (usize, Stage)| measured.iter().position(|step| *step == wanted).unwrap();
+        assert!(
+            first((1, Stage::Measure)) < first((0, Stage::Form)),
             "{measured:?}"
         );
-        assert!(measured[6..].iter().all(|(_, stage)| *stage == Stage::Measure));
-        for (position, (unit, stage)) in measured.iter().enumerate() {
-            if *stage == Stage::Measure {
-                assert!(
-                    measured[position..].iter().all(|(later, stage)| {
-                        *stage != Stage::Form || units[*later].share <= units[*unit].share
-                    }),
-                    "a refinement of unit {unit} preceded a form of a unit worth more"
-                );
-            }
-        }
     }
 
     /// A mix of units as a load has them: four whose launches are formed
@@ -3182,9 +3391,9 @@ mod tests {
     /// such units once spent most of a budget compiling on the device's
     /// thread while most units stopped at their defaults). Its compiles run
     /// ahead on a worker like any other, so they take none of the device's
-    /// time; every unit's other forms are measured, the units worth more
-    /// first, before any unit refines one; and the device is given to the
-    /// lesser unit for its measurements alone.
+    /// time; every unit's own forms are measured before it refines one, the
+    /// units worth more first; and the device is given to the lesser unit
+    /// for its measurements alone.
     #[test]
     fn a_low_share_units_long_compiles_do_not_crowd_out_other_units_forms() {
         let clock = Fake::default();
@@ -3207,17 +3416,17 @@ mod tests {
         // more refined its forms too: none stopped at its defaults.
         assert!(units.iter().all(|unit| unit.measured.len() >= unit.forms));
         assert!(units[1..].iter().all(|unit| unit.measured.len() == 4));
-        // No refinement of any unit was admitted before every unit's forms
-        // were: a form whose long compile is in flight is admitted, and the
-        // device takes other work meanwhile rather than wait for it.
-        let began = |stage: Stage| {
-            report
-                .admitted
-                .iter()
-                .filter(move |admitted| admitted.stage == stage)
-                .map(|admitted| admitted.began)
-        };
-        assert!(began(Stage::Form).max() <= began(Stage::Measure).min());
+        // No unit's refinement was admitted before its own forms were.
+        for unit in 0..units.len() {
+            let began = |stage: Stage| {
+                report
+                    .admitted
+                    .iter()
+                    .filter(move |admitted| admitted.unit == unit && admitted.stage == stage)
+                    .map(|admitted| admitted.began)
+            };
+            assert!(began(Stage::Form).max() <= began(Stage::Measure).min());
+        }
         // Of the forms, the units worth more were measured first.
         let pieces = stages(&log)
             .into_iter()
@@ -3307,7 +3516,11 @@ mod tests {
             publication: SECOND * 2,
             ..Synthetic::new(name, clock, 0.5, &vec![1.; challengers])
         };
-        let mut units = [unit(0, &clock, 100), unit(1, &clock, 100), unit(2, &clock, 0)];
+        let mut units = [
+            unit(0, &clock, 100),
+            unit(1, &clock, 100),
+            unit(2, &clock, 0),
+        ];
         // The third unit has no points to discover and no work at all.
         units[2].points = 0;
         let (log, report) = run(&mut units, &clock, 20);
@@ -3316,7 +3529,10 @@ mod tests {
         assert_eq!(log.len(), 16);
         assert_eq!(report.settling, SECOND * 4);
         assert_eq!(report.ended, SECOND * 20);
-        assert_eq!((report.unused(), report.overrun()), (Duration::ZERO, Duration::ZERO));
+        assert_eq!(
+            (report.unused(), report.overrun()),
+            (Duration::ZERO, Duration::ZERO)
+        );
         // Each unit that worked was published once; the one that did not
         // owed nothing.
         assert_eq!(units.each_ref().map(|unit| unit.published), [1, 1, 0]);
@@ -3327,7 +3543,10 @@ mod tests {
         let mut units = [unit(0, &clock, 0), unit(1, &clock, 0)];
         let (log, report) = run(&mut units, &clock, 5);
         assert_eq!(stages(&log), [(0, Stage::Discovery)]);
-        assert_eq!((report.ended, report.overrun()), (SECOND * 3, Duration::ZERO));
+        assert_eq!(
+            (report.ended, report.overrun()),
+            (SECOND * 3, Duration::ZERO)
+        );
         assert_eq!(report.refused.len(), 1);
     }
 

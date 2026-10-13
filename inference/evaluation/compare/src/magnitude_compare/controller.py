@@ -80,7 +80,13 @@ def build_commands(plan: Plan) -> tuple[tuple[str, ...], ...]:
     return tuple(commands)
 
 
-def job(plan: Plan, model: str, trees: tuple[Tree, ...], gate: GateSettings | None) -> Job:
+def job(
+    plan: Plan,
+    model: str,
+    trees: tuple[Tree, ...],
+    gate: GateSettings | None,
+    max_hold: float = Job.max_hold_seconds,
+) -> Job:
     paths = host_paths(plan)
     command = (
         "uv",
@@ -113,6 +119,7 @@ def job(plan: Plan, model: str, trees: tuple[Tree, ...], gate: GateSettings | No
         gate=gate,
         trees=trees,
         env=UV_ENVIRONMENT,
+        max_hold_seconds=max_hold,
     )
 
 
@@ -160,7 +167,11 @@ def prepare(plan: Plan, root: Path) -> Prepared:
 
 
 def describe(
-    plan: Plan, models: tuple[str, ...], host: str | None, gate: GateSettings | None
+    plan: Plan,
+    models: tuple[str, ...],
+    host: str | None,
+    gate: GateSettings | None,
+    max_hold: float = Job.max_hold_seconds,
 ) -> str:
     """The planned jobs and each job's host schedule, without running anything."""
     trees = tuple(
@@ -175,9 +186,10 @@ def describe(
         "",
     ]
     for model in models:
-        planned = job(plan, model, trees, gate)
+        planned = job(plan, model, trees, gate, max_hold)
         lines += [
             f"job: tool {planned.tool}, model {planned.model}, on {host or 'this machine'}",
+            f"  max hold: {planned.max_hold_seconds:g} s",
             f"  trees: {', '.join(f'{tree.name} <- {tree.local}' for tree in planned.trees)}",
             f"  env: {' '.join(f'{name}={value}' for name, value in planned.env)}",
             *(f"  build: {shlex.join(command)}" for command in planned.build),
@@ -212,6 +224,11 @@ def finish(outcome: Outcome) -> str | None:
 
 
 def run(
-    prepared: Prepared, model: str, host: str | None, gate: GateSettings | None, hosts: Hosts
+    prepared: Prepared,
+    model: str,
+    host: str | None,
+    gate: GateSettings | None,
+    hosts: Hosts,
+    max_hold: float = Job.max_hold_seconds,
 ) -> Outcome:
-    return execute(job(prepared.plan, model, prepared.trees, gate), host, hosts=hosts)
+    return execute(job(prepared.plan, model, prepared.trees, gate, max_hold), host, hosts=hosts)

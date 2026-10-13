@@ -80,6 +80,12 @@ def test_attribution_names_the_moved_entries():
     assert row["entries"][1]["base_ms"] == 8.0  # launches of one entry summed
 
 
+def test_cells_without_attribution_are_judged_without_entries():
+    plain = [{**cell(100), "detail": {"rows": 4094.0}}, {**cell(90), "detail": None}]
+    [row] = speed.compare(samples([plain[0]], [plain[1]]), 0.0)
+    assert row["verdict"] == "regressed" and row["entries"] == []
+
+
 def test_entry_on_one_side_only_comes_first():
     candidate = cell(90)
     candidate["detail"]["attribution"]["entries"].append(

@@ -6,7 +6,8 @@ use super::tuning::{
     ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
-        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning, history_window,
+        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning, PrefillListing,
+        history_window,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
@@ -38,7 +39,7 @@ use super::tuning::{
 use super::*;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
-use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationForecast};
+use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
     DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
@@ -404,6 +405,7 @@ fn invocation_demand(
             },
             device,
             tuning.settings,
+            super::tuning::Objective::new(graph_demand.terms.clone()),
         ),
     );
     demand.graph_demand = Some(graph_demand.clone());
@@ -796,6 +798,7 @@ impl<'a> Preparation<'a> {
             let point = super::tuning::PointShape {
                 label: format!("m{rows}"),
                 weight: 1.0,
+                terms: Vec::new(),
                 rows: rows as u64,
                 sequences: 1,
                 context: None,
@@ -1071,12 +1074,12 @@ impl<'a> Preparation<'a> {
                 for block in blocks {
                     mixer_demand
                         .entry(block.mixer())
-                        .or_insert_with(InvocationForecast::default)
+                        .or_insert_with(InvocationCounts::default)
                         .add(calls);
                     if let Some(feed) = block.feed_forward() {
                         feed_demand
                             .entry(feed)
-                            .or_insert_with(InvocationForecast::default)
+                            .or_insert_with(InvocationCounts::default)
                             .add(calls);
                     }
                 }
@@ -1448,7 +1451,7 @@ impl<'a> Preparation<'a> {
             scopes: scopes.clone(),
             epsilon: self.epsilon,
             decode_rows: None,
-            listed: false,
+            listing: PrefillListing::Every,
             window,
         };
         let history = match binding.history.encoding() {
@@ -1572,12 +1575,29 @@ impl<'a> Preparation<'a> {
                         self.spec.forms_tensor_operations(),
                         shape.width,
                     );
+                // A launch whose rows see at most one request's history
+                // lists the tiles they see; the unlisted kernel serves the
+                // others, or every launch where nothing lists.
+                let capacity = super::tuning::request_history_rows(
+                    &self.tuning.model(),
+                    magnitude_state::KvCodec::AffineK8V4,
+                    window,
+                )
+                .map_err(|outcome| CatalogFailure::Preparation {
+                    entry: "attention_prefill_k8v4",
+                    bindings: format!("{shape:?}"),
+                    outcome,
+                })?;
+                let mut unlisted = mix();
+                if lists {
+                    unlisted.listing = PrefillListing::Unlisted { capacity };
+                }
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?;
+                    .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(unlisted))?;
                 let prefill_listed = if lists {
                     let mut listed = mix();
-                    listed.listed = true;
+                    listed.listing = PrefillListing::Listed { capacity };
                     self.spec
                         .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(listed))?
                 } else {
@@ -2398,7 +2418,7 @@ impl<'a> Preparation<'a> {
     fn head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
         if let Some(demand) = &self.graph_demand {
             let mut calls = demand.head.clone();
-            calls.base.add(&demand.head_prefix);
+            calls.add(&demand.head_prefix);
             self.tuning.set_invocations(calls, true);
         }
         let Some(head_plan) = plan.head() else {
@@ -2428,7 +2448,7 @@ impl<'a> Preparation<'a> {
             }
             if let Some(demand) = &self.graph_demand {
                 let mut calls = demand.head.clone();
-                calls.base.add(&demand.head_prefix);
+                calls.add(&demand.head_prefix);
                 self.tuning.set_invocations(calls, true);
             }
             let bindings = format!("{b:?}");
@@ -2452,7 +2472,7 @@ impl<'a> Preparation<'a> {
             let attention = self.attention(b.attention, attention_layers.scopes(b))?;
             if let Some(demand) = &self.graph_demand {
                 self.tuning
-                    .set_invocations(InvocationForecast::new(demand.head_prefix.clone()), true);
+                    .set_invocations(demand.head_prefix.clone(), true);
             }
             let priming_project = self.spec.tuned(
                 &mut self.tuning,
@@ -2485,7 +2505,7 @@ impl<'a> Preparation<'a> {
                 }
             };
             if let Some(demand) = &self.graph_demand {
-                let mut calls = InvocationForecast::default();
+                let mut calls = InvocationCounts::default();
                 for _ in &layers.scopes(b) {
                     calls.add(&demand.head);
                 }

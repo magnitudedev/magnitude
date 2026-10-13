@@ -21,6 +21,7 @@ import json
 import os
 import signal
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import get_args
 
@@ -158,6 +159,11 @@ def parser() -> argparse.ArgumentParser:
     measurement_options(run)
     run.add_argument("--host", help="ssh alias or pool; omitted runs locally")
     run.add_argument("--no-gate", action="store_true", help="skip the thermal gate")
+    run.add_argument(
+        "--max-hold",
+        type=float,
+        help="seconds the job may hold the host's lock (the flow's default when omitted)",
+    )
     job = commands.add_parser("job", help="measure inside a run directory (run by the flow)")
     measurement_options(job)
     job.add_argument("--artifacts", type=Path, required=True, help="catalog acquisition JSON")
@@ -242,7 +248,7 @@ def job_arguments(argv: list[str], *, local: bool, engines: list[str]) -> list[s
         name, separator, value = token.partition("=")
         if name == "--no-gate":
             continue
-        if name == "--host":
+        if name in ("--host", "--max-hold"):
             if not separator:
                 next(tokens)
             continue
@@ -284,6 +290,8 @@ def run(argv: list[str], args: argparse.Namespace) -> int:
             "--build-identity", "{build_file}",
         ),
     )
+    if args.max_hold is not None:
+        job = replace(job, max_hold_seconds=args.max_hold)
     try:
         outcome = execute(job, args.host)
     except (StepFailed, HostUnavailable) as error:

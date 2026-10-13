@@ -83,11 +83,17 @@ impl<'a> UntunedEntries<'a> {
     }
 }
 
-/// What a walk consults for its tuned entries.
-pub(super) type InvocationDemand = std::collections::HashMap<
-    super::tuning::TuningKey,
-    crate::programs::invocation_demand::InvocationCounts,
->;
+/// What a walk consults for its tuned entries: each unit's launches for the
+/// load's objective, and the objective with each term's time at the units'
+/// defaults once measured ([`super::tuning::Objective`]).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InvocationDemand {
+    pub units: std::collections::HashMap<
+        super::tuning::TuningKey,
+        crate::programs::invocation_demand::InvocationCounts,
+    >,
+    pub objective: super::tuning::Objective,
+}
 
 pub(super) enum Tuning<'a> {
     /// A preparation's tuner, in its count, census or search phase.
@@ -102,7 +108,7 @@ pub(super) enum Tuning<'a> {
         device: &'a Device,
         settings: super::tuning::TuningSettings,
         invocations: InvocationDemand,
-        current: crate::programs::invocation_demand::InvocationForecast,
+        current: crate::programs::invocation_demand::InvocationCounts,
         repeat_case: bool,
     },
 }
@@ -112,19 +118,23 @@ impl<'a> Tuning<'a> {
         model: ModelInputs<'a>,
         device: &'a Device,
         settings: super::tuning::TuningSettings,
+        objective: super::tuning::Objective,
     ) -> Self {
         Self::Demand {
             model,
             device,
             settings,
-            invocations: InvocationDemand::new(),
+            invocations: InvocationDemand {
+                units: Default::default(),
+                objective,
+            },
             current: Default::default(),
             repeat_case: true,
         }
     }
     pub fn set_invocations(
         &mut self,
-        current: crate::programs::invocation_demand::InvocationForecast,
+        current: crate::programs::invocation_demand::InvocationCounts,
         repeat_case: bool,
     ) {
         if let Self::Demand {
@@ -212,14 +222,15 @@ impl<'a> Tuning<'a> {
                 ..
             } => {
                 invocations
+                    .units
                     .entry((
                         contender.label(),
                         contender.key(),
                         std::collections::BTreeMap::new(),
                     ))
                     .or_default()
-                    .add(&current.represented(|logical| {
-                        (logical > rows / 2 && logical <= rows).then_some(rows)
+                    .add(&current.represented(|launch| {
+                        (launch.rows > rows / 2 && launch.rows <= rows).then_some(rows)
                     }));
                 Ok(None)
             }
@@ -463,9 +474,10 @@ impl<'a> Specializer<'a> {
                 representatives.sort_unstable();
                 representatives.dedup();
                 let calls = current
-                    .represented(|rows| case.invocation_rows(rows, &representatives))
+                    .represented(|launch| case.invocation_rows(launch, &representatives))
                     .scaled(if *repeat_case { case.launches() } else { 1 });
                 invocations
+                    .units
                     .entry((entry, bindings.clone(), fixed.statics().clone()))
                     .or_default()
                     .add(&calls);
