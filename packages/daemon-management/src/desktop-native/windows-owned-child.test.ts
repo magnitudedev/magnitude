@@ -44,7 +44,7 @@ describe("Windows owned service composition (simulated native boundary)", () => 
       const boot = yield* child.events.pipe(Stream.take(1), Stream.runHead)
       expect(Option.getOrThrow(boot)).toEqual({ _tag: "Booted", pid: 42 })
       expect(yield* child.diagnosticTail).toContain("service diagnostic")
-      yield* child.send({ _tag: "Start", controlToken: Option.none() })
+      yield* child.send({ _tag: "Start" })
       expect(JSON.parse(test.observed.writes[0]!)).toEqual({ _tag: "Start" })
       yield* child.stop
       expect(yield* child.exit).toBe(1)

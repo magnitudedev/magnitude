@@ -46,8 +46,6 @@ import {
 import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
 import {
   MagnitudeHealthResponseSchema,
-  MagnitudeReadinessResponseSchema,
-  AcnIdentitySchema,
   AcnRpcGroup, } from "@magnitudedev/acn-protocol"
 import { IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
@@ -207,7 +205,6 @@ function withCors(
 
 const disallowedCorsResponse = HttpServerResponse.empty({ status: 403 })
 const encodeHealthResponse = Schema.encode(MagnitudeHealthResponseSchema)
-const encodeReadinessResponse = Schema.encode(MagnitudeReadinessResponseSchema)
 
 // OPTIONS preflight handler — catches all OPTIONS requests.
 const OptionsRouteHandler = (request: HttpServerRequest.HttpServerRequest) => {
@@ -683,10 +680,9 @@ export const installAcnHealthRoutes = (
     const request = yield* HttpServerRequest.HttpServerRequest
     const state = yield* lifecycle.state
     const status = state._tag === "Ready" ? 200 : 503
-    // Callers not admitted to control learn readiness only; the instance identity fences RPC clients.
+    // Anonymous remote callers learn readiness only; the instance identity fences RPC clients.
     if ((yield* remote.access(request)) === "Anonymous") {
-      const body = yield* encodeReadinessResponse({ service: "magnitude-acn", version: AcnIdentitySchema.make(ACN_VERSION), state: { _tag: state._tag } })
-      return yield* HttpServerResponse.json(body, { status })
+      return HttpServerResponse.unsafeJson({ service: "magnitude-acn", version: ACN_VERSION, state: { _tag: state._tag } }, { status })
     }
     const body = yield* encodeHealthResponse(makeHealthResponse(ACN_VERSION, state))
     return yield* HttpServerResponse.json(body, { status })
@@ -705,17 +701,17 @@ export const installAcnPublicRoutes = (
   const network = remote.network
   yield* router.add("POST", "/rpc", Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    // A stale instance is refused first, so a client whose token rotated with a restart re-admits.
-    if (request.headers["x-magnitude-acn-id"] !== ACN_INSTANCE_ID) return HttpServerResponse.empty({ status: 409 })
-    // Application control needs a local controller or a signed-in browser on a page this service served.
+    // Application control from another device needs a signed-in browser on a page this service served.
     const access = yield* remote.access(request)
     if (access === "Anonymous") {
-      return HttpServerResponse.text("Sign in to Magnitude with the Network access key to control it.", { status: 401 })
+      return HttpServerResponse.text("Sign in to Magnitude with the Network access key to control it from another device.", { status: 401 })
     }
     if (access === "SignedIn" && !isSameOrigin(request)) {
       return HttpServerResponse.text("Magnitude application control accepts requests only from its own pages.", { status: 403 })
     }
-    return yield* lifecycle.dispatchRpc
+    return request.headers["x-magnitude-acn-id"] === ACN_INSTANCE_ID
+      ? yield* lifecycle.dispatchRpc
+      : HttpServerResponse.empty({ status: 409 })
   }))
   yield* router.prefixed("/inference/v1/proxies/codex").add(
     "*", "/*", makeInferenceProxy(icn, "codex", network, fetchTarget, usage, activity),
@@ -735,7 +731,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
   Effect.scoped(Effect.gen(function* () {
     const dataDir = options.dataDir ?? defaultDataDir()
     const debug = options.debug === true
-    const controlToken = yield* owner.awaitStart
+    yield* owner.awaitStart
 
     const lifecycle = yield* makeAcnServiceLifecycle()
     const healthReportingFinished = yield* Deferred.make<void, JsonLineChannelFailed>()
@@ -765,7 +761,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     )
     const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
     const server = Context.get(infrastructure, HttpServer.HttpServer)
-    const remote = yield* makeRemoteAccess(network, controlToken)
+    const remote = yield* makeRemoteAccess(network)
     yield* installAcnHealthRoutes(router, lifecycle, remote).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
     if (network.enabled && network.bind !== primaryBind) {

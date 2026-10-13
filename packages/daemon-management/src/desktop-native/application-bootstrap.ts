@@ -10,7 +10,6 @@ import { previousInstallationUpgrade } from "./previous-installation-live"
 import { checkServicePort, requireServicePort } from "./service-port"
 import type { ChildOutputMode } from "./child-output"
 import { SERVER_DATA_DIRECTORY, SERVER_PORT } from "./server-profile"
-import { issueLocalControlToken, type LocalControl } from "./local-control"
 
 export const ApplicationRuntime = Schema.Union(
   Schema.TaggedStruct("Installed", { resourcesDirectory: Schema.String }),
@@ -100,7 +99,6 @@ export const makeApplicationService = (options: {
   readonly output: ChildOutputMode
   readonly admission: "Immediate" | "Supervised"
   readonly owner: OwnerAgent
-  readonly localControl: LocalControl
 }) => Effect.gen(function* () {
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
   const spawner = process.platform === "win32" ? yield* Effect.gen(function* () {
@@ -121,8 +119,6 @@ export const makeApplicationService = (options: {
     Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })),
     Effect.zipRight(checked.spawn(command)),
   ) })
-  const issueControlToken = issueLocalControlToken({ stateDirectory: options.stateDirectory, localControl: options.localControl, groupAccess: options.profile.groupAccess }).pipe(
-    Effect.mapError(error => new OwnedChildSpawnFailed({ executable: command.executable, message: error.message })))
-  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION, options.owner, issueControlToken)
+  return yield* makeOwnedService(command, MAGNITUDE_RPC_VERSION, options.owner)
     .pipe(Effect.provideService(OwnedChildSpawner, admitted))
 })

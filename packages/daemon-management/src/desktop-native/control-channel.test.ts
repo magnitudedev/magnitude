@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream"
 import { DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
-import { Effect, Fiber, Option, Schema, Stream } from "effect"
+import { Effect, Fiber, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
 import { receiveJsonLines, sendJsonLine } from "@magnitudedev/utils/json-line-channel"
 
@@ -15,7 +15,7 @@ const observe = <A, I>(schema: Schema.Schema<A, I>, chunks: ReadonlyArray<Buffer
 
 describe("inherited control framing", () => {
   it("handles split and batched messages", async () => {
-    expect(await Effect.runPromise(observe(DesktopOwnerCommand, ['{"_tag":"Sta', 'rt"}\n{"_tag":"Shutdown"}\n']))).toEqual([{ _tag: "Start", controlToken: Option.none() }, { _tag: "Shutdown" }])
+    expect(await Effect.runPromise(observe(DesktopOwnerCommand, ['{"_tag":"Sta', 'rt"}\n{"_tag":"Shutdown"}\n']))).toEqual([{ _tag: "Start" }, { _tag: "Shutdown" }])
   })
   it("preserves UTF-8 across byte boundaries", async () => {
     const bytes = Buffer.from('"日本語"\n')

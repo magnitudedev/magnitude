@@ -49,7 +49,7 @@ Keep Magnitude running on the server. On your own computer, run:
 ssh -N -L 10101:127.0.0.1:10100 user@server
 ```
 
-Use `http://127.0.0.1:10101/inference/v1` in your client. SSH forwards that local port to Magnitude on the server. Network access can stay off, and no Magnitude API key is required through the tunnel. If your client requires a key, any value works. Through the tunnel, `http://127.0.0.1:10101` also opens the app without signing in, because Magnitude sees the connection as coming from the server itself. A server set up with `magnitude server setup` is the exception: it asks every browser, including one on the server itself, for the API key, so its app needs network access on.
+Use `http://127.0.0.1:10101/inference/v1` in your client. SSH forwards that local port to Magnitude on the server. Network access can stay off, and no Magnitude API key is required through the tunnel. If your client requires a key, any value works. Through the tunnel, `http://127.0.0.1:10101` also opens the app without signing in, because Magnitude sees the connection as coming from the server itself.
 
 Keep the tunnel running while using inference. You must be able to reach the server over SSH, for example through your local network or Tailscale.
 

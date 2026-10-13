@@ -31,7 +31,7 @@ const run = Effect.scoped(Effect.gen(function* () {
     if (event._tag === "Booted") {
       if (event.pid !== child.identity.pid) return yield* new AcceptanceFailed({ message: "Wrong child identity" })
       yield* Effect.log(`Booted owned ACN ${event.pid}; authorizing Start`)
-      yield* child.send({ _tag: "Start", controlToken: Option.none() })
+      yield* child.send({ _tag: "Start" })
     } else {
       yield* Effect.log(`ACN: ${event.health.state._tag}`)
       if (event.health.state._tag === "Ready") yield* Deferred.succeed(ready, undefined)

@@ -5,14 +5,8 @@ export const REMOTE_ACCESS_SESSION_PATH = "/auth/session"
 export const REMOTE_ACCESS_SIGN_OUT_PATH = "/auth/session/end"
 
 /**
- * Header carrying the local control token. A service running as a system service admits loopback
- * callers to application control only with it; anywhere else loopback alone admits them.
- */
-export const LOCAL_CONTROL_HEADER = "x-magnitude-control-token"
-
-/**
- * How ACN admits the caller asking. Local callers (loopback, plus the local control token where the
- * service requires one) never sign in; any other browser signs in with the Network access key.
+ * How ACN admits the caller asking. Callers on the server's own machine never sign in; a browser on
+ * another device signs in with the Network access key.
  */
 export const RemoteAccessStatus = Schema.Union(
   Schema.TaggedStruct("Local", {}),

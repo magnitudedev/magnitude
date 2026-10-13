@@ -11,12 +11,10 @@ import {
   Exit,
   Fiber,
   Layer,
-  Option,
-  Redacted,
   Scope,
   Stream,
 } from "effect";
-import { LOCAL_CONTROL_HEADER, MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol";
+import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/acn-protocol";
 import { MagnitudeClient } from "./client";
 import { MagnitudeServiceStarter } from "./service-starter";
 import { ServiceStartFailed } from "./connection-errors";
@@ -121,63 +119,6 @@ const fixture = (options: { readonly starterUpgrades?: boolean } = {}) => {
     },
   };
 };
-
-/** A system service: only callers presenting the current start's control token are admitted. */
-const tokenService = () => {
-  let token = "token-1";
-  let id = "first";
-  const seen: Array<{ readonly path: string; readonly token: string | undefined }> = [];
-  const http = HttpClient.make((request) => Effect.sync(() => {
-    const presented = request.headers[LOCAL_CONTROL_HEADER];
-    seen.push({ path: new URL(request.url).pathname, token: presented });
-    if (request.url.endsWith("/health"))
-      return HttpClientResponse.fromWeb(request, Response.json(presented === token ? health(id)
-        : { service: "magnitude-acn", version: "0.0.1", state: { _tag: "Ready" } }));
-    if (request.headers["x-magnitude-acn-id"] !== id)
-      return HttpClientResponse.fromWeb(request, new Response(null, { status: 409 }));
-    if (presented !== token)
-      return HttpClientResponse.fromWeb(request, new Response(null, { status: 401 }));
-    if (request.body._tag !== "Uint8Array") throw new Error("Expected encoded RPC body");
-    const message = JSON.parse(new TextDecoder().decode(request.body.body).trim());
-    return HttpClientResponse.fromWeb(request, new Response(JSON.stringify({
-      _tag: "Exit", requestId: message.id, exit: { _tag: "Success", value: {} },
-    }) + "\n"));
-  }));
-  return {
-    seen,
-    current: () => token,
-    restart: () => { token = "token-2"; id = "second"; },
-    layer: (localControl?: Effect.Effect<Option.Option<Redacted.Redacted<string>>>) => MagnitudeClient.layer({
-      autoStart: false, ...(localControl === undefined ? {} : { localControl }),
-    }).pipe(Layer.provide(Layer.succeed(HttpClient.HttpClient, http))),
-  };
-};
-
-describe("MagnitudeClient local control", () => {
-  it("presents the local control token on health and RPC, rereading it when the service restarts", async () => {
-    const service = tokenService();
-    await Effect.runPromise(Effect.gen(function* () {
-      const client = yield* MagnitudeClient;
-      yield* client.models.stop({});
-      service.restart();
-      yield* client.models.stop({});
-      expect((yield* client.connection.state)._tag).toBe("Ready");
-    }).pipe(Effect.provide(service.layer(Effect.sync(() => Option.some(Redacted.make(service.current())))))));
-    expect(service.seen.map((entry) => `${entry.path} ${entry.token}`)).toEqual([
-      "/health token-1", "/rpc token-1", "/rpc token-1", "/health token-2", "/rpc token-2",
-    ]);
-  });
-
-  it("reports a service that does not admit this caller as access denied", async () => {
-    const service = tokenService();
-    const result = await Effect.runPromise(Effect.gen(function* () {
-      const client = yield* MagnitudeClient;
-      return yield* Effect.either(client.models.stop({}));
-    }).pipe(Effect.provide(service.layer())));
-    expect(result._tag === "Left" && result.left._tag).toBe("ServiceAccessDenied");
-    expect(service.seen.map((entry) => entry.path)).toEqual(["/health"]);
-  });
-});
 
 describe("MagnitudeClient", () => {
   it("scope closure cancels startup, terminalizes waiters, and prevents reuse", async () => {

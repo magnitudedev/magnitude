@@ -334,7 +334,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       }
     },
   }
-  const service = yield* makeApplicationService({ owner: ownerAgent, output: "DiagnosticTail", admission: "Supervised", localControl: "Open", runtime: applicationRuntime, profile,
+  const service = yield* makeApplicationService({ owner: ownerAgent, output: "DiagnosticTail", admission: "Supervised", runtime: applicationRuntime, profile,
     stateDirectory: stateDir, home: homedir(), environment: process.env }).pipe(Effect.provide([NodeSqliteDriverLayer, NodeContext.layer]))
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, service: value.service, owner: { _tag: "Desktop" as const, tray: value.tray } })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, owner: { _tag: "Desktop" as const, tray } })))

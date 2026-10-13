@@ -2,11 +2,11 @@ import { BunContext, BunHttpServer } from "@effect/platform-bun"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { LOCAL_CONTROL_HEADER, MagnitudeReadinessResponseSchema, type MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
+import type { MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
 import { FetchHttpClient, HttpBody, HttpClient, HttpClientRequest, HttpServer, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import { Rpc, RpcGroup, RpcSerialization, RpcServer } from "@effect/rpc"
-import { Cause, Context, Effect, Layer, Option, Redacted, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect"
 import { networkInterfaces } from "node:os"
 import { LOOPBACK_ONLY, type NetworkAccess } from "@magnitudedev/storage"
 import { IcnBinaryNotFound } from "@magnitudedev/icn"
@@ -23,7 +23,7 @@ describe("ACN startup failure presentation", () => {
     vi.stubEnv("MAGNITUDE_ICN_PATH", join(root, "absent-installation.json"))
     try {
       const result = await Effect.runPromise(launchAcnServer({ dataDir: root, port: 0 }, {
-        awaitStart: Effect.succeed(Option.none()), awaitShutdown: Effect.never, ownerState: Stream.never, request: () => Effect.never,
+        awaitStart: Effect.void, awaitShutdown: Effect.never, ownerState: Stream.never, request: () => Effect.never,
         reportHealth: health => Effect.sleep(health.state._tag === "Stopping" ? "25 millis" : "0 millis").pipe(
           Effect.zipRight(Effect.sync(() => { delivered.push(health) })),
         ),
@@ -86,7 +86,7 @@ describe("ACN public HTTP listener", () => {
       }))
       const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
       const publicRouter = yield* HttpLayerRouter.make
-      const remote = yield* makeRemoteAccess(LOOPBACK_ONLY, Option.none())
+      const remote = yield* makeRemoteAccess(LOOPBACK_ONLY)
       yield* installAcnHealthRoutes(publicRouter, lifecycle, remote)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, {
         origin: new URL(icnOrigin),
@@ -164,7 +164,7 @@ describe("ACN network access", () => {
       yield* icn.add("GET", "/v1/models", Effect.succeed(HttpServerResponse.text("inference models")))
       const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
       const publicRouter = yield* HttpLayerRouter.make
-      const remoteAccess = yield* makeRemoteAccess(network, Option.none())
+      const remoteAccess = yield* makeRemoteAccess(network)
       yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, remoteAccess)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
@@ -216,7 +216,7 @@ describe("ACN network access", () => {
       const http = yield* HttpClient.HttpClient
       const lifecycle = yield* makeAcnServiceLifecycle()
       const publicRouter = yield* HttpLayerRouter.make
-      const remoteAccess = yield* makeRemoteAccess(network, Option.none())
+      const remoteAccess = yield* makeRemoteAccess(network)
       yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess)
       yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL("http://127.0.0.1:1"), clientOptions: { headers: {} } }, remoteAccess)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
@@ -265,60 +265,12 @@ describe("ACN network access", () => {
       expect(yield* (yield* send("GET", `${remote}/health`, { cookie })).text).not.toContain('"id"')
     })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
-  it("admits loopback callers to control only with the local control token when the service requires one", async () => {
-    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const http = yield* HttpClient.HttpClient
-      const lifecycle = yield* makeAcnServiceLifecycle()
-      const icn = yield* HttpLayerRouter.make
-      yield* icn.add("GET", "/v1/models", Effect.succeed(HttpServerResponse.text("inference models")))
-      const icnOrigin = loopbackOrigin(yield* listen(icn, 0))
-      const publicRouter = yield* HttpLayerRouter.make
-      const remoteAccess = yield* makeRemoteAccess(network, Option.some(Redacted.make("control-secret")))
-      yield* installAcnHealthRoutes(publicRouter, lifecycle, remoteAccess)
-      yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, remoteAccess)
-      const local = loopbackOrigin(yield* listen(publicRouter, 0))
-      const rpcRouter = yield* HttpLayerRouter.make
-      yield* rpcRouter.add("POST", "/rpc", Effect.succeed(HttpServerResponse.text("dispatched")))
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
-      const send = (method: "GET" | "POST", path: string, headers: Record<string, string> = {}, body?: string) => http.execute(
-        (method === "GET" ? HttpClientRequest.get(`${local}${path}`, { headers }) : HttpClientRequest.post(`${local}${path}`, { headers, body: HttpBody.text(body ?? "{}", "application/json") })))
-      const rpc = (headers: Record<string, string> = {}) => send("POST", "/rpc", { "x-magnitude-acn-id": ACN_INSTANCE_ID, ...headers })
-      const token = { [LOCAL_CONTROL_HEADER]: "control-secret" }
-
-      const anonymousHealth = yield* send("GET", "/health")
-      expect(anonymousHealth.status).toBe(200)
-      expect(Schema.decodeUnknownSync(MagnitudeReadinessResponseSchema)(yield* anonymousHealth.json)).toMatchObject({ state: { _tag: "Ready" } })
-      expect(yield* (yield* send("GET", "/health")).text).not.toContain('"id"')
-      expect((yield* rpc()).status).toBe(401)
-      expect((yield* rpc({ [LOCAL_CONTROL_HEADER]: "control-guess" })).status).toBe(401)
-      expect((yield* rpc({ origin: local })).status).toBe(401)
-      expect((yield* send("POST", "/rpc", { ...token, "x-magnitude-acn-id": "stale" })).status).toBe(409)
-      expect(yield* (yield* send("GET", "/auth/session")).json).toEqual({ _tag: "SignInRequired", keyConfigured: true })
-      expect((yield* send("POST", "/auth/session", { origin: local }, JSON.stringify({ key: "mag-wrong" }))).status).toBe(401)
-
-      expect(yield* (yield* send("GET", "/health", token)).text).toContain('"id"')
-      const controlled = yield* rpc(token)
-      expect(controlled.status).toBe(200)
-      expect(yield* controlled.text).toBe("dispatched")
-      expect(yield* (yield* send("GET", "/auth/session", token)).json).toEqual({ _tag: "Local" })
-
-      const keyless = yield* send("GET", "/inference/v1/models")
-      expect(keyless.status).toBe(200)
-      expect(yield* keyless.text).toBe("inference models")
-
-      const signedIn = yield* send("POST", "/auth/session", { origin: local }, JSON.stringify({ key: "mag-test-key" }))
-      expect(signedIn.status).toBe(204)
-      const cookie = (signedIn.headers["set-cookie"] ?? "").split(";")[0]!
-      expect((yield* rpc({ cookie, origin: local })).status).toBe(200)
-      expect((yield* rpc({ cookie })).status).toBe(403)
-    })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
-  })
   it("refuses non-local hosts and never gates while loopback only", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const http = yield* HttpClient.HttpClient
       const lifecycle = yield* makeAcnServiceLifecycle()
       const publicRouter = yield* HttpLayerRouter.make
-      yield* installAcnHealthRoutes(publicRouter, lifecycle, yield* makeRemoteAccess(LOOPBACK_ONLY, Option.none()))
+      yield* installAcnHealthRoutes(publicRouter, lifecycle, yield* makeRemoteAccess(LOOPBACK_ONLY))
       const origin = loopbackOrigin(yield* listen(publicRouter, 0))
       const get = (headers: Record<string, string>) => http.execute(HttpClientRequest.get(`${origin}/health`, { headers }))
       expect((yield* get({ host: "192.168.1.2:1" })).status).toBe(421)

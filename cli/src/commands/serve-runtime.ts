@@ -42,9 +42,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   // A restart request re-admits the owner in place, so settings read at service start take effect.
   for (;;) {
     yield* Ref.set(ready, false)
-    // The system service is reachable by every account on the machine, so loopback control needs its token.
     const stop = yield* runHeadlessApplication({ runtime, profile, stateDirectory, home: homedir(), environment: process.env,
-    localControl: owner === "service" ? "Token" : "Open",
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
     initializeUpdates: initializeServeUpdates(runtime, profile, addon, owner),

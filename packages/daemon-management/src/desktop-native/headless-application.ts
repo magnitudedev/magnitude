@@ -11,7 +11,6 @@ import { serveApplicationControl, type ApplicationControlOptions } from "./appli
 import { serveWindowsApplicationControl } from "./windows-control"
 import { applicationNativeHostPath, makeApplicationService, type ApplicationRuntime, type ApplicationProfile } from "./application-bootstrap"
 import type { OwnerAgent } from "./owned-service"
-import type { LocalControl } from "./local-control"
 import { ownerDone, ownerResult, ownerUnsupported } from "./owner-agent"
 import { acquireLinuxInstallationLease } from "./linux-installation-lease"
 import { isUpdateInstallationActive } from "./update-installation-lease"
@@ -33,7 +32,7 @@ export type HeadlessStop = "DesktopTakeover" | "Requested" | "Restart" | "Instal
  * It returns why it stopped once the service tree, control endpoint, leases and ownership are released.
  */
 export const runHeadlessApplication = (options: {
-  readonly runtime: ApplicationRuntime; readonly profile: ApplicationProfile; readonly localControl: LocalControl
+  readonly runtime: ApplicationRuntime; readonly profile: ApplicationProfile
   readonly stateDirectory: string; readonly home: string; readonly environment: Readonly<Record<string, string | undefined>>
   readonly stop: Effect.Effect<void>
   readonly stopping?: (reason: HeadlessStop) => Effect.Effect<void>

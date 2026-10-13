@@ -1,7 +1,7 @@
 import { MagnitudeHealthResponseSchema, AcnIdentitySchema, AcnInstanceIdSchema, AcnRevisionSchema, type MagnitudeHealthResponse } from "@magnitudedev/acn-protocol"
 import type { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { ProcessStartIdentitySchema } from "@magnitudedev/utils/process-groups"
-import { Deferred, Effect, Fiber, Logger, Option, Queue, Redacted, Ref, Schema, Stream, TestClock, TestContext } from "effect"
+import { Deferred, Effect, Fiber, Logger, Option, Queue, Ref, Schema, Stream, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { OwnedChildSpawner } from "./owned-child"
 import { makeOwnedService, type OwnerAgent } from "./owned-service"
@@ -12,7 +12,7 @@ const health: MagnitudeHealthResponse = Schema.decodeUnknownSync(MagnitudeHealth
   service: "magnitude-acn", version: AcnIdentitySchema.make("0.0.14"), revision: AcnRevisionSchema.make(1),
   id: AcnInstanceIdSchema.make("test-child"), pid: 42, rpcVersion: 1, state: { _tag: "Ready" },
 })
-const setup = (issueControlToken?: Effect.Effect<Option.Option<Redacted.Redacted<string>>>) => Effect.gen(function* () {
+const setup = Effect.gen(function* () {
   const events = yield* Queue.unbounded<DesktopChildEvent>()
   const exit = yield* Deferred.make<number>()
   const commands = yield* Ref.make<DesktopOwnerCommand[]>([])
@@ -27,24 +27,12 @@ const setup = (issueControlToken?: Effect.Effect<Option.Option<Redacted.Redacted
       stop: Ref.update(stops, value => value + 1),
     }
   }) })
-  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner, issueControlToken).pipe(Effect.provideService(OwnedChildSpawner, spawner))
+  const service = yield* makeOwnedService({ output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test", arguments: [], environment: {} }, 1, idleOwner).pipe(Effect.provideService(OwnedChildSpawner, spawner))
   return { service, events, exit, commands, launches, stops }
 })
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => Effect.runPromise(Effect.scoped(effect).pipe(Effect.provide(TestContext.TestContext)))
 
 describe("desktop-owned service supervision", () => {
-  it("hands each start the local control token issued for it", async () => {
-    const starts = await run(Effect.gen(function* () {
-      const issued = yield* Ref.make(0)
-      const { events, commands } = yield* setup(Ref.updateAndGet(issued, value => value + 1).pipe(
-        Effect.map(value => Option.some(Redacted.make(`token-${value}`)))))
-      yield* Queue.offer(events, { _tag: "Booted", pid: 42 })
-      yield* Effect.yieldNow().pipe(Effect.repeatN(20))
-      return (yield* Ref.get(commands)).flatMap(command => command._tag === "Start" ? [Option.map(command.controlToken, Redacted.value)] : [])
-    }))
-    expect(starts).toEqual([Option.some("token-1")])
-  })
-
   it("retains diagnostics when control EOF precedes process exit without exposing them in Status", async () => {
     const messages: unknown[] = []
     const logger = Logger.make(({ message }) => { messages.push(message) })
@@ -95,7 +83,7 @@ describe("desktop-owned service supervision", () => {
   })))
 
   it("waits for matching Booted, observes readiness, and shuts down once", async () => run(Effect.gen(function* () {
-    const f = yield* setup()
+    const f = yield* setup
     yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
     yield* Queue.offer(f.events, { _tag: "Health", health })
     expect((yield* f.service.awaitReady).id).toBe(health.id)
@@ -107,7 +95,7 @@ describe("desktop-owned service supervision", () => {
   })))
 
   it("removes Ready immediately on child loss and Quit prevents recovery", async () => run(Effect.gen(function* () {
-    const f = yield* setup()
+    const f = yield* setup
     yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
     yield* Queue.offer(f.events, { _tag: "Health", health })
     yield* f.service.awaitReady
@@ -121,7 +109,7 @@ describe("desktop-owned service supervision", () => {
   })))
 
   it("bounds repeated crashes and permits only explicit retry", async () => run(Effect.gen(function* () {
-    const f = yield* setup()
+    const f = yield* setup
     yield* Deferred.succeed(f.exit, 9)
     yield* TestClock.adjust("8 seconds")
     expect((yield* f.service.state)._tag).toBe("Failed")
@@ -135,7 +123,7 @@ describe("desktop-owned service supervision", () => {
   })))
 
   it("never admits mismatched health", async () => run(Effect.gen(function* () {
-    const f = yield* setup()
+    const f = yield* setup
     const waiter = yield* f.service.awaitReady.pipe(Effect.either, Effect.forkScoped)
     for (let index = 0; index < 4; index++) {
       yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
@@ -146,7 +134,7 @@ describe("desktop-owned service supervision", () => {
     expect((yield* f.service.state)._tag).toBe("Failed")
   })))
   it("presents the service's safe startup detail without a stack trace", async () => run(Effect.gen(function* () {
-    const f = yield* setup()
+    const f = yield* setup
     for (let index = 0; index < 4; index++) {
       yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
       yield* Queue.offer(f.events, { _tag: "Health", health: Schema.decodeUnknownSync(MagnitudeHealthResponseSchema)({

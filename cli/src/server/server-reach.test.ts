@@ -33,8 +33,6 @@ describe("serve ready output", () => {
   })
   it("tells the service how to stop instead of Ctrl+C", () => {
     const output = renderServeReady(reach({ service: true }))
-    expect(output).toContain("On this computer:   http://127.0.0.1:10100  (the browser app asks for the network access key)")
-    expect(renderServeReady(reach())).not.toContain("10100  (the browser app")
     expect(output).not.toContain("Ctrl+C")
     expect(output).toContain("magnitude server remove")
   })

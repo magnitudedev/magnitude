@@ -1,6 +1,6 @@
 import { Command, CommandExecutor, FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Duration, Effect, Layer, Option, Predicate, Schedule } from "effect"
+import { Duration, Effect, Layer, Option, Schedule } from "effect"
 import { open } from "node:fs/promises"
 import { join } from "node:path"
 import { userInfo } from "node:os"
@@ -27,19 +27,11 @@ const askTerminal = (question: string) => Effect.acquireUseRelease(
 
 const withService = <A, E>(use: (client: MagnitudeClient) => Effect.Effect<A, E>) => withLocalService(desktopServiceOrigin, use)
 
-const isAccessDenied = (error: unknown) => Predicate.isTagged(error, "ServiceAccessDenied")
-
-/**
- * The service may still be starting, or restarting after a settings change; `serverSetup` bounds the
- * whole wait. Control needs its local control token, which the person reads as a member of the group
- * setup just added them to.
- */
+/** The service may still be starting, or restarting after a settings change; `serverSetup` bounds the whole wait. */
 const readNetworkAccess = (settled: boolean) => withService(client => client.configuration.getNetworkAccess({})).pipe(
   Effect.filterOrFail(settings => !settled || !settings.pending, () => failed("The server is still restarting.")),
-  Effect.retry({ schedule: Schedule.spaced(Duration.seconds(1)), while: error => !isAccessDenied(error) }),
-  Effect.mapError(error => isAccessDenied(error)
-    ? failed("The server is running, but this account can't control it yet. Log out and back in, then run `magnitude server setup` again to turn on network access.")
-    : failed("The Magnitude server did not start.")))
+  Effect.retry(Schedule.spaced(Duration.seconds(1))),
+  Effect.mapError(() => failed("The Magnitude server did not start.")))
 
 const enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed> = Effect.gen(function* () {
   const current = yield* readNetworkAccess(false)

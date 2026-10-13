@@ -47,4 +47,3 @@ export { TerminalCommand, TerminalCommandFailed, nodeTerminalCommand } from "./t
 export { openServerFirewall } from "./server-firewall"
 export { ServerInstallationFailed, installedServerCli, parseServerInstallation, requireInstalledRoot, installLinuxServer, removeLinuxServer, installMacServer, removeMacServer, macServerPlist,
   classifyServerAccounts, inspectServerAccounts, hasLinuxServerRemnants, systemIdRange } from "./server-installation"
-export { LOCAL_CONTROL_TOKEN_FILE, LocalControlDenied, LocalControlFailed, issueLocalControlToken, readLocalControlToken, type LocalControl } from "./local-control"
