@@ -26,6 +26,18 @@ import {
   highlightCode,
 } from "../stores/shiki-store"
 
+const SAFE_LINK_PROTOCOLS = ["http:", "https:", "mailto:"]
+
+/** Only allow links whose protocol is on the allowlist (blocks javascript:, file:, etc.) */
+function isSafeHref(href: string | undefined): href is string {
+  if (!href) return false
+  try {
+    return SAFE_LINK_PROTOCOLS.includes(new URL(href).protocol)
+  } catch {
+    return false // not a full URL, so don't render it as a clickable link
+  }
+}
+
 /** Highlight a code block — returns highlighted HTML or null if not yet loaded */
 function useCodeHighlight(code: string, lang: string): string | null {
   // Subscribe to shiki store — re-renders when highlighter loads
@@ -117,6 +129,9 @@ function MarkdownContentImpl({
         return <CodeBlock code={code} lang={lang} />
       },
       a({ href, children }) {
+        if (!isSafeHref(href)) {
+          return <>{children}</>
+        }
         return (
           <a
             href={href}
