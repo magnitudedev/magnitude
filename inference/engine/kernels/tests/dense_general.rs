@@ -321,16 +321,36 @@ fn mappings(device: &seismic::Device, launches: Launches) -> Vec<Mapping> {
     }
 }
 
+/// The statics the device's implementation declares: backends fix different
+/// subsets of the entry dimensions (the CPU forms read most of them at run time).
+fn declared(
+    implementation: Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError>,
+) -> Vec<String> {
+    implementation
+        .unwrap()
+        .expect("every test device has a native implementation")
+        .statics
+}
+
+/// `mapping`'s specialization with those of `statics` that `declared` names.
 fn specialization(
     device: &seismic::Device,
+    declared: &[String],
     statics: &[(&str, usize)],
     mapping: &Mapping,
 ) -> seismic::NativeSpecialization {
-    let statics = if is_cpu(device) { &[][..] } else { statics };
-    let specialization = statics.iter().fold(
-        seismic::NativeSpecialization::new(),
-        |spec, (name, value)| spec.with_static(*name, *value as u64),
-    );
+    let specialization = statics
+        .iter()
+        .filter(|(name, _)| declared.iter().any(|declared| declared == name))
+        .fold(
+            seismic::NativeSpecialization::new(),
+            |spec, (name, value)| spec.with_static(*name, *value as u64),
+        );
+    let specialization = if device.backend() == seismic::BackendName::Cuda {
+        specialization.with_param("OPERAND", 0)
+    } else {
+        specialization
+    };
     mapping
         .params
         .iter()
@@ -348,13 +368,16 @@ fn project_rows_specialization(
     statics: &[(&str, usize)],
     mapping: &Mapping,
 ) -> seismic::NativeSpecialization {
-    let specialization = specialization(device, statics, mapping);
+    let declared = declared(project_rows::native_implementation(device));
+    let specialization = specialization(device, &declared, statics, mapping);
     if device.backend() != seismic::BackendName::Metal {
         return specialization;
     }
     specialization
+        .with_static("WB", 0)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
+        .with_param("RESIDUE", 1)
         .with_launch_param(7, "TALL_M", 128)
         .with_launch_param(7, "TALL_K", 64)
         .with_launch_param(7, "STAGERS", 2)
@@ -369,7 +392,7 @@ const ROW_CLASSES: [usize; 6] = [1, 3, 5, 12, 40, 80];
 /// Whether `rows` runs the INT8 candidate under `mapping` (CUDA: only the
 /// small GEMM band takes it; the CPU: every class).
 fn quantized(device: &seismic::Device, mapping: &Mapping, rows: usize) -> bool {
-    mapping.int8 && (is_cpu(device) || (16 < rows && rows <= 64))
+    mapping.int8 && (is_cpu(device) || (16 < rows))
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +689,8 @@ fn portable_entries_match_host_reference() {
                 floats(DType::BF16, &[m, k], &x),
                 floats(DType::BF16, &[n, k], &w),
                 floats(DType::F32, &[0], &[]),
+                // No packing bound.
+                floats(DType::F32, &[0], &[]),
             ],
         );
         let (expected, magnitudes) = project(&x, &w, k, n);
@@ -838,6 +863,7 @@ fn native_project_rows_matches_host_reference() {
                             source: &source,
                             weight: &weight,
                             weight_scale: &weight_scale,
+                            weight_bound: &tensor(device, DType::F32, &[0], &[]),
                         })
                         .unwrap()
                         .value;
@@ -861,8 +887,8 @@ fn native_dense_up_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [2, 3],
-        cuda_gemm: 5,
+        cuda_gemv: [1, 2],
+        cuda_gemm: 4,
         split: false,
     };
     let devices = devices();
@@ -902,8 +928,13 @@ fn native_dense_up_matches_host_reference() {
                             UW: seismic::Element::bf16(),
                             A: seismic::Element::bf16(),
                         },
-                        &specialization(device, &[("H", h), ("F", f)], &mapping)
-                            .with_static("US", 1),
+                        &specialization(
+                            device,
+                            &declared(dense_up::native_implementation(device)),
+                            &[("H", h), ("F", f)],
+                            &mapping,
+                        )
+                        .with_static("US", 1),
                     )
                     .unwrap()
                     .call(dense_up::Args {
@@ -935,8 +966,8 @@ fn native_short_conv_project_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [2, 3],
-        cuda_gemm: 5,
+        cuda_gemv: [1, 2],
+        cuda_gemm: 4,
         split: false,
     };
     let devices = devices();
@@ -972,10 +1003,15 @@ fn native_short_conv_project_matches_host_reference() {
                             XW: seismic::Element::bf16(),
                             A: seismic::Element::bf16(),
                         },
-                        &specialization(device, &[("H", h), ("CH", ch)], &mapping)
-                            .with_static("BS", 0)
-                            .with_static("CS", 0)
-                            .with_static("XS", 0),
+                        &specialization(
+                            device,
+                            &declared(short_conv_project::native_implementation(device)),
+                            &[("H", h), ("CH", ch)],
+                            &mapping,
+                        )
+                        .with_static("BS", 0)
+                        .with_static("CS", 0)
+                        .with_static("XS", 0),
                     )
                     .unwrap()
                     .call(short_conv_project::Args {
@@ -1010,8 +1046,8 @@ fn native_per_layer_gate_matches_host_reference() {
         metal_gemv: 1,
         metal_batch: 2,
         metal_gemm: 4,
-        cuda_gemv: [2, 3],
-        cuda_gemm: 5,
+        cuda_gemv: [1, 2],
+        cuda_gemm: 4,
         split: false,
     };
     let devices = devices();
@@ -1042,8 +1078,13 @@ fn native_per_layer_gate_matches_host_reference() {
                             GW: seismic::Element::bf16(),
                             A: seismic::Element::bf16(),
                         },
-                        &specialization(device, &[("D", d), ("L", l), ("P", p)], &mapping)
-                            .with_static("GS", 0),
+                        &specialization(
+                            device,
+                            &declared(per_layer_gate::native_implementation(device)),
+                            &[("D", d), ("L", l), ("P", p)],
+                            &mapping,
+                        )
+                        .with_static("GS", 0),
                     )
                     .unwrap()
                     .call(per_layer_gate::Args {

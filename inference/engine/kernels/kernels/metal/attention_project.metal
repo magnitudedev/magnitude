@@ -28,6 +28,10 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     device half *weight_factors [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_FACTORS)]],      \
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
+    device const float *query_bound [[buffer(SEISMIC_BUFFER_QUERY_BOUND)]],             \
+    device const float *gate_bound [[buffer(SEISMIC_BUFFER_GATE_BOUND)]],               \
+    device const float *key_bound [[buffer(SEISMIC_BUFFER_KEY_BOUND)]],                 \
+    device const float *value_bound [[buffer(SEISMIC_BUFFER_VALUE_BOUND)]],             \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define ATTENTION_PROJECT_OPERANDS                                                      \
@@ -36,7 +40,8 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     const uint gate_rows = uint(SEISMIC_DIM_GR);                                        \
     const uint key_rows = uint(SEISMIC_DIM_K);                                          \
     const uint value_rows = uint(SEISMIC_DIM_V);                                        \
-    projection::Rms<activation, norm_element, projection::AllRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
+    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+        in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_1, input_norm, SEISMIC_INPUT_NORM_STRIDE_0,               \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}};                            \
     projection::Weights<packets::W0> query_w{query_weight, KERNEL_W0_LAYOUT(k), k};     \
@@ -298,18 +303,25 @@ kernel void attention_project_tall(ATTENTION_PROJECT_ARGUMENTS,
 // as integer codes under the gain limits of the four weights together, two
 // rows packed per operand element, the weights' block scales and biases (in
 // segment order in each table), then the packed tiles of the segments. The
-// operand is laid out for the first weight with a packed path; a segment
+// operand is laid out for the weights that serve the most weight rows; a segment
 // whose weights it does not serve runs the staged tiles (`unpacked`), with
 // their results, as do the zero tiles of mode 1.
 #define ATTENTION_PROJECT_PACKING_SCRATCH(first)                                        \
     projection::packing_scratch{packed, token_factors, token_scales,                    \
         weight_factors + ulong(first) * (k / 32u) * 2u, weight_scales + (first)}
-#define ATTENTION_PROJECT_PACKING                                                       \
-    projection::packing_shared<packets::W0, packets::W1, packets::W2, packets::W3>
+// The shared operand coded for WIDTH residue bits where it has them; its
+// layout (folds, centre, the weights it serves) is every width's.
+#define ATTENTION_PROJECT_PACKING_OF(WIDTH)                                             \
+    projection::packing_shared<WIDTH, packets::W0, uint(SEISMIC_DIM_Q), packets::W1, uint(SEISMIC_DIM_GR), \
+        packets::W2, uint(SEISMIC_DIM_K), packets::W3, uint(SEISMIC_DIM_V)>
+#define ATTENTION_PROJECT_PACKING ATTENTION_PROJECT_PACKING_OF(1)
 #define ATTENTION_PROJECT_PACKED(SLOT)                                                  \
-    projection::packing_serves<packets::SLOT, ATTENTION_PROJECT_PACKING::folds>::value
+    projection::packing_serves<packets::SLOT, ATTENTION_PROJECT_PACKING::folds,         \
+        ATTENTION_PROJECT_PACKING::residue>::value
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_PACK
+// RESIDUE: the operand's residue width for weights with residue bits.
+template <uint RESIDUE>
 kernel void attention_project_pack(ATTENTION_PROJECT_ARGUMENTS,
     uint pairs [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -320,8 +332,18 @@ kernel void attention_project_pack(ATTENTION_PROJECT_ARGUMENTS,
     threadgroup float4 peaks[8];
     ATTENTION_PROJECT_OPERANDS;
     projection::Plain<activation, projection::AllRows> x{normalized, k, 1, k, {}};
-    projection::packing_operand<ATTENTION_PROJECT_PACKING::centre, ATTENTION_PROJECT_PACKING::folds>(x,
-        ATTENTION_PROJECT_PACKING_SCRATCH(0u), uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
+    // The bounds of the segments the operand serves, where each has one.
+    constexpr uint SERVED = (ATTENTION_PROJECT_PACKED(W0) && SEISMIC_DIM_Q > 0 ? 1u : 0u)
+        | (ATTENTION_PROJECT_PACKED(W1) && SEISMIC_DIM_GR > 0 ? 2u : 0u)
+        | (ATTENTION_PROJECT_PACKED(W2) && SEISMIC_DIM_K > 0 ? 4u : 0u)
+        | (ATTENTION_PROJECT_PACKED(W3) && SEISMIC_DIM_V > 0 ? 8u : 0u);
+    constexpr uint BOUNDED = (SEISMIC_DIM_QB != 0 ? 1u : 0u) | (SEISMIC_DIM_GB != 0 ? 2u : 0u)
+        | (SEISMIC_DIM_KB != 0 ? 4u : 0u) | (SEISMIC_DIM_VB != 0 ? 8u : 0u);
+    constexpr uint BOUNDS = projection::packing_bounded<SERVED, BOUNDED>::value;
+    const projection::packing_bounds<BOUNDS> bounds{{query_bound, gate_bound, key_bound, value_bound}};
+    projection::packing_operand<ATTENTION_PROJECT_PACKING::centre, ATTENTION_PROJECT_PACKING::folds,
+        ATTENTION_PROJECT_PACKING_OF(RESIDUE)::residue, BOUNDS>(x, ATTENTION_PROJECT_PACKING_SCRATCH(0u), bounds,
+        uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -352,7 +374,7 @@ kernel void attention_project_pack_coefficients(ATTENTION_PROJECT_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_ATTENTION_PROJECT_PACKED
-template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+template <uint RESIDUE, uint PACK_TOKENS, uint WEIGHTS_AHEAD>
 kernel void attention_project_packed(ATTENTION_PROJECT_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -363,20 +385,20 @@ kernel void attention_project_packed(ATTENTION_PROJECT_ARGUMENTS,
     // Mode 1 has no query or gate tiles (`unpacked` zeroes those results).
     const bool projected = SEISMIC_PARAM_PROJECT_MODE == 0;
     uint group = tile;
-    constexpr uint FOLDS = ATTENTION_PROJECT_PACKING::folds;
-    if (projection::gemm_packed_segment<packets::W0, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(query_out,
+    constexpr uint FOLDS = ATTENTION_PROJECT_PACKING::folds, CODED = ATTENTION_PROJECT_PACKING_OF(RESIDUE)::residue;
+    if (projection::gemm_packed_segment<packets::W0, FOLDS, CODED, PACK_TOKENS, WEIGHTS_AHEAD>(query_out,
             query_w, ATTENTION_PROJECT_PACKING_SCRATCH(0u), projected ? m : 0u, padded, query_rows, k, group,
             projection::packing_simdgroups, sg, lane))
         return;
-    if (projection::gemm_packed_segment<packets::W1, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(gate_out,
+    if (projection::gemm_packed_segment<packets::W1, FOLDS, CODED, PACK_TOKENS, WEIGHTS_AHEAD>(gate_out,
             gate_w, ATTENTION_PROJECT_PACKING_SCRATCH(r1), projected ? m : 0u, padded, gate_rows, k, group,
             projection::packing_simdgroups, sg, lane))
         return;
-    if (projection::gemm_packed_segment<packets::W2, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(key_out,
+    if (projection::gemm_packed_segment<packets::W2, FOLDS, CODED, PACK_TOKENS, WEIGHTS_AHEAD>(key_out,
             key_w, ATTENTION_PROJECT_PACKING_SCRATCH(r2), m, padded, key_rows, k, group,
             projection::packing_simdgroups, sg, lane))
         return;
-    projection::gemm_packed_segment<packets::W3, FOLDS, PACK_TOKENS, WEIGHTS_AHEAD>(value_out,
+    projection::gemm_packed_segment<packets::W3, FOLDS, CODED, PACK_TOKENS, WEIGHTS_AHEAD>(value_out,
         value_w, ATTENTION_PROJECT_PACKING_SCRATCH(r3), m, padded, value_rows, k, group,
         projection::packing_simdgroups, sg, lane);
 }

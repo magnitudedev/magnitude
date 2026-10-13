@@ -23,19 +23,17 @@ pub use seismic_lang::checked::{
     NativeComparison, NativeCondition, NativeImplementation, NativeLaunch, NativeNatExpr,
     NativeParameter, NativeScratch, NativeSpecialization, NativeSpecializationError,
 };
-pub use seismic_lang::precision::{
-    ErrorEnvelope, Limit, PrecisionPolicy, SpecialPolicy, Tolerance, TuningPrecision,
-};
+pub use seismic_lang::precision::{Limit, PrecisionPolicy, SpecialPolicy, Tolerance};
 /// Numerical comparison helpers used by validation frontends.
 pub mod testing {
-    pub use seismic_compiler::numerics::{compare_element, ElementComparison};
+    pub use seismic_compiler::numerics::{ElementComparison, compare_element};
 }
 pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 /// Offline formation coverage of a generated module's native
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]
 pub mod coverage {
-    use crate::{generated::Module, BackendName, KernelRequest, NativeSpecialization};
+    use crate::{BackendName, KernelRequest, NativeSpecialization, generated::Module};
     pub use seismic_runtime::native::coverage::{
         Configuration, Coverage, CoverageError, FormationFailure, GroupSite, RequestFailure,
     };
@@ -104,18 +102,26 @@ pub mod coverage {
 }
 /// Replay of the tuning search against recorded surveys (development).
 pub use seismic_runtime::native::replay;
+/// The search's timed comparison of two alternatives, for a comparison whose
+/// rounds its caller runs.
+pub use seismic_runtime::native::sampling::{Shuffle, Tally, Verdict};
 pub use seismic_runtime::native::search::{
-    search, Cost, Evaluator, ParameterValues, PointKey, SearchSettings, SearchSpace,
-    SearchSpaceError, SearchStop, SearchTrace,
+    Cost, ParameterValues, PointKey, SearchSettings, SearchStop,
 };
 pub use seismic_runtime::native::trace::{
-    host_seconds, SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedSubmission,
+    SubmissionTrace, TraceDetail, TraceError, TracedLaunch, TracedLaunchGeometry, TracedSubmission,
+    host_seconds,
 };
 pub use seismic_runtime::native::tune::{
-    CensusPlan, Configuration, ConfigurationRecord, DeclaredParameter, Exclusion, NumericalEvidence,
-    NumericalMetrics, Outcome, PointInputs, PointMeasurement, PointRecord, PointSpec,
-    PointUnavailable, SearchPlan, Standing, StartPlan, Strategy, SurveyPlan, TuneError,
-    TuningInitializer, TuningMethod, TuningReference, TuningResult, TuningTime,
+    COMPARISON_VERSION, Configuration, ConfigurationRecord, Constraint, CoverageCheck,
+    CoverageOutcome, DeclaredParameter, Difference, Exclusion, Footprint, FormationRecord, Formed,
+    GOVERNING_STEP, GoverningStep, Grounded, Narrowed, NumericalObservation, NumericalRequirement,
+    Observed, Outcome, Performed, PieceMemory, PointInputs, PointMeasurement, PointRecord,
+    PointSpec, ProcessMemory, Publication, Quote, Raise, RaiseOutcome, Reselection, SearchPlan,
+    Spent, Stage, Standing, StepPower, Strategy, SubjectComparison, SubjectMeasurement, SurveyPlan,
+    SustainedClock, TuneError, TuningDisposition, TuningInitializer, TuningMethod, TuningResult,
+    TuningTime, UnitPlan, Violation, Work, Workers, WorkloadRotation, WrittenRows, admit,
+    governing_ratio, reselect, return_freed_pages,
 };
 pub use seismic_runtime::native::{MeasureOptions, Measurement, NativeArtifactIdentity};
 
@@ -159,15 +165,17 @@ pub mod native_cpu {
 }
 
 pub use seismic_lang::expr::{BigInt, BigUint};
-pub use seismic_lang::registry::{f16_bits, f16_to_f32, BackendName, Layout};
+pub use seismic_lang::ids::StableEntryId;
+pub use seismic_lang::registry::{BackendName, Layout, f16_bits, f16_to_f32};
 pub use seismic_lang::types::DType;
 /// The Seismic CPU library every CPU native kernel builds on.
 pub use seismic_native_cpu as cpu;
 pub use seismic_runtime::api::HostRegion;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
+pub use seismic_runtime::native::recorded_graph_device_bytes;
 mod slab;
 pub use seismic_runtime::devices::{
-    Availability, CapacityBasis, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
+    Availability, CapacityBasis, DISPLACEMENT_HISTORY, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,
     DeviceMemory, DeviceMemoryInfo, DeviceMemoryStatus, DeviceSelector, DeviceTopology,
     DiscoveryDiagnostic, DiscoveryError, DisplacementWindow, HeadroomBasis, HeadroomEstimate,
     HostDisplacement, HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility,
@@ -263,6 +271,13 @@ impl Device {
     pub fn tuning_identity(&self) -> String {
         self.inner.tuning_identity()
     }
+    /// Lend the device `workers` for the programs it forms off the calling
+    /// thread, or take them back (none): whoever owns a span of formation
+    /// on the device (a load's tuner) owns its threads. Without workers the
+    /// device forms in turn on the thread that asks.
+    pub fn staff(&self, workers: Option<Arc<Workers>>) {
+        self.inner.staff(workers)
+    }
     /// Whether this opened device forms Metal tensor operations (false on
     /// every other backend): what `DeviceInfo::forms_tensor_operations`
     /// answers before the device is opened.
@@ -301,6 +316,11 @@ impl Device {
             inner: seismic_runtime::native::graph::NativeGraphSequence::new(&self.inner),
         }
     }
+    /// How many native programs this device has formed (compiled, or loaded
+    /// from its artifact store), for checks that preparation forms nothing.
+    pub fn programs_formed(&self) -> usize {
+        self.inner.programs_formed()
+    }
     /// Seismic-owned charges and limits for this device and its pool.
     pub fn memory_usage(&self) -> MemoryUsage {
         self.inner.memory_usage()
@@ -308,6 +328,11 @@ impl Device {
     /// Enforce a requested allocation budget on this device's allocations.
     pub fn set_memory_limit(&self, limit: Option<u64>) {
         self.inner.set_memory_limit(limit)
+    }
+    /// Start [`MemoryUsage::high_water`] again from the current charge: the
+    /// next reading is the most charged since this call.
+    pub fn restart_memory_high_water(&self) {
+        self.inner.restart_memory_high_water()
     }
     /// Samples this device's backend memory observation.
     pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
@@ -335,6 +360,16 @@ impl fmt::Debug for Device {
 /// An element representation by registry identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Element(RepresentationId);
+
+/// The integer codes of a packed representation ([`Element::integer_codes`]):
+/// every code is a value in `min ..= max`, and `group` consecutive values
+/// along the packing axis share one scale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntegerCodes {
+    pub min: i32,
+    pub max: i32,
+    pub group: u64,
+}
 
 impl Element {
     /// The storage registered under a unique storage name (`q4k`,
@@ -372,6 +407,24 @@ impl Element {
                 Some(u64::from(layout.logical_group))
             }
         }
+    }
+    /// The integer codes of packed storage, as the registry decodes them:
+    /// the values a code takes and the columns that share one scale. `None`
+    /// for dense storage and for floating codes.
+    pub fn integer_codes(&self) -> Option<IntegerCodes> {
+        use seismic_lang::reference_math::ReferenceScalar;
+        use seismic_lang::registry::{DecodeComponent, QuantizedComponent};
+        let recipe = seismic_lang::registry::decode_recipe(self.0, DType::F32)?;
+        recipe.component(QuantizedComponent::Code)?;
+        let constant = |role| match recipe.component(role) {
+            Some(DecodeComponent::Constant(ReferenceScalar::I32(value))) => Some(value),
+            _ => None,
+        };
+        Some(IntegerCodes {
+            min: constant(QuantizedComponent::CodeMin)?,
+            max: constant(QuantizedComponent::CodeMax)?,
+            group: u64::try_from(constant(QuantizedComponent::GroupSize)?).ok()?,
+        })
     }
     /// Rows of one row tile of row-layout storage (`rows8`: 8); 1 for every
     /// other storage. A matrix view of tiled storage selects whole tiles, or
@@ -476,6 +529,11 @@ impl Element {
             seismic_lang::types::DType::U32,
         ))
     }
+    pub fn u64() -> Element {
+        Element(seismic_lang::registry::dense(
+            seismic_lang::types::DType::U64,
+        ))
+    }
     pub fn bool() -> Element {
         Element(seismic_lang::registry::dense(
             seismic_lang::types::DType::Bool,
@@ -514,6 +572,46 @@ impl BF16 {
     }
     pub const fn to_bits(self) -> u16 {
         self.0
+    }
+}
+
+pub use seismic_runtime::native::graph::NativeTimelinePort;
+pub use seismic_runtime::native::timeline::TimelineNode;
+
+/// A monotonic value one device's native work and the host both advance
+/// and wait on (`seismic_runtime::native::timeline`). A sealed graph's
+/// timeline node binds it per run: at a wait node (the host gate) the device
+/// runs nothing after it until the host has raised the timeline to the run's
+/// value; at a signal node the device raises it to the run's value once the
+/// work before has completed, its writes visible to the host.
+#[derive(Clone)]
+pub struct Timeline {
+    inner: Arc<seismic_runtime::native::timeline::TimelineInner>,
+}
+
+impl Timeline {
+    /// A timeline at 0 on `device`.
+    pub fn new(device: &Device) -> Result<Self, TensorError> {
+        seismic_runtime::native::timeline::TimelineInner::new(device.inner()).map(|inner| Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Raise the timeline to `value` from the host, after every host write
+    /// before it; a value it has reached already changes nothing.
+    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner.signal(value)
+    }
+
+    /// Whether the timeline has reached `value`.
+    pub fn reached(&self, value: u64) -> bool {
+        self.inner.reached(value)
+    }
+
+    /// Wait at most `timeout` for the timeline to reach `value`, after which
+    /// the host sees every device write before the signal; whether it did.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        self.inner.wait(value, timeout)
     }
 }
 
@@ -649,6 +747,46 @@ impl Tensor {
         .map(|inner| Tensor {
             inner: Arc::new(inner),
         })
+    }
+
+    /// A zero-filled tensor in storage the host writes and reads in place
+    /// while device work that uses it is queued or running (host-visible on
+    /// every backend, mapped pinned host memory on CUDA): the slots and the
+    /// directory of a table the host fills while steps that read it wait at
+    /// a gate (`Timeline`), or a notice the device writes for the host.
+    pub fn shared(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::shared(device.inner(), element.id(), extents)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+
+    /// Write `bytes` at `offset` bytes into this view without waiting for
+    /// device work that uses its storage.
+    ///
+    /// # Safety
+    /// The tensor was made by [`Tensor::shared`] (or is a view of one), and
+    /// no device work in flight reads or writes these bytes: what the device
+    /// reads after it, it reads after a gate the host opens once written.
+    pub unsafe fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<(), TensorError> {
+        // SAFETY: the caller upholds the contract.
+        unsafe { self.inner.write_shared(offset, bytes) }
+    }
+
+    /// Read `into.len()` bytes at `offset` bytes into this view without
+    /// waiting for device work that uses its storage.
+    ///
+    /// # Safety
+    /// The tensor was made by [`Tensor::shared`] (or is a view of one), and
+    /// no device work in flight writes these bytes: the device wrote them
+    /// before a signal the host waited for.
+    pub unsafe fn read_shared(&self, offset: u64, into: &mut [u8]) -> Result<(), TensorError> {
+        // SAFETY: the caller upholds the contract.
+        unsafe { self.inner.read_shared(offset, into) }
     }
 
     /// A zero-filled owned tensor.
@@ -1195,30 +1333,39 @@ impl NativeTensorBatchCompletion {
     }
 }
 
-/// The points of one native tuning unit, whose inputs are built on request.
+/// The points of one native tuning unit, whose inputs are built on request
+/// and held by the tuner only while its work uses them.
 pub trait PointSource<'a, E: Entry> {
+    /// The tuner gave up the inputs built for `point`: drop what the source
+    /// kept of them. A later [`PointSource::build`] builds them again.
+    fn release(&mut self, _point: usize) {}
     /// Every point, in ascending cost.
     fn points(&self) -> Vec<PointSpec>;
-    /// Build point `point`'s inputs, refusing before any step predicted not
-    /// to fit within `limit`.
-    fn build(
-        &mut self,
-        point: usize,
-        limit: std::time::Duration,
-    ) -> Result<PointInputs<'a>, PointUnavailable>;
+    /// The dimensions of calls the unit's configuration serves at shapes its
+    /// points' inputs do not take, each naming every dimension its launches
+    /// read: a configuration whose launches at any exceed the formed
+    /// functions' or the device's limits is excluded as it is formed.
+    fn served(&self) -> Vec<std::collections::BTreeMap<String, u64>> {
+        Vec::new()
+    }
+    /// Build point `point`'s inputs, or say why they cannot be built.
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String>;
 }
 
 impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S {
+    fn release(&mut self, point: usize) {
+        (**self).release(point);
+    }
     fn points(&self) -> Vec<PointSpec> {
         (**self).points()
     }
 
-    fn build(
-        &mut self,
-        point: usize,
-        limit: std::time::Duration,
-    ) -> Result<PointInputs<'a>, PointUnavailable> {
-        (**self).build(point, limit)
+    fn served(&self) -> Vec<std::collections::BTreeMap<String, u64>> {
+        (**self).served()
+    }
+
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String> {
+        (**self).build(point)
     }
 }
 
@@ -1226,121 +1373,258 @@ impl<'a, E: Entry, S: PointSource<'a, E> + ?Sized> PointSource<'a, E> for &mut S
 struct TypedPoints<'s, 'a, E: Entry>(&'s mut dyn PointSource<'a, E>);
 
 impl<'a, E: Entry> seismic_runtime::native::tune::PointSource<'a> for TypedPoints<'_, 'a, E> {
+    fn release(&mut self, point: usize) {
+        self.0.release(point);
+    }
     fn points(&self) -> Vec<PointSpec> {
         self.0.points()
     }
 
-    fn build(
-        &mut self,
-        point: usize,
-        limit: std::time::Duration,
-    ) -> Result<PointInputs<'a>, PointUnavailable> {
-        self.0.build(point, limit)
+    fn served(&self) -> Vec<std::collections::BTreeMap<String, u64>> {
+        self.0.served()
+    }
+
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String> {
+        self.0.build(point)
     }
 }
 
-/// The search of one native tuning unit of entry `E`, advanced in steps: a
-/// census, a start that measures the defaults and every form's start, any
-/// number of refinements, and a conclusion that confirms and validates the
-/// choice. A consumer tuning several units decides which the next time goes
-/// to; the steps of one unit together measure what one uninterrupted search
-/// measures.
+/// The tuning of one native unit of entry `E`, advanced one piece of work at
+/// a time. From [`NativeSearch::prepare_defaults`] on the unit holds a legal
+/// served choice with a complete record ([`NativeSearch::terminal`]);
+/// everything after is optional and can only replace that choice with a
+/// better one. A consumer tuning several units decides which unit's next
+/// piece ([`NativeSearch::next`]) is worth starting, and whether its whole
+/// price fits the budget left ([`Quote::fits`]); a piece begun
+/// ([`NativeSearch::perform`]) runs to its end.
 pub struct NativeSearch<'a, E: Entry> {
     inner: seismic_runtime::native::tune::UnitSearch<'static, 'a>,
     entry: std::marker::PhantomData<E>,
 }
 
+/// The compile of a unit's next piece of work ([`NativeSearch::forming`]).
+pub type Forming = seismic_runtime::native::tune::Forming<'static>;
+/// The compile of a unit's canonical program ([`NativeSearch::grounding`]).
+pub type Grounding = seismic_runtime::native::tune::Grounding<'static>;
+/// A cold compile of one of a unit's programs ([`NativeSearch::cold_compile`]).
+pub use seismic_runtime::native::tune::ColdCompile;
+
 impl<'a, E: Entry> NativeSearch<'a, E> {
-    /// Measure the defaults at the points every candidate must pass, within
-    /// the plan's limit. A result without configurations says they did not
-    /// fit: the unit keeps its defaults.
-    pub fn census(
+    /// The unit's mandatory work: form the declared canonical program and
+    /// hand it to serving, without building point inputs or observations.
+    pub fn prepare_defaults(
         &mut self,
         points: &mut dyn PointSource<'a, E>,
-        plan: CensusPlan,
-    ) -> Result<TuningResult, TuneError> {
-        self.inner.census(&mut TypedPoints(points), plan)
+    ) -> Result<(), TuneError> {
+        self.inner.prepare_defaults(&mut TypedPoints(points))
     }
 
-    /// Admit the further points the plan's admission covers, then measure
-    /// the defaults and every form's start, whatever the time.
-    pub fn start(
+    /// The compile of the mandatory work, to run on any thread; none once
+    /// the canonical program is formed. [`NativeSearch::grounded`] takes
+    /// what it formed and ends the mandatory work.
+    pub fn grounding(
         &mut self,
         points: &mut dyn PointSource<'a, E>,
-        plan: StartPlan,
-        until: std::time::Instant,
-    ) -> Result<Standing, TuneError> {
-        self.inner.start(&mut TypedPoints(points), plan, until)
+    ) -> Result<Option<Grounding>, TuneError> {
+        self.inner.grounding(&TypedPoints(points))
     }
 
-    /// Continue the search until `slice`, or until what remains before
-    /// `until` only covers concluding it.
-    pub fn refine(
+    pub fn grounded(&mut self, grounded: Grounded) -> Result<(), TuneError> {
+        self.inner.grounded(grounded)
+    }
+
+    /// The compile of the next piece of work ([`Work::forming`]), to run
+    /// ahead of it on any thread; none when the piece compiles nothing
+    /// ahead.
+    pub fn forming(&self) -> Option<Forming> {
+        self.inner.forming()
+    }
+
+    /// A cold compile of the largest program of the unit's canonical
+    /// default: what compiling one takes when nothing serves it.
+    pub fn cold_compile(&self) -> Option<ColdCompile> {
+        self.inner.cold_compile()
+    }
+
+    /// Give up what only running work needs: every point's inputs
+    /// (`points` drops what it built), the default's observations of them
+    /// and result storage; with no work left, the held programs too. The
+    /// served choice and the record stay, and work that follows builds the
+    /// inputs again, priced with that.
+    pub fn release(&mut self, points: &mut dyn PointSource<'a, E>) {
+        self.inner.release(&mut TypedPoints(points))
+    }
+
+    /// Offer the next piece with one challenger fewer; false when it has
+    /// no fewer to offer.
+    pub fn narrow(&mut self) -> bool {
+        self.inner.narrow()
+    }
+
+    /// Whether any of the unit's points has its inputs resident.
+    pub fn holds_inputs(&self) -> bool {
+        self.inner.holds_inputs()
+    }
+
+    /// What the unit's resident inputs hold, as making them resident was
+    /// observed to add.
+    pub fn held_inputs(&self) -> u64 {
+        self.inner.held_inputs()
+    }
+
+    /// How many programs the unit's search holds formed.
+    pub fn programs_held(&self) -> usize {
+        self.inner.programs_held()
+    }
+
+    /// What the unit's held programs hold, as forming them was observed to
+    /// add.
+    pub fn held_programs(&self) -> u64 {
+        self.inner.held_programs()
+    }
+
+    /// Give up the programs the unit's search holds; a piece that follows
+    /// forms what it runs again, priced with that.
+    pub fn give_up_programs(&mut self) {
+        self.inner.give_up_programs()
+    }
+
+    /// The most a single piece of the unit's work has added to the bytes
+    /// held: what an unpriced footprint is held to.
+    pub fn largest_footprint(&self) -> u64 {
+        self.inner.largest_footprint()
+    }
+
+    /// Hold what the next piece's compile formed. Returns what the
+    /// compile took.
+    pub fn formed(&mut self, formed: Formed) -> Result<std::time::Duration, TuneError> {
+        self.inner.formed(formed)
+    }
+
+    /// How the unit's optional work measures and searches.
+    pub fn plan(&mut self, plan: UnitPlan) {
+        self.inner.plan(plan)
+    }
+
+    /// The unit's complete record as it stands.
+    pub fn terminal(&self) -> Result<TuningResult, TuneError> {
+        self.inner.terminal()
+    }
+
+    /// The unit's next piece of work with its whole price; none when it
+    /// has none left.
+    pub fn next(&self) -> Option<Work> {
+        self.inner.next()
+    }
+
+    /// Run optional work before the consumer's cutoff. None is for an
+    /// explicitly unbounded caller, such as a kernel survey or test.
+    pub fn perform(
         &mut self,
-        slice: std::time::Instant,
-        until: std::time::Instant,
-    ) -> Result<Standing, TuneError> {
-        self.inner.refine(slice, until)
-    }
-
-    /// What concluding the search will take.
-    pub fn reserve(&self) -> std::time::Duration {
-        self.inner.reserve()
-    }
-
-    /// Confirm the finalists found so far and validate the choice at the
-    /// points not timed; `allowance` is the time the unit was given, for
-    /// the record.
-    pub fn conclude(
-        self,
         points: &mut dyn PointSource<'a, E>,
-        until: std::time::Instant,
-        allowance: std::time::Duration,
-    ) -> Result<TuningResult, TuneError> {
-        self.inner
-            .conclude(&mut TypedPoints(points), until, allowance)
+        before: Option<std::time::Instant>,
+    ) -> Result<Performed, TuneError> {
+        self.inner.perform(&mut TypedPoints(points), before)
+    }
+
+    /// The longest single operation the unit has completed.
+    pub fn longest_operation(&self) -> std::time::Duration {
+        self.inner.longest_operation()
+    }
+
+    /// The price of [`NativeSearch::publish_artifact`]: of the served
+    /// choice as it stands, or, `worked`, as it
+    /// stands once the unit's next piece has run. Nothing where the store
+    /// keeps the choice's programs as a load requests them.
+    pub fn artifact_owed(&self, worked: bool) -> Quote {
+        self.inner.artifact_owed(worked)
+    }
+
+    /// What [`NativeSearch::publish_artifact`] does, known before it runs:
+    /// what a load's publications are
+    /// observed against.
+    pub fn artifact_publication(&self, worked: bool) -> Publication {
+        self.inner.artifact_publication(worked)
+    }
+
+    /// What building the inputs the unit holds took: what giving them up
+    /// is held to before the load has observed inputs given up.
+    pub fn inputs_built(&self) -> Quote {
+        self.inner.inputs_built()
+    }
+
+    /// Publish the serving artifact of the unit's served choice: form its
+    /// programs exactly as a load requests them and release them. Returns
+    /// what it took.
+    pub fn publish_artifact(&mut self) -> Result<std::time::Duration, TuneError> {
+        self.inner.publish_artifact()
+    }
+
+    /// The defaults' measurements at the points discovered so far.
+    pub fn service_measurements(&self) -> Vec<PointMeasurement> {
+        self.inner.service_measurements()
+    }
+
+    /// Weigh the unit's points by `weights`, in the order its source gave
+    /// them, before anything of its search is measured against the weights
+    /// it opened with ([`UnitSearch::reweigh`]). False once it has.
+    pub fn reweigh(&mut self, weights: &[f64]) -> bool {
+        self.inner.reweigh(weights)
+    }
+
+    /// Whether the unit's defaults are measured at every discovery point.
+    pub fn discovered(&self) -> bool {
+        self.inner.discovered()
+    }
+
+    /// Where the unit's tuning stands.
+    pub fn standing(&self) -> Standing {
+        self.inner.standing()
     }
 }
 
-/// `rotation`, with `initialize` and `written`, as a point's inputs.
+/// Complete numerical `rotation`, its declared performance `workload`, and
+/// state initialization/observation as a point's inputs.
 pub fn point_inputs<'a, E: Entry>(
     rotation: Vec<E::Args<'_>>,
+    workload: WorkloadRotation,
     initialize: Option<TuningInitializer<'a>>,
-    written: std::collections::BTreeMap<String, std::ops::Range<u64>>,
+    written: std::collections::BTreeMap<String, WrittenRows>,
 ) -> PointInputs<'a> {
     PointInputs {
         rotation: rotation.into_iter().map(E::encode).collect(),
+        workload,
         initialize,
         written,
     }
 }
 
 /// One workload for native tuning with its inputs built up front: argument
-/// sets used for both measurement and numerical validation, and the point's
-/// share of the objective.
+/// sets forming its full numerical contract, an explicit performance workload,
+/// and the point's invocation demand. Built up front, its inputs are handed
+/// over once: a tuner that gave them up cannot have them built again.
 pub struct TuningPoint<'a, E: Entry> {
     pub label: String,
     pub weight: f64,
-    /// Points naming the same class are variants of one workload (the same
-    /// rows at different history lengths): they split their summed weight by
-    /// the defaults' real time at each. `None`: a class of its own.
+    /// Served-region identity for keyed reuse and discovery; it does not
+    /// independently normalize the expected elapsed-service objective.
     pub class: Option<String>,
     /// The point's cost relative to the unit's other points: points come in
     /// ascending cost, and the tuner predicts a point's time from the
     /// previous one's by the ratio of their costs.
     pub cost: f64,
-    /// A candidate may be chosen only if it was validated here.
-    pub required: bool,
     pub rotation: Vec<E::Args<'a>>,
+    /// Performance invocations selected from the full numerical witness vector.
+    pub workload: WorkloadRotation,
     /// Required when the entry has `&mut` parameters: restores every writable
     /// tensor in every rotation. The caller owns the pristine bytes; the tuner
     /// invokes this initializer before reference and validation executions.
     /// Timed passes after a candidate's validated invocation run without it.
     pub initialize: Option<TuningInitializer<'a>>,
-    /// The leading-axis rows each named `&mut` parameter's entry writes:
-    /// validation observes exactly those rows. A `&mut` parameter absent
-    /// here is observed whole.
-    pub written: std::collections::BTreeMap<String, std::ops::Range<u64>>,
+    /// The leading-axis rows each named `&mut` parameter's entry writes. A
+    /// `&mut` parameter absent here is observed whole, as written
+    /// everywhere.
+    pub written: std::collections::BTreeMap<String, WrittenRows>,
 }
 
 impl<'a, E: Entry> PointSource<'a, E> for Vec<TuningPoint<'a, E>> {
@@ -1351,20 +1635,22 @@ impl<'a, E: Entry> PointSource<'a, E> for Vec<TuningPoint<'a, E>> {
                 weight: point.weight,
                 class: point.class.clone(),
                 cost: point.cost,
-                required: point.required,
-                census: point.required,
+                census: point.weight > 0.0,
             })
             .collect()
     }
 
-    fn build(
-        &mut self,
-        point: usize,
-        _limit: std::time::Duration,
-    ) -> Result<PointInputs<'a>, PointUnavailable> {
+    fn build(&mut self, point: usize) -> Result<PointInputs<'a>, String> {
         let point = &mut self[point];
+        if point.rotation.is_empty() {
+            return Err(format!(
+                "the inputs of `{}` were built up front and handed over already",
+                point.label
+            ));
+        }
         Ok(point_inputs::<E>(
             std::mem::take(&mut point.rotation),
+            point.workload.clone(),
             point.initialize.take(),
             std::mem::take(&mut point.written),
         ))
@@ -1549,7 +1835,8 @@ impl fmt::Display for KernelDomainViolation {
 
 impl std::error::Error for NativeGraphMetadataError {}
 
-pub use seismic_runtime::native::graph::NativeGraphStorageBytes;
+pub use generated::forget_evaluated_entry_shapes;
+pub use seismic_runtime::native::graph::{HostHeap, NativeGraphStorageBytes};
 
 #[derive(Clone)]
 pub struct NativeGraphLayout {
@@ -1557,6 +1844,20 @@ pub struct NativeGraphLayout {
 }
 
 impl NativeGraphLayout {
+    /// The host heap of each plan sealed into this layout, known from the
+    /// layout's topology before any plan is sealed
+    /// (`NativeGraphPlan::host_heap` is what a sealed plan holds).
+    pub fn plan_heap(&self) -> HostHeap {
+        self.inner.plan_heap()
+    }
+
+    /// The host heap of one static binding of a plan sealed into this
+    /// layout, known before any plan is sealed or bound
+    /// (`BoundNativeGraphPlan::host_heap` is what a binding holds).
+    pub fn bound_heap(&self) -> HostHeap {
+        self.inner.bound_heap()
+    }
+
     pub fn storage_bytes(&self) -> NativeGraphStorageBytes {
         self.inner.storage_bytes()
     }
@@ -1803,9 +2104,11 @@ impl NativeGraphResourceTemplate {
                                 })
                                 .map_err(|error| format!("scratch `{}`: {error}", buffer.name))
                         })
-                        .map(|bytes| seismic_runtime::native::ScratchNeed {
-                            bytes,
-                            sync: buffer.sync,
+                        .map(|bytes| {
+                            seismic_runtime::native::ScratchNeed {
+                                bytes,
+                                sync: buffer.sync,
+                            }
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?,
@@ -1933,7 +2236,12 @@ impl fmt::Display for KernelRequest {
             .map(|(name, value)| format!("{name}={value}"))
             .collect::<Vec<_>>()
             .join(",");
-        write!(f, "{} `{}` [{elements}] {{{statics}}}", self.backend.as_str(), self.entry)
+        write!(
+            f,
+            "{} `{}` [{elements}] {{{statics}}}",
+            self.backend.as_str(),
+            self.entry
+        )
     }
 }
 
@@ -1946,6 +2254,39 @@ pub struct BoundEntry<E> {
 }
 
 impl<E: Entry> BoundEntry<E> {
+    /// Every element parameter of the entry with the element it is bound
+    /// to: with the entry and its static values, what the entry's native
+    /// implementation on a device is a function of.
+    pub fn elements(&self) -> &[(&'static str, Element)] {
+        &self.elements
+    }
+
+    /// The element the entry's element parameter `name` is bound to.
+    pub fn element(&self, name: &str) -> Option<Element> {
+        self.elements
+            .iter()
+            .find(|(bound, _)| *bound == name)
+            .map(|(_, element)| *element)
+    }
+
+    /// The default specialization at `statics` as `device` offers this entry.
+    pub fn default_specialization(
+        &self,
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
+        generated::native_default_specialization::<E>(device, statics)
+    }
+
+    /// Validate a stored choice for this entry's actual element bindings.
+    pub fn specialization_valid(
+        &self,
+        device: &Device,
+        specialization: &NativeSpecialization,
+    ) -> Result<bool, CheckedBundleError> {
+        generated::native_specialization_valid::<E>(device, specialization)
+    }
+
     pub fn prepare(
         &self,
         device: &Device,
@@ -2025,6 +2366,12 @@ impl NativeGraphMetadata {
     /// The backend whose native declarations the graph checks.
     pub fn backend(&self) -> BackendName {
         self.backend
+    }
+
+    /// A timeline node after every node enqueued so far
+    /// (`NativeGraph::timeline`).
+    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        self.inner.timeline(node)
     }
 
     /// Tag following checked ports and nodes with a semantic class extent
@@ -2193,7 +2540,7 @@ impl NativeGraphMetadata {
                 return Err(NativeGraphMetadataError::Unsupported(format!(
                     "`{}`: {error}",
                     E::NAME
-                )))
+                )));
             }
         }
         let scratch = checked_native_scratch_bound(
@@ -2214,7 +2561,13 @@ impl NativeGraphMetadata {
             .collect();
         let pending = self
             .inner
-            .enqueue(E::encode_workflow(args), parameter_shapes, shapes, scratch)
+            .enqueue(
+                E::encode_workflow(args),
+                parameter_shapes,
+                shapes,
+                scratch,
+                checked.sealed_node().clone(),
+            )
             .map_err(NativeGraphMetadataError::Call)?;
         if let Some(template) = &mut self.template {
             template.nodes.push(MetadataNodeSource {
@@ -2231,6 +2584,12 @@ impl NativeGraphMetadata {
         self.inner
             .export(result.inner)
             .map_err(NativeGraphMetadataError::Workflow)
+    }
+
+    /// The host heap of the plan this exact topology seals to, from the
+    /// lengths its entries' schemas and declarations fix.
+    pub fn plan_heap(&self) -> HostHeap {
+        self.inner.plan_heap()
     }
 
     pub fn seal(self) -> Result<NativeGraphStorageBytes, NativeGraphMetadataError> {
@@ -2280,6 +2639,13 @@ impl NativePort {
 }
 
 impl NativeGraph {
+    /// A timeline node after every node enqueued so far: a host gate the
+    /// device waits at, or a signal the host waits for (`Timeline`). Each
+    /// run binds it (`NativeGraphBindings::set_timeline`).
+    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        self.inner.timeline(node)
+    }
+
     /// Declare an external tensor descriptor from model metadata. Sealing
     /// checks each use against its generated Seismic entry contract.
     pub fn port(&mut self, element: Element, extents: &[u64]) -> Result<NativePort, TensorError> {
@@ -2363,6 +2729,14 @@ pub struct NativeGraphPlan {
 }
 
 impl NativeGraphPlan {
+    /// The host heap this sealed plan holds, at its vectors' capacities.
+    pub fn host_heap(&self) -> HostHeap {
+        self.inner.host_heap()
+    }
+    /// The bytes of `host_heap`.
+    pub fn host_bytes(&self) -> u64 {
+        self.inner.host_bytes()
+    }
     pub fn workspace_bytes(&self) -> u64 {
         self.inner.workspace_bytes()
     }
@@ -2424,6 +2798,11 @@ impl BoundNativeGraphPlan {
         NativeGraphBindings {
             inner: self.inner.bindings(),
         }
+    }
+
+    /// The host heap this binding holds, at its vectors' capacities.
+    pub fn host_heap(&self) -> HostHeap {
+        self.inner.host_heap()
     }
 }
 
@@ -2538,6 +2917,19 @@ pub struct NativeGraphBindings {
 impl NativeGraphBindings {
     pub fn set(&mut self, port: &NativePort, tensor: &Tensor) -> Result<(), WorkflowError> {
         self.inner.set(port.inner, tensor.inner.clone())
+    }
+
+    /// Bind timeline node `port` to `timeline` at `value` for this run: a
+    /// gate waits until the timeline reaches the value, a signal raises it
+    /// to the value.
+    pub fn set_timeline(
+        &mut self,
+        port: NativeTimelinePort,
+        timeline: &Timeline,
+        value: u64,
+    ) -> Result<(), WorkflowError> {
+        self.inner
+            .set_timeline(port, timeline.inner.clone(), value)
     }
 
     /// Bind an unsubmitted exported output lease as a graph destination.
@@ -2807,6 +3199,17 @@ impl<E: Entry> NativeKernel<E> {
         self.inner.specialization()
     }
 
+    /// Check the launches of a call whose dimensions are `dimensions`
+    /// against the formed functions and the device limits, as a call's are
+    /// checked from its arguments: whether the kernel serves a shape no
+    /// argument set at hand takes.
+    pub fn admits(
+        &self,
+        dimensions: &std::collections::BTreeMap<String, u64>,
+    ) -> Result<(), CallError> {
+        self.inner.admits(dimensions)
+    }
+
     /// What was formed: backend, bindings, specialization, source digest
     /// and toolchain.
     pub fn artifact(&self) -> &NativeArtifactIdentity {
@@ -2910,6 +3313,31 @@ pub mod generated {
 
     const LOGICAL_ENTRY_CACHE_CAPACITY: usize = 64;
 
+    /// The compiled shapes every module of the process retains in its
+    /// cache: each memoizes the shapes it has evaluated
+    /// (`CompiledEntryShapes::forget_evaluated`).
+    static RETAINED_ENTRY_SHAPES: std::sync::Mutex<
+        Vec<std::sync::Weak<seismic_lang::entry::CompiledEntryShapes>>,
+    > = std::sync::Mutex::new(Vec::new());
+
+    /// Forget the shapes the process's checked entries have evaluated for
+    /// graph metadata, and return how many there were. Checking a graph
+    /// family evaluates each entry's shapes at every class and keeps them,
+    /// so that its classes and the families after it do not evaluate them
+    /// again; once those are built the kept shapes serve nothing until
+    /// another family is checked, which evaluates what it needs anew.
+    pub fn forget_evaluated_entry_shapes() -> usize {
+        let mut retained = RETAINED_ENTRY_SHAPES
+            .lock()
+            .expect("retained entry shapes poisoned");
+        retained.retain(|shapes| shapes.strong_count() > 0);
+        retained
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .map(|shapes| shapes.forget_evaluated())
+            .sum()
+    }
+
     /// Opaque proof that a generated entry name resolved in its own checked
     /// module. Generated code can pass it back to Seismic, but consumers
     /// never observe or fabricate compiler entry identifiers.
@@ -3008,7 +3436,14 @@ pub mod generated {
                 .map(|item| item.compiled_shapes.clone());
             Ok(match cell {
                 Some(cell) => cell
-                    .get_or_init(|| Arc::new(logical.compile_tensor_shapes()))
+                    .get_or_init(|| {
+                        let shapes = Arc::new(logical.compile_tensor_shapes());
+                        RETAINED_ENTRY_SHAPES
+                            .lock()
+                            .expect("retained entry shapes poisoned")
+                            .push(Arc::downgrade(&shapes));
+                        shapes
+                    })
                     .clone(),
                 None => Arc::new(logical.compile_tensor_shapes()),
             })
@@ -3026,7 +3461,7 @@ pub mod generated {
     #[cfg(test)]
     mod logical_entry_cache_tests {
         use super::*;
-        use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+        use seismic_lang::checked::{SourceFile, SourceSet, check_source};
 
         #[test]
         fn reuses_one_semantic_entry_per_element_binding() {
@@ -3302,6 +3737,8 @@ pub mod generated {
     pub struct NativeGraphCheckedEntry {
         shapes: Arc<seismic_lang::entry::CompiledEntryShapes>,
         implementation: NativeImplementation,
+        /// The lengths of the vectors a sealed node calling the entry holds.
+        sealed_node: seismic_runtime::native::graph::SealedNodeShape,
     }
 
     impl NativeGraphCheckedEntry {
@@ -3322,19 +3759,31 @@ pub mod generated {
                     backend.as_str()
                 )));
             };
-            let shapes = match module.compiled_entry_shapes(entry.id(), &element_bindings(elements))
-            {
+            let bindings = element_bindings(elements);
+            let shapes = match module.compiled_entry_shapes(entry.id(), &bindings) {
                 Ok(shapes) => shapes,
+                Err(error) => return Ok(Err(error.to_string())),
+            };
+            let sealed_node = match module.logical_entry(entry.id(), &bindings) {
+                Ok(logical) => seismic_runtime::native::graph::SealedNodeShape::of(
+                    logical.schema(),
+                    &implementation,
+                ),
                 Err(error) => return Ok(Err(error.to_string())),
             };
             Ok(Ok(Self {
                 shapes,
                 implementation,
+                sealed_node,
             }))
         }
 
         pub fn implementation(&self) -> &NativeImplementation {
             &self.implementation
+        }
+
+        pub(crate) fn sealed_node(&self) -> &seismic_runtime::native::graph::SealedNodeShape {
+            &self.sealed_node
         }
 
         /// The identity of the entry and element bindings this contract
@@ -3624,6 +4073,24 @@ pub mod generated {
         native_implementation_for_backend::<E>(device.backend())
     }
 
+    /// The entry's default specialization at `statics` as the opened device
+    /// offers its implementation, including Seismic-owned CPU workers and ISA
+    /// tier. `None` when the backend has no implementation or nothing is
+    /// admissible at `statics`.
+    pub fn native_default_specialization<E: Entry>(
+        device: &Device,
+        statics: &NativeSpecialization,
+    ) -> Result<Option<NativeSpecialization>, CheckedBundleError> {
+        let module = E::module()?;
+        let entry = E::resolve(module)?;
+        Ok(seismic_runtime::native::default_specialization(
+            device.inner(),
+            module.checked(),
+            entry.id(),
+            statics,
+        ))
+    }
+
     /// Validate a stored native choice against the opened device's complete
     /// parameter domain, including Seismic-owned CPU workers and ISA tier.
     pub fn native_specialization_valid<E: Entry>(
@@ -3638,26 +4105,6 @@ pub mod generated {
             entry.id(),
             specialization,
         ))
-    }
-
-    /// The error classes the entry's implementation for `device`'s backend
-    /// declares, in declaration order.
-    pub fn native_error_classes<E: Entry>(
-        device: &Device,
-    ) -> Result<Vec<String>, CheckedBundleError> {
-        let module = E::module()?;
-        let entry = E::resolve(module)?;
-        Ok(module
-            .checked()
-            .native_implementation(entry.id(), device.backend())
-            .map(|implementation| {
-                implementation
-                    .error_classes
-                    .iter()
-                    .map(|class| class.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default())
     }
 
     /// Digest of the entry's implementation for `device`'s backend at these
@@ -3681,58 +4128,14 @@ pub mod generated {
         )
     }
 
-    /// Floating result/state subjects of the checked entry, after element substitution.
-    pub fn native_numerical_subjects<E: Entry>(
-        elements: &[(&str, Element)],
-    ) -> Result<Vec<(String, DType)>, TuneError> {
-        use seismic_compiler::numerics::{input_subject, result_subject};
-        use seismic_lang::entry::{ParameterKind, ResultKind, TensorAccess};
-        use seismic_lang::registry::{representation_info, RepresentationKind};
-        let module = E::module().map_err(|e| TuneError::Declaration(e.to_string()))?;
-        let entry = E::resolve(module).map_err(|e| TuneError::Declaration(e.to_string()))?;
-        let logical = module
-            .logical_entry(entry.id(), &element_bindings(elements))
-            .map_err(|e| TuneError::Declaration(e.to_string()))?;
-        let dense = |representation| match representation_info(representation).kind {
-            RepresentationKind::Dense(dtype) => Some(dtype),
-            _ => None,
-        };
-        let mut subjects = Vec::new();
-        for result in logical.schema().results() {
-            let dtype = match result.kind {
-                ResultKind::Tensor { representation, .. } => dense(representation),
-                ResultKind::Scalar(dtype) => Some(dtype),
-                _ => None,
-            };
-            if let Some(dtype @ (DType::F32 | DType::F16 | DType::BF16)) = dtype {
-                subjects.push((result_subject(&result.path), dtype));
-            }
-        }
-        for (ordinal, parameter) in logical.schema().parameters().iter().enumerate() {
-            if let ParameterKind::Tensor {
-                representation,
-                access: TensorAccess::Mutable | TensorAccess::Owned,
-                ..
-            } = parameter.kind
-            {
-                if let Some(dtype @ (DType::F32 | DType::F16 | DType::BF16)) = dense(representation)
-                {
-                    subjects.push((input_subject(ordinal), dtype));
-                }
-            }
-        }
-        Ok(subjects)
-    }
-
     pub fn tune_native<E: Entry>(
         device: &Device,
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
         points: &mut dyn PointSource<'_, E>,
-        validation: impl Into<TuningPrecision>,
+        validation: NumericalRequirement,
         strategy: Strategy,
-        reference: TuningReference,
     ) -> Result<TuningResult, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
@@ -3745,9 +4148,8 @@ pub mod generated {
             statics: statics.clone(),
             cpu,
             points: &mut TypedPoints(points),
-            validation: validation.into(),
+            validation,
             strategy,
-            reference,
         })
     }
 
@@ -3757,8 +4159,7 @@ pub mod generated {
         statics: &NativeSpecialization,
         elements: &[(&str, Element)],
         cpu: Option<&'static native_cpu::CpuNativeKernels>,
-        validation: impl Into<TuningPrecision>,
-        reference: TuningReference,
+        validation: NumericalRequirement,
     ) -> Result<NativeSearch<'a, E>, TuneError> {
         let module = E::module().map_err(|error| TuneError::Declaration(error.to_string()))?;
         let entry =
@@ -3772,8 +4173,7 @@ pub mod generated {
                     bindings: element_bindings(elements),
                     statics: statics.clone(),
                     cpu,
-                    validation: validation.into(),
-                    reference,
+                    validation,
                 },
             )?,
             entry: std::marker::PhantomData,

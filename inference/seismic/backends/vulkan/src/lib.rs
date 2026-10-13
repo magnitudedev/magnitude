@@ -24,14 +24,31 @@ pub use facts::{
 pub use instance::LoaderError;
 pub use memory::Buffer;
 
-/// Enumerate the physical devices: no logical device is created. GPUs come
-/// first, so the first device of the backend is a GPU when there is one.
+/// Enumerate the physical devices against the whole floor, so a device
+/// discovery reports available opens: one meeting the static floor whose
+/// numerics only a probe establishes is opened briefly, once per process,
+/// to run it (`device::numerical_floor`). A device meeting the static floor
+/// reports its heap budget. GPUs come first, so the first device of the
+/// backend is a GPU when there is one.
 pub fn discover() -> Result<Vec<Description>, LoaderError> {
     let instance = instance::instance()?;
     let mut descriptions = instance
         .physical_devices()?
         .into_iter()
-        .map(|physical| facts::describe(instance, physical))
+        .map(|physical| {
+            let mut description = facts::describe(instance, physical);
+            if description.floor.is_ok() {
+                description.heap_budget_bytes =
+                    Some(device::memory_budget(instance, physical).heap_budget_bytes);
+                description.floor = device::numerical_floor(instance, physical, &description.facts)
+                    .map_err(|error| {
+                        error.floor_reason().unwrap_or_else(|| {
+                            format!("its numerical probes could not run: {error}")
+                        })
+                    });
+            }
+            description
+        })
         .collect::<Vec<_>>();
     descriptions.sort_by_key(|description| !description.facts.is_gpu());
     Ok(descriptions)
@@ -41,8 +58,9 @@ pub fn discover() -> Result<Vec<Description>, LoaderError> {
 mod tests {
     use super::*;
 
-    /// Every device meeting the discovery floor opens, or fails only the
-    /// multiply-add probe (lavapipe); storage round-trips through host
+    /// Every device discovery reports available opens, and one it reports
+    /// unavailable (below the static floor, or failing a numerical probe)
+    /// fails to open for the same reason; storage round-trips through host
     /// writes and reads.
     #[test]
     fn devices_meeting_the_floor_open_and_round_trip_storage() {
@@ -68,18 +86,20 @@ mod tests {
                 description.facts.shader_fma,
                 facts::hex(&description.facts.uuid)
             );
-            if description.floor.is_err() {
+            if let Err(reason) = &description.floor {
+                let error = Device::open(description.facts.uuid)
+                    .err()
+                    .expect("a device discovery reports unavailable does not open");
+                eprintln!("  {error}");
+                if let Some(open_reason) = error.floor_reason() {
+                    assert_eq!(&open_reason, reason);
+                }
                 continue;
             }
-            let device = match Device::open(description.facts.uuid) {
-                Ok(device) => device,
-                Err(error @ (OpenError::MultiplyAdd { .. } | OpenError::Rounding { .. })) => {
-                    eprintln!("  {error}");
-                    continue;
-                }
-                Err(error) => panic!("a device meeting the floor opens: {error}"),
-            };
-            let buffer = device.allocate(1 << 20, 256).expect("allocation");
+            let device = Device::open(description.facts.uuid).unwrap_or_else(|error| {
+                panic!("a device discovery reports available opens: {error}")
+            });
+            let buffer = device.allocate(1 << 20, 256, None).expect("allocation");
             let bytes = (0..1u32 << 18)
                 .flat_map(|word| word.to_le_bytes())
                 .collect::<Vec<_>>();

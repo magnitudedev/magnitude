@@ -237,7 +237,9 @@ impl DirectModule {
         let info = vk::ComputePipelineCreateInfo::default()
             .stage(stage)
             .layout(inner.layout);
-        let created = unsafe { device.create_compute_pipelines(inner.cache, &[info], None) };
+        let created = inner.measured(|| unsafe {
+            device.create_compute_pipelines(inner.cache, &[info], None)
+        });
         unsafe { device.destroy_shader_module(shader, None) };
         created.map(|pipelines| pipelines[0]).map_err(|(_, error)| {
             toolchain(format!(

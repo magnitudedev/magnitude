@@ -35,4 +35,14 @@ __device__ __forceinline__ float softcap(float cap, float z) {
     return cap * (2.0f / (1.0f + expf(-2.0f * z / cap)) - 1.0f);
 }
 
+// A gated delta net's output gate on z, by the code the entries take
+// (`gate_function: i32`): 0 SiLU, 1 sigmoid.
+constexpr int gate_sigmoid = 1;
+
+__device__ __forceinline__ float output_gate(int function, float z) {
+    if (function == gate_sigmoid)
+        return 1.0f / (1.0f + expf(-z));
+    return z / (1.0f + expf(-z));
+}
+
 } // namespace functions

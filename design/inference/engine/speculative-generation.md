@@ -61,17 +61,40 @@ and state-repair forwards must also be exposed as operations, rather than hidden
 inside otherwise synchronous callbacks. The dispatcher is the sole submitter of
 model work and returns each operation's result to its owning continuation.
 
-A target-conditioned drafter (the model's own draft head or a separate draft)
-enters prompt history as part of each prompt chunk's operation, not as method
-work after it: the prompt knows every token, so a chunk's entry pairs each
-following prompt token with the chunk row before it. The executor runs that
-entry on the device right behind the chunk, in the drafter's form (a draft
-head's entry pass over its history, a separate draft's injection), reading the
-chunk's own feature output, and commits it with the chunk; prefill waits on no
-host feature read and schedules no separate drafter flight. A prompt chunk
-whose successor is already known is queued behind the in-flight chunk, entry
-included. Method-owned drafter entries remain for replayed or resumed history
-and for rows whose successor token is sampled.
+A target-conditioned drafter enters prompt history as part of each prompt chunk's
+operation. A successor-dependent head pairs each target feature with the token
+following it, entering only pairs whose tokens lie inside the consumed prefix.
+At target position N its head is at N−1 with the final feature still open. The
+executor retains that feature in one independently charged device row; generation
+records the obligation without owning its device lifetime. The next chunk enters
+that row with its first token, followed by the chunk's complete pairs, as one
+ordered device entry. A first one-token chunk captures the open row without a head
+advance. A feature-only separate draft can enter all rows immediately.
+
+A head that reads the target's history (an assistant drafter) keeps none and is
+never primed. Its position is the target's, which only committed target rows
+move. Only the chunk closing the prompt (the one selecting or forcing the first
+token) demands its final target feature; each verification supplies its last
+accepted row's. A draft is one transaction of the anchor alone at the anchor's
+target position, conditioned on the feature that selected it; the executor
+chains proposals over the target's committed history and writes nothing. Its
+checkpoint is that position alone: a resumed request always computes at least
+its closing row. Replay enters nothing, so the replayed anchor's round decodes
+plainly and its feature resumes drafting.
+
+Media rows enter the target from the projector under placeholder tokens. A
+drafter whose history embeds every prompt token cannot represent them, and
+generation refuses that drafter for a request with media spans rather than
+embedding placeholders. A reading head sees media rows only through the
+target's history; a feature-only separate draft sees only their target features.
+
+The executor queues entry directly behind its target chunk and commits them
+together. Queued lookahead uses its predecessor's new boundary row, including
+before the host observes that predecessor. No continuing prompt chunk requires a
+host feature read or retains a whole graph-output arena in a prefix. Host method
+entries remain for replay and rows whose successor is sampled. Exporting a
+checkpoint removes the sampled successor from the final pending pair, retaining
+its open feature so a restored request supplies its own successor token.
 
 Yielding an operation transfers submission responsibility, not ownership of the
 request's unresolved state. The round owns its advances through resolution or
@@ -121,6 +144,14 @@ drafter's next use. Checkpoints include that obligation, target state, method
 state, and compatibility identity. Restoring target KV alone is insufficient
 when a drafter requires missing hidden states; the method must reseed/replay or
 decline that checkpoint.
+
+A request eligible for prefix reuse keeps each intermediate drafter history
+complete for a continuation at that boundary. A later peer may introduce a
+branch after prefill has started, so the original request's eventual draft
+position cannot justify omitting history from a reusable prefix. Requests that
+do not contribute reusable prefixes may omit window rows their own first draft
+cannot read. The scheduler declares reuse eligibility before residency;
+generation carries that constraint into device and transaction priming alike.
 
 Publication follows successful target and method reconciliation. Arrays, cache
 storage, streamed weights, and other borrowed resources remain leased until
@@ -246,3 +277,103 @@ and concurrent load. Batching can reduce the spare compute that speculation
 uses. Efficient execution of the chosen composition is required; universal
 speedup from a particular drafter is not assumed. Adaptive proposal width, if
 selected, belongs to the generation method and remains explicit and measurable.
+
+
+## Shared draft budgeting
+
+A round's draft budget is a pair: the proposals the drafter generates and the
+prefix of them offered to target verification. The verified count cannot exceed
+the generated count. Counts exclude the anchor and the target's bonus token. MTP
+and separate drafters share one budget mechanism; the method implements proposal
+execution and state reconciliation, and the scheduler reports launch durations
+without branching on the drafting algorithm.
+
+A load's draft policy is fixed or adaptive. A drafter given neither a width nor
+a budget is adaptive over every width it has: all a separate drafter's block
+holds, or all a draft head chains. An explicit width alone is that fixed width.
+
+### Fixed
+
+Every round takes one configured budget. A round whose grant cannot hold the
+generated count runs plain; it does not invent a smaller block. The load prepares
+exactly that generated count.
+
+### Adaptive
+
+Each round's budget is chosen from measurements of the load's own rounds.
+
+**Widths.** Launch rows round up to a row class, so a verification that does not
+fill its class pays for rows it does not use. The candidate widths are those whose
+verification (the proposals and their anchor) fills a class, the method's widest
+width, and none. Both counts of a budget are taken from them. The load prepares
+every candidate generated count before readiness and counts them in assessment and
+memory admission; the tuner's workload lists their launches as alternatives of
+one method. A round near the end of a request takes the widest candidate that
+fits the tokens it may still produce.
+
+**Acceptance.** Acceptance is equality with the target's selection, and the
+selection at a position is a function of the request's seed, the position and the
+logits. So the proposals a full verification would have accepted are those that
+agree with the tokens the request goes on to commit. Every drafted proposal is
+scored against them, verified or not, at no device cost, under sampling as under
+greedy selection. The controller keeps, per request, how often a block is right
+through each depth: the mean of the depth's recent blocks, never above a
+shallower depth's. A request starts from the load's latest values.
+
+A block's proposals depend on how many were generated, because bidirectional
+drafter layers see the whole block. Acceptance is nevertheless kept by depth
+alone, and corrected by the rounds that follow any change of generated count.
+
+**Costs.** The load keeps the measured duration of each drafter launch by
+generated count and each target launch by rows, per context class and per number
+of requests sharing the launch. Nothing is forecast. A launch not yet measured
+costs at least what a smaller one measured, and at least what the same launch
+measured at a shorter context; a larger launch proves nothing about a smaller
+one. With nothing measured every width costs the same.
+
+**Choice.** Expected tokens are one plus the acceptance of each verified depth;
+a round's time is its two launches. Three rules:
+
+1. The round takes the budget committing the most tokens per second. Once its
+   block is drafted, it verifies the prefix that does so with the drafter's
+   launch already paid. Of equal rates the narrowest wins.
+2. A width that stops being the fastest is still generated for a while, with
+   verification following rule 1. Its depths stay scored, so the text supporting
+   it again is seen in the next round. Each round a width is the fastest earns it
+   one such round, up to the rounds a look would take to return, and a kept round
+   spends more of them the less of the rate is at stake.
+3. A look is a round generating wider than rules 1 and 2 would. It is an ordinary
+   round that loses a known time to the fastest budget. It goes to the wider
+   width with the most to gain for that time, where the gain is that width's rate
+   if every proposal were right. Looks take a fixed share of decode time, scaled
+   down where little can be gained. A look is also taken on a run of rounds that
+   accepted everything they verified, which is what text that became predictable
+   looks like from a narrow width. The run that earns one halves when such a look
+   finds its block right and doubles when it finds it wrong, and the load carries
+   it from one request to the next.
+
+The controller runs no device work solely to learn: every round it causes
+commits tokens. An unmeasured launch is tried because its bound makes it the
+fastest; a deeper depth is scored because a look or a kept width drafted it.
+
+**Shared launches.** Requests whose drafted blocks are verified in one launch
+share its rows: the launch takes the row class committing the most tokens per
+second, and its rows go to the proposals most often right, whichever requests
+drafted them. Each request then verifies no more than its share. A drafter launch
+batches equal blocks only, so requests generating different counts draft in
+separate launches.
+
+**Guarantees and limits.**
+
+- On text that one width serves throughout, decode is within the looks' share of
+  that width's rate once its launches are measured.
+- On text that changes, verification follows within the few rounds the depth
+  means take to move, and generation within the rounds a width is kept or a look
+  takes to come. Text that turns predictable under a narrow width brings looks
+  round after round while they keep finding their blocks right; this is what
+  returns a chained head, whose deeper proposals each cost a pass and so stop
+  being drafted, to its wider widths.
+- Measuring a load's launches costs one round per width per context class.
+- The means, the kept rounds and the looks' share are fixed constants, not
+  statistical guarantees. Acceptance that alternates faster than the means move
+  is not followed.

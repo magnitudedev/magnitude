@@ -3,27 +3,33 @@
 pub mod assessment;
 mod completion;
 mod device_resources;
+mod device_table;
 mod domain;
 mod error;
 mod execution_path;
 mod host_tables;
-mod progressive;
 mod import_transforms;
 mod inventory;
 mod kernel_cache;
 mod lanes;
 pub mod memory;
 mod native;
+#[cfg(test)]
+mod ngram_steps_tests;
 mod operation;
 mod operators;
 mod planning;
 pub mod programs;
+mod progressive;
+mod slot_directory;
+mod stored_table;
+mod streamed_table;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
-    CompletedVisionWork, GraphError, HeadProgram, ImportProgram, PreparedDraftGraphs,
-    PreparedDrafterGraphs, PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
-    PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport, StateProgram, TargetOutput,
-    TargetProgram, VisionProgram,
+    CompletedVisionWork, GraphError, HeadProgram, ImportProgram, PlannedSealedGraphs,
+    PreparedDraftGraphs, PreparedDrafterGraphs, PreparedHeadGraphs, PreparedStateCopyGraphs,
+    PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport,
+    SealedGraphsHeap, StateProgram, TargetOutput, TargetProgram, VisionProgram,
 };
 pub mod platform;
 mod residency;
@@ -33,48 +39,53 @@ mod resources;
 pub use completion::{Completed, Completion, CompletionWake};
 pub use device_resources::{
     ConditioningRange, ConditioningRef, FeatureRef, ImageRef, LogitsRef, ResourceDomain,
-    ResourceError,
+    ResourceError, WeakFeatureRef,
 };
 pub use domain::{
-    require_normal, ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
+    ClaimRefusal, DeviceHeap, DomainError, DomainRequirements, DomainReservation, ExecutorDomain,
     HeadFlight, MemoryChargeReconciliation, NativeFamily, OpenRequirements,
-    PendingOperationOutcome, PhysicalDecision, ProgramFamily, ReservedResources, ResumeState,
-    StateBindings, SubmitFailure, TargetFlight, TargetHostTiming, VisionFlight,
+    PendingOperationOutcome, PhysicalDecision, PrimingCompletionFlight, ProgramFamily,
+    ReservedResources, ResumeState, StateBindings, SubmitFailure, TargetContinuation, TargetFlight,
+    TargetHostTiming, VisionFlight, require_normal,
 };
-pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
+pub use error::{
+    CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,
+    TableReadError,
+};
 pub use execution_path::ExecutionPath;
 pub use inventory::kernel_inventory;
-pub use kernel_cache::{KernelCache, KernelCacheError, TuningCacheKey, DEFAULT_KERNEL_CACHE_BYTES};
+pub use kernel_cache::{
+    DEFAULT_KERNEL_CACHE_BYTES, KernelCache, KernelCacheError, StoredEvidence, TuningCacheKey,
+};
 pub use lanes::ConditioningSlice;
 pub use lanes::{
-    HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs, ResidentWeightSlot,
-    StateLaunchCore, StateLaunchInputs, StateWork, TargetLaunchCore, TargetLaunchInputs,
-    TargetLaunchWorkspace, TargetTokens, ValidatedHeadLaunch, ValidatedImportLaunch,
-    ValidatedStateLaunch, ValidatedTargetLaunch, ValidatedVisionLaunch, VisionLaunchCore,
-    VisionLaunchInputs,
+    HeadConditioning, HeadLaunchCore, HeadLaunchInputs, ImportLaunchCore, ImportLaunchInputs,
+    ResidentWeightSlot, StateLaunchCore, StateLaunchInputs, StateWork, TargetHistoryRead,
+    TargetLaunchCore, TargetLaunchInputs, TargetLaunchWorkspace, TargetReads, TargetTokens,
+    ValidatedHeadLaunch, ValidatedImportLaunch, ValidatedStateLaunch, ValidatedTargetLaunch,
+    ValidatedVisionLaunch, VisionLaunchCore, VisionLaunchInputs,
 };
 pub use magnitude_batching::{self as batching, Demand, LaunchClass};
 /// Development-only tuning pin for bit-exact measurement runs
-/// (`forward_bench`); see the module documentation.
+/// (`magnitude-harness --tuning-record`); see the module documentation.
 #[cfg(feature = "pinned-tuning")]
 pub use native::pinned_tuning;
 /// Development-only tuning survey for replaying the search
-/// (`forward_bench --tuning-survey`); see the module documentation.
+/// (`magnitude-harness --tuning-survey`); see the module documentation.
 #[cfg(feature = "tuning-survey")]
 pub use native::tuning_survey;
 pub use native::{
-    attention_points, row_points, AdmittedErrorClasses, AttestedPrograms, CatalogError,
-    CatalogFailure, PointShape, NO_ERROR_CLASSES,
-    QualificationCase, QualificationReport, SearchProgress, TunedEntry, TuningContext, TuningEvent,
-    TuningLimits,
-    TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
-    ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
+    AttestedPrograms, CatalogError, CatalogFailure, NumericalProfile, PinnedChoice, PointShape,
+    QualificationCase, QualificationReport, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
+    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
+    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
+    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
+    UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
 };
 pub use operation::{
     CommittedClass, DraftForm, ExecutableKind, FeatureReader, FeatureRows, FeatureSpan, GroupKey,
     HeadPhase, Operation, OperationError, Outcome, Priming, ProgramIdentity, RequestId,
-    ResourceDomainId,
-    RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
+    ResourceDomainId, RowResult, Sampling, SelectSpec, Selected, Shaping, TokenId, WorkKind,
 };
 pub use operators::routed::{
     Expansion, GeneralRoutedBinding, GeneralRoutedScales, GeneralRoutedShape,
@@ -83,23 +94,23 @@ pub use operators::short_conv::{ShortConvBinding, ShortConvShape};
 pub use operators::state_space::{StateSpaceBinding, StateSpaceShape};
 pub use operators::vision::{VisionEntry, VisionKernel};
 pub use planning::{
-    image_cell_limit, resident_element, resident_layout, source_element, ArtifactComponent,
-    ArtifactComponentKind,
-    AssessmentFit, AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
-    AssessmentMemoryBounds, AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding,
-    AttentionShape, BackendPlan, CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding,
-    DenseBranchBinding, DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan,
-    EmbeddingBinding, ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding,
-    FeedForwardProgramSlot, GraphSlots, HeadBinding, HeadProgramPlan, HeadProjection, HostTablePlan,
-    ImportProgramSlot, MarkovBinding, MixerProgramSlot, ModelLoadPlan, NativeGraphCharge,
-    ParallelBinding, PerLayerBinding, PerLayerEntryBinding, PlannedDevice, PlannedMethod,
-    ProgramPlan, ReadoutBinding, ReadoutHead, RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity,
-    ResourceLimits, ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SelectorBinding,
-    StartupSlots, StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan,
-    TensorOperations,
-    SublayerTail, TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan,
-    VisionProgramPlan, WeightPlan, WeightScalePlan, WeightStorageIdentity, MAX_DRAFT_PROPOSALS,
-    MAX_IMAGE_CELLS,
+    ArtifactComponent, ArtifactComponentKind, AssessmentFit, AssessmentFitVerdict,
+    AssessmentGraphResourceBounds, AssessmentHeaderBounds, AssessmentMemoryBounds,
+    AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
+    CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding, DenseBranchBinding,
+    DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan, EmbeddingBinding,
+    ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FeedForwardProgramSlot,
+    GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan, ImportProgramSlot,
+    MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding, MixerProgramSlot, ModelLoadPlan,
+    NGramBinding, NativeGraphCharge, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
+    PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead,
+    RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity, ResourceLimits,
+    ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SealedGraphHostBytes,
+    SelectionBinding, SelectionShape, SelectorBinding, SharedHeadProgramPlan, StartupSlots, StateCapacityPlan, StateProgramPlan,
+    StateResourcePlan, StateStorePlan, SublayerTail, TapProgramPlan, TargetBlockProgramSlot,
+    TargetProgramPlan, TensorOperations, VisionProgramPlan, WeightPlan, WeightScalePlan,
+    WeightStorageIdentity, draft_ladder, image_cell_limit, resident_element, resident_layout,
+    source_element,
 };
 
 /// Whether this executor runs `definition` with its draft head selected.

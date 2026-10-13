@@ -4,7 +4,7 @@
 //! with its own components, placement geometry (pages, slabs and span limit),
 //! free space and per-row references.
 
-use crate::{history_geometry, ComponentDescriptor, Error, HistoryGeometry, LayerRef, LayoutError};
+use crate::{ComponentDescriptor, Error, HistoryGeometry, LayerRef, LayoutError, history_geometry};
 use std::collections::BTreeSet;
 
 /// A stored history domain of one store: its index among the store's stored
@@ -20,8 +20,9 @@ pub enum HistoryDomainKind {
     /// One row per token, but a history references only its last `rows`
     /// accepted rows plus its tentative rows.
     Window { rows: usize },
-    /// One row per `rate` tokens, committed at block boundaries. Interface
-    /// only: a store rejects it.
+    /// One row per `rate` tokens: block `b`'s row is written by the advance
+    /// whose rows reach position `(b + 1) rate`, and a history at position
+    /// `p` references blocks `[0, p / rate)`.
     Block { rate: usize },
     /// No storage: the domain's layers read the regions of layer `source`.
     Shared { source: LayerRef },
@@ -39,19 +40,28 @@ impl HistoryDomainKind {
                 .ok_or(LayoutError::ArithmeticOverflow("window row limit"))?
                 .min(context)),
             Self::Shared { .. } => Ok(0),
-            Self::Block { .. } => Err(Error::UnsupportedHistoryDomain(self)),
+            Self::Block { rate } => Ok(context / rate),
         }
     }
 
     /// Rows a checkpoint or retained prefix at position `position`
     /// references: every row for Token, rows `[position - n, position)` for
-    /// Window(n).
+    /// Window(n), every complete block for Block.
     pub fn checkpoint_rows(self, position: usize) -> Result<usize, Error> {
         match self {
             Self::Token => Ok(position),
             Self::Window { rows } => Ok(rows.min(position)),
             Self::Shared { .. } => Ok(0),
-            Self::Block { .. } => Err(Error::UnsupportedHistoryDomain(self)),
+            Self::Block { rate } => Ok(position / rate),
+        }
+    }
+
+    /// The domain's rows an advance of `count` rows from `position` adds:
+    /// one per row, or for Block one per block it completes.
+    pub fn advance_rows(self, position: usize, count: usize) -> usize {
+        match self {
+            Self::Block { rate } => (position + count) / rate - position / rate,
+            Self::Token | Self::Window { .. } | Self::Shared { .. } => count,
         }
     }
 
@@ -66,7 +76,7 @@ impl HistoryDomainKind {
     }
 
     /// The first logical position a history at `position` still references:
-    /// 0 for Token, `position - n` for Window(n).
+    /// 0 for Token and Block, `position - n` for Window(n).
     pub(crate) fn retained_from(self, position: usize) -> usize {
         match self {
             Self::Window { rows } => position.saturating_sub(rows),
@@ -141,27 +151,40 @@ impl HistoryDomainLayout {
         history_geometry(
             self.row_bytes()?,
             self.kind().row_limit(context, max_advance)?,
-            shared_appended_rows(self.components(), domains, max_advance),
+            prepared_appended_rows(self.kind(), self.components(), domains, max_advance),
         )
         .map_err(Error::Request)
     }
 }
 
-/// The appended rows Shared readers of a stored domain with `components`
-/// see within one advance: `max_advance` when any Shared layout of `domains`
-/// reads one of its layers, else none.
-fn shared_appended_rows(
+/// Rows within an advance read through stored history by Shared layers,
+/// compressed causal target attention or an indexer. Each requires room for
+/// its prepared destination spans beside the already accepted spans.
+fn prepared_appended_rows(
+    kind: HistoryDomainKind,
     components: &[ComponentDescriptor],
     domains: &[HistoryDomainLayout],
     max_advance: usize,
 ) -> usize {
+    // An indexer reads the raw keys and scores the blocks of its launch's
+    // earlier rows beside the accepted ones.
+    if let HistoryDomainKind::Block { rate } = kind {
+        return max_advance.div_ceil(rate);
+    }
+    if !components.iter().all(ComponentDescriptor::attended) {
+        return max_advance;
+    }
     let read = domains.iter().any(|domain| match domain {
         HistoryDomainLayout::Shared { source, .. } => components
             .iter()
             .any(|component| component.layer == *source),
         _ => false,
     });
-    if read {
+    if read
+        || components
+            .iter()
+            .any(ComponentDescriptor::causal_rows_use_cache)
+    {
         max_advance
     } else {
         0
@@ -204,6 +227,8 @@ pub(crate) fn validate_domains(
     max_advance: usize,
 ) -> Result<(Vec<StoredDomain>, Vec<(LayerRef, HistorySource)>), Error> {
     let mut stored = Vec::new();
+    // Each layer has one history, but an indexer two: its raw keys and its
+    // block keys (a Block domain's).
     let mut layers = BTreeSet::new();
     let mut shared = Vec::new();
     let layouts = plans
@@ -225,16 +250,31 @@ pub(crate) fn validate_domains(
                 }
                 shared.push((source, readers));
             }
-            HistoryDomainLayout::Block { .. } => {
-                return Err(Error::UnsupportedHistoryDomain(kind));
-            }
             HistoryDomainLayout::Token { components }
-            | HistoryDomainLayout::Window { components, .. } => {
+            | HistoryDomainLayout::Window { components, .. }
+            | HistoryDomainLayout::Block { components, .. } => {
                 if components.is_empty() {
                     return Err(LayoutError::EmptyHistoryDomain.into());
                 }
-                if kind == (HistoryDomainKind::Window { rows: 0 }) {
+                if kind == (HistoryDomainKind::Window { rows: 0 })
+                    || kind == (HistoryDomainKind::Block { rate: 0 })
+                {
                     return Err(LayoutError::ZeroWindow.into());
+                }
+                // An indexer's domain holds indexer keys alone, after every
+                // domain attention reads; a Block domain is an indexer's.
+                let attended = components.iter().filter(|component| component.attended()).count();
+                if (attended != 0 && attended != components.len())
+                    || (attended != 0 && matches!(kind, HistoryDomainKind::Block { .. }))
+                    || (attended != 0
+                        && stored.iter().any(|domain: &StoredDomain| {
+                            !domain.components.iter().all(ComponentDescriptor::attended)
+                        }))
+                {
+                    return Err(LayoutError::WrongRepresentation(
+                        "indexer keys in their own domains after the attended ones",
+                    )
+                    .into());
                 }
                 let row_limit = kind.row_limit(context, max_advance)?;
                 if plan.logical_rows < row_limit {
@@ -245,7 +285,7 @@ pub(crate) fn validate_domains(
                 }
                 let mut row_bytes = 0u64;
                 for component in &components {
-                    if !layers.insert(component.layer) {
+                    if !layers.insert((component.layer, matches!(kind, HistoryDomainKind::Block { .. }))) {
                         return Err(LayoutError::DuplicateLayer(component.layer).into());
                     }
                     for plane in component.planes() {
@@ -259,7 +299,7 @@ pub(crate) fn validate_domains(
                 let geometry = history_geometry(
                     row_bytes,
                     row_limit,
-                    shared_appended_rows(&components, &layouts, max_advance),
+                    prepared_appended_rows(kind, &components, &layouts, max_advance),
                 )
                 .map_err(Error::Request)?;
                 // Every plane's capacity is at most the domain's total.
@@ -289,7 +329,7 @@ pub(crate) fn validate_domains(
             })
             .ok_or(LayoutError::UnknownSharedSource(source))?;
         for layer in readers {
-            if !layers.insert(layer) {
+            if !layers.insert((layer, false)) {
                 return Err(LayoutError::DuplicateLayer(layer).into());
             }
             bindings.push((

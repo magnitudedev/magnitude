@@ -33,6 +33,8 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
     device float *up_scales [[buffer(SEISMIC_BUFFER_SCRATCH_UP_SCALES)]],               \
     device const float *gate_scale [[buffer(SEISMIC_BUFFER_GATE_SCALE)]],               \
     device const float *up_scale [[buffer(SEISMIC_BUFFER_UP_SCALE)]],                   \
+    device const float *gate_bound [[buffer(SEISMIC_BUFFER_GATE_BOUND)]],               \
+    device const float *up_bound [[buffer(SEISMIC_BUFFER_UP_BOUND)]],                   \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define DENSE_EXPAND_OPERANDS                                                           \
@@ -259,9 +261,12 @@ kernel void dense_expand_int8(DENSE_EXPAND_ARGUMENTS,
     const projection::packing_scratch up_scratch{packed, token_factors, token_scales, up_factors, up_scales}
 #define DENSE_EXPAND_PACKING_AVAILABLE \
     (projection::packing_codes<packets::W0>::available \
-        && projection::packing_serves<packets::W1, projection::packing_codes<packets::W0>::folds>::value)
+        && projection::packing_serves<packets::W1, projection::packing_codes<packets::W0>::folds, \
+            projection::packing_codes<packets::W0>::residue>::value)
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_PACK
+// RESIDUE: the operand's residue width for weights with residue bits.
+template <uint RESIDUE>
 kernel void dense_expand_pack(DENSE_EXPAND_ARGUMENTS,
     uint pairs [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -272,9 +277,13 @@ kernel void dense_expand_pack(DENSE_EXPAND_ARGUMENTS,
     threadgroup float4 peaks[8];
     DENSE_EXPAND_PACKING_SCRATCH;
     projection::Plain<activation, projection::AllRows> x{normalized, SEISMIC_DIM_H, 1, uint(SEISMIC_DIM_H), {}};
-    projection::packing_operand<projection::packing_shared<packets::W0, packets::W1>::centre,
-        projection::packing_shared<packets::W0, packets::W1>::folds>(x, gate_scratch, uint(SEISMIC_DIM_O),
-        uint(SEISMIC_DIM_H), pairs, peaks, thread_index, sg, lane);
+    typedef projection::packing_shared<RESIDUE, packets::W0, 1, packets::W1, 1> shared;
+    // The operand serves both weights: their bounds, where both have one.
+    constexpr uint BOUNDS =
+        projection::packing_bounded<3u, (SEISMIC_DIM_GB != 0 ? 1u : 0u) | (SEISMIC_DIM_UB != 0 ? 2u : 0u)>::value;
+    const projection::packing_bounds<BOUNDS> bounds{{gate_bound, up_bound}};
+    projection::packing_operand<shared::centre, shared::folds, shared::residue, BOUNDS>(x, gate_scratch, bounds,
+        uint(SEISMIC_DIM_O), uint(SEISMIC_DIM_H), pairs, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -298,7 +307,7 @@ kernel void dense_expand_pack_coefficients(DENSE_EXPAND_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_DENSE_EXPAND_PACKED
-template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+template <uint RESIDUE, uint PACK_TOKENS, uint WEIGHTS_AHEAD>
 kernel void dense_expand_packed(DENSE_EXPAND_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -309,7 +318,7 @@ kernel void dense_expand_packed(DENSE_EXPAND_ARGUMENTS,
     DENSE_EXPAND_OPERANDS;
     DENSE_EXPAND_PACKING_SCRATCH;
     const uint m = uint(SEISMIC_DIM_O);
-    projection::gemm_packed_paired<packets::W0, packets::W1, PACK_TOKENS, WEIGHTS_AHEAD>(out, gate,
+    projection::gemm_packed_paired<packets::W0, packets::W1, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, gate,
         up, gate_scratch, up_scratch, m, (m + 63u) / 64u * 64u, uint(SEISMIC_DIM_F), uint(SEISMIC_DIM_H), tile,
         projection::packing_simdgroups, exchange, sg, lane);
 }

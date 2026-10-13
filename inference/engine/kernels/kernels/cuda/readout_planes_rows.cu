@@ -4,7 +4,7 @@
 // the routine the certified exact level shares (`lib/readout/progressive.cuh`).
 #include "lib/readout/progressive.cuh"
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 
 #ifdef SEISMIC_FORMING_READOUT_PLANES_ROWS_FORM
 extern "C" __global__ void readout_planes_rows_form(SEISMIC_KERNEL_PARAMS) {
@@ -27,7 +27,8 @@ __global__ void readout_planes_rows_scan(SEISMIC_KERNEL_PARAMS) {
                                      SEISMIC_REST_STRIDE_0, SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2,
                                      reinterpret_cast<const unsigned short *>(SEISMIC_PTR(SEISMIC_BUFFER_SCALES)),
                                      SEISMIC_SCALES_STRIDE_0};
-    const progressive::Selection selection{};
+    progressive::Selection selection{};
+    selection.softcap = __uint_as_float((unsigned)SEISMIC_PARAM_SOFTCAP);
     __shared__ uint4 staged[PROGRESSIVE_ROWS * PROGRESSIVE_CHUNK / 8];
     // Rows 8b..8b + 7 of row block b (the grid's second axis).
     const unsigned first = blockIdx.y * PROGRESSIVE_ROWS;

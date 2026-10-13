@@ -1,8 +1,8 @@
 //! CPU execution-service vocabulary, exhaustive closed-op demand, and the
 //! fixed primitive probe suite acquired after the production worker pool exists.
 
-use crate::workers::{LaunchFrame, TeamBarrier, Workers};
 use crate::Cpu;
+use crate::workers::{LaunchFrame, TeamBarrier, Workers};
 use seismic_compiler::errors::TargetError;
 use seismic_estimator::{
     CompositionQualificationCase, CompositionQualificationParts, ConcreteExecutionDemand,
@@ -219,9 +219,9 @@ fn arithmetic_class(ty: ValueType) -> CpuService {
             dtype: DType::F16 | DType::BF16,
             ..
         } => NARROW_STRICT,
-        ValueType::Scalar(DType::I32 | DType::U32 | DType::Bool)
+        ValueType::Scalar(DType::I32 | DType::U32 | DType::U64 | DType::Bool)
         | ValueType::Vector {
-            dtype: DType::I32 | DType::U32 | DType::Bool,
+            dtype: DType::I32 | DType::U32 | DType::U64 | DType::Bool,
             ..
         }
         | ValueType::Index
@@ -247,9 +247,9 @@ pub(crate) fn operation_cost(
     let one_demand = seismic_estimator::OperationCost::one;
     let cost = |first, rest| seismic_estimator::OperationCost::demands(first, rest);
     match op {
-        ClosedOpView::ScalarBits { .. } | ClosedOpView::ScalarFromBits { .. } => {
-            one(arena, INTEGER, Latency)
-        }
+        ClosedOpView::ScalarBits { .. }
+        | ClosedOpView::ScalarFromBits { .. }
+        | ClosedOpView::ReadPlaneLane { .. } => one(arena, INTEGER, Latency),
         ClosedOpView::Constant { out, .. }
         | ClosedOpView::Unary { out, .. }
         | ClosedOpView::Binary { out, .. }

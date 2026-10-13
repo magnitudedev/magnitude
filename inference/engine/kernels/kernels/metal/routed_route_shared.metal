@@ -12,6 +12,10 @@
 #define KERNEL_W2 SEISMIC_SHARED_UP
 #include "lib/routed/route.h"
 
+// The shared rows run `routed_expand`'s paired GEMV, which packs 16-bit
+// activations (`lib/routed/routed.h`); F32 activations take `routed_route`.
+static_assert(element::Act::bytes == 2, "routed_route_shared requires a bf16 or f16 activation element");
+
 kernel void routed_route_shared(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
     device const uchar *norm [[buffer(SEISMIC_BUFFER_NORM)]],
@@ -24,7 +28,7 @@ kernel void routed_route_shared(
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
     device uchar *shared_product [[buffer(SEISMIC_RESULT_2_BUFFER)]],
-    device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
@@ -35,7 +39,7 @@ kernel void routed_route_shared(
     threadgroup float parts[8 * route_simdgroups];
     threadgroup float inverses[8];
     threadgroup uint last;
-    const routing::Rows<Norm> in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
+    const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     if (group < route_groups) {
         route_group(in, router, shared_router, routes, scores, normalized, coefficient, logits, arrivals,
             seismic_words, shared, &last, group, tid, simd, lane);

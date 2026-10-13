@@ -602,6 +602,24 @@ impl<B: PhysicalDialect> Kernel<B> {
                     indices: indices(raw_indices),
                 }
             }
+            Op::ReadPlaneLane {
+                out,
+                place,
+                plane,
+                index: raw_indices,
+            } => {
+                let place = self.closed_place(*place, emission);
+                let geometry = place.geometry.packed();
+                let plane_info = geometry.layout.planes[*plane as usize].clone();
+                let place = place.map_geometry(geometry);
+                Closed::ReadPlaneLane {
+                    out: value(*out),
+                    place,
+                    plane: *plane,
+                    plane_info,
+                    indices: indices(raw_indices),
+                }
+            }
             Op::ReadPlane {
                 out,
                 place,

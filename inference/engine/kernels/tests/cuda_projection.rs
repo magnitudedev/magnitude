@@ -5,8 +5,8 @@
 //! CUDA device.
 
 use magnitude_kernels::{
-    dense_expand, dense_output, embedding_rows, head_logits_rows, readout_features_rows,
-    readout_head_rows, readout_selected_rows, sample_rows, shape_rows,
+    dense_expand, dense_output, embedding_rows, readout_features_rows, readout_head_rows,
+    readout_project_rows, readout_selected_rows, sample_rows, shape_rows,
 };
 mod cuda_common;
 
@@ -107,7 +107,7 @@ fn expand_kernel(
             UW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.dense_expand_params(
+        &mapping.projection_params(
             NativeSpecialization::new()
                 .with_static("H", case.h as u64)
                 .with_static("F", case.f as u64)
@@ -131,7 +131,7 @@ fn output_kernel(
             DW: format.resident(),
             A: Element::bf16(),
         },
-        &mapping.dense_output_params(
+        &mapping.projection_params(
             NativeSpecialization::new()
                 .with_static("H", h as u64)
                 .with_static("F", f as u64)
@@ -197,6 +197,8 @@ fn dense_expand_cases(formats: &[Format], seed: u64) {
                         activation: 0,
                         gate_scale: &f32_tensor(&device, &[0], &[]),
                         up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        up_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -280,6 +282,7 @@ fn dense_output_cases(device: &Device, formats: &[Format], h: usize, f: usize, r
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
                         down_scale: &f32_tensor(&device, &[0], &[]),
+                        down_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -353,6 +356,8 @@ fn cuda_gemm_row_bands_match_host_model() {
                         activation: 0,
                         gate_scale: &f32_tensor(&device, &[0], &[]),
                         up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        up_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -396,6 +401,7 @@ fn cuda_gemm_row_bands_match_host_model() {
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
                         down_scale: &f32_tensor(&device, &[0], &[]),
+                        down_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -408,6 +414,15 @@ fn cuda_gemm_row_bands_match_host_model() {
             );
             println!("BITS {label} {:016x}", digests[0]);
         }
+    }
+}
+
+/// What these tests hold a tuned configuration to against its default: 8
+/// rounding steps of the `bf16` activations, the engine's standard α.
+fn tuning_requirement() -> seismic::NumericalRequirement {
+    seismic::NumericalRequirement::RoundingSteps {
+        alpha: 8.,
+        activation: Some(seismic::DType::BF16),
     }
 }
 
@@ -441,7 +456,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
             weight: 1.0,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: vec![dense_expand::Args {
                 residual,
                 norm: &norm,
@@ -452,6 +467,8 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
                 activation: 0,
                 gate_scale: &absent_scale,
                 up_scale: &absent_scale,
+                gate_bound: &absent_scale,
+                up_bound: &absent_scale,
             }],
             initialize: None,
             written: Default::default(),
@@ -459,16 +476,8 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-        admission: std::time::Duration::from_secs(600),
-        required: std::time::Duration::from_secs(600),
-        settings: seismic::SearchSettings {
-            improvement: 0.01,
-            restarts: 2,
-            confirmed: 3,
-            default_margin: 0.02,
-            samples: 5,
-            confirmation_samples: 5,
-        },
+
+        settings: seismic::SearchSettings { error_rate: 0.05 },
         min_sample_seconds: 0.001,
         start: Vec::new(),
     });
@@ -487,19 +496,13 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
         },
         &statics,
         points,
-        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-            absolute: seismic::precision::Limit::new(0.01).unwrap(),
-            relative: seismic::precision::Limit::new(0.05).unwrap(),
-            relative_floor: seismic::precision::Limit::ZERO,
-            ulps: None,
-        }),
+        tuning_requirement(),
         search,
-        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
-        seismic::TuningMethod::Factored { complete: true, .. }
+        seismic::TuningMethod::Search { complete: true, .. }
     ));
     assert_eq!(result.rejections().count(), 0);
     println!(
@@ -545,13 +548,14 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
                 weight: 1.0,
                 class: None,
                 cost: 1.0,
-                required: false,
+                workload: seismic::WorkloadRotation::All,
                 rotation: vec![dense_output::Args {
                     residual,
                     product,
                     down_weight: &down.tensor,
                     out_rows,
                     down_scale: &absent_scale,
+                    down_bound: &absent_scale,
                 }],
                 initialize: None,
                 written: Default::default(),
@@ -560,16 +564,8 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         .collect();
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
-        admission: std::time::Duration::from_secs(600),
-        required: std::time::Duration::from_secs(600),
-        settings: seismic::SearchSettings {
-            improvement: 0.01,
-            restarts: 2,
-            confirmed: 3,
-            default_margin: 0.02,
-            samples: 5,
-            confirmation_samples: 5,
-        },
+
+        settings: seismic::SearchSettings { error_rate: 0.05 },
         min_sample_seconds: 0.001,
         start: Vec::new(),
     });
@@ -585,19 +581,13 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
         },
         &statics,
         points,
-        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-            absolute: seismic::precision::Limit::new(0.01).unwrap(),
-            relative: seismic::precision::Limit::new(0.05).unwrap(),
-            relative_floor: seismic::precision::Limit::ZERO,
-            ulps: None,
-        }),
+        tuning_requirement(),
         search,
-        seismic::TuningReference::Portable,
     )
     .unwrap();
     assert!(matches!(
         result.method,
-        seismic::TuningMethod::Factored { complete: true, .. }
+        seismic::TuningMethod::Search { complete: true, .. }
     ));
     assert_eq!(result.rejections().count(), 0);
     println!(
@@ -641,7 +631,7 @@ fn cuda_dense_weights_match_host_model() {
                     A: bf16,
                 },
                 &mapping
-                    .dense_expand_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
+                    .projection_params(statics.clone().with_static("GS", 0).with_static("US", 0)),
             )
             .unwrap()
             .call(dense_expand::Args {
@@ -654,6 +644,8 @@ fn cuda_dense_weights_match_host_model() {
                 activation: 0,
                 gate_scale: &f32_tensor(&device, &[0], &[]),
                 up_scale: &f32_tensor(&device, &[0], &[]),
+                gate_bound: &f32_tensor(&device, &[0], &[]),
+                up_bound: &f32_tensor(&device, &[0], &[]),
             })
             .unwrap()
             .value;
@@ -681,7 +673,7 @@ fn cuda_dense_weights_match_host_model() {
             let result = dense_output::native_for_device_with(
                 &device,
                 dense_output::Elements { DW: bf16, A: bf16 },
-                &mapping.dense_output_params(statics.with_static("DS", 0)),
+                &mapping.projection_params(statics.with_static("DS", 0)),
             )
             .unwrap()
             .call(dense_output::Args {
@@ -690,6 +682,7 @@ fn cuda_dense_weights_match_host_model() {
                 down_weight: &down.tensor,
                 out_rows: &out_rows,
                 down_scale: &f32_tensor(&device, &[0], &[]),
+                down_bound: &f32_tensor(&device, &[0], &[]),
             })
             .unwrap()
             .value;
@@ -734,7 +727,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                     UW: format.resident(),
                     A: Element::bf16(),
                 },
-                &mapping.dense_expand_params(
+                &mapping.projection_params(
                     NativeSpecialization::new()
                         .with_static("H", h as u64)
                         .with_static("F", f as u64)
@@ -767,6 +760,8 @@ fn cuda_gemv_rows_match_single_row_bits() {
                         activation: 0,
                         gate_scale: &f32_tensor(&device, &[0], &[]),
                         up_scale: &f32_tensor(&device, &[0], &[]),
+                        gate_bound: &f32_tensor(&device, &[0], &[]),
+                        up_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -778,6 +773,7 @@ fn cuda_gemv_rows_match_single_row_bits() {
                         down_weight: &down.tensor,
                         out_rows: &out_rows,
                         down_scale: &f32_tensor(&device, &[0], &[]),
+                        down_bound: &f32_tensor(&device, &[0], &[]),
                     })
                     .unwrap()
                     .value;
@@ -857,6 +853,8 @@ fn cuda_head_rows_match_host_model() {
                         NativeSpecialization::new()
                             .with_static("V", v as u64)
                             .with_static("D", d as u64)
+                            .with_static("PT", 1)
+                            .with_static("NM", d as u64)
                             .with_static("WS", 0),
                     ),
                 )
@@ -898,16 +896,21 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             .iter()
             .map(|value| value * 0.001 + 1e-5)
             .collect::<Vec<_>>();
-        for ksplit in [2, 4] {
+        for _form in [0] {
             let specialization = NativeSpecialization::new()
                 .with_static("V", v as u64)
                 .with_static("D", d as u64)
-                .with_launch_param(0, "KSPLIT", ksplit)
-                .with_launch_param(1, "KSPLIT", ksplit)
-                .with_launch_param(3, "ROTATE", 2);
-            let kernel = head_logits_rows::native_for_device_with(
+                .with_static("S", v as u64)
+                .with_static("I", 0)
+                .with_static("WS", 0)
+                .with_param("OPERAND", 0)
+                .with_launch_param(1, "KSPLIT", 4)
+                .with_launch_param(2, "KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2)
+                .with_launch_param(5, "KSPLIT", 4);
+            let kernel = readout_project_rows::native_for_device_with(
                 &device,
-                head_logits_rows::Elements {
+                readout_project_rows::Elements {
                     A: Element::bf16(),
                     OW: Format::Q6K.resident(),
                 },
@@ -915,17 +918,66 @@ fn cuda_head_logits_scoped_launches_match_host_model() {
             )
             .unwrap();
             let logits = kernel
-                .call(head_logits_rows::Args {
+                .call(readout_project_rows::Args {
                     features: &bf16_tensor(&device, &[rows as u64, d as u64], &features),
                     weight: &head.tensor,
+                    token_rows: &Tensor::zeros(
+                        &device,
+                        Element::i32(),
+                        &[rows as u64, 0, v as u64],
+                    )
+                    .unwrap(),
+                    weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
+                    softcap: 0.0,
                 })
                 .unwrap()
                 .value;
             check(
-                &format!("head_logits rows={rows} ksplit={ksplit}"),
+                &format!("prepared projection rows={rows}"),
                 &read_f32(&logits),
                 &expected,
                 &tolerance,
+            );
+            let columns = 5;
+            let ids = (0..rows)
+                .flat_map(|row| [((row * 19) % v) as i32, 8, 15, 16, (v - 1) as i32])
+                .collect::<Vec<_>>();
+            let indexed = readout_project_rows::native_for_device_with(
+                &device,
+                readout_project_rows::Elements {
+                    A: Element::bf16(),
+                    OW: Format::Q6K.resident(),
+                },
+                &specialization
+                    .with_static("S", columns as u64)
+                    .with_static("I", 1),
+            )
+            .unwrap()
+            .call(readout_project_rows::Args {
+                features: &bf16_tensor(&device, &[rows as u64, d as u64], &features),
+                weight: &head.tensor,
+                token_rows: &i32_tensor(&device, &[rows as u64, 1, columns as u64], &ids),
+                weight_scale: &Tensor::zeros(&device, Element::f32(), &[0]).unwrap(),
+                softcap: 0.0,
+            })
+            .unwrap()
+            .value;
+            let selected = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| index / columns * v + *id as usize)
+                .collect::<Vec<_>>();
+            check(
+                &format!("prepared indexed packed projection rows={rows}"),
+                &read_f32(&indexed),
+                &selected
+                    .iter()
+                    .map(|index| expected[*index])
+                    .collect::<Vec<_>>(),
+                &selected
+                    .iter()
+                    .map(|index| tolerance[*index])
+                    .collect::<Vec<_>>(),
             );
         }
     }
@@ -952,11 +1004,16 @@ fn cuda_features_and_selected_rows_match_host_model() {
                     NW: Element::f32(),
                     A: Element::bf16(),
                 },
-                &NativeSpecialization::new().with_static("D", d as u64),
+                &NativeSpecialization::new()
+                    .with_static("D", d as u64)
+                    .with_static("PT", 1)
+                    .with_static("NM", d as u64),
             )
             .unwrap()
             .call(readout_features_rows::Args {
-                hidden: &hidden,
+                hidden: &hidden
+                    .reshape(&[hidden.extents()[0], 1, hidden.extents()[1]])
+                    .unwrap(),
                 norm: &norm,
                 out_rows: &out_rows,
                 epsilon: EPSILON,
@@ -987,7 +1044,9 @@ fn cuda_features_and_selected_rows_match_host_model() {
                 },
                 &NativeSpecialization::new()
                     .with_static("V", v as u64)
-                    .with_static("D", d as u64),
+                    .with_static("D", d as u64)
+                    .with_static("PT", 1)
+                    .with_static("NM", d as u64),
             )
             .unwrap()
             .call(readout_selected_rows::Args {
@@ -1022,7 +1081,7 @@ fn cuda_features_and_selected_rows_match_host_model() {
 #[test]
 fn dense_expand_host_model_matches_portable_body() {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile, check_source},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1130,12 +1189,16 @@ fn cuda_embedding_rows_decode_table_rows() {
                 EW: format.resident(),
                 A: Element::bf16(),
             },
-            &NativeSpecialization::new().with_static("D", d as u64),
+            &NativeSpecialization::new()
+                .with_static("D", d as u64)
+                .with_static("PT", 1)
+                .with_static("NM", d as u64),
         )
         .unwrap()
         .call(embedding_rows::Args {
             table: &table.tensor,
             tokens: &tokens,
+            directory: &i32_tensor(&device, &[0, 1], &[]),
             scale: 1.0,
             normalize: 0,
             epsilon: 0.0,
@@ -1157,6 +1220,81 @@ fn cuda_embedding_rows_decode_table_rows() {
                     "{format:?} row {row} col {column}"
                 );
             }
+        }
+    }
+}
+
+/// A read through a directory reads each selected row's slot (row 0 for a
+/// row without one and for a failed selection), exactly as a direct read of
+/// that slot does (`projection.rs` covers the rows16 backends).
+#[test]
+fn cuda_embedding_rows_read_the_slots_their_directory_names() {
+    let Some(device) = cuda() else { return };
+    let mut rng = Rng(6);
+    let (v, d, logical) = (40, 512, 130);
+    // Every third logical row has a slot.
+    let directory_values = (0..logical)
+        .map(|row| {
+            if row % 3 == 0 {
+                ((7 * row + 3) % v) as i32
+            } else {
+                -1
+            }
+        })
+        .collect::<Vec<_>>();
+    let directory = i32_tensor(&device, &[logical as u64, 1], &directory_values);
+    let direct = i32_tensor(&device, &[0, 1], &[]);
+    for format in Format::ALL {
+        let table = weight(&device, format, v, d, &mut rng);
+        let kernel = embedding_rows::native_for_device_with(
+            &device,
+            embedding_rows::Elements {
+                EW: format.resident(),
+                A: Element::bf16(),
+            },
+            &NativeSpecialization::new()
+                .with_static("D", d as u64)
+                .with_static("PT", 1)
+                .with_static("NM", d as u64),
+        )
+        .unwrap();
+        for rows in [1usize, 3, 64, 513] {
+            // The second pair is a failed selection; statuses vary.
+            let selected = (0..rows)
+                .flat_map(|i| match i {
+                    1 => [-1, 7],
+                    _ => [((i * 97 + 6) % logical) as i32, (i % 2) as i32],
+                })
+                .collect::<Vec<_>>();
+            let slots = selected
+                .chunks_exact(2)
+                .flat_map(|pair| {
+                    let slot =
+                        usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                    [slot, pair[1]]
+                })
+                .collect::<Vec<_>>();
+            let read = |pairs: &[i32], directory: &Tensor| {
+                let out = kernel
+                    .call(embedding_rows::Args {
+                        table: &table.tensor,
+                        tokens: &i32_tensor(&device, &[rows as u64, 2], pairs),
+                        directory,
+                        scale: 1.0,
+                        normalize: 0,
+                        epsilon: 0.0,
+                    })
+                    .unwrap();
+                (
+                    out.r0.read_to_host().unwrap(),
+                    out.r1.read_to_host().unwrap(),
+                )
+            };
+            assert_eq!(
+                read(&selected, &directory),
+                read(&slots, &direct),
+                "{format:?} rows {rows}: a read through the directory"
+            );
         }
     }
 }
@@ -1291,7 +1429,16 @@ fn cuda_sample_rows_match_portable_semantics_for_every_partition() {
 
 /// The portable `shape_rows` body, row by row.
 fn shape_host(logits: &[f32], params: &[f32; 8], history: &[i32]) -> Vec<f32> {
-    let [temperature, top_k, top_p, min_p, repetition, presence, frequency, _] = *params;
+    let [
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition,
+        presence,
+        frequency,
+        _,
+    ] = *params;
     let top_k = top_k as i32;
     let penalized: Vec<f32> = logits
         .iter()
@@ -1526,6 +1673,8 @@ fn cuda_gemm_timings() {
                                 activation: 0,
                                 gate_scale: &absent_scale,
                                 up_scale: &absent_scale,
+                                gate_bound: &absent_scale,
+                                up_bound: &absent_scale,
                             })
                             .collect();
                         expand_times.push(expand.measure(args, &options).unwrap().median);
@@ -1536,6 +1685,7 @@ fn cuda_gemm_timings() {
                                 down_weight: &downs[r],
                                 out_rows: &out_rows,
                                 down_scale: &absent_scale,
+                                down_bound: &absent_scale,
                             })
                             .collect();
                         output_times.push(output.measure(args, &options).unwrap().median);
@@ -1605,6 +1755,8 @@ fn cuda_projection_timings() {
                         activation: 0,
                         gate_scale: &absent_scale,
                         up_scale: &absent_scale,
+                        gate_bound: &absent_scale,
+                        up_bound: &absent_scale,
                     })
                     .collect();
                 let measured = expand.measure(args, &options).unwrap();
@@ -1622,6 +1774,7 @@ fn cuda_projection_timings() {
                         down_weight: &downs[r],
                         out_rows: &out_rows,
                         down_scale: &absent_scale,
+                        down_bound: &absent_scale,
                     })
                     .collect();
                 let measured = output.measure(args, &options).unwrap();
@@ -1669,6 +1822,8 @@ fn cuda_head_timings() {
                     NativeSpecialization::new()
                         .with_static("V", v as u64)
                         .with_static("D", d as u64)
+                        .with_static("PT", 1)
+                        .with_static("NM", d as u64)
                         .with_static("WS", 0),
                 ),
             )

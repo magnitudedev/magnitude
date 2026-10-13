@@ -8,7 +8,9 @@
 //! construction details. The semantic oracle is a validation consumer of the
 //! same entry graph, never a production execution path.
 
+pub mod analysis;
 pub mod bundle;
+pub mod cancellation;
 pub mod checked;
 pub mod entry;
 pub mod expr;
@@ -18,8 +20,10 @@ pub mod registry;
 
 mod check;
 mod external_tables;
+pub mod grids;
 pub mod initialization;
 pub mod intrinsics;
+pub mod lattice;
 pub mod precision;
 pub mod reference_math;
 pub(crate) mod repr;

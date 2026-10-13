@@ -117,6 +117,7 @@ fn attention_decode_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, grou
         spans,
         fresh,
         range,
+        |_| true,
         |token, out| activation::widen::<E::A>(history_key.row([token, kv_head, 0]), out),
         |token, out| activation::widen::<E::A>(history_value.row([token, kv_head, 0]), out),
         |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),

@@ -265,6 +265,7 @@ fn scalar_argument(value: ScalarValue) -> ArgumentValue {
         ScalarValue::BF16(value) => ArgumentValue::BF16(value),
         ScalarValue::I32(value) => ArgumentValue::I32(value),
         ScalarValue::U32(value) => ArgumentValue::U32(value),
+        ScalarValue::U64(value) => ArgumentValue::U64(value),
         ScalarValue::Bool(value) => ArgumentValue::Bool(value),
         ScalarValue::Index(value) => ArgumentValue::Index(value),
         ScalarValue::Range { start, end } => ArgumentValue::Range { start, end },

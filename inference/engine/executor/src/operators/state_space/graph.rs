@@ -6,14 +6,16 @@
 //! ports.
 
 use crate::operators::gated_delta::graph::{
-    bank_ports, chunked, RecurrentControlPorts, RecurrentStatePorts,
+    RecurrentControlPorts, RecurrentStatePorts, bank_ports, chunked,
 };
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::operators::{InputForm, Join};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
 use crate::{
-    native::StateSpaceKernels, ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape,
+    ModelLoadPlan, StateResourcePlan, StateSpaceBinding, StateSpaceShape, native::StateSpaceKernels,
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{
     attention_output, attention_project, state_space_chunk, state_space_gate, state_space_step,
 };
@@ -96,10 +98,19 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
+    join: &Join,
     block: StateSpaceBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
+    let mut bound = |graph: &mut G, kind| {
+        PackingBound::planned(graph, load, WeightRole { scope, kind }, weights, constants)
+    };
+    let projection_bound = bound(graph, WeightKind::StateSpaceProjection)?;
+    let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
+    // The projection's other segments are absent, and so are their bounds.
+    let absent = PackingBound::absent(graph, constants)?;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
     let projection_weight = weight(graph, WeightKind::StateSpaceProjection)?;
@@ -118,7 +129,17 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     let projection = graph
         .enqueue(
             kernels.project,
-            &shape.project_dimensions(block.rows),
+            &[
+                shape.project_dimensions(block.rows).as_slice(),
+                &[
+                    ("QB", projection_bound.extent),
+                    ("GB", 0),
+                    ("KB", 0),
+                    ("VB", 0),
+                ],
+                &InputForm::SINGLE.dimensions(shape.hidden),
+            ]
+            .concat(),
             attention_project::WorkflowArgs {
                 hidden: hidden.into(),
                 input_norm: (&input_norm).into(),
@@ -128,6 +149,10 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 value_weight: (&empty).into(),
                 epsilon: block.epsilon,
                 project_mode: 0,
+                query_bound: (&projection_bound.tensor).into(),
+                gate_bound: (&absent.tensor).into(),
+                key_bound: (&absent.tensor).into(),
+                value_bound: (&absent.tensor).into(),
             },
         )?
         .r0;
@@ -189,14 +214,21 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
+    let inject = join.inject(graph, block.rows, constants)?;
     let output = graph
         .enqueue(
             kernels.output,
-            &shape.output_dimensions(block.rows),
+            &[
+                shape.output_dimensions(block.rows).as_slice(),
+                &[("OB", output_bound.extent)],
+            ]
+            .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
+                inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
+                output_bound: (&output_bound.tensor).into(),
             },
         )?
         .value;
@@ -207,14 +239,14 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, source_element, ComponentSelection, ExecutionPath, FeedForwardProgramSlot,
-        MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity, ResourceLimits,
-        ResourcePlanner,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
+        source_element,
     };
     use crate::{DenseScales, GeneralRoutedScales, PlanError};
     use magnitude_artifacts::{
-        gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+        gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
@@ -250,7 +282,7 @@ mod tests {
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
             let mut stored = |name: String, shape: Vec<u64>, encoding: Encoding| {
-                let nbytes = source_element(encoding)
+                let nbytes = source_element(encoding, *shape.last().unwrap())
                     .unwrap()
                     .canonical_byte_len(&shape)
                     .unwrap();
@@ -518,7 +550,10 @@ mod tests {
                 magnitude_state::KvCodec::Dense,
             )
             .unwrap();
-            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
+            assert!(
+                demand.streamed_bytes > 0 && demand.launches > 0,
+                "{backend:?}"
+            );
         }
     }
 
@@ -635,7 +670,10 @@ mod tests {
             );
             assert!(matches!(
                 plan.target().readout().head,
-                crate::ReadoutHead::Packed { weight_scale: 1, .. }
+                crate::ReadoutHead::Packed {
+                    weight_scale: 1,
+                    ..
+                }
             ));
 
             let state = ResourcePlanner::state_plan(

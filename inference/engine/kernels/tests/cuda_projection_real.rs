@@ -10,7 +10,7 @@
 mod cuda_common;
 
 use cuda_common::*;
-use magnitude_kernels::dense_expand;
+use magnitude_kernels::{dense_expand, project_rows};
 use seismic::{Element, NativeSpecialization, Tensor};
 use seismic_lang::registry::bf16_round;
 use std::collections::HashMap;
@@ -122,6 +122,8 @@ impl Gguf {
             7 => Format::Q5_1,
             39 => Format::Mxfp4,
             40 => Format::Nvfp4,
+            17 => Format::Iq2Xs,
+            18 => Format::Iq3Xxs,
             other => panic!("{name}: GGUF type {other}"),
         };
         let k = dims[0] as usize;
@@ -136,6 +138,8 @@ impl Gguf {
             Format::Q5_1 => 24,
             Format::Mxfp4 => 17,
             Format::Nvfp4 => 36,
+            Format::Iq2Xs => 74,
+            Format::Iq3Xxs => 98,
         };
         let row_bytes = k / format.block_values() * block_bytes;
         let start = self.data + offset + first * row_bytes;
@@ -316,7 +320,7 @@ fn real_4b_projections_match_their_operand_emulation() {
                             UW: up_format.resident(),
                             A: Element::bf16(),
                         },
-                        &mapping.dense_expand_params(
+                        &mapping.projection_params(
                             NativeSpecialization::new()
                                 .with_static("H", h as u64)
                                 .with_static("F", f as u64)
@@ -335,8 +339,14 @@ fn real_4b_projections_match_their_operand_emulation() {
                                 out_rows: &out_rows,
                                 eps: EPSILON,
                                 activation: 0,
-                                gate_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
-                                up_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[]).unwrap(),
+                                gate_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                    .unwrap(),
+                                up_scale: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                    .unwrap(),
+                                gate_bound: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                    .unwrap(),
+                                up_bound: &Tensor::from_host(&device, Element::f32(), &[0], &[])
+                                    .unwrap(),
                             })
                             .unwrap()
                             .value,
@@ -382,4 +392,392 @@ fn real_4b_projections_match_their_operand_emulation() {
         failures.is_empty(),
         "paths departing from their emulation: {failures:?}"
     );
+}
+
+/// Actual large-row geometry qualifies the converted operand algorithm; this
+/// direct native diagnostic does not publish model-level class admission.
+#[test]
+fn real_12b_physical_f16_projection_operands() {
+    let Some(device) = cuda() else { return };
+    let Ok(path) = std::env::var("MAGNITUDE_GGUF_12B") else {
+        return;
+    };
+    let gguf = Gguf::open(&path);
+    let (rows, hidden, intermediate) = (512usize, 3840usize, 15360usize);
+    let load = |name: &str| {
+        let (format, width, bytes) = gguf.rows(name, 0, intermediate);
+        assert_eq!(width, hidden);
+        let resident = format.resident();
+        let shape = [intermediate as u64, hidden as u64];
+        let packed = resident
+            .repack_host(Element::named(format.external()).unwrap(), &shape, &bytes)
+            .unwrap();
+        Tensor::from_host(&device, resident, &shape, &packed).unwrap()
+    };
+    let gate = load("blk.0.ffn_gate.weight");
+    let up = load("blk.0.ffn_up.weight");
+    let values = residual(&gguf, rows, false);
+    let residual = f32_tensor(&device, &[rows as u64, hidden as u64], &values);
+    let norm = f32_tensor(
+        &device,
+        &[hidden as u64],
+        &gguf.f32s("blk.0.ffn_norm.weight"),
+    );
+    let out_rows = i32_tensor(
+        &device,
+        &[rows as u64],
+        &(0..rows as i32).collect::<Vec<_>>(),
+    );
+    let absent = f32_tensor(&device, &[0], &[]);
+    let kernel = |operand| {
+        dense_expand::native_for_device_with(
+            &device,
+            dense_expand::Elements {
+                NW: Element::f32(),
+                GW: gate.element(),
+                UW: up.element(),
+                A: Element::bf16(),
+            },
+            &Mapping {
+                int8: 0,
+                ksplit: 4,
+                rotate: 1,
+            }
+            .projection_params(
+                NativeSpecialization::new()
+                    .with_static("H", hidden as u64)
+                    .with_static("F", intermediate as u64)
+                    .with_static("GS", 0)
+                    .with_static("US", 0),
+            )
+            .with_param("OPERAND", operand),
+        )
+        .unwrap()
+    };
+    let args = || dense_expand::Args {
+        residual: &residual,
+        norm: &norm,
+        gate_weight: &gate,
+        up_weight: &up,
+        out_rows: &out_rows,
+        eps: 1e-6,
+        activation: 1,
+        gate_scale: &absent,
+        up_scale: &absent,
+        gate_bound: &absent,
+        up_bound: &absent,
+    };
+    let baseline = kernel(0);
+    let physical = kernel(1);
+    let reference = read_bf16(&baseline.call(args()).unwrap().value);
+    let actual = read_bf16(&physical.call(args()).unwrap().value);
+    assert!(
+        reference
+            .iter()
+            .chain(&actual)
+            .all(|value| value.is_finite())
+    );
+    let scale = (reference
+        .iter()
+        .map(|&value| (value as f64).powi(2))
+        .sum::<f64>()
+        / reference.len() as f64)
+        .sqrt();
+    let rms = (reference
+        .iter()
+        .zip(&actual)
+        .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+        .sum::<f64>()
+        / reference.len() as f64)
+        .sqrt()
+        / scale;
+    let radius = |value: f32, toward: f32| {
+        let bits = value.to_bits() >> 16;
+        let adjacent = if value == 0.0 {
+            1 | if toward < 0.0 { 0x8000 } else { 0 }
+        } else if (value > 0.0) == (toward > value) {
+            bits + 1
+        } else {
+            bits - 1
+        };
+        (f32::from_bits(adjacent << 16) as f64 - value as f64).abs() * 0.5
+    };
+    let peak = reference
+        .iter()
+        .zip(&actual)
+        .map(|(&a, &b)| {
+            ((a as f64 - b as f64).abs() - radius(a, b) - radius(b, a)).max(0.0) / scale
+        })
+        .fold(0.0f64, f64::max);
+    eprintln!(
+        "physical F16 operand diagnostic: RMS={rms}, peak rounding-cell gap={peak}, outputs={}",
+        actual.len()
+    );
+    assert!(
+        rms <= 0.005 && peak <= 0.25,
+        "empirical kernel class envelope"
+    );
+    let measure = seismic::MeasureOptions {
+        samples: 13,
+        min_sample_seconds: 0.02,
+    };
+    for round in 0..3 {
+        let order = if round % 2 == 0 {
+            [("semantic", &baseline), ("physical-F16", &physical)]
+        } else {
+            [("physical-F16", &physical), ("semantic", &baseline)]
+        };
+        for (name, kernel) in order {
+            let seconds = kernel.measure(vec![args()], &measure).unwrap().median;
+            eprintln!("paired round{round} {name}: {:.6} ms", seconds * 1e3);
+        }
+    }
+    // A different consumer: the actual down projection reads the semantic
+    // gate/up output and publishes F32, so it has no GLU rounding-cell proxy.
+    let (format, width, bytes) = gguf.rows("blk.0.ffn_down.weight", 0, hidden);
+    assert_eq!(width, intermediate);
+    let resident = format.resident();
+    let shape = [hidden as u64, intermediate as u64];
+    let packed = resident
+        .repack_host(Element::named(format.external()).unwrap(), &shape, &bytes)
+        .unwrap();
+    let down = Tensor::from_host(&device, resident, &shape, &packed).unwrap();
+    let product = baseline.call(args()).unwrap().value;
+    let down_kernel = |operand| {
+        project_rows::native_for_device_with(
+            &device,
+            project_rows::Elements {
+                A: Element::bf16(),
+                W: down.element(),
+                Y: Element::f32(),
+            },
+            &NativeSpecialization::new()
+                .with_static("K", intermediate as u64)
+                .with_static("N", hidden as u64)
+                .with_static("WS", 0)
+                .with_param("INT8", 0)
+                .with_param("OPERAND", operand)
+                .with_launch_param(1, "KSPLIT", 4)
+                .with_launch_param(2, "KSPLIT", 4)
+                .with_launch_param(4, "ROTATE", 2),
+        )
+        .unwrap()
+    };
+    let down_args = || project_rows::Args {
+        source: &product,
+        weight: &down,
+        weight_scale: &absent,
+        weight_bound: &absent,
+    };
+    let exact_down = down_kernel(0);
+    let physical_down = down_kernel(1);
+    let expected = read_f32(&exact_down.call(down_args()).unwrap().value);
+    let got = read_f32(&physical_down.call(down_args()).unwrap().value);
+    assert!(expected.iter().chain(&got).all(|x| x.is_finite()));
+    let rms_scale =
+        (expected.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / expected.len() as f64).sqrt();
+    let difference = expected
+        .iter()
+        .zip(&got)
+        .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+        .sum::<f64>();
+    let relative_rms = (difference / expected.len() as f64).sqrt() / rms_scale;
+    let relative_peak = expected
+        .iter()
+        .zip(&got)
+        .map(|(&a, &b)| (a as f64 - b as f64).abs() / rms_scale)
+        .fold(0.0f64, f64::max);
+    eprintln!("physical F16 down operand diagnostic: RMS={relative_rms}, peak={relative_peak}");
+    assert!(
+        relative_rms <= 0.005 && relative_peak <= 0.25,
+        "empirical kernel class envelope"
+    );
+    for round in 0..3 {
+        let order = if round % 2 == 0 {
+            [("semantic", &exact_down), ("physical-F16", &physical_down)]
+        } else {
+            [("physical-F16", &physical_down), ("semantic", &exact_down)]
+        };
+        for (name, kernel) in order {
+            let seconds = kernel.measure(vec![down_args()], &measure).unwrap().median;
+            eprintln!("down paired round{round} {name}: {:.6} ms", seconds * 1e3);
+        }
+    }
+
+    // Same semantic/physical type still needs a produced materialized view.
+    // Forty rows also exercise split-K; one row must retain exact GEMV bits.
+    for count in [1usize, 40] {
+        let bytes = reference[..count * intermediate]
+            .iter()
+            .flat_map(|&x| seismic_lang::registry::f16_bits(x).to_le_bytes())
+            .collect::<Vec<_>>();
+        let input = Tensor::from_host(
+            &device,
+            Element::f16(),
+            &[count as u64, intermediate as u64],
+            &bytes,
+        )
+        .unwrap();
+        let form = |operand| {
+            project_rows::native_for_device_with(
+                &device,
+                project_rows::Elements {
+                    A: Element::f16(),
+                    W: down.element(),
+                    Y: Element::f32(),
+                },
+                &NativeSpecialization::new()
+                    .with_static("K", intermediate as u64)
+                    .with_static("N", hidden as u64)
+                    .with_static("WS", 0)
+                    .with_param("INT8", 0)
+                    .with_param("OPERAND", operand)
+                    .with_launch_param(1, "KSPLIT", 4)
+                    .with_launch_param(2, "KSPLIT", 4)
+                    .with_launch_param(4, "ROTATE", 2),
+            )
+            .unwrap()
+        };
+        let args = || project_rows::Args {
+            source: &input,
+            weight: &down,
+            weight_scale: &absent,
+            weight_bound: &absent,
+        };
+        let left = read_f32(&form(0).call(args()).unwrap().value);
+        let right = read_f32(&form(1).call(args()).unwrap().value);
+        if count == 1 {
+            assert_eq!(left, right, "operand policy must preserve exact decode");
+        } else {
+            let scale =
+                (left.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / left.len() as f64).sqrt();
+            let rms = (left
+                .iter()
+                .zip(&right)
+                .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+                .sum::<f64>()
+                / left.len() as f64)
+                .sqrt()
+                / scale;
+            assert!(
+                right.iter().all(|x| x.is_finite()) && rms <= 0.005,
+                "materialized same-type split-K operand view RMS={rms}"
+            );
+            eprintln!("F16 semantic/physical split-K rows40 RMS={rms}");
+        }
+    }
+}
+
+/// Actual 26B packed expert matrices and full balanced 512x8 routed coverage.
+/// This isolates operand reuse; the order is synthetic, not a trained router.
+#[test]
+fn real_26b_grouped_physical_f16_operands() {
+    let Some(device) = cuda() else { return };
+    let Ok(path) = std::env::var("MAGNITUDE_GGUF_26B") else {
+        return;
+    };
+    let gguf = Gguf::open(&path);
+    let (m, e, f, h, t) = (512usize, 128usize, 704usize, 2816usize, 32usize);
+    let load = |name: &str, columns: usize, rows: usize, offset: usize, stride: usize| {
+        let mut external = Vec::new();
+        let mut format = None;
+        for expert in 0..e {
+            let (kind, width, bytes) = gguf.rows(name, expert * stride + offset, rows);
+            assert_eq!(width, columns);
+            format = Some(kind);
+            external.extend_from_slice(&bytes);
+        }
+        let format = format.unwrap();
+        let shape = [e as u64, rows as u64, columns as u64];
+        let resident = format.resident();
+        let bytes = resident
+            .repack_host(
+                Element::named(format.external()).unwrap(),
+                &shape,
+                &external,
+            )
+            .unwrap();
+        Tensor::from_host(&device, resident, &shape, &bytes).unwrap()
+    };
+    let gate = load("blk.0.ffn_gate_up_exps.weight", h, f, 0, f * 2);
+    let up = load("blk.0.ffn_gate_up_exps.weight", h, f, f, f * 2);
+    let down = load("blk.0.ffn_down_exps.weight", f, h, 0, h);
+    let norm = gguf
+        .f32s("blk.0.ffn_norm.weight")
+        .into_iter()
+        .map(bf16_round)
+        .collect::<Vec<_>>();
+    let input = normalized(&residual(&gguf, m, false), &norm, m, h);
+    let input = bf16_tensor(&device, &[m as u64, h as u64], &input);
+    let order = (0..e * t).map(|i| (i % m) as i32).collect::<Vec<_>>();
+    let order = i32_tensor(&device, &[e as u64, t as u64], &order);
+    let blocks = i32_tensor(&device, &[e as u64], &(0..e as i32).collect::<Vec<_>>());
+    let form = |operand| {
+        magnitude_kernels::routed_experts::native_for_device_with(
+            &device,
+            magnitude_kernels::routed_experts::Elements {
+                A: Element::bf16(),
+                EGW: gate.element(),
+                EUW: up.element(),
+                EDW: down.element(),
+            },
+            &NativeSpecialization::new()
+                .with_static("H", h as u64)
+                .with_static("F", f as u64)
+                .with_param("OPERAND", operand),
+        )
+        .unwrap()
+    };
+    let args = || magnitude_kernels::routed_experts::Args {
+        normalized: &input,
+        order: &order,
+        blocks: &blocks,
+        expert_gate: &gate,
+        expert_up: &up,
+        expert_down: &down,
+        activation: 1,
+    };
+    let baseline = form(0);
+    let physical = form(1);
+    let left = read_bf16(&baseline.call(args()).unwrap().value);
+    let right = read_bf16(&physical.call(args()).unwrap().value);
+    assert!(left.iter().chain(&right).all(|x| x.is_finite()));
+    let scale = (left.iter().map(|&x| (x as f64).powi(2)).sum::<f64>() / left.len() as f64).sqrt();
+    let rms = (left
+        .iter()
+        .zip(&right)
+        .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+        .sum::<f64>()
+        / left.len() as f64)
+        .sqrt()
+        / scale;
+    let peak = left
+        .iter()
+        .zip(&right)
+        .map(|(&a, &b)| (a as f64 - b as f64).abs() / scale)
+        .fold(0.0f64, f64::max);
+    eprintln!(
+        "26B grouped physical operands: RMS={rms}, raw peak={peak}, outputs={}",
+        left.len()
+    );
+    // Raw peak includes output rounding. Whole-model admission remains separate.
+    assert!(rms <= 0.005, "empirical operand RMS envelope");
+    let measure = seismic::MeasureOptions {
+        samples: 13,
+        min_sample_seconds: 0.02,
+    };
+    for round in 0..3 {
+        let order = if round % 2 == 0 {
+            [("semantic", &baseline), ("physical-F16", &physical)]
+        } else {
+            [("physical-F16", &physical), ("semantic", &baseline)]
+        };
+        for (name, kernel) in order {
+            let seconds = kernel.measure(vec![args()], &measure).unwrap().median;
+            eprintln!(
+                "26B grouped paired round{round} {name}: {:.6} ms",
+                seconds * 1e3
+            );
+        }
+    }
 }

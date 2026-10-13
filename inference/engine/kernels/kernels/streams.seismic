@@ -1,0 +1,286 @@
+# Hyper-connection residual streams. The residual is S streams of H values
+# per row, one `[M, S * H]` F32 tensor (stream s at columns s * H ..). A
+# sublayer reads it through a mix site and writes back through a scatter:
+#   xn[s]  = rms(X[s]) * norm[s]                       (per-stream RMS norm)
+#   low    = silu(down(xn) / S)                        (`stream_mix_down`)
+#   inject = 2 sigmoid(inject(xn) / S)                 (`stream_mix_down`, C = 1)
+#   p[s]   = sigmoid(up(low))[s] * xn[s] / S           (`stream_mix_up`)
+# The sublayer's input row is the sum of the S partials p, formed by its
+# consumer entry (`form_input` in functions.seismic, PT = S, NM = 0), and its
+# output joins the streams through the output entry's `scatter` with the
+# inject values (`functions.seismic`). The decoder's exit is a mix site
+# without inject (C = 0) whose partials the readout sums.
+#
+# The mix entries read the streams and their norm through `[M, S, H]` and
+# `[S, H]` views of the row-major `[M, S * H]` and `[S * H]` tensors, which
+# name S and H; their natives read a row's S * H values at the innermost
+# stride.
+
+# The per-stream RMS normalization of the streams, rounded to the result's
+# element as rows of S * H, and each stream's inverse.
+fn group_rms[M, H, S](x: &tensor[M, S, H] f32, norm: &tensor[S, H] T,
+    y: &mut tensor[M, S * H] U, inverse: &mut tensor[M, S] f32, epsilon: f32):
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            let mut squares = f32(0.0)
+            for column in 0..H:
+                let v = x[row, stream, column]
+                squares = squares + v * v
+            let scale = rsqrt(squares / f32(H) + epsilon)
+            inverse[row, stream] = scale
+            for column in 0..H:
+                y[row, stream * H + column] = x[row, stream, column] * scale * f32(norm[stream, column])
+
+# A mix site's first stage: the per-stream normalized streams (rounded to A)
+# through one segmented projection, down | inject. Results: the low-rank
+# rows `silu(v / S)` in A, the inject values `2 sigmoid(v / S)` in F32 (C = 1;
+# none for the exit site, C = 0), and the per-stream norm inverses the second
+# stage reads.
+fn stream_mix_down[M, H, S, LR, C](hidden: &tensor[M, S, H] f32, norm: &tensor[S, H] NW,
+    down_weight: &tensor[LR, S * H] DW, inject_weight: &tensor[C * S, S * H] IW, epsilon: f32)
+    -> (tensor[M, LR] A, tensor[M, C * S] f32, tensor[M, S] f32)
+    where S >= 1 and LR >= 1 and C >= 0 and C <= 1:
+    let mut normalized = tensor[M, S * H] A
+    let mut inverse = tensor[M, S] f32
+    let mut low_sum = tensor[M, LR] f32
+    let mut low = tensor[M, LR] A
+    let mut inject_sum = tensor[M, C * S] f32
+    let mut inject = tensor[M, C * S] f32
+    group_rms(hidden, norm, normalized, inverse, epsilon)
+    linear(normalized, down_weight, low_sum)
+    parallel for row in 0..M:
+        parallel for column in 0..LR:
+            let v = low_sum[row, column] / f32(S)
+            low[row, column] = v / (1.0 + exp(-v))
+    if C > 0:
+        linear(normalized, inject_weight, inject_sum)
+        parallel for row in 0..M:
+            parallel for column in 0..C * S:
+                inject[row, column] = 2.0 / (1.0 + exp(-inject_sum[row, column] / f32(S)))
+    return low, inject, inverse
+
+# A mix site's second stage: the low-rank rows through `up`, each output the
+# gate of its stream's column, publishing the per-stream partials
+# `sigmoid(v) * xn / S` in F32 (xn unrounded, from the first stage's
+# inverses).
+fn stream_mix_up[M, H, S, LR](low: &tensor[M, LR] A, up_weight: &tensor[S * H, LR] UW,
+    hidden: &tensor[M, S, H] f32, inverse: &tensor[M, S] f32, norm: &tensor[S, H] NW)
+    -> tensor[M, S * H] f32 where S >= 1 and LR >= 1:
+    # The rows are dense activations: staging them in A (an exact copy)
+    # states that domain (`project_rows`).
+    let mut rows = tensor[M, LR] A
+    parallel for row in 0..M:
+        rows[row] = low[row]
+    let mut gate_sum = tensor[M, S * H] f32
+    let mut partials = tensor[M, S * H] f32
+    linear(rows, up_weight, gate_sum)
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                let at = stream * H + column
+                let gate = 1.0 / (1.0 + exp(-gate_sum[row, at]))
+                let normalized = hidden[row, stream, column] * inverse[row, stream] * f32(norm[stream, column])
+                partials[row, at] = gate * normalized / f32(S)
+    return partials
+
+# S scaled copies of each row: copy s is `scales[s]` times the row. The
+# streams' entry is the copies of the embedded rows at scale 1 (exact).
+fn repeat_rows[M, H, S](rows: &tensor[M, H] f32, scales: &tensor[S] f32) -> tensor[M, S * H] f32
+    where S >= 1:
+    let mut result = tensor[M, S * H] f32
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..H:
+                result[row, stream * H + column] = rows[row, column] * scales[stream]
+    return result
+
+# Metal: the projection library's row classes (`lib/projection`). GEMV
+# classes (to 16 rows) reduce every stream's square sum in each threadgroup
+# and normalize while staging; the first threadgroup publishes the inverses.
+# Past 16 rows `stage` publishes the normalized streams in A to scratch with
+# the inverses, one threadgroup per row and stream, and the GEMM reads them.
+native stream_mix_down for metal from "metal/stream_mix_down.metal":
+    static (H, S, LR, C)
+    params (arithmetic BATCH_FROM in [5, 3, 9])
+    where H % 32 == 0 and C <= 1
+    scratch normalized bytes (M * S * H * 2) when M > 16
+    launch stream_mix_down_gemv when M < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
+        threadgroups (ceil_div(LR, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(C * S, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(S * H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch stream_mix_down_batch when M >= BATCH_FROM and M <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(LR, BATCH_SIMDGROUPS * BATCH_ROWS * 8)
+            + ceil_div(C * S, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch stream_mix_down_stage when M > 16:
+        threadgroups (M * S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_down_gemm when M > 16:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(LR, TILE_N) + ceil_div(C * S, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+# CUDA: the projection library's classes (`attention_project`'s). Past one
+# row `stage` stages the normalized streams and publishes the inverses, one
+# block per row; a one-row GEMV block forms its row itself, and the first
+# block publishes the inverses.
+native stream_mix_down for cuda from "cuda/stream_mix_down.cu":
+    static (H, S, LR, C)
+    where (S * H) % 64 == 0 and C <= 1
+    scratch staged bytes (M * S * H * 2) when M > 1
+    launch stream_mix_down_stage when M > 1:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_down_gemv when M <= 8:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(LR, 16) + ceil_div(C * S, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((1 - min(1, M - 1)) * S * H * 2)
+    launch stream_mix_down_gemv16 when M > 8 and M <= 16:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(LR, 16) + ceil_div(C * S, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_down_gemm_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(ceil_div(LR, 16), 8) + ceil_div(ceil_div(C * S, 16), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 10240) + 2048)
+    launch stream_mix_down_gemm when M > 64:
+        params (code ROTATE in [2, 1, 4])
+        threadgroups (ceil_div(ceil_div(LR, 16), 8) + ceil_div(ceil_div(C * S, 16), 8), ceil_div(M, 128), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+
+# Vulkan: the library's GEMV prologue has one norm group per row, so `stage`
+# normalizes every stream into scratch and publishes its inverse at every row
+# count (one workgroup per row and stream); the GEMV (to 8 rows) and GEMM
+# classes read the staged rows.
+native stream_mix_down for vulkan from "vulkan/stream_mix_down.comp":
+    static (H, S, LR, C)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where H % 8 == 0 and C <= 1 and SUB_M <= TILE_M and SUB_N <= TILE_N
+    scratch normalized bytes (M * S * H * 2)
+    launch stream_mix_down_stage:
+        threadgroups (M * S, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (128)
+    launch stream_mix_down_gemv when M <= 8:
+        threadgroups (ceil_div(LR, SIMDGROUPS * ROWS * 32 / LANES)
+            + ceil_div(C * S, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(S * H, 32), 288) * 72)
+    launch stream_mix_down_gemm when M > 8:
+        threadgroups (ceil_div(LR, TILE_N) + ceil_div(C * S, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+# CPU: one work item per row normalizes its streams (the norm decoded into
+# its shared bytes) and publishes the inverses; then ROWS weight rows per
+# work item over the segments down | inject.
+native stream_mix_down for cpu from "cpu/stream_mix_down.rs":
+    params (ROWS in [8, 4, 2, 1])
+    scratch normalized bytes (M * S * H * 4)
+    launch stream_mix_down_normalize:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (H * 4)
+    launch stream_mix_down_rows:
+        threadgroups (ceil_div(LR, ROWS) + ceil_div(C * S, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Metal: the projection library's row classes over the plain low-rank rows,
+# with the `Mix` epilogue.
+native stream_mix_up for metal from "metal/stream_mix_up.metal":
+    static (H, S, LR)
+    params (arithmetic BATCH_FROM in [5, 3, 9])
+    where H % 32 == 0 and LR % 32 == 0
+    launch stream_mix_up_gemv when M < BATCH_FROM:
+        params (SIMDGROUPS in [16, 8, 4, 2, 32], code ROWS in [1, 2, 4], code arithmetic LANES in [16, 32, 8])
+        threadgroups (ceil_div(S * H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (min(ceil_div(LR, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+    launch stream_mix_up_batch when M >= BATCH_FROM and M <= 16:
+        params (BATCH_SIMDGROUPS in [8, 4, 16, 32], code BATCH_ROWS in [2, 1, 4])
+        threadgroups (ceil_div(S * H, BATCH_SIMDGROUPS * BATCH_ROWS * 8), 1, 1)
+        threads_per_threadgroup (BATCH_SIMDGROUPS * 32, 1, 1)
+        shared_bytes (16640)
+    launch stream_mix_up_gemm when M > 16:
+        params (code TILE_M in [64, 128, 32], code TILE_N in [64, 128])
+        threadgroups (ceil_div(S * H, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (max(TILE_M, 64) * TILE_N / 32, 1, 1)
+
+# CUDA: the projection library's classes over the low-rank rows read in
+# place (`attention_output`'s, without split-K: S * H columns are many).
+native stream_mix_up for cuda from "cuda/stream_mix_up.cu":
+    static (H, S, LR)
+    where LR % 64 == 0
+    launch stream_mix_up_gemv when M <= 8:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(S * H, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_up_gemv16 when M > 8 and M <= 16:
+        params (code arithmetic KSPLIT in [4, 2, 8])
+        threadgroups (ceil_div(ceil_div(S * H, 16), 8 / KSPLIT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch stream_mix_up_gemm_small when M > 16 and M <= 64:
+        threadgroups (ceil_div(ceil_div(S * H, 16), 8), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 10240) + 2048)
+    launch stream_mix_up_gemm when M > 64:
+        params (code ROTATE in [2, 1, 4])
+        threadgroups (ceil_div(ceil_div(S * H, 16), 8), ceil_div(M, 128), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 10240) + 2048)
+
+# Vulkan: the projection library's classes over the low-rank rows.
+native stream_mix_up for vulkan from "vulkan/stream_mix_up.comp":
+    static (H, S, LR)
+    params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
+            TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
+    where SUB_M <= TILE_M and SUB_N <= TILE_N
+    launch stream_mix_up_gemv when M <= 8:
+        threadgroups (ceil_div(S * H, SIMDGROUPS * ROWS * 32 / LANES), 1, 1)
+        threads_per_threadgroup (SIMDGROUPS * 32, 1, 1)
+        shared_bytes (256 + min(8 * ceil_div(LR, 32), 288) * 72)
+    launch stream_mix_up_gemm when M > 8:
+        threadgroups (ceil_div(S * H, TILE_N), ceil_div(M, TILE_M), 1)
+        threads_per_threadgroup (TILE_M * TILE_N * 32 / (SUB_M * SUB_N), 1, 1)
+        shared_bytes ((TILE_M + TILE_N) * 80)
+
+# CPU: the low-rank rows staged as F32, then ROWS weight rows per work item
+# (the norm decoded into its shared bytes).
+native stream_mix_up for cpu from "cpu/stream_mix_up.rs":
+    params (ROWS in [8, 4, 2, 1])
+    scratch staged bytes (M * LR * 4)
+    launch stream_mix_up_stage:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch stream_mix_up_rows:
+        threadgroups (ceil_div(S * H, ROWS), 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (S * H * 4)
+
+# One thread per value.
+native repeat_rows for metal from "metal/repeat_rows.metal":
+    launch repeat_rows:
+        threadgroups (ceil_div(M * S * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native repeat_rows for cuda from "cuda/repeat_rows.cu":
+    launch repeat_rows:
+        threadgroups (ceil_div(M * S * H, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native repeat_rows for vulkan from "vulkan/repeat_rows.comp":
+    launch repeat_rows:
+        threadgroups (min(ceil_div(M * S * H, 256), 65535), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native repeat_rows for cpu from "cpu/repeat_rows.rs":
+    launch repeat_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)

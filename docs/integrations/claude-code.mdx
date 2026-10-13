@@ -13,6 +13,8 @@ description: "Connect Claude Code to your downloaded Magnitude models."
 
 Magnitude configures Claude Code’s gateway. Local model IDs use the `anthropic-local/` prefix. Keep Magnitude running while connected, including for hosted models: hosted requests still go to their provider through the gateway. Disconnect and restart Claude Code before using it independently again.
 
+If Claude Code isn’t signed in, **Connect** also adds a placeholder credential, and Magnitude serves every request from it with your loaded model, including the Claude models that built-in subagents ask for. If you sign in to Claude Code later, connect again so your own login is used for Claude models.
+
 ## Run Claude Code
 
 After connecting in Magnitude, start Claude Code with:

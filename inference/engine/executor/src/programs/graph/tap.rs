@@ -7,7 +7,7 @@
 //! into the draft's conditioning features. Tap indices are run inputs, so
 //! blocks tapped at the same positions share a plan.
 
-use super::{draft::GraphDraft, GraphError};
+use super::{GraphError, draft::GraphDraft};
 use magnitude_kernels::tap_rows;
 use seismic::{Element, NativePort, WorkflowTensor};
 

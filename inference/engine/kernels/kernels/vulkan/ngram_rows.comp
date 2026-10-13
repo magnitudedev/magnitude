@@ -1,0 +1,86 @@
+// ngram_rows (contract and portable body in ngram.seismic): the n-gram table
+// rows of each launch row from its token and its predecessors, the ones
+// before the slot read from the slot's token window. The Vulkan form of
+// `cuda/ngram_rows.cu`: an invocation owns one item, item y < M forming row
+// y's C * P rows ((0, 0) past the slots), item M + b publishing slot b's
+// successor window. The hash is the body's u64 words (only a remainder of
+// them, never a quotient and remainder of one value; see `versions_bank`).
+#include <seismic/element.glsl>
+#include "lib/recurrent/versions.glsl"
+
+// The token of launch row `row`, stored as the window stores it.
+uint ngram_stored_token(int row) {
+    return uint(element_i32_at(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS) + uint64_t(row) * SEISMIC_TOKENS_STRIDE_0 * 4ul) + 1);
+}
+
+uint ngram_window_at(uint64_t bank, int tap) {
+    return element_u32_at(bank + uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 * 4ul);
+}
+
+uint64_t ngram_u64_at(uint64_t base, uint64_t index) {
+    return element_u64_at(base + index * 8ul);
+}
+
+void ngram_put(uint64_t entry, int row, int status) {
+    const uint64_t at = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + entry * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+    element_i32_put(at, row);
+    element_i32_put(at + SEISMIC_RESULT_0_STRIDE_1 * 4ul, status);
+}
+
+void ngram_rows() {
+    const uint64_t item = uint64_t(gl_WorkGroupID.x) * gl_WorkGroupSize.x + gl_LocalInvocationIndex;
+    const uint64_t launch_rows = SEISMIC_DIM_M;
+    if (item >= launch_rows + SEISMIC_DIM_B)
+        return;
+    const uint64_t window = SEISMIC_PTR(SEISMIC_BUFFER_WINDOW);
+    const uint64_t bank_bytes = SEISMIC_WINDOW_STRIDE_0 * 4ul;
+    const int context = int(SEISMIC_DIM_C);
+    const uint64_t heads_per_order = SEISMIC_DIM_P;
+    if (item >= launch_rows) {
+        const versions_slot slot = versions_slot_of(item - launch_rows);
+        const uint64_t source = versions_bank(window, slot.source, bank_bytes);
+        const uint64_t target = versions_bank(window, slot.target, bank_bytes);
+        const int published = context + versions_tape_rows(slot, int(SEISMIC_DIM_T));
+        for (int tap = 0; tap < published; ++tap) {
+            const int position = slot.stop + tap - context;
+            const uint value = position < 0 ? ngram_window_at(source, slot.taped + slot.stop + tap)
+                                            : ngram_stored_token(slot.lo + position);
+            element_u32_put(target + uint64_t(tap) * SEISMIC_WINDOW_STRIDE_1 * 4ul, value);
+        }
+        return;
+    }
+    const int row = int(item);
+    const uint64_t heads = uint64_t(context) * heads_per_order;
+    const uint64_t first = uint64_t(row) * heads;
+    const uint64_t slot_index = versions_slot_index_of_row(row);
+    if (slot_index == SEISMIC_DIM_B) {
+        for (uint64_t head = 0ul; head < heads; ++head)
+            ngram_put(first + head, 0, 0);
+        return;
+    }
+    const versions_slot slot = versions_slot_of(slot_index);
+    const uint64_t source = versions_bank(window, slot.source, bank_bytes);
+    const int local = row - slot.lo;
+    const int reset = int(uint(SEISMIC_PARAM_RESET));
+    const uint reset_stored = uint(reset + 1);
+    const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS) + uint64_t(row) * SEISMIC_TOKENS_STRIDE_0 * 4ul;
+    const int status = element_i32_at(tokens + SEISMIC_TOKENS_STRIDE_1 * 4ul);
+    const uint64_t multipliers = SEISMIC_PTR(SEISMIC_BUFFER_MULTIPLIERS);
+    const uint64_t sizes = SEISMIC_PTR(SEISMIC_BUFFER_SIZES);
+    const uint64_t offsets = SEISMIC_PTR(SEISMIC_BUFFER_OFFSETS);
+    uint64_t mixed = uint64_t(int64_t(element_i32_at(tokens))) * ngram_u64_at(multipliers, 0ul);
+    bool cut = false;
+    for (int distance = 1; distance <= context; ++distance) {
+        const uint stored = local >= distance ? ngram_stored_token(row - distance)
+                                              : ngram_window_at(source, slot.taped + context + local - distance);
+        cut = cut || stored == 0u || stored == reset_stored;
+        const uint64_t token = cut ? uint64_t(int64_t(reset)) : uint64_t(stored - 1u);
+        mixed ^= token * ngram_u64_at(multipliers, uint64_t(distance) * SEISMIC_MULTIPLIERS_STRIDE_0);
+        for (uint64_t p = 0ul; p < heads_per_order; ++p) {
+            const uint64_t head = uint64_t(distance - 1) * heads_per_order + p;
+            const uint64_t table_row = ngram_u64_at(offsets, head * SEISMIC_OFFSETS_STRIDE_0)
+                + mixed % ngram_u64_at(sizes, head * SEISMIC_SIZES_STRIDE_0);
+            ngram_put(first + head, int(table_row), status);
+        }
+    }
+}

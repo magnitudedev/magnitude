@@ -11,34 +11,43 @@ use seismic::{Device, Tensor};
 pub struct ResidentWeightSlot {
     identity: WeightStorageIdentity,
     tensor: Tensor,
+    /// The weight's packing bound, which its import makes
+    /// (`WeightPlan::bound`): `[bound] f32`, where its plan has one.
+    bound: Option<Tensor>,
 }
 
 impl ResidentWeightSlot {
     pub fn new(plan: &WeightPlan, device: &Device, tensor: Tensor) -> Result<Self, InvariantError> {
+        let invariant = |detail: String| InvariantError {
+            context: "resident weight slot",
+            detail,
+        };
         if !tensor.belongs_to(device)
             || tensor.element() != plan.resident
             || tensor.extents() != plan.shape
             || tensor.byte_len() != plan.resident_bytes
         {
-            return Err(InvariantError {
-                context: "resident weight slot",
-                detail: format!(
-                    "{} ({:?}): planned element {:?}, shape {:?}, bytes {}; actual element {:?}, shape {:?}, bytes {}, same device {}",
-                    plan.descriptor.name,
-                    plan.role,
-                    plan.resident,
-                    plan.shape,
-                    plan.resident_bytes,
-                    tensor.element(),
-                    tensor.extents(),
-                    tensor.byte_len(),
-                    tensor.belongs_to(device),
-                ),
-            });
+            return Err(invariant(format!(
+                "{} ({:?}): planned element {:?}, shape {:?}, bytes {}; actual element {:?}, shape {:?}, bytes {}, same device {}",
+                plan.descriptor.name,
+                plan.role,
+                plan.resident,
+                plan.shape,
+                plan.resident_bytes,
+                tensor.element(),
+                tensor.extents(),
+                tensor.byte_len(),
+                tensor.belongs_to(device),
+            )));
         }
+        let bound = (plan.bound != 0)
+            .then(|| Tensor::zeros(device, seismic::Element::f32(), &[plan.bound]))
+            .transpose()
+            .map_err(|error| invariant(error.to_string()))?;
         Ok(Self {
             identity: plan.storage_identity(),
             tensor,
+            bound,
         })
     }
 
@@ -48,11 +57,13 @@ impl ResidentWeightSlot {
     pub fn tensor(&self) -> &Tensor {
         &self.tensor
     }
-    pub fn tensor_mut(&mut self) -> &mut Tensor {
-        &mut self.tensor
+    /// The resident weight and its packing bound, which an import writes.
+    pub fn parts_mut(&mut self) -> (&Tensor, Option<&mut Tensor>) {
+        (&self.tensor, self.bound.as_mut())
     }
-    pub fn into_tensor(self) -> Tensor {
-        self.tensor
+    /// The resident weight and its packing bound.
+    pub fn into_parts(self) -> (Tensor, Option<Tensor>) {
+        (self.tensor, self.bound)
     }
 }
 

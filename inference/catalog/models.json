@@ -17,6 +17,7 @@
       "repository": "unsloth/Qwen3.5-4B-MTP-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-4B-DFlash-GGUF", "path": "Qwen3.5-4B-DFlash-Q8_0.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 13.1,
@@ -42,6 +43,7 @@
       "repository": "unsloth/Qwen3.5-9B-MTP-GGUF",
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
+      "speculativeDecoding": { "method": "dflash", "draft": { "type": "file", "repository": "magnitudedev/Qwen3.5-9B-DFlash-GGUF", "path": "Qwen3.5-9B-DFlash-Q8_0.gguf" } },
       "license": "apache-2.0",
       "artificialAnalysis": {
         "score": 11.2,
@@ -81,9 +83,13 @@
       "description": "Large multimodal MoE preview of Qwen's next-generation architecture with strong agentic reasoning and low active compute.",
       "releaseDate": "2026-08-26",
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 180000000000, "activeParameters": 6000000000 },
-      "support": { "level": "disabled", "reason": "Qwen4exp hyper-connections and QSA attention are not implemented yet." },
+      "support": { "level": "supported" },
       "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": { "type": "file", "repository": "unsloth/Qwen3.8-Flash-Next-GGUF", "path": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" }
+      },
+      "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "fidelityRank": 20, "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "qwen-community-1.0",
       "artificialAnalysis": {
@@ -104,7 +110,7 @@
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 35000000000, "activeParameters": 3000000000 },
       "support": { "level": "supported" },
       "repository": "unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
-      "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "variants": [{"variantId": "gguf:q2", "format": "UD-Q2_K_XL", "variantLabel": "Q2", "fidelityRank": 20, "quantizationAware": false}, {"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "UD-Q5_K_XL", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "UD-Q6_K_XL", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "UD-Q8_K_XL", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "speculativeDecoding": {
         "method": "dflash",
@@ -155,6 +161,14 @@
       "parameterization": { "architecture": "dense", "totalParameters": 5100000000 },
       "support": { "level": "supported" },
       "repository": "unsloth/gemma-4-E2B-it-qat-GGUF",
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-E2B-it-qat-MTP-GGUF",
+          "path": "gemma-4-E2B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
@@ -180,6 +194,14 @@
       "parameterization": { "architecture": "dense", "totalParameters": 8000000000 },
       "support": { "level": "supported" },
       "repository": "unsloth/gemma-4-E4B-it-qat-GGUF",
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-E4B-it-qat-MTP-GGUF",
+          "path": "gemma-4-E4B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
@@ -344,6 +366,14 @@
       "parameterization": { "architecture": "dense", "totalParameters": 11950000000 },
       "support": { "level": "supported" },
       "repository": "unsloth/gemma-4-12B-it-qat-GGUF",
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-12B-it-qat-MTP-GGUF",
+          "path": "gemma-4-12B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
@@ -369,6 +399,14 @@
       "parameterization": { "architecture": "mixtureOfExperts", "totalParameters": 25200000000, "activeParameters": 3800000000 },
       "support": { "level": "supported" },
       "repository": "unsloth/gemma-4-26B-A4B-it-qat-GGUF",
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-26B-A4B-it-qat-MTP-GGUF",
+          "path": "gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",
@@ -394,6 +432,14 @@
       "parameterization": { "architecture": "dense", "totalParameters": 30700000000 },
       "support": { "level": "supported" },
       "repository": "unsloth/gemma-4-31B-it-qat-GGUF",
+      "speculativeDecoding": {
+        "method": "mtp",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/gemma-4-31B-it-qat-MTP-GGUF",
+          "path": "gemma-4-31B-it-qat-MTP-Q4_0.gguf"
+        }
+      },
       "variants": [{"variantId": "gguf:q4", "format": "UD-Q4_K_XL", "variantLabel": "Q4 QAT", "fidelityRank": 58, "quantizationAware": true}],
       "projector": { "path": "mmproj-BF16.gguf" },
       "license": "apache-2.0",

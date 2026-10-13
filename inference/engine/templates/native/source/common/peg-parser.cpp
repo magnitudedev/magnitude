@@ -1347,14 +1347,14 @@ common_peg_parser common_peg_parser_builder::python_dict() {
         auto ws = space();
         auto member = sequence({python_string(), ws, literal(":"), ws, python_value()});
         auto members = sequence({member, zero_or_more(sequence({ws, literal(","), ws, member}))});
+        // Whitespace around a value belongs to its container's separators.
         return sequence({
             literal("{"),
             ws,
             choice({
                 literal("}"),
                 sequence({members, ws, literal("}")})
-            }),
-            ws
+            })
         });
     });
 }
@@ -1362,15 +1362,14 @@ common_peg_parser common_peg_parser_builder::python_dict() {
 common_peg_parser common_peg_parser_builder::python_array() {
     return rule("python-array", [this]() {
         auto ws = space();
-        auto elements = sequence({python_value(), zero_or_more(sequence({literal(","), ws, python_value()}))});
+        auto elements = sequence({python_value(), zero_or_more(sequence({ws, literal(","), ws, python_value()}))});
         return sequence({
             literal("["),
             ws,
             choice({
                 literal("]"),
                 sequence({elements, ws, literal("]")})
-            }),
-            ws
+            })
         });
     });
 }

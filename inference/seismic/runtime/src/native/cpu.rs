@@ -12,6 +12,7 @@ use seismic_cpu::{NativeStep, NativeSteps};
 use seismic_native_cpu::{Tier, WeightKernels};
 
 use super::trace::host_seconds;
+use super::timeline::{TimelineKind, TimelineNode};
 use super::{Dispatch, DispatchList, NativeRoute};
 use crate::backends::CpuOpened;
 use crate::driver::typed_buffer;
@@ -132,6 +133,7 @@ impl CpuInvocation<'_> {
 }
 
 /// The CPU route of one prepared implementation.
+#[derive(Clone)]
 pub(crate) struct CpuRoute {
     pub(crate) opened: Arc<CpuOpened>,
     pub(crate) tier: Tier,
@@ -200,11 +202,53 @@ pub(super) fn run(
     let mut weights = Vec::new();
     let calls = calls(list, &mut pointers, &mut weights);
     let now = host_seconds();
-    match steps(&calls, &pointers, &weights, executor.workers()) {
-        Ok(steps) if steps.is_empty() => (Ok(()), (now, now)),
-        Ok(steps) => executor.run_native(&Steps { steps, repetitions }, host_seconds),
-        Err(error) => (Err(error), (now, now)),
+    if !list.has_timelines() {
+        return match steps(&calls, &pointers, &weights, executor.workers()) {
+            Ok(steps) if steps.is_empty() => (Ok(()), (now, now)),
+            Ok(steps) => executor.run_native(&Steps { steps, repetitions }, host_seconds),
+            Err(error) => (Err(error), (now, now)),
+        };
     }
+    // The calls between timeline boundaries run as pool jobs of their own;
+    // at a boundary this thread waits for, or signals, its timelines.
+    let mut end = now;
+    for _ in 0..repetitions {
+        let mut first = 0;
+        for boundary in 0..=calls.len() {
+            let operations = list.timelines(boundary);
+            if operations.is_empty() && boundary < calls.len() {
+                continue;
+            }
+            match steps(&calls[first..boundary], &pointers, &weights, executor.workers()) {
+                Ok(steps) if steps.is_empty() => {}
+                Ok(steps) => {
+                    let (outcome, (_, finished)) = executor.run_native(
+                        &Steps {
+                            steps,
+                            repetitions: 1,
+                        },
+                        host_seconds,
+                    );
+                    end = finished;
+                    if outcome.is_err() {
+                        return (outcome, (now, end));
+                    }
+                }
+                Err(error) => return (Err(error), (now, end)),
+            }
+            first = boundary;
+            for operation in operations {
+                let TimelineKind::Cpu(timeline) = operation.timeline.kind() else {
+                    unreachable!("a run binds timelines of its own device");
+                };
+                match operation.node {
+                    TimelineNode::Wait => timeline.wait_unbounded(operation.value),
+                    TimelineNode::Signal => timeline.signal(operation.value),
+                }
+            }
+        }
+    }
+    (Ok(()), (now, end))
 }
 
 /// One call of a submission: its dispatch, the range of its buffers in the

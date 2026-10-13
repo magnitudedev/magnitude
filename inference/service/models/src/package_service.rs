@@ -1150,6 +1150,8 @@ impl InstalledModelPackages for ManagedModelStore {
     ) -> BoxFuture<'_, Result<RemoveInstalledModelPackageResponse, InventoryError>> {
         let package_id = package_id.clone();
         Box::pin(async move {
+            // Occurrence ids must come from the same observation that `delete` validates against.
+            self.ensure_installed_model_inventory().await?;
             let managed_occurrences = self
                 .installed_packages
                 .read()
@@ -1170,10 +1172,15 @@ impl InstalledModelPackages for ManagedModelStore {
             let mut removed = false;
             let mut freed_bytes = 0_u64;
             for inventory_entry_id in managed_occurrences {
-                let deleted = <Self as ModelInventory>::delete(self, &inventory_entry_id).await?;
+                let deleted = <Self as ModelInventory>::delete(self, &inventory_entry_id)
+                    .await
+                    .inspect_err(|error| {
+                        tracing::warn!(package_id = %package_id.0, model_id = %inventory_entry_id.0, %error, "installed model package removal failed");
+                    })?;
                 removed |= deleted.deleted;
                 freed_bytes = freed_bytes.saturating_add(deleted.freed_bytes);
             }
+            tracing::info!(package_id = %package_id.0, removed, freed_bytes, "removed installed model package");
             Ok(RemoveInstalledModelPackageResponse {
                 package_id,
                 removed,

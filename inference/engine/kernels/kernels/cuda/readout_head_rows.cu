@@ -9,7 +9,7 @@
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 using Source = projection::GemvSource<Pro>;
 using Scaling = projection::scaling<(SEISMIC_DIM_WS != 0)>;
 using Epi = Scaling::type<projection::Logits>;
@@ -41,19 +41,20 @@ __device__ __forceinline__ void head_gemv(const Pro &pro, projection::u8 *row, c
 }
 
 // The GEMM of one row band over the staged A rows.
-template <class Shape>
+template <class Shape, class Operands>
 __device__ __forceinline__ void head_gemm(const projection::u8 *staged, unsigned O, unsigned long long D,
                                           unsigned long long V, const packets::W0 &head, const Epi &epi) {
     extern __shared__ uint4 dynamic_shared[];
     const unsigned long long column = projection::gemm_column<Shape>();
     if (column < projection::gemm_columns(V))
-        projection::gemm_run<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, D, nullptr, O,
+        projection::gemm_run<Shape, false, Operands>(reinterpret_cast<projection::u8 *>(dynamic_shared), staged, D, nullptr, O,
                                            D, column, V, head, projection::NoWeight{}, epi);
 }
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_STAGE
-extern "C" __global__ void readout_head_rows_stage(SEISMIC_KERNEL_PARAMS) {
-    projection::stage_row<false>(PROLOGUE, blockIdx.x, SEISMIC_DIM_D, STAGING, nullptr);
+template <unsigned OPERAND>
+__global__ void readout_head_rows_stage(SEISMIC_KERNEL_PARAMS) {
+    projection::stage_projection_row<false, typename projection::GemmOperands<OPERAND>::type>(PROLOGUE, blockIdx.x, SEISMIC_DIM_O, SEISMIC_DIM_D, STAGING, nullptr);
 }
 #endif
 
@@ -74,15 +75,16 @@ __global__ void readout_head_rows_gemv16(SEISMIC_KERNEL_PARAMS) {
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM_SMALL
-extern "C" __global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
-    head_gemm<projection::SmallGemm>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
+template <unsigned OPERAND>
+__global__ void readout_head_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    head_gemm<projection::SmallGemm, typename projection::GemmOperands<OPERAND>::type>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD, EPILOGUE);
 }
 #endif
 
 #ifdef SEISMIC_FORMING_READOUT_HEAD_ROWS_GEMM
-template <unsigned ROTATE>
+template <unsigned OPERAND, unsigned ROTATE>
 __global__ void readout_head_rows_gemm(SEISMIC_KERNEL_PARAMS) {
-    head_gemm<projection::LargeGemm<ROTATE>>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
+    head_gemm<projection::LargeGemm<ROTATE>, typename projection::GemmOperands<OPERAND>::type>(STAGING, (unsigned)SEISMIC_DIM_O, SEISMIC_DIM_D, SEISMIC_DIM_V, HEAD,
                                              EPILOGUE);
 }
 #endif

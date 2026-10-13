@@ -3,8 +3,8 @@
 //! projection (`attention_output` over one head of `channels`).
 //! `short_conv_rows` declares no parameters.
 
-use super::cases::projection_shape;
-use super::{row_points, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits};
+use super::cases::{packing_statics, projection_shape};
+use super::{EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points};
 use crate::ShortConvBinding;
 use magnitude_family_contracts::{WeightKind, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project};
@@ -138,8 +138,10 @@ pub(crate) struct ShortConvOutputTuning {
 
 pub(crate) struct ShortConvOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    bound: Tensor,
 }
 
 impl EntryTuning for ShortConvOutputTuning {
@@ -168,7 +170,13 @@ impl EntryTuning for ShortConvOutputTuning {
             );
         }
         let [_, statics @ ..] = shape.output_dimensions(0);
-        Ok(statics.to_vec())
+        let mut statics = statics.to_vec();
+        statics.extend(packing_statics(
+            inputs,
+            &self.scopes,
+            &[("OB", Some(WeightKind::RecurrentOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -192,12 +200,14 @@ impl EntryTuning for ShortConvOutputTuning {
                         &[point.rows, shape.hidden],
                         seed + 1,
                     )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, 0], seed + 3)?,
                     gated: inputs.activation(
                         self.binding.activation,
                         &[point.rows, 1, shape.channels],
                         seed + 2,
                     )?,
                     output: inputs.weight(scope, WeightKind::RecurrentOutput)?,
+                    bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                 })
             })
             .collect()
@@ -206,13 +216,15 @@ impl EntryTuning for ShortConvOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_bound: &case.bound,
         }
     }
 
     generated_entry!(attention_output, this => attention_output::Elements {
         OW: this.binding.output,
         A: this.binding.activation,
-    }, rounded to this.binding.activation);
+    });
 }

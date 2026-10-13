@@ -9,7 +9,7 @@
 
 use crate::expr::{
     AnyExpr, BinaryOp, BoolExpr, CmpOp, DurationExpr, DurationTerm, ExprArena, IntExpr, NaryOp,
-    NatExpr, NodeView, SymbolId, UnaryOp,
+    NatExpr, NodeView, ScalarOperand, SymbolId, UnaryOp,
 };
 
 /// Maps a source symbol to an expression of the same sort in the destination.
@@ -22,6 +22,15 @@ pub(crate) fn transfer_int(
     map: &mut SymbolMap<'_>,
 ) -> IntExpr {
     int_of(src, AnyExpr::Int(node), dst, map)
+}
+
+pub(crate) fn transfer_bool(
+    src: &ExprArena,
+    node: BoolExpr,
+    dst: &mut ExprArena,
+    map: &mut SymbolMap<'_>,
+) -> BoolExpr {
+    bool_of(src, AnyExpr::Bool(node), dst, map)
 }
 
 fn int_of(src: &ExprArena, node: AnyExpr, dst: &mut ExprArena, map: &mut SymbolMap<'_>) -> IntExpr {
@@ -74,18 +83,9 @@ pub(crate) fn transfer(
         NodeView::NatConst(c) => AnyExpr::Nat(dst.nat(c)),
         NodeView::IntConst(c) => AnyExpr::Int(dst.int(c)),
         NodeView::BoolConst(b) => AnyExpr::Bool(dst.bool(b)),
-        NodeView::ScalarConst { dtype, bits } => AnyExpr::Scalar(match dtype {
-            crate::types::DType::F32 => dst
-                .scalar_const::<crate::expr::F32>(f32::from_bits(bits))
-                .erase(),
-            crate::types::DType::F16 => dst.scalar_const::<crate::expr::F16>(bits as u16).erase(),
-            crate::types::DType::BF16 => dst.scalar_const::<crate::expr::BF16>(bits as u16).erase(),
-            crate::types::DType::I32 => dst.scalar_const::<crate::expr::I32>(bits as i32).erase(),
-            crate::types::DType::U32 => dst.scalar_const::<crate::expr::U32>(bits).erase(),
-            crate::types::DType::Bool => dst
-                .scalar_const::<crate::expr::BoolScalar>(bits != 0)
-                .erase(),
-        }),
+        NodeView::ScalarConst { dtype, bits } => AnyExpr::Scalar(dst.scalar_const_erased(
+            crate::reference_math::ReferenceScalar::from_bits(dtype, bits),
+        )),
         NodeView::Symbol(s) => map(s, dst),
         NodeView::ScalarInteger {
             operation,
@@ -93,7 +93,18 @@ pub(crate) fn transfer(
         } => {
             let operands = operands
                 .iter()
-                .map(|(dtype, value)| (*dtype, transfer_int(src, *value, dst, map)))
+                .map(|operand| match *operand {
+                    ScalarOperand::Word { dtype, value } => ScalarOperand::Word {
+                        dtype,
+                        value: transfer_int(src, value, dst, map),
+                    },
+                    ScalarOperand::Scalar(value) => {
+                        match transfer(src, AnyExpr::Scalar(value), dst, map) {
+                            AnyExpr::Scalar(value) => ScalarOperand::Scalar(value),
+                            _ => panic!("expression transfer changed a scalar operand's sort"),
+                        }
+                    }
+                })
                 .collect::<Vec<_>>();
             AnyExpr::Int(dst.scalar_integer(operation, &operands))
         }

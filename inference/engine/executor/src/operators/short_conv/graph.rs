@@ -5,13 +5,15 @@
 //! contract, so the block binds the recurrent control ports; its bank is the
 //! window alone.
 
+use crate::operators::Join;
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
 use crate::{
-    native::ShortConvKernels, ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan,
+    ModelLoadPlan, ShortConvBinding, ShortConvShape, StateResourcePlan, native::ShortConvKernels,
 };
-use magnitude_family_contracts::{WeightKind, WeightScope};
+use magnitude_family_contracts::{WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{attention_output, short_conv_project, short_conv_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -81,11 +83,25 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
-    weight_scale: &WorkflowTensor,
+    constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
+    join: &Join,
     block: ShortConvBlock,
 ) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
+    // The weights have no second-level scales: their scale ports bind the
+    // absent operand.
+    let weight_scale = &GraphConstant::absent(graph, constants)?.tensor().clone();
+    let output_bound = PackingBound::planned(
+        graph,
+        load,
+        WeightRole {
+            scope,
+            kind: WeightKind::RecurrentOutput,
+        },
+        weights,
+        constants,
+    )?;
     let mut weight = |graph: &mut G, kind| weight(graph, load, scope, kind, weights);
     let input_norm = weight(graph, WeightKind::InputNorm)?;
     let input_gate = weight(graph, WeightKind::ShortConvInputGate)?;
@@ -120,7 +136,11 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     let projection = graph
         .enqueue(
             kernels.project,
-            &[shape.project_dimensions(block.rows).as_slice(), &[("BS", 0), ("CS", 0), ("XS", 0)]].concat(),
+            &[
+                shape.project_dimensions(block.rows).as_slice(),
+                &[("BS", 0), ("CS", 0), ("XS", 0)],
+            ]
+            .concat(),
             short_conv_project::WorkflowArgs {
                 residual: hidden.into(),
                 norm: (&input_norm).into(),
@@ -162,14 +182,21 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
         .value;
     // One output head of every channel.
     let gated = gated.reshape(&[block.rows, 1, shape.channels]);
+    let inject = join.inject(graph, block.rows, constants)?;
     let output = graph
         .enqueue(
             kernels.output,
-            &shape.output_dimensions(block.rows),
+            &[
+                shape.output_dimensions(block.rows).as_slice(),
+                &[("OB", output_bound.extent)],
+            ]
+            .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
+                inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
+                output_bound: (&output_bound.tensor).into(),
             },
         )?
         .value;
@@ -180,13 +207,13 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
 mod tests {
     use crate::programs::native_target_graph::checked_target_family_storage;
     use crate::{
-        resident_layout, source_element, ComponentSelection, ExecutionPath,
-        FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan, PlannedMethod, ResourceCapacity,
-        ResourceLimits, ResourcePlanner,
+        ComponentSelection, ExecutionPath, FeedForwardProgramSlot, MixerProgramSlot, ModelLoadPlan,
+        PlannedMethod, ResourceCapacity, ResourceLimits, ResourcePlanner, resident_layout,
+        source_element,
     };
     use magnitude_artifacts::{
-        gguf::{Encoding, TensorDescriptor},
         ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+        gguf::{Encoding, TensorDescriptor},
     };
     use magnitude_family_contracts::{
         ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
@@ -194,8 +221,7 @@ mod tests {
         HeadNorm, HistoryDomain, HistoryReads, ImportTransform, InputNorm, InputSemantics,
         KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm,
         Rotary, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, RowRange,
-        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
-        WeightDescriptor,
+        ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
     };
     use magnitude_state::KvCodec;
     use seismic::BackendName;
@@ -215,7 +241,7 @@ mod tests {
             } else {
                 Encoding::F32
             };
-            let nbytes = source_element(encoding)
+            let nbytes = source_element(encoding, *shape.last().unwrap())
                 .unwrap()
                 .canonical_byte_len(&shape)
                 .unwrap();
@@ -363,9 +389,7 @@ mod tests {
         let definition = ModelDefinition {
             family: FamilyId("lfm2-shaped".into()),
             artifact_identity: identity,
-            inputs: InputSemantics {
-                coordinate_axes: 1,
-            },
+            inputs: InputSemantics { coordinate_axes: 1 },
             decoder: Decoder {
                 activation_dtype: ActivationDType::BF16,
                 hidden: HIDDEN,
@@ -482,7 +506,10 @@ mod tests {
                 magnitude_state::KvCodec::Dense,
             )
             .unwrap();
-            assert!(demand.streamed_bytes > 0 && demand.launches > 0, "{backend:?}");
+            assert!(
+                demand.streamed_bytes > 0 && demand.launches > 0,
+                "{backend:?}"
+            );
         }
     }
 }

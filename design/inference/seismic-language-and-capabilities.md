@@ -3,7 +3,6 @@ applies_to:
   - inference/seismic/**
   - inference/seismic-std/**
   - inference/engine/**
-  - inference/validation/**
   - inference/docs/seismic/**
 ---
 
@@ -47,6 +46,23 @@ of unordered parallel execution. Its consuming execution returns a complete outc
 that owns results and final tensor input backing independently of the interpreter
 and semantic arena. Allowed associations follow actual executed nodes, including
 called bodies, and are deduplicated rather than retained as an execution trace.
+
+Ordinary shape domains retain boolean combinations of integer comparisons. A
+`where` disjunction is a whole applicability condition: it does not establish
+either alternative by itself. The checker may use established boolean
+relationships and sound integer facts to prove a helper call, and rejects a
+relationship it cannot establish. A reached branch can eliminate alternatives
+proved false and then use the sole remaining condition; an unknown alternative
+never grants another arm's facts. Exact integer interval bounds can establish
+an exhaustive contiguous set of equality alternatives, but cannot fill gaps in
+a declared set. Integer `min` and `max` use the existing exact
+mathematical quantity semantics, including in shape expressions.
+
+A static helper call owns a complete dimension plan from its tensor arguments
+and explicit named dimension bindings. Helper recipe dimensions need not appear
+in public tensor axes, but every call must bind or infer them. An ordinary
+external entry still requires its public dimensions to be uniquely inferred
+from input tensor axes.
 
 ## Computation and implementation choice
 
@@ -154,14 +170,21 @@ and derives iteration/index bounds separately. Symbolic runtime integer values r
 mathematical integer sort independently of scalar storage representation.
 
 Dimensions, range endpoints, loop coordinates, and their arithmetic are mathematical quantities;
-Index is the nonnegative bounded refinement of that domain, not an I32 alias. An authored I32/U32
-scalar operation instead has the exact fixed-width source meaning, including wrapping and signed
-conversion. Its symbolic projection must preserve that typed result. A mathematical rewrite may
+Index is the nonnegative bounded refinement of that domain, not an I32 alias. An authored
+I32/U32/U64 scalar operation instead has the exact fixed-width source meaning, including wrapping
+and signed conversion; U64 words are full 64-bit words on every backend (a native's `ulong`,
+`unsigned long long`, `uint64_t` or `u64`), never narrowed. Its symbolic projection must preserve that typed result. A mathematical rewrite may
 replace it only after the applicable source facts prove equality. Converting between a quantity
 and a scalar occurs at the expression's actual typed boundary, before an operation when an operand
 is typed scalar and after an operation when its consumer requires a scalar.
 Thus I32_MAX + I32(1) is negative, U32_MAX + U32(1) is zero, while a loop coordinate
 multiplied by a shape extent retains its mathematical product even beyond a native word.
+Generated access and nonempty-axis checks compare mathematical observations of the
+already evaluated endpoints with the actual descriptor extent. They neither wrap the
+extent into a source word nor replay endpoint arithmetic. An authored scalar extent
+getter retains its declared word conversion. Participant construction admits a
+mathematical extent only when its physical representation preserves that value;
+unrepresentable quantities produce an ordinary capacity limitation before lowering.
 
 ## Logical ownership
 
@@ -174,6 +197,14 @@ A tensor source value is one of:
 Owned values move. Shared borrows may overlap. Mutable borrows are exclusive. Slicing borrows;
 ownership copies are explicit. `let` is immutable and `let mut` authorizes mutation without
 manufacturing ownership or write access.
+
+Initialization requirements and recorded storage accesses preserve the conditions under which
+an element is visited. A condition involving a private loop coordinate stays inside that
+coordinate's quantified domain when the effect leaves the loop; projecting the external path
+must not widen a live prefix to every iteration. Simple integer comparisons may constrain the
+half-open visit interval exactly. Other guards remain explicit, and unsupported containment
+remains a proof failure. Word-cast identities require established representable bounds; no
+initialization is inferred from allocated capacity or from unvisited cells.
 
 Logical tensor operations accept values independently of their current storage realization.
 When an operation requires an addressable input, the compiler materializes a computed value;
@@ -253,19 +284,18 @@ The default configuration at given static dimensions is the first configuration 
 in declared parameter and value order, so reordering values or adding a `where` conjunct cannot
 leave admissible statics without a default. Statics that no configuration admits lie outside the
 kernel's domain: graph construction rejects such a node, naming the call and its statics.
-A configuration that changes the entry's numerics beyond summation order declares it:
-`error_class NAME when C` names the error class of the configurations satisfying `C`, a condition
-over static dimensions and entry parameters (reduced-precision operands, a result row that depends
-on its launch's other rows). A configuration may be in several classes; the default is in none.
-Classes do not restrict direct selection, which stays explicit; native tuning forms a class's
-configurations only for a caller that admits the class.
+A native declaration states no precision: it has no numerical associations, error classes or
+deviation markers, and it never describes how the native kernel computes. Its parameters,
+domains, launch blocks and `where` condition define the tuning space; the portable function it
+attaches to defines what every configuration computes. Whether a configuration's numerics are
+acceptable is decided by measurement against that contract (see `seismic-numerical-precision.md`).
 An inactive launch is neither encoded nor checked against pipeline or device limits, its geometry is not
 evaluated, and it keeps its ordinal (formed functions and trace entries stay in declaration order;
 a trace records it as an empty launch). An inactive scratch buffer keeps its ABI slot at the minimum
 charge without evaluating its size. A call whose launches are all inactive is legal and does nothing.
 A native declaration may name natural-number expressions: `let NAME = E` lines after `params` and
 `elements`, each over entry dimensions, entry parameters and the terms before it. A term is
-substitution: the `where` condition, error classes, scratch sizes and guards, launch conditions and
+substitution: the `where` condition, scratch sizes and guards, launch conditions and
 geometry and the `repeat` count read its name as its expression, and the checked implementation is
 that of the declaration with every term written out. A term may not take the name of a dimension,
 a parameter (entry or launch) or another term.
@@ -280,7 +310,13 @@ dispatches a block more than once: the checker rejects `repeat` on every other b
 A scratch buffer declared `sync` (`scratch S bytes (E) sync`) holds arrival counters: it is zero
 whenever one of the call's launches starts, and the call's kernels restore every counter they use
 to zero before the call ends. Kernels use it for "the last threadgroup to arrive finishes the
-work", in which no threadgroup waits for another, so it needs no co-residency.
+work", in which no threadgroup waits for another, so it needs no co-residency. The counter only
+orders the arrivals: every buffer the last threadgroup reads that other threadgroups of the same
+launch wrote must be device-coherent in the kernel's declaration: Metal `coherent(device)`
+(`arrive::coherent_device`), CUDA loads that bypass L1 (`__ldcg`). Device-scope fences order the
+counter but do not make plain loads see another core's stores; M1 Max-class GPUs serve them from a
+stale cache. The engine kernels' build rejects a Metal entry that binds atomic scratch and declares
+any other writable scratch without `coherent(device)`.
 
 ## Backend capabilities
 
@@ -428,7 +464,16 @@ inventing subtraction preconditions.
 The checker records, per indexed axis, whether each point or range bound is proved in
 its source scope. Semantic lowering emits a runtime source check exactly for the bounds
 the checker did not prove, whether the access is an element read, a slice view or a
-store destination; the slice metadata carries the same per-bound flags.
+store destination; the slice metadata carries the same per-bound flags. For runtime-data
+bounds, removing a supported runtime check is an optional optimization and uses only
+established facts and successful proof evidence. An unresolved bound retains its check;
+only the successful checked continuation owns the ensuing bound assumptions. Initialization
+analysis consumes those same per-bound flags on the reached values and actual view axes,
+without treating a successful bound as a produced write. Primitive accesses evaluate their
+operands before the checks; assignment destinations and atomic selections reach each index
+and its check before evaluating the RHS or update value. Deferred reads retain the facts
+of their own successful access continuation. Static bounds retain the complete required
+arithmetic proof.
 
 
 Natural-bound implication uses structural monotonicity: division or ceiling division
@@ -438,6 +483,182 @@ this proof. The expression owner preserves partial-operation definedness; source
 or target dimensions are never sampled or guessed to establish universal coverage.
 This lets a legal row-width bound cover its packet count and a wider storage bound
 cover a narrower same-shaped internal allocation.
+
+Optional guard classification, common branch-bound strengthening, written-region
+simplification, and sign strengthening use established equalities, bounds, and successful
+proof evidence. Branch joins retain declared type bounds; a candidate adds a common
+bound only when both arms establish it. Unknown candidates add nothing. Optional
+written-region simplification retains the exact region when a simpler form is unproved. An unknown condition retains both paths;
+required bounds, initialization coverage, and explicitly parallel loop separation keep
+their full proof obligation. Inferring independence for an ordered loop is an optional
+optimization: it uses established geometric and sign evidence, including positive
+constant scaling and products of independently nonnegative factors. An unresolved
+relationship leaves the loop ordered without speculative arithmetic search. Exact finite recipe domains may establish a proposition only
+when every admitted, defined case proves it; exceeding the proof resource bound
+leaves it unknown. Initialization coverage first tries independently sufficient
+written regions before exploring unrelated conditional writes. This changes proof
+ordering without granting unwritten storage or discarding a possible path.
+
+A produced write reaches its scalar and region meaning once under its source-position
+facts. Accumulation retains every prior write and guard as an exact union rather than
+renormalizing the entire write history at each store. Optional whole-root promotion
+belongs to materialization before branch facts, private loop coordinates, or exit
+facts are projected away. Those boundaries retain the source fact world's write
+meaning. Reads, carry obligations and implementation applicability still perform
+full required coverage; delayed simplification never fabricates initialized cells
+or permits a later write to satisfy an earlier read.
+
+A provisional loop read with no abstract incoming initialization may be eliminated
+using established coverage or retained with its exact source-position region,
+available writes, path, facts, and span. Each loop resolver owns full coverage and
+vacuity proof against that saved state before binding private coordinates or
+projecting paths for an enclosing loop or input contract. Unknown coverage retains
+the read; it never grants initialization. Reads using provisional incoming carry
+assumptions keep full input-requirement re-export, so an inferred invariant cannot
+replace the caller's initialization obligation.
+
+Typing and source-position initialization share exact source operation semantics.
+A value retains its typed recipe, source provenance, and occurrence identity
+independently of whether arithmetic derivation establishes a simpler expression.
+Word arithmetic preserves wrapping; conversions and payload transport consume
+actual typed operands through the language-owned scalar recipes. A mathematical
+projection is scoped derived information: no-wrap arithmetic requires bounds on
+the mathematical candidate from its operands, never the word result's own type
+range. Partial-operation definedness remains distinct from value bounds and from
+successful source continuation.
+
+Checked source values retain exact meaning and actual publication as distinct
+views of one occurrence. Structured values preserve their scalar leaf identities.
+Copies and repeated immutable projections reuse those identities; reads, calls,
+assignments, branch joins, and loop versions retain their actual source lifetimes.
+Executable geometry refers to the dominating published result, rather than
+reconstructing a typed operation from an algebraic expression. Mathematical
+header quantities keep their existing host-expression path. Execution binds each
+publication in its declared quantity or scalar sort, retaining scalar dtype and
+payload bits; one semantic value cannot acquire conflicting interpretations. Static versus runtime
+dependence follows source inputs and operand provenance, not derivation success.
+Initialization evaluates each operation over its reached actual operands; it never
+reuses an earlier expression after those operands change. Private aliases and
+continuation evidence cannot escape their scope as global facts. Value identities
+confer no tensor initialization by themselves.
+
+The checker has one private arithmetic derivation owner shared by bounds,
+initialization, contracts, and scoped simplification. Required checks first
+consume the same established relations and interval summaries as optional
+queries, then use the existing bounded arithmetic rules if unresolved. Recursive
+constraint queries retain their active dependency context through every operand;
+a cyclic premise cannot establish its own sign, and other independent premises
+remain available. An unresolved request is not a refutation or
+an assumption. Optional simplification retains the original operation or effect
+when established relations are insufficient. Scoped value definitions and other
+premises remain distinct from cached derivation outcomes; neither a preferred
+interval summary nor a failed query changes a value's meaning. Type membership
+conjoins its bounds with the current source constraints. Republishing a known
+value cannot replace stronger loop or path bounds with its broader type range.
+Explicit scope-range replacement remains distinct from adding a premise and
+cannot erase independent type or path evidence. Repeated identical membership
+preserves the constraint state and its derivation caches.
+
+Initialization contracts project private computation at each parameter's actual
+logical geometry. If a required image contains an unavailable private coordinate,
+only that axis expands to its parameter extent; known coordinates, prefixes, and
+supported scoped domains remain correlated. Call views and reshapes supply their
+logical axes before those contracts map into backing-root coordinates. The same
+projection conservatively expands may-access footprints for independence checks;
+it never expands guaranteed writes. Unsupported linear-address geometry can still
+require the complete root.
+
+Optional region normalization is not the authority for rejecting a read whose
+domain is empty. When no initialization is available, required coverage proves
+emptiness using the complete arithmetic rules, with each quantified binder and
+guard scoped to its body. A successful empty-domain proof grants no initialized
+cells and does not replace bounds or independence checks.
+
+Reached scalar normalization uses one fixed fact world and an arena-bound
+DAG memo shared by unchanged copies of that world. A structural fact change
+starts a new owner. Reinstalling an identical bound or assumption preserves the
+existing owner and evidence; replacing a primary bound starts a new owner even
+when an independent extra bound has the same value. Extra assumptions retain
+their own lifetime across primary-bound replacements. Newly established successful proof evidence invalidates
+reached reductions, so later calls can use stronger established ordering; failed
+proofs grant no reductions. Immutable exact-equality metadata remains reusable
+within its fact world and arena. Cached shallow proof success can be reused before
+constructing a proof engine. Cached recursive-search failure still permits the
+independent finite-domain alternative; it is not a complete failure verdict by
+itself. Supported exact integer arithmetic is normalized from its operands
+upward, so a reached zero inside a minimum and an in-range nested word cast have
+the same meaning at a later call. Unresolved minima and maxima retain their
+normalized operands; selecting an operand requires established ordering. A
+nonnegative reached assumption supplies a weaker constant lower bound only when
+existing exact equalities reduce their difference to a nonnegative constant.
+These operations do not search additional arithmetic alternatives or increase
+proof depth. Unknown divisors, undefined children, opaque scalar recipes, and
+coefficient overflow retain their original operation rather than becoming a
+numeric placeholder or an initialized region.
+
+Source-position write accumulation reaches each newly formed effect under its
+current facts and unions it with the exact previously reached writes. It does
+not repeatedly normalize the entire accumulated history or attempt whole-root
+promotion after every store. Before an arm, iteration, carry view or exported
+parameter guarantee loses its facts or coordinate scope, its accumulated writes
+are materialized using the existing normalization and optional full-root check.
+Required read coverage, saved deferred reads and alternative applicability retain
+their complete authoritative proof. Incoming assumptions remain distinct from
+produced writes; materialization cannot turn an incoming assumption into a write.
+View projection preserves the constant regions Empty and Full directly. It does
+not ask coverage to rediscover these exact inverse images. Partial regions still
+use scoped whole-view coverage before projection, so a guarantee established
+under private facts can be materialized before those facts disappear at export.
+Read admission remains responsible for recognizing an empty access domain.
+
+Region normalization uses this same reached scalar meaning. Binder endpoints
+are normalized under outer facts before installing the binder's interval; its
+body and image coordinates use only that binder's scoped facts. Guard operands
+use outer facts, and its interior uses justified guard facts while retaining the
+guard in the resulting region. Different fact worlds in branches and binder scopes have separate
+normalization memos. One normalization batch owns the scoped reaching traversal
+and geometric reduction of its separate effect results. Identical binders and
+ordered guard paths under the same parent scope reuse that scope's constraint
+and derivation state within the batch; different parents, paths and clipped
+bounds remain separate. Export phases with different constraint states or
+mandatory versus established-only policies use separate batches. Each deferred
+read first resolves coverage and vacuity in its saved source state; only surviving
+outward effects enter an export batch. Local failures do not create input effects.
+No scope state escapes the batch or changes effect order, metadata or required
+admission. Row-major conversion forms geometry without reaching scalar terms;
+the consuming boundary normalizes its complete converted regions once.
+Recursive separation compares those normalized children instead of repeating
+the reaching traversal. World-exit materialization shares normalization across
+separate roots, while each root retains its own geometry and promotion policy.
+Region normalization separates reaching
+from geometric reduction. After a binder's body is reached once, structural finalization
+accumulates enclosing image domains, distributes unions, and lifts independent
+guards without rewalking scalar descendants or rebasing each partial domain.
+Each union member clips its own bound. A lifted guard remains on the output and
+supplies facts only to its interior finalization; it cannot create unguarded
+initialization. Geometry reduces each accumulated image domain, retains
+unsupported binders and guards, and preserves the existing union joins. Newly
+constructed clipped endpoints, widths and addresses use exact reached arithmetic
+under their formation scope. A clipped endpoint uses the finalizer's outer facts
+before its own binder is installed. Exact
+required equality checking also uses this normal form. Numeric normalization never expands guaranteed writes or suppresses bounds,
+independence, or missing-cell obligations.
+
+Initialization call effects retain exact typed integer-word cast expressions. A
+signed/unsigned same-width roundtrip preserves the original signed value, while
+an arbitrary unsigned-to-signed cast retains its modular interpretation. Remainder
+normalization may use an established integer interval. Reached numeric assumptions
+normalize under the facts that held before they were added, so equivalent modular
+values retain the same prefix guards. Signed affine interval bounds follow coefficient
+sign; nonlinear products require nonnegative factors. Minima and maxima retain
+independently valid bounds from both operands. These rules never assume an unsigned
+count fits the positive signed range or grant unwritten tensor coverage. Under an
+established zero equation, adding or subtracting that equation preserves a quotient
+numerator. A positive constant quotient reduces only when this equivalent numerator
+is exactly divisible as checked integer arithmetic and the result has no quotient or
+remainder atoms. Missing relations, inexact division and coefficient overflow retain
+the original operation. The same equation normal form applies to reached assumptions;
+it does not alter the required proof depth or infer consistency of the facts.
 
 Preparation-time reference execution can carry an explicit semantic-work limit.
 Nodes, loop iterations, element accesses, and allocation/view construction consume
@@ -463,3 +684,56 @@ an identity view of the entire backing tensor.
 Provably nonnegative signed additions, products and divisions of natural shape values
 canonicalize to the same natural arithmetic DAG, preserving division-by-zero failure. Potentially negative signed
 expressions retain checked conversion and their original definedness conditions.
+
+## Ordinary rounding and payload primitives
+
+`rint(x)` returns the nearest integral value in the operand's floating dtype,
+with ties to even. It preserves signed zero and infinities and canonicalizes
+NaNs through the same language-owned scalar recipe as ordinary arithmetic.
+It is scalar or elementwise; it does not change storage type or quantize a row.
+
+`bitcast_u32(x)` accepts F32 and `bitcast_f32(x)` accepts U32, scalar or
+elementwise, preserving every payload bit. They perform no numeric conversion,
+including no NaN canonicalization. Checked numeric casts remain separate.
+The scalar reference constructs both operations from existing terminal word
+and payload operations, and portable lowering reuses the existing typed IR
+bitcast. Quantizer gain rules, coefficient types, partner-row coupling and
+accumulation recipes remain ordinary checked computations around these
+primitives; the primitives carry no tolerance or native trust authority.
+
+`exp2(x)` owns a separate base-two scalar recipe: it splits off an integer
+power-of-two scale before evaluating the bounded fraction, then publishes once
+in the declared dtype. Its bit-built scale handles subnormal output and
+exceptional inputs. It is not a source alias for `exp(x * ln(2))`; that
+expression rounds its entire transformed input first. Backend approximate
+exponentials remain separate physical choices assessed against this recipe.
+
+## Logical quantized components
+
+Checked quantized component reads take a packed tensor and its logical element
+indices, with the same bounds checks as an element read. The named `code`,
+`scale`, and signed `bias` roles are the integer code and coefficient results
+already constructed by that representation's owned decode recipe. Hierarchical
+coefficients keep their existing F32 multiplication order. An integer format
+without bias returns exact zero; a representation without an integer code
+cannot bind the integer code role. The distinct F32 `code_value` role selects
+its existing pre-scale converted code temporary, including registered floating
+codebooks; it does not decode a complete weight and divide out a coefficient.
+Support is checked against the actual representation binding, rather than
+inferred from a decoded F32 value or byte size.
+
+The same logical interface exposes the quantization group, interpreted code
+bounds, bias presence, and coefficient factorization used by a checked fold.
+For a hierarchical coefficient, `scale_factor` and `bias_factor` are the
+existing converted super-coefficient temporaries, before coefficient codes and
+bias sign. The i32 `scale_code` and `bias_code` roles select the owned interpreted coefficient-code temporaries; direct coefficients use one (absent bias uses zero), and neither role requires an integer weight code. `coefficient_code_max` comes from that coefficient's owned integer
+interpretation. Direct coefficients expose their own value with multiplier one.
+These roles describe the registered representation, not PACK availability or a
+numerical permission. Their constant results require no physical field read.
+
+The interface exposes no plane ordinal, byte offset, layout spelling, or
+independent coefficient reconstruction. Portable IR and the interpreter select
+the same owned decode temporaries. Physical layouts retain their existing field
+read lowering and identities. Numerical helper computations can therefore name
+coefficient and code rounding without duplicating format tables or expanding
+the entry ABI with shadow weight tensors.

@@ -441,7 +441,7 @@ pub(crate) fn project(value: &ir::Expr, index: usize) -> ir::Expr {
     {
         return operands[index].clone();
     }
-    ir::Expr::new(
+    let mut projected = ir::Expr::new(
         ir::ExprKind::Primitive {
             id: PrimitiveId::TupleGet(index as u32),
             operands: vec![value.clone()],
@@ -451,7 +451,11 @@ pub(crate) fn project(value: &ir::Expr, index: usize) -> ir::Expr {
         parts.as_slice()[index].clone(),
         None,
         value.span,
-    )
+    );
+    if let ir::SourceValue::Tuple(parts) = &value.value {
+        projected.value = parts[index].clone();
+    }
+    projected
 }
 pub(crate) fn argument_leaves(
     access: &ir::Ownership,

@@ -28,6 +28,8 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    selection: Tensor,
+    block_slots: Tensor,
     _history_key_slabs: SlabTensor,
     _history_value_slabs: SlabTensor,
     history_key: Tensor,
@@ -120,8 +122,10 @@ impl Bound {
     fn new_with_options(device: &Device, case: &Case, slab_rows: u32, reuse_middle: bool) -> Self {
         let Geometry { kv, g, p, .. } = case.geometry;
         let (m, w) = (case.rows, case.geometry.w());
-        let [(history_key_slabs, history_key), (history_value_slabs, history_value)] =
-            history_slabs(device, case, slab_rows, reuse_middle);
+        let [
+            (history_key_slabs, history_key),
+            (history_value_slabs, history_value),
+        ] = history_slabs(device, case, slab_rows, reuse_middle);
         Self {
             query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
             gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
@@ -137,6 +141,8 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            selection: no_selection(device, m),
+            block_slots: block_slots(device, 1),
             _history_key_slabs: history_key_slabs,
             _history_value_slabs: history_value_slabs,
             history_key,
@@ -329,10 +335,7 @@ fn prefill_specializations_on(
                 // here one group, the smallest declared value holding them.
                 if device.backend() == BackendName::Metal {
                     specialization
-                        .with_param(
-                            "HEADS",
-                            (geometry.g.next_power_of_two() as u64).min(16),
-                        )
+                        .with_param("HEADS", (geometry.g.next_power_of_two() as u64).min(16))
                         .with_param("DIRECT", direct)
                 } else {
                     specialization
@@ -361,7 +364,7 @@ fn prefill_kernel(
     attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        specialization,
+        &visible_prefill(device, specialization.clone()),
     )
     .unwrap()
 }
@@ -382,6 +385,32 @@ macro_rules! args {
             history_key: &mut $bound.history_key,
             history_value: &mut $bound.history_value,
             epsilon: $case.epsilon,
+            slab_rows: $bound.slab_rows,
+        }
+    };
+    (attention_prefill, $bound:expr, $case:expr) => {
+        attention_prefill::Args {
+            query: &$bound.query,
+            gate: &$bound.gate,
+            key: &$bound.key,
+            value: &$bound.value,
+            query_norm: &$bound.query_norm,
+            key_norm: &$bound.key_norm,
+            value_norm: &$bound.value_norm,
+            rotary_components: &$bound.components,
+            rotary_frequencies: &$bound.frequencies,
+            rotary_amplitudes: &$bound.amplitudes,
+            coordinates: &$bound.coordinates,
+            visible: &$bound.visible,
+            fresh: &$bound.fresh,
+            destinations: &$bound.destinations,
+            selection: &$bound.selection,
+            block_slots: &$bound.block_slots,
+            history_key: &mut $bound.history_key,
+            history_value: &mut $bound.history_value,
+            epsilon: $case.epsilon,
+            scale: $case.scale,
+            gate_function: 0,
             slab_rows: $bound.slab_rows,
         }
     };
@@ -477,7 +506,7 @@ fn check(
 /// reach.
 fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile, check_source},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -489,6 +518,10 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     sources.push(SourceFile {
         path: "attention.seismic".into(),
         text: include_str!("../kernels/attention.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
     });
     let module = check_source(sources).unwrap();
     let logical = module
@@ -505,7 +538,7 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     };
     let floats = |values: &[f32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
     let ints = |values: &[i32]| values.iter().map(|x| f64::from(*x)).collect::<Vec<_>>();
-    let args = vec![
+    let mut args = vec![
         tensor(
             DType::BF16,
             vec![m, kv * g, 2 * w],
@@ -531,6 +564,15 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
         Arg::Scalar(ReferenceScalar::I32(0)),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
     ];
+    // The prefill takes its WorkList bitmap (none: B = 0) and block keys
+    // (BR = 1) after the destinations.
+    let prefill = entry == "attention_prefill";
+    if prefill {
+        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
+    }
+    // The history planes' parameter ordinals.
+    let planes = if prefill { 16 } else { 14 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
@@ -549,8 +591,8 @@ fn check_host_model_against_portable_body(entry: &str, case: &Case) {
     }
     let inputs = outcome.inputs().collect::<Vec<_>>();
     for (ordinal, expected, name) in [
-        (14, &expected.1, "history_key"),
-        (15, &expected.2, "history_value"),
+        (planes, &expected.1, "history_key"),
+        (planes + 1, &expected.2, "history_value"),
     ] {
         let input = inputs
             .iter()
@@ -733,6 +775,7 @@ fn check_attention_slab_case(case: &Case, reused: bool) {
                         .with_param("MATRIX", matrix)
                         .with_param("STAGES", stages)
                         .with_param("COLUMNS", columns)
+                        .with_param("QREG", 0)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -926,7 +969,17 @@ fn prefill_timing_on(device: &Device) {
             .sum::<f64>();
         let flop = pairs * (QWEN.kv * QWEN.g * QWEN.w() * 4) as f64;
         let case = Case::new(QWEN, history as usize + rows.len(), 1, &rows, 9);
-        let configs = [(16, 1), (16, 128), (16, 256), (16, 512), (8, 1), (8, 256), (32, 1), (32, 256), (32, 512)];
+        let configs = [
+            (16, 1),
+            (16, 128),
+            (16, 256),
+            (16, 512),
+            (8, 1),
+            (8, 256),
+            (32, 1),
+            (32, 256),
+            (32, 512),
+        ];
         for (config, specialization) in prefill_specializations_on(device, QWEN, &configs) {
             let kernel = prefill_kernel(device, &specialization);
             let mut bound = Bound::new(device, &case);
@@ -947,6 +1000,52 @@ fn prefill_timing_on(device: &Device) {
 fn qwen_geometry_speculative_decode_matches_host_model() {
     for device in devices() {
         qwen_geometry_speculative_decode_matches_host_model_on(&device);
+    }
+}
+
+/// Register-held queries reuse the operand stage region only after every
+/// query fragment is captured. Exercise empty partitions, padded query rows,
+/// and the long-history verification shape against the dense host model.
+#[test]
+#[ignore = "bounded CUDA register-query decode qualification"]
+fn cuda_register_query_decode_matches_host_model() {
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cuda)
+        .expect("CUDA qualification requires CUDA");
+    let geometry = Geometry {
+        kv: 4,
+        g: 6,
+        p: 32,
+        s: 192,
+    };
+    let specialization = qwen_form(statics(geometry), geometry)
+        .with_param("PARTS", 12)
+        .with_param("WARPS", 4)
+        .with_param("SLICES", 1)
+        .with_param("MATRIX", 1)
+        .with_param("STAGES", 2)
+        .with_param("COLUMNS", 1)
+        .with_param("QREG", 1);
+    let kernel = decode_kernel(&device, &specialization);
+    for (rows, context) in [(1, 1), (8, 1), (8, 65536)] {
+        let case = Case::new(
+            geometry,
+            context as usize + rows,
+            1,
+            &speculative_rows(rows, context),
+            13,
+        );
+        let expected = case.expected();
+        let mut bound = Bound::new(&device, &case);
+        let gated = run_decode(&kernel, &mut bound, &case);
+        check(
+            &format!("CUDA register-query decode {rows} rows context {context}"),
+            &case,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -1041,43 +1140,89 @@ fn qwen_geometry_decode_and_prefill_match_host_model_on(device: &Device) {
     }
 }
 
-
 /// State-only priming must publish the same K/V as ordinary attention,
 /// including slab boundaries and ignored destinations, without an output.
 #[test]
 fn dense_append_publishes_only_the_same_history_as_prefill() {
     let rows = [
-        Row { spans: vec![(0, 16)], fresh: (0, 1), destination: 31, position: 16 },
-        Row { spans: vec![(0, 16)], fresh: (1, 2), destination: 32, position: 17 },
-        Row { spans: vec![(0, 16)], fresh: (2, 3), destination: -1, position: 18 },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (0, 1),
+            destination: 31,
+            position: 16,
+        },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (1, 2),
+            destination: 32,
+            position: 17,
+        },
+        Row {
+            spans: vec![(0, 16)],
+            fresh: (2, 3),
+            destination: -1,
+            position: 18,
+        },
     ];
     let case = Case::new(SMALL, 64, 1, &rows, 97);
     let expected = case.expected();
     let catalog = DeviceCatalog::discover().unwrap();
     for backend in [BackendName::Cpu, BackendName::Metal] {
-        let Ok(device) = catalog.open_backend(backend) else { continue; };
-        let specialization = if is_cpu(&device) { cpu_statics(SMALL) }
-            else { qwen_form(statics(SMALL), SMALL) };
+        let Ok(device) = catalog.open_backend(backend) else {
+            continue;
+        };
+        let specialization = if is_cpu(&device) {
+            cpu_statics(SMALL)
+        } else {
+            qwen_form(statics(SMALL), SMALL)
+        };
         let append = attention_append_dense::native_for_device_with(
-            &device, attention_append_dense::Elements { A: Element::bf16() }, &append_specialization(&specialization),
-        ).unwrap();
+            &device,
+            attention_append_dense::Elements { A: Element::bf16() },
+            &append_specialization(&specialization),
+        )
+        .unwrap();
         let mut appended = Bound::new_with_slab_rows(&device, &case, 32);
-        append.call(args!(attention_append_dense, appended, case)).unwrap();
+        append
+            .call(args!(attention_append_dense, appended, case))
+            .unwrap();
         let mut full = Bound::new_with_slab_rows(&device, &case, 32);
-        let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)]).remove(0).1;
+        let prefill = prefill_specializations_on(&device, SMALL, &[(16, 1)])
+            .remove(0)
+            .1;
         let _ = run_prefill(&prefill_kernel(&device, &prefill), &mut full, &case);
         let actual_key = bf16_values(&appended.history_key);
-        assert_eq!(actual_key, bf16_values(&full.history_key), "{backend:?}: keys");
-        assert_eq!(bf16_values(&appended.history_value), bf16_values(&full.history_value), "{backend:?}: values");
+        assert_eq!(
+            actual_key,
+            bf16_values(&full.history_key),
+            "{backend:?}: keys"
+        );
+        assert_eq!(
+            bf16_values(&appended.history_value),
+            bf16_values(&full.history_value),
+            "{backend:?}: values"
+        );
         for (a, e) in actual_key.iter().zip(&expected.1) {
-            assert!((a - e).abs() <= 8.0e-3 * e.abs().max(1.0), "{backend:?}: host key {a} != {e}");
+            assert!(
+                (a - e).abs() <= 8.0e-3 * e.abs().max(1.0),
+                "{backend:?}: host key {a} != {e}"
+            );
         }
-        assert_eq!(bf16_values(&appended.history_value), expected.2, "{backend:?}: host values");
+        assert_eq!(
+            bf16_values(&appended.history_value),
+            expected.2,
+            "{backend:?}: host values"
+        );
         eprintln!("{backend:?}: dense append exact prefill state; host reference agrees");
     }
 }
 
 fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecialization {
-    specialization.statics().iter().filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
-        .fold(NativeSpecialization::new(), |spec, (name, value)| spec.with_static(name, *value))
+    specialization
+        .statics()
+        .iter()
+        .filter(|(name, _)| !matches!(name.as_str(), "G" | "I" | "U"))
+        .fold(NativeSpecialization::new(), |spec, (name, value)| {
+            spec.with_static(name, *value)
+        })
 }

@@ -202,18 +202,40 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     // Bank 0 is the zero seed the advance reads; bank 1 is its successor.
     // One tape row per bank: the window holds C - 1 + 1 rows.
     let tape_row = (32 + 16) * 128 + 32;
-    let mut slabs = SlabTensor::new(&device, 2, 2, vec![
-        SlabRegion { element: Element::bf16(), row_shape: vec![4, 8192] },
-        SlabRegion { element: Element::f32(), row_shape: vec![32, 128, 128] },
-        SlabRegion { element: Element::f32(), row_shape: vec![1, tape_row as u64] },
-    ]).unwrap();
+    let mut slabs = SlabTensor::new(
+        &device,
+        2,
+        2,
+        vec![
+            SlabRegion {
+                element: Element::bf16(),
+                row_shape: vec![4, 8192],
+            },
+            SlabRegion {
+                element: Element::f32(),
+                row_shape: vec![32, 128, 128],
+            },
+            SlabRegion {
+                element: Element::f32(),
+                row_shape: vec![1, tape_row as u64],
+            },
+        ],
+    )
+    .unwrap();
     slabs.add_slab().unwrap();
     for (region, bytes) in [
         vec![0u8; 2 * 4 * 8192 * 2],
         vec![0u8; 2 * 32 * 128 * 128 * 4],
         vec![0u8; 2 * tape_row * 4],
-    ].into_iter().enumerate() {
-        slabs.region_rows(region, 0, 2).unwrap().write_from_host(&bytes).unwrap();
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        slabs
+            .region_rows(region, 0, 2)
+            .unwrap()
+            .write_from_host(&bytes)
+            .unwrap();
     }
     let mut window = slabs.logical_region(0).unwrap();
     let mut delta = slabs.logical_region(1).unwrap();
@@ -240,6 +262,8 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         alpha_weight: &alpha,
         beta_weight: &beta,
         epsilon: 1e-6,
+        qkv_bound: &f32_tensor(device, &[0], &[]),
+        gate_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()
     .value;
@@ -269,6 +293,7 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
         norm_epsilon: 128e-6,
         epsilon: 1e-6,
         grouped: false,
+        gate_function: 0,
         slab_banks: 2,
     })
     .unwrap()
@@ -282,10 +307,17 @@ fn actual_4b_recurrent_stage_boundaries_vs_cpu_gguf_on(device: &Device, path: &P
     .unwrap()
     .call(attention_output::Args {
         hidden: &hidden,
+        inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
         output_weight: &output,
+        output_bound: &f32_tensor(device, &[0], &[]),
     })
     .unwrap()
     .value;
     report(path, "output", read_f32(&projected));
+}
+
+/// The inject port of a single residual stream: no columns.
+fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
+    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
 }

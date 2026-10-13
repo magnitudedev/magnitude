@@ -23,6 +23,7 @@ pub fn round_to(dtype: DType, value: f64) -> f64 {
         DType::F16 => f16_round(value as f32) as f64,
         DType::I32 => value as i32 as f64,
         DType::U32 => value as u32 as f64,
+        DType::U64 => value as u64 as f64,
         DType::Bool => {
             if value != 0.0 {
                 1.0
@@ -31,6 +32,10 @@ pub fn round_to(dtype: DType, value: f64) -> f64 {
             }
         }
     }
+}
+
+extern "C" fn seismic_approx_exp2_f32(x: f32) -> f32 {
+    x.exp2()
 }
 
 extern "C" fn seismic_approx_exp_f32(x: f32) -> f32 {
@@ -256,6 +261,10 @@ atomic_helper!(
 /// barrier entry points.
 pub(crate) fn host_symbols() -> Vec<(&'static str, *const u8)> {
     vec![
+        (
+            "seismic_approx_exp2_f32",
+            seismic_approx_exp2_f32 as *const u8,
+        ),
         (
             "seismic_approx_exp_f32",
             seismic_approx_exp_f32 as *const u8,

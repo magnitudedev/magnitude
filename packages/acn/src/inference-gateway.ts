@@ -1,3 +1,5 @@
+import { zstdDecompress } from "node:zlib"
+import { MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL } from "@magnitudedev/acn-protocol"
 import * as IcnSchemas from "@magnitudedev/icn-protocol/schemas"
 import { Context, Data, Effect, Schema } from "effect"
 import { parseTree, type Node, type ParseError } from "jsonc-parser"
@@ -193,6 +195,22 @@ const readBoundedBody = async (
   return bytes
 }
 
+/**
+ * Decode zstd content, stopping once the output exceeds `limit`. A few
+ * kilobytes of zstd can expand to gigabytes, and `Bun.zstdDecompress` has no
+ * output bound, so it would allocate all of it before any size check.
+ */
+const decodeBoundedZstd = (
+  bytes: Uint8Array,
+  limit: number,
+): Promise<Uint8Array | undefined> => new Promise((resolve, reject) => {
+  zstdDecompress(bytes, { maxOutputLength: limit }, (error, decoded) => {
+    if (!error) resolve(decoded)
+    else if ((error as NodeJS.ErrnoException).code === "ERR_BUFFER_TOO_LARGE") resolve(undefined)
+    else reject(error)
+  })
+})
+
 const propertyName = (node: Node): unknown => node.children?.[0]?.value
 
 const locateModelValue = (
@@ -377,6 +395,50 @@ const localModels = async (
   return paginatedLocalModels(models, incoming)
 }
 
+/**
+ * Claude Code sends Magnitude's placeholder only when it has no Anthropic login, so such a request
+ * can never succeed upstream. Its Claude models (subagents and background work use the Claude model
+ * tiers) are served by a local model instead.
+ */
+const carriesPlaceholderCredential = (headers: Headers): boolean => {
+  const authorization = headers.get("authorization")
+  const apiKey = headers.get("x-api-key")
+  return authorization === `Bearer ${MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL}`
+    || apiKey === MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL
+    || (authorization === null && apiKey === "")
+}
+
+const LoadedInstances = Schema.Struct({
+  instances: Schema.Array(Schema.Struct({
+    modelId: Schema.String,
+    lifecycle: Schema.Struct({ _tag: Schema.String }),
+  })),
+})
+
+/** The model serving now: a Ready instance first, else one still loading. */
+const loadedLocalModel = async (
+  source: Request,
+  icn: InferenceProxyTarget,
+  fetchTarget: InferenceFetch,
+  signal: AbortSignal,
+): Promise<string | undefined> => {
+  const headers = forwardedHeaders(source.headers)
+  headers.delete("content-length")
+  headers.delete("content-type")
+  headers.delete("content-encoding")
+  localAuthorization(headers, icn)
+  const response = await fetchTarget(new URL("/api/v1/instances", icn.origin), {
+    method: "GET",
+    headers,
+    signal,
+    ...localEngineFetch,
+  })
+  if (!response.ok) return undefined
+  const { instances } = await Schema.decodeUnknownPromise(LoadedInstances)(await response.json())
+  return (instances.find(({ lifecycle }) => lifecycle._tag === "Ready")
+    ?? instances.find(({ lifecycle }) => lifecycle._tag === "Loading"))?.modelId
+}
+
 const proxyClassifiedRequest = async (
   source: Request,
   incoming: URL,
@@ -391,8 +453,18 @@ const proxyClassifiedRequest = async (
   if (classified._tag === "Invalid") return classified.response
   const { body } = classified
   const headers = forwardedHeaders(source.headers)
-  if (body.model.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX)) {
-    const canonicalModel = body.model.slice(LOCAL_ANTHROPIC_MODEL_PREFIX.length)
+  const placeholder = carriesPlaceholderCredential(source.headers)
+  if (body.model.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX) || placeholder) {
+    const canonicalModel = body.model.startsWith(LOCAL_ANTHROPIC_MODEL_PREFIX)
+      ? body.model.slice(LOCAL_ANTHROPIC_MODEL_PREFIX.length)
+      : await loadedLocalModel(source, icn, fetchTarget, signal)
+    if (canonicalModel === undefined) {
+      return anthropicGatewayError(
+        `No local model is loaded in Magnitude to serve ${body.model}. Load a model in Magnitude, or choose an ${LOCAL_ANTHROPIC_MODEL_PREFIX} model.`,
+        400,
+        "invalid_request_error",
+      )
+    }
     if (canonicalModel.length === 0) {
       return anthropicGatewayError(
         "Local model alias is missing its canonical model ID",
@@ -408,7 +480,7 @@ const proxyClassifiedRequest = async (
       )
     }
     localAuthorization(headers, icn)
-    headers.set("magnitude-gateway-model", body.model)
+    headers.set("magnitude-gateway-model", `${LOCAL_ANTHROPIC_MODEL_PREFIX}${canonicalModel}`)
     headers.delete("content-length")
     const response = await fetchTarget(new URL(localPath, icn.origin), {
       method: source.method,
@@ -515,13 +587,13 @@ const classifyCodexRoutingBody = async (source: Request): Promise<RoutingBodyRes
     return invalidCodex("Request body exceeds the 128 MB routing limit", 413)
   }
   if (encoding !== "zstd") return classifyRoutingBytes(original, invalidCodex)
-  let decoded: Uint8Array
+  let decoded: Uint8Array | undefined
   try {
-    decoded = await Bun.zstdDecompress(original)
+    decoded = await decodeBoundedZstd(original, MAX_CODEX_ROUTING_BODY_BYTES)
   } catch {
     return invalidCodex("Request body is not valid zstd content")
   }
-  if (decoded.byteLength > MAX_CODEX_ROUTING_BODY_BYTES) {
+  if (decoded === undefined) {
     return invalidCodex("Decoded request body exceeds the 128 MB routing limit", 413)
   }
   const classified = classifyRoutingBytes(decoded, invalidCodex)

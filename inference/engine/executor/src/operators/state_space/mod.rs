@@ -134,10 +134,13 @@ impl StateSpaceShape {
     }
 
     /// `attention_output`'s dimensions: `heads` heads of `head_width`.
-    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        // One residual stream (`scatter` without inject).
         [
             ("M", rows),
             ("D", self.hidden),
+            ("SN", 1),
+            ("IN", 0),
             ("Q", self.heads),
             ("W", self.head_width),
         ]
@@ -167,7 +170,9 @@ pub struct StateSpaceBinding {
 pub(crate) fn admit(space: &StateSpace) -> Result<(), PlanError> {
     if space.head_width == 0
         || !space.norm_group.is_multiple_of(space.head_width)
-        || !space.heads.is_multiple_of(space.norm_group / space.head_width)
+        || !space
+            .heads
+            .is_multiple_of(space.norm_group / space.head_width)
     {
         return Err(PlanError::Unsupported(
             "state-space output norm group of partial heads",
@@ -181,7 +186,10 @@ pub(super) fn weights<'a>(space: &'a StateSpace, push: &mut super::WeightPush<'_
     use magnitude_family_contracts::WeightKind;
     push(WeightKind::StateSpaceProjection, &space.projection);
     push(WeightKind::RecurrentConvolution, &space.convolution);
-    push(WeightKind::RecurrentConvolutionBias, &space.convolution_bias);
+    push(
+        WeightKind::RecurrentConvolutionBias,
+        &space.convolution_bias,
+    );
     push(WeightKind::RecurrentTimeBias, &space.time_bias);
     push(WeightKind::RecurrentDecay, &space.decay);
     push(WeightKind::StateSpaceSkip, &space.skip);

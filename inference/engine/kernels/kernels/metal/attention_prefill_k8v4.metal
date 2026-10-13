@@ -1,3 +1,7 @@
+#define ATTENTION_AFFINE_HISTORY 1
+#define ATTENTION_KEY_CODE_WORDS SEISMIC_DIM_KC
+#define ATTENTION_VALUE_CODE_WORDS SEISMIC_DIM_VC
+#define ATTENTION_KEY_COEFFICIENTS SEISMIC_DIM_KP
 #define ATTENTION_QUERY_GROUP SEISMIC_DIM_G
 #define ATTENTION_I SEISMIC_DIM_I
 #define ATTENTION_U SEISMIC_DIM_U
@@ -7,7 +11,23 @@
 #define PREFILL_HEADS_PER_GROUP SEISMIC_TUNE_HEADS
 #define PREFILL_DIRECT SEISMIC_TUNE_DIRECT
 #define PREFILL_COISSUE SEISMIC_TUNE_COISSUE
+#define PREFILL_SELECTED (SEISMIC_DIM_B != 0)
 #include "lib/attention/attention.h"
+
+// Listed key tiles a query tile can hold: each of its rows reads at most the
+// bitmap's 32 * B * BR keys, in at most R + 1 runs (the entry's `lists`
+// scratch, attention.seismic).
+#define PREFILL_LIST_CAPACITY uint(SEISMIC_TUNE_QT * ((32 * SEISMIC_DIM_B * SEISMIC_DIM_BR + PREFILL_KEYS - 1) / PREFILL_KEYS + SEISMIC_DIM_R + 1))
+// The worklist scratch: the query tiles' (span, first) lists, their counts,
+// then the rows' span ordinals.
+#define PREFILL_LIST_TILES uint((SEISMIC_DIM_M + SEISMIC_TUNE_QT - 1) / SEISMIC_TUNE_QT)
+#define PREFILL_WORKLIST(selection, worklist)                                                              \
+    attention::prefill_selection{selection,                                                                \
+        (worklist) + ulong(PREFILL_LIST_TILES) * PREFILL_LIST_CAPACITY * 2 + PREFILL_LIST_TILES,          \
+        reinterpret_cast<device const int2 *>(worklist),                                                   \
+        reinterpret_cast<device const uint *>((worklist) + ulong(PREFILL_LIST_TILES) * PREFILL_LIST_CAPACITY * 2), \
+        uint(SEISMIC_DIM_B), int(SEISMIC_DIM_BR), PREFILL_LIST_CAPACITY}
+
 
 // The launches over affine K8/V4 history (bodies in lib/attention/attention.h):
 // the prepare launch appends encoded rows, and every history K/V tile is
@@ -33,7 +53,9 @@
 static inline attention::history_window prefill_window(device float *partials, uint M, uint listed) {
     const uint tiles = (M + SEISMIC_TUNE_QT - 1) / SEISMIC_TUNE_QT * SEISMIC_DIM_KV * PREFILL_HEAD_GROUPS;
     const uint split = metal::max(1u, (SEISMIC_TUNE_SPLIT_GROUPS + tiles - 1) / tiles);
-    const uint most = ((M + 31) / 32) * SEISMIC_DIM_KV * ((SEISMIC_DIM_G + 15) / 16);
+    // Preserve the per-row history/state reserve beyond the 512-row grid.
+    // Shrinking it further can leave less space than the fold state needs.
+    const uint most = ((metal::min(M, 512u) + 31) / 32) * SEISMIC_DIM_KV * ((SEISMIC_DIM_G + 15) / 16);
     const uint charged = (512 + most - 1) / most;
     const uint taken = metal::min(split, metal::max(1u, charged / 2));
     return attention::history_window::in(partials, M, taken, charged, listed);
@@ -129,6 +151,8 @@ kernel void attention_prefill_k8v4_attend(
     device float *partials [[buffer(SEISMIC_BUFFER_SCRATCH_PARTIALS)]],
     device float *statistics [[buffer(SEISMIC_BUFFER_SCRATCH_STATISTICS)]],
     device uint *counts [[buffer(SEISMIC_BUFFER_SCRATCH_COUNTS)]],
+    device const uint *selection [[buffer(SEISMIC_BUFFER_SELECTION)]],
+    device int *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
     uint3 group [[threadgroup_position_in_grid]],
@@ -157,7 +181,8 @@ kernel void attention_prefill_k8v4_attend(
     attention::prefill_attend<SEISMIC_TUNE_QT>(history,
         query, gate, visible, fresh, result, queries, keys, values, partials, statistics, counts,
         SEISMIC_DIM_M, SEISMIC_DIM_R, as_type<float>(uint(SEISMIC_PARAM_SCALE)) * ATTENTION_LOG2E,
-        SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane);
+        SEISMIC_PARAM_GATE_FUNCTION != 0, shared, exchange, group, groups, thread_index, simd, lane,
+        PREFILL_WORKLIST(selection, worklist));
 }
 
 kernel void attention_prefill_k8v4_fold(
@@ -206,4 +231,26 @@ kernel void attention_prefill_k8v4_merge(
 #endif
     attention::prefill_merge<SEISMIC_TUNE_QT>(query, gate, result, partials, statistics, counts,
         SEISMIC_DIM_M, group.x, group.y, column, SEISMIC_PARAM_GATE_FUNCTION != 0);
+}
+
+// The WorkList's list launch (B > 0): each query tile's read key tiles
+// (`attention::prefill_list`).
+kernel void attention_prefill_k8v4_list(
+    device const int *visible [[buffer(SEISMIC_BUFFER_VISIBLE)]],
+    device const int *fresh [[buffer(SEISMIC_BUFFER_FRESH)]],
+    device const uint *selection [[buffer(SEISMIC_BUFFER_SELECTION)]],
+    device int *worklist [[buffer(SEISMIC_BUFFER_SCRATCH_WORKLIST)]],
+    constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
+    threadgroup uchar *shared [[threadgroup(0)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == -1)
+        return;
+    const attention::prefill_selection list = PREFILL_WORKLIST(selection, worklist);
+    attention::prefill_list<SEISMIC_TUNE_QT>(visible, fresh, selection, const_cast<device int *>(list.bases),
+        const_cast<device int2 *>(list.lists), const_cast<device uint *>(list.listed), SEISMIC_DIM_M,
+        SEISMIC_DIM_R, SEISMIC_DIM_B, int(SEISMIC_DIM_BR), PREFILL_LIST_CAPACITY, shared, group.x,
+        thread_index, simd, lane);
 }

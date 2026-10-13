@@ -533,7 +533,7 @@ fn split_gguf_opens_as_one_component() {
     let package = Package::open_without_projector(&paths[0]).unwrap();
     let manifest = package.manifest();
     assert_eq!(manifest.target.files.len(), 3);
-    assert_eq!(manifest.target.path(), paths[0].canonicalize().unwrap());
+    assert_eq!(manifest.target.path(), std::path::absolute(&paths[0]).unwrap());
     let reopened = Package::open_manifest(&manifest).unwrap();
     assert_eq!(reopened.identity(), package.identity());
     assert_eq!(reopened.manifest(), manifest);
@@ -548,6 +548,37 @@ fn split_gguf_opens_as_one_component() {
         gguf::GgufArtifact::open(&paths[0]),
         Err(Error::Io(_))
     ));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A content-addressed store keeps each shard as a blob and names it by a
+/// link. The package opens through the links and reopens from its manifest,
+/// which keeps the links' split names.
+#[cfg(unix)]
+#[test]
+fn split_gguf_opens_through_linked_blobs() {
+    let root = temporary_directory("split-linked");
+    let blobs = root.join("blobs");
+    let snapshot = root.join("snapshot");
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let links: Vec<PathBuf> = write_split(&root, false)
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let blob = blobs.join(format!("sha256-{index}"));
+            std::fs::rename(&path, &blob).unwrap();
+            let link = snapshot.join(path.file_name().unwrap());
+            std::os::unix::fs::symlink(&blob, &link).unwrap();
+            link
+        })
+        .collect();
+    let package = Package::open_without_projector(&links[0]).unwrap();
+    let manifest = package.manifest();
+    assert_eq!(manifest.target.files.len(), 3);
+    assert_eq!(manifest.target.path(), std::path::absolute(&links[0]).unwrap());
+    let reopened = Package::open_manifest(&manifest).unwrap();
+    assert_eq!(reopened.identity(), package.identity());
     std::fs::remove_dir_all(root).unwrap();
 }
 

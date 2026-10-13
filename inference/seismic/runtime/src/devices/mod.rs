@@ -15,8 +15,9 @@ mod host;
 pub use crate::memory::MemoryUsage;
 pub use catalog::Catalog;
 pub use host::{
-    DisplacementWindow, HeadroomBasis, HeadroomEstimate, HostDisplacement, HostMeasurements,
-    HostMemoryStatus, KernelPressure, LimitVisibility, ProcessLimitKind, ProcessMemoryLimit,
+    DISPLACEMENT_HISTORY, DisplacementWindow, HeadroomBasis, HeadroomEstimate, HostDisplacement,
+    HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility, ProcessLimitKind,
+    ProcessMemoryLimit,
 };
 
 use seismic_compiler::errors::TargetError;
@@ -161,6 +162,12 @@ pub struct DeviceMemoryInfo {
     /// The host pool used for host-side copies (loading, staging). Equal to
     /// `allocation_pool` when the device allocates host RAM.
     pub host_pool: MemoryPoolId,
+    /// The pool host-shared storage consumes (`Tensor::shared`, which the
+    /// host writes in place while device work reads it): `allocation_pool`
+    /// when it is the device's own memory (host RAM of a host-backed device,
+    /// a large host-visible device-local heap), else `host_pool` (CUDA's
+    /// mapped pinned memory, a Vulkan device without one).
+    pub shared_pool: MemoryPoolId,
     /// The single-allocation limit (`TargetLimits::max_allocation_bytes`).
     /// Neither capacity nor availability.
     pub max_allocation_bytes: u64,
@@ -179,7 +186,11 @@ pub enum MemoryPoolKind {
     DeviceLocal,
 }
 
-/// The definition of a pool's capacity figure.
+/// The definition of a pool's capacity figure. A dedicated device's capacity
+/// is its usable memory: the device's total less what the driver reserves,
+/// what the operating system withholds from a process and the process's own
+/// context, computed once per process by discovery before the process
+/// allocates. Other programs' use is not subtracted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CapacityBasis {
     /// macOS `hw.memsize`: installed physical RAM.
@@ -187,17 +198,27 @@ pub enum CapacityBasis {
     /// Linux `MemTotal` / Windows `ullTotalPhys`: RAM usable by the OS after
     /// firmware and kernel reservations.
     OsUsableRam,
-    /// CUDA `cuDeviceTotalMem`: memory of the exposed device or partition.
-    CudaDeviceTotal,
+    /// The memory a CUDA device lets this process use
+    /// (`seismic_cuda::usable_memory_bytes`): under WDDM `cuMemGetInfo` free
+    /// bytes once this process's context exists, before it allocates;
+    /// elsewhere NVML's total less its reserve less that context.
+    CudaUsable,
+    /// The `VK_EXT_memory_budget` budget of the Vulkan device's largest
+    /// device-local heap: WDDM's per-process budget.
+    VulkanHeapBudget,
     /// The size of the Vulkan device's largest device-local heap.
     VulkanDeviceLocalHeap,
 }
 
+/// One physical memory pool. `capacity_bytes` is what memory policy plans
+/// against; `total_bytes` is the memory the pool has, a descriptive figure
+/// that never bounds an allocation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryPoolInfo {
     pub id: MemoryPoolId,
     pub kind: MemoryPoolKind,
     pub capacity_bytes: u64,
+    pub total_bytes: u64,
     pub basis: CapacityBasis,
     pub(crate) ledger: LedgerKey,
 }

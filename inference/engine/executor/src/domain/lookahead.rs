@@ -151,6 +151,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             let mut expected = lookahead.predicted[slot].clone();
             if lookahead.selected_tokens {
                 let choice = selected.get(slot).filter(|choice| choice.status == 0)?;
+                // A queued step that read a table row the device did not
+                // hold for this token is not the continuation. (A slot whose
+                // stored rows could not be read is claimed all the same: its
+                // sequence fails when the step finishes, and the others
+                // continue, `finish_target_work`.)
+                if !lookahead.flight.submission.output().found_selected(choice.token.0) {
+                    return None;
+                }
                 if let Operation::Forward { tokens, .. } = &mut expected {
                     tokens[0] = choice.token;
                 }
@@ -279,7 +287,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             return Ok(());
         }
         if bindings.lookahead.is_some() {
-            return Err(DomainError::invariant("a lookahead was queued over another"));
+            return Err(DomainError::invariant(
+                "a lookahead was queued over another",
+            ));
         }
         // Tokens are the flight's selection rows, one per slot in slot
         // order, so the continuation keeps every slot in the same order.
@@ -346,6 +356,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
             slots.push(slot);
         }
+        // The continuation follows the tokens fed so far.
+        let Ok(preceding) = self.target_preceding(&predicted) else {
+            return Ok(());
+        };
         let class_limits = self.target_class_limits();
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let batch = if selected_tokens {
@@ -398,6 +412,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         ];
         let readout_workspace = readout.acquire_workspace().map_err(invariant)?;
         let readout_output = readout.acquire_output().map_err(invariant)?;
+        let boundary = if predicted.iter().any(|op| {
+            matches!(
+                op,
+                Operation::Forward {
+                    prime: Some(Priming { boundary: true, .. }),
+                    ..
+                }
+            )
+        }) {
+            match self.allocate_boundary() {
+                Ok(boundary) => Some(boundary),
+                Err(DomainError::Capacity(_)) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let count = operations.len();
         let inputs = TargetLaunchInputs::new(
             batch,
@@ -409,62 +440,67 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             graph_outputs,
             readout_workspace,
             readout_output,
-        );
+        )
+        .with_boundary(boundary)
+        .with_preceding(preceding);
         let launch = match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
             self.domain.id(),
             self.definition.decoder.hidden as usize,
+            self.definition.head.as_ref().map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder)) as usize,
         ) {
             Ok(launch) => launch,
             Err((_, error)) => return Err(DomainError::Invariant(error)),
         };
         // A planned prompt chunk's drafter entry follows the in-flight entry
         // of the chunk before it, with its own draft launch leases.
-        let priming = match &predicted[..] {
-            [Operation::Forward {
-                request,
-                prime: Some(prime),
-                ..
-            }] => {
-                let Some(successor) = flight
-                    .priming
-                    .as_ref()
-                    .filter(|priming| priming.request == *request)
-                    .and_then(|priming| priming.submission.launch().advances().first())
-                    .and_then(|advance| advance.successor(prime.tokens.len()).ok())
-                else {
-                    if self.trace_lookahead {
-                        eprintln!(
-                            "lookahead skipped after={}: drafter entry has no room",
-                            flight.id
-                        );
-                    }
-                    return Ok(());
-                };
-                let Some(head) = self
-                    .resources
-                    .head_graph()
-                    .filter(|head| head.available_workspace() > 0 && head.available_output() > 0)
-                else {
-                    if self.trace_lookahead {
-                        eprintln!(
-                            "lookahead skipped after={}: no free drafter launch leases",
-                            flight.id
-                        );
-                    }
-                    return Ok(());
-                };
-                Some((
-                    *request,
-                    prime.clone(),
-                    successor,
-                    head.acquire_workspace().map_err(invariant)?,
-                    head.acquire_output().map_err(invariant)?,
-                ))
-            }
-            _ => None,
-        };
+        let priming =
+            match &predicted[..] {
+                [
+                    Operation::Forward {
+                        request,
+                        prime: Some(prime),
+                        ..
+                    },
+                ] => {
+                    let Some(successor) = flight
+                        .priming
+                        .as_ref()
+                        .filter(|priming| priming.request == *request)
+                        .and_then(|priming| priming.submission.launch().advances().first())
+                        .and_then(|advance| advance.successor(prime.tokens.len()).ok())
+                    else {
+                        if self.trace_lookahead {
+                            eprintln!(
+                                "lookahead skipped after={}: drafter entry has no room",
+                                flight.id
+                            );
+                        }
+                        return Ok(());
+                    };
+                    let Some(head) = self.resources.head_graph().filter(|head| {
+                        head.available_workspace() > 0 && head.available_output() > 0
+                    }) else {
+                        if self.trace_lookahead {
+                            eprintln!(
+                                "lookahead skipped after={}: no free drafter launch leases",
+                                flight.id
+                            );
+                        }
+                        return Ok(());
+                    };
+                    Some((
+                        *request,
+                        prime.clone(),
+                        successor,
+                        head.acquire_workspace().map_err(invariant)?,
+                        head.acquire_output().map_err(invariant)?,
+                    ))
+                }
+                _ => None,
+            };
+        let launch_trace = self.trace_target_submission(&predicted);
         let started = Instant::now();
         let submission = self
             .family
@@ -494,7 +530,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             );
         }
         let mut queued = TargetWork {
-            launch_trace: None,
+            launch_trace,
             requests,
             submission,
             priming: None,
@@ -510,6 +546,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 request,
                 &prime,
                 TentativeAdvance::Successor(successor),
+                flight.submission.output().boundary.clone(),
                 workspace,
                 output,
             )?;

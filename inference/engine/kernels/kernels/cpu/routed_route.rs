@@ -14,11 +14,16 @@ use lib::routed::routed;
 fn routed_route_normalize<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], shared: &mut [u8]) {
     let row = group[0] as usize;
     let h = cx.dim_h() as usize;
-    let weight = seismic::cpu::tensor::floats(shared, h);
-    cx.arg_norm().decode_row(0, weight);
     // SAFETY: each work item writes its own row of the scratch.
     let normalized = unsafe { cx.scratch_normalized().slice_mut::<f32>(4 * row * h, h) };
-    projection::rms_row::<E::A>(cx.arg_residual().row([row, 0]), weight, cx.arg_eps(), normalized);
+    let norm = cx.arg_norm();
+    projection::form_input::<E::A>(
+        cx.arg_residual().row([row, 0]),
+        (cx.dim_nm() != 0).then_some(&norm),
+        cx.arg_eps(),
+        shared,
+        normalized,
+    );
     // SAFETY: each work item writes its own row of the result.
     activation::store::<E::A>(normalized, unsafe { cx.result_0().row_mut([row, 0]) });
 }

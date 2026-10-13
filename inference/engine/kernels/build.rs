@@ -32,7 +32,13 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "gated_delta_step_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's step over the projection's convolved channels; the other backends convolve in `gated_delta_step`",
-    ),    (
+    ),
+    (
+        "packing_bound",
+        &[BackendName::Metal],
+        "a weight's packing bound, which only Metal's token-packing projection forms read",
+    ),
+    (
         "readout_top_rows",
         &[BackendName::Metal, BackendName::Cuda],
         "level one of the progressive head's certified selection (decode rows)",
@@ -75,6 +81,11 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/attention/prefill",
         &[BackendName::Cuda, BackendName::Vulkan],
         "prefill attention body (CUDA tensor-core flash, Vulkan tiled); Metal keeps its prefill in `attention.h`",
+    ),
+    (
+        "lib/core/matrix",
+        &[BackendName::Vulkan],
+        "cooperative-matrix fragment types and the one zero accumulator every Vulkan matrix body clears with",
     ),
     (
         "lib/attention/flash",
@@ -127,6 +138,21 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
     ),
     (
+        "lib/streams/down_weight",
+        &[BackendName::Vulkan],
+        "representation ladder of a mix site's `down_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
+        "lib/streams/inject_weight",
+        &[BackendName::Vulkan],
+        "representation ladder of a mix site's `inject_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
+        "lib/streams/up_weight",
+        &[BackendName::Vulkan],
+        "representation ladder of a mix site's `up_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
         "lib/recurrent/convolution",
         &[BackendName::Metal],
         "the gated-delta convolution and window publication, apart from `recurrent.h` because the Metal-only `gated_delta_step_convolved` binds no window; the other backends keep them in their recurrent library",
@@ -150,11 +176,15 @@ fn main() {
         // first addition; the recursive directory source deduplicates them.
         .source("kernels/draft.seismic")
         .source("kernels/readout.seismic")
+        .source("kernels/clustered_readout.seismic")
         .source("kernels/vision.seismic")
         .source("kernels/recurrent.seismic")
         .source("kernels/short_conv.seismic")
         .source("kernels/state_space.seismic")
         .source("kernels/residual.seismic")
+        .source("kernels/streams.seismic")
+        .source("kernels/ngram.seismic")
+        .source("kernels/indexer.seismic")
         .source("kernels/functions.seismic")
         .run()
         .unwrap_or_else(|error| {
@@ -171,6 +201,14 @@ fn main() {
             "native backend parity failed ({} violations):\n  - {}",
             violations.len(),
             violations.join("\n  - ")
+        );
+    }
+    let incoherent = metal_arrival_coherence(&kernels.join("metal"));
+    if !incoherent.is_empty() {
+        panic!(
+            "Metal arrival handoffs are not device-coherent ({} violations):\n  - {}",
+            incoherent.len(),
+            incoherent.join("\n  - ")
         );
     }
 }
@@ -313,6 +351,102 @@ fn tree_parity(kernels: &Path) -> Vec<String> {
         }
     }
     violations
+}
+
+/// A Metal entry that counts arrivals over atomic scratch, so that the last of
+/// its threadgroups finishes the work (`arrive::last`), declares every other
+/// writable scratch buffer device-coherent (`arrive::coherent_device`): the
+/// last threadgroup's plain loads of another threadgroup's stores are
+/// otherwise served from a stale cache on M1 Max-class GPUs
+/// (`lib/core/arrive.h`). Read-only (`const`) scratch was written by an
+/// earlier launch and needs nothing.
+fn metal_arrival_coherence(metal: &Path) -> Vec<String> {
+    let mut violations = Vec::new();
+    let entries = std::fs::read_dir(metal)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", metal.display()));
+    for entry in entries {
+        let path = entry.expect("a Metal kernel directory entry").path();
+        if path.extension().and_then(|value| value.to_str()) != Some("metal") {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        let text = expand_includes(metal, &path, &mut seen);
+        let declarations = scratch_declarations(&text);
+        // An entry that binds atomic scratch counts arrivals over it (the
+        // `sync` scratch of `arrive::last`).
+        if !declarations
+            .iter()
+            .any(|declaration| declaration.contains("atomic_"))
+        {
+            continue;
+        }
+        let name = relative(metal, &path).display().to_string();
+        for declaration in declarations {
+            let coherent = declaration.contains("coherent");
+            let atomic = declaration.contains("atomic_");
+            let read_only = declaration.contains("const ");
+            if !(coherent || atomic || read_only) {
+                violations.push(format!(
+                    "`metal/{name}` hands work to its last-arriving threadgroup but declares writable scratch `{}` without `arrive::coherent_device` (lib/core/arrive.h)",
+                    declaration.split_whitespace().collect::<Vec<_>>().join(" ")
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// `path`'s text with each local `#include "..."` replaced by the included
+/// file's (relative to the including file, else to the Metal root), each file
+/// once.
+fn expand_includes(metal: &Path, path: &Path, seen: &mut BTreeSet<PathBuf>) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !seen.insert(path.clone()) {
+        return String::new();
+    }
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    let mut expanded = String::new();
+    for line in text.lines() {
+        let included = line
+            .trim_start()
+            .strip_prefix("#include \"")
+            .and_then(|rest| rest.split('"').next());
+        match included {
+            Some(name) => {
+                let beside = path.parent().map(|parent| parent.join(name));
+                let file = beside
+                    .filter(|candidate| candidate.exists())
+                    .unwrap_or_else(|| metal.join(name));
+                if file.exists() {
+                    expanded.push_str(&expand_includes(metal, &file, seen));
+                }
+            }
+            None => {
+                expanded.push_str(line);
+                expanded.push('\n');
+            }
+        }
+    }
+    expanded
+}
+
+/// The parameter declarations bound to scratch buffers
+/// (`[[buffer(SEISMIC_BUFFER_SCRATCH_...)]]`), from the preceding parameter
+/// separator.
+fn scratch_declarations(text: &str) -> Vec<String> {
+    let mut declarations = Vec::new();
+    let marker = "[[buffer(SEISMIC_BUFFER_SCRATCH_";
+    let mut from = 0;
+    while let Some(found) = text[from..].find(marker) {
+        let at = from + found;
+        let start = text[..at]
+            .rfind([',', '('])
+            .map_or(0, |position| position + 1);
+        declarations.push(text[start..at].replace('\\', " ").trim().to_owned());
+        from = at + marker.len();
+    }
+    declarations
 }
 
 /// Every file under `directory`, recursively. Each visited directory is a

@@ -22,8 +22,9 @@ cached state is valid for a request, and nothing re-checks that decision.
 - **Cached prefix**: an immutable resume state at the end of a path, with the generation method's
   checkpoint at that position.
 - **Resume state**: what making a request resident at a position needs and nothing more: the
-  numerical state of every sequence lane, and encoded features of the media spans that straddle
-  the position. It holds no request's input.
+  numerical state of every sequence lane, encoded features of media spans that straddle
+  the position, and any independently owned target feature needed to enter the next drafter
+  row. It holds no request's input or token beyond the prefix.
 - **Hit**: the result of matching a path against the cache. It exists only when the entry's path
   equals the queried path up to its position, at an exact boundary of the queried path.
 
@@ -54,7 +55,9 @@ path it holds and are not part of an entry's identity.
   request** all become resident through that one transition, when rounds are formed. They differ
   only in when it runs.
 - **Eviction** releases numerical state and encoded features; the input stays, so replay is
-  conditioned exactly as the first pass.
+  conditioned exactly as the first pass. A replay that resumes inside the prompt ends at the
+  prompt end, and the generated rows replay in a later round: a round's target rows lie wholly
+  within or wholly past the prepared input.
 - **Resume bound**: a resumed request still computes the row it next samples from, so only
   prefixes strictly below it qualify: the prompt length before the first token, the accepted
   length after.
@@ -86,7 +89,8 @@ plans.
 ## Invariants
 
 1. A hit exists only for an entry whose path is a prefix of the queried path at an exact
-   boundary.
+   boundary. Every cached lane depends only on that prefix; an open drafter feature takes its
+   successor token from the resumed request.
 2. Making a request resident from a hit cannot fail for input reasons. A shortfall of capacity
    gives the request a capacity wait at the current availability epoch, ended when the epoch
    advances. When, between flights, memory is Normal and no request awaits host credit or memory
@@ -96,9 +100,11 @@ plans.
    an engine invariant failure, never a request error.
 3. A request with installed input keeps it until it closes; every row the executor lowers has its
    input. There is no fallback for missing input.
-4. A resume state references features only for spans that straddle its position.
-5. Classified holdings count each feature allocation once, across request inputs and cached
-   prefixes.
+4. A resume state references media features only for spans that straddle its position, plus
+   at most one independent device row for a successor-dependent drafter boundary. Forks share
+   that immutable row; eviction releases it after its last numerical owner or consumer ends.
+5. Classified holdings count each feature allocation once, across in-flight work, resident
+   requests and cached prefixes. A cached boundary never pins a chunk's graph-output arena.
 6. For any sequence of requests (interleaved, waiting, evicted, cancelled), a request whose live
    path shares a cached prefix of at least the minimum hit length, at an exact boundary below its
    resume bound, resumes from the deepest such prefix. The prefixes cached for it include, for

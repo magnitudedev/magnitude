@@ -75,15 +75,42 @@ impl FormationFacts {
             SUBGROUP_WIDTH
         };
         [
-            Self { subgroup_lanes: other_lanes, ..*self },
-            Self { float16: !float16, ..*self },
-            Self { matrix: !matrix, ..*self },
-            Self { wide_accumulators: !wide_accumulators, ..*self },
-            Self { mixed_dot: !mixed_dot, ..*self },
-            Self { f32_atomic_add: !f32_atomic_add, ..*self },
-            Self { shared_int64_atomics: !shared_int64_atomics, ..*self },
-            Self { rounding_rte_32: !rounding_rte_32, ..*self },
-            Self { denorm_preserve_32: !denorm_preserve_32, ..*self },
+            Self {
+                subgroup_lanes: other_lanes,
+                ..*self
+            },
+            Self {
+                float16: !float16,
+                ..*self
+            },
+            Self {
+                matrix: !matrix,
+                ..*self
+            },
+            Self {
+                wide_accumulators: !wide_accumulators,
+                ..*self
+            },
+            Self {
+                mixed_dot: !mixed_dot,
+                ..*self
+            },
+            Self {
+                f32_atomic_add: !f32_atomic_add,
+                ..*self
+            },
+            Self {
+                shared_int64_atomics: !shared_int64_atomics,
+                ..*self
+            },
+            Self {
+                rounding_rte_32: !rounding_rte_32,
+                ..*self
+            },
+            Self {
+                denorm_preserve_32: !denorm_preserve_32,
+                ..*self
+            },
         ]
         .into_iter()
         .filter(Self::consistent)
@@ -260,7 +287,19 @@ pub struct Facts {
     pub host_visible_device_local_bytes: u64,
 }
 
+/// The largest host-visible device-local heap that is a small BAR window,
+/// which upload storage is not spent on.
+const SMALL_BAR_BYTES: u64 = 256 << 20;
+
 impl Facts {
+    /// Whether upload storage (host-written storage the device reads:
+    /// upload regions, host-shared tensors) is device-local memory: a
+    /// host-visible device-local heap larger than a small BAR window
+    /// (ReBAR/SAM, or unified memory). Else it is host RAM.
+    pub fn uploads_device_local(&self) -> bool {
+        self.host_visible_device_local_bytes > SMALL_BAR_BYTES
+    }
+
     pub fn is_gpu(&self) -> bool {
         matches!(
             self.device_type,
@@ -347,12 +386,14 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One enumerated physical device: its facts, and whether it meets the floor
-/// (`Err` names the first missing item).
+/// One enumerated physical device: its facts, whether it meets the floor
+/// (`Err` names the first missing item), and for a device meeting it, the
+/// budget of its device-local heap when discovered (`VK_EXT_memory_budget`).
 #[derive(Clone, Debug)]
 pub struct Description {
     pub facts: Facts,
     pub floor: Result<(), String>,
+    pub heap_budget_bytes: Option<u64>,
 }
 
 /// Device extensions of the floor.
@@ -580,7 +621,11 @@ pub(crate) fn describe(instance: &Instance, physical: vk::PhysicalDevice) -> Des
         Some((missing, _)) => Err(format!("missing {missing}")),
         None => Ok(()),
     };
-    Description { facts, floor }
+    Description {
+        facts,
+        floor,
+        heap_budget_bytes: None,
+    }
 }
 
 /// Whether the device offers subgroup-scope 16x16x16 cooperative matrix

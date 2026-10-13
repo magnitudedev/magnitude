@@ -7,8 +7,9 @@
 //! progress drives the instance's stage and fraction; readiness is verified against the host's
 //! resolution before the instance is Ready.
 
+use std::cell::RefCell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
@@ -17,14 +18,16 @@ use magnitude_engine::composition::{ReadinessMismatch, ReadyEngine};
 use magnitude_engine::error::{LoadError, PreviewError};
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::preview::LoadPreview;
-use magnitude_engine::worker::EngineClient;
+use magnitude_engine::worker::{EngineClient, Preparation, load_prepared};
 use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
-    InstalledModelPackages as _, MemoryShortage, ModelId, ModelInstance, ModelInstanceId,
+    InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
+    ModelAssessmentEntryState, ModelAssessments, ModelAssessmentsSnapshot, ModelId, ModelInstance,
+    ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
-    ModelLoadStage, ModelPackageId, ModelServingConfiguration,
+    ModelLoadStage, ModelPackageId, ModelServingConfiguration, ServingProfile,
 };
 use magnitude_service_contracts::{HardwareDeviceId, InventoryError};
 use magnitude_service_models::{
@@ -35,7 +38,7 @@ use seismic::DeviceCatalog;
 
 use super::optimization::{self, PreparationJobs};
 use super::supervisor::{HostMemoryObserver, MemorySupervisor};
-use super::worker::EngineWorker;
+use super::worker::{EngineWorker, SpawnedWorker};
 use super::{
     LoadingObserver, ModelOperationFailure, ModelResidency, ModelResidencyDriver,
     PreparedResidency, ReleaseControl, ResidencyAcquisition, ResidencyClient, ResidencyGrant,
@@ -49,7 +52,7 @@ use crate::worker_process::WorkerLauncher;
 /// How long a ready instance with no lease stays resident.
 pub const MODEL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 /// How long a released worker has to unload and exit before it is killed.
-const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(super) const GRACEFUL_EXIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// The same bound for an explicit stop, which must end active execution promptly.
 const INTERRUPTED_EXIT: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -95,6 +98,9 @@ pub struct ModelInstances {
     residency: ResidencyClient<ResidentEngine>,
     supervisor: MemorySupervisor,
     preparations: PreparationJobs,
+    /// The assessment pool whose verdicts admit loads. It is built from these instances, so it
+    /// is attached once both exist.
+    assessments: Arc<std::sync::OnceLock<Arc<dyn ModelAssessments>>>,
 }
 
 impl ModelInstances {
@@ -105,7 +111,9 @@ impl ModelInstances {
         let host_capacity = environment.catalog.topology().host_pool().capacity_bytes;
         let supervisor = MemorySupervisor::start(
             Arc::clone(&environment.host_memory),
-            environment.reserves.for_domain(host_capacity),
+            environment
+                .reserves
+                .for_domain(seismic::MemoryPoolKind::HostRam, host_capacity),
             client.notifier(),
         );
         let preparations = PreparationJobs::default();
@@ -122,6 +130,25 @@ impl ModelInstances {
             residency: client,
             supervisor,
             preparations,
+            assessments: Arc::default(),
+        }
+    }
+
+    /// Admit loads by `assessments`' verdicts from now on.
+    pub fn attach_assessments(&self, assessments: Arc<dyn ModelAssessments>) {
+        let _ = self.assessments.set(assessments);
+    }
+
+    /// Refuse a load the assessment says cannot fit, before the residency replaces anything.
+    /// A model not yet assessed is admitted: the engine's own resource plan still guards it.
+    async fn admit(&self, target: &ResolvedResidencyTarget) -> Result<(), InventoryError> {
+        let Some(assessments) = self.assessments.get() else {
+            return Ok(());
+        };
+        let snapshot = assessments.snapshot().await?;
+        match assessed_fit(&snapshot, &target.model_id, &target.configuration.profile) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
         }
     }
 
@@ -146,9 +173,11 @@ impl ModelInstances {
 
     /// Make `model_id` resident without leasing it.
     pub async fn ensure_resident(&self, model_id: &str) -> Result<ModelInstance, InventoryError> {
+        let target = self.target(model_id)?;
+        self.admit(&target).await?;
         match self
             .residency
-            .acquire(self.target(model_id)?, ResidencyAcquisition::Warm)
+            .acquire(target, ResidencyAcquisition::Warm)
             .await?
         {
             ResidencyGrant::Ready(instance) => Ok(instance),
@@ -162,10 +191,12 @@ impl ModelInstances {
         model_id: &str,
         progress: Option<LoadingObserver>,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
+        let target = self.target(model_id)?;
+        self.admit(&target).await?;
         match self
             .residency
             .acquire(
-                self.target(model_id)?,
+                target,
                 ResidencyAcquisition::Inference { progress },
             )
             .await?
@@ -302,6 +333,49 @@ impl CatalogPackageRemover for ModelInstances {
     }
 }
 
+/// The refusal for `model_id` served at `profile` when its assessment does not fit.
+fn assessed_fit(
+    snapshot: &ModelAssessmentsSnapshot,
+    model_id: &ModelId,
+    profile: &ServingProfile,
+) -> Option<InventoryError> {
+    [&snapshot.catalog, &snapshot.discovered]
+        .into_iter()
+        .flat_map(|domain| match domain {
+            ModelAssessmentDomainSnapshot::Available { entries, .. } => entries.as_slice(),
+            ModelAssessmentDomainSnapshot::Pending { .. } => &[],
+        })
+        .filter(|entry| entry.subject.model_id() == model_id)
+        .filter_map(|entry| match &entry.state {
+            ModelAssessmentEntryState::Assessed { profiles, .. } => Some(profiles),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|assessment| match assessment {
+            ModelAssessment::DoesNotFit {
+                profile: assessed,
+                deficit_bytes,
+                ..
+            } if assessed == profile => Some(InventoryError::DoesNotFit(format!(
+                "{model_id} needs {} more memory than this computer can provide",
+                memory_size(*deficit_bytes)
+            ))),
+            _ => None,
+        })
+}
+
+/// `bytes` as the clients show a shortfall: binary units from MB, one decimal, rounded up.
+fn memory_size(bytes: u64) -> String {
+    const MEBIBYTE: f64 = 1024.0 * 1024.0;
+    let tenths = |amount: f64| (amount * 10.0).ceil() / 10.0;
+    let megabytes = tenths(bytes as f64 / MEBIBYTE);
+    if megabytes < 1024.0 {
+        format!("{megabytes:.1} MB")
+    } else {
+        format!("{:.1} GB", tenths(bytes as f64 / (MEBIBYTE * 1024.0)))
+    }
+}
+
 /// Instance equality: the serving configuration fingerprint (bundle identity and serving
 /// profile). The engine policy is the service's single serving policy.
 fn residency_target(
@@ -368,6 +442,15 @@ fn preview_failure(error: PreviewError) -> ModelOperationFailure {
     ModelOperationFailure::new(code, error.to_string(), retryable)
 }
 
+/// Sets its flag when dropped: with the task that holds it.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// A worker's load failure. A memory refusal is a shortage: blocked by the bytes the engine's
 /// claim found available above the domain's reserve, or under pressure with no byte count.
 fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailure {
@@ -391,23 +474,30 @@ fn load_failure(error: LoadError, worker: &EngineWorker) -> ModelOperationFailur
         LoadError::Internal { .. } => "model_load_failed",
     };
     let message = match &error {
-        LoadError::WorkerLost { .. } => match worker.diagnostics() {
-            diagnostics if diagnostics.is_empty() => error.to_string(),
-            diagnostics => format!("{error}; worker diagnostics: {diagnostics}"),
-        },
+        LoadError::WorkerLost { .. } => {
+            let exit = worker
+                .ended_status()
+                .map_or_else(String::new, |status| format!("; worker {status}"));
+            match worker.diagnostics() {
+                diagnostics if diagnostics.is_empty() => format!("{error}{exit}"),
+                diagnostics => format!("{error}{exit}; worker diagnostics: {diagnostics}"),
+            }
+        }
         _ => error.to_string(),
     };
     ModelOperationFailure::new(code, message, retryable)
 }
 
-/// The share of a tuning load's fraction that tuning fills; weight import fills the rest, or all
-/// of a load that does not tune.
+/// The share of a load's fraction that a Prepare worker's tuning fills when the load needed
+/// one; the Load worker's weight import fills the rest, or all of a load that needed none.
 const TUNING_SHARE: f32 = 0.5;
 /// The least fraction a stage reports again after, so a load publishes a bounded number of
 /// snapshots however many weights it imports.
 const REPORT_STEP: f32 = 0.005;
 
-/// A load's stage and fraction from its worker's progress, by measured work. Monotonic.
+/// A load's stage and fraction from the progress of its workers in turn (the Load; or, with
+/// tuning records missing, a Load that ends unprepared, the Prepare and the Load), by measured
+/// work. Monotonic.
 #[derive(Default)]
 struct LoadProgression {
     tuned: bool,
@@ -420,6 +510,9 @@ impl LoadProgression {
     fn advance(&mut self, progress: LoadProgress) -> Option<(ModelLoadStage, f32)> {
         let previous = self.reported.map_or(0.0, |(_, fraction)| fraction);
         let (stage, fraction) = match progress {
+            // The second Load worker prepares again after the Prepare worker tuned: the load
+            // does not return to `preparing`.
+            LoadProgress::Preparing if self.tuned => return None,
             LoadProgress::Preparing => (ModelLoadStage::Preparing, 0.0),
             LoadProgress::Tuning { completed, total } => {
                 self.tuned = true;
@@ -474,6 +567,25 @@ impl EngineResidency {
             });
     }
 
+    /// Spawn an inference worker for `instance_id`'s load and hand it to the residency, which
+    /// terminates it when the load is stopped.
+    fn spawn_load_worker(
+        &self,
+        instance_id: &ModelInstanceId,
+    ) -> Result<SpawnedWorker, ModelOperationFailure> {
+        let spawned = EngineWorker::spawn(&self.environment.launcher).map_err(|error| {
+            ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
+        })?;
+        let worker: Arc<dyn ResidencyWorker> = spawned.worker.clone();
+        self.client
+            .notifier()
+            .send(ResidencyNotification::LoadWorkerStarted {
+                instance_id: instance_id.clone(),
+                worker,
+            });
+        Ok(spawned)
+    }
+
     async fn load(
         &self,
         instance_id: &ModelInstanceId,
@@ -491,36 +603,88 @@ impl EngineResidency {
         let plan = load_plan(&preview)?;
         self.progress(instance_id, ModelLoadStage::Preparing, Some(&plan));
 
-        // A load tunes whatever its post-install preparation has not stored yet.
+        // A load never searches kernels. The bundle's post-install job is stopped first; the
+        // records it published stand. The Load worker reports tuning units without a record:
+        // with none it is the load, one worker. Otherwise it places nothing and ends, a
+        // Prepare worker searches what is missing and is proven gone, and a second Load worker
+        // serves what is stored (the engine's one sequence, `load_prepared`).
         self.preparations
             .stop(&servable_model_bundle_key_for_bundle(&configuration.bundle));
-        let spawned = EngineWorker::spawn(&environment.launcher).map_err(|error| {
-            ModelOperationFailure::new("worker_spawn_failed", format!("{error:#}"), true)
-        })?;
-        let worker: Arc<dyn ResidencyWorker> = spawned.worker.clone();
-        self.client
-            .notifier()
-            .send(ResidencyNotification::LoadWorkerStarted {
-                instance_id: instance_id.clone(),
-                worker,
-            });
         let mut manifest = resolved.manifest.clone();
         manifest.device = DeviceRequest::Selector(preview.device);
-        let notifier = self.client.notifier();
-        let progress_instance = instance_id.clone();
-        let progress_plan = plan.clone();
-        let connected = crate::spawn_blocking_traced(move || {
-            let mut progression = LoadProgression::default();
-            spawned.connect(manifest, move |progress| {
-                if let Some((stage, fraction)) = progression.advance(progress) {
+        // The sequence runs on a blocking thread, which outlives this task when the load is
+        // stopped: it starts no further worker once the task is gone.
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let _abandon = SetOnDrop(Arc::clone(&abandoned));
+        let driver = self.clone();
+        let load_instance = instance_id.clone();
+        let load_plan = plan.clone();
+        let loaded = crate::spawn_blocking_traced(move || {
+            // One progression across the workers: a Prepare fills `optimizing`, the Load the
+            // rest.
+            let progression = RefCell::new(LoadProgression::default());
+            let notifier = driver.client.notifier();
+            let report = |progress: LoadProgress| {
+                if let Some((stage, fraction)) = progression.borrow_mut().advance(progress) {
                     notifier.send(ResidencyNotification::LoadProgress {
-                        instance_id: progress_instance.clone(),
+                        instance_id: load_instance.clone(),
                         stage,
                         fraction,
-                        planned_allocation: Some(progress_plan.clone()),
+                        planned_allocation: Some(load_plan.clone()),
                     });
                 }
-            })
+            };
+            // The worker last started, for a failure's diagnostics; a spawn failure itself.
+            let last_worker = RefCell::new(None);
+            let spawn_failure = RefCell::new(None);
+            let spawn = || {
+                let stopped = |reason: String| LoadError::WorkerLost { reason };
+                if abandoned.load(Ordering::Acquire) {
+                    return Err(stopped("the load was stopped".into()));
+                }
+                match driver.spawn_load_worker(&load_instance) {
+                    Ok(spawned) => {
+                        *last_worker.borrow_mut() = Some(Arc::clone(&spawned.worker));
+                        Ok(spawned)
+                    }
+                    Err(failure) => {
+                        let reason = failure.message();
+                        *spawn_failure.borrow_mut() = Some(failure);
+                        Err(stopped(reason))
+                    }
+                }
+            };
+            let loaded = load_prepared(
+                &manifest,
+                |unprepared| {
+                    spawn()?
+                        .connect(manifest.clone(), unprepared, &report)
+                        .map_err(|(_, error)| error)
+                },
+                || spawn().map(SpawnedWorker::into_process),
+                &report,
+            );
+            match loaded {
+                Ok((loaded, preparation)) => {
+                    if let Preparation::Incomplete(error) = preparation {
+                        // The load is not failed by its preparation: units without a record
+                        // serve their canonical defaults, and a later load prepares them.
+                        tracing::warn!(
+                            %error,
+                            "kernel preparation did not finish; the load serves canonical defaults \
+                             for the units without a tuning record"
+                        );
+                    }
+                    Ok(loaded)
+                }
+                Err(error) => Err(match (spawn_failure.take(), last_worker.take()) {
+                    (Some(failure), _) => failure,
+                    (None, Some(worker)) => load_failure(error, &worker),
+                    (None, None) => {
+                        ModelOperationFailure::new("worker_exited", error.to_string(), true)
+                    }
+                }),
+            }
         })
         .await
         .map_err(|error| {
@@ -530,9 +694,7 @@ impl EngineResidency {
                 true,
             )
         })?;
-        let (worker, connection) = connected.map_err(|(worker, error)| {
-            load_failure(error, &worker)
-        })?;
+        let (worker, connection) = loaded?;
 
         // The worker read its own package: it must agree with the host's resolution on the
         // package identity, the chat templates and the input modalities. This is the end of the
@@ -705,6 +867,90 @@ impl From<ModelOperationFailure> for InventoryError {
 mod tests {
     use super::*;
 
+    const MODEL: &str = "qwen3.5-4b:gguf:q4";
+
+    fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "environmentId": "environment",
+            "catalog": {
+                "_tag": "Available",
+                "sourceRevision": 1,
+                "entries": [{
+                    "subject": { "_tag": "Catalog", "modelId": model, "selection": "Effective" },
+                    "state": {
+                        "_tag": "Assessed",
+                        "capabilities": {
+                            "vision": false, "tools": true, "structuredOutput": true,
+                            "reasoning": { "supported": false, "efforts": [] },
+                        },
+                        "templateFingerprint": "template",
+                        "profiles": [assessment],
+                    },
+                }],
+            },
+            "discovered": { "_tag": "Pending", "sourceRevision": 0 },
+        }))
+        .expect("assessment snapshot")
+    }
+
+    fn does_not_fit(context_length: u32, deficit_bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "_tag": "DoesNotFit",
+            "profile": { "contextLength": context_length },
+            "assessmentId": "assessment",
+            "memory": [],
+            "limitingResource": "gpu",
+            "deficitBytes": deficit_bytes,
+        })
+    }
+
+    fn model_id(model: &str) -> ModelId {
+        model.parse().expect("model id")
+    }
+
+    #[test]
+    fn a_load_assessed_as_not_fitting_is_refused_with_the_shortfall() {
+        let snapshot = snapshot(MODEL, does_not_fit(262_144, 1_825_361_000));
+        let refusal = assessed_fit(
+            &snapshot,
+            &model_id(MODEL),
+            &ServingProfile { context_length: 262_144 },
+        );
+        let Some(InventoryError::DoesNotFit(message)) = refusal else {
+            panic!("expected a does-not-fit refusal, got {refusal:?}");
+        };
+        assert_eq!(
+            message,
+            format!("{MODEL} needs 1.7 GB more memory than this computer can provide")
+        );
+    }
+
+    #[test]
+    fn fitting_unassessed_or_other_profile_loads_are_admitted() {
+        let fits = serde_json::json!({
+            "_tag": "Fits",
+            "profile": { "contextLength": 262_144 },
+            "assessmentId": "assessment",
+            "memory": [],
+            "performance": [],
+        });
+        let profile = ServingProfile { context_length: 262_144 };
+        assert!(assessed_fit(&snapshot(MODEL, fits), &model_id(MODEL), &profile).is_none());
+        let other_profile = snapshot(MODEL, does_not_fit(131_072, 1));
+        assert!(assessed_fit(&other_profile, &model_id(MODEL), &profile).is_none());
+        let other_model = snapshot("other:gguf:q4", does_not_fit(262_144, 1));
+        assert!(assessed_fit(&other_model, &model_id(MODEL), &profile).is_none());
+    }
+
+    #[test]
+    fn shortfalls_read_as_the_clients_show_them() {
+        assert_eq!(memory_size(1_000), "0.1 MB");
+        assert_eq!(memory_size(359_000_000), "342.4 MB");
+        assert_eq!(memory_size(1_825_361_000), "1.7 GB");
+        assert_eq!(memory_size(3_758_096_384), "3.5 GB");
+    }
+
     fn weights(completed_bytes: u64, total_bytes: u64) -> LoadProgress {
         LoadProgress::ImportingWeights {
             completed_bytes,
@@ -745,6 +991,35 @@ mod tests {
                 (ModelLoadStage::LoadingWeights, 1.0),
                 (ModelLoadStage::Finalizing, 1.0),
             ]
+        );
+    }
+
+    /// A first load is three workers in turn. The Prepare worker's tuning fills the first
+    /// half; the second Load worker's own preparation does not take the load back to
+    /// `preparing`.
+    #[test]
+    fn the_load_worker_continues_where_the_prepare_worker_ended() {
+        let mut progression = LoadProgression::default();
+        // The Load worker that ends unprepared, then the Prepare worker.
+        progression.advance(LoadProgress::Preparing);
+        progression.advance(LoadProgress::Preparing);
+        progression.advance(LoadProgress::Tuning {
+            completed: 100,
+            total: 100,
+        });
+        // The Load worker.
+        assert_eq!(progression.advance(LoadProgress::Preparing), None);
+        assert_eq!(
+            progression.advance(weights(500, 1000)),
+            Some((ModelLoadStage::LoadingWeights, 0.75))
+        );
+        // No tuning was reported: the load fills with weights.
+        let mut progression = LoadProgression::default();
+        progression.advance(LoadProgress::Preparing);
+        assert_eq!(progression.advance(LoadProgress::Preparing), None);
+        assert_eq!(
+            progression.advance(weights(500, 1000)),
+            Some((ModelLoadStage::LoadingWeights, 0.5))
         );
     }
 

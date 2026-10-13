@@ -2,22 +2,21 @@
 
 use super::*;
 use crate::{
+    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
+    ResourceAllocator, ResourceCapacity, ResourceLimits, ResourcePlanner, TargetLaunchCore,
     completion::CompletionWake,
     platform,
     programs::{
-        CompletedHeadWork, CompletedStateWork, CompletedVisionWork, CompletedWork,
-        ProgramSubmission, ReadySubmission,
+        CompletedHeadWork, CompletedVisionWork, CompletedWork, ProgramSubmission, ReadySubmission,
     },
-    AttestedPrograms, ComponentSelection, ExecutionPath, ExecutionPlanner, PlannedMethod,
-    ResourceAllocator, ResourceCapacity, ResourceLimits, ResourcePlanner, TargetLaunchCore,
 };
 use magnitude_artifacts::PackageManifest;
 use magnitude_family_contracts::FamilyId;
 use magnitude_state::{KvCodec, ShrinkPolicy};
 use std::marker::PhantomData;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
 };
 
 /// The planning fixture's model (the smallest geometry every native kernel
@@ -34,6 +33,13 @@ fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
 }
 
 type Fixture = (ExecutorDomain<TestFamily>, StateBindings<TestFamily>);
+
+thread_local! {
+    /// The stored-table reads the next target submission's output carries:
+    /// a test sets them to inject a step's table reads.
+    static STORED_READS: std::cell::RefCell<Vec<crate::programs::StoredRead>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 fn fixture(control: Option<PendingControl>) -> Option<Fixture> {
     fixture_with(control, false, false)
@@ -52,12 +58,14 @@ fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
         8192,
         vec![HistoryDomainPlan {
             layout: HistoryDomainLayout::Token {
-                components: vec![ComponentDescriptor::new(
-                    LayerRef::Target(0),
-                    CodecSpec::dense(seismic::DType::F32, 4096, 4096),
-                    1,
-                )
-                .unwrap()],
+                components: vec![
+                    ComponentDescriptor::new(
+                        LayerRef::Target(0),
+                        CodecSpec::dense(seismic::DType::F32, 4096, 4096),
+                        1,
+                    )
+                    .unwrap(),
+                ],
             },
             logical_rows: 8192,
         }],
@@ -73,24 +81,40 @@ fn spare_head_store(device: Rc<seismic::Device>) -> StoreBindings {
 }
 
 fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) -> Option<Fixture> {
+    fixture_on(control, lookahead, head, platform::DeviceRequest::Automatic)
+}
+
+fn fixture_on(
+    control: Option<PendingControl>,
+    lookahead: bool,
+    head: bool,
+    device_request: platform::DeviceRequest,
+) -> Option<Fixture> {
+    fixture_of(tiny_definition(), 2, control, lookahead, head, device_request)
+}
+
+/// A domain over `definition` launching up to `rows` rows.
+fn fixture_of(
+    definition: ModelDefinition,
+    rows: usize,
+    control: Option<PendingControl>,
+    lookahead: bool,
+    head: bool,
+    device_request: platform::DeviceRequest,
+) -> Option<Fixture> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     let reserves = platform::MemoryReserves::standard();
-    let selected = platform::select_device(
-        &catalog,
-        ExecutionPath::Native,
-        platform::DeviceRequest::Automatic,
-        &reserves,
-    )
-    .ok()?;
+    let selected =
+        platform::select_device(&catalog, ExecutionPath::Native, device_request, &reserves).ok()?;
     let device = Rc::new(
         catalog
             .open(catalog.resolve(selected.info.selector).unwrap())
             .unwrap(),
     );
-    let definition = Rc::new(tiny_definition());
+    let definition = Rc::new(definition);
     let manifest = tiny_manifest(&definition);
     let limits = ResourceLimits {
-        max_launch_rows: 2,
+        max_launch_rows: rows,
         max_launch_slots: 2,
         max_selected_rows: 2,
         max_drafting_slots: 2,
@@ -134,8 +158,10 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
             weights: &crate::ZeroTuningWeights,
             observer: &crate::UnreportedTuning,
             cache: None,
-            error_classes: &crate::NO_ERROR_CLASSES,
+            numerical_profile: crate::ResolvedNumericalProfile::standard(),
+            settings: crate::TuningSettings::STANDARD,
         },
+        crate::UnpreparedUnits::ServeDefaults,
     )
     .unwrap();
     let target_graphs = programs
@@ -146,6 +172,7 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
             &state,
             draft.programs().target(),
             limits,
+            &seismic::Workers::new(1),
         )
         .unwrap();
     let target_readout_graphs = programs
@@ -156,11 +183,10 @@ fn fixture_with(control: Option<PendingControl>, lookahead: bool, head: bool) ->
             &device,
             draft.load(),
             &definition,
-            draft.programs().vision(),
-            state.target_state(),
-            state.head_state(),
+            draft.programs(),
+            &state,
             limits,
-            0,
+            PlannedMethod::Plain,
         )
         .unwrap();
     let resources_plan = ResourcePlanner::plan_with_state(
@@ -228,7 +254,12 @@ fn open<F: ProgramFamily>(
     domain
         .install_input(request, PreparedModelInput::continuation_only())
         .unwrap();
-    assert!(domain.open_state(bindings, request, None).unwrap().is_empty());
+    assert!(
+        domain
+            .open_state(bindings, request, None)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[derive(Default)]
@@ -253,11 +284,11 @@ impl PendingControl {
 struct PendingCompletion(PendingControl);
 impl Completion for PendingCompletion {
     fn is_complete(&self) -> bool {
-        self.0 .0.lock().unwrap().result.is_some()
+        self.0.0.lock().unwrap().result.is_some()
     }
     fn result(&mut self) -> Result<(), crate::DeviceError> {
         self.0
-             .0
+            .0
             .lock()
             .unwrap()
             .result
@@ -266,7 +297,7 @@ impl Completion for PendingCompletion {
     }
     fn notify(&mut self, wake: CompletionWake) {
         let wake = {
-            let mut state = self.0 .0.lock().unwrap();
+            let mut state = self.0.0.lock().unwrap();
             if state.result.is_some() {
                 Some(wake)
             } else {
@@ -328,9 +359,47 @@ impl<L, W, O> ProgramSubmission for PendingSubmission<L, W, O> {
     }
 }
 
-impl crate::programs::SubmittedHead for PendingFailureSubmission<CompletedHeadWork> {
+type HeadTestWork = PendingSubmission<
+    crate::HeadLaunchCore,
+    (NativeGraphWorkspaceLease, Option<NativeGraphOutputLease>),
+    Option<crate::GraphOutputTensor>,
+>;
+
+enum ControlledHeadSubmission {
+    Failure(PendingFailureSubmission<CompletedHeadWork>),
+    Work(HeadTestWork),
+}
+
+impl From<PendingFailureSubmission<CompletedHeadWork>> for ControlledHeadSubmission {
+    fn from(value: PendingFailureSubmission<CompletedHeadWork>) -> Self {
+        Self::Failure(value)
+    }
+}
+
+impl ProgramSubmission for ControlledHeadSubmission {
+    type CompletedWork = CompletedHeadWork;
+
+    fn completion(&mut self) -> &mut dyn Completion {
+        match self {
+            Self::Failure(work) => work.completion(),
+            Self::Work(work) => work.completion(),
+        }
+    }
+
+    fn finish(self) -> Result<Self::CompletedWork, crate::DeviceError> {
+        match self {
+            Self::Failure(work) => work.finish(),
+            Self::Work(work) => work.finish(),
+        }
+    }
+}
+
+impl crate::programs::SubmittedHead for ControlledHeadSubmission {
     fn launch(&self) -> &crate::HeadLaunchCore {
-        unreachable!("controlled fixture submits no head launch")
+        match self {
+            Self::Failure(_) => panic!("failure-only head has no launch"),
+            Self::Work(work) => &work.core,
+        }
     }
 }
 
@@ -388,9 +457,10 @@ impl TestFamily {
 }
 impl ProgramFamily for TestFamily {
     type TargetSubmission = TestSubmission<TargetLaunchCore, (), crate::TargetOutput>;
-    type HeadSubmission = PendingFailureSubmission<CompletedHeadWork>;
+    type HeadSubmission = ControlledHeadSubmission;
     type VisionSubmission = PendingFailureSubmission<CompletedVisionWork>;
-    type StateSubmission = PendingFailureSubmission<CompletedStateWork>;
+    type StateSubmission =
+        ReadySubmission<crate::StateLaunchCore, crate::NativeGraphWorkspaceLease, ()>;
     fn bind_head(&mut self, _: crate::ResidentHead, _: &ModelDefinition) -> Result<(), String> {
         Ok(())
     }
@@ -421,11 +491,14 @@ impl ProgramFamily for TestFamily {
             core,
             (),
             crate::TargetOutput {
+                boundary: None,
                 readout: None,
                 commits: crate::CommitSpan {
                     first: now,
                     last: now,
                 },
+                selected_rows: None,
+                stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
             },
         ))
     }
@@ -443,9 +516,12 @@ impl ProgramFamily for TestFamily {
     }
     fn submit_state(
         &mut self,
-        _: ValidatedStateLaunch,
+        launch: ValidatedStateLaunch,
     ) -> Result<Self::StateSubmission, (crate::SubmitError, ValidatedStateLaunch)> {
-        panic!("controlled fixture does not submit state work")
+        // Like target work, this fixture models ownership and completion only.
+        // Numerical copy correctness is qualified by native state tests.
+        let (core, workspace) = launch.into_submission_parts();
+        Ok(ReadySubmission::new(core, workspace, ()))
     }
 }
 
@@ -522,9 +598,11 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 0);
     let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
     let (pending, _) = finish_one(&mut domain, flight);
-    assert!(domain
-        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-        .is_ok());
+    assert!(
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .is_ok()
+    );
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
@@ -546,7 +624,10 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
         rows: head.free_rows(history) + 1,
     }];
     domain.provision_open(&mut bindings).unwrap();
-    assert!(bindings.lookahead.is_none(), "the growing entry orphaned the lookahead");
+    assert!(
+        bindings.lookahead.is_none(),
+        "the growing entry orphaned the lookahead"
+    );
     domain
         .grant_state_growth(&mut bindings, true, &demand, 0)
         .unwrap();
@@ -589,7 +670,10 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
         Err(DomainError::Input(detail)) if detail == "head component is disabled" => {}
         Err(error) => panic!("provisioning drafter work failed: {error}"),
     }
-    assert!(bindings.lookahead.is_none(), "drafter work resolved the lookahead");
+    assert!(
+        bindings.lookahead.is_none(),
+        "drafter work resolved the lookahead"
+    );
     assert!(domain.target[&request].blocked_tails().is_empty());
 }
 
@@ -602,16 +686,15 @@ fn in_place_rows_reserve_without_a_free_page() {
     };
     let request = RequestId(10);
     open(&mut domain, &mut bindings, request);
-    let accept = |domain: &mut ExecutorDomain<TestFamily>,
-                  bindings: StateBindings<TestFamily>,
-                  position| {
-        let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
-        let (pending, bindings) = finish_one(domain, flight);
-        domain
-            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
-            .unwrap();
-        bindings
-    };
+    let accept =
+        |domain: &mut ExecutorDomain<TestFamily>, bindings: StateBindings<TestFamily>, position| {
+            let flight = submit_reserved_target(domain, bindings, vec![forward(request, position)]);
+            let (pending, bindings) = finish_one(domain, flight);
+            domain
+                .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                .unwrap();
+            bindings
+        };
     let mut bindings = accept(&mut domain, bindings, 0);
     // Hold every other page of the backed slabs with one-row histories.
     let store = domain.target_store.clone();
@@ -631,10 +714,54 @@ fn in_place_rows_reserve_without_a_free_page() {
     for position in 1..4 {
         bindings = accept(&mut domain, bindings, position);
     }
-    assert!(store
-        .history_domains()
-        .all(|history| store.free_rows(history) == 0));
+    assert!(
+        store
+            .history_domains()
+            .all(|history| store.free_rows(history) == 0)
+    );
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 4);
+}
+
+/// Continuing a checkpoint relocates a tail another request extended. The
+/// reservation must describe the new layout rather than demand a second page.
+#[test]
+fn reservation_recomputes_row_demand_after_shared_tail_relocation() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let source = RequestId(71);
+    open(&mut domain, &mut bindings, source);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 0)]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let checkpoint = domain.resume_state(source).unwrap();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(source, 1)]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    bindings = returned;
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let copy = RequestId(72);
+    domain
+        .install_input(copy, PreparedModelInput::continuation_only())
+        .unwrap();
+    domain
+        .open_state(&mut bindings, copy, Some(&checkpoint))
+        .unwrap();
+    assert!(!domain.target[&copy].blocked_tails().is_empty());
+    let operations = [forward(copy, 1)];
+    let before = domain.requirements(&bindings, &operations).unwrap();
+    assert!(before.state_demand.iter().any(|demand| demand.rows > 0));
+    let reservation = domain.reserve(&mut bindings, &operations).unwrap();
+    assert!(
+        reservation
+            .requirements
+            .state_demand
+            .iter()
+            .all(|demand| demand.rows == 0)
+    );
 }
 
 /// A cancelled completed request aborts and the bindings return; a device
@@ -667,8 +794,11 @@ fn pending_target_request_cancellation_aborts_then_device_failure_consumes_the_b
     };
     let failed_request = RequestId(3);
     open(&mut failed_domain, &mut bindings, failed_request);
-    let flight =
-        submit_reserved_target(&mut failed_domain, bindings, vec![forward(failed_request, 0)]);
+    let flight = submit_reserved_target(
+        &mut failed_domain,
+        bindings,
+        vec![forward(failed_request, 0)],
+    );
     failed.resolve(Err(crate::DeviceError::Execution(
         "injected target failure".into(),
     )));
@@ -741,7 +871,7 @@ fn pending_head_and_vision_device_failures_consume_the_bindings() {
     let mut head = HeadFlight {
         requests: Vec::new(),
         steps: 0,
-        submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()),
+        submission: PendingFailureSubmission::<CompletedHeadWork>::new(head_control.clone()).into(),
         started: Instant::now(),
         launch_trace: None,
         bindings,
@@ -887,8 +1017,8 @@ fn vision_definition() -> ModelDefinition {
 /// media row.
 fn vision_input(placements: &[(usize, &str)], count: usize) -> PreparedModelInput {
     use magnitude_artifacts::{
-        media::{DType, PreparedTensor},
         BoundaryRule, InputLayout, InputSpan,
+        media::{DType, PreparedTensor},
     };
     use magnitude_family_contracts::{PreparedVisionInput, TokenPlan, VisionSpatialControls};
     let definition = vision_definition();
@@ -1146,4 +1276,788 @@ fn an_image_repeated_across_turns_resumes_and_encodes_its_remaining_placement() 
     };
     assert_eq!((*row, *start, *count), (1, 0, 1));
     assert!(*source == features);
+}
+
+/// Publishing target output must not synchronously wait for head completion.
+/// Its second flight keeps the completion wake and preserves device failures.
+#[test]
+fn deferred_priming_keeps_pending_completion_and_reports_device_failure() {
+    let Some((domain, bindings)) = fixture(None) else {
+        return;
+    };
+    let control = PendingControl::default();
+    let mut flight = PrimingCompletionFlight {
+        work: PrimingFlight {
+            request: RequestId(88),
+            submission: PendingFailureSubmission::new(control.clone()).into(),
+            continuation: None,
+        },
+        target_end: 1,
+        bindings,
+        started: Instant::now(),
+    };
+    assert!(!flight.completion().is_complete());
+    let woke = Arc::new(AtomicBool::new(false));
+    let observed = woke.clone();
+    flight.completion().notify(CompletionWake::new(move || {
+        observed.store(true, Ordering::SeqCst);
+    }));
+    assert!(!woke.load(Ordering::SeqCst));
+    control.resolve(Err(crate::DeviceError::Execution(
+        "deferred entry failed".into(),
+    )));
+    assert!(woke.load(Ordering::SeqCst));
+    assert!(flight.completion().is_complete());
+    let mut domain = domain;
+    assert!(matches!(
+        domain.finish_priming(flight),
+        Err(DomainError::Device(_))
+    ));
+}
+
+/// Form real owned state advances and a checked head launch, with controlled
+/// completion instead of numerical kernels. This fixture borrows the plain
+/// model's readout pool for the head's leases; no graph consumes those buffers.
+/// The target has two final prompt rows and the head has their one known
+/// successor. The scheduler's final-prompt detection is outside this fixture.
+fn target_with_pending_priming(
+    request: RequestId,
+) -> (
+    ExecutorDomain<TestFamily>,
+    TargetFlight<TestFamily>,
+    PendingControl,
+) {
+    let (mut domain, mut bindings) = fixture_on(
+        None,
+        false,
+        true,
+        platform::DeviceRequest::Backend(seismic::BackendName::Cpu),
+    )
+    .expect("deferred priming ownership tests require the CPU fixture");
+    open(&mut domain, &mut bindings, request);
+    let mut operation = prefill(request, 0);
+    if let Operation::Forward {
+        tokens, committed, ..
+    } = &mut operation
+    {
+        tokens.push(TokenId(2));
+        *committed = 2;
+    }
+    // Target submission precedes its head submission, just as in production.
+    // This controlled target is already ready and has returned its workspace.
+    let mut flight = submit_reserved_target(&mut domain, bindings, vec![operation]);
+    let advance = TentativeAdvance::Accepted(
+        OwnedStateAdvance::begin(domain.head.remove(&request).unwrap(), 1)
+            .ok()
+            .unwrap(),
+    );
+    let slot = domain
+        .head_slot(request, &[TokenId(2)], 0, &[], &advance, 0)
+        .unwrap();
+    let batch = crate::batching::ValidatedHeadBatch::from_slots(
+        &[slot],
+        domain.definition.decoder.vocabulary as usize,
+        domain.head_class_limits().unwrap(),
+    )
+    .unwrap();
+    let row_bytes = domain.head_conditioning_bytes();
+    let conditioning = FeatureRows::new(vec![0u8; row_bytes].into(), 1).unwrap();
+    let pool = domain.resources.target_readout_graph();
+    let inputs = crate::HeadLaunchInputs::new(
+        batch,
+        vec![advance],
+        crate::HeadConditioning::Rows(vec![conditioning]),
+        true,
+        pool.acquire_workspace().unwrap(),
+        pool.acquire_output().unwrap(),
+    );
+    let launch = ValidatedHeadLaunch::new(
+        inputs,
+        domain.head_store.as_ref().unwrap(),
+        domain.resource_identity(),
+        row_bytes,
+    )
+    .unwrap_or_else(|(_, error)| panic!("controlled head launch: {error}"));
+    let (core, workspace, output) = launch.into_submission_parts();
+    let control = PendingControl::default();
+    let head = ControlledHeadSubmission::Work(PendingSubmission {
+        completion: PendingCompletion(control.clone()),
+        core,
+        workspace: (workspace, output),
+        output: None,
+    });
+    assert!(flight.work.priming.is_none());
+    flight.work.priming = Some(PrimingFlight {
+        request,
+        submission: head,
+        continuation: None,
+    });
+    (domain, flight, control)
+}
+
+fn publish_before_priming(
+    domain: &mut ExecutorDomain<TestFamily>,
+    flight: TargetFlight<TestFamily>,
+) -> (PendingOperationOutcome, PrimingCompletionFlight<TestFamily>) {
+    let (outcomes, continuation) = domain.finish_target_for_publication(flight, true).unwrap();
+    let [pending] = outcomes
+        .try_into()
+        .unwrap_or_else(|_| panic!("one target outcome"));
+    let TargetContinuation::Priming(mut priming) = continuation else {
+        panic!("the pending head must retain the binding right");
+    };
+    assert!(!priming.completion().is_complete());
+    (pending, priming)
+}
+
+#[test]
+fn deferred_priming_commits_after_target_publication_and_releases_leases() {
+    let request = RequestId(93);
+    let (mut domain, flight, control) = target_with_pending_priming(request);
+    let held_outputs = domain.resources.target_readout_graph().available_output();
+    let (pending, mut priming) = publish_before_priming(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    assert_eq!(domain.target[&request].position(), 2);
+    assert!(!domain.head.contains_key(&request));
+    assert!(
+        domain.resume_state(request).is_err(),
+        "no half-resolved checkpoint"
+    );
+    assert!(
+        domain.release_state(&[request]).is_err(),
+        "no eviction before head completion"
+    );
+    assert_eq!(
+        domain.resources.target_readout_graph().available_output(),
+        held_outputs
+    );
+    let woke = Arc::new(AtomicBool::new(false));
+    let observed = woke.clone();
+    priming.completion().notify(CompletionWake::new(move || {
+        observed.store(true, Ordering::SeqCst);
+    }));
+    control.resolve(Ok(()));
+    assert!(woke.load(Ordering::SeqCst));
+    let (finished, _, mut bindings) = domain.finish_priming(priming).unwrap();
+    assert_eq!(finished, request);
+    let checkpoint = domain.resume_state(request).unwrap();
+    assert_eq!(checkpoint.target.position(), 2);
+    assert_eq!(checkpoint.head.as_ref().unwrap().position(), 1);
+    assert_eq!(
+        domain.resources.target_readout_graph().available_output(),
+        held_outputs + 1
+    );
+    // The returned binding right is usable only after the second flight ends.
+    domain.provision_open(&mut bindings).unwrap();
+    domain.close(request).unwrap();
+}
+
+#[test]
+fn deferred_priming_aborts_when_its_target_chunk_is_rejected() {
+    let request = RequestId(94);
+    let (mut domain, flight, control) = target_with_pending_priming(request);
+    let (pending, priming) = publish_before_priming(&mut domain, flight);
+    domain.abort(pending).unwrap();
+    assert_eq!(domain.target[&request].position(), 0);
+    assert!(domain.resume_state(request).is_err());
+    control.resolve(Ok(()));
+    let (_, _, bindings) = domain.finish_priming(priming).unwrap();
+    let checkpoint = domain.resume_state(request).unwrap();
+    assert_eq!(checkpoint.target.position(), 0);
+    assert_eq!(checkpoint.head.as_ref().unwrap().position(), 0);
+    // Aborting releases the tentative rows and leaves the target reusable.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    domain.close(request).unwrap();
+}
+
+/// Cancellation at the executor boundary must wait to close resident state.
+/// The scheduler's cancel control itself is not exercised by this domain test.
+#[test]
+fn deferred_priming_prevents_cancelled_request_retirement_until_completion() {
+    let request = RequestId(95);
+    let (mut domain, flight, control) = target_with_pending_priming(request);
+    let (pending, priming) = publish_before_priming(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    assert_eq!(
+        domain.close(request).unwrap_err(),
+        "request has unresolved work"
+    );
+    assert!(domain.input.contains_key(&request));
+    assert_eq!(domain.target[&request].position(), 2);
+    control.resolve(Ok(()));
+    let (_, _, mut bindings) = domain.finish_priming(priming).unwrap();
+    domain.close(request).unwrap();
+    assert!(!domain.input.contains_key(&request));
+    assert!(!domain.target.contains_key(&request));
+    assert!(!domain.head.contains_key(&request));
+    // Retirement leaves both stores usable by a different request.
+    let next = RequestId(96);
+    open(&mut domain, &mut bindings, next);
+    let fresh = domain.resume_state(next).unwrap();
+    assert_eq!(fresh.target.position(), 0);
+    assert_eq!(fresh.head.as_ref().unwrap().position(), 0);
+    domain.close(next).unwrap();
+}
+
+#[test]
+fn boundary_features_commit_fork_and_abort_with_numerical_state() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let request = RequestId(91);
+    open(&mut domain, &mut bindings, request);
+    let first = domain.allocate_boundary().unwrap();
+    let attach = |pending: &mut PendingOperationOutcome, boundary: &FeatureRef| {
+        let aggregate =
+            FeatureRef::logical(boundary.domain().clone(), 1, boundary.allocation().width())
+                .unwrap()
+                .with_boundary(boundary.clone())
+                .unwrap();
+        pending.outcome = Outcome::Forward {
+            rows: vec![RowResult {
+                features: Some(aggregate),
+                ..RowResult::default()
+            }],
+        };
+    };
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(request, 0)]);
+    let (mut pending, mut bindings) = finish_one(&mut domain, flight);
+    attach(&mut pending, &first);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    let checkpoint = domain.resume_state(request).unwrap();
+    assert!(
+        checkpoint
+            .boundary
+            .as_ref()
+            .unwrap()
+            .same_allocation(&first)
+    );
+    let fork = RequestId(92);
+    domain
+        .install_input(fork, PreparedModelInput::continuation_only())
+        .unwrap();
+    domain
+        .open_state(&mut bindings, fork, Some(&checkpoint))
+        .unwrap();
+    domain.release_state(&[request]).unwrap();
+    assert!(domain.input[&request].boundary.is_none());
+    assert!(
+        domain.input[&fork]
+            .boundary
+            .as_ref()
+            .unwrap()
+            .same_allocation(&first)
+    );
+    let second = domain.allocate_boundary().unwrap();
+    for invalid in [false, true] {
+        let flight = submit_reserved_target(&mut domain, bindings, vec![forward(fork, 1)]);
+        let (mut pending, returned) = finish_one(&mut domain, flight);
+        bindings = returned;
+        attach(&mut pending, &second);
+        if invalid {
+            assert!(
+                domain
+                    .reconcile(pending, PhysicalDecision { accepted_rows: 0 })
+                    .is_err()
+            );
+        } else {
+            domain.abort(pending).unwrap();
+        }
+        let restored = domain.resume_state(fork).unwrap();
+        assert_eq!(restored.position(), 1);
+        assert!(restored.boundary.as_ref().unwrap().same_allocation(&first));
+    }
+    let flight = submit_reserved_target(&mut domain, bindings, vec![forward(fork, 1)]);
+    let (mut pending, _) = finish_one(&mut domain, flight);
+    attach(&mut pending, &second);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert!(
+        domain
+            .resume_state(fork)
+            .unwrap()
+            .boundary
+            .as_ref()
+            .unwrap()
+            .same_allocation(&second)
+    );
+    assert!(
+        checkpoint
+            .boundary
+            .as_ref()
+            .unwrap()
+            .same_allocation(&first)
+    );
+}
+
+/// A forward of `values` at `position`, every row committed.
+fn feed(request: RequestId, position: usize, values: &[u32]) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens: values.iter().map(|value| crate::TokenId(*value)).collect(),
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        committed: values.len(),
+        prime: None,
+    }
+}
+
+fn token_values(tokens: &[crate::TokenId]) -> Vec<u32> {
+    tokens.iter().map(|token| token.0).collect()
+}
+
+/// A request's tokens follow its sequence as its state does: an aborted
+/// step's tokens give way to the forward fed again at its position, and a
+/// sequence resumed from another's state holds that state's tokens and feeds
+/// on from them, leaving its source's unchanged.
+#[test]
+fn token_history_follows_rollback_and_fork() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let source = RequestId(81);
+    open(&mut domain, &mut bindings, source);
+    // The fixture launches at most two rows.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &[10, 11])]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 2, &[12])]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    // A step past the accepted rows is fed, then aborted.
+    let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 3, &[20, 21])]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    domain.abort(pending).unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 3);
+    assert_eq!(
+        token_values(domain.preceding_tokens(source, 3, 2).unwrap()),
+        [11, 12]
+    );
+    let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 3, &[40])]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(
+        token_values(domain.preceding_tokens(source, 4, 2).unwrap()),
+        [12, 40]
+    );
+    // Nothing is known past the fed tokens.
+    assert!(domain.preceding_tokens(source, 5, 2).is_err());
+
+    let checkpoint = domain.resume_state(source).unwrap();
+    let copy = RequestId(82);
+    domain
+        .install_input(copy, PreparedModelInput::continuation_only())
+        .unwrap();
+    domain
+        .open_state(&mut bindings, copy, Some(&checkpoint))
+        .unwrap();
+    assert_eq!(
+        token_values(domain.preceding_tokens(copy, 4, 8).unwrap()),
+        [10, 11, 12, 40]
+    );
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(copy, 4, &[50])]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(
+        token_values(domain.preceding_tokens(copy, 5, 2).unwrap()),
+        [40, 50]
+    );
+    assert!(domain.preceding_tokens(source, 5, 1).is_err());
+}
+
+#[test]
+fn a_forward_replaces_the_tokens_at_and_after_its_position() {
+    use super::input::TokenHistory;
+    let tokens = |values: &[u32]| values.iter().map(|value| crate::TokenId(*value)).collect::<Vec<_>>();
+    let mut history = TokenHistory::default();
+    history.feed(0, &tokens(&[1, 2, 3, 4])).unwrap();
+    // A verification's rejected rows are fed again from the first rejected.
+    history.feed(2, &tokens(&[9])).unwrap();
+    assert_eq!(token_values(history.before(3).unwrap()), [1, 2, 9]);
+    assert!(history.before(4).is_err());
+    // No forward follows tokens never fed.
+    assert!(history.feed(5, &tokens(&[7])).is_err());
+    let resumed = TokenHistory::starting(history.before(2).unwrap());
+    assert_eq!(token_values(resumed.before(2).unwrap()), [1, 2]);
+}
+
+/// The host's rows for a step (`NGramHash::rows` over the request's token
+/// history) equal the rows the device's `ngram_rows` names from the step's
+/// tokens and the bank's token window: through a prefill chunk, a
+/// verification of which only some rows are accepted, and the decode that
+/// continues from the tape version.
+#[test]
+fn host_rows_from_the_token_history_equal_the_device_rows() {
+    use magnitude_family_contracts::NGramHash;
+    use magnitude_kernels::ngram_rows;
+    use seismic::{BackendName, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+    let hash = NGramHash {
+        context: 2,
+        heads_per_order: 8,
+        multipliers: vec![(i64::MAX as u64 / 248_320) | 1, 1_000_003, (1 << 41) + 17],
+        sizes: (0..16).map(|head| 20_000_003 + 2 * head).collect(),
+        offsets: (0..16).map(|head| head * 20_000_040).collect(),
+        reset: 7,
+    };
+    let (context, heads) = (2u64, 16usize);
+    let tape = 3u64;
+    let (banks, slab_banks) = (4u64, 2u64);
+    let catalog = DeviceCatalog::discover().unwrap();
+    let devices = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu]
+        .into_iter()
+        .filter_map(|backend| catalog.open_backend(backend).ok())
+        .collect::<Vec<_>>();
+    let ints = |device: &seismic::Device, shape: &[u64], values: &[i32]| {
+        Tensor::from_host(
+            device,
+            Element::i32(),
+            shape,
+            &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let words = |device: &seismic::Device, values: &[u64]| {
+        Tensor::from_host(
+            device,
+            Element::u64(),
+            &[values.len() as u64],
+            &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let tokens = |values: &[u32]| values.iter().map(|value| crate::TokenId(*value)).collect::<Vec<_>>();
+    // (position, tokens, the version read (bank, tape rows), stop, the bank
+    // published, rows accepted).
+    let steps: [(usize, Vec<u32>, (i32, i32), i32, i32, usize); 3] = [
+        (0, vec![3, 7, 7, 12, 40, 41, 7, 9, 13], (0, 0), 9, 1, 9),
+        (9, vec![22, 7, 31, 5], (1, 0), 1, 2, 2),
+        (11, vec![17], (2, 1), 1, 3, 1),
+    ];
+    for device in devices {
+        let backend = device.backend().as_str();
+        let mut slabs = SlabTensor::new(
+            &device,
+            slab_banks,
+            banks,
+            vec![SlabRegion {
+                element: Element::u32(),
+                row_shape: vec![context + tape, 1],
+            }],
+        )
+        .unwrap();
+        for slab in 0..banks.div_ceil(slab_banks) {
+            assert_eq!(slabs.add_slab().unwrap(), slab as usize);
+            slabs
+                .region_rows(0, slab * slab_banks, slab_banks)
+                .unwrap()
+                .write_from_host(&vec![0u8; (slab_banks * (context + tape) * 4) as usize])
+                .unwrap();
+        }
+        let mut window = slabs.logical_region(0).unwrap();
+        let implementation = seismic::generated::native_implementation::<ngram_rows::Entry>(&device)
+            .unwrap()
+            .unwrap();
+        let statics = match backend {
+            "cpu" => NativeSpecialization::new(),
+            _ => NativeSpecialization::new()
+                .with_static("C", context)
+                .with_static("P", 8),
+        };
+        let kernel = ngram_rows::native_for_device(
+            &device,
+            &implementation.default_specialization(&statics).unwrap(),
+        )
+        .unwrap();
+        let mut history = super::input::TokenHistory::default();
+        for (position, fed, (source, taped), stop, target, accepted) in &steps {
+            let fed = tokens(fed);
+            let preceding = history
+                .before(*position)
+                .unwrap()
+                .iter()
+                .rev()
+                .take(context as usize)
+                .rev()
+                .map(|token| u64::from(token.0))
+                .collect::<Vec<_>>();
+            let host = hash.rows(&preceding, &fed.iter().map(|token| u64::from(token.0)).collect::<Vec<_>>());
+            let rows = fed.len();
+            let result = kernel
+                .call(ngram_rows::Args {
+                    tokens: &ints(
+                        &device,
+                        &[rows as u64, 2],
+                        &fed.iter().flat_map(|token| [token.0 as i32, 0]).collect::<Vec<_>>(),
+                    ),
+                    multipliers: &words(&device, &hash.multipliers),
+                    sizes: &words(&device, &hash.sizes),
+                    offsets: &words(&device, &hash.offsets),
+                    segments: &ints(&device, &[2, 2], &[0, rows as i32, rows as i32, rows as i32]),
+                    stop: &ints(&device, &[1], &[*stop]),
+                    previous_bank: &ints(&device, &[1], &[*source]),
+                    previous_tape: &ints(&device, &[1], &[*taped]),
+                    following_bank: &ints(&device, &[1], &[*target]),
+                    window: &mut window,
+                    reset: hash.reset as i32,
+                    slab_banks: slab_banks as u32,
+                })
+                .unwrap()
+                .value;
+            let device_rows = result
+                .read_to_host()
+                .unwrap()
+                .chunks_exact(8)
+                .map(|pair| u64::from(u32::from_le_bytes(pair[..4].try_into().unwrap())))
+                .collect::<Vec<_>>();
+            assert_eq!(device_rows.len(), rows * heads);
+            assert_eq!(device_rows, host, "{backend}: step at {position}");
+            // The step's tokens are fed; the next forward follows the
+            // accepted ones.
+            history.feed(*position, &fed).unwrap();
+            history.before(position + accepted).unwrap();
+        }
+    }
+}
+
+/// A stored table of 4096 IQ4_NL rows 160 wide whose step 1 named row 1 for
+/// batch slot 0 and row 3500 for slot 1, read after the artifact was cut
+/// short under the open table: slot 1's row could not be read. The table
+/// file's path, to remove, and the step's read.
+fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::StoredRead) {
+    use crate::stored_table::{StepRows, StoredTable};
+    const ROWS: u64 = 4096;
+    const ROW_BYTES: u64 = 90;
+    let path = std::env::temp_dir().join(format!(
+        "magnitude-domain-table-{name}-{}.bin",
+        std::process::id()
+    ));
+    std::fs::write(&path, vec![0x11u8; (ROWS * ROW_BYTES) as usize]).unwrap();
+    let device = seismic::DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(seismic::BackendName::Cpu)
+        .unwrap();
+    let table = Arc::new(
+        StoredTable::new(
+            &device,
+            seismic::Element::named("gguf_iq4_nl_block").unwrap(),
+            ROWS,
+            160,
+            64,
+            crate::planning::DirectoryForm::Hashed,
+            magnitude_artifacts::UncachedSource::open(&path).unwrap(),
+            0,
+            None,
+        )
+        .unwrap(),
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(2048 * ROW_BYTES)
+        .unwrap();
+    let step = table
+        .queue(StepRows::Known(vec![vec![1], vec![3500]]))
+        .unwrap();
+    assert!(step.gate.wait(step.value, std::time::Duration::from_secs(10)));
+    // The device read the step's rows.
+    step.read.signal(step.value).unwrap();
+    (path, crate::programs::StoredRead::new(table, step.value))
+}
+
+/// Spec §7.3: a step whose stored-table rows could not be read for one of
+/// its two sequences fails that sequence alone, with its typed error. Its
+/// outputs are discarded and its accepted state returns, as an orphan's;
+/// it is poisoned, so its next step fails too though that step reads
+/// nothing that failed, until it closes. The other sequence commits both
+/// steps.
+#[test]
+fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let (kept, failed) = (RequestId(91), RequestId(92));
+    open(&mut domain, &mut bindings, kept);
+    open(&mut domain, &mut bindings, failed);
+    let (path, read) = failed_table_read("poison");
+    STORED_READS.with(|reads| reads.borrow_mut().push(read));
+    let mut bindings = bindings;
+    for (step, position) in [(0, 0usize), (1, 1)] {
+        let flight = submit_reserved_target(
+            &mut domain,
+            bindings,
+            vec![feed(kept, position, &[10 + step]), feed(failed, 0, &[20])],
+        );
+        let (pending, returned) = domain.finish_target(flight).unwrap();
+        bindings = returned;
+        assert_eq!(pending.len(), 2);
+        for pending in pending {
+            if pending.request() == kept {
+                assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
+                domain
+                    .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                    .unwrap();
+            } else {
+                let Outcome::TableReadFailed(error) = pending.outcome() else {
+                    panic!("step {step}: the failed sequence's outcome is not its failure");
+                };
+                assert!(error.detail.contains("3500"), "{error}");
+                assert!(matches!(
+                    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }),
+                    Err(DomainError::TableRead(_))
+                ));
+            }
+        }
+        assert_eq!(domain.resume_state(kept).unwrap().position(), position + 1);
+        assert_eq!(domain.resume_state(failed).unwrap().position(), 0);
+    }
+    // Closing the sequence clears its poison.
+    domain.close(failed).unwrap();
+    open(&mut domain, &mut bindings, failed);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(failed, 0, &[20])]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The planning fixture with its attention selecting one block of four rows
+/// past the dense limit, by an indexer of two 64-wide heads, over a 64-token
+/// context.
+fn selected_definition() -> ModelDefinition {
+    use magnitude_family_contracts::{
+        HistoryReads, Indexer, Operator, RmsNorm, WeightDescriptor,
+    };
+    let mut definition = tiny_definition();
+    definition.decoder.context_limit = 64;
+    let Operator::Attention(attention) = &mut definition.decoder.blocks[0].sublayers[0].op else {
+        panic!("the fixture's mixer is attention");
+    };
+    let hidden = definition.decoder.hidden;
+    let norm = |name: &str| RmsNorm {
+        weight: WeightDescriptor::stored(name, vec![64]),
+        epsilon: 1e-6,
+    };
+    attention.reads = HistoryReads::Selected {
+        block: 4,
+        blocks: 1,
+        indexer: Indexer {
+            heads: 2,
+            width: 64,
+            query: WeightDescriptor::stored("indexer_q", vec![128, hidden]),
+            key: WeightDescriptor::stored("indexer_k", vec![64, hidden]),
+            query_norm: norm("indexer_q_norm"),
+            key_norm: norm("indexer_k_norm"),
+        },
+    };
+    definition
+}
+
+/// A selected read's launches carry its indexer's histories as the state
+/// holds them: every row reads the raw keys of the three positions before
+/// it and the blocks complete before it, writes its raw key and the block
+/// it completes; a commit of an accepted prefix keeps the blocks that prefix
+/// completes, so a rollback across a block boundary continues as a straight
+/// run does. The graphs of every class (the indexer, the Segments decode,
+/// the WorkList prefill) prepare and seal on the device.
+#[test]
+fn selected_histories_follow_blocks_across_rollback() {
+    use magnitude_state::HistoryDomainId;
+    const RAW: HistoryDomainId = HistoryDomainId(1);
+    const BLOCKS: HistoryDomainId = HistoryDomainId(2);
+    let Some((mut domain, mut bindings)) = fixture_of(
+        selected_definition(),
+        16,
+        None,
+        false,
+        false,
+        platform::DeviceRequest::Automatic,
+    ) else {
+        return;
+    };
+    let blocks = |domain: &ExecutorDomain<TestFamily>, request| {
+        domain
+            .resume_state(request)
+            .unwrap()
+            .target
+            .history_ranges(BLOCKS)
+            .iter()
+            .map(|(_, rows)| rows)
+            .sum::<usize>()
+    };
+    let source = RequestId(91);
+    open(&mut domain, &mut bindings, source);
+    // Ten prompt rows complete blocks 0 and 1.
+    let tokens = (0..10).collect::<Vec<u32>>();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &tokens)]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 10 })
+        .unwrap();
+    assert_eq!(blocks(&domain, source), 2);
+    // Six rows from 10 complete blocks 2 and 3, then roll back whole: the
+    // history keeps blocks 0 and 1.
+    let flight = submit_reserved_target(
+        &mut domain,
+        bindings,
+        vec![feed(source, 10, &[20, 21, 22, 23, 24, 25])],
+    );
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain.abort(pending).unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 10);
+    assert_eq!(blocks(&domain, source), 2);
+    // Two other rows from 10 (positions 10, 11) complete block 2 alone.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 10, &[40, 41])]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 12);
+    assert_eq!(blocks(&domain, source), 3);
+    // The raw keys of positions 9..12 remain for the next block.
+    let checkpoint = domain.resume_state(source).unwrap();
+    assert_eq!(
+        checkpoint
+            .target
+            .history_ranges(RAW)
+            .iter()
+            .map(|(_, rows)| rows)
+            .sum::<usize>(),
+        3
+    );
+    // Single decode rows continue past the dense limit, completing block 3.
+    let mut bindings = bindings;
+    for (position, token) in (12..16).zip(30..) {
+        let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, position, &[token])]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        bindings = returned;
+    }
+    assert_eq!(blocks(&domain, source), 4);
 }

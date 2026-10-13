@@ -61,7 +61,10 @@ control, and is the one stop signal the host reads.
 **Pipeline.** Idle, between flights and holding the binding right; or InFlight, one group on the
 device whose flight holds the binding right until completion returns it. In Idle the owner selects
 a round and submits its groups in order. Completion reconciles the group, queues its follow-up
-operations in the round and continues it; an exhausted round returns to Idle. The pipeline waits
+operations in the round and continues it; an exhausted round returns to Idle. A final prompt
+chunk may publish its accepted token at target completion and continue as its outstanding
+drafter-entry flight. This second completion holds the binding right, remains responsive to
+controls, and resolves head state before the round finishes. The pipeline waits
 on nothing but its flight: one request's shortage or one slow consumer never stops the others.
 
 **Request states.** A request has one state in one place: the owner's table, or the current round
@@ -81,7 +84,9 @@ capacity at an availability epoch, or memory. A started round is a value that ow
 
 Provisioning a group first applies the [release order](memory.md#release-order). If the group
 still doesn't fit, each of its requests leaves the round with its operations, parked or pending,
-with a capacity wait at the current epoch, or a memory wait in Blind or Reclaim.
+with a capacity wait at the current epoch, or a memory wait in Blind or Reclaim. A Blind or Reclaim
+refusal, in provisioning or at submission, is itself a memory observation: the owner enters that condition
+at once, so the memory wait does not end before memory is observed Normal again.
 
 **The availability epoch advances exactly when capacity is freed:** a reconciled completion, a
 request ending or being evicted, a release or shrink, memory returning to Normal, or memory freed
@@ -148,7 +153,9 @@ guarantees. The token bound applies with or without a duration target.
 
 Measure completed execution service, not asynchronous submission time or emitted
 token counts. Bounds are approximate at indivisible execution boundaries;
-bounded submission lookahead must preserve opportunities to reschedule.
+bounded submission lookahead must preserve opportunities to reschedule. The CPU backend completes
+a launch during its submission, so it queues no lookahead: a queued successor would run before the
+owner could apply a cancellation, stop or admission.
 Worker idleness follows the absence of execution service, not the absence of
 published tokens. Drafting or suspended verification is still forward progress.
 

@@ -11,7 +11,8 @@ use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLSize, MTLStorageMode,
+    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLEvent, MTLSharedEvent,
+    MTLSize, MTLStorageMode,
 };
 use seismic_compiler::errors::ExecutionError;
 
@@ -85,12 +86,12 @@ fn sample_timestamps(device: &MetalDevice) -> TimestampPair {
     // the host clock read beside it is the time base every interval uses.
     let host = host_seconds();
     // SAFETY: both pointers are valid for one write.
-    unsafe {
+    crate::pooled(|| unsafe {
         device.handle().raw().sampleTimestamps_gpuTimestamp(
             std::ptr::NonNull::from(&mut cpu),
             std::ptr::NonNull::from(&mut gpu),
         )
-    };
+    });
     TimestampPair { gpu, host }
 }
 
@@ -111,6 +112,10 @@ unsafe impl Sync for LaunchTimestamps {}
 impl LaunchTimestamps {
     /// A buffer of `samples` timestamp samples (two per timed launch).
     pub fn new(device: &MetalDevice, samples: usize) -> Result<Self, ExecutionError> {
+        crate::pooled(|| Self::form(device, samples))
+    }
+
+    fn form(device: &MetalDevice, samples: usize) -> Result<Self, ExecutionError> {
         let failed = |detail: &str| ExecutionError::SubmissionFailed(detail.into());
         let raw = device.handle().raw();
         if !raw.supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary) {
@@ -175,8 +180,10 @@ impl LaunchTimestamps {
 
 /// How a batch places its launches in compute encoders.
 enum Encoding {
-    /// Every launch in one serial encoder: the production form.
-    Serial(Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>),
+    /// Every launch between two event commands in one serial encoder: the
+    /// production form. `None` after an event command, until the next
+    /// launch opens the next encoder.
+    Serial(Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>),
     /// Every launch in its own encoder, with the encoder's start and end
     /// timestamps sampled at stage boundaries into its range of
     /// `timestamps`. Encoders of one command buffer run in order over
@@ -206,24 +213,104 @@ pub struct DirectBatch {
 fn command_buffer(
     device: &MetalDevice,
 ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>, ExecutionError> {
-    device.queue().commandBuffer().ok_or_else(|| {
+    crate::pooled(|| device.queue().commandBuffer()).ok_or_else(|| {
         ExecutionError::SubmissionFailed("Metal could not create a native command buffer".into())
     })
+}
+
+fn serial_encoder(
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
+    crate::pooled(|| command.computeCommandEncoder()).ok_or_else(|| {
+        ExecutionError::SubmissionFailed("Metal could not create a native compute encoder".into())
+    })
+}
+
+/// A 64-bit value the host and the device's command buffers both advance
+/// and wait on (`MTLSharedEvent`).
+pub struct SharedEvent {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+// A shared event is a thread-safe Metal object.
+unsafe impl Send for SharedEvent {}
+unsafe impl Sync for SharedEvent {}
+
+impl SharedEvent {
+    /// An event at 0.
+    pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
+        crate::pooled(|| device.handle().raw().newSharedEvent())
+            .map(|event| Self { event })
+            .ok_or_else(|| {
+                ExecutionError::AllocationFailed("Metal could not create a shared event".into())
+            })
+    }
+
+    fn as_event(&self) -> &ProtocolObject<dyn MTLEvent> {
+        ProtocolObject::from_ref(&*self.event)
+    }
+
+    /// Set the event to `value` from the host.
+    pub fn signal(&self, value: u64) {
+        crate::pooled(|| self.event.setSignaledValue(value));
+    }
+
+    pub fn value(&self) -> u64 {
+        crate::pooled(|| self.event.signaledValue())
+    }
+
+    /// Wait at most `timeout` for the event to reach `value`; whether it
+    /// did.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        let milliseconds = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        crate::pooled(|| {
+            self.event.signaledValue() >= value
+                || self
+                    .event
+                    .waitUntilSignaledValue_timeoutMS(value, milliseconds)
+        })
+    }
 }
 
 impl DirectBatch {
     pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
         let command = command_buffer(device)?;
-        let encoder = command.computeCommandEncoder().ok_or_else(|| {
-            ExecutionError::SubmissionFailed(
-                "Metal could not create a native compute encoder".into(),
-            )
-        })?;
+        let encoder = serial_encoder(&command)?;
         Ok(Self {
             device: device.clone(),
             command,
-            encoding: Encoding::Serial(encoder),
+            encoding: Encoding::Serial(Some(encoder)),
         })
+    }
+
+    /// The command buffer's following work waits until `event` reaches
+    /// `value` (`encodeWaitForEvent`): the host gate.
+    pub fn wait_event(&mut self, event: &SharedEvent, value: u64) {
+        self.end_serial();
+        crate::pooled(|| {
+            self.command
+                .encodeWaitForEvent_value(event.as_event(), value)
+        });
+    }
+
+    /// `event` reaches `value` once the work encoded before it completes
+    /// (`encodeSignalEvent`).
+    pub fn signal_event(&mut self, event: &SharedEvent, value: u64) {
+        self.end_serial();
+        crate::pooled(|| {
+            self.command
+                .encodeSignalEvent_value(event.as_event(), value)
+        });
+    }
+
+    /// End the open serial encoder: an event command is encoded between
+    /// encoders.
+    fn end_serial(&mut self) {
+        if let Encoding::Serial(encoder) = &mut self.encoding {
+            if let Some(encoder) = encoder.take() {
+                crate::pooled(|| encoder.endEncoding());
+            }
+        }
     }
 
     /// A measurement batch of at most `launches` launches: each launch gets
@@ -282,8 +369,15 @@ impl DirectBatch {
                 "native ABI words exceed Metal setBytes limit".into(),
             ));
         }
+        let command = &self.command;
         match &mut self.encoding {
-            Encoding::Serial(encoder) => encode_launch(encoder, launch),
+            Encoding::Serial(encoder) => {
+                let encoder = match encoder {
+                    Some(encoder) => encoder,
+                    None => encoder.insert(serial_encoder(command)?),
+                };
+                crate::pooled(|| encode_launch(encoder, launch))
+            }
             Encoding::Timed {
                 timestamps,
                 first,
@@ -297,26 +391,29 @@ impl DirectBatch {
                         "timed Metal batch exceeds its declared launch count".into(),
                     ));
                 }
-                let pass = MTLComputePassDescriptor::computePassDescriptor();
-                pass.setDispatchType(MTLDispatchType::Serial);
-                // SAFETY: index 0 always exists; sample indices lie inside
-                // the batch's reserved range.
-                unsafe {
-                    let attachment = pass.sampleBufferAttachments().objectAtIndexedSubscript(0);
-                    attachment.setSampleBuffer(Some(&timestamps.samples));
-                    attachment.setStartOfEncoderSampleIndex(*first + 2 * *encoded);
-                    attachment.setEndOfEncoderSampleIndex(*first + 2 * *encoded + 1);
-                }
-                let encoder = self
-                    .command
-                    .computeCommandEncoderWithDescriptor(&pass)
-                    .ok_or_else(|| {
-                        ExecutionError::SubmissionFailed(
-                            "Metal could not create a timed compute encoder".into(),
-                        )
-                    })?;
-                encode_launch(&encoder, launch);
-                encoder.endEncoding();
+                crate::pooled(|| {
+                    let pass = MTLComputePassDescriptor::computePassDescriptor();
+                    pass.setDispatchType(MTLDispatchType::Serial);
+                    // SAFETY: index 0 always exists; sample indices lie
+                    // inside the batch's reserved range.
+                    unsafe {
+                        let attachment =
+                            pass.sampleBufferAttachments().objectAtIndexedSubscript(0);
+                        attachment.setSampleBuffer(Some(&timestamps.samples));
+                        attachment.setStartOfEncoderSampleIndex(*first + 2 * *encoded);
+                        attachment.setEndOfEncoderSampleIndex(*first + 2 * *encoded + 1);
+                    }
+                    let encoder = command
+                        .computeCommandEncoderWithDescriptor(&pass)
+                        .ok_or_else(|| {
+                            ExecutionError::SubmissionFailed(
+                                "Metal could not create a timed compute encoder".into(),
+                            )
+                        })?;
+                    encode_launch(&encoder, launch);
+                    encoder.endEncoding();
+                    Ok(())
+                })?;
                 launches.push(Some(*encoded));
                 *encoded += 1;
             }
@@ -329,7 +426,9 @@ impl DirectBatch {
     pub fn commit(self) -> DirectSubmission {
         let timing = match self.encoding {
             Encoding::Serial(encoder) => {
-                encoder.endEncoding();
+                if let Some(encoder) = encoder {
+                    crate::pooled(|| encoder.endEncoding());
+                }
                 None
             }
             Encoding::Timed {
@@ -347,7 +446,7 @@ impl DirectBatch {
                 calibration,
             }),
         };
-        self.command.commit();
+        crate::pooled(|| self.command.commit());
         DirectSubmission {
             device: self.device,
             command: self.command,
@@ -435,7 +534,7 @@ unsafe impl Sync for DirectSubmission {}
 impl DirectSubmission {
     pub fn is_complete(&self) -> bool {
         matches!(
-            self.command.status(),
+            crate::pooled(|| self.command.status()),
             MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
         )
     }
@@ -450,23 +549,24 @@ impl DirectSubmission {
     /// Wait and report the command buffer's outcome.
     pub fn finish(&self) -> Result<(), ExecutionError> {
         self.wait_complete();
-        match self.command.error() {
+        crate::pooled(|| match self.command.error() {
             Some(error) => Err(ExecutionError::SubmissionFailed(
                 error.localizedDescription().to_string(),
             )),
             None => Ok(()),
-        }
+        })
     }
 
     /// Device execution time of the completed command buffer.
     pub fn device_seconds(&self) -> f64 {
-        self.command.GPUEndTime() - self.command.GPUStartTime()
+        let (start, end) = self.device_interval();
+        end - start
     }
 
     /// The completed command buffer's device execution interval on the
     /// [`host_seconds`] clock.
     pub fn device_interval(&self) -> (f64, f64) {
-        (self.command.GPUStartTime(), self.command.GPUEndTime())
+        crate::pooled(|| (self.command.GPUStartTime(), self.command.GPUEndTime()))
     }
 
     /// For a timed batch, each `encode` call's device interval on the
@@ -484,17 +584,17 @@ impl DirectSubmission {
             Vec::new()
         } else {
             // SAFETY: the range lies inside the batch's reserved samples.
-            let data = unsafe {
+            crate::pooled(|| unsafe {
                 timing
                     .timestamps
                     .samples
                     .resolveCounterRange(NSRange::new(timing.first, 2 * timing.encoded))
             }
-            .ok_or_else(|| failed("Metal did not resolve the timed batch's samples"))?;
-            data.to_vec()
-                .chunks_exact(8)
-                .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
-                .collect::<Vec<_>>()
+            .map(|data| data.to_vec()))
+            .ok_or_else(|| failed("Metal did not resolve the timed batch's samples"))?
+            .chunks_exact(8)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().expect("eight bytes")))
+            .collect::<Vec<_>>()
         };
         // GPU ticks map linearly onto the host clock between the pair taken
         // when the batch was formed and one taken now.

@@ -2,6 +2,44 @@ use super::super::*;
 use super::*;
 
 impl<'a> QualificationView<'a> {
+    pub(super) fn qualify_feature_copy(&self, device: &Device) -> Result<(), CatalogFailure> {
+        let failure = |error: String| qualification("feature_copy", "activation", error);
+        let element = match self.geometry.activation_dtype {
+            magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
+            magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
+        };
+        let element = self.plan.head().and_then(|head| head.blocks().first()).map_or(element, |head| head.conditioning);
+        let row_bytes = if element == Element::f32() { 64 } else { 32 };
+        let bytes = (0..4 * row_bytes).map(|i| i as u8).collect::<Vec<_>>();
+        let source = Tensor::from_host(device, element, &[4, 16], &bytes)
+            .map_err(|error| failure(error.to_string()))?;
+        let destination =
+            Tensor::zeros(device, element, &[4, 16]).map_err(|error| failure(error.to_string()))?;
+        let source = source
+            .slice_leading(1, 3)
+            .map_err(|error| failure(error.to_string()))?;
+        let mut slice = destination
+            .slice_leading(2, 4)
+            .map_err(|error| failure(error.to_string()))?;
+        self.programs
+            .state
+            .feature_copy
+            .call(feature_copy::Args {
+                input: &source,
+                out: &mut slice,
+            })
+            .map_err(|error| failure(error.to_string()))?;
+        let actual = destination
+            .read_to_host()
+            .map_err(|error| failure(error.to_string()))?;
+        let mut expected = vec![0u8; 2 * row_bytes];
+        expected.extend_from_slice(&bytes[row_bytes..3 * row_bytes]);
+        if actual != expected {
+            return Err(failure("feature copy changed activation storage".into()));
+        }
+        Ok(())
+    }
+
     pub(super) fn qualify_shape_rows(&self, device: &Device) -> Result<(), CatalogFailure> {
         // One vocabulary row at unit temperature without cuts or penalties:
         // shaping is the identity.

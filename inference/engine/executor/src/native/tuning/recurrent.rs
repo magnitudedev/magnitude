@@ -10,12 +10,12 @@
 //! slot reads, the bank it publishes to), filled with pseudo-random state; the
 //! published bank is the case state restored before each validation run.
 
-use super::cases::projection_shape;
+use super::cases::{packing_statics, projection_shape};
 use super::{
-    row_points, served_row_points, CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs,
-    TuningLimits,
+    CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
+    served_row_points,
 };
-use crate::operators::gated_delta::graph::CHUNKED_ROWS;
+use crate::operators::gated_delta::{self, graph::CHUNKED_ROWS};
 use magnitude_family_contracts::{Operator, RecurrentHeadMapping, WeightKind, WeightScope};
 use magnitude_kernels::{
     attention_output, gated_delta_chunk, gated_delta_project, gated_delta_project_convolved,
@@ -56,11 +56,14 @@ impl RecurrentShape {
     ) -> Result<Vec<(&'static str, u64)>, String> {
         let (_, hidden) =
             projection_shape(inputs, &self.scopes, WeightKind::RecurrentQueryKeyValue)?;
+        let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
         Ok(vec![
             ("H", hidden),
             ("NK", self.key_heads),
             ("NV", self.value_heads),
             ("W", self.width),
+            ("PT", parts),
+            ("NM", norm),
         ])
     }
 
@@ -95,6 +98,8 @@ pub(crate) struct RecurrentProjectCase {
     alpha: Tensor,
     beta: Tensor,
     epsilon: f32,
+    qkv_bound: Tensor,
+    gate_bound: Tensor,
 }
 
 impl RecurrentProjectTuning {
@@ -131,7 +136,17 @@ impl EntryTuning for RecurrentProjectTuning {
     }
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
-        self.shape.projection_statics(inputs)
+        let scopes = &self.shape.scopes;
+        let mut statics = self.shape.projection_statics(inputs)?;
+        statics.extend(packing_statics(
+            inputs,
+            scopes,
+            &[
+                ("QB", Some(WeightKind::RecurrentQueryKeyValue)),
+                ("ZB", Some(WeightKind::RecurrentGate)),
+            ],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -149,16 +164,19 @@ impl EntryTuning for RecurrentProjectTuning {
             .map(|(index, scope)| {
                 let qkv = inputs.weight(scope, WeightKind::RecurrentQueryKeyValue)?;
                 let hidden = qkv.extents()[1];
+                let (parts, norm) = inputs.input_form(&self.shape.scopes, hidden)?;
                 Ok(RecurrentProjectCase {
                     hidden: inputs.activation(
                         Element::f32(),
-                        &[point.rows, hidden],
+                        &[point.rows, parts * hidden],
                         index as u64 + 1,
                     )?,
-                    norm: inputs.weight(scope, WeightKind::InputNorm)?,
+                    norm: inputs.input_norm(scope, WeightKind::InputNorm, self.norm, norm)?,
                     gate: inputs.weight(scope, WeightKind::RecurrentGate)?,
                     alpha: inputs.weight(scope, WeightKind::RecurrentAlpha)?,
                     beta: inputs.weight(scope, WeightKind::RecurrentBeta)?,
+                    qkv_bound: inputs.bound(scope, WeightKind::RecurrentQueryKeyValue)?,
+                    gate_bound: inputs.bound(scope, WeightKind::RecurrentGate)?,
                     qkv,
                     epsilon: self.epsilon,
                 })
@@ -175,6 +193,8 @@ impl EntryTuning for RecurrentProjectTuning {
             alpha_weight: &case.alpha,
             beta_weight: &case.beta,
             epsilon: case.epsilon,
+            qkv_bound: &case.qkv_bound,
+            gate_bound: &case.gate_bound,
         }
     }
 
@@ -192,8 +212,10 @@ pub(crate) struct RecurrentOutputTuning {
 
 pub(crate) struct RecurrentOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
+    bound: Tensor,
 }
 
 impl RecurrentOutputTuning {
@@ -223,11 +245,20 @@ impl EntryTuning for RecurrentOutputTuning {
         if columns != self.shape.value_heads * self.shape.width {
             return Err("the recurrent output projection disagrees with the binding".into());
         }
-        Ok(vec![
+        let (streams, inject) = inputs.join(&self.shape.scopes)?;
+        let mut statics = vec![
             ("D", hidden),
+            ("SN", streams),
+            ("IN", inject),
             ("Q", self.shape.value_heads),
             ("W", self.shape.width),
-        ])
+        ];
+        statics.extend(packing_statics(
+            inputs,
+            &self.shape.scopes,
+            &[("OB", Some(WeightKind::RecurrentOutput))],
+        )?);
+        Ok(statics)
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -239,6 +270,7 @@ impl EntryTuning for RecurrentOutputTuning {
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String> {
+        let (streams, inject) = inputs.join(&self.shape.scopes)?;
         TuningInputs::rotation_scopes(&self.shape.scopes, point)
             .into_iter()
             .enumerate()
@@ -247,12 +279,18 @@ impl EntryTuning for RecurrentOutputTuning {
                 let hidden = output.extents()[0];
                 let seed = 2 * index as u64;
                 Ok(RecurrentOutputCase {
-                    hidden: inputs.activation(Element::f32(), &[point.rows, hidden], seed + 1)?,
+                    hidden: inputs.activation(
+                        Element::f32(),
+                        &[point.rows, streams * hidden],
+                        seed + 1,
+                    )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, inject], seed + 3)?,
                     gated: inputs.activation(
                         self.activation,
                         &[point.rows, self.shape.value_heads, self.shape.width],
                         seed + 2,
                     )?,
+                    bound: inputs.bound(scope, WeightKind::RecurrentOutput)?,
                     output,
                 })
             })
@@ -262,12 +300,14 @@ impl EntryTuning for RecurrentOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
+            output_bound: &case.bound,
         }
     }
 
-    generated_entry!(attention_output, this => this.elements(), rounded to this.activation);
+    generated_entry!(attention_output, this => this.elements());
 }
 
 /// What both state entries tune over: the gated delta advance of one
@@ -302,7 +342,7 @@ pub(crate) struct SlotTables {
 
 impl SlotTables {
     fn new(inputs: &mut TuningInputs<'_, '_>, rows: u64) -> Result<Self, String> {
-        let tables = inputs.batch(rows, 0, 1, 0)?;
+        let tables = inputs.batch(rows, 0, &[Vec::new()], 0)?;
         let slots = tables.actual_slots;
         let segments = tables.segments[..=slots]
             .iter()
@@ -385,7 +425,15 @@ pub(crate) struct RecurrentStateCase {
     slab_banks: u32,
     norm_epsilon: f32,
     epsilon: f32,
+    codes: RecurrentCodes,
+}
+
+/// The model's per-layer recurrent codes a state entry takes.
+#[derive(Clone, Copy)]
+struct RecurrentCodes {
+    /// Whether the q/k heads map to value heads in groups.
     grouped: bool,
+    gate_function: i32,
 }
 
 /// Tape rows of a tuning case's banks: one, the least a store holds. Cases
@@ -407,20 +455,20 @@ impl RecurrentState {
         inputs: &mut TuningInputs<'_, '_>,
         point: &PointShape,
     ) -> Result<Vec<RecurrentStateCase>, String> {
-        let grouped = self.grouped(inputs)?;
+        let codes = self.codes(inputs)?;
         TuningInputs::rotation_scopes(&self.shape.scopes, point)
             .into_iter()
             .enumerate()
-            .map(|(index, scope)| self.case(inputs, scope, point.rows, 4 * index as u64, grouped))
+            .map(|(index, scope)| self.case(inputs, scope, point.rows, 4 * index as u64, codes))
             .collect()
     }
 
-    /// Whether the model's q/k heads map to value heads in groups.
-    fn grouped(&self, inputs: &TuningInputs<'_, '_>) -> Result<bool, String> {
+    fn codes(&self, inputs: &TuningInputs<'_, '_>) -> Result<RecurrentCodes, String> {
         match inputs.operator(&self.shape.scopes)? {
-            Operator::GatedDelta(delta) => {
-                Ok(matches!(delta.head_mapping, RecurrentHeadMapping::Grouped))
-            }
+            Operator::GatedDelta(delta) => Ok(RecurrentCodes {
+                grouped: matches!(delta.head_mapping, RecurrentHeadMapping::Grouped),
+                gate_function: gated_delta::gate_function(delta),
+            }),
             other => Err(format!("a {} layer has no recurrent mixer", other.name())),
         }
     }
@@ -431,7 +479,7 @@ impl RecurrentState {
         scope: WeightScope,
         rows: u64,
         seed: u64,
-        grouped: bool,
+        codes: RecurrentCodes,
     ) -> Result<RecurrentStateCase, String> {
         let shape = &self.shape;
         let tables = SlotTables::new(inputs, rows)?;
@@ -454,7 +502,7 @@ impl RecurrentState {
             slab_banks: TUNING_BANKS as u32,
             norm_epsilon: self.epsilon * shape.width as f32,
             epsilon: self.epsilon,
-            grouped,
+            codes,
         })
     }
 }
@@ -512,7 +560,8 @@ macro_rules! state_entry {
                     slab_banks: case.slab_banks,
                     norm_epsilon: case.norm_epsilon,
                     epsilon: case.epsilon,
-                    grouped: case.grouped,
+                    grouped: case.codes.grouped,
+                    gate_function: case.codes.gate_function,
                 }
             }
 
@@ -627,7 +676,7 @@ impl EntryTuning for RecurrentProjectConvolvedTuning {
         AW: this.0.alpha,
         BW: this.0.beta,
         A: this.0.activation,
-    }, rounded to this.0.activation);
+    });
 }
 
 /// `gated_delta_step_convolved`, the convolved step form's state advance,
@@ -648,7 +697,7 @@ pub(crate) struct RecurrentStepConvolvedCase {
     slab_banks: u32,
     norm_epsilon: f32,
     epsilon: f32,
-    grouped: bool,
+    codes: RecurrentCodes,
 }
 
 impl EntryTuning for RecurrentStepConvolvedTuning {
@@ -683,7 +732,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
     ) -> Result<Vec<Self::Case>, String> {
         let state = &self.0;
         let shape = &state.shape;
-        let grouped = state.grouped(inputs)?;
+        let codes = state.codes(inputs)?;
         TuningInputs::rotation_scopes(&shape.scopes, point)
             .into_iter()
             .enumerate()
@@ -710,7 +759,7 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
                     slab_banks: TUNING_BANKS as u32,
                     norm_epsilon: state.epsilon * shape.width as f32,
                     epsilon: state.epsilon,
-                    grouped,
+                    codes,
                 })
             })
             .collect()
@@ -733,7 +782,8 @@ impl EntryTuning for RecurrentStepConvolvedTuning {
             slab_banks: case.slab_banks,
             norm_epsilon: case.norm_epsilon,
             epsilon: case.epsilon,
-            grouped: case.grouped,
+            grouped: case.codes.grouped,
+            gate_function: case.codes.gate_function,
         }
     }
 

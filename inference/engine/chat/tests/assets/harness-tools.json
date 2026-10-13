@@ -1,0 +1,1334 @@
+{
+ "claude-code": [
+  {
+   "name": "Agent",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "description": {
+      "type": "string"
+     },
+     "prompt": {
+      "type": "string"
+     },
+     "subagent_type": {
+      "type": "string"
+     },
+     "model": {
+      "type": "string",
+      "enum": [
+       "sonnet",
+       "opus",
+       "haiku",
+       "fable"
+      ]
+     },
+     "run_in_background": {
+      "type": "boolean"
+     },
+     "isolation": {
+      "type": "string",
+      "enum": [
+       "worktree",
+       "remote"
+      ]
+     }
+    },
+    "required": [
+     "description",
+     "prompt"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Bash",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "number"
+     },
+     "description": {
+      "type": "string"
+     },
+     "run_in_background": {
+      "type": "boolean"
+     },
+     "dangerouslyDisableSandbox": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "command"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "CronCreate",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "cron": {
+      "type": "string"
+     },
+     "prompt": {
+      "type": "string"
+     },
+     "recurring": {
+      "type": "boolean"
+     },
+     "durable": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "cron",
+     "prompt"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "CronDelete",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "CronList",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "DesignSync",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "method": {
+      "type": "string",
+      "enum": [
+       "list_projects",
+       "get_project",
+       "list_files",
+       "get_file",
+       "finalize_plan",
+       "write_files",
+       "delete_files",
+       "register_assets",
+       "unregister_assets",
+       "create_project",
+       "report_validate"
+      ]
+     },
+     "projectId": {
+      "type": "string",
+      "minLength": 1
+     },
+     "path": {
+      "type": "string",
+      "minLength": 1
+     },
+     "writes": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 256
+      }
+     },
+     "deletes": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 256
+      }
+     },
+     "planId": {
+      "type": "string",
+      "minLength": 1
+     },
+     "files": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 256
+        },
+        "localPath": {
+         "type": "string",
+         "minLength": 1
+        },
+        "data": {
+         "type": "string"
+        },
+        "encoding": {
+         "type": "string",
+         "enum": [
+          "base64"
+         ]
+        },
+        "mimeType": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "paths": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 256
+      }
+     },
+     "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+     },
+     "assets": {
+      "maxItems": 256,
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "name": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 255
+        },
+        "path": {
+         "type": "string",
+         "minLength": 1,
+         "maxLength": 256
+        },
+        "subtitle": {
+         "type": "string",
+         "maxLength": 255
+        },
+        "viewport": {
+         "type": "object",
+         "properties": {
+          "width": {
+           "type": "integer",
+           "exclusiveMinimum": 0,
+           "maximum": 9007199254740991
+          },
+          "height": {
+           "type": "integer",
+           "exclusiveMinimum": 0,
+           "maximum": 9007199254740991
+          }
+         },
+         "required": [
+          "width"
+         ],
+         "additionalProperties": false
+        },
+        "group": {
+         "type": "string",
+         "maxLength": 64
+        }
+       },
+       "required": [
+        "name",
+        "path"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "localDir": {
+      "type": "string",
+      "minLength": 1
+     },
+     "counts": {
+      "type": "object",
+      "properties": {
+       "total": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+       },
+       "bad": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+       },
+       "thin": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+       },
+       "variantsIdentical": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+       },
+       "iterations": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+       }
+      },
+      "required": [
+       "total",
+       "bad",
+       "thin",
+       "variantsIdentical",
+       "iterations"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "required": [
+     "method"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Edit",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "type": "string"
+     },
+     "old_string": {
+      "type": "string"
+     },
+     "new_string": {
+      "type": "string"
+     },
+     "replace_all": {
+      "default": false,
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "file_path",
+     "old_string",
+     "new_string"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "EnterWorktree",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "ExitWorktree",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "action": {
+      "type": "string",
+      "enum": [
+       "keep",
+       "remove"
+      ]
+     },
+     "discard_changes": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "ListAgents",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "channel": {
+      "type": "string",
+      "maxLength": 256
+     },
+     "q": {
+      "type": "string",
+      "maxLength": 256
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "NotebookEdit",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "notebook_path": {
+      "type": "string"
+     },
+     "cell_id": {
+      "type": "string"
+     },
+     "new_source": {
+      "type": "string"
+     },
+     "cell_type": {
+      "type": "string",
+      "enum": [
+       "code",
+       "markdown"
+      ]
+     },
+     "edit_mode": {
+      "type": "string",
+      "enum": [
+       "replace",
+       "insert",
+       "delete"
+      ]
+     }
+    },
+    "required": [
+     "notebook_path",
+     "new_source"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Read",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "type": "string"
+     },
+     "offset": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+     },
+     "limit": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+     },
+     "pages": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "file_path"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "ReportFindings",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "level": {
+      "type": "string",
+      "enum": [
+       "low",
+       "medium",
+       "high",
+       "xhigh",
+       "max"
+      ]
+     },
+     "findings": {
+      "maxItems": 32,
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "file": {
+         "type": "string"
+        },
+        "line": {
+         "type": "integer",
+         "minimum": -9007199254740991,
+         "maximum": 9007199254740991
+        },
+        "summary": {
+         "type": "string"
+        },
+        "short_summary": {
+         "type": "string",
+         "maxLength": 60
+        },
+        "failure_scenario": {
+         "type": "string"
+        },
+        "category": {
+         "type": "string",
+         "maxLength": 40
+        },
+        "verdict": {
+         "type": "string",
+         "enum": [
+          "CONFIRMED",
+          "PLAUSIBLE"
+         ]
+        },
+        "outcome": {
+         "type": "string",
+         "enum": [
+          "fixed",
+          "skipped",
+          "no_change_needed"
+         ]
+        }
+       },
+       "required": [
+        "file",
+        "summary",
+        "failure_scenario"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "findings"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "ScheduleWakeup",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "delaySeconds": {
+      "type": "number"
+     },
+     "reason": {
+      "type": "string"
+     },
+     "prompt": {
+      "type": "string"
+     },
+     "stop": {
+      "type": "boolean"
+     },
+     "noop": {
+      "type": "boolean"
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "SendMessage",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "to": {
+      "type": "string",
+      "allOf": [
+       {
+        "pattern": "^[^\\n\\r]*$"
+       },
+       {
+        "pattern": "^[\\s\\S]{0,300}$"
+       }
+      ]
+     },
+     "summary": {
+      "type": "string",
+      "maxLength": 200
+     },
+     "message": {
+      "default": "",
+      "type": "string"
+     },
+     "notify_when_idle": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "to",
+     "message"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Skill",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "skill": {
+      "type": "string"
+     },
+     "args": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "skill"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "TaskOutput",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "string"
+     },
+     "block": {
+      "default": true,
+      "type": "boolean"
+     },
+     "timeout": {
+      "default": 30000,
+      "type": "number",
+      "minimum": 0,
+      "maximum": 600000
+     }
+    },
+    "required": [
+     "task_id",
+     "block",
+     "timeout"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "TaskStop",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "string"
+     },
+     "shell_id": {
+      "type": "string"
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "WebFetch",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "url": {
+      "type": "string",
+      "format": "uri"
+     },
+     "prompt": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "url",
+     "prompt"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "WebSearch",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string",
+      "minLength": 2
+     },
+     "allowed_domains": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "blocked_domains": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "query"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Workflow",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "script": {
+      "type": "string",
+      "maxLength": 524288
+     },
+     "name": {
+      "type": "string"
+     },
+     "description": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "args": {},
+     "scriptPath": {
+      "type": "string"
+     },
+     "resumeFromRunId": {
+      "type": "string",
+      "pattern": "^wf_[a-z0-9-]{6,}$"
+     }
+    },
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "Write",
+   "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+     "file_path": {
+      "type": "string"
+     },
+     "content": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "file_path",
+     "content"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ],
+ "oh-my-pi": [
+  {
+   "name": "read",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "bash",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "command": {
+      "type": "string"
+     },
+     "env": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "type": "string"
+      }
+     },
+     "timeout": {
+      "type": "number"
+     },
+     "cwd": {
+      "type": "string"
+     },
+     "pty": {
+      "type": "boolean"
+     },
+     "async": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "command",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "edit",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "input": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "input",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "eval",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "language": {
+      "enum": [
+       "py",
+       "js"
+      ],
+      "type": "string"
+     },
+     "code": {
+      "type": "string"
+     },
+     "title": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "number"
+     },
+     "reset": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "language",
+     "code"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "glob",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     },
+     "hidden": {
+      "type": "boolean"
+     },
+     "gitignore": {
+      "type": "boolean"
+     },
+     "limit": {
+      "type": "number"
+     }
+    },
+    "additionalProperties": false,
+    "required": [
+     "i"
+    ]
+   }
+  },
+  {
+   "name": "grep",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "pattern": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     },
+     "case": {
+      "type": "boolean"
+     },
+     "gitignore": {
+      "type": "boolean"
+     },
+     "skip": {
+      "type": [
+       "number",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "pattern",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "task",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "context": {
+      "type": "string"
+     },
+     "tasks": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "task": {
+         "type": "string"
+        },
+        "name": {
+         "type": "string"
+        },
+        "agent": {
+         "type": "string",
+         "default": "task"
+        },
+        "outputSchema": {
+         "anyOf": [
+          {
+           "type": "object"
+          },
+          {
+           "type": "boolean"
+          },
+          {
+           "type": "string"
+          },
+          {
+           "type": "null"
+          }
+         ]
+        },
+        "schemaMode": {
+         "enum": [
+          "permissive",
+          "strict"
+         ],
+         "type": "string"
+        }
+       },
+       "required": [
+        "task"
+       ],
+       "additionalProperties": false
+      }
+     }
+    },
+    "required": [
+     "context",
+     "tasks",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "hub",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "op": {
+      "enum": [
+       "send",
+       "wait",
+       "inbox",
+       "list",
+       "jobs",
+       "cancel",
+       "start",
+       "ps",
+       "logs",
+       "stop",
+       "restart",
+       "describe"
+      ],
+      "type": "string"
+     },
+     "to": {
+      "type": "string"
+     },
+     "message": {
+      "type": "string"
+     },
+     "replyTo": {
+      "type": "string"
+     },
+     "await": {
+      "type": "boolean"
+     },
+     "from": {
+      "type": "string"
+     },
+     "ids": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "timeoutMs": {
+      "type": "number"
+     },
+     "peek": {
+      "type": "boolean"
+     },
+     "status": {
+      "enum": [
+       "running",
+       "idle",
+       "parked"
+      ],
+      "type": "string"
+     },
+     "limit": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "name": {
+      "type": "string",
+      "maxLength": 48
+     },
+     "application": {
+      "type": "string",
+      "minLength": 1
+     },
+     "args": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "env": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": {
+       "type": "string"
+      }
+     },
+     "cwd": {
+      "type": "string"
+     },
+     "pty": {
+      "type": "boolean"
+     },
+     "ready": {
+      "type": "object",
+      "properties": {
+       "log": {
+        "type": "string",
+        "minLength": 1
+       },
+       "port": {
+        "type": "number"
+       },
+       "host": {
+        "type": "string",
+        "minLength": 1
+       },
+       "timeout": {
+        "type": "number",
+        "exclusiveMinimum": 0
+       }
+      },
+      "additionalProperties": false
+     },
+     "restart": {
+      "enum": [
+       "no",
+       "on-failure",
+       "always"
+      ],
+      "type": "string"
+     },
+     "persist": {
+      "type": "boolean"
+     },
+     "detached": {
+      "type": "boolean"
+     },
+     "lines": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     },
+     "head": {
+      "type": "boolean"
+     },
+     "grep": {
+      "type": "string",
+      "minLength": 1
+     },
+     "follow": {
+      "type": "boolean"
+     },
+     "cursor": {
+      "type": "number",
+      "minimum": 0
+     },
+     "for": {
+      "enum": [
+       "ready",
+       "exit"
+      ],
+      "type": "string"
+     },
+     "pattern": {
+      "type": "string",
+      "minLength": 1
+     },
+     "text": {
+      "type": "string",
+      "minLength": 1
+     },
+     "enter": {
+      "type": "boolean"
+     },
+     "keys": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "signal": {
+      "enum": [
+       "SIGINT",
+       "SIGTERM",
+       "SIGHUP",
+       "SIGQUIT",
+       "SIGKILL"
+      ],
+      "type": "string"
+     },
+     "timeout": {
+      "type": "number",
+      "exclusiveMinimum": 0
+     }
+    },
+    "required": [
+     "op",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "todo",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "op": {
+      "enum": [
+       "init",
+       "start",
+       "done",
+       "rm",
+       "drop",
+       "block",
+       "unblock",
+       "append",
+       "view"
+      ],
+      "type": "string"
+     },
+     "list": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "phase": {
+         "type": "string"
+        },
+        "items": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "minItems": 1
+        }
+       },
+       "required": [
+        "phase",
+        "items"
+       ],
+       "additionalProperties": false
+      }
+     },
+     "task": {
+      "type": "string"
+     },
+     "phase": {
+      "type": "string"
+     },
+     "items": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "op",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "web_search",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "query": {
+      "type": "string"
+     },
+     "recency": {
+      "enum": [
+       "day",
+       "week",
+       "month",
+       "year"
+      ],
+      "type": "string"
+     },
+     "limit": {
+      "type": "number"
+     },
+     "max_tokens": {
+      "type": "number"
+     },
+     "temperature": {
+      "type": "number"
+     },
+     "num_search_results": {
+      "type": "number"
+     }
+    },
+    "required": [
+     "query",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  },
+  {
+   "name": "write",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "i": {
+      "type": "string"
+     },
+     "path": {
+      "type": "string"
+     },
+     "content": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "path",
+     "content",
+     "i"
+    ],
+    "additionalProperties": false
+   }
+  }
+ ]
+}

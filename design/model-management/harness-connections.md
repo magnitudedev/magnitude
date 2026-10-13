@@ -54,7 +54,8 @@ Pi, OpenCode, Hermes, OpenClaw, Codex, Claude Code, Oh My Pi, Cline
 ```
 
 Detection proves that an external executable is launchable from the user's `PATH`, excluding
-dependency-local binaries. ACN resolves the user's login-shell environment once, through the
+dependency-local binaries. On Windows only `PATHEXT` matches are launchable, and batch shims run
+through `cmd.exe` in every host runtime. ACN resolves the user's login-shell environment once, through the
 protected command helper, because a service started by the desktop or a service manager does not
 inherit it; configuration roots and the command environment are scoped to the connection service,
 never global process mutations. Installation and connection are independent observations. Connected means
@@ -220,8 +221,20 @@ not own this wire-compatibility behavior.
 - **Cline:** publish its supported OpenAI-compatible provider, exact model metadata, and persistent
   provider/model selection. Its fixed TUI effort surface still requires the Chat Completions
   boundary.
-- **Claude Code:** persist the Magnitude gateway settings and selected `anthropic-local/` model, but
-  no effort default. Its discovery schema limitation requires the Anthropic boundary.
+- **Claude Code:** persist the Magnitude gateway settings and the selected `anthropic-local/`
+  model, but no effort default. Its discovery schema limitation requires the Anthropic boundary.
+  The gateway forwards Claude models upstream with the client's own credential, so a Claude login
+  is left in charge whenever Claude Code has one: an OAuth login or Console key in its own storage
+  (the macOS Keychain items, `.credentials.json`, or the global config's `primaryApiKey`, honoring
+  `CLAUDE_CONFIG_DIR`), or a key, token, or `apiKeyHelper` in its user settings. Only the
+  existence of a credential is read. Without one, Claude Code sends nothing, so the connection
+  writes Magnitude's placeholder `ANTHROPIC_AUTH_TOKEN` (bearer, no approval
+  prompt) and an empty `ANTHROPIC_API_KEY` so an exported key cannot take over. The gateway serves
+  every placeholder request, including the Claude model tiers subagents use, from the loaded local
+  model, so the connection needs no model to be selected. Connected accepts either the placeholder
+  or an existing login. A login added after connecting is not repaired by inspection, which never
+  writes; reconnect or sync removes the placeholder values, and until then Claude Code keeps using
+  local models for every request. Disconnect removes exactly the values Magnitude wrote.
 - **OpenClaw:** publish a dedicated Magnitude agent. Explicit connection selection also updates
   the ordinary global primary with conditional restoration; the user owns session creation.
 

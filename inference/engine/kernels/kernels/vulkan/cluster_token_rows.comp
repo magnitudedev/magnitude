@@ -1,0 +1,11 @@
+#include <seismic/element.glsl>
+void cluster_token_rows() {
+    const uint64_t selected = SEISMIC_PTR(SEISMIC_BUFFER_SELECTED), ordering = SEISMIC_PTR(SEISMIC_BUFFER_TOKEN_ORDER), rows = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t stride = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < SEISMIC_DIM_M * SEISMIC_DIM_K * SEISMIC_DIM_B; index += stride) {
+        const uint64_t row = index / (SEISMIC_DIM_K * SEISMIC_DIM_B), col = index % (SEISMIC_DIM_K * SEISMIC_DIM_B);
+        const int cluster = element_i32_at(selected + (row * SEISMIC_SELECTED_STRIDE_0 + (col / SEISMIC_DIM_B) * SEISMIC_SELECTED_STRIDE_1) * 4ul);
+        const int token = cluster >= 0 && uint64_t(cluster) < SEISMIC_DIM_C ? element_i32_at(ordering + (uint64_t(cluster) * SEISMIC_TOKEN_ORDER_STRIDE_0 + (col % SEISMIC_DIM_B) * SEISMIC_TOKEN_ORDER_STRIDE_1) * 4ul) : -1;
+        element_i32_put(rows + (row * SEISMIC_RESULT_0_STRIDE_0 + col * SEISMIC_RESULT_0_STRIDE_1) * 4ul, token);
+    }
+}

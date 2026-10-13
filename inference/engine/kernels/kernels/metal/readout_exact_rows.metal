@@ -33,7 +33,7 @@ kernel void readout_exact_rows_gather(
         SEISMIC_REST_STRIDE_0, SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2, scales, SEISMIC_SCALES_STRIDE_0};
     const progressive::Selection selection{draws, SEISMIC_DRAWS_STRIDE_0, SEISMIC_DRAWS_STRIDE_1, temperature,
         SEISMIC_TEMPERATURE_STRIDE_0, mask, SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained,
-        SEISMIC_CONSTRAINED_STRIDE_0};
+        SEISMIC_CONSTRAINED_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))};
     // Radius column 1: the 5-bit view's.
     progressive::gather<false>(features, SEISMIC_FEATURES_STRIDE_0, planes, radius + SEISMIC_RADIUS_STRIDE_1,
         nullptr, SEISMIC_RADIUS_STRIDE_0, fine, SEISMIC_FINE_STRIDE_0, SEISMIC_FINE_STRIDE_1, floor,

@@ -198,7 +198,8 @@ pub(crate) fn device_for_workers(
         atomics: scalars
             .iter()
             .copied()
-            .filter(|dtype| dtype.is_numeric())
+            // The host atomics are 32-bit and narrower read-modify-writes.
+            .filter(|dtype| dtype.is_numeric() && dtype.bytes() <= 4)
             .collect(),
         representations,
     };

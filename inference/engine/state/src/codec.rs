@@ -28,6 +28,9 @@ impl fmt::Display for CodecIdentity {
 pub enum LayerRef {
     Target(u32),
     Head(u32),
+    /// The selected-attention indexer of target block `n`: its keys, which
+    /// no attention reads as history.
+    Indexer(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,7 +50,7 @@ pub enum PlaneName {
     Norm,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Codec {
     Dense {
         dtype: DType,
@@ -64,7 +67,7 @@ pub enum Codec {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CodecSpec {
     pub key: Codec,
     pub value: Codec,
@@ -155,7 +158,71 @@ impl KvCodec {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryEncoding {
+    Dense,
+    Affine,
+    Unsupported,
+}
+
+/// Physical extents per head of the affine storage descriptor. Native ABI
+/// names belong to the executor; this state contract names only its planes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AffineGeometry {
+    pub key_codes: usize,
+    pub key_coefficients: usize,
+    pub value_codes: usize,
+    pub value_coefficients: usize,
+    pub key_bits: u8,
+    pub value_bits: u8,
+}
+
 impl CodecSpec {
+    pub fn encoding(self) -> HistoryEncoding {
+        match (self.key, self.value) {
+            (Codec::Dense { .. }, Codec::Dense { .. }) => HistoryEncoding::Dense,
+            (Codec::Affine { .. }, Codec::Affine { .. }) => HistoryEncoding::Affine,
+            _ => HistoryEncoding::Unsupported,
+        }
+    }
+
+    /// The identical physical plane contract used by state allocation and
+    /// every attention producer/consumer, with widths per head.
+    pub fn planes(self) -> Result<Vec<PlaneDescriptor>, LayoutError> {
+        let mut planes = planes_for(VectorKind::Key, self.key, self.key_width)?;
+        planes.extend(planes_for(VectorKind::Value, self.value, self.value_width)?);
+        Ok(planes)
+    }
+
+    pub fn affine_geometry(self) -> Result<AffineGeometry, LayoutError> {
+        let (
+            Codec::Affine { bits: key_bits, .. },
+            Codec::Affine {
+                bits: value_bits, ..
+            },
+        ) = (self.key, self.value)
+        else {
+            return Err(LayoutError::WrongRepresentation("affine plane geometry"));
+        };
+        let planes = self.planes()?;
+        Ok(AffineGeometry {
+            key_codes: planes[0].row_elements,
+            key_coefficients: planes[1].row_elements,
+            value_codes: planes[2].row_elements,
+            value_coefficients: planes[3].row_elements,
+            key_bits,
+            value_bits,
+        })
+    }
+
+    pub fn bytes_per_head(self) -> Result<usize, LayoutError> {
+        self.planes()?.iter().try_fold(0usize, |total, plane| {
+            total
+                .checked_add(plane.row_bytes)
+                .ok_or(LayoutError::ArithmeticOverflow("history row bytes"))
+        })
+    }
+
     pub fn dense(dtype: DType, key_width: usize, value_width: usize) -> Self {
         Self {
             key: Codec::Dense { dtype },
@@ -198,6 +265,15 @@ pub struct ComponentDescriptor {
 }
 
 impl ComponentDescriptor {
+    /// Causal target attention consumes earlier rows through this codec even
+    /// within one batch. Media and separate draft visibility remain explicit
+    /// properties of their attention rows; this only declares cache semantics.
+    pub fn causal_rows_use_cache(&self) -> bool {
+        matches!(self.layer, LayerRef::Target(_))
+            && (matches!(self.codec.key, Codec::Affine { .. })
+                || matches!(self.codec.value, Codec::Affine { .. }))
+    }
+
     pub fn new(layer: LayerRef, codec: CodecSpec, heads: usize) -> Result<Self, LayoutError> {
         let codec = codec.validate()?;
         if heads == 0 {
@@ -228,6 +304,49 @@ impl ComponentDescriptor {
         })
     }
 
+    /// A selected-attention indexer's component: one dense key vector of
+    /// `width` `dtype` values per row and, with `coordinates`, the row's four
+    /// rotary coordinates (`i32`) in the value plane: a raw key's, whose
+    /// block is rotated at its first row's coordinates.
+    pub fn indexer(
+        layer: LayerRef,
+        dtype: DType,
+        width: usize,
+        coordinates: bool,
+    ) -> Result<Self, LayoutError> {
+        if !matches!(layer, LayerRef::Indexer(_)) {
+            return Err(LayoutError::WrongRepresentation(
+                "indexer history of an attention layer",
+            ));
+        }
+        let mut planes = planes_for(VectorKind::Key, Codec::Dense { dtype }, width)?;
+        let value_width = if coordinates { 4 } else { 0 };
+        // Its planes are `[rows, elements]`: one vector per row, no heads.
+        if coordinates {
+            planes.push(plane(VectorKind::Value, PlaneName::Dense, DType::I32, value_width)?);
+        }
+        Ok(Self {
+            layer,
+            codec: CodecSpec {
+                key: Codec::Dense { dtype },
+                value: Codec::Dense {
+                    dtype: if coordinates { DType::I32 } else { dtype },
+                },
+                key_width: width,
+                value_width,
+                packing: 1,
+            },
+            heads: 1,
+            planes,
+        })
+    }
+
+    /// Whether attention reads this component as history (an indexer's
+    /// keys are not).
+    pub fn attended(&self) -> bool {
+        !matches!(self.layer, LayerRef::Indexer(_))
+    }
+
     pub fn planes(&self) -> &[PlaneDescriptor] {
         &self.planes
     }
@@ -243,6 +362,7 @@ impl ComponentDescriptor {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutError {
+    WrongRepresentation(&'static str),
     ZeroWidth(VectorKind),
     ZeroHeads,
     InvalidDType { plane: PlaneName, dtype: DType },
@@ -260,6 +380,9 @@ pub enum LayoutError {
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WrongRepresentation(operation) => {
+                write!(f, "history descriptor does not support {operation}")
+            }
             Self::ZeroWidth(vector) => write!(f, "{vector:?} width must be positive"),
             Self::ZeroHeads => f.write_str("an attention-history component needs a head"),
             Self::InvalidDType { plane, dtype } => {

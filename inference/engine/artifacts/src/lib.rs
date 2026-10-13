@@ -13,6 +13,7 @@ mod package;
 mod payload;
 mod preprocessing;
 mod source;
+mod uncached;
 
 pub use error::Error;
 pub use identity::{ArtifactIdentity, PackageIdentity};
@@ -25,6 +26,7 @@ pub use preprocessing::{
 #[cfg(unix)]
 pub use source::MappedWindow;
 pub use source::{FileSource, SourceReader};
+pub use uncached::UncachedSource;
 pub use token::TokenId;
 
 mod token;

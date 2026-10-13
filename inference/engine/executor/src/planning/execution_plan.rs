@@ -2,10 +2,10 @@
 
 use super::{
     ArtifactComponent, ArtifactComponentKind, CapabilityPlan, ComponentPlan, ComponentSelection,
-    ModelLoadPlan, PlannedMethod, ProgramPlan, ResourceLimits, ResourcePlan, WeightPlan,
-    MAX_DRAFT_PROPOSALS,
+    MAX_DRAFT_PROPOSALS, ModelLoadPlan, PlannedMethod, ProgramPlan, ReadoutClassChoice,
+    ResourceLimits, ResourcePlan, WeightPlan,
 };
-use crate::{error::PlanError, platform::SelectedDevice, ExecutionPath};
+use crate::{ExecutionPath, error::PlanError, platform::SelectedDevice};
 use magnitude_artifacts::PackageManifest;
 use magnitude_family_contracts::ModelDefinition;
 use magnitude_state::KvCodec;
@@ -47,7 +47,7 @@ impl PlannedDevice {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedPolicy {
     path: ExecutionPath,
     method: PlannedMethod,
@@ -113,8 +113,8 @@ impl BackendPlan {
         &self.programs
     }
 
-    pub fn policy(&self) -> ResolvedPolicy {
-        self.policy
+    pub fn policy(&self) -> &ResolvedPolicy {
+        &self.policy
     }
 
     pub fn load(&self) -> &ModelLoadPlan {
@@ -144,12 +144,39 @@ impl ExecutionPlanDraft {
         &self.programs
     }
 
-    pub fn policy(&self) -> ResolvedPolicy {
-        self.policy
+    pub fn policy(&self) -> &ResolvedPolicy {
+        &self.policy
     }
 
     pub fn load(&self) -> &ModelLoadPlan {
         &self.load
+    }
+
+    /// Retain only empirically selected optional readout views before graph
+    /// resources or persistent residency are admitted. The canonical packed
+    /// projection remains available to every class.
+    pub fn finalize_readout(
+        mut self,
+        definition: &ModelDefinition,
+        choices: &[ReadoutClassChoice],
+    ) -> Result<Self, PlanError> {
+        let canonical = self.clone();
+        self.load = self
+            .load
+            .finalize_readout(choices)
+            .map_err(PlanError::InvalidDefinition)?;
+        self.programs = self.load.program_plan(definition, self.policy.codec)?;
+        if !choices.is_empty() {
+            let context_limit = u32::try_from(definition.decoder.context_limit)
+                .map_err(|_| PlanError::Arithmetic("model context exceeds assessment range"))?;
+            let assessment =
+                crate::assessment::prepare_execution_assessment(definition, &self, context_limit)
+                    .map_err(|error| PlanError::ResourcePlanning(error.to_string()))?;
+            if assessment.memory_charge().allocation_bytes > self.device.assessment_capacity_bytes {
+                return canonical.finalize_readout(definition, &[]);
+            }
+        }
+        Ok(self)
     }
 
     pub fn admit(self, resources: ResourcePlan) -> Result<ExecutionPlan, PlanError> {
@@ -205,8 +232,8 @@ impl ExecutionPlan {
         self.capabilities
     }
 
-    pub fn policy(&self) -> ResolvedPolicy {
-        self.policy
+    pub fn policy(&self) -> &ResolvedPolicy {
+        &self.policy
     }
 }
 
@@ -277,8 +304,12 @@ impl ExecutionPlanner {
             return Err(PlanError::Topology("method and head selection disagree"));
         }
         match method {
-            PlannedMethod::Mtp { .. } if definition.head.is_none() || definition.draft.is_some() => {
-                return Err(PlanError::Topology("MTP drafts with the definition's head alone"));
+            PlannedMethod::Mtp { .. }
+                if definition.head.is_none() || definition.draft.is_some() =>
+            {
+                return Err(PlanError::Topology(
+                    "MTP drafts with the definition's head alone",
+                ));
             }
             PlannedMethod::DFlash { .. }
                 if definition.draft.is_none() || definition.head.is_some() =>
@@ -297,7 +328,7 @@ impl ExecutionPlanner {
             && crate::programs::graph::readout::reads_progressive_heads(backend)
                 .map_err(PlanError::ResourcePlanning)?
         {
-            load.with_progressive_head(definition)
+            load.with_readout_candidates(definition)
                 .map_err(PlanError::InvalidDefinition)?
         } else {
             load
@@ -341,18 +372,22 @@ impl ExecutionPlanner {
             }
             // One block pass drafts every proposal, so the width is bounded
             // by the draft's block, not by sealed chains.
-            PlannedMethod::DFlash { proposals } => {
-                let block = definition
-                    .draft
-                    .as_ref()
-                    .map_or(0, magnitude_family_contracts::DraftDefinition::max_proposals);
-                if proposals == 0 || u64::from(proposals) > block {
+            PlannedMethod::DFlash {
+                proposals,
+                generated,
+                ..
+            } => {
+                let block = definition.draft.as_ref().map_or(
+                    0,
+                    magnitude_family_contracts::DraftDefinition::max_proposals,
+                );
+                if proposals == 0 || u64::from(proposals) > block || generated > proposals {
                     return Err(PlanError::Unsupported("DFlash proposal width"));
                 }
                 Some(proposals)
             }
         };
-        if programs.head().is_some() != matches!(method, PlannedMethod::Mtp { .. })
+        if programs.drafts_with_head() != matches!(method, PlannedMethod::Mtp { .. })
             || programs.draft().is_some() != matches!(method, PlannedMethod::DFlash { .. })
             || programs.vision().is_some() != selection.vision
         {

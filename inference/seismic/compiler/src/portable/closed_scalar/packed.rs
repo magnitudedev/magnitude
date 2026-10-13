@@ -32,6 +32,48 @@ impl Terms {
 }
 
 impl Analysis<'_> {
+    /// The position of the logical value at `indices` along its view's
+    /// packed storage.
+    fn logical_position(
+        &mut self,
+        view: AnyBufferView,
+        indices: &[Term],
+        state: &State,
+    ) -> Result<Term> {
+        let layout = self.storage.view(view);
+        let mut logical = self.terms.node(Node::Natural(0));
+        for (&index, stride) in indices.iter().zip(&layout.strides) {
+            let stride = self.expression((*stride).into(), &state.slots)?;
+            let displacement = self.terms.natural_binary(true, index, stride);
+            logical = self.terms.natural_binary(false, logical, displacement);
+        }
+        Ok(logical)
+    }
+
+    /// The lane (a `u32` word) of the value at `indices` among the values
+    /// one entry of packet plane `plane` covers: position arithmetic, as a
+    /// field read's.
+    pub(in crate::portable) fn plane_lane(
+        &mut self,
+        view: AnyBufferView,
+        indices: &[Term],
+        plane: u32,
+        state: &State,
+    ) -> Result<Term> {
+        let RepresentationKind::Packed(packet) =
+            &registry::representation_info(view.representation()).kind
+        else {
+            return Err("lane read does not address a resident packet");
+        };
+        let schema = packet
+            .planes
+            .get(plane as usize)
+            .ok_or("lane read has no registered plane")?;
+        let logical = self.logical_position(view, indices, state)?;
+        let lane = self.terms.natural_div_rem(true, logical, schema.group);
+        Ok(self.terms.node(Node::WordFromNatural(lane, DType::U32)))
+    }
+
     /// Project the fixed field-read instruction through its actual view and
     /// registered packet ABI. This is address/bit transport, not a decoder.
     pub(in crate::portable) fn plane_field(
@@ -64,12 +106,7 @@ impl Analysis<'_> {
         if field >= schema.fields || indices.len() != layout.strides.len() {
             return Err("packed field coordinates differ from the registered ABI");
         }
-        let mut logical = self.terms.node(Node::Natural(0));
-        for (&index, stride) in indices.iter().zip(&layout.strides) {
-            let stride = self.expression((*stride).into(), &state.slots)?;
-            let displacement = self.terms.natural_binary(true, index, stride);
-            logical = self.terms.natural_binary(false, logical, displacement);
-        }
+        let logical = self.logical_position(view, indices, state)?;
         let packet_index = self.terms.natural_div_rem(false, logical, packet.group);
         let packet_size = self
             .terms

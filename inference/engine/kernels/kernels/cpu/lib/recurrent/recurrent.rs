@@ -22,7 +22,7 @@
 // The raw outputs `S q` go to the `mixed` scratch (F32 values rounded to A,
 // [M, NV, W]); a `gate` launch then forms each row's gated result.
 
-use super::super::core::{activation, reduce};
+use super::super::core::{activation, functions, reduce};
 use seismic::cpu::{math, Dense, Scalars, Scratch, Tensor, F32};
 use seismic::cpu::slab::SlabTensor;
 use std::ops::Range;
@@ -317,9 +317,17 @@ impl<'a, A: Dense> Recurrence<'a, A> {
 
     /// The `gate` launch of both entries: row `row`'s raw outputs, per value
     /// head RMS-normalized over W with `epsilon` and scaled by the recurrent
-    /// norm (`norm`, decoded; A), times SiLU(z) (A), published to A in
-    /// `gated`. `values` holds W floats.
-    pub fn gate_row(&self, row: usize, norm: &[f32], epsilon: f32, gated: &Tensor<'a, A, 3>, values: &mut [f32]) {
+    /// norm (`norm`, decoded; A), times the output gate of z (A; code
+    /// `gate_function`), published to A in `gated`. `values` holds W floats.
+    pub fn gate_row(
+        &self,
+        row: usize,
+        norm: &[f32],
+        epsilon: f32,
+        gate_function: i32,
+        gated: &Tensor<'a, A, 3>,
+        values: &mut [f32],
+    ) {
         let (w, nv) = (self.width, self.value_heads);
         let z = self.channels();
         // SAFETY: the advance launch wrote every raw row before this launch;
@@ -333,7 +341,8 @@ impl<'a, A: Dense> Recurrence<'a, A> {
             let out = unsafe { gated.span_mut([row, head, 0], w) };
             for (((target, value), weight), gate) in out.iter_mut().zip(values.iter()).zip(norm).zip(gates) {
                 let normalized = activation::publish::<A>(value * inverse * weight);
-                let activated = activation::publish::<A>(activation::silu(A::widen(*gate)));
+                let activated =
+                    activation::publish::<A>(functions::output_gate(gate_function, A::widen(*gate)));
                 *target = A::narrow(normalized * activated);
             }
         }

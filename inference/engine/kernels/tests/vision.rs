@@ -18,7 +18,7 @@ use magnitude_kernels::{
 };
 use seismic::{Device, Element, NativeSpecialization, Tensor};
 use seismic_lang::{
-    checked::{check_source, CheckedModule, SourceFile},
+    checked::{CheckedModule, SourceFile, check_source},
     entry::ElementBindings,
     failure::SourceTermination,
     interp::{Arg, Interpreter, OracleOutcome, OutcomeValue, TensorData},
@@ -97,11 +97,24 @@ impl Host {
         Self::new(dtype, shape, values)
     }
     fn ints(shape: &[usize], values: impl IntoIterator<Item = usize>) -> Self {
-        Self::new(DType::I32, shape, values.into_iter().map(|v| v as f32).collect())
+        Self::new(
+            DType::I32,
+            shape,
+            values.into_iter().map(|v| v as f32).collect(),
+        )
     }
     /// An optional operand of `count` rows (0 or 1) of `row` shape.
-    fn rows(dtype: DType, count: usize, row: &[usize], scale: f32, offset: f32, rng: &mut Rng) -> Self {
-        let shape = std::iter::once(count).chain(row.iter().copied()).collect::<Vec<_>>();
+    fn rows(
+        dtype: DType,
+        count: usize,
+        row: &[usize],
+        scale: f32,
+        offset: f32,
+        rng: &mut Rng,
+    ) -> Self {
+        let shape = std::iter::once(count)
+            .chain(row.iter().copied())
+            .collect::<Vec<_>>();
         let values = rng
             .values(shape.iter().product(), scale)
             .into_iter()
@@ -162,7 +175,14 @@ fn module() -> CheckedModule {
     let mut sources = seismic_std::sources();
     for (path, text) in [
         ("vision.seismic", include_str!("../kernels/vision.seismic")),
-        ("attention.seismic", include_str!("../kernels/attention.seismic")),
+        (
+            "attention.seismic",
+            include_str!("../kernels/attention.seismic"),
+        ),
+        (
+            "functions.seismic",
+            include_str!("../kernels/functions.seismic"),
+        ),
     ] {
         sources.push(SourceFile {
             path: path.into(),
@@ -290,26 +310,45 @@ fn patch_stem_matches_its_portable_body() {
     let module = module();
     let (rows, channels, hidden, table_rows) = (5usize, 3usize, 64usize, 49usize);
     for device in devices() {
-        for (frames, biased, patch, weights) in
-            [(2usize, true, 16usize, DType::F16), (1, false, 16, DType::F32), (1, false, 14, DType::F32)]
-        {
+        for (frames, biased, patch, weights) in [
+            (2usize, true, 16usize, DType::F16),
+            (1, false, 16, DType::F32),
+            (1, false, 14, DType::F32),
+        ] {
             let (s, nb) = (frames - 1, usize::from(biased));
             let mut rng = Rng::new(21);
-            let pixels = Host::random(DType::F32, &[rows, channels, frames, patch, patch], 1.0, &mut rng);
+            let pixels = Host::random(
+                DType::F32,
+                &[rows, channels, frames, patch, patch],
+                1.0,
+                &mut rng,
+            );
             let frame = Host::random(weights, &[hidden, channels, patch, patch], 0.05, &mut rng);
-            let next = Host::random(weights, &[s, hidden, channels, patch, patch], 0.05, &mut rng);
+            let next = Host::random(
+                weights,
+                &[s, hidden, channels, patch, patch],
+                0.05,
+                &mut rng,
+            );
             let bias = Host::rows(DType::F32, nb, &[hidden], 0.1, 0.0, &mut rng);
             let table = Host::random(DType::F32, &[table_rows, hidden], 0.5, &mut rng);
             let indices = Host::ints(&[rows, 4], (0..rows * 4).map(|i| i * 5 % table_rows));
             let coefficients = Host::new(
                 DType::F32,
                 &[rows, 4],
-                (0..rows * 4).map(|_| (rng.symmetric() + 1.0) / 2.0).collect(),
+                (0..rows * 4)
+                    .map(|_| (rng.symmetric() + 1.0) / 2.0)
+                    .collect(),
             );
             let expected = interpret(
                 &module,
                 "vision_patch_stem",
-                &[("W0", weights), ("W1", weights), ("B", DType::F32), ("PE", DType::F32)],
+                &[
+                    ("W0", weights),
+                    ("W1", weights),
+                    ("B", DType::F32),
+                    ("PE", DType::F32),
+                ],
                 &[
                     Input::Tensor(&pixels),
                     Input::Tensor(&frame),
@@ -330,7 +369,13 @@ fn patch_stem_matches_its_portable_body() {
                 },
                 &specialization_on(
                     &device,
-                    &[("C", channels), ("S", s), ("P", patch), ("H", hidden), ("NB", nb)],
+                    &[
+                        ("C", channels),
+                        ("S", s),
+                        ("P", patch),
+                        ("H", hidden),
+                        ("NB", nb),
+                    ],
                 ),
             )
             .unwrap();
@@ -348,7 +393,10 @@ fn patch_stem_matches_its_portable_body() {
                 .unwrap()
                 .value;
             relative_error(
-                &format!("vision_patch_stem {:?} S{s} NB{nb} P{patch} {weights:?}", device.backend()),
+                &format!(
+                    "vision_patch_stem {:?} S{s} NB{nb} P{patch} {weights:?}",
+                    device.backend()
+                ),
                 &read_values(&result),
                 &expected,
                 2e-3,
@@ -374,7 +422,11 @@ fn norm_matches_its_portable_body() {
     ];
     for device in devices() {
         for (g, centered, weighted, biased, gathered, interleave, output) in forms {
-            let (nw, nb, no) = (usize::from(weighted), usize::from(biased), usize::from(gathered));
+            let (nw, nb, no) = (
+                usize::from(weighted),
+                usize::from(biased),
+                usize::from(gathered),
+            );
             let mut rng = Rng::new(22);
             let source = Host::random(DType::F32, &[cells, g, h], 2.0, &mut rng);
             let weight = Host::rows(DType::F32, nw, &[h], 0.5, 1.0, &mut rng);
@@ -402,7 +454,10 @@ fn norm_matches_its_portable_body() {
                     NBE: bias.element(),
                     Y: Element::dense(output),
                 },
-                &specialization_on(&device, &[("G", g), ("H", h), ("NW", nw), ("NB", nb), ("NO", no)]),
+                &specialization_on(
+                    &device,
+                    &[("G", g), ("H", h), ("NW", nw), ("NB", nb), ("NO", no)],
+                ),
             )
             .unwrap();
             let t = |host: &Host| host.tensor(&device);
@@ -419,7 +474,10 @@ fn norm_matches_its_portable_body() {
                 .unwrap()
                 .value;
             relative_error(
-                &format!("vision_norm {:?} G{g} centered {centered} NW{nw} NB{nb} NO{no}", device.backend()),
+                &format!(
+                    "vision_norm {:?} G{g} centered {centered} NW{nw} NB{nb} NO{no}",
+                    device.backend()
+                ),
                 &read_values(&result),
                 &expected,
                 2e-3,
@@ -438,7 +496,16 @@ fn linear_matches_its_portable_body() {
     let (m, n) = (70usize, 96usize);
     // (biased, residual, gated, clamped, activation, output, weights, depth)
     let forms = [
-        (true, true, false, false, 0, DType::F32, DType::F16, 128usize),
+        (
+            true,
+            true,
+            false,
+            false,
+            0,
+            DType::F32,
+            DType::F16,
+            128usize,
+        ),
         (true, false, false, false, 0, DType::F16, DType::F16, 128),
         (true, false, false, false, 1, DType::F16, DType::F16, 128),
         (true, false, false, false, 2, DType::F16, DType::F16, 128),
@@ -466,7 +533,12 @@ fn linear_matches_its_portable_body() {
             let expected = interpret(
                 &module,
                 "vision_linear",
-                &[("A", DType::F16), ("W", weights), ("B", DType::F32), ("Y", output)],
+                &[
+                    ("A", DType::F16),
+                    ("W", weights),
+                    ("B", DType::F32),
+                    ("Y", output),
+                ],
                 &[
                     Input::Tensor(&x),
                     Input::Tensor(&weight),
@@ -488,7 +560,14 @@ fn linear_matches_its_portable_body() {
                 },
                 &specialization_on(
                     &device,
-                    &[("N", n), ("K", k), ("NB", nb), ("NR", nr), ("NG", ng), ("NC", nc)],
+                    &[
+                        ("N", n),
+                        ("K", k),
+                        ("NB", nb),
+                        ("NR", nr),
+                        ("NG", ng),
+                        ("NC", nc),
+                    ],
                 ),
             )
             .unwrap();
@@ -533,7 +612,11 @@ fn clamp_matches_its_portable_body() {
             &module,
             "vision_clamp",
             &[("A", DType::F16)],
-            &[Input::Tensor(&x), Input::Tensor(&minimum), Input::Tensor(&maximum)],
+            &[
+                Input::Tensor(&x),
+                Input::Tensor(&minimum),
+                Input::Tensor(&maximum),
+            ],
         );
         let kernel = vision_clamp::native_for_device_with(
             &device,
@@ -550,7 +633,12 @@ fn clamp_matches_its_portable_body() {
             })
             .unwrap()
             .value;
-        assert_eq!(read_values(&result), expected, "vision_clamp {:?}", device.backend());
+        assert_eq!(
+            read_values(&result),
+            expected,
+            "vision_clamp {:?}",
+            device.backend()
+        );
     }
 }
 
@@ -573,7 +661,11 @@ fn attention_matches_its_portable_body() {
     for device in devices() {
         for (heads, quarter, head_norms, value_norm, windows, unit_scale) in forms {
             let width = 4 * quarter;
-            let (nq, nv, ws) = (usize::from(head_norms), usize::from(value_norm), usize::from(windows));
+            let (nq, nv, ws) = (
+                usize::from(head_norms),
+                usize::from(value_norm),
+                usize::from(windows),
+            );
             let mut rng = Rng::new(25);
             let shape = [rows, heads, width];
             let query = Host::random(DType::F16, &shape, 2.0, &mut rng);
@@ -583,7 +675,10 @@ fn attention_matches_its_portable_body() {
             let key_norm = Host::rows(DType::F32, nq, &[width], 0.3, 1.0, &mut rng);
             let value_norm = Host::new(DType::F32, &[nv, width], vec![1.0; nv * width]);
             let side = 7;
-            let coordinates = Host::ints(&[rows, 2], (0..rows).flat_map(|row| [row / side + 1, row % side + 1]));
+            let coordinates = Host::ints(
+                &[rows, 2],
+                (0..rows).flat_map(|row| [row / side + 1, row % side + 1]),
+            );
             // Windows of 48 rows (the last one partial).
             let spans = Host::ints(
                 &[ws, rows, 2],
@@ -613,7 +708,13 @@ fn attention_matches_its_portable_body() {
                 vision_attention::Elements { A: Element::f16() },
                 &specialization_on(
                     &device,
-                    &[("H", heads), ("P", quarter), ("NQ", nq), ("NV", nv), ("WS", ws)],
+                    &[
+                        ("H", heads),
+                        ("P", quarter),
+                        ("NQ", nq),
+                        ("NV", nv),
+                        ("WS", ws),
+                    ],
                 ),
             )
             .unwrap();
@@ -667,15 +768,28 @@ fn attention_timing() {
             let key_norm = Host::rows(DType::F32, 0, &[width], 0.3, 1.0, &mut rng);
             let value_norm = Host::new(DType::F32, &[0, width], vec![]);
             let side = 64;
-            let coordinates = Host::ints(&[rows, 2], (0..rows).flat_map(|row| [row / side + 1, row % side + 1]));
+            let coordinates = Host::ints(
+                &[rows, 2],
+                (0..rows).flat_map(|row| [row / side + 1, row % side + 1]),
+            );
             let spans = Host::ints(
                 &[ws, rows, 2],
-                (0..ws * rows).flat_map(|row| [row / 1024 * 1024, (row / 1024 * 1024 + 1024).min(rows)]),
+                (0..ws * rows)
+                    .flat_map(|row| [row / 1024 * 1024, (row / 1024 * 1024 + 1024).min(rows)]),
             );
             let kernel = vision_attention::native_for_device_with(
                 &device,
                 vision_attention::Elements { A: Element::f16() },
-                &specialization_on(&device, &[("H", heads), ("P", quarter), ("NQ", 0), ("NV", 0), ("WS", ws)]),
+                &specialization_on(
+                    &device,
+                    &[
+                        ("H", heads),
+                        ("P", quarter),
+                        ("NQ", 0),
+                        ("NV", 0),
+                        ("WS", ws),
+                    ],
+                ),
             )
             .unwrap();
             let t = |host: &Host| host.tensor(&device);
@@ -704,7 +818,10 @@ fn attention_timing() {
                         epsilon: EPSILON,
                         unit_scale: 0,
                     }],
-                    &seismic::MeasureOptions { samples: 15, min_sample_seconds: 0.005 },
+                    &seismic::MeasureOptions {
+                        samples: 15,
+                        min_sample_seconds: 0.005,
+                    },
                 )
                 .unwrap();
             let keys = if ws == 1 { 1024 } else { rows };
@@ -785,7 +902,9 @@ fn position_matches_its_portable_body() {
         let coefficients = Host::new(
             DType::F32,
             &[rows, 4],
-            (0..rows * 4).map(|_| (rng.symmetric() + 1.0) / 2.0).collect(),
+            (0..rows * 4)
+                .map(|_| (rng.symmetric() + 1.0) / 2.0)
+                .collect(),
         );
         let expected = interpret(
             &module,
@@ -800,7 +919,9 @@ fn position_matches_its_portable_body() {
         );
         let kernel = vision_position::native_for_device_with(
             &device,
-            vision_position::Elements { PE: table.element() },
+            vision_position::Elements {
+                PE: table.element(),
+            },
             &specialization_on(&device, &[("H", h)]),
         )
         .unwrap();

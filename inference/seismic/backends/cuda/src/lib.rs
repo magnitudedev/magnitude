@@ -1,6 +1,7 @@
 //! CUDA backend: target discovery, the sealed capability registry, direct
 //! typed-kernel PTX compilation, and the CUDA device service/executor.
 
+mod blocks;
 mod buffer;
 pub mod capability;
 mod command;
@@ -9,6 +10,8 @@ pub mod direct;
 mod driver;
 mod executor;
 pub mod model;
+#[cfg(not(target_os = "windows"))]
+mod nvml;
 pub mod nvrtc;
 mod open;
 mod profile;
@@ -21,7 +24,7 @@ pub use capability::CudaIntrinsic;
 pub use command::{CompiledKernel, OccupancyRelation};
 pub use compile::NativeCandidate;
 pub use executor::{Device, Executor, MemoryInfo};
-pub use open::{open, open_analytical, OpenedCuda};
+pub use open::{open, open_analytical, usable_memory_bytes, OpenedCuda};
 pub use profile::{
     describe, device_count, max_allocation_bytes, ComputeCapability, CudaFacts, CudaKernelAbi,
     DeviceDescriptor, DriverApiVersion, PtxFeatureSet, PtxTarget, TensorMemory, BACKEND_REVISION,

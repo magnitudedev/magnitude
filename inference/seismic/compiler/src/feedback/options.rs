@@ -80,12 +80,19 @@ pub enum EvaluationMethod {
 pub struct PreparationOptions {
     pub precision: seismic_lang::precision::PrecisionPolicy,
     pub evaluation: EvaluationMethod,
+    /// The instant by which preparation must finish. Past it, preparation
+    /// stops at its next step boundary and fails with
+    /// `PreparationError::Expired`; no partial artifact is published. A
+    /// deadline bounds the work, never its result, so it is not part of the
+    /// preparation's identity.
+    pub deadline: Option<std::time::Instant>,
 }
 impl Default for PreparationOptions {
     fn default() -> Self {
         Self {
             precision: Default::default(),
             evaluation: EvaluationMethod::Analytical,
+            deadline: None,
         }
     }
 }
@@ -95,6 +102,7 @@ impl PreparationOptions {
         Self {
             precision,
             evaluation: EvaluationMethod::Analytical,
+            deadline: None,
         }
     }
     pub fn feedback(
@@ -104,6 +112,13 @@ impl PreparationOptions {
         Self {
             precision,
             evaluation: EvaluationMethod::Feedback(options),
+            deadline: None,
+        }
+    }
+    pub fn with_deadline(self, deadline: std::time::Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+            ..self
         }
     }
 }
@@ -147,6 +162,7 @@ impl EvaluationMethod {
                                 SymbolValue::I32(v) => (5, v.to_le_bytes().to_vec()),
                                 SymbolValue::U32(v) => (6, v.to_le_bytes().to_vec()),
                                 SymbolValue::Bool(v) => (7, [u8::from(*v)].to_vec()),
+                                SymbolValue::U64(v) => (8, v.to_le_bytes().to_vec()),
                             };
                             digest.update([tag]);
                             digest.update((bits.len() as u64).to_le_bytes());

@@ -37,9 +37,70 @@ pub struct ImportWorkspaceLease {
     source: ImportSource,
 }
 
-enum ImportSource {
+/// The tensor one import entry reads a weight from: a view of the mapped
+/// artifact, or an upload its importer fills.
+pub(crate) enum ImportSource {
     Mapped(Tensor),
     Staged(Tensor),
+}
+
+impl ImportSource {
+    /// The source of `weight`'s import on `device`, the one way every
+    /// import takes it, a load's and a tuning unit's alike. A weight
+    /// uploaded as stored is a view of `window` where one is given: the
+    /// artifact's own pages, which the process's footprint does not count.
+    /// Any other is an upload of the weight's source bytes on the device,
+    /// not yet written
+    /// ([`crate::programs::native_import::fill_staged_source`] writes it).
+    pub(crate) fn acquire(
+        weight: &WeightPlan,
+        stored: &Stored,
+        window: Option<&ImportWindow>,
+        device: &Device,
+    ) -> Result<Self, AllocationError> {
+        let count = weight
+            .shape
+            .iter()
+            .try_fold(1u64, |count, extent| count.checked_mul(*extent))
+            .ok_or_else(|| {
+                AllocationError::Plan(InvariantError {
+                    context: "import source",
+                    detail: "weight element count overflows".into(),
+                })
+            })?;
+        match window {
+            // A transformed or dequantized weight uploads the host's
+            // prepared bytes; only an unprepared one can read its stored
+            // range in place.
+            Some(window) if !weight.host_prepared() => {
+                Ok(Self::Mapped(window.tensor(stored, weight, count)?))
+            }
+            // SAFETY: the importer fills this exact tensor before binding
+            // it as a kernel source.
+            _ => unsafe { Tensor::uninitialized(device, weight.upload, &[count]) }
+                .map(Self::Staged)
+                .map_err(|error| AllocationError::Device(error.to_string())),
+        }
+    }
+
+    pub(crate) fn tensor(&self) -> &Tensor {
+        match self {
+            Self::Mapped(tensor) | Self::Staged(tensor) => tensor,
+        }
+    }
+
+    pub(crate) fn staged_mut(&mut self) -> Option<&mut Tensor> {
+        match self {
+            Self::Mapped(_) => None,
+            Self::Staged(tensor) => Some(tensor),
+        }
+    }
+
+    pub(crate) fn into_tensor(self) -> Tensor {
+        match self {
+            Self::Mapped(tensor) | Self::Staged(tensor) => tensor,
+        }
+    }
 }
 
 /// One page-rounded artifact range charged once and shared by the source
@@ -49,13 +110,61 @@ pub(crate) struct ImportWindow {
     start: u64,
     end: u64,
     data_offset: u64,
+    /// The bytes mapped: the range, rounded out to whole pages.
+    mapped_bytes: u64,
     region: ReadOnlyMappedRegion,
 }
 
 impl ImportWindow {
-    #[cfg(unix)]
+    /// The window of exactly `stored`'s range in its artifact.
+    pub(crate) fn of(device: &Device, stored: &Stored) -> Result<Self, AllocationError> {
+        let (file, start, end) = stored_range(stored)?;
+        Self::map(device, file, start, end)
+    }
+}
+
+/// `stored`'s file and the range of it the tensor occupies.
+fn stored_range(stored: &Stored) -> Result<(Arc<FileSource>, u64, u64), AllocationError> {
+    let (file, offset, length) = stored.file_range();
+    let end = offset.checked_add(length).ok_or_else(|| {
+        AllocationError::Plan(InvariantError {
+            context: "import window",
+            detail: "source range overflows".into(),
+        })
+    })?;
+    Ok((file.clone(), offset, end))
+}
+
+impl ImportWindow {
+    /// A window of a load's import, held to the import transient its
+    /// execution plan admitted.
     pub(crate) fn new(
         execution: &ExecutionPlan,
+        device: &Device,
+        source: Arc<FileSource>,
+        start: u64,
+        end: u64,
+    ) -> Result<Self, AllocationError> {
+        let window = Self::map(device, source, start, end)?;
+        if window.mapped_bytes > execution.resources().qualification_peak_bytes() {
+            return Err(AllocationError::Plan(InvariantError {
+                context: "import window",
+                detail: "mapped source exceeds admitted import transient".into(),
+            }));
+        }
+        Ok(window)
+    }
+
+    /// Whether `device` reads an artifact's mapped pages in place: where it
+    /// does, a weight uploaded as stored is imported from a window and
+    /// nowhere else.
+    pub(crate) fn serves(device: &Device) -> bool {
+        cfg!(unix) && device.backend() == BackendName::Metal
+    }
+
+    /// The page-rounded range `start..end` of `source`, mapped for `device`.
+    #[cfg(unix)]
+    pub(crate) fn map(
         device: &Device,
         source: Arc<FileSource>,
         start: u64,
@@ -75,9 +184,7 @@ impl ImportWindow {
         let window = source
             .map_window(start, end - start)
             .map_err(|error| AllocationError::Device(error.to_string()))?;
-        if window.mapped_len() as u64 > execution.resources().qualification_peak_bytes() {
-            return Err(invalid("mapped source exceeds admitted import transient"));
-        }
+        let mapped_bytes = window.mapped_len() as u64;
         let pointer = std::ptr::NonNull::new(window.as_ref().as_ref().as_ptr() as *mut u8)
             .ok_or_else(|| invalid("mapped artifact window has no address"))?;
         // SAFETY: the window owns the immutable mapped range through every
@@ -90,13 +197,13 @@ impl ImportWindow {
             start,
             end,
             data_offset: window.data_offset() as u64,
+            mapped_bytes,
             region,
         })
     }
 
     #[cfg(not(unix))]
-    pub(crate) fn new(
-        _execution: &ExecutionPlan,
+    pub(crate) fn map(
         _device: &Device,
         _source: Arc<FileSource>,
         _start: u64,
@@ -147,15 +254,10 @@ impl ImportWorkspaceLease {
         self.bytes
     }
     pub fn source(&self) -> &Tensor {
-        match &self.source {
-            ImportSource::Mapped(tensor) | ImportSource::Staged(tensor) => tensor,
-        }
+        self.source.tensor()
     }
     pub fn staged_mut(&mut self) -> Option<&mut Tensor> {
-        match &mut self.source {
-            ImportSource::Mapped(_) => None,
-            ImportSource::Staged(tensor) => Some(tensor),
-        }
+        self.source.staged_mut()
     }
 }
 
@@ -315,39 +417,18 @@ impl ResourceAllocator {
                 "source upload exceeds admitted startup transient bytes",
             ));
         }
-        let staged = || {
-            // SAFETY: NativeImportProgram fills this exact tensor with
-            // write_from_host before binding it as a kernel source.
-            unsafe { Tensor::uninitialized(device, weight.upload, &[count]) }
-                .map(ImportSource::Staged)
-                .map_err(|error| AllocationError::Device(error.to_string()))
-        };
-        // A transformed or dequantized weight uploads the host's prepared
-        // bytes; only an unprepared one can read its stored range in place.
-        let source = if weight.host_prepared() {
-            staged()?
-        } else if let Some(window) = window {
-            ImportSource::Mapped(window.tensor(stored, weight, count)?)
-        } else if device.backend() == BackendName::Metal {
-            #[cfg(unix)]
-            {
-                let (file, offset, length) = stored.file_range();
-                let end = offset
-                    .checked_add(length)
-                    .ok_or_else(|| invalid("source range overflows"))?;
-                let mapped = ImportWindow::new(execution, device, file.clone(), offset, end)?;
-                ImportSource::Mapped(mapped.tensor(stored, weight, count)?)
+        // A weight imported alone, where the device reads mapped pages in
+        // place, has a window of its own range; its source view keeps the
+        // mapping.
+        let own = match window {
+            None if ImportWindow::serves(device) && !weight.host_prepared() => {
+                let (file, start, end) = stored_range(stored)?;
+                Some(ImportWindow::new(execution, device, file, start, end)?)
             }
-            #[cfg(not(unix))]
-            {
-                staged()?
-            }
-        } else {
-            staged()?
+            _ => None,
         };
-        let tensor = match &source {
-            ImportSource::Mapped(tensor) | ImportSource::Staged(tensor) => tensor,
-        };
+        let source = ImportSource::acquire(weight, stored, window.or(own.as_ref()), device)?;
+        let tensor = source.tensor();
         if !tensor.belongs_to(device)
             || tensor.element() != weight.upload
             || tensor.extents() != [count]
@@ -431,7 +512,7 @@ impl ResourceAllocator {
                 return Err(AllocationError::Plan(InvariantError {
                     context: "resource allocator",
                     detail: "prepared head graph differs from admitted Seismic footprint".into(),
-                }))
+                }));
             }
         };
         let vision_graph = match (vision_graphs, plan.vision_graph()) {
@@ -447,7 +528,7 @@ impl ResourceAllocator {
                 return Err(AllocationError::Plan(InvariantError {
                     context: "resource allocator",
                     detail: "prepared vision graph differs from admitted Seismic footprint".into(),
-                }))
+                }));
             }
         };
         let state_charge = plan.state_graph();

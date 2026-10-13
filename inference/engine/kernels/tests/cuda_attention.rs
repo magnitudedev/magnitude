@@ -26,7 +26,8 @@ fn cuda_decode(
             .with_param("SLICES", slices)
             .with_param("MATRIX", 0)
             .with_param("STAGES", 2)
-            .with_param("COLUMNS", 1),
+            .with_param("COLUMNS", 1)
+            .with_param("QREG", 0),
     )
     .unwrap()
 }
@@ -39,7 +40,7 @@ fn cuda_prefill(
     attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        &qwen_form(statics(geometry), geometry)
+        &visible_prefill(device, qwen_form(statics(geometry), geometry))
             .with_param("WARPS", warps)
             .with_param("SPLIT_GROUPS", split_groups)
             .with_param("STAGES", 2)

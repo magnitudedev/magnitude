@@ -18,7 +18,9 @@ fn statics(kernel: &VisionKernel, name: &str, label: &str) -> Result<u64, Catalo
         .iter()
         .find(|(bound, _)| *bound == name)
         .map(|(_, value)| *value)
-        .ok_or_else(|| qualification_dynamic("vision", label, format!("no static dimension {name}")))
+        .ok_or_else(|| {
+            qualification_dynamic("vision", label, format!("no static dimension {name}"))
+        })
 }
 
 /// The element bound to `name`.
@@ -71,7 +73,9 @@ impl<'a> QualificationView<'a> {
         for kernel in vision_plan.kernels() {
             let label = format!("{kernel:?}");
             let label = label.as_str();
-            let zeros = |entry, element, extents: &[u64]| semantic_zeros(device, element, extents, entry, label);
+            let zeros = |entry, element, extents: &[u64]| {
+                semantic_zeros(device, element, extents, entry, label)
+            };
             let values = |entry, element, extents: &[u64], values: &[f32]| {
                 semantic_dense_values(device, element, extents, values, entry, label)
             };
@@ -81,7 +85,13 @@ impl<'a> QualificationView<'a> {
             match kernel.entry {
                 VisionEntry::PatchStem => {
                     let entry = "vision_patch_stem";
-                    let (c, s, p, h, nb) = (statics("C")?, statics("S")?, statics("P")?, statics("H")?, statics("NB")?);
+                    let (c, s, p, h, nb) = (
+                        statics("C")?,
+                        statics("S")?,
+                        statics("P")?,
+                        statics("H")?,
+                        statics("NB")?,
+                    );
                     let table_shape = self.weight_shape(
                         WeightScope::Vision,
                         WeightKind::Vision(VisionWeight::Position),
@@ -97,10 +107,27 @@ impl<'a> QualificationView<'a> {
                             pixels: &zeros(entry, Element::f32(), &[rows, c, 1 + s, p, p])?,
                             frame_weight: &zeros(entry, element("W0")?, &[h, c, p, p])?,
                             next_frame_weight: &zeros(entry, element("W1")?, &[s, h, c, p, p])?,
-                            bias: &values(entry, element("B")?, &[nb, h], &repeated(&bias_values, nb))?,
+                            bias: &values(
+                                entry,
+                                element("B")?,
+                                &[nb, h],
+                                &repeated(&bias_values, nb),
+                            )?,
                             table: &values(entry, element("PE")?, &[l, h], &table_values)?,
-                            indices: &semantic_i32(device, &[rows, 4], &[0, 1, 2, 3].repeat(rows as usize), entry, label)?,
-                            coefficients: &semantic_f32(device, &[rows, 4], &[1.0, 0.0, 0.0, 0.0].repeat(rows as usize), entry, label)?,
+                            indices: &semantic_i32(
+                                device,
+                                &[rows, 4],
+                                &[0, 1, 2, 3].repeat(rows as usize),
+                                entry,
+                                label,
+                            )?,
+                            coefficients: &semantic_f32(
+                                device,
+                                &[rows, 4],
+                                &[1.0, 0.0, 0.0, 0.0].repeat(rows as usize),
+                                entry,
+                                label,
+                            )?,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;
@@ -113,14 +140,37 @@ impl<'a> QualificationView<'a> {
                 }
                 VisionEntry::Norm => {
                     let entry = "vision_norm";
-                    let (g, h, nw, nb, no) = (statics("G")?, statics("H")?, statics("NW")?, statics("NB")?, statics("NO")?);
+                    let (g, h, nw, nb, no) = (
+                        statics("G")?,
+                        statics("H")?,
+                        statics("NW")?,
+                        statics("NB")?,
+                        statics("NO")?,
+                    );
                     let bias_values = pattern(h, 7, 2);
                     let result = prepared(&kernels.norm, kernel, entry, label)?
                         .call(vision_norm::Args {
-                            source: &semantic_f32(device, &[1, g, h], &pattern(g * h, 9, 0), entry, label)?,
+                            source: &semantic_f32(
+                                device,
+                                &[1, g, h],
+                                &pattern(g * h, 9, 0),
+                                entry,
+                                label,
+                            )?,
                             weight: &zeros(entry, element("NWE")?, &[nw, h])?,
-                            bias: &values(entry, element("NBE")?, &[nb, h], &repeated(&bias_values, nb))?,
-                            order: &semantic_i32(device, &[no, g], &(0..(no * g) as i32).collect::<Vec<_>>(), entry, label)?,
+                            bias: &values(
+                                entry,
+                                element("NBE")?,
+                                &[nb, h],
+                                &repeated(&bias_values, nb),
+                            )?,
+                            order: &semantic_i32(
+                                device,
+                                &[no, g],
+                                &(0..(no * g) as i32).collect::<Vec<_>>(),
+                                entry,
+                                label,
+                            )?,
                             epsilon: 1.0e-6,
                             centered: 1,
                             interleave: 0,
@@ -128,8 +178,12 @@ impl<'a> QualificationView<'a> {
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;
                     match (nw, nb) {
-                        (_, 1) => require_values(&result, &repeated(&bias_values, g), entry, label)?,
-                        (1, _) => require_values(&result, &vec![0.0; (g * h) as usize], entry, label)?,
+                        (_, 1) => {
+                            require_values(&result, &repeated(&bias_values, g), entry, label)?
+                        }
+                        (1, _) => {
+                            require_values(&result, &vec![0.0; (g * h) as usize], entry, label)?
+                        }
                         _ => require_finite_nonzero(&result, entry, label)?,
                     }
                 }
@@ -151,18 +205,50 @@ impl<'a> QualificationView<'a> {
                         .call(vision_linear::Args {
                             x: &values(entry, activation, &[rows, k], &pattern(rows * k, 5, 0))?,
                             weight: &zeros(entry, element("W")?, &[n, k])?,
-                            bias: &values(entry, element("B")?, &[nb, n], &repeated(&bias_values, nb))?,
-                            residual: &semantic_f32(device, &[nr, rows, n], &repeated(&residual_values, nr), entry, label)?,
-                            gate: &values(entry, activation, &[ng, rows, n], &repeated(&gate_values, ng))?,
-                            minimum: &semantic_f32(device, &[nc], &repeated(&[-1.0], nc), entry, label)?,
-                            maximum: &semantic_f32(device, &[nc], &repeated(&[1.0], nc), entry, label)?,
+                            bias: &values(
+                                entry,
+                                element("B")?,
+                                &[nb, n],
+                                &repeated(&bias_values, nb),
+                            )?,
+                            residual: &semantic_f32(
+                                device,
+                                &[nr, rows, n],
+                                &repeated(&residual_values, nr),
+                                entry,
+                                label,
+                            )?,
+                            gate: &values(
+                                entry,
+                                activation,
+                                &[ng, rows, n],
+                                &repeated(&gate_values, ng),
+                            )?,
+                            minimum: &semantic_f32(
+                                device,
+                                &[nc],
+                                &repeated(&[-1.0], nc),
+                                entry,
+                                label,
+                            )?,
+                            maximum: &semantic_f32(
+                                device,
+                                &[nc],
+                                &repeated(&[1.0], nc),
+                                entry,
+                                label,
+                            )?,
                             activation: 0,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;
                     let expected = (0..(rows * n) as usize)
                         .map(|index| {
-                            let mut value = if nb == 1 { bias_values[index % n as usize] } else { 0.0 };
+                            let mut value = if nb == 1 {
+                                bias_values[index % n as usize]
+                            } else {
+                                0.0
+                            };
                             if nc == 1 {
                                 value = value.clamp(-1.0, 1.0);
                             }
@@ -188,7 +274,10 @@ impl<'a> QualificationView<'a> {
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;
-                    let expected = input.iter().map(|value| value.clamp(-1.0, 2.0)).collect::<Vec<_>>();
+                    let expected = input
+                        .iter()
+                        .map(|value| value.clamp(-1.0, 2.0))
+                        .collect::<Vec<_>>();
                     require_values(&result, &expected, entry, label)?;
                 }
                 VisionEntry::Attention => {
@@ -211,9 +300,27 @@ impl<'a> QualificationView<'a> {
                             query: &zeros(entry, activation, &shape)?,
                             key: &zeros(entry, activation, &shape)?,
                             value: &values(entry, activation, &shape, &repeated(&value_row, rows))?,
-                            query_norm: &semantic_ones(device, Element::f32(), &[nq, width], entry, label)?,
-                            key_norm: &semantic_ones(device, Element::f32(), &[nq, width], entry, label)?,
-                            value_norm: &semantic_ones(device, Element::f32(), &[nv, width], entry, label)?,
+                            query_norm: &semantic_ones(
+                                device,
+                                Element::f32(),
+                                &[nq, width],
+                                entry,
+                                label,
+                            )?,
+                            key_norm: &semantic_ones(
+                                device,
+                                Element::f32(),
+                                &[nq, width],
+                                entry,
+                                label,
+                            )?,
+                            value_norm: &semantic_ones(
+                                device,
+                                Element::f32(),
+                                &[nv, width],
+                                entry,
+                                label,
+                            )?,
                             coordinates: &zeros(entry, Element::i32(), &[rows, 2])?,
                             spans: &semantic_i32(
                                 device,
@@ -242,14 +349,24 @@ impl<'a> QualificationView<'a> {
                         .call(vision_pool::Args {
                             source: &semantic_f32(device, &[1, g, h], &input, entry, label)?,
                             standard_bias: &zeros(entry, element("SB")?, &[ns, h])?,
-                            standard_scale: &semantic_ones(device, element("SS")?, &[ns, h], entry, label)?,
+                            standard_scale: &semantic_ones(
+                                device,
+                                element("SS")?,
+                                &[ns, h],
+                                entry,
+                                label,
+                            )?,
                             weight: 1.0,
                             scale: 1.0,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;
                     let expected = (0..h as usize)
-                        .map(|column| (0..g as usize).map(|member| input[member * h as usize + column]).sum())
+                        .map(|column| {
+                            (0..g as usize)
+                                .map(|member| input[member * h as usize + column])
+                                .sum()
+                        })
                         .collect::<Vec<f32>>();
                     require_values(&result, &expected, entry, label)?;
                 }
@@ -270,8 +387,20 @@ impl<'a> QualificationView<'a> {
                         .call(vision_position::Args {
                             source: &semantic_f32(device, &[rows, h], &input, entry, label)?,
                             table: &values(entry, element("PE")?, &[l, h], &table_values)?,
-                            indices: &semantic_i32(device, &[rows, 4], &[0, 1, 2, 3].repeat(rows as usize), entry, label)?,
-                            coefficients: &semantic_f32(device, &[rows, 4], &[1.0, 0.0, 0.0, 0.0].repeat(rows as usize), entry, label)?,
+                            indices: &semantic_i32(
+                                device,
+                                &[rows, 4],
+                                &[0, 1, 2, 3].repeat(rows as usize),
+                                entry,
+                                label,
+                            )?,
+                            coefficients: &semantic_f32(
+                                device,
+                                &[rows, 4],
+                                &[1.0, 0.0, 0.0, 0.0].repeat(rows as usize),
+                                entry,
+                                label,
+                            )?,
                         })
                         .map_err(|error| qualification_dynamic(entry, label, error))?
                         .value;
@@ -291,7 +420,13 @@ impl<'a> QualificationView<'a> {
                             residual: &semantic_f32(device, &[rows, width], &input, entry, label)?,
                             projected: &zeros(entry, Element::f32(), &[rows, width])?,
                             norm: &semantic_ones(device, element("NW")?, &[width], entry, label)?,
-                            out_rows: &semantic_i32(device, &[rows], &(0..rows as i32).collect::<Vec<_>>(), entry, label)?,
+                            out_rows: &semantic_i32(
+                                device,
+                                &[rows],
+                                &(0..rows as i32).collect::<Vec<_>>(),
+                                entry,
+                                label,
+                            )?,
                             epsilon: 1.0e-6,
                             scale: 1.0,
                         })

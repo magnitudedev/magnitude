@@ -13,8 +13,8 @@ use seismic_lang::checked::{NativeImplementation, NativeSpecialization};
 use seismic_lang::entry::{
     CallSchema, ElementBindings, LogicalEntry, ParameterKind, ResultKind, TensorAccess,
 };
-use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
+use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::ids::RepresentationId;
 use seismic_lang::registry;
 
@@ -698,10 +698,14 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     "#define {plane_prefix} 1\n#define {plane_prefix}_BYTES_PER_GROUP {}\n",
                     plane.bytes_per_group
                 ));
-                if let registry::RowPlaneContent::Codes { shift, bits } = plane.content {
-                    out.push_str(&format!(
+                match plane.content {
+                    registry::RowPlaneContent::Codes { shift, bits } => out.push_str(&format!(
                         "#define {plane_prefix}_CODE_SHIFT {shift}\n#define {plane_prefix}_CODE_BITS {bits}\n"
-                    ));
+                    )),
+                    registry::RowPlaneContent::Grids { bits } => {
+                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"))
+                    }
+                    registry::RowPlaneContent::Groups { .. } => {}
                 }
             }
         }
@@ -800,13 +804,20 @@ fn render_code_interpretation(
                 out.push_str(&format!("#define {prefix}_CODE_TABLE_{ordinal} {value}\n"));
             }
         }
+        // The grid's points live in the native packet libraries.
+        registry::CodeInterpretation::Grid(grid) => {
+            out.push_str(&format!(
+                "#define {prefix}_CODE_GRID 1\n#define {prefix}_CODE_GRID_LANES {}\n#define {prefix}_CODE_GRID_INDEX_BITS {}\n",
+                grid.lanes, grid.index_bits
+            ));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::checked::{check_source, SourceFile, SourceSet};
+    use seismic_lang::checked::{SourceFile, SourceSet, check_source};
     use seismic_lang::registry::BackendName;
 
     const PROBE: &str = "fn probe[N, K](x: &tensor[N, K] E) -> tensor[1] f32:\n    let mut output = tensor[1] f32\n    for i in 0..1:\n        output[i] = f32(x[0, 0])\n    return output\n\nnative probe for cuda from \"probe.cu\":\n    static (K)\n    params (TILE in [4, 8])\n    scratch partials bytes (N * 4)\n    launch probe:\n        threadgroups (1, 1, 1)\n        threads_per_threadgroup (TILE, 1, 1)\n";

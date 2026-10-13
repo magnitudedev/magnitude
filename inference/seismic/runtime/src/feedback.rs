@@ -169,7 +169,7 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                     registry::RepresentationKind::PackedRows(_) => {
                         return Err(ObservationError::Unsupported(
                             registry::ROW_LAYOUT_IS_NATIVE_ONLY.into(),
-                        ))
+                        ));
                     }
                 };
                 construction_temporary = construction_temporary.max(temporary);
@@ -452,10 +452,10 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Observer<T, E> {
                 })? {
                     Comparison::Match => {}
                     Comparison::Mismatch(reason) => {
-                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")))
+                        return Err(ObservationError::IncorrectResult(format!("{reason:?}")));
                     }
                     Comparison::Unsupported(reason) => {
-                        return Err(ObservationError::Unsupported(reason))
+                        return Err(ObservationError::Unsupported(reason));
                     }
                 }
             }
@@ -542,10 +542,11 @@ fn dense_input_value(
     random: &mut u64,
 ) -> Result<f64, ObservationError> {
     let bits = random_bits(random);
-    if matches!(dtype, DType::I32 | DType::U32 | DType::Bool) {
+    if matches!(dtype, DType::I32 | DType::U32 | DType::U64 | DType::Bool) {
         let (minimum, maximum) = match dtype {
             DType::I32 => (i32::MIN as f64, i32::MAX as f64),
             DType::U32 => (0.0, u32::MAX as f64),
+            DType::U64 => (0.0, (1u64 << 53) as f64),
             DType::Bool => (0.0, 1.0),
             _ => unreachable!(),
         };
@@ -685,7 +686,7 @@ fn scalar(
         _ => {
             return Err(ObservationError::InvalidCase(
                 "index sort cannot encode a scalar parameter".into(),
-            ))
+            ));
         }
     })
 }
@@ -699,6 +700,7 @@ fn encode(dtype: DType, value: f64, bytes: &mut Vec<u8>) {
         ),
         DType::I32 => bytes.extend_from_slice(&(value as i32).to_le_bytes()),
         DType::U32 => bytes.extend_from_slice(&(value as u32).to_le_bytes()),
+        DType::U64 => bytes.extend_from_slice(&(value as u64).to_le_bytes()),
         DType::Bool => bytes.push(u8::from(value != 0.0)),
     }
 }
@@ -712,10 +714,12 @@ fn validation_input_value(
     if case == ValidationCase::FiniteRandom {
         return dense_input_value(dtype, assumption, random);
     }
-    let integer = matches!(dtype, DType::I32 | DType::U32 | DType::Bool);
+    let integer = matches!(dtype, DType::I32 | DType::U32 | DType::U64 | DType::Bool);
     let default = match dtype {
         DType::I32 => (i32::MIN as f64, i32::MAX as f64),
         DType::U32 => (0.0, u32::MAX as f64),
+        // The largest U64 every input value carries exactly.
+        DType::U64 => (0.0, (1u64 << 53) as f64),
         DType::Bool => (0.0, 1.0),
         DType::F16 => (-65504.0, 65504.0),
         DType::BF16 => {
@@ -874,11 +878,12 @@ fn capture_invocation<T: TargetFamily, H>(
                 ArgumentValue::BF16(v) => ObservedValue::Scalar(SymbolValue::BF16(*v)),
                 ArgumentValue::I32(v) => ObservedValue::Scalar(SymbolValue::I32(*v)),
                 ArgumentValue::U32(v) => ObservedValue::Scalar(SymbolValue::U32(*v)),
+                ArgumentValue::U64(v) => ObservedValue::Scalar(SymbolValue::U64(*v)),
                 ArgumentValue::Bool(v) => ObservedValue::Scalar(SymbolValue::Bool(*v)),
                 _ => {
                     return Err(ObservationError::InvalidCase(
                         "non-value in completed scalar result".into(),
-                    ))
+                    ));
                 }
             },
         };
@@ -925,6 +930,7 @@ mod tests {
             }
             DType::I32 => i32::from_le_bytes(bytes.try_into().unwrap()) as f64,
             DType::U32 => u32::from_le_bytes(bytes.try_into().unwrap()) as f64,
+            DType::U64 => u64::from_le_bytes(bytes.try_into().unwrap()) as f64,
             DType::Bool => f64::from(bytes[0] != 0),
         }
     }

@@ -1077,9 +1077,10 @@ fn features_rows(ctx: &Ctx) -> Vec<Variant> {
             .map(|(m, o)| Case {
                 label: format!("m{m}o{o}"),
                 args: vec![
+                    // The rows as their `[M, PT, D]` parts (one part).
                     ctx.dense(
                         f32e(),
-                        &[m as u64, HIDDEN as u64],
+                        &[m as u64, 1, HIDDEN as u64],
                         &activations(&mut rng, m, HIDDEN, 1.0),
                     ),
                     norm.clone(),
@@ -1187,7 +1188,7 @@ fn selected_rows(ctx: &Ctx) -> Vec<Variant> {
         .collect()
 }
 
-fn head_logits_rows(ctx: &Ctx) -> Vec<Variant> {
+fn readout_project_rows(ctx: &Ctx) -> Vec<Variant> {
     projection_variants()
         .into_iter()
         .map(|(label, a, _, dense, every)| {
@@ -1248,6 +1249,8 @@ fn draft_rows(ctx: &Ctx) -> Vec<Variant> {
                             .map(|_| rng.below(VOCABULARY_SLICE) as i32)
                             .collect::<Vec<_>>(),
                     ),
+                    // An empty directory: the tokens are the table's rows.
+                    ctx.ints(&[0], &[]),
                     Arg::Shared(table.clone()),
                     ctx.dense(
                         a,
@@ -1304,6 +1307,8 @@ fn embedding_rows(ctx: &Ctx) -> Vec<Variant> {
                             .flat_map(|_| [rng.below(VOCABULARY_SLICE) as i32, 0])
                             .collect::<Vec<_>>(),
                     ),
+                    // An empty directory: the tokens are the table's rows.
+                    ctx.ints(&[0], &[]),
                     // The Qwen entry: unscaled, not normalized.
                     f32s(1.0),
                     i32s(0),
@@ -2364,11 +2369,11 @@ const ENTRIES: &[EntrySpec] = &[
         build: selected_rows,
     },
     EntrySpec {
-        id: "head_logits_rows",
-        names: &["head_logits_rows"],
+        id: "readout_project_rows",
+        names: &["readout_project_rows"],
         family: "readout",
         library: true,
-        build: head_logits_rows,
+        build: readout_project_rows,
     },
     EntrySpec {
         id: "draft_rows",
@@ -2760,11 +2765,20 @@ fn run_entry(
     let mut lines: BTreeMap<String, String> = BTreeMap::new();
     let mut prepared = 0usize;
     for variant in &variants {
-        // A variant names the statics of either backend's declaration.
+        // A variant names the statics of either backend's declaration. The
+        // golden entries run over the single residual stream: those of the
+        // streams' join (`SN` 1, `IN` 0) and input form (`PT` 1, `NM` the
+        // row width, `D` or `H`) that the declaration names.
+        let width = variant
+            .statics
+            .iter()
+            .find(|(name, _)| *name == "D" || *name == "H")
+            .map_or(0, |(_, value)| *value);
         let statics = variant
             .statics
             .iter()
             .copied()
+            .chain([("SN", 1), ("IN", 0), ("PT", 1), ("NM", width)])
             .filter(|(name, _)| native.statics.iter().any(|s| s == name))
             .collect::<Vec<_>>();
         let mut configs = configurations(native, &statics, spec.id);

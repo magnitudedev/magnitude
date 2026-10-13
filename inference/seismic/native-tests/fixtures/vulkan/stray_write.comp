@@ -1,0 +1,10 @@
+void stray_write() {
+    seismic_f32 state = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_STATE));
+    seismic_f32 x = seismic_f32(SEISMIC_PTR(SEISMIC_BUFFER_X));
+    const uint index = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    if (index < SEISMIC_DIM_N) {
+        const bool stray = SEISMIC_TUNE_STRAY != 0 && index == SEISMIC_DIM_N - 1;
+        state[uint(index * SEISMIC_STATE_STRIDE_0)].v =
+            stray ? 42.0 : x[uint(index * SEISMIC_X_STRIDE_0)].v;
+    }
+}

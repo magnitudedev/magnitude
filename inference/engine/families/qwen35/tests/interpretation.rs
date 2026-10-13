@@ -1,17 +1,19 @@
 use magnitude_artifacts::{
-    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
     ArtifactIdentity, PackageIdentity,
+    gguf::{ByteOrder, Directory, Encoding, Metadata, Scalar, TensorDescriptor, Value},
 };
 use magnitude_artifacts::{
-    media::{DType, PreparedMedia, PreparedTensor},
     ImageProcessor, InputLayout, TokenId,
+    media::{DType, PreparedMedia, PreparedTensor},
 };
 use magnitude_family_contracts::{
-    AttentionGate, GateFunction, ImportTransform, InputNorm, ModelInputAdapter, Operator,
-    OutputForm, PositionSampling, RecurrentHeadMapping, RowRange, TokenPlan, VisionResize,
+    AttentionGate, GateFunction, HeadComponent, HeadHistory, HeadInput, ImportTransform, InputNorm,
+    ModelInputAdapter, Operator, OutputForm, PositionSampling, RecurrentHeadMapping, RowRange,
+    TokenPlan, VisionResize,
 };
-use magnitude_family_qwen35::inputs::{QwenImageTokens, QwenInputAdapter};
-use magnitude_family_qwen35::{describe_projector, inspect_components, recognize, Architecture};
+use magnitude_family_qwen::describe_projector;
+use magnitude_family_qwen::inputs::{QwenImageTokens, QwenInputAdapter};
+use magnitude_family_qwen35::{Architecture, FAMILY_IDS, inspect_components, recognize};
 
 fn directory(routed: bool) -> Directory {
     let architecture = if routed { "qwen35moe" } else { "qwen35" };
@@ -239,7 +241,10 @@ fn routed_mtp_head_uses_expert_roles_without_dense_intermediate_metadata() {
     assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    let sublayers = &head.blocks[0].block.sublayers;
+    let [block] = head.blocks[0].blocks.as_slice() else {
+        panic!("a Qwen3.5 MTP head block is one decoder block");
+    };
+    let sublayers = &block.sublayers;
     assert!(matches!(sublayers[0].op, Operator::Attention(_)));
     assert!(matches!(sublayers[1].op, Operator::RoutedFfn(_)));
 }
@@ -379,11 +384,13 @@ fn binds_dense_and_routed_geometry_to_semantic_roles() {
                 matches!(block.sublayers[1].op, Operator::RoutedFfn(_)),
                 routed
             );
-            assert!(block
-                .sublayers
-                .iter()
-                .all(|sublayer| sublayer.output == OutputForm::Residual
-                    && matches!(sublayer.input, InputNorm::Rms(_))));
+            assert!(
+                block
+                    .sublayers
+                    .iter()
+                    .all(|sublayer| sublayer.output == OutputForm::Residual
+                        && matches!(sublayer.input, InputNorm::Rms(_)))
+            );
         }
     }
 }
@@ -392,29 +399,33 @@ fn binds_dense_and_routed_geometry_to_semantic_roles() {
 fn rejects_wrong_shapes_and_unbound_family_roles() {
     let mut wrong_shape = directory(false);
     wrong_shape.tensors[2].shape[0] += 1;
-    assert!(inspect_components(
-        &wrong_shape,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([0; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &wrong_shape,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([0; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 
     let mut unbound = directory(false);
     let mut extra = unbound.tensors[2].clone();
     extra.name = "blk.0.unbound.weight".into();
     unbound.tensors.push(extra);
-    assert!(inspect_components(
-        &unbound,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([0; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &unbound,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([0; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -431,7 +442,12 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
     assert_eq!(model.decoder.blocks.len(), 2);
     let head = model.head.unwrap();
     assert_eq!(head.depth(), 1);
-    assert_eq!(head.blocks[0].combine.shape, [8, 16]);
+    let HeadInput::Combine { combine, .. } = &head.blocks[0].input else {
+        panic!("a Qwen3.5 MTP head combines its input at the target's width");
+    };
+    assert_eq!(combine.shape, [8, 16]);
+    assert_eq!(head.history, HeadHistory::Own);
+    assert_eq!(head.component, HeadComponent::Target);
 
     let mut malformed = mtp_directory();
     malformed
@@ -440,15 +456,17 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
         .find(|tensor| tensor.name == "blk.2.nextn.eh_proj.weight")
         .unwrap()
         .shape[1] = 15;
-    assert!(inspect_components(
-        &malformed,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([3; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &malformed,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([3; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 
     let mut unqualified_depth = mtp_directory();
     unqualified_depth
@@ -457,15 +475,17 @@ fn binds_every_mtp_role_outside_the_target_geometry() {
         .find(|metadata| metadata.name == "qwen35.nextn_predict_layers")
         .unwrap()
         .value = Value::Scalar(Scalar::Unsigned(2));
-    assert!(inspect_components(
-        &unqualified_depth,
-        None,
-        PackageIdentity {
-            target: ArtifactIdentity([3; 32]),
-            projector: None
-        }
-    )
-    .is_err());
+    assert!(
+        inspect_components(
+            &unqualified_depth,
+            None,
+            PackageIdentity {
+                target: ArtifactIdentity([3; 32]),
+                projector: None
+            }
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -672,9 +692,10 @@ fn qwen_adapter_closes_token_and_vision_coordinates() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let tokens = vec![TokenId(98), TokenId(99), TokenId(100), TokenId(7)];
     let plan = TokenPlan::new(
         tokens.clone(),
@@ -733,9 +754,10 @@ fn qwen_adapter_prepares_a_repeated_image_once_for_every_placement() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let placeholder = [TokenId(98), TokenId(99), TokenId(100)];
     let tokens = [&placeholder[..], &[TokenId(7)], &placeholder[..]].concat();
     let plan = TokenPlan::new(
@@ -789,9 +811,10 @@ fn prepared_input_holds_exactly_the_images_its_spans_place() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let tokens = vec![TokenId(98), TokenId(99), TokenId(100), TokenId(7)];
     let plan = TokenPlan::new(
         tokens.clone(),
@@ -833,9 +856,10 @@ fn qwen_adapter_rejects_media_with_wrong_processor_identity() {
         },
     )
     .unwrap();
-    let adapter = QwenInputAdapter::new(Some(
-        QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap(),
-    ));
+    let adapter = QwenInputAdapter::new(
+        FAMILY_IDS,
+        Some(QwenImageTokens::new(TokenId(99), TokenId(98), TokenId(100)).unwrap()),
+    );
     let tokens = vec![TokenId(98), TokenId(99), TokenId(100)];
     let plan = TokenPlan::new(
         tokens.clone(),

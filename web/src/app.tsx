@@ -1,4 +1,5 @@
 import { ErrorNotice, NoticeAction } from "./components/error-notice"
+import { LoadModelButton, fitNotice, loadRefusal } from "./components/model-fit"
 import { ModelLoadFailureIndicator, ModelLoadNotice, modelRemovalNotice, downloadNotice, modelCommandNotice } from "./components/model-error"
 import { LoadingRegion, SkeletonLine, ModelsSkeleton, RecommendationsSkeleton, ConnectionsSkeleton } from "./components/page-skeletons"
 import { pageLayout } from "./components/page-layout"
@@ -27,7 +28,6 @@ import {
   SlidersIcon,
   DownloadSimpleIcon,
   CircleNotchIcon,
-  PlayIcon,
   SquareIcon,
   TrashIcon,
   XIcon,
@@ -76,15 +76,6 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
 const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
-/** Memory fit is advice, separate from an attempted operation's failure. */
-const fitNotice = (model: CatalogLocalModel): string | null => {
-  const serving = model.servingState
-  if (serving._tag === "Assessing") return "Assessing memory and speed…"
-  if (serving._tag === "Failed") return "Assessment failed."
-  const assessment = serving.assessment
-  if (assessment._tag === "DoesNotFit") return `This model needs ${formatMemorySize(assessment.deficitBytes, { rounding: "up" })} more memory than this computer can provide. Choose a smaller model.`
-  return null
-}
 function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
   const serving = model.servingState
   const content = (
@@ -252,7 +243,8 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
   const transferring = acquiring(acquisition)
   const fit = model.catalogData.support._tag === "Supported" ? fitNotice(model) : null
   const loadFailure = residency?._tag === "Failed" && !command.pendingOperations.includes("load") ? residency.failure : null
-  const loadNotice = inlineLoadFailure ? loadFailure : null
+  const doesNotFit = loadRefusal(model) !== null
+  const loadNotice = inlineLoadFailure && !doesNotFit ? loadFailure : null
   const downloadFailure = (acquisition._tag === "InstallFailed" || acquisition._tag === "UpdateFailed") && !command.pendingOperations.includes("install") ? acquisition.failure : null
   const canDownload = model.catalogData.support._tag === "Supported" && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
   const [confirmingLoad, setConfirmingLoad] = useState(false)
@@ -261,14 +253,14 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
       {transferring ? null : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <Button className="min-w-28" disabled={pending} onClick={requestLoad}><PlayIcon />Load model</Button>)}
+        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <LoadModelButton model={model} pending={pending} onLoad={requestLoad} />)}
         {!onConnectAgent && <RemoveDownloadButton model={model} running={canStop} disabled={pending} onRemove={() => remove(model.modelId)} />}
         {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>}
       </>}
 
     </div>
     {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
-    {fit !== null && !loadFailure && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
+    {fit !== null && (doesNotFit || !loadFailure) && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
     {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description="It was stopped to keep your other apps running. Quit apps you aren’t using before loading it again." className="col-span-full mt-3" />}
     {model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Catalog." className="col-span-full mt-3" />}
     {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>

@@ -4,21 +4,21 @@
 use super::preparation::PreparationInputs;
 use super::tuning::{TunedEntry, TuningContext, TuningLimits};
 use super::*;
+use crate::SublayerTail;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
-use crate::SublayerTail;
 use crate::{
-    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, HeadProjection, ImportProgramSlot,
-    MixerProgramSlot,
+    ExecutionPlanDraft, FeedForwardProgramSlot, HeadBinding, ImportProgramSlot, MixerProgramSlot,
     PlanError, PlannedDevice, ProgramPlan, ReadoutHead,
 };
-use magnitude_family_contracts::{ProgressivePlane, SublayerIndex};
+use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
-    attention_append_dense, draft_confidence, draft_convolve_input, draft_convolve_residual, draft_gated_rows,
-    draft_path_step, draft_top_k, feature_rows, import_dense, post_norm_residual, project_rows,
-    repack_weight, tap_rows, widen_rows,
+    attention_append_dense, cluster_token_rows, draft_convolve_input, draft_convolve_residual,
+    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, indexer_select,
+    ngram_gate, ngram_inject, ngram_rows, packing_bound, place_logits_rows, post_norm_residual,
+    project_rows, readout_project_rows, repack_weight, repeat_rows, selection_notice, stored_rows,
+    stream_mix_down, stream_mix_up, tap_rows, widen_rows,
 };
-use magnitude_state::KvCodec;
 use std::{collections::HashSet, rc::Rc};
 
 /// Invocation workspace of the fused routed form's decode kernels.
@@ -46,17 +46,20 @@ fn recurrent_step_bytes(step: &RecurrentStepKernels) -> u128 {
 pub struct AttestedPrograms {
     backend: BackendName,
     tuned: Vec<TunedEntry>,
+    unprepared: usize,
+    readout_choices: Vec<crate::ReadoutClassChoice>,
     pub(super) owner: Tensor,
     report: QualificationReport,
     pub(super) target: AttestedTarget,
     pub(super) head: Option<AttestedHead>,
+    pub(super) shared_head: Option<AttestedSharedHead>,
     pub(super) draft: Option<AttestedDraft>,
     pub(super) vision: Option<AttestedVision>,
     pub(super) state: AttestedState,
     pub(super) imports: Vec<(ImportProgramSlot, AttestedImport)>,
     invocation_workspace_bytes: u64,
-    target_graphs: Option<crate::PreparedTargetGraphs>,
-    target_readout_graphs: Option<crate::PreparedTargetReadoutGraphs>,
+    target_graphs: Option<std::sync::Arc<crate::PreparedTargetGraphs>>,
+    target_readout_graphs: Option<std::sync::Arc<crate::PreparedTargetReadoutGraphs>>,
     drafter_graphs: Option<crate::PreparedDrafterGraphs>,
     vision_graphs: Option<Rc<crate::programs::native_vision::PreparedVisionGraphs>>,
     state_graphs: Option<Rc<crate::programs::native_state::PreparedStateCopyGraphs>>,
@@ -64,6 +67,7 @@ pub struct AttestedPrograms {
 
 #[derive(Clone)]
 pub(crate) struct AttestedTarget {
+    pub residual_features: Option<NativeKernel<feature_rows::Entry>>,
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub blocks: Vec<AttestedTargetBlock>,
     pub readout: ReadoutKernels,
@@ -85,6 +89,10 @@ pub(crate) struct AttestedTargetBlock {
     pub output_scales: OutputScales,
     /// The per-layer input sublayer's entries, when the block has one.
     pub per_layer: Option<PerLayerKernels>,
+    /// The decoder's hyper-connection streams' entries, when it has them.
+    pub streams: Option<StreamsKernels>,
+    /// The n-gram input's entries, when the block has one.
+    pub ngram: Option<NGramKernels>,
 }
 
 /// The factor a sublayer's post-norm row op scales its result by: 1, or the
@@ -95,6 +103,33 @@ pub(crate) struct OutputScales {
     pub mixer: f32,
     pub feed_forward: f32,
     pub per_layer: f32,
+}
+
+/// The tails of a block's mixer, feed-forward and per-layer sublayers that
+/// decide their output scales (`OutputScales`); `None` for a sublayer whose
+/// scale is 1 whatever the artifact holds.
+pub(crate) fn output_tails(block: crate::TargetBlockProgramSlot) -> [Option<SublayerTail>; 3] {
+    [
+        match block.mixer() {
+            MixerProgramSlot::Attention(binding) => Some(binding.tail),
+            _ => None,
+        },
+        match block.feed_forward() {
+            Some(FeedForwardProgramSlot::Dense(binding)) => Some(binding.tail),
+            Some(FeedForwardProgramSlot::Parallel(binding)) => Some(SublayerTail::PostNorm {
+                norm: binding.norm,
+                scaled: binding.scaled,
+            }),
+            _ => None,
+        },
+        block.per_layer().map(|binding| binding.tail),
+    ]
+}
+
+/// Whether a sublayer of `tail` scales its result by its layer's output
+/// scale, a value of the artifact (`output_scale`); otherwise by 1.
+pub(crate) fn reads_layer_scale(tail: Option<SublayerTail>) -> bool {
+    matches!(tail, Some(SublayerTail::PostNorm { scaled: true, .. }))
 }
 
 /// The F32 source values of a planned role, read through the tuning weight
@@ -158,23 +193,24 @@ fn check_rotary_divisors(
     Ok(())
 }
 
-/// The output scale of the sublayer `index` with `tail`.
+/// The output scale of the sublayer whose weights `scope` names, with
+/// `tail`.
 fn output_scale(
     load: &crate::ModelLoadPlan,
     tuning: TuningContext<'_>,
-    index: SublayerIndex,
+    scope: WeightScope,
     tail: Option<SublayerTail>,
 ) -> Result<f32, CatalogFailure> {
     let failure = |outcome: String| CatalogFailure::Preparation {
         entry: "post_norm_residual",
-        bindings: format!("layer scale of {index:?}"),
+        bindings: format!("layer scale of {scope:?}"),
         outcome,
     };
-    if !matches!(tail, Some(SublayerTail::PostNorm { scaled: true, .. })) {
+    if !reads_layer_scale(tail) {
         return Ok(1.0);
     }
     let role = magnitude_family_contracts::WeightRole {
-        scope: magnitude_family_contracts::WeightScope::TargetSublayer(index),
+        scope,
         kind: magnitude_family_contracts::WeightKind::LayerScale,
     };
     match source_f32s(load, tuning, role).map_err(failure)?[..] {
@@ -212,13 +248,38 @@ pub(crate) struct AttestedHead {
 
 #[derive(Clone)]
 pub(crate) struct AttestedHeadBlock {
+    pub streams: Option<super::StreamsKernels>,
+    pub copy: NativeKernel<feature_copy::Entry>,
+    pub gather: NativeKernel<feature_rows::Entry>,
     pub binding: HeadBinding,
     pub input: NativeKernel<draft_rows::Entry>,
     pub attention: AttentionKernels,
     pub priming_project: NativeKernel<attention_project::Entry>,
     pub feed_forward: AttestedFeedForward,
     pub features: NativeKernel<readout_features_rows::Entry>,
-    pub logits: HeadLogitsKernels,
+    pub logits: ProjectionKernels,
+}
+
+/// The entries of a draft head reading target history, in pass order: the
+/// target's embedding rows, the join of the embedding and hidden halves, the
+/// projection into the head's width, its decoder blocks, its normalized
+/// output, its own vocabulary table, token selection (the target's, over the
+/// whole vocabulary) and the projection back to the target's width.
+#[derive(Clone)]
+pub(crate) struct AttestedSharedHead {
+    pub embedding: NativeKernel<embedding_rows::Entry>,
+    pub join: NativeKernel<tap_rows::Entry>,
+    pub input: NativeKernel<project_rows::Entry>,
+    pub blocks: Vec<AttestedTargetBlock>,
+    pub features: NativeKernel<readout_features_rows::Entry>,
+    pub projection: ProjectionKernels,
+    pub centroids: Option<NativeKernel<readout_project_rows::Entry>>,
+    pub cluster_selection: Option<NativeKernel<draft_top_k::Entry>>,
+    pub cluster_rows: Option<NativeKernel<cluster_token_rows::Entry>>,
+    pub placement: Option<NativeKernel<place_logits_rows::Entry>>,
+    pub chain: NativeKernel<project_rows::Entry>,
+    pub shape: NativeKernel<shape_rows::Entry>,
+    pub sample: NativeKernel<sample_rows::Entry>,
 }
 
 /// A separate draft's entries: per layer in draft order, then the block
@@ -228,7 +289,7 @@ pub(crate) struct AttestedHeadBlock {
 pub(crate) struct AttestedDraft {
     pub blocks: Vec<DraftBlockKernels>,
     pub embedding: NativeKernel<embedding_rows::Entry>,
-    pub head: NativeKernel<readout_head_rows::Entry>,
+    pub head: ProjectionKernels,
     /// Token selection over the readout vocabulary.
     pub shape: NativeKernel<shape_rows::Entry>,
     pub sample: NativeKernel<sample_rows::Entry>,
@@ -246,14 +307,21 @@ pub(crate) struct AttestedVision {
 
 #[derive(Clone)]
 pub(crate) struct AttestedState {
+    pub feature_copy: NativeKernel<feature_copy::Entry>,
     pub copies: Vec<(Element, NativeKernel<copy_rows::Entry>)>,
     pub conditioning: Option<NativeKernel<conditioning_overlay::Entry>>,
 }
 
+/// The entries that make a weight resident: its import, and for a repacked
+/// weight with a packing bound (`WeightPlan::bound`) the entry that makes
+/// the bound from the imported weight.
 #[derive(Clone)]
 pub(crate) enum AttestedImport {
     Dense(NativeKernel<import_dense::Entry>),
-    Repack(NativeKernel<repack_weight::Entry>),
+    Repack {
+        repack: NativeKernel<repack_weight::Entry>,
+        bound: Option<NativeKernel<packing_bound::Entry>>,
+    },
 }
 
 fn missing(entry: &'static str, binding: impl fmt::Debug) -> CatalogFailure {
@@ -280,12 +348,56 @@ where
 }
 
 impl AttestedPrograms {
+    pub fn readout_choices(&self) -> &[crate::ReadoutClassChoice] {
+        &self.readout_choices
+    }
+
+    /// Remove optional physical recipes before graph formation when ordinary
+    /// resource admission admits only the canonical packed model.
+    pub fn discard_readout_choices(
+        &mut self,
+        canonical_plan: &ProgramPlan,
+    ) -> Result<(), PlanError> {
+        if self.target_graphs.is_some()
+            || self.target_readout_graphs.is_some()
+            || self.drafter_graphs.is_some()
+        {
+            return Err(PlanError::Topology(
+                "readout physical choices are sealed by prepared graphs",
+            ));
+        }
+        if let ReadoutHeadKernels::Qualified { packed, .. } = &self.target.readout.head {
+            self.target.readout.head = packed.as_ref().clone();
+        }
+        if let Some(head) = &mut self.head {
+            for block in &mut head.blocks {
+                if let ProjectionKernels::Qualified { packed, .. } = &block.logits {
+                    block.logits = packed.as_ref().clone();
+                    let weight = block.binding.projection.packed();
+                    block.binding.projection = ReadoutHead::Packed {
+                        weight: weight.element,
+                        weight_scale: weight.scale,
+                    };
+                }
+            }
+        }
+        if let Some(head) = &mut self.shared_head {
+            if let ProjectionKernels::Qualified { packed, .. } = &head.projection {
+                head.projection = packed.as_ref().clone();
+            }
+        }
+        self.readout_choices.clear();
+        self.invocation_workspace_bytes =
+            Self::planned_invocation_workspace_bytes(canonical_plan, self.backend)?;
+        Ok(())
+    }
+
     pub fn install_target_readout_graphs(&mut self, graphs: crate::PreparedTargetReadoutGraphs) {
-        self.target_readout_graphs = Some(graphs);
+        self.target_readout_graphs = Some(std::sync::Arc::new(graphs));
     }
 
     pub fn target_readout_graphs(&self) -> Option<&crate::PreparedTargetReadoutGraphs> {
-        self.target_readout_graphs.as_ref()
+        self.target_readout_graphs.as_deref()
     }
 
     pub fn prepare_target_readout_graphs(
@@ -304,20 +416,38 @@ impl AttestedPrograms {
         )
     }
 
-    /// Seals the head, vision and state-copy graphs. `proposals` is the most
-    /// proposals one head transaction drafts (unused without a head).
+    /// Seals head, vision and state-copy graphs for the planned method cap
+    /// and exact separate-draft physical widths.
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_auxiliary_graphs(
         &mut self,
         device: &Device,
         load: &crate::ModelLoadPlan,
         definition: &magnitude_family_contracts::ModelDefinition,
-        vision_plan: Option<&crate::VisionProgramPlan>,
-        target_state: &crate::StateStorePlan,
-        head_state: Option<&crate::StateStorePlan>,
+        programs: &ProgramPlan,
+        state: &crate::StateResourcePlan,
         limits: crate::ResourceLimits,
-        proposals: usize,
+        method: crate::PlannedMethod,
     ) -> Result<(), String> {
+        let proposals = method.draft_rows();
+        let vision_plan = programs.vision();
+        let (target_state, head_state) = (state.target_state(), state.head_state());
+        if self.shared_head.is_some() != programs.shared_head().is_some() {
+            return Err("attested and planned draft heads reading target history disagree".into());
+        }
+        if let (Some(handles), Some(plan)) = (&self.shared_head, programs.shared_head()) {
+            let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
+                definition, state, plan,
+            )?;
+            let classes =
+                crate::programs::native_shared_head::shared_head_graph_classes(limits, proposals)?;
+            self.drafter_graphs = Some(crate::PreparedDrafterGraphs::SharedHead(Rc::new(
+                crate::programs::native_shared_head::PreparedSharedHeadGraphs::prepare(
+                    device, handles, load, &geometry, classes,
+                )
+                .map_err(|error| error.to_string())?,
+            )));
+        }
         let row_classes = magnitude_batching::row_classes(limits.max_launch_rows)
             .into_iter()
             .map(|rows| rows as u64)
@@ -337,8 +467,14 @@ impl AttestedPrograms {
             let head = definition
                 .head
                 .as_ref()
-                .and_then(|head| head.blocks.first())
-                .ok_or("head graph requires a draft head block")?;
+                .ok_or("head graph requires a draft head")?;
+            let head = crate::operators::CausalHeadBlock::of(
+                head,
+                head.blocks
+                    .first()
+                    .ok_or("head graph requires a draft head block")?,
+            )
+            .map_err(|error| error.to_string())?;
             let history = state.sole_history()?;
             let history_rows =
                 u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
@@ -366,18 +502,16 @@ impl AttestedPrograms {
                 .draft
                 .as_ref()
                 .ok_or("draft graphs require a draft")?;
-            let geometry =
-                crate::programs::native_draft::DraftGeometry::new(definition, state, proposals)?;
-            let classes =
-                crate::programs::native_draft::draft_graph_classes(limits, proposals, draft)?;
+            let geometry = crate::programs::native_draft::DraftGeometry::new(definition, state)?;
+            let classes = crate::programs::native_draft::draft_graph_classes(
+                limits,
+                proposals,
+                &method.block_widths(),
+                draft,
+            )?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
                 crate::programs::native_draft::PreparedDraftGraphs::prepare(
-                    device,
-                    handles,
-                    &self.target,
-                    load,
-                    &geometry,
-                    classes,
+                    device, handles, load, &geometry, classes,
                 )
                 .map_err(|error| error.to_string())?,
             )));
@@ -429,12 +563,14 @@ impl AttestedPrograms {
         self.state_graphs.as_ref()
     }
 
+    /// Hold the load's sealed target graphs: its one copy, which the bound
+    /// graphs of the target program share.
     pub fn install_target_graphs(&mut self, graphs: crate::PreparedTargetGraphs) {
-        self.target_graphs = Some(graphs);
+        self.target_graphs = Some(std::sync::Arc::new(graphs));
     }
 
     pub fn target_graphs(&self) -> Option<&crate::PreparedTargetGraphs> {
-        self.target_graphs.as_ref()
+        self.target_graphs.as_deref()
     }
 
     pub fn prepare_target_graphs(
@@ -445,6 +581,7 @@ impl AttestedPrograms {
         state: &crate::StateResourcePlan,
         plan: &crate::TargetProgramPlan,
         limits: crate::ResourceLimits,
+        workers: &seismic::Workers,
     ) -> Result<crate::PreparedTargetGraphs, String> {
         crate::programs::native_target_graph::PreparedTargetGraphs::prepare(
             device,
@@ -454,6 +591,7 @@ impl AttestedPrograms {
             state,
             plan,
             limits,
+            workers,
         )
     }
 
@@ -512,6 +650,7 @@ impl AttestedPrograms {
         // The native catalog's one-word device identity owner is retained
         // with every prepared group.
         let mut bytes = 4u128;
+        let mut charged_bounds = HashSet::new();
         for slot in plan.imports() {
             if charged_imports.insert(*slot) {
                 bytes += match slot {
@@ -519,17 +658,48 @@ impl AttestedPrograms {
                     ImportProgramSlot::Repack { .. } => bytes!(repack_weight),
                 };
             }
+            if let ImportProgramSlot::Repack { resident, .. } = slot {
+                if crate::planning::packing_run(*resident).is_some()
+                    && charged_bounds.insert(*resident)
+                {
+                    bytes += bytes!(packing_bound);
+                }
+            }
         }
         for &element in plan.state().copies() {
             if charged_copies.insert(element) {
                 bytes += bytes!(copy_rows);
             }
         }
-        bytes += bytes!(conditioning_overlay);
+        bytes += bytes!(conditioning_overlay) + bytes!(feature_copy);
         bytes += bytes!(shape_rows) + bytes!(sample_rows);
         let target = plan.target();
         bytes += bytes!(embedding_rows);
-        for block in target.blocks() {
+        // The decoder blocks of a draft head reading target history are
+        // prepared with the target's, one group per distinct binding.
+        let head_blocks = plan
+            .shared_head()
+            .map_or(&[][..], |head| head.blocks.as_slice());
+        if let Some(head) = plan.shared_head() {
+            bytes += bytes!(tap_rows) + 2 * bytes!(project_rows) + bytes!(readout_features_rows);
+            bytes += match head.projection {
+                ReadoutHead::Packed { .. } => bytes!(readout_project_rows),
+                ReadoutHead::Qualified { .. } => {
+                    bytes!(readout_project_rows)
+                        + bytes!(readout_top_rows)
+                        + bytes!(readout_refine_rows)
+                        + bytes!(readout_exact_rows)
+                        + bytes!(readout_planes_rows)
+                }
+            };
+            if head.clustered.is_some() {
+                bytes += bytes!(readout_project_rows)
+                    + bytes!(draft_top_k)
+                    + bytes!(cluster_token_rows)
+                    + bytes!(place_logits_rows);
+            }
+        }
+        for block in target.blocks().iter().chain(head_blocks) {
             match block.mixer() {
                 MixerProgramSlot::Attention(binding)
                     if charged_mixers.insert(MixerProgramSlot::Attention(binding)) =>
@@ -541,14 +711,37 @@ impl AttestedPrograms {
                                 bytes!(project_rows) + bytes!(post_norm_residual)
                             }
                         }
-                        + match binding.history {
-                            KvCodec::Dense => bytes!(attention_append_dense) + bytes!(attention_decode) + bytes!(attention_prefill),
-                            KvCodec::AffineK8V4 => {
-                                bytes!(attention_append_k8v4) + bytes!(attention_decode_k8v4) + bytes!(attention_prefill_k8v4)
+                        + match binding.history.encoding() {
+                            magnitude_state::HistoryEncoding::Dense => {
+                                bytes!(attention_append_dense)
+                                    + bytes!(attention_decode)
+                                    + bytes!(attention_prefill)
                             }
-                            KvCodec::RotatedK4V4 => {
-                                return Err(PlanError::Unsupported("native rotated K4/V4 KV codec"))
+                            magnitude_state::HistoryEncoding::Affine => {
+                                bytes!(attention_append_k8v4)
+                                    + bytes!(attention_decode_k8v4)
+                                    + bytes!(attention_prefill_k8v4)
                             }
+                            magnitude_state::HistoryEncoding::Unsupported => {
+                                return Err(PlanError::Unsupported(
+                                    "native rotated K4/V4 KV codec",
+                                ));
+                            }
+                        }
+                        // A selected read's indexer projection, selection
+                        // and WorkList prefill.
+                        + match binding.selection {
+                            Some(_) => {
+                                bytes!(attention_project)
+                                    + bytes!(indexer_select)
+                                    + match binding.history.encoding() {
+                                        magnitude_state::HistoryEncoding::Affine => {
+                                            bytes!(attention_prefill_k8v4)
+                                        }
+                                        _ => bytes!(attention_prefill),
+                                    }
+                            }
+                            None => 0,
                         }
                 }
                 MixerProgramSlot::Recurrent(binding)
@@ -623,6 +816,23 @@ impl AttestedPrograms {
                 bytes += bytes!(per_layer_gate) + bytes!(project_rows) + bytes!(post_norm_residual);
             }
         }
+        let mut charged_ngrams = HashSet::new();
+        for binding in target.blocks().iter().filter_map(|block| block.ngram()) {
+            if charged_ngrams.insert(binding) {
+                bytes += bytes!(ngram_rows)
+                    + bytes!(stored_rows)
+                    + bytes!(selection_notice)
+                    + 2 * bytes!(project_rows)
+                    + bytes!(ngram_gate)
+                    + bytes!(ngram_inject);
+            }
+        }
+        let mut charged_streams = HashSet::new();
+        for binding in target.blocks().iter().filter_map(|block| block.streams()) {
+            if charged_streams.insert(binding) {
+                bytes += 2 * bytes!(stream_mix_down) + bytes!(stream_mix_up) + bytes!(repeat_rows);
+            }
+        }
         if target.per_layer().is_some() {
             bytes += 2 * bytes!(import_dense)
                 + bytes!(repack_weight)
@@ -634,8 +844,10 @@ impl AttestedPrograms {
                 ReadoutHead::Packed { .. } => {
                     bytes!(readout_head_rows) + bytes!(readout_selected_rows)
                 }
-                ReadoutHead::Progressive => {
-                    bytes!(readout_top_rows)
+                ReadoutHead::Qualified { .. } => {
+                    bytes!(readout_head_rows)
+                        + bytes!(readout_selected_rows)
+                        + bytes!(readout_top_rows)
                         + bytes!(readout_refine_rows)
                         + bytes!(readout_exact_rows)
                         + bytes!(readout_planes_rows)
@@ -647,11 +859,24 @@ impl AttestedPrograms {
         if target.taps().is_some() {
             bytes += bytes!(tap_rows) + bytes!(project_rows) + bytes!(feature_rows);
         }
+        if plan.head().is_some_and(|head| {
+            head.blocks()
+                .iter()
+                .any(|block| block.conditioning == Element::f32())
+        }) {
+            bytes += bytes!(feature_rows);
+        }
         if let Some(head) = plan.head() {
             // Token selection over the draft vocabulary.
             bytes += bytes!(shape_rows) + bytes!(sample_rows);
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
+                    bytes += bytes!(feature_copy) + bytes!(feature_rows);
+                    if binding.streams.is_some() {
+                        bytes += 2 * bytes!(stream_mix_down)
+                            + bytes!(stream_mix_up)
+                            + bytes!(repeat_rows);
+                    }
                     bytes += bytes!(draft_rows)
                         + 2 * bytes!(attention_project)
                         + bytes!(attention_append_dense)
@@ -660,9 +885,10 @@ impl AttestedPrograms {
                         + bytes!(attention_output)
                         + bytes!(readout_features_rows);
                     bytes += match binding.projection {
-                        HeadProjection::Packed(_) => bytes!(head_logits_rows),
-                        HeadProjection::Progressive => {
-                            bytes!(readout_top_rows)
+                        ReadoutHead::Packed { .. } => bytes!(readout_project_rows),
+                        ReadoutHead::Qualified { .. } => {
+                            bytes!(readout_project_rows)
+                                + bytes!(readout_top_rows)
                                 + bytes!(readout_refine_rows)
                                 + bytes!(readout_exact_rows)
                                 + bytes!(readout_planes_rows)
@@ -679,7 +905,7 @@ impl AttestedPrograms {
                         | FeedForwardProgramSlot::Parallel(_) => {
                             return Err(PlanError::Unsupported(
                                 "draft head routed feed-forward form",
-                            ))
+                            ));
                         }
                     }
                 }
@@ -704,16 +930,17 @@ impl AttestedPrograms {
                     bytes += bytes!(dense_expand) + bytes!(dense_output);
                 }
             }
+            bytes += match draft.projection() {
+                ReadoutHead::Packed { .. } | ReadoutHead::Qualified { .. } => {
+                    bytes!(readout_head_rows)
+                }
+            };
             bytes += bytes!(embedding_rows)
-                + bytes!(readout_head_rows)
                 + bytes!(shape_rows)
                 + bytes!(sample_rows)
                 + bytes!(widen_rows);
             if draft.markov().is_some() {
-                bytes += bytes!(embedding_rows)
-                    + bytes!(dense_output)
-                    + bytes!(readout_features_rows)
-                    + bytes!(draft_confidence);
+                bytes += bytes!(embedding_rows) + bytes!(dense_output);
             }
             if let Some(binding) = draft.dflash2() {
                 let (projections, norms) = super::draft::dflash2_entries(draft, binding);
@@ -745,38 +972,50 @@ impl AttestedPrograms {
             .map_err(|_| PlanError::Arithmetic("native invocation workspace bytes overflow"))
     }
 
-    /// Prepare every native entry the draft's program plan needs on the
-    /// opened device: static values from the model, parameters tuned on the
-    /// device, qualification. Errors name the native path and the device's
-    /// backend; entries without an implementation for that backend are
-    /// reported together.
-    pub fn prepare_draft(
+    /// Search every tuning unit of the draft's program plan that has no
+    /// stored record, on the opened device within the tuning budget, and
+    /// publish each unit's record to `tuning.cache`. Nothing is prepared
+    /// for serving: [`Self::prepare_draft`] reads the records. This is the
+    /// only search; it runs in a process that ends before the model is
+    /// loaded, and holds no more than `room`. Returns every unit's outcome.
+    pub fn search_draft(
         plan: &ExecutionPlanDraft,
         device: &Device,
         tuning: TuningContext<'_>,
-    ) -> Result<Self, CatalogError> {
-        Self::prepare_for(
+        room: Option<super::tuning::TuningRoom>,
+    ) -> Result<Vec<TunedEntry>, CatalogError> {
+        let limits = TuningLimits::of(plan.policy().limits(), tuning.definition);
+        Self::preparation_inputs(
             plan.policy().path(),
             plan.device(),
             plan.programs(),
             plan.load(),
-            TuningLimits::of(plan.policy().limits(), tuning.definition),
+            limits,
+            plan.policy().limits(),
+            plan.policy().method(),
             device,
             tuning,
+            room,
         )
+        .and_then(NativePreparationCache::search_programs)
         .map_err(|failure| CatalogError::native(device.backend(), failure))
     }
 
+    /// What a walk of `topology` on `device` reads, once the plan and the
+    /// opened device are known to agree.
     #[allow(clippy::too_many_arguments)]
-    fn prepare_for(
+    fn preparation_inputs<'a>(
         path: ExecutionPath,
         planned_device: &PlannedDevice,
-        topology: &ProgramPlan,
-        load: &crate::ModelLoadPlan,
+        topology: &'a ProgramPlan,
+        load: &'a crate::ModelLoadPlan,
         limits: TuningLimits,
-        device: &Device,
-        tuning: TuningContext<'_>,
-    ) -> Result<Self, CatalogFailure> {
+        selection_limits: crate::ResourceLimits,
+        method: crate::PlannedMethod,
+        device: &'a Device,
+        tuning: TuningContext<'a>,
+        room: Option<super::tuning::TuningRoom>,
+    ) -> Result<PreparationInputs<'a>, CatalogFailure> {
         if path != ExecutionPath::Native {
             return Err(CatalogFailure::Preparation {
                 entry: "program_factory",
@@ -791,14 +1030,84 @@ impl AttestedPrograms {
                 outcome: "program plan and opened device differ".into(),
             });
         }
-        let definition = tuning.definition;
-        let mut prepared = NativePreparationCache::prepare_programs(PreparationInputs {
+        Ok(PreparationInputs {
             device,
             plan: topology,
             load,
             limits,
             tuning,
-        })?;
+            room,
+            selection_limits,
+            graph_demand: crate::programs::invocation_demand::GraphInvocationDemand::new(
+                method,
+                super::tuning::workload::terms(limits, &method.draft_widths()),
+                tuning.definition.draft.as_ref(),
+                selection_limits.max_launch_rows as u64,
+            ),
+        })
+    }
+
+    /// Prepare every native entry the draft's program plan needs on the
+    /// opened device, as a load does: static values from the model, each
+    /// tuned entry at the choice its stored tuning record names; then
+    /// qualification. At a unit without a record it does what `unprepared`
+    /// says: stops with [`CatalogFailure::Unprepared`], or prepares the
+    /// unit at its canonical default. Nothing is searched, measured or
+    /// published. Errors name the native
+    /// path and the device's backend; entries without an implementation for
+    /// that backend are reported together.
+    pub fn prepare_draft(
+        plan: &ExecutionPlanDraft,
+        device: &Device,
+        tuning: TuningContext<'_>,
+        unprepared: super::tuning::UnpreparedUnits,
+    ) -> Result<Self, CatalogError> {
+        Self::prepare_for(
+            plan.policy().path(),
+            plan.device(),
+            plan.programs(),
+            plan.load(),
+            TuningLimits::of(plan.policy().limits(), tuning.definition),
+            plan.policy().limits(),
+            plan.policy().method(),
+            plan.policy().codec(),
+            device,
+            tuning,
+            unprepared,
+        )
+        .map_err(|failure| CatalogError::native(device.backend(), failure))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_for(
+        path: ExecutionPath,
+        planned_device: &PlannedDevice,
+        topology: &ProgramPlan,
+        load: &crate::ModelLoadPlan,
+        limits: TuningLimits,
+        selection_limits: crate::ResourceLimits,
+        method: crate::PlannedMethod,
+        codec: magnitude_state::KvCodec,
+        device: &Device,
+        tuning: TuningContext<'_>,
+        unprepared: super::tuning::UnpreparedUnits,
+    ) -> Result<Self, CatalogFailure> {
+        let definition = tuning.definition;
+        let mut prepared = NativePreparationCache::prepare_programs(
+            Self::preparation_inputs(
+                path,
+                planned_device,
+                topology,
+                load,
+                limits,
+                selection_limits,
+                method,
+                device,
+                tuning,
+                None,
+            )?,
+            unprepared,
+        )?;
         let tuned = std::mem::take(&mut prepared.tuned);
         let mut cases = Vec::new();
         let mut include = |case| {
@@ -844,135 +1153,189 @@ impl AttestedPrograms {
         let report = QualificationReport { cases };
         let target_plan = topology.target();
         check_rotary_divisors(load, tuning)?;
-        let mut blocks = Vec::with_capacity(target_plan.blocks().len());
-        for (index, block) in target_plan.blocks().iter().enumerate() {
-            let sublayer = |sublayer| {
-                u32::try_from(index)
-                    .map(|block| SublayerIndex { block, sublayer })
-                    .map_err(|_| CatalogFailure::Preparation {
-                        entry: "program_factory",
-                        bindings: "target block index".into(),
-                        outcome: "the block index exceeds u32".into(),
+        // The decoder blocks of `slots`, whose sublayers' weights `scope`
+        // names: the target's, or those of a draft head reading its history.
+        let attest_blocks = |slots: &[crate::TargetBlockProgramSlot],
+                             scope: fn(SublayerIndex) -> WeightScope|
+         -> Result<Vec<AttestedTargetBlock>, CatalogFailure> {
+            let mut blocks = Vec::with_capacity(slots.len());
+            for (index, block) in slots.iter().enumerate() {
+                let sublayer = |sublayer| {
+                    u32::try_from(index)
+                        .map(|block| scope(SublayerIndex { block, sublayer }))
+                        .map_err(|_| CatalogFailure::Preparation {
+                            entry: "program_factory",
+                            bindings: "target block index".into(),
+                            outcome: "the block index exceeds u32".into(),
+                        })
+                };
+                let [mixer_tail, feed_forward_tail, per_layer_tail] = output_tails(*block);
+                let output_scales = OutputScales {
+                    mixer: output_scale(load, tuning, sublayer(0)?, mixer_tail)?,
+                    feed_forward: output_scale(load, tuning, sublayer(1)?, feed_forward_tail)?,
+                    per_layer: output_scale(load, tuning, sublayer(2)?, per_layer_tail)?,
+                };
+                let per_layer = block
+                    .per_layer()
+                    .map(|binding| {
+                        prepared
+                            .target
+                            .per_layer
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("per_layer_stages", binding))
                     })
-            };
-            let output_scales = OutputScales {
-                mixer: output_scale(
-                    load,
-                    tuning,
-                    sublayer(0)?,
-                    match block.mixer() {
-                        MixerProgramSlot::Attention(binding) => Some(binding.tail),
-                        _ => None,
-                    },
-                )?,
-                feed_forward: output_scale(
-                    load,
-                    tuning,
-                    sublayer(1)?,
-                    match block.feed_forward() {
-                        Some(FeedForwardProgramSlot::Dense(binding)) => Some(binding.tail),
-                        Some(FeedForwardProgramSlot::Parallel(binding)) => {
-                            Some(SublayerTail::PostNorm {
-                                norm: binding.norm,
-                                scaled: binding.scaled,
-                            })
-                        }
-                        _ => None,
-                    },
-                )?,
-                per_layer: output_scale(
-                    load,
-                    tuning,
-                    sublayer(2)?,
-                    block.per_layer().map(|binding| binding.tail),
-                )?,
-            };
-            let per_layer = block
-                .per_layer()
-                .map(|binding| {
-                    prepared
-                        .target
-                        .per_layer
-                        .get(&binding)
-                        .cloned()
-                        .ok_or_else(|| missing("per_layer_stages", binding))
+                    .transpose()?;
+                let mixer = match block.mixer() {
+                    MixerProgramSlot::Attention(binding) => AttestedMixer::Attention(
+                        prepared
+                            .target
+                            .attention
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("attention_stages", binding))?,
+                    ),
+                    MixerProgramSlot::Recurrent(binding) => AttestedMixer::Recurrent(
+                        prepared
+                            .target
+                            .recurrent
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("gated_delta_stages", binding))?,
+                    ),
+                    MixerProgramSlot::StateSpace(binding) => AttestedMixer::StateSpace(
+                        prepared
+                            .target
+                            .state_space
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("state_space_stages", binding))?,
+                    ),
+                    MixerProgramSlot::ShortConv(binding) => AttestedMixer::ShortConv(
+                        prepared
+                            .target
+                            .short_conv
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("short_conv_stages", binding))?,
+                    ),
+                };
+                let feed_forward = block
+                    .feed_forward()
+                    .map(|slot| match slot {
+                        FeedForwardProgramSlot::Dense(binding) => prepared
+                            .target
+                            .dense
+                            .get(&binding)
+                            .cloned()
+                            .map(AttestedFeedForward::Dense)
+                            .ok_or_else(|| missing("dense_stages", binding)),
+                        FeedForwardProgramSlot::Routed(binding) => prepared
+                            .target
+                            .routed
+                            .get(&binding)
+                            .cloned()
+                            .map(AttestedFeedForward::Routed)
+                            .ok_or_else(|| missing("routed_stages", binding)),
+                        FeedForwardProgramSlot::GeneralRouted(binding) => prepared
+                            .target
+                            .general_routed
+                            .get(&binding)
+                            .cloned()
+                            .map(AttestedFeedForward::GeneralRouted)
+                            .ok_or_else(|| missing("general_routed_stages", binding)),
+                        FeedForwardProgramSlot::Parallel(binding) => prepared
+                            .target
+                            .parallel
+                            .get(&binding)
+                            .cloned()
+                            .map(AttestedFeedForward::Parallel)
+                            .ok_or_else(|| missing("parallel_stages", binding)),
+                    })
+                    .transpose()?;
+                let streams = block
+                    .streams()
+                    .map(|binding| {
+                        prepared
+                            .target
+                            .streams
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("stream_mix", binding))
+                    })
+                    .transpose()?;
+                let ngram = block
+                    .ngram()
+                    .map(|binding| {
+                        prepared
+                            .target
+                            .ngram
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("ngram_inject", binding))
+                    })
+                    .transpose()?;
+                blocks.push(AttestedTargetBlock {
+                    mixer,
+                    feed_forward,
+                    output_scales,
+                    per_layer,
+                    streams,
+                    ngram,
+                });
+            }
+            Ok(blocks)
+        };
+        let blocks = attest_blocks(target_plan.blocks(), WeightScope::TargetSublayer)?;
+        let shared_head = topology
+            .shared_head()
+            .map(|plan| {
+                let handles = prepared
+                    .shared_head
+                    .as_ref()
+                    .ok_or_else(|| missing("shared_head", "enabled"))?;
+                Ok::<_, CatalogFailure>(AttestedSharedHead {
+                    embedding: slot(&prepared.target.embedding, plan.embedding, "embedding_rows")?,
+                    join: handles
+                        .join
+                        .clone()
+                        .ok_or_else(|| missing("tap_rows", "head"))?,
+                    input: handles
+                        .input
+                        .clone()
+                        .ok_or_else(|| missing("project_rows", "head input"))?,
+                    blocks: attest_blocks(&plan.blocks, WeightScope::HeadSublayer)?,
+                    features: handles
+                        .features
+                        .clone()
+                        .ok_or_else(|| missing("readout_features_rows", "head"))?,
+                    projection: handles
+                        .projection
+                        .clone()
+                        .ok_or_else(|| missing("readout_project_rows", "head"))?,
+                    centroids: handles.centroids.clone(),
+                    cluster_selection: handles.cluster_selection.clone(),
+                    cluster_rows: handles.cluster_rows.clone(),
+                    placement: handles.placement.clone(),
+                    chain: handles
+                        .chain
+                        .clone()
+                        .ok_or_else(|| missing("project_rows", "head chain"))?,
+                    shape: prepared
+                        .glue
+                        .shape_rows
+                        .clone()
+                        .ok_or_else(|| missing("shape_rows", "fixed"))?,
+                    sample: prepared
+                        .glue
+                        .sample_rows
+                        .clone()
+                        .ok_or_else(|| missing("sample_rows", "fixed"))?,
                 })
-                .transpose()?;
-            let mixer = match block.mixer() {
-                MixerProgramSlot::Attention(binding) => AttestedMixer::Attention(
-                    prepared
-                        .target
-                        .attention
-                        .get(&binding)
-                        .cloned()
-                        .ok_or_else(|| missing("attention_stages", binding))?,
-                ),
-                MixerProgramSlot::Recurrent(binding) => AttestedMixer::Recurrent(
-                    prepared
-                        .target
-                        .recurrent
-                        .get(&binding)
-                        .cloned()
-                        .ok_or_else(|| missing("gated_delta_stages", binding))?,
-                ),
-                MixerProgramSlot::StateSpace(binding) => AttestedMixer::StateSpace(
-                    prepared
-                        .target
-                        .state_space
-                        .get(&binding)
-                        .cloned()
-                        .ok_or_else(|| missing("state_space_stages", binding))?,
-                ),
-                MixerProgramSlot::ShortConv(binding) => AttestedMixer::ShortConv(
-                    prepared
-                        .target
-                        .short_conv
-                        .get(&binding)
-                        .cloned()
-                        .ok_or_else(|| missing("short_conv_stages", binding))?,
-                ),
-            };
-            let feed_forward = block
-                .feed_forward()
-                .map(|slot| match slot {
-                    FeedForwardProgramSlot::Dense(binding) => prepared
-                        .target
-                        .dense
-                        .get(&binding)
-                        .cloned()
-                        .map(AttestedFeedForward::Dense)
-                        .ok_or_else(|| missing("dense_stages", binding)),
-                    FeedForwardProgramSlot::Routed(binding) => prepared
-                        .target
-                        .routed
-                        .get(&binding)
-                        .cloned()
-                        .map(AttestedFeedForward::Routed)
-                        .ok_or_else(|| missing("routed_stages", binding)),
-                    FeedForwardProgramSlot::GeneralRouted(binding) => prepared
-                        .target
-                        .general_routed
-                        .get(&binding)
-                        .cloned()
-                        .map(AttestedFeedForward::GeneralRouted)
-                        .ok_or_else(|| missing("general_routed_stages", binding)),
-                    FeedForwardProgramSlot::Parallel(binding) => prepared
-                        .target
-                        .parallel
-                        .get(&binding)
-                        .cloned()
-                        .map(AttestedFeedForward::Parallel)
-                        .ok_or_else(|| missing("parallel_stages", binding)),
-                })
-                .transpose()?;
-            blocks.push(AttestedTargetBlock {
-                mixer,
-                feed_forward,
-                output_scales,
-                per_layer,
-            });
-        }
+            })
+            .transpose()?;
         let target = AttestedTarget {
+            residual_features: prepared.target.residual_features.clone(),
             embedding: slot(
                 &prepared.target.embedding,
                 target_plan.embedding(),
@@ -1030,10 +1393,39 @@ impl AttestedPrograms {
                     .ok_or_else(|| missing("head", "enabled"))?;
                 let mut blocks = Vec::with_capacity(head_plan.blocks().len());
                 for &binding in head_plan.blocks() {
+                    let logits = handles
+                        .logits
+                        .get(&binding)
+                        .cloned()
+                        .ok_or_else(|| missing("head_logits", binding))?;
+                    let mut attested_binding = binding;
+                    if matches!(&logits, ProjectionKernels::Qualified { .. }) {
+                        let weight = binding.projection.packed();
+                        attested_binding.projection = ReadoutHead::Qualified {
+                            weight: weight.element,
+                            weight_scale: weight.scale,
+                        };
+                    }
                     blocks.push(AttestedHeadBlock {
-                        binding,
+                        streams: binding
+                            .streams
+                            .map(|_| {
+                                handles
+                                    .streams
+                                    .get(&binding)
+                                    .cloned()
+                                    .ok_or_else(|| missing("head streams", binding))
+                            })
+                            .transpose()?,
+                        copy: slot(&handles.copy, binding, "feature_copy")?,
+                        gather: slot(&handles.gather, binding, "feature_rows")?,
+                        binding: attested_binding,
                         input: slot(&handles.input, binding, "draft_rows")?,
-                        priming_project: slot(&handles.priming_project, binding, "attention_project")?,
+                        priming_project: slot(
+                            &handles.priming_project,
+                            binding,
+                            "attention_project",
+                        )?,
                         attention: handles
                             .attention
                             .get(&binding)
@@ -1062,15 +1454,11 @@ impl AttestedPrograms {
                                     entry: "routed_select",
                                     bindings: format!("{binding:?}"),
                                     outcome: "draft heads run the fused routed form only".into(),
-                                })
+                                });
                             }
                         },
                         features: slot(&handles.features, binding, "readout_features_rows")?,
-                        logits: handles
-                            .logits
-                            .get(&binding)
-                            .cloned()
-                            .ok_or_else(|| missing("head_logits", binding))?,
+                        logits,
                     });
                 }
                 Ok::<_, CatalogFailure>(AttestedHead {
@@ -1185,6 +1573,7 @@ impl AttestedPrograms {
                 Some(DType::F16) => &prepared.glue.copy_rows_f16,
                 Some(DType::BF16) => &prepared.glue.copy_rows_bf16,
                 Some(DType::U32) => &prepared.glue.copy_rows_u32,
+                Some(DType::I32) => &prepared.glue.copy_rows_i32,
                 _ => return Err(missing("copy_rows", element)),
             };
             copies.push((
@@ -1195,6 +1584,11 @@ impl AttestedPrograms {
             ));
         }
         let state = AttestedState {
+            feature_copy: prepared
+                .glue
+                .feature_copy
+                .clone()
+                .ok_or_else(|| missing("feature_copy", "activation"))?,
             copies,
             conditioning: Some(
                 prepared
@@ -1206,27 +1600,36 @@ impl AttestedPrograms {
         };
         let mut imports = Vec::with_capacity(topology.imports().len());
         for &binding in topology.imports() {
-            let handle = match binding {
-                ImportProgramSlot::Dense { source, resident } => AttestedImport::Dense(slot(
-                    &prepared.import.import_dense,
-                    (source, resident),
-                    "import_dense",
-                )?),
-                ImportProgramSlot::Repack { source, resident } => AttestedImport::Repack(slot(
-                    &prepared.import.repack_weight,
-                    (source, resident),
-                    "repack_weight",
-                )?),
-            };
+            let handle = prepared
+                .import
+                .attested(binding)
+                .ok_or_else(|| missing("weight_import", binding))?;
             imports.push((binding, handle));
         }
         let invocation_workspace_bytes = Self::sum_invocation_workspace_bytes(&prepared)?;
-        let planned_bytes = Self::planned_invocation_workspace_bytes(topology, device.backend())
-            .map_err(|error| CatalogFailure::Preparation {
+        let finalized_load = load
+            .clone()
+            .finalize_readout(&prepared.readout_choices)
+            .map_err(|outcome| CatalogFailure::Preparation {
                 entry: "program_factory",
-                bindings: "native invocation workspace".into(),
-                outcome: error.to_string(),
+                bindings: "readout physical choices".into(),
+                outcome,
             })?;
+        let finalized_topology =
+            finalized_load
+                .program_plan(definition, codec)
+                .map_err(|error| CatalogFailure::Preparation {
+                    entry: "program_factory",
+                    bindings: "finalized readout topology".into(),
+                    outcome: error.to_string(),
+                })?;
+        let planned_bytes =
+            Self::planned_invocation_workspace_bytes(&finalized_topology, device.backend())
+                .map_err(|error| CatalogFailure::Preparation {
+                    entry: "program_factory",
+                    bindings: "native invocation workspace".into(),
+                    outcome: error.to_string(),
+                })?;
         if invocation_workspace_bytes != planned_bytes {
             return Err(CatalogFailure::Qualification {
                 entry: "program_factory",
@@ -1238,11 +1641,14 @@ impl AttestedPrograms {
         }
         let attested = Self {
             backend: device.backend(),
+            readout_choices: prepared.readout_choices.clone(),
             tuned,
+            unprepared: prepared.unprepared,
             owner: prepared.owner.clone(),
             report,
             target,
             head,
+            shared_head,
             draft,
             vision,
             state,
@@ -1278,11 +1684,18 @@ impl AttestedPrograms {
         }
         charge!(prepared.import.import_dense.values());
         charge!(prepared.import.repack_weight.values());
+        charge!(prepared.import.packing_bound.values());
         charge!(prepared.target.embedding.values());
         for handles in prepared.target.attention.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
                 + u128::from(handles.history.invocation_workspace_bytes())
-                + u128::from(handles.output.invocation_workspace_bytes());
+                + u128::from(handles.output.invocation_workspace_bytes())
+                + u128::from(
+                    handles
+                        .selection
+                        .as_ref()
+                        .map_or(0, |selection| selection.invocation_workspace_bytes()),
+                );
         }
         for handles in prepared.target.recurrent.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
@@ -1322,6 +1735,21 @@ impl AttestedPrograms {
             bytes += u128::from(handles.gate.invocation_workspace_bytes())
                 + u128::from(handles.output.project.invocation_workspace_bytes())
                 + u128::from(handles.output.residual.invocation_workspace_bytes());
+        }
+        for handles in prepared.target.ngram.values() {
+            bytes += u128::from(handles.rows.invocation_workspace_bytes())
+                + u128::from(handles.stored.invocation_workspace_bytes())
+                + u128::from(handles.key.invocation_workspace_bytes())
+                + u128::from(handles.value.invocation_workspace_bytes())
+                + u128::from(handles.gate.invocation_workspace_bytes())
+                + u128::from(handles.inject.invocation_workspace_bytes())
+                + u128::from(handles.notice.invocation_workspace_bytes());
+        }
+        for handles in prepared.target.streams.values() {
+            bytes += u128::from(handles.down.invocation_workspace_bytes())
+                + u128::from(handles.exit.invocation_workspace_bytes())
+                + u128::from(handles.up.invocation_workspace_bytes())
+                + u128::from(handles.repeat.invocation_workspace_bytes());
         }
         for entry in prepared.target.per_layer_entry.values() {
             bytes += u128::from(entry.round.invocation_workspace_bytes())
@@ -1378,19 +1806,9 @@ impl AttestedPrograms {
         }
         for handles in prepared.target.readout.values() {
             bytes += u128::from(handles.features.invocation_workspace_bytes())
-                + match &handles.head {
-                    ReadoutHeadKernels::Packed { head, selected } => {
-                        u128::from(head.invocation_workspace_bytes())
-                            + u128::from(selected.invocation_workspace_bytes())
-                    }
-                    ReadoutHeadKernels::Progressive(kernels) => {
-                        u128::from(kernels.top.invocation_workspace_bytes())
-                            + u128::from(kernels.refine.invocation_workspace_bytes())
-                            + u128::from(kernels.exact.invocation_workspace_bytes())
-                            + u128::from(kernels.planes.invocation_workspace_bytes())
-                    }
-                };
+                + handles.head.invocation_workspace_bytes();
         }
+        charge!(prepared.target.residual_features.iter());
         charge!(prepared.target.features.values());
         if let Some(taps) = &prepared.target.taps {
             bytes += u128::from(taps.tap.invocation_workspace_bytes())
@@ -1399,6 +1817,14 @@ impl AttestedPrograms {
         }
         if let Some(head) = &prepared.head {
             charge!(head.input.values());
+            charge!(head.copy.values());
+            charge!(head.gather.values());
+            for handles in head.streams.values() {
+                bytes += u128::from(handles.down.invocation_workspace_bytes())
+                    + u128::from(handles.exit.invocation_workspace_bytes())
+                    + u128::from(handles.up.invocation_workspace_bytes())
+                    + u128::from(handles.repeat.invocation_workspace_bytes());
+            }
             charge!(head.priming_project.values());
             for handles in head.attention.values() {
                 bytes += u128::from(handles.project.invocation_workspace_bytes())
@@ -1419,18 +1845,24 @@ impl AttestedPrograms {
             }
             charge!(head.features.values());
             for logits in head.logits.values() {
-                match logits {
-                    HeadLogitsKernels::Packed(kernel) => charge!([kernel]),
-                    HeadLogitsKernels::Progressive(kernels) => {
-                        charge!([&kernels.top]);
-                        charge!([&kernels.refine]);
-                        charge!([&kernels.exact]);
-                        charge!([&kernels.planes]);
-                    }
-                }
+                bytes += logits.invocation_workspace_bytes();
             }
             charge!(head.shape.iter());
             charge!(head.sample.iter());
+        }
+        if let Some(head) = &prepared.shared_head {
+            charge!(head.join.iter());
+            charge!(head.input.iter());
+            charge!(head.features.iter());
+            bytes += head
+                .projection
+                .as_ref()
+                .map_or(0, ProjectionKernels::invocation_workspace_bytes);
+            charge!(head.centroids.iter());
+            charge!(head.cluster_selection.iter());
+            charge!(head.cluster_rows.iter());
+            charge!(head.placement.iter());
+            charge!(head.chain.iter());
         }
         if let Some(draft) = &prepared.draft {
             for handles in draft.attention.values() {
@@ -1443,15 +1875,16 @@ impl AttestedPrograms {
                     + u128::from(handles.output.invocation_workspace_bytes());
             }
             charge!(draft.embedding.iter());
-            charge!(draft.head.iter());
+            bytes += draft
+                .head
+                .as_ref()
+                .map_or(0, ProjectionKernels::invocation_workspace_bytes);
             charge!(draft.shape.iter());
             charge!(draft.sample.iter());
             charge!(draft.widen.iter());
             if let Some(markov) = &draft.markov {
                 bytes += u128::from(markov.embedding.invocation_workspace_bytes())
-                    + u128::from(markov.projection.invocation_workspace_bytes())
-                    + u128::from(markov.features.invocation_workspace_bytes())
-                    + u128::from(markov.confidence.invocation_workspace_bytes());
+                    + u128::from(markov.projection.invocation_workspace_bytes());
             }
             if let Some(dflash2) = &draft.dflash2 {
                 charge!(dflash2.norms.values());
@@ -1481,6 +1914,9 @@ impl AttestedPrograms {
         if let Some(handle) = &prepared.glue.sample_rows {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
+        if let Some(handle) = &prepared.glue.feature_copy {
+            bytes += u128::from(handle.invocation_workspace_bytes());
+        }
         if let Some(handle) = &prepared.glue.conditioning_overlay {
             bytes += u128::from(handle.invocation_workspace_bytes());
         }
@@ -1489,6 +1925,7 @@ impl AttestedPrograms {
             prepared.glue.copy_rows_f16.as_ref(),
             prepared.glue.copy_rows_bf16.as_ref(),
             prepared.glue.copy_rows_u32.as_ref(),
+            prepared.glue.copy_rows_i32.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -1569,17 +2006,23 @@ impl AttestedPrograms {
                 None => {
                     let top = target(WeightKind::OutputPlane(ProgressivePlane::Top))
                         .ok_or("head qualification requires the target output")?;
-                    let [vocabulary, words] = top.shape[..] else {
+                    let [vocabulary, groups, _] = top.shape[..] else {
                         return Err("target top plane is not a matrix".into());
                     };
-                    ProgressivePlane::ALL.into_iter().try_fold(0u64, |bytes, plane| {
-                        let element = crate::progressive::element(plane);
-                        let plane_bytes =
-                            fixture(element, &plane.shape(vocabulary, words * 8))?;
-                        bytes
-                            .checked_add(plane_bytes)
-                            .ok_or_else(|| "draft projection fixture overflows".to_owned())
-                    })?
+                    let depth = top
+                        .progressive_depth()
+                        .ok_or("target top plane has no code depth")?;
+                    let hidden = groups * 32;
+                    ProgressivePlane::ALL
+                        .into_iter()
+                        .try_fold(0u64, |bytes, plane| {
+                            let element = crate::progressive::element(plane);
+                            let plane_bytes =
+                                fixture(element, &plane.shape(vocabulary, hidden, depth))?;
+                            bytes
+                                .checked_add(plane_bytes)
+                                .ok_or_else(|| "draft projection fixture overflows".to_owned())
+                        })?
                 }
             };
             for (scope, bytes) in &mut scopes {
@@ -1617,7 +2060,6 @@ impl AttestedPrograms {
                 .target_readout_graphs
                 .as_ref()
                 .ok_or_else(|| missing("target", "prepared readout graphs"))?
-                .clone()
                 .bind_weights(&model)
                 .map_err(|error| CatalogFailure::Preparation {
                     entry: "target_readout_graph",
@@ -1625,7 +2067,7 @@ impl AttestedPrograms {
                     outcome: error,
                 })?;
             crate::programs::native_target::NativeTargetProgram::new(
-                model.output_norm.tensor().device(),
+                model.embedding.tensor().device(),
                 self.state.clone(),
                 geometry,
                 graphs,
@@ -1673,6 +2115,23 @@ impl AttestedPrograms {
                         graphs,
                     )
                     .map(NativeDrafterProgram::Head)
+                    .map_err(|error| missing("head", error))
+                }
+                crate::PreparedDrafterGraphs::SharedHead(graphs) => {
+                    self.shared_head
+                        .as_ref()
+                        .ok_or_else(|| missing("head", "disabled"))?;
+                    if resident.depth != 1 {
+                        return Err(missing("head", "native single-head topology"));
+                    }
+                    let graphs = graphs
+                        .bind_weights(&resident)
+                        .map_err(|error| missing("head", error))?;
+                    crate::programs::native_shared_head::NativeSharedHeadProgram::new(
+                        definition.decoder.clone(),
+                        graphs,
+                    )
+                    .map(NativeDrafterProgram::SharedHead)
                     .map_err(|error| missing("head", error))
                 }
                 crate::PreparedDrafterGraphs::Draft(graphs) => {
@@ -1740,34 +2199,30 @@ impl AttestedPrograms {
                 .clone(),
         )
     }
+    /// The import entry that converts `weight`'s uploaded rows into its
+    /// resident storage.
+    pub(crate) fn import_entry(
+        &self,
+        weight: &crate::WeightPlan,
+    ) -> Result<AttestedImport, CatalogError> {
+        let requested = ImportProgramSlot::of(weight);
+        self.imports
+            .iter()
+            .find(|(slot, _)| *slot == requested)
+            .map(|(_, handle)| handle.clone())
+            .ok_or_else(|| CatalogError::native(self.backend, missing("weight_import", requested)))
+    }
+
     /// Bind one already planned semantic weight to its exact import entry.
     /// This happens during loader construction, never during a numerical call.
     pub(crate) fn bind_import(
         &self,
         weight: &crate::WeightPlan,
     ) -> Result<crate::programs::native_import::NativeImportProgram, CatalogError> {
-        (|| -> Result<crate::programs::native_import::NativeImportProgram, CatalogFailure> {
-            let requested = if let (Some(source), Some(resident)) =
-                (weight.upload.dtype(), weight.resident.dtype())
-            {
-                ImportProgramSlot::Dense { source, resident }
-            } else {
-                ImportProgramSlot::Repack {
-                    source: weight.upload,
-                    resident: weight.resident,
-                }
-            };
-            let (_, handle) = self
-                .imports
-                .iter()
-                .find(|(slot, _)| *slot == requested)
-                .ok_or_else(|| missing("weight_import", requested))?;
-            Ok(crate::programs::native_import::NativeImportProgram::new(
-                weight.storage_identity(),
-                handle.clone(),
-            ))
-        })()
-        .map_err(|failure| CatalogError::native(self.backend, failure))
+        Ok(crate::programs::native_import::NativeImportProgram::new(
+            weight.storage_identity(),
+            self.import_entry(weight)?,
+        ))
     }
     pub fn invocation_workspace_bytes(&self) -> u64 {
         self.invocation_workspace_bytes
@@ -1782,6 +2237,28 @@ impl AttestedPrograms {
                     bytes = bytes
                         .checked_add(handle.invocation_workspace_bytes())
                         .ok_or("prepared program charge overflows")?;
+                }
+            }};
+        }
+        macro_rules! projection {
+            ($kernels:expr) => {{
+                let mut recipes: Vec<&ProjectionKernels> = vec![$kernels];
+                while let Some(recipe) = recipes.pop() {
+                    match recipe {
+                        ProjectionKernels::RawPacked(kernel) => charge!(kernel),
+                        ProjectionKernels::PreparedPacked(kernel) => charge!(kernel),
+                        ProjectionKernels::Qualified {
+                            packed,
+                            progressive,
+                            ..
+                        } => {
+                            recipes.push(packed.as_ref());
+                            charge!(&progressive.top);
+                            charge!(&progressive.refine);
+                            charge!(&progressive.exact);
+                            charge!(&progressive.planes);
+                        }
+                    }
                 }
             }};
         }
@@ -1837,6 +2314,16 @@ impl AttestedPrograms {
                         charge!(prefill);
                         if let Some(prefill_listed) = prefill_listed {
                             charge!(prefill_listed);
+                        }
+                    }
+                }
+                if let Some(selection) = &handles.selection {
+                    charge!(&selection.project);
+                    charge!(&selection.select);
+                    match &selection.prefill {
+                        super::target::SelectedPrefillKernel::Dense(kernel) => charge!(kernel),
+                        super::target::SelectedPrefillKernel::AffineK8V4(kernel) => {
+                            charge!(kernel)
                         }
                     }
                 }
@@ -1957,17 +2444,28 @@ impl AttestedPrograms {
             charge!(&entry.copy);
         }
         charge!(&self.target.readout.features);
-        match &self.target.readout.head {
-            ReadoutHeadKernels::Packed { head, selected } => {
-                charge!(head);
-                charge!(selected);
+        let mut recipes = vec![&self.target.readout.head];
+        while let Some(recipe) = recipes.pop() {
+            match recipe {
+                ReadoutHeadKernels::Packed { head, selected } => {
+                    charge!(head);
+                    charge!(selected);
+                }
+                ReadoutHeadKernels::Qualified {
+                    packed,
+                    progressive,
+                    ..
+                } => {
+                    recipes.push(packed.as_ref());
+                    charge!(&progressive.top);
+                    charge!(&progressive.refine);
+                    charge!(&progressive.exact);
+                    charge!(&progressive.planes);
+                }
             }
-            ReadoutHeadKernels::Progressive(kernels) => {
-                charge!(&kernels.top);
-                charge!(&kernels.refine);
-                charge!(&kernels.exact);
-                charge!(&kernels.planes);
-            }
+        }
+        if let Some(features) = &self.target.residual_features {
+            charge!(features);
         }
         if let Some(features) = &self.target.features {
             charge!(features);
@@ -1981,21 +2479,52 @@ impl AttestedPrograms {
         charge!(&self.target.sample);
         if let Some(head) = &self.head {
             for block in &head.blocks {
+                charge!(&block.copy);
+                charge!(&block.gather);
+                if let Some(streams) = &block.streams {
+                    charge!(&streams.down);
+                    charge!(&streams.exit);
+                    charge!(&streams.up);
+                    charge!(&streams.repeat);
+                }
                 charge!(&block.input);
                 charge!(&block.priming_project);
                 attention!(&block.attention);
                 feed_forward!(&block.feed_forward);
                 charge!(&block.features);
-                match &block.logits {
-                    HeadLogitsKernels::Packed(kernel) => charge!(kernel),
-                    HeadLogitsKernels::Progressive(kernels) => {
-                        charge!(&kernels.top);
-                        charge!(&kernels.refine);
-                        charge!(&kernels.exact);
-                        charge!(&kernels.planes);
-                    }
+                projection!(&block.logits);
+            }
+            charge!(&head.shape);
+            charge!(&head.sample);
+        }
+        if let Some(head) = &self.shared_head {
+            charge!(&head.embedding);
+            charge!(&head.join);
+            charge!(&head.input);
+            for block in &head.blocks {
+                // `operators::admit` keeps these blocks attention and dense.
+                if let AttestedMixer::Attention(handles) = &block.mixer {
+                    attention!(handles);
+                }
+                if let Some(handles) = &block.feed_forward {
+                    feed_forward!(handles);
                 }
             }
+            charge!(&head.features);
+            projection!(&head.projection);
+            for kernel in head.centroids.iter() {
+                charge!(kernel);
+            }
+            for kernel in head.cluster_selection.iter() {
+                charge!(kernel);
+            }
+            for kernel in head.cluster_rows.iter() {
+                charge!(kernel);
+            }
+            for kernel in head.placement.iter() {
+                charge!(kernel);
+            }
+            charge!(&head.chain);
             charge!(&head.shape);
             charge!(&head.sample);
         }
@@ -2006,15 +2535,13 @@ impl AttestedPrograms {
                 dense!(&block.dense);
             }
             charge!(&draft.embedding);
-            charge!(&draft.head);
+            projection!(&draft.head);
             charge!(&draft.shape);
             charge!(&draft.sample);
             charge!(&draft.widen);
             if let Some(markov) = &draft.markov {
                 charge!(&markov.embedding);
                 charge!(&markov.projection);
-                charge!(&markov.features);
-                charge!(&markov.confidence);
             }
             if let Some(dflash2) = &draft.dflash2 {
                 for layer in &dflash2.layers {
@@ -2068,6 +2595,7 @@ impl AttestedPrograms {
                 charge!(kernel);
             }
         }
+        charge!(&self.state.feature_copy);
         for (_, copy) in &self.state.copies {
             charge!(copy);
         }
@@ -2077,7 +2605,12 @@ impl AttestedPrograms {
         for (_, import) in &self.imports {
             match import {
                 AttestedImport::Dense(handle) => charge!(handle),
-                AttestedImport::Repack(handle) => charge!(handle),
+                AttestedImport::Repack { repack, bound } => {
+                    charge!(repack);
+                    if let Some(bound) = bound {
+                        charge!(bound);
+                    }
+                }
             }
         }
         Ok(bytes)
@@ -2095,8 +2628,15 @@ impl AttestedPrograms {
     pub const fn backend(&self) -> BackendName {
         self.backend
     }
-    /// Every entry tuned while these programs were prepared.
+    /// Every tuned entry these programs were prepared from a stored record
+    /// of.
     pub fn tuned(&self) -> &[TunedEntry] {
         &self.tuned
+    }
+
+    /// Tuning units these programs serve at their canonical defaults
+    /// because no record was stored for them.
+    pub fn unprepared(&self) -> usize {
+        self.unprepared
     }
 }

@@ -34,8 +34,10 @@ export const projectInferenceHardware = (
     availableBytes: Option.flatMap(domain.current_free_bytes, Option.fromNullable),
     sharesSystemMemory: domain.shares_system_memory,
   }))
+  // Accelerators are the GPUs a model can run on: a device below its backend's floor carries an
+  // unavailable reason and never runs one, so it is not an accelerator.
   const accelerators = hardware.memory_domains.flatMap((domain) => domain.devices
-    .filter((device) => device.kind !== "cpu")
+    .filter((device) => device.kind !== "cpu" && Option.isNone(device.unavailable_reason))
     .map((device) => ({
       acceleratorId: LocalInferenceAcceleratorIdSchema.make(device.id),
       name: inferenceAcceleratorDisplayName(device),

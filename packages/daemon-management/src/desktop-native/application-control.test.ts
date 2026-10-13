@@ -84,6 +84,20 @@ describe("local application control", () => {
       if (result._tag === "Left") expect(result.left._tag).toBe("ApplicationControlClosed")
     })))
   })
+  it("treats an owner that resets the connection while exiting as gone, not as a control failure", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const path = join(yield* setup, "exiting.sock")
+      // A dying owner closes the accepted connection with the request still unread, which resets it.
+      const server = yield* Effect.acquireRelease(Effect.sync(() => createLocalServer({ pauseOnConnect: true }, socket => {
+        socket.on("error", () => {})
+        setTimeout(() => socket.destroy(), 50)
+      })), server => Effect.promise(() => new Promise<void>(resolve => server.close(() => resolve()))))
+      yield* Effect.promise(() => new Promise<void>(resolve => server.listen(path, resolve)))
+      const result = yield* requestApplication(path, "ShowWindow").pipe(Effect.either)
+      expect(result._tag).toBe("Left")
+      if (result._tag === "Left") expect(result.left._tag).toBe("ApplicationControlClosed")
+    })))
+  })
   it("reports cold-start connection failure inside an HTTP callback without crashing the host", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const path = join(yield* setup, "missing.sock")

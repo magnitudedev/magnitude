@@ -213,6 +213,7 @@ impl SegmentConstruction {
             alive: environment.alive,
             cohort: cohort.as_ref(),
             successful: environment.successful,
+            quantity_bounds: environment.quantity_bounds,
             lexical: environment.lexical,
         };
         assert!(

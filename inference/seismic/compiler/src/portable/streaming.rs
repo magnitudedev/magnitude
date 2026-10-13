@@ -83,19 +83,38 @@ mod tests {
     }
     #[test]
     fn closed_views_and_elementwise_values_stream_into_their_reduction() {
-        assert!(analyze("fn probe[N](x: &tensor[N] bf16) -> tensor[1] f32:\n    let a = f32(reshape(x, (N, 1)))\n    return reduce(a * a, 0, sum)\n")>=3);
+        assert!(
+            analyze(
+                "fn probe[N](x: &tensor[N] bf16) -> tensor[1] f32:\n    let a = f32(reshape(x, (N, 1)))\n    return reduce(a * a, 0, sum)\n"
+            ) >= 3
+        );
     }
     #[test]
     fn escaping_total_tensor_remains_a_complete_computed_product() {
-        assert_eq!(analyze("fn probe[N](x: &tensor[N] f32) -> (tensor[N] f32, f32):\n    let a = x + x\n    return (a, reduce(a, 0, sum))\n"),1);
+        assert_eq!(
+            analyze(
+                "fn probe[N](x: &tensor[N] f32) -> (tensor[N] f32, f32):\n    let a = x + x\n    return (a, reduce(a, 0, sum))\n"
+            ),
+            1
+        );
     }
     #[test]
     fn potentially_failing_tensor_definition_does_not_move_into_a_consumer() {
-        assert_eq!(analyze("fn probe[N](x: &tensor[N] i32) -> i32:\n    let a = x / x\n    return reduce(a, 0, sum)\n"), 0);
+        assert_eq!(
+            analyze(
+                "fn probe[N](x: &tensor[N] i32) -> i32:\n    let a = x / x\n    return reduce(a, 0, sum)\n"
+            ),
+            0
+        );
     }
 
     #[test]
     fn snapshot_materialization_is_owned_by_construction() {
-        assert_eq!(analyze("fn probe[N](x: &mut tensor[N] f32) -> f32:\n    let a = x + x\n    parallel for i in 0..N:\n        x[i] = 0.0\n    return reduce(a, 0, sum)\n"),1);
+        assert_eq!(
+            analyze(
+                "fn probe[N](x: &mut tensor[N] f32) -> f32:\n    let a = x + x\n    parallel for i in 0..N:\n        x[i] = 0.0\n    return reduce(a, 0, sum)\n"
+            ),
+            1
+        );
     }
 }

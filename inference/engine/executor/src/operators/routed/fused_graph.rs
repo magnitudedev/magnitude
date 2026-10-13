@@ -10,15 +10,15 @@
 //! [`TILE_ROWS`], so the graph plan charges them to the workspace; nothing is
 //! uploaded per step.
 
-use crate::programs::graph::{draft::GraphDraft, GraphError};
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::operators::{Join, SublayerInput};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
+use crate::programs::native_constants::GraphConstant;
+use crate::programs::native_target_graph::{WeightPort, weight};
 use crate::{
-    native::{RoutedDecodeKernels, RoutedKernels},
     ModelLoadPlan, RoutedBinding,
+    native::{RoutedDecodeKernels, RoutedKernels},
 };
-use magnitude_family_contracts::{
-    RouteNormalization, RoutedFfn, WeightKind, WeightScope,
-};
+use magnitude_family_contracts::{RouteNormalization, RoutedFfn, WeightKind, WeightScope};
 use magnitude_kernels::{
     routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
     routed_route, routed_route_shared,
@@ -261,13 +261,21 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     load: &ModelLoadPlan,
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    input: SublayerInput<'_>,
     residual: &WorkflowTensor,
+    join: &Join,
     rows: u64,
     hidden: u64,
     shape: &ExpertShape,
     epsilon: f32,
 ) -> Result<WorkflowTensor, GraphError> {
-    let norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
+    // A mix site's partials have no input norm: the port is empty.
+    let norm = if input.form.normalized {
+        weight(graph, load, scope, WeightKind::InputNorm, weights)?
+    } else {
+        GraphConstant::absent(graph, constants)?.tensor().clone()
+    };
     let router = weight(graph, load, scope, WeightKind::Router, weights)?;
     let shared_router = weight(graph, load, scope, WeightKind::SharedRouter, weights)?;
     let expert_gate = weight(graph, load, scope, WeightKind::ExpertGate, weights)?;
@@ -277,11 +285,15 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     let shared_up = weight(graph, load, scope, WeightKind::SharedUp, weights)?;
     let shared_down = weight(graph, load, scope, WeightKind::SharedDown, weights)?;
 
+    let form = input.form.dimensions(hidden);
+    let [streams, injected] = join.dimensions();
     let choices = [
         ("M", rows),
         ("H", hidden),
         ("E", shape.count),
         ("K", shape.selected),
+        form[0],
+        form[1],
     ];
     let experts_dims = [
         ("M", rows),
@@ -290,6 +302,16 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("K", shape.selected),
         ("F", shape.intermediate),
         ("S", shape.shared_intermediate),
+    ];
+    let output_dims = [
+        ("M", rows),
+        ("H", hidden),
+        ("E", shape.count),
+        ("K", shape.selected),
+        ("F", shape.intermediate),
+        ("S", shape.shared_intermediate),
+        streams,
+        injected,
     ];
     let mut routes = graph.local_for(handle.route, "routes", &choices)?;
     let mut scores = graph.local_for(handle.route, "scores", &choices)?;
@@ -302,7 +324,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     handle.route,
                     &choices,
                     routed_route::WorkflowArgs {
-                        residual: residual.into(),
+                        residual: input.rows.into(),
                         norm: (&norm).into(),
                         router: (&router).into(),
                         shared_router: (&shared_router).into(),
@@ -338,9 +360,11 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                         ("E", shape.count),
                         ("K", shape.selected),
                         ("S", shape.shared_intermediate),
+                        form[0],
+                        form[1],
                     ],
                     routed_route_shared::WorkflowArgs {
-                        residual: residual.into(),
+                        residual: input.rows.into(),
                         norm: (&norm).into(),
                         router: (&router).into(),
                         shared_router: (&shared_router).into(),
@@ -375,12 +399,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 (expert_product, routed.r2, routed.r1)
             }
         };
+        let inject = join.inject(graph, rows, constants)?;
         return Ok(graph
             .enqueue(
                 handle.output,
-                &experts_dims,
+                &output_dims,
                 routed_output::WorkflowArgs {
                     residual: residual.into(),
+                    inject: (&inject).into(),
                     expert_product: (&expert_product).into(),
                     shared_product: (&shared_product).into(),
                     routes: routes.tensor().into(),
@@ -397,7 +423,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         handle.route,
         &choices,
         routed_route::WorkflowArgs {
-            residual: residual.into(),
+            residual: input.rows.into(),
             norm: (&norm).into(),
             router: (&router).into(),
             shared_router: (&shared_router).into(),
@@ -431,6 +457,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         ("B", blocks),
         ("T", TILE_ROWS),
         ("S", shape.shared_intermediate),
+        streams,
+        injected,
     ];
     let mut counts = graph.local_for(handle.group, "counts", &tables)?;
     let mut order = graph.local_for(handle.group, "order", &tables)?;
@@ -463,12 +491,14 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             },
         )?
         .value;
+    let inject = join.inject(graph, rows, constants)?;
     Ok(graph
         .enqueue(
             handle.combine,
             &combine_dims,
             routed_combine::WorkflowArgs {
                 residual: residual.into(),
+                inject: (&inject).into(),
                 expert_output: (&experts).into(),
                 inverse: inverse.tensor().into(),
                 scores: scores.tensor().into(),
@@ -500,6 +530,7 @@ mod tests {
         let mut port =
             |element, extents: &[u64]| graph.port(element, extents).unwrap().tensor().clone();
         let residual = port(Element::f32(), &[m, h]);
+        let inject = port(Element::f32(), &[m, 0]);
         let expert_product = port(activation, &[m, k, f]);
         let shared_product = port(activation, &[m, s]);
         let routes = port(Element::i32(), &[m, k]);
@@ -510,9 +541,19 @@ mod tests {
         let Err(error) = GraphDraft::enqueue::<routed_output::Entry>(
             &mut graph,
             &elements,
-            &[("M", m), ("H", h), ("E", e), ("K", k), ("F", f), ("S", s)],
+            &[
+                ("M", m),
+                ("H", h),
+                ("E", e),
+                ("K", k),
+                ("F", f),
+                ("S", s),
+                ("SN", 1),
+                ("IN", 0),
+            ],
             routed_output::WorkflowArgs {
                 residual: (&residual).into(),
+                inject: (&inject).into(),
                 expert_product: (&expert_product).into(),
                 shared_product: (&shared_product).into(),
                 routes: (&routes).into(),
@@ -531,7 +572,7 @@ mod tests {
         assert_eq!(violation.backend, BackendName::Metal);
         assert_eq!(
             violation.statics,
-            [("F", f), ("H", h), ("K", k), ("S", s)]
+            [("F", f), ("H", h), ("IN", 0), ("K", k), ("S", s), ("SN", 1),]
                 .map(|(name, value)| (name.to_owned(), value))
                 .to_vec()
         );

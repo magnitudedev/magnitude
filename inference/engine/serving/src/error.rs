@@ -27,6 +27,8 @@ pub enum ModelUnavailable {
     Unsupported(String),
     /// Installed material failed integrity validation.
     Integrity(String),
+    /// The model's assessment says it cannot fit this machine's memory.
+    DoesNotFit(String),
     /// The instance serving this request was stopped or replaced.
     InstanceStopped,
     /// A managed-model operation failed with a source-defined code.
@@ -71,6 +73,7 @@ impl std::fmt::Display for ServingError {
                 | ModelUnavailable::Busy(message)
                 | ModelUnavailable::Unsupported(message)
                 | ModelUnavailable::Integrity(message)
+                | ModelUnavailable::DoesNotFit(message)
                 | ModelUnavailable::Operation { message, .. }
                 | ModelUnavailable::Internal(message) => formatter.write_str(message),
                 ModelUnavailable::InstanceStopped => {
@@ -285,6 +288,9 @@ fn request_class(error: &RequestError) -> Class {
         | RequestError::DeviceLost { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "device_lost", true)
         }
+        RequestError::WeightReadFailed { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "weight_read_failed", true)
+        }
         RequestError::ModelUnloaded {
             cause: UnloadCause::Shutdown,
         } => (StatusCode::CONFLICT, MODEL, "model_instance_stopped", false),
@@ -355,6 +361,12 @@ fn model_class(error: &ModelUnavailable) -> Class {
             StatusCode::UNPROCESSABLE_ENTITY,
             INVALID,
             "integrity_failed",
+            false,
+        ),
+        ModelUnavailable::DoesNotFit(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            INVALID,
+            "model_does_not_fit",
             false,
         ),
         ModelUnavailable::InstanceStopped => {

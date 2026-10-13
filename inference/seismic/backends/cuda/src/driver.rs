@@ -82,6 +82,7 @@ driver! {
     driver_version: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDriverGetVersion",
     primary_context_retain: unsafe extern "system" fn(*mut Handle, c_int) -> ResultCode => "cuDevicePrimaryCtxRetain",
     primary_context_release: unsafe extern "system" fn(c_int) -> ResultCode => "cuDevicePrimaryCtxRelease_v2",
+    primary_context_state: unsafe extern "system" fn(c_int, *mut c_uint, *mut c_int) -> ResultCode => "cuDevicePrimaryCtxGetState",
     context_get: unsafe extern "system" fn(*mut Handle) -> ResultCode => "cuCtxGetCurrent",
     context_set: unsafe extern "system" fn(Handle) -> ResultCode => "cuCtxSetCurrent",
     stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
@@ -106,6 +107,7 @@ driver! {
     memset_d8_async: unsafe extern "system" fn(u64, c_uchar, usize, Handle) -> ResultCode => "cuMemsetD8Async",
     memset_d16_async: unsafe extern "system" fn(u64, u16, usize, Handle) -> ResultCode => "cuMemsetD16Async",
     memset_d32_async: unsafe extern "system" fn(u64, c_uint, usize, Handle) -> ResultCode => "cuMemsetD32Async",
+    memset_d2d32_async: unsafe extern "system" fn(u64, usize, c_uint, usize, usize, Handle) -> ResultCode => "cuMemsetD2D32Async",
     module_load: unsafe extern "system" fn(*mut Handle, *const c_void, c_uint, *mut c_int, *mut *mut c_void) -> ResultCode => "cuModuleLoadDataEx",
     module_unload: unsafe extern "system" fn(Handle) -> ResultCode => "cuModuleUnload",
     module_function: unsafe extern "system" fn(*mut Handle, Handle, *const c_char) -> ResultCode => "cuModuleGetFunction",
@@ -121,6 +123,10 @@ driver! {
     launch_cooperative: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchCooperativeKernel",
     error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString";
     optional {
+        // Driver API 11.7+: stream memory operations on a 32-bit word (a
+        // host gate's wait, a device signal to the host).
+        stream_wait_value_32: unsafe extern "system" fn(Handle, u64, u32, c_uint) -> ResultCode => "cuStreamWaitValue32_v2",
+        stream_write_value_32: unsafe extern "system" fn(Handle, u64, u32, c_uint) -> ResultCode => "cuStreamWriteValue32_v2",
         // Driver API 11.4+: identifies the exposed device, including a MIG
         // partition, rather than its parent GPU.
         device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
@@ -178,6 +184,19 @@ impl Driver {
             code: result,
             description,
         })
+    }
+
+    /// Whether the device's primary context exists in this process.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub fn primary_context_active(&self, ordinal: c_int) -> Result<bool, DriverError> {
+        let (mut flags, mut active) = (0, 0);
+        unsafe {
+            self.check(
+                (self.primary_context_state)(ordinal, &mut flags, &mut active),
+                "primary context state",
+            )?;
+        }
+        Ok(active != 0)
     }
 
     /// One `cuDeviceGetAttribute` query.
@@ -615,6 +634,25 @@ fn memory_management_symbol<F: Copy>(symbol: Option<F>) -> Result<F, DriverError
         code: 0,
         description: "the CUDA driver predates driver API 10.2 virtual memory management".into(),
     })
+}
+
+/// The granularity in which the driver backs device memory
+/// (`cuMemGetAllocationGranularity`, recommended): what one allocation's
+/// size is rounded up to. 2 MiB when the driver predates the query.
+pub(crate) fn allocation_granularity(context: &Context) -> u64 {
+    const FALLBACK: u64 = 2 << 20;
+    let Some(granularity_of) = context.driver.memory_granularity else {
+        return FALLBACK;
+    };
+    let properties = AllocationProperties::device(context.ordinal());
+    let mut granularity = 0usize;
+    // CU_MEM_ALLOC_GRANULARITY_RECOMMENDED
+    let queried = unsafe { granularity_of(&mut granularity, &properties, 1) } == 0;
+    if queried && granularity > 0 {
+        granularity as u64
+    } else {
+        FALLBACK
+    }
 }
 
 /// A device address range reserved once, with physical memory mapped over a
@@ -1092,6 +1130,11 @@ impl HostMapped {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host.add(offset), bytes.len());
         }
+    }
+
+    /// The allocation's first byte on the host.
+    pub fn host(&self) -> *mut u8 {
+        self.host
     }
 
     /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.

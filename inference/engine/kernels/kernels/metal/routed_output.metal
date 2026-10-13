@@ -19,6 +19,7 @@
 template <uint ROWS, uint LANES>
 kernel void routed_output(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
+    device const float *inject [[buffer(SEISMIC_BUFFER_INJECT)]],
     device const uchar *expert_product [[buffer(SEISMIC_BUFFER_EXPERT_PRODUCT)]],
     device const uchar *shared_product [[buffer(SEISMIC_BUFFER_SHARED_PRODUCT)]],
     device const int *routes [[buffer(SEISMIC_BUFFER_ROUTES)]],
@@ -70,8 +71,9 @@ kernel void routed_output(
     for (uint k = 0; k < K; ++k)
         selected = metal::fma(scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1],
             A::round(projected[k][tid]), selected);
-    value[m * SEISMIC_RESULT_0_STRIDE_0 + n * SEISMIC_RESULT_0_STRIDE_1] =
-        residual[m * SEISMIC_RESIDUAL_STRIDE_0 + n * SEISMIC_RESIDUAL_STRIDE_1] + selected
-        + A::round(projected[K][tid]) * coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0];
+    projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(value + m * SEISMIC_RESULT_0_STRIDE_0,
+        SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
+        inject + m * SEISMIC_INJECT_STRIDE_0, SEISMIC_DIM_H, n, selected,
+        A::round(projected[K][tid]) * coefficient[m * SEISMIC_COEFFICIENT_STRIDE_0]);
 }
 #endif

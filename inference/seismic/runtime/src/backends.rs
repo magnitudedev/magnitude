@@ -6,12 +6,12 @@
 //! API.  It does not reproduce target facts or planning policy.
 
 use crate::api::{
+    CallError, WorkflowError,
     device::DeviceInner,
     kernel::{
         DecodedResults, EncodedArgs, EncodedWorkflowArgs, PendingWorkflowResults,
         WorkflowCompletionAny,
     },
-    CallError, WorkflowError,
 };
 use crate::devices::{
     Availability, CapacityBasis, DeviceInfo, DeviceKind, DeviceMeasurements, DeviceMemoryStatus,
@@ -24,10 +24,11 @@ use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::NativeExecutor;
 use seismic_compiler::feedback::PreparationOptions;
 use seismic_lang::checked::CheckedModule;
-use seismic_lang::entry::ElementBindings;
+use seismic_lang::entry::{ElementBindings, LogicalEntry};
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_native_target::TargetFamily;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 type CpuExecutor = seismic_cpu::Executor;
 pub(crate) type CpuOpened = Opened<seismic_cpu::Cpu, CpuExecutor>;
@@ -52,7 +53,7 @@ type MetalAdmittedRun = crate::execution::AdmittedRun<seismic_metal::Metal, Meta
 #[cfg(not(target_os = "macos"))]
 mod vulkan;
 #[cfg(not(target_os = "macos"))]
-pub(crate) use vulkan::{vulkan_buffer, VulkanOpened};
+pub(crate) use vulkan::{VulkanOpened, vulkan_buffer};
 
 type CudaExecutor = seismic_cuda::Executor;
 pub(crate) type CudaOpened = Opened<seismic_cuda::Cuda, CudaExecutor>;
@@ -98,12 +99,18 @@ pub(crate) enum DiscoveredMemory {
     Host {
         max_allocation_bytes: u64,
     },
-    /// Allocations consume a device-local pool with its own capacity.
+    /// Allocations consume a device-local pool: `capacity_bytes` is what the
+    /// driver lets this process use ([`granted_bytes`]), `total_bytes` the
+    /// memory the backend reports for the device.
     Dedicated {
         capacity_bytes: u64,
+        total_bytes: u64,
         basis: CapacityBasis,
         ledger: LedgerKey,
         max_allocation_bytes: u64,
+        /// Whether host-shared storage (upload allocations) is the device's
+        /// own memory; else it is host RAM.
+        shared_device_local: bool,
     },
     Unsupported {
         reason: String,
@@ -292,7 +299,11 @@ impl AdmittedWorkflowKind {
 }
 
 /// Enumerates every enabled backend. Only cheap native queries run here:
-/// no context, queue, stream, worker pool, probe or profile is created.
+/// no context, queue, stream, worker pool or profile is created, with one
+/// exception that keeps discovery the authority on availability: a Vulkan
+/// device meeting its static floor whose numerics only a probe establishes
+/// (no `RoundingModeRTE 32` or `VK_KHR_shader_fma`) is opened briefly, once
+/// per process, to run the probe, and is unavailable when it fails.
 pub(crate) fn discover() -> BackendDiscovery {
     use seismic_lang::registry::BackendName;
     let mut devices = Vec::new();
@@ -358,23 +369,41 @@ pub(crate) fn discover() -> BackendDiscovery {
                         continue;
                     }
                 };
+                let max_allocation_bytes =
+                    seismic_cuda::max_allocation_bytes(descriptor.total_memory_bytes);
+                let mut availability = Availability::Available;
                 // An integrated GPU (GB10) allocates from the host RAM pool,
                 // like Apple silicon: it shares the host memory domain and
-                // budget instead of contributing a device pool.
+                // budget instead of contributing a device pool. A dedicated
+                // device's capacity is the memory the driver lets this
+                // process use once its context exists
+                // (`usable_memory_bytes`); a device whose context cannot be
+                // created cannot be opened either.
                 let memory = if descriptor.integrated {
                     DiscoveredMemory::Host {
-                        max_allocation_bytes: seismic_cuda::max_allocation_bytes(
-                            descriptor.total_memory_bytes,
-                        ),
+                        max_allocation_bytes,
                     }
                 } else {
+                    let granted = granted_bytes(BackendName::Cuda, descriptor.uuid, || {
+                        seismic_cuda::usable_memory_bytes(ordinal, descriptor.uuid)
+                            .map_err(|error| error.to_string())
+                    });
                     DiscoveredMemory::Dedicated {
-                        capacity_bytes: descriptor.total_memory_bytes,
-                        basis: CapacityBasis::CudaDeviceTotal,
+                        capacity_bytes: match granted {
+                            Ok(bytes) => bytes.min(descriptor.total_memory_bytes),
+                            Err(error) => {
+                                availability = Availability::Unavailable {
+                                    reason: format!("its CUDA context could not be created: {error}"),
+                                };
+                                descriptor.total_memory_bytes
+                            }
+                        },
+                        total_bytes: descriptor.total_memory_bytes,
+                        basis: CapacityBasis::CudaUsable,
                         ledger: LedgerKey::PhysicalGpu(descriptor.uuid),
-                        max_allocation_bytes: seismic_cuda::max_allocation_bytes(
-                            descriptor.total_memory_bytes,
-                        ),
+                        max_allocation_bytes,
+                        // Upload allocations are mapped pinned host memory.
+                        shared_device_local: false,
                     }
                 };
                 devices.push(DiscoveredDevice {
@@ -384,7 +413,7 @@ pub(crate) fn discover() -> BackendDiscovery {
                     name: descriptor.name,
                     kind: DeviceKind::Gpu,
                     backend: BackendName::Cuda,
-                    availability: Availability::Available,
+                    availability,
                     memory,
                     memory_bandwidth: descriptor.memory_bandwidth,
                     descriptor: Descriptor::Cuda {
@@ -416,6 +445,30 @@ pub(crate) fn discover() -> BackendDiscovery {
         devices,
         diagnostics,
     }
+}
+
+/// The memory a dedicated GPU's driver lets this process use through
+/// `backend`, measured once per process, backend and physical device: the
+/// first measurement precedes any allocation of this process, so a later
+/// discovery (a refresh, or another catalog) keeps it rather than measuring
+/// the process's own holdings. A failed measurement is not kept.
+pub(crate) fn granted_bytes(
+    backend: seismic_lang::registry::BackendName,
+    uuid: [u8; 16],
+    measure: impl FnOnce() -> Result<u64, String>,
+) -> Result<u64, String> {
+    type Granted = HashMap<(seismic_lang::registry::BackendName, [u8; 16]), u64>;
+    static GRANTED: OnceLock<Mutex<Granted>> = OnceLock::new();
+    let mut granted = GRANTED
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("the granted-memory registry lock is never poisoned");
+    if let Some(bytes) = granted.get(&(backend, uuid)) {
+        return Ok(*bytes);
+    }
+    let bytes = measure()?;
+    granted.insert((backend, uuid), bytes);
+    Ok(bytes)
 }
 
 /// Opens one catalog device, revalidating its native identity, with its
@@ -508,6 +561,7 @@ pub(crate) fn open(
         trace: std::sync::Mutex::new(None),
         artifacts: options.artifacts,
         native: crate::native::NativeQueue::default(),
+        chosen: std::sync::Mutex::new(std::collections::HashMap::new()),
     }))
 }
 
@@ -523,6 +577,156 @@ pub(crate) enum DevicePrograms {
 }
 
 impl DevicePrograms {
+    /// Lend the device's former `workers`, or take them back
+    /// ([`ProgramFormer::staff`]).
+    pub(crate) fn staff(
+        &self,
+        workers: Option<Arc<seismic_native_target::workers::Workers>>,
+    ) {
+        match self {
+            Self::Cpu => {}
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.staff(workers),
+            Self::Cuda(former) => former.staff(workers),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.staff(workers),
+        }
+    }
+
+    /// The threads lent to the device's former, if any.
+    pub(crate) fn workers(&self) -> Option<Arc<seismic_native_target::workers::Workers>> {
+        match self {
+            Self::Cpu => None,
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.workers(),
+            Self::Cuda(former) => former.workers(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.workers(),
+        }
+    }
+
+    /// How many native programs this device's toolchain has formed.
+    pub(crate) fn formed(&self) -> usize {
+        match self {
+            Self::Cpu => 0,
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.formed(),
+            Self::Cuda(former) => former.formed(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.formed(),
+        }
+    }
+
+    /// What compiling `source` takes this device's toolchain when nothing
+    /// serves it ([`ProgramFormer::cold`]); nothing on the CPU backend,
+    /// which compiles nothing at run time.
+    pub(crate) fn cold(
+        &self,
+        source: &seismic_native_target::ProgramSource,
+    ) -> Result<std::time::Duration, seismic_native_target::NativeCompilationError> {
+        match self {
+            Self::Cpu => Ok(std::time::Duration::ZERO),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.cold(source),
+            Self::Cuda(former) => former.cold(source),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.cold(source),
+        }
+    }
+
+    /// `sources` as this device's former reads them
+    /// ([`ProgramFormer::keyed`]). The CPU backend forms no programs.
+    pub(crate) fn keyed(
+        &self,
+        sources: Vec<seismic_native_target::ProgramSource>,
+    ) -> Vec<crate::formation::Keyed> {
+        let keyed = |key: &dyn Fn(seismic_native_target::ProgramSource) -> crate::formation::Keyed| {
+            sources.into_iter().map(key).collect()
+        };
+        match self {
+            Self::Cpu => Vec::new(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => keyed(&|source| former.keyed(source)),
+            Self::Cuda(former) => keyed(&|source| former.keyed(source)),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => keyed(&|source| former.keyed(source)),
+        }
+    }
+
+    /// What forming `sources` together on this device does, known before
+    /// they are formed, and the most entries one source's compile forms.
+    pub(crate) fn class(
+        &self,
+        sources: &[crate::formation::Keyed],
+    ) -> (crate::formation::FormationClass, usize) {
+        match self {
+            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.class(sources),
+            Self::Cuda(former) => former.class(sources),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.class(sources),
+        }
+    }
+
+    /// What publishing `sources` on this device does, known before it runs
+    /// ([`ProgramFormer::publication`]).
+    pub(crate) fn publication(
+        &self,
+        sources: &[crate::formation::Keyed],
+    ) -> (crate::formation::FormationClass, usize) {
+        match self {
+            Self::Cpu => (crate::formation::FormationClass::Kept, 0),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.publication(sources),
+            Self::Cuda(former) => former.publication(sources),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.publication(sources),
+        }
+    }
+
+    /// How many of `sources` publishing them on this device compiles
+    /// ([`ProgramFormer::publishing_sources`]).
+    pub(crate) fn publishing_sources(&self, sources: &[crate::formation::Keyed]) -> usize {
+        match self {
+            Self::Cpu => 0,
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.publishing_sources(sources),
+            Self::Cuda(former) => former.publishing_sources(sources),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.publishing_sources(sources),
+        }
+    }
+
+    /// Publish `sources` as a later process will request them
+    /// ([`ProgramFormer::publish`]).
+    pub(crate) fn publish(
+        &self,
+        sources: &[seismic_native_target::ProgramSource],
+    ) -> Result<(), seismic_native_target::NativeCompilationError> {
+        match self {
+            Self::Cpu => Ok(()),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.publish(sources),
+            Self::Cuda(former) => former.publish(sources),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.publish(sources),
+        }
+    }
+
+    /// What this device's toolchain's compiles have taken in this process,
+    /// by the entries each formed.
+    pub(crate) fn compiled(&self) -> crate::native::tune::Linear {
+        match self {
+            Self::Cpu => crate::native::tune::Linear::default(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(former) => former.compiled(),
+            Self::Cuda(former) => former.compiled(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(former) => former.compiled(),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn metal(&self) -> &ProgramFormer<seismic_metal::toolchain::MetalToolchain> {
         let Self::Metal(former) = self else {
@@ -606,7 +810,7 @@ impl OpenedKind {
             Self::Vulkan(_) => {
                 return Err(WorkflowError::PlannedRouteUnavailable {
                     backend: seismic_lang::registry::BackendName::Vulkan,
-                })
+                });
             }
         })
     }
@@ -641,6 +845,17 @@ impl OpenedKind {
             Self::Cuda(device) => device.set_memory_limit(limit),
             #[cfg(not(target_os = "macos"))]
             Self::Vulkan(device) => device.set_memory_limit(limit),
+        }
+    }
+
+    pub(crate) fn restart_memory_high_water(&self) {
+        match self {
+            Self::Cpu(device) => device.restart_memory_high_water(),
+            #[cfg(target_os = "macos")]
+            Self::Metal(device) => device.restart_memory_high_water(),
+            Self::Cuda(device) => device.restart_memory_high_water(),
+            #[cfg(not(target_os = "macos"))]
+            Self::Vulkan(device) => device.restart_memory_high_water(),
         }
     }
 
@@ -846,10 +1061,13 @@ impl OpenedKind {
             Self::Cpu(_) => driver::typed_buffer::<seismic_cpu::Cpu, CpuExecutor>(allocation)
                 .data_pointer() as u64,
             #[cfg(target_os = "macos")]
-            Self::Metal(_) => driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
-                .gpu_address(),
-            Self::Cuda(_) => driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation)
-                .pointer(),
+            Self::Metal(_) => {
+                driver::typed_buffer::<seismic_metal::Metal, MetalExecutor>(allocation)
+                    .gpu_address()
+            }
+            Self::Cuda(_) => {
+                driver::typed_buffer::<seismic_cuda::Cuda, CudaExecutor>(allocation).pointer()
+            }
             #[cfg(not(target_os = "macos"))]
             Self::Vulkan(_) => vulkan_buffer(allocation).address(),
         }
@@ -893,8 +1111,7 @@ impl OpenedKind {
 
     pub(crate) fn prepare(
         &self,
-        module: &CheckedModule,
-        entry: EntryId,
+        logical: LogicalEntry,
         bindings: ElementBindings,
         public_device: &Arc<DeviceInner>,
         options: PreparationOptions,
@@ -904,8 +1121,7 @@ impl OpenedKind {
                 device,
                 seismic_cpu::native_compiler(),
                 &(),
-                module,
-                entry,
+                logical,
                 bindings,
                 public_device,
                 options,
@@ -918,8 +1134,7 @@ impl OpenedKind {
                     device,
                     seismic_metal::native_compiler(),
                     &context,
-                    module,
-                    entry,
+                    logical,
                     bindings,
                     public_device,
                     options,
@@ -930,8 +1145,7 @@ impl OpenedKind {
                 device,
                 seismic_cuda::native_compiler(),
                 &(),
-                module,
-                entry,
+                logical,
                 bindings,
                 public_device,
                 options,
@@ -1010,8 +1224,7 @@ fn prepare<T, E, C>(
     device: &Arc<Opened<T, E>>,
     compiler: &C,
     native_context: &C::Context,
-    module: &CheckedModule,
-    entry: EntryId,
+    logical: LogicalEntry,
     bindings: ElementBindings,
     public_device: &Arc<DeviceInner>,
     options: PreparationOptions,
@@ -1025,8 +1238,7 @@ where
         device,
         compiler,
         native_context,
-        module,
-        entry,
+        logical,
         bindings,
         public_device,
         options,
@@ -1035,4 +1247,22 @@ where
         prepared,
         device: public_device.clone(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::granted_bytes;
+    use seismic_lang::registry::BackendName;
+
+    /// The first successful measurement stands for the process; a failure
+    /// is measured again.
+    #[test]
+    fn a_granted_measurement_is_kept_for_the_process_and_a_failure_is_not() {
+        let uuid = [0xa5; 16];
+        let failed = granted_bytes(BackendName::Cuda, uuid, || Err("busy".to_owned()));
+        assert_eq!(failed, Err("busy".to_owned()));
+        assert_eq!(granted_bytes(BackendName::Cuda, uuid, || Ok(6 << 30)), Ok(6 << 30));
+        assert_eq!(granted_bytes(BackendName::Cuda, uuid, || Ok(1 << 30)), Ok(6 << 30));
+        assert_eq!(granted_bytes(BackendName::Vulkan, uuid, || Ok(7 << 30)), Ok(7 << 30));
+    }
 }

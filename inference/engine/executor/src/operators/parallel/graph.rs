@@ -10,13 +10,13 @@ use super::DenseBesideRouted;
 use crate::native::ParallelKernels;
 use crate::operators::dense_ffn::graph::dimensions as dense_dimensions;
 use crate::operators::routed::graph::{
-    general_routed, CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum,
+    CheckedGeneralRoutedEntries, GeneralRoutedGraphEntries, RoutedSum, general_routed,
 };
-use crate::programs::graph::{draft::GraphDraft, GraphError};
+use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{weight, WeightPort};
+use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
 use crate::{GeneralRoutedShape, ModelLoadPlan, ParallelBinding};
-use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightScope};
+use magnitude_family_contracts::{SublayerIndex, WeightKind, WeightRole, WeightScope};
 use magnitude_kernels::{dense_expand, moe_tail, project_rows};
 use seismic::{Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -111,11 +111,30 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
         weights,
     )?;
     let out_rows = GraphConstant::identity_for_class(graph, rows, Some("M"))?;
-    let absent_scale = GraphConstant::absent_scale(graph, constants)?;
+    let absent_scale = GraphConstant::absent(graph, constants)?.tensor().clone();
+    let mut bound = |graph: &mut G, kind| {
+        let role = WeightRole {
+            scope: dense_scope,
+            kind,
+        };
+        PackingBound::planned(graph, load, role, weights, constants)
+    };
+    let gate_bound = bound(graph, WeightKind::DenseGate)?;
+    let up_bound = bound(graph, WeightKind::DenseUp)?;
+    let down_bound = bound(graph, WeightKind::DenseDown)?;
     let product = graph
         .enqueue(
             entries.expand,
-            &[dimensions.as_slice(), &[("GS", 0), ("US", 0)]].concat(),
+            &[
+                dimensions.as_slice(),
+                &[
+                    ("GS", 0),
+                    ("US", 0),
+                    ("GB", gate_bound.extent),
+                    ("UB", up_bound.extent),
+                ],
+            ]
+            .concat(),
             dense_expand::WorkflowArgs {
                 residual: residual.into(),
                 norm: (&norm).into(),
@@ -126,17 +145,26 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 activation,
                 gate_scale: (&absent_scale).into(),
                 up_scale: (&absent_scale).into(),
+                gate_bound: (&gate_bound.tensor).into(),
+                up_bound: (&up_bound.tensor).into(),
             },
         )?
         .value;
     let dense = graph
         .enqueue(
             entries.down,
-            &[("M", rows), ("K", features), ("N", hidden), ("WS", 0)],
+            &[
+                ("M", rows),
+                ("K", features),
+                ("N", hidden),
+                ("WS", 0),
+                ("WB", down_bound.extent),
+            ],
             project_rows::WorkflowArgs {
                 source: (&product).into(),
                 weight: (&down).into(),
                 weight_scale: (&absent_scale).into(),
+                weight_bound: (&down_bound.tensor).into(),
             },
         )?
         .value;
@@ -167,7 +195,6 @@ pub(crate) fn parallel<'a, G: GraphDraft + 'a>(
                 norm: (&tail_norm).into(),
                 epsilon,
                 scale,
-            },
-        )?
+            },        )?
         .value)
 }

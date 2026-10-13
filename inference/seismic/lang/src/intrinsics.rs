@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MathOp {
     Fma,
+    /// Nearest integral value, ties to even, in the operand dtype.
+    Rint,
     Exp,
+    Exp2,
     Rsqrt,
     Sqrt,
     Log,
@@ -35,9 +38,11 @@ pub enum MathOp {
 }
 
 impl MathOp {
-    pub const ALL: [MathOp; 10] = [
+    pub const ALL: [MathOp; 12] = [
         MathOp::Fma,
+        MathOp::Rint,
         MathOp::Exp,
+        MathOp::Exp2,
         MathOp::Rsqrt,
         MathOp::Sqrt,
         MathOp::Log,
@@ -51,7 +56,9 @@ impl MathOp {
     pub fn name(self) -> &'static str {
         match self {
             MathOp::Fma => "fma",
+            MathOp::Rint => "rint",
             MathOp::Exp => "exp",
+            MathOp::Exp2 => "exp2",
             MathOp::Rsqrt => "rsqrt",
             MathOp::Sqrt => "sqrt",
             MathOp::Log => "log",
@@ -253,6 +260,8 @@ pub enum PrimitiveId {
     Binary(BinaryOp),
     /// Scalar or elementwise cast; also the dense decode of a packed value.
     Cast(DType),
+    /// Exact F32/U32 payload reinterpretation; never a numeric conversion.
+    Bitcast(DType),
     Math(MathOp),
     Select,
     /// `tensor[shape] elem`: uninitialized owned storage; the node's output
@@ -275,6 +284,11 @@ pub enum PrimitiveId {
     /// Point read `t[i, j]`: one flag per axis, `true` when the index bound
     /// is not proved.
     ElementRead {
+        checks: Vec<bool>,
+    },
+    /// Registry-owned semantic component at logical element indices.
+    QuantizedComponentRead {
+        component: crate::registry::QuantizedComponent,
         checks: Vec<bool>,
     },
     /// `extent(v, axis)`.
@@ -317,6 +331,7 @@ impl PrimitiveId {
             PrimitiveId::Unary(op) => format!("unary.{}", op.text().trim()),
             PrimitiveId::Binary(op) => format!("binary.{}", op.text()),
             PrimitiveId::Cast(d) => format!("cast.{}", d.name()),
+            PrimitiveId::Bitcast(d) => format!("bitcast.{}", d.name()),
             PrimitiveId::Math(op) => format!("math.{}", op.name()),
             PrimitiveId::Select => "select".into(),
             PrimitiveId::TensorAlloc => "tensor.alloc".into(),
@@ -327,6 +342,9 @@ impl PrimitiveId {
             PrimitiveId::Reshape => "tensor.reshape".into(),
             PrimitiveId::SliceView { .. } => "tensor.slice".into(),
             PrimitiveId::ElementRead { .. } => "tensor.read".into(),
+            PrimitiveId::QuantizedComponentRead { component, .. } => {
+                format!("quantized.{}", component.name())
+            }
             PrimitiveId::Extent { .. } => "tensor.extent".into(),
             PrimitiveId::Atomic { op, .. } => format!("atomic.{}", op.name()),
             PrimitiveId::Reduce { op, .. } => format!("reduce.{}", op.name()),
@@ -447,6 +465,7 @@ pub fn atomic_dtype(dtype: DType) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum DTypeClass {
     Any,
+    Exact(DType),
     Float,
     Int,
     Numeric,
@@ -457,6 +476,7 @@ impl DTypeClass {
     pub(crate) fn matches(self, d: DType) -> bool {
         match self {
             DTypeClass::Any => true,
+            DTypeClass::Exact(expected) => d == expected,
             DTypeClass::Float => d.is_float(),
             DTypeClass::Int => d.is_int(),
             DTypeClass::Numeric => d.is_numeric(),
@@ -753,6 +773,17 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
                 dtype: ResultDType::Dtype(*dtype),
             },
         ),
+        PrimitiveId::Bitcast(dtype) => sig(
+            vec![ew(match dtype {
+                DType::F32 => DTypeClass::Exact(DType::U32),
+                DType::U32 => DTypeClass::Exact(DType::F32),
+                _ => unreachable!("checked bitcast only covers F32/U32"),
+            })],
+            TypeFunction::Elementwise {
+                shape_of: 0,
+                dtype: ResultDType::Dtype(*dtype),
+            },
+        ),
         PrimitiveId::Math(op) => {
             let class = if op.numeric_operands() {
                 DTypeClass::Numeric
@@ -793,6 +824,10 @@ pub(crate) fn primitive(id: &PrimitiveId) -> PrimitiveSignature {
         PrimitiveId::SliceView { .. } | PrimitiveId::ElementRead { .. } => sig(
             vec![TypePattern::TensorOf(ElemClass::Any)],
             TypeFunction::Structural,
+        ),
+        PrimitiveId::QuantizedComponentRead { component, .. } => sig(
+            vec![TypePattern::TensorOf(ElemClass::Any)],
+            TypeFunction::Fixed(ValueType::Scalar(component.dtype())),
         ),
         PrimitiveId::Extent { .. } => sig(
             vec![TypePattern::TensorOf(ElemClass::Any)],
@@ -1122,7 +1157,7 @@ mod tests {
             assert_eq!(not.admits_dtype(dtype), dtype == DType::Bool);
             assert_eq!(
                 bit_not.admits_dtype(dtype),
-                matches!(dtype, DType::I32 | DType::U32)
+                matches!(dtype, DType::I32 | DType::U32 | DType::U64)
             );
             assert_eq!(neg.admits_dtype(dtype), dtype != DType::Bool);
         }

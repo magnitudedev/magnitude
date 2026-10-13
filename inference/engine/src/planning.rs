@@ -7,7 +7,7 @@
 //! tensor directory (a header-only open is sufficient), the model
 //! definition, the resolved model policy and the service limits.
 
-use crate::options::{ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
+use crate::options::{DraftPolicy, ExecutionManifest, ResolvedMethod, ResolvedModelPolicy};
 use magnitude_batching::MAX_CLASS_ROWS;
 use magnitude_executor::{
     image_cell_limit, platform::SelectedDevice, BackendPlan, ComponentSelection,
@@ -100,11 +100,30 @@ fn planner_inputs(
         ResolvedMethod::Mtp {
             greedy_proposals,
             sampled_proposals,
+            ..
         } => PlannedMethod::Mtp {
             greedy_proposals,
             sampled_proposals,
         },
-        ResolvedMethod::DFlash { proposals } => PlannedMethod::DFlash { proposals },
+        // A block pass drafts exactly a fixed budget's generated width, or
+        // any width an adaptive load may choose.
+        ResolvedMethod::DFlash { proposals } => match manifest.model.draft_policy {
+            Some(DraftPolicy::Fixed(budget)) => PlannedMethod::DFlash {
+                proposals,
+                generated: budget.generated as u8,
+                ladder: false,
+            },
+            Some(DraftPolicy::Adaptive) => PlannedMethod::DFlash {
+                proposals,
+                generated: proposals,
+                ladder: true,
+            },
+            None => PlannedMethod::DFlash {
+                proposals,
+                generated: proposals,
+                ladder: false,
+            },
+        },
     };
     let image_cells = image_cell_limit(&manifest.definition, manifest.service.launch_rows())
         .map_err(ExecutionPlanningError::Plan)?;
@@ -140,6 +159,10 @@ fn resource_limits(
             admitted: max_launch_rows,
         });
     }
+    // A CPU launch completes during its submission, so a queued successor
+    // would run before the owner could apply a cancellation, stop or
+    // admission, and it overlaps nothing.
+    let lookahead = model.lookahead && backend != seismic::BackendName::Cpu;
     Ok(ResourceLimits {
         max_launch_rows,
         // Every request consumes at least one token in either phase. A
@@ -151,7 +174,7 @@ fn resource_limits(
         exported_logits_rows: model.exported_logits_rows,
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: image_cells,
-        lookahead: model.lookahead,
+        lookahead,
     })
 }
 
@@ -162,11 +185,12 @@ mod tests {
 
     fn model(exported_logits_rows: usize) -> ResolvedModelPolicy {
         ResolvedModelPolicy {
+            draft_policy: None,
             method: ResolvedMethod::Plain,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
             exported_logits_rows,
-            error_classes: Vec::new(),
+            numerical_profile: None,
         }
     }
 
@@ -218,6 +242,28 @@ mod tests {
                 admitted: 512,
             })
         );
+    }
+
+    #[test]
+    fn synchronous_cpu_launches_queue_no_lookahead() {
+        let model = ResolvedModelPolicy {
+            lookahead: true,
+            ..model(0)
+        };
+        for (backend, expected) in [
+            (seismic::BackendName::Cpu, false),
+            (seismic::BackendName::Metal, true),
+            (seismic::BackendName::Cuda, true),
+            (seismic::BackendName::Vulkan, true),
+        ] {
+            assert_eq!(
+                resource_limits(&service(512, 32), &model, 0, backend)
+                    .unwrap()
+                    .lookahead,
+                expected,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]

@@ -721,6 +721,14 @@ impl CompiledEntryShapes {
         Ok(evaluated)
     }
 
+    /// Forget every shape evaluated so far and return how many there were.
+    /// The memo only saves evaluating a shape again, so forgetting changes
+    /// no result: what built many graph classes holds them until it is
+    /// done, and releases them here.
+    pub fn forget_evaluated(&self) -> usize {
+        std::mem::take(&mut *self.lock()).len()
+    }
+
     fn lock(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::HashMap<(ShapeSlot, Vec<u64>), CheckedTensorShape>>

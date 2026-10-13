@@ -24,15 +24,17 @@ pub use decoder::{
     DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
     FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HashRoutingTable, HeadNorm,
     HistoryDomain, HistoryReads, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
-    InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention, Operator,
-    OutputForm, PerLayerEntry, PerLayerInput, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
-    RotaryDivisors, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-    SharedExpert, SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms,
-    ValueNorm, ValueSource,
+    Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
+    NGramHash, NGramInput, Operator, OutputForm, PerLayerEntry, PerLayerInput,
+    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RotaryDivisors, RotaryPair,
+    RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
+    SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms, ValueNorm,
+    ValueSource,
 };
 pub use draft::{
-    BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition, DraftEmbedding, DraftMethod,
-    DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead, TapPoint,
+    BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition,
+    DraftEmbedding, DraftMethod, DraftVariant, DynamicConvolution, LayerConvolutions, MarkovHead,
+    TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
 pub use images::{ImageMarkers, SequentialImageInput, SpatialControls};
@@ -149,7 +151,7 @@ impl WeightDescriptor {
                         )));
                     }
                 }
-                ImportTransform::Progressive(plane) => {
+                ImportTransform::Progressive { plane, depth } => {
                     let [rows, columns] = shape[..] else {
                         return Err(DefinitionError::new(format!(
                             "{:?} is not a matrix of whole 32-value groups",
@@ -162,7 +164,7 @@ impl WeightDescriptor {
                             self.name
                         )));
                     }
-                    shape = plane.shape(rows, columns);
+                    shape = plane.shape(rows, columns, *depth);
                 }
             }
         }
@@ -199,40 +201,74 @@ pub enum ImportTransform {
     /// (NVFP4) stays a separate factor of the resident weight, so it is exact
     /// for block encodings too.
     ScaleByTensor { tensor: String },
-    /// One plane of the progressive placement of a Q8_0 matrix (the last
+    /// One plane of a symmetric 32-value code matrix (the last
     /// transform; `ProgressivePlane`).
-    Progressive(ProgressivePlane),
+    Progressive {
+        plane: ProgressivePlane,
+        depth: ProgressiveCodeDepth,
+    },
 }
 
-/// The progressive placement of a Q8_0 matrix `[rows, columns]`: its
-/// offset-binary codes `u = c + 128` in significance-ordered bit planes, so a
+/// The exact symmetric 32-value code representation a progressive placement
+/// preserves. The coarse view owns half its bits, then one refinement bit;
+/// the remaining planes complete the original codes without duplicated weights.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProgressiveCodeDepth {
+    Four,
+    Eight,
+}
+
+impl ProgressiveCodeDepth {
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::Four => 4,
+            Self::Eight => 8,
+        }
+    }
+    pub const fn coarse_bits(self) -> u8 {
+        self.bits() / 2
+    }
+}
+
+/// The progressive placement of a matrix `[rows, columns]`: its
+/// offset-binary codes `u = c + 2^(depth-1)` in significance-ordered bit planes, so a
 /// reader of the top bits reads only them (`readout.seismic`, the progressive
 /// head readout). The planes hold the matrix's values bit for bit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ProgressivePlane {
-    /// Bits 7..4, eight codes per u32 (`[rows, columns / 8]`).
+    /// The coarse half of each code, packed into u32 words.
     Top,
-    /// Bit 3, a u32 per 32-value group (`[rows, columns / 32]`).
-    Bit3,
-    /// Bits 2..0, three u32 per group (`[rows, columns / 32, 3]`).
+    /// The next refinement bit, a u32 per 32-value group.
+    Next,
+    /// The remaining significance-ordered bit planes of each group.
     Rest,
     /// The f16 scale of every group (`[rows, columns / 32]`).
     Scales,
-    /// Per row, bounds on how far a dot product moves from the 4- and 5-bit
+    /// Per row, bounds on how far a dot product moves from the coarse and refined
     /// views to the exact row, per unit Euclidean length of the activation
     /// row, F32 rounding included (`[2, rows]` F32).
     Radius,
 }
 
 impl ProgressivePlane {
-    pub const ALL: [Self; 5] = [Self::Top, Self::Bit3, Self::Rest, Self::Scales, Self::Radius];
+    pub const ALL: [Self; 5] = [
+        Self::Top,
+        Self::Next,
+        Self::Rest,
+        Self::Scales,
+        Self::Radius,
+    ];
 
     /// The plane's shape for a `[rows, columns]` matrix.
-    pub fn shape(self, rows: u64, columns: u64) -> Vec<u64> {
+    pub fn shape(self, rows: u64, columns: u64, depth: ProgressiveCodeDepth) -> Vec<u64> {
         match self {
-            Self::Top => vec![rows, columns / 8],
-            Self::Bit3 | Self::Scales => vec![rows, columns / 32],
-            Self::Rest => vec![rows, columns / 32, 3],
+            Self::Top => vec![rows, columns / 32, u64::from(depth.coarse_bits())],
+            Self::Next | Self::Scales => vec![rows, columns / 32],
+            Self::Rest => vec![
+                rows,
+                columns / 32,
+                u64::from(depth.bits() - depth.coarse_bits() - 1),
+            ],
             Self::Radius => vec![rows, 2],
         }
     }
@@ -252,7 +288,10 @@ impl std::hash::Hash for ImportTransform {
             Self::Scale { factor } => factor.to_bits().hash(state),
             Self::Flatten => {}
             Self::ScaleByTensor { tensor } => tensor.hash(state),
-            Self::Progressive(plane) => plane.hash(state),
+            Self::Progressive { plane, depth } => {
+                plane.hash(state);
+                depth.hash(state);
+            }
         }
     }
 }
@@ -269,9 +308,10 @@ pub enum WeightScope {
         sublayer: SublayerIndex,
         branch: u32,
     },
-    /// Weights of a draft head block outside its sublayers.
+    /// Weights of a draft head block outside its decoder blocks' sublayers.
     HeadBlock(u32),
-    /// A sublayer of a draft head block (`block` is the head block).
+    /// A sublayer of a draft head's decoder block (`block` counts the
+    /// decoder blocks of every head block in order).
     HeadSublayer(SublayerIndex),
     HeadBranch {
         sublayer: SublayerIndex,
@@ -302,7 +342,12 @@ pub enum WeightKind {
     /// A sublayer's or branch's output normalization.
     PostNorm,
     LayerScale,
-    HyperConnectionMix,
+    /// A hyper-connection site's weights: a sublayer's mix (sublayer
+    /// scope) or the exit's (target scope).
+    HyperConnectionNorm,
+    HyperConnectionDown,
+    HyperConnectionUp,
+    HyperConnectionInject,
     Query,
     QueryGate,
     AttentionGate,
@@ -311,6 +356,10 @@ pub enum WeightKind {
     QueryNorm,
     KeyNorm,
     AttentionOutput,
+    IndexerQuery,
+    IndexerKey,
+    IndexerQueryNorm,
+    IndexerKeyNorm,
     RecurrentQueryKeyValue,
     RecurrentGate,
     RecurrentAlpha,
@@ -347,15 +396,30 @@ pub enum WeightKind {
     SharedDown,
     PerLayerGate,
     PerLayerProjection,
+    NGramTable,
+    NGramKey,
+    NGramValue,
+    NGramKeyNorm,
+    NGramQueryNorm,
+    NGramConvolutionNorm,
+    NGramConvolution,
     RotaryDivisors,
     OutputNorm,
     Output,
+    /// The model-defined centroid projection for clustered proposals.
+    OutputCentroids,
     /// A plane of the output projection's progressive placement
     /// (`ImportTransform::Progressive`), which then replaces `Output`.
     OutputPlane(ProgressivePlane),
     HeadEmbeddingNorm,
     HeadHiddenNorm,
     HeadCombine,
+    /// A draft head's projection of `[embedding ‖ hidden]` into its width
+    /// (`HeadInput::Projected`).
+    HeadInputProjection,
+    /// A draft head's projection of its normalized output into the hidden
+    /// row its next chained step conditions on (`HeadChain::Projected`).
+    HeadChainProjection,
     /// A draft's projection of the concatenated target taps.
     DraftFusion,
     DraftFusionNorm,
@@ -407,27 +471,155 @@ pub fn checked_product(dimensions: &[u64]) -> Result<u64, DefinitionError> {
         .ok_or_else(|| DefinitionError::new("model dimensions overflow"))
 }
 
-/// One draft block following the target decoder: it combines the embedding
-/// of the next token with the target's hidden row, runs one decoder block and
-/// normalizes its output for the target's vocabulary projection.
+/// How a draft head forms its input row from the target's embedding `e` of
+/// the next token and a conditioning hidden row `h` (the target's normalized
+/// output row, or the head's own chain feature).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct HeadBlock {
-    pub embedding_norm: RmsNorm,
-    pub hidden_norm: RmsNorm,
-    /// `[hidden, 2·hidden]`.
-    pub combine: WeightDescriptor,
-    pub block: Block,
-    pub output_norm: ExitNorm,
+pub enum HeadInput {
+    /// `combine · [RMS(e)·w_e ‖ RMS(h)·w_h]`, at the target's width.
+    Combine {
+        embedding_norm: RmsNorm,
+        hidden_norm: RmsNorm,
+        /// `[hidden, 2·hidden]`.
+        combine: WeightDescriptor,
+    },
+    /// `pre · [e·scale ‖ h]`, into the head's own width.
+    Projected {
+        /// `[width, 2·hidden]`.
+        pre: WeightDescriptor,
+        embedding_scale: EmbeddingScale,
+    },
 }
 
-/// An embedded draft head (MTP): blocks that read the target's embedding and
-/// vocabulary projection.
+/// The vocabulary projection, independent of proposal candidate policy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum VocabularyProjection {
+    /// The target's output projection.
+    Target,
+    /// The head's own table, `[vocabulary, width]`.
+    Own { table: WeightDescriptor },
+}
+
+/// Model-defined candidate policy for a proposal distribution.
+/// This never changes the target's exact readout or acceptance semantics.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ProposalReadoutPolicy {
+    Full,
+    Clustered {
+        /// `[clusters, width]` centroid projection.
+        centroids: WeightDescriptor,
+        /// Cluster-major permutation of every canonical vocabulary token.
+        token_order: Vec<TokenId>,
+        selected_clusters: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadReadout {
+    pub projection: VocabularyProjection,
+    pub policy: ProposalReadoutPolicy,
+}
+
+impl HeadReadout {
+    pub fn full(projection: VocabularyProjection) -> Self {
+        Self {
+            projection,
+            policy: ProposalReadoutPolicy::Full,
+        }
+    }
+
+    pub fn own_table(&self) -> Option<&WeightDescriptor> {
+        match &self.projection {
+            VocabularyProjection::Target => None,
+            VocabularyProjection::Own { table } => Some(table),
+        }
+    }
+}
+
+/// The hidden row a chained step conditions on after the step before it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum HeadChain {
+    /// The head's normalized output.
+    Output,
+    /// The head's residual streams before its output normalization/mix.
+    Residual,
+    /// `post ·` the head's normalized output: `[hidden, width]`.
+    Projected { post: WeightDescriptor },
+}
+
+/// The attention history a draft head's blocks read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeadHistory {
+    /// The head stores its own rows: every committed row enters it, and its
+    /// blocks' attention owns or shares history among themselves.
+    Own,
+    /// The head stores nothing. Every attention sublayer is
+    /// `KeyValue::Shared` with a source naming a sublayer of the *target*
+    /// decoder, whose accepted history it reads; a draft is one row per step
+    /// at the anchor's position.
+    Target,
+}
+
+/// The package component a draft head's weights are stored in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HeadComponent {
+    /// Embedded in the target artifact.
+    Target,
+    /// The package's separate draft component.
+    Draft,
+}
+
+/// One draft head following the target decoder: it forms its input from the
+/// embedding of the next token and a hidden row, runs its decoder blocks at
+/// its own width and normalizes their output for its vocabulary projection.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HeadBlock {
+    pub residual: ResidualForm,
+    pub input: HeadInput,
+    pub blocks: Vec<Block>,
+    pub output_norm: ExitNorm,
+    pub readout: HeadReadout,
+    pub chain: HeadChain,
+}
+
+impl HeadBlock {
+    /// The residual width of the head's blocks.
+    pub fn width(&self, decoder: &Decoder) -> u64 {
+        match &self.input {
+            HeadInput::Combine { .. } => decoder.hidden,
+            HeadInput::Projected { pre, .. } => pre.shape.first().copied().unwrap_or(0),
+        }
+    }
+}
+
+/// A draft head (MTP): chained blocks that read the target's embedding and a
+/// hidden row and propose the tokens after the anchor.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Head {
     pub blocks: Vec<HeadBlock>,
+    pub history: HeadHistory,
+    pub component: HeadComponent,
 }
 
 impl Head {
+    /// A residual-chaining head consumes the target's residual streams; an
+    /// output-chaining head consumes its normalized output feature.
+    pub fn residual_conditioning(&self) -> bool {
+        self.blocks
+            .first()
+            .is_some_and(|block| matches!(block.chain, HeadChain::Residual))
+    }
+
+    pub fn conditioning_width(&self, decoder: &Decoder) -> u64 {
+        if self.residual_conditioning() {
+            match &decoder.residual {
+                ResidualForm::Single => decoder.hidden,
+                ResidualForm::HyperConnections(form) => decoder.hidden * form.streams,
+            }
+        } else {
+            decoder.hidden
+        }
+    }
     pub fn depth(&self) -> usize {
         self.blocks.len()
     }
@@ -437,21 +629,132 @@ impl Head {
             return Err(DefinitionError::new("draft head has no blocks"));
         }
         let combined_hidden = checked_product(&[2, decoder.hidden])?;
-        let context = decoder::Context {
-            hidden: decoder.hidden,
-            coordinate_axes,
-            per_layer: None,
-        };
         for block in &self.blocks {
-            decoder::validate_rms(&block.embedding_norm, decoder.hidden, "draft head norm")?;
-            decoder::validate_rms(&block.hidden_norm, decoder.hidden, "draft head norm")?;
-            expect_shape(
-                &block.combine,
-                &[decoder.hidden, combined_hidden],
-                "draft head input projection",
-            )?;
-            decoder::validate_blocks(std::slice::from_ref(&block.block), &context)?;
-            decoder::validate_exit_norm(&block.output_norm, decoder.hidden, "draft head norm")?;
+            if matches!(block.chain, HeadChain::Residual) != self.residual_conditioning() {
+                return Err(DefinitionError::new(
+                    "head blocks must preserve their conditioning representation",
+                ));
+            }
+            let width = block.width(decoder);
+            match &block.input {
+                HeadInput::Combine {
+                    embedding_norm,
+                    hidden_norm,
+                    combine,
+                } => {
+                    decoder::validate_rms(embedding_norm, decoder.hidden, "draft head norm")?;
+                    decoder::validate_rms(
+                        hidden_norm,
+                        self.conditioning_width(decoder),
+                        "draft head norm",
+                    )?;
+                    expect_shape(
+                        combine,
+                        &[decoder.hidden, combined_hidden],
+                        "draft head input projection",
+                    )?;
+                }
+                HeadInput::Projected { pre, .. } => {
+                    if width == 0 {
+                        return Err(DefinitionError::new("draft head has no width"));
+                    }
+                    expect_shape(
+                        pre,
+                        &[width, combined_hidden],
+                        "draft head input projection",
+                    )?;
+                }
+            }
+            if block.blocks.is_empty() {
+                return Err(DefinitionError::new("draft head has no decoder blocks"));
+            }
+            let context = decoder::Context {
+                hidden: width,
+                vocabulary: decoder.vocabulary,
+                coordinate_axes,
+                residual: &block.residual,
+                per_layer: None,
+                shared_sources: match self.history {
+                    HeadHistory::Own => None,
+                    HeadHistory::Target => Some(&decoder.blocks),
+                },
+            };
+            decoder::validate_blocks(&block.blocks, &context)?;
+            decoder::validate_exit_norm(&block.output_norm, &context, "draft head norm")?;
+            if let Some(table) = block.readout.own_table() {
+                expect_shape(
+                    table,
+                    &[decoder.vocabulary, width],
+                    "draft head readout table",
+                )?;
+            }
+            if let ProposalReadoutPolicy::Clustered {
+                centroids,
+                token_order,
+                selected_clusters,
+                ..
+            } = &block.readout.policy
+            {
+                let clusters = centroids.shape.first().copied().unwrap_or(0);
+                if clusters == 0
+                    || *selected_clusters == 0
+                    || *selected_clusters > clusters
+                    || decoder.vocabulary % clusters != 0
+                {
+                    return Err(DefinitionError::new(
+                        "invalid proposal readout cluster geometry",
+                    ));
+                }
+                expect_shape(centroids, &[clusters, width], "proposal readout centroids")?;
+                if token_order.len() as u64 != decoder.vocabulary {
+                    return Err(DefinitionError::new(
+                        "proposal readout ordering must cover the vocabulary",
+                    ));
+                }
+                let mut seen = vec![false; token_order.len()];
+                for token in token_order {
+                    let Some(entry) = seen.get_mut(token.0 as usize) else {
+                        return Err(DefinitionError::new(
+                            "proposal readout ordering has a noncanonical token",
+                        ));
+                    };
+                    if std::mem::replace(entry, true) {
+                        return Err(DefinitionError::new(
+                            "proposal readout ordering repeats a token",
+                        ));
+                    }
+                }
+            }
+            match &block.chain {
+                HeadChain::Residual
+                    if block.residual != decoder.residual || width != decoder.hidden =>
+                {
+                    return Err(DefinitionError::new(
+                        "a residual-chaining head must preserve the target's residual form",
+                    ));
+                }
+                HeadChain::Residual => {}
+                HeadChain::Output if width != decoder.hidden => {
+                    return Err(DefinitionError::new(
+                        "a draft head of its own width chains through a projection",
+                    ));
+                }
+                HeadChain::Output => {}
+                HeadChain::Projected { post } => {
+                    expect_shape(
+                        post,
+                        &[decoder.hidden, width],
+                        "draft head chain projection",
+                    )?;
+                }
+            }
+            if matches!(block.readout.projection, VocabularyProjection::Target)
+                && width != decoder.hidden
+            {
+                return Err(DefinitionError::new(
+                    "a draft head of its own width reads out through its own table",
+                ));
+            }
         }
         Ok(())
     }
@@ -505,10 +808,7 @@ impl ModelDefinition {
         }
         if let Some(head) = &self.head {
             for block in &head.blocks {
-                decoder::blocks_deferred_forms(std::slice::from_ref(&block.block), &mut forms);
-                if matches!(block.output_norm, ExitNorm::HyperConnectionHead(_)) {
-                    forms.push(DeferredForm::HyperConnectionHead);
-                }
+                decoder::blocks_deferred_forms(&block.blocks, &mut forms);
             }
         }
         forms
@@ -707,20 +1007,305 @@ mod tests {
     }
 
     #[test]
+    fn a_head_reading_target_history_names_target_layers_and_owns_none() {
+        let target_layer = SublayerIndex {
+            block: 0,
+            sublayer: 0,
+        };
+        let head = |key_value, history| Head {
+            blocks: vec![HeadBlock {
+                residual: ResidualForm::Single,
+                input: HeadInput::Projected {
+                    pre: weight("pre", &[4, 8]),
+                    embedding_scale: EmbeddingScale::Unit,
+                },
+                blocks: vec![Block {
+                    sublayers: vec![attention("h", key_value)],
+                }],
+                output_norm: ExitNorm::Rms(rms("head_norm", 4)),
+                readout: HeadReadout::full(VocabularyProjection::Own {
+                    table: weight("head_table", &[8, 4]),
+                }),
+                chain: HeadChain::Projected {
+                    post: weight("post", &[4, 4]),
+                },
+            }],
+            history,
+            component: HeadComponent::Draft,
+        };
+        let mut model = definition(vec![attention("a", owned("a", HistoryDomain::Token))]);
+        model.head = Some(head(
+            KeyValue::Shared {
+                source: target_layer,
+            },
+            HeadHistory::Target,
+        ));
+        assert!(model.validate().is_ok());
+        model.head = Some(head(owned("h", HistoryDomain::Token), HeadHistory::Target));
+        assert_eq!(
+            model.validate().unwrap_err().to_string(),
+            "attention reading target history owns its own"
+        );
+        model.head = Some(head(
+            KeyValue::Shared {
+                source: SublayerIndex {
+                    block: 1,
+                    sublayer: 0,
+                },
+            },
+            HeadHistory::Target,
+        ));
+        assert_eq!(
+            model.validate().unwrap_err().to_string(),
+            "shared attention history names no target attention sublayer"
+        );
+        // The same source names the head's own layers when it keeps its own.
+        model.head = Some(head(
+            KeyValue::Shared {
+                source: target_layer,
+            },
+            HeadHistory::Own,
+        ));
+        assert_eq!(
+            model.validate().unwrap_err().to_string(),
+            "shared attention history names no earlier attention sublayer"
+        );
+    }
+
+    #[test]
     fn deferred_forms_are_named_not_rejected_by_the_contract() {
-        let mut model = definition(vec![attention(
+        let model = definition(vec![attention(
             "a",
             owned("a", HistoryDomain::Block { rate: 4 }),
         )]);
-        model.decoder.residual = ResidualForm::HyperConnections(HyperConnections {
-            streams: 4,
-            mixing: HyperConnectionMixing::Sinkhorn { iterations: 20 },
-        });
         assert!(model.validate().is_ok());
+        assert_eq!(model.deferred_forms(), [DeferredForm::BlockHistory]);
+    }
+
+    /// A two-stream, rank-3 site over hidden 4.
+    fn site(name: &str, inject: bool) -> HyperConnectionWeights {
+        HyperConnectionWeights {
+            norm: rms(&format!("{name}.hc_norm"), 8),
+            down: weight(&format!("{name}.hc_down"), &[3, 8]),
+            up: weight(&format!("{name}.hc_up"), &[8, 3]),
+            inject: inject.then(|| weight(&format!("{name}.hc_inject"), &[2, 8])),
+        }
+    }
+
+    fn ngram() -> Sublayer {
+        Sublayer {
+            input: InputNorm::None,
+            op: Operator::NGramInput(Box::new(NGramInput {
+                hash: NGramHash {
+                    context: 2,
+                    heads_per_order: 1,
+                    multipliers: vec![3, 5, 7],
+                    sizes: vec![5, 7],
+                    offsets: vec![0, 5],
+                    reset: 7,
+                },
+                width: 2,
+                table: weight("ple.table", &[12, 2]),
+                key: weight("ple.key", &[8, 4]),
+                value: weight("ple.value", &[4, 4]),
+                key_norm: rms("ple.norm_key", 8),
+                query_norm: rms("ple.norm_query", 8),
+                convolution_norm: rms("ple.norm_conv", 8),
+                convolution: weight("ple.conv", &[8, 4]),
+                kernel: 4,
+                dilation: 3,
+            })),
+            output: OutputForm::Residual,
+        }
+    }
+
+    fn hyper_connected(sublayers: Vec<Sublayer>) -> ModelDefinition {
+        let mut model = definition(sublayers);
+        model.decoder.residual = ResidualForm::HyperConnections(HyperConnections {
+            streams: 2,
+            mixing: HyperConnectionMixing::LowRankGated { rank: 3 },
+        });
+        model.decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output", false));
+        model
+    }
+
+    fn mixed(mut sublayer: Sublayer, name: &str) -> Sublayer {
+        sublayer.input = InputNorm::HyperConnectionMix(site(name, true));
+        sublayer.output = OutputForm::Scatter;
+        sublayer
+    }
+
+    #[test]
+    fn hyper_connections_with_selected_history_and_ngram_input_validate() {
+        let mut selected = attention("a", owned("a", HistoryDomain::Token));
+        let Operator::Attention(operator) = &mut selected.op else {
+            unreachable!()
+        };
+        operator.reads = HistoryReads::Selected {
+            block: 4,
+            blocks: 2,
+            indexer: Indexer {
+                heads: 2,
+                width: 2,
+                query: weight("a.indexer.q", &[4, 4]),
+                key: weight("a.indexer.k", &[2, 4]),
+                query_norm: rms("a.indexer.q_norm", 2),
+                key_norm: rms("a.indexer.k_norm", 2),
+            },
+        };
+        let model = hyper_connected(vec![ngram(), mixed(selected, "a")]);
+        model.validate().unwrap();
+        assert_eq!(model.deferred_forms(), []);
+    }
+
+    #[test]
+    fn sublayers_must_match_the_residual_form() {
+        let plain = attention("a", owned("a", HistoryDomain::Token));
+        let rejects = |model: ModelDefinition| model.validate().unwrap_err().to_string();
         assert_eq!(
-            model.deferred_forms(),
-            [DeferredForm::HyperConnections, DeferredForm::BlockHistory]
+            rejects(hyper_connected(vec![plain.clone()])),
+            "attention sublayer disagrees with the residual form"
         );
+        assert_eq!(
+            rejects(definition(vec![mixed(plain.clone(), "a")])),
+            "attention sublayer disagrees with the residual form"
+        );
+        assert_eq!(
+            rejects(definition(vec![ngram()])),
+            "n-gram input sublayer disagrees with the residual form"
+        );
+        let mut exit_injects = hyper_connected(vec![mixed(plain, "a")]);
+        exit_injects.decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output", true));
+        assert_eq!(
+            rejects(exit_injects),
+            "decoder output norm disagrees with the residual form"
+        );
+    }
+
+    #[test]
+    fn ngram_products_must_be_exact() {
+        let mut sublayer = ngram();
+        let Operator::NGramInput(input) = &mut sublayer.op else {
+            unreachable!()
+        };
+        input.hash.multipliers[2] = u64::MAX / 4;
+        assert_eq!(
+            hyper_connected(vec![sublayer])
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "invalid n-gram input geometry"
+        );
+    }
+
+    /// The reference's vectorized rule (`references/families/qwen4exp.py`
+    /// `ngram_rows`, mlx's `ngram_ids`): the sequence after its `context`
+    /// previous tokens (reset tokens before the sequence), each shift valid
+    /// while the position's segment since the latest reset strictly before
+    /// it reaches back that far.
+    fn reference_rows(hash: &NGramHash, tokens: &[u64]) -> Vec<u64> {
+        let previous = vec![hash.reset; hash.context as usize];
+        reference_rows_after(hash, &previous, tokens)
+    }
+
+    fn reference_rows_after(hash: &NGramHash, previous: &[u64], tokens: &[u64]) -> Vec<u64> {
+        let context = hash.context as usize;
+        assert_eq!(previous.len(), context);
+        let history = previous.iter().chain(tokens).copied().collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for at in context..history.len() {
+            let previous = history[..at]
+                .iter()
+                .rposition(|token| *token == hash.reset)
+                .map_or(-1, |index| index as i64);
+            let in_segment = at as i64 - (previous + 1);
+            let shifted = (0..=context)
+                .map(|shift| match in_segment >= shift as i64 {
+                    true => history[at - shift],
+                    false => hash.reset,
+                })
+                .collect::<Vec<_>>();
+            for order in 2..=context + 1 {
+                let mixed = (1..order).fold(shifted[0] * hash.multipliers[0], |mixed, distance| {
+                    mixed ^ (shifted[distance] * hash.multipliers[distance])
+                });
+                let first = (order - 2) * hash.heads_per_order as usize;
+                for head in first..first + hash.heads_per_order as usize {
+                    rows.push(mixed % hash.sizes[head] + hash.offsets[head]);
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn ngram_rows_follow_the_reference_across_chunks() {
+        let hash = NGramHash {
+            context: 2,
+            heads_per_order: 2,
+            multipliers: vec![1_000_003, 999_983, 1_000_033],
+            sizes: vec![101, 103, 107, 109],
+            offsets: vec![0, 101, 204, 311],
+            reset: 7,
+        };
+        // Resets at the start, adjacent and mid-sequence.
+        let mut state = 11u64;
+        let tokens = (0..64)
+            .map(|index| match index {
+                0 | 9 | 10 | 33 => 7,
+                _ => {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 33) % 50
+                }
+            })
+            .collect::<Vec<_>>();
+        let whole = hash.rows(&[], &tokens);
+        assert_eq!(whole, reference_rows(&hash, &tokens));
+        // Chunked: each chunk reads the tokens before it.
+        for split in [1, 2, 9, 10, 11, 34, 63] {
+            let mut chunked = hash.rows(&[], &tokens[..split]);
+            chunked.extend(hash.rows(&tokens[..split], &tokens[split..]));
+            assert_eq!(chunked, whole, "split at {split}");
+        }
+    }
+
+    /// mlx's `ngram_ids` cases (`test_integer_planner_matches_library_eos_and_batch`):
+    /// every third token the reset, after a previous context that holds a
+    /// reset and a token, at lengths 1, 2, 19 and 512; multipliers of the
+    /// released size (just under `i64::MAX / vocabulary`).
+    #[test]
+    fn ngram_rows_follow_the_reference_after_a_previous_context() {
+        let hash = NGramHash {
+            context: 2,
+            heads_per_order: 8,
+            multipliers: vec![
+                (i64::MAX as u64 / 248_320) | 1,
+                (i64::MAX as u64 / 248_320 / 3) | 1,
+                (i64::MAX as u64 / 248_320 / 7) | 1,
+            ],
+            sizes: (0..16).map(|head| 20_000_003 + 2 * head).collect(),
+            offsets: (0..16).map(|head| head * 20_000_040).collect(),
+            reset: 2,
+        };
+        for length in [1usize, 2, 19, 512] {
+            let mut state = length as u64;
+            let tokens = (0..length)
+                .map(|index| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match index % 3 {
+                        0 => 2,
+                        _ => (state >> 33) % 100,
+                    }
+                })
+                .collect::<Vec<_>>();
+            for previous in [[2, 7], [8, 2]] {
+                assert_eq!(
+                    hash.rows(&previous, &tokens),
+                    reference_rows_after(&hash, &previous, &tokens),
+                    "length {length}, previous {previous:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "magnitude-remote"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+magnitude-remote = "magnitude_remote.cli:main"
+
+[tool.ruff]
+extend = "../pyproject.toml"
+
+[tool.ruff.lint.per-file-ignores]
+# Runs on hosts with their system Python (3.9 on macOS): no newer syntax.
+"src/magnitude_remote/host/*" = ["UP"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/magnitude_remote"]

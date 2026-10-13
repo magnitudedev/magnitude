@@ -12,7 +12,7 @@ use crate::device::{
 };
 use crate::formation::DirectModule;
 use crate::memory::{Buffer, Range};
-use ash::vk;
+use ash::vk::{self, Handle};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,6 +27,23 @@ pub struct DirectLaunch<'a> {
     pub words: &'a [u8],
     pub scalar_results: (&'a Buffer, u64),
     pub groups: [u64; 3],
+}
+
+/// What fixes a launch's device work apart from the values it reads: its
+/// pipeline and group counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LaunchKind {
+    pipeline: u64,
+    groups: [u64; 3],
+}
+
+impl DirectLaunch<'_> {
+    pub fn kind(&self) -> LaunchKind {
+        LaunchKind {
+            pipeline: self.module.pipeline_handle(self.function).as_raw(),
+            groups: self.groups,
+        }
+    }
 }
 
 /// Argument blocks written into upload chunks for one command buffer.
@@ -155,9 +172,11 @@ fn begin(
 }
 
 /// Forms a [`DirectGraph`]: the launches of one submission, in order, with
-/// their argument blocks fixed.
+/// their argument blocks fixed, in one or more segments.
 pub struct DirectGraphBuilder {
     device: Device,
+    /// Heap usage and held memory when recording began.
+    mark: (u64, u64),
     /// Becomes the graph; dropping an abandoned builder retires it (and the
     /// chunks it wrote) unsubmitted.
     graph: Option<GraphInner>,
@@ -167,22 +186,45 @@ pub struct DirectGraphBuilder {
 
 impl DirectGraphBuilder {
     pub fn new(device: &Device) -> Result<Self, ExecutionError> {
-        let mut recording = device.recording();
-        let command = device.command(&mut recording, vk::CommandBufferLevel::SECONDARY)?;
-        let builder = Self {
+        let mut builder = Self {
             device: device.clone(),
+            mark: device.inner.unheld_mark(),
             graph: Some(GraphInner {
                 device: device.clone(),
-                command,
+                commands: Vec::new(),
                 arguments: Vec::new(),
                 last_use: AtomicU64::new(0),
             }),
             arguments: Arguments::new(),
             launched: false,
         };
+        builder.begin_segment()?;
+        Ok(builder)
+    }
+
+    fn graph(&mut self) -> &mut GraphInner {
+        self.graph.as_mut().expect("a live builder holds its graph")
+    }
+
+    fn command(&self) -> vk::CommandBuffer {
+        *self
+            .graph
+            .as_ref()
+            .expect("a live builder holds its graph")
+            .commands
+            .last()
+            .expect("a live builder has begun a segment")
+    }
+
+    /// Allocate and begin the secondary buffer of the next segment.
+    fn begin_segment(&mut self) -> Result<(), ExecutionError> {
+        let device = self.device.clone();
+        let mut recording = device.recording();
+        let command = device.command(&mut recording, vk::CommandBufferLevel::SECONDARY)?;
+        self.graph().commands.push(command);
         let inheritance = vk::CommandBufferInheritanceInfo::default();
         let begun = begin(
-            device,
+            &device,
             command,
             vk::CommandBufferUsageFlags::SIMULTANEOUS_USE,
             Some(&inheritance),
@@ -190,14 +232,26 @@ impl DirectGraphBuilder {
         // Released before an error drops the builder, whose graph retires
         // under this lock.
         drop(recording);
-        begun.map(|()| builder)
+        begun
     }
 
-    fn command(&self) -> vk::CommandBuffer {
-        self.graph
-            .as_ref()
-            .expect("a live builder holds its graph")
-            .command
+    fn end_segment(&self) -> Result<(), ExecutionError> {
+        let recording = self.device.recording();
+        let ended = call(
+            unsafe { self.device.inner.device.end_command_buffer(self.command()) },
+            "vkEndCommandBuffer",
+        );
+        drop(recording);
+        ended
+    }
+
+    /// End the current segment and begin the next: launches added from now
+    /// on can be replayed apart from those added before, in their own queue
+    /// submission. Segments share the graph's argument blocks, and a
+    /// segment's first launch still follows the previous launch's writes.
+    pub fn segment(&mut self) -> Result<(), ExecutionError> {
+        self.end_segment()?;
+        self.begin_segment()
     }
 
     /// Append a launch after every launch added before it; an empty grid
@@ -222,17 +276,21 @@ impl DirectGraphBuilder {
         Ok(())
     }
 
+    /// Finish recording. The device memory recording took beyond blocks
+    /// (command memory) is the graph's; the device keeps it after the graph
+    /// is dropped, for the command buffers it reuses, so it stays held.
     pub fn instantiate(mut self) -> Result<DirectGraph, ExecutionError> {
+        self.end_segment()?;
         let mut graph = self.graph.take().expect("a live builder holds its graph");
         graph.arguments = std::mem::take(&mut self.arguments.chunks);
-        let recording = self.device.recording();
-        let ended = call(
-            unsafe { self.device.inner.device.end_command_buffer(graph.command) },
-            "vkEndCommandBuffer",
-        );
-        drop(recording);
-        ended.map(|()| DirectGraph {
+        let device_bytes = self.device.inner.unheld_since(self.mark);
+        self.device
+            .inner
+            .graphs
+            .fetch_add(device_bytes, Ordering::Relaxed);
+        Ok(DirectGraph {
             inner: std::sync::Arc::new(graph),
+            device_bytes,
         })
     }
 }
@@ -245,17 +303,31 @@ impl Drop for DirectGraphBuilder {
     }
 }
 
-/// A recorded secondary command buffer of launches with fixed arguments.
-/// One replay replaces its launches' individual recording.
+/// Recorded secondary command buffers (its segments, in launch order) of
+/// launches with fixed arguments. One replay replaces its launches'
+/// individual recording.
 pub struct DirectGraph {
     inner: std::sync::Arc<GraphInner>,
+    device_bytes: u64,
 }
 
-/// Shared by the graph and the submissions replaying it, so its buffer and
+impl DirectGraph {
+    pub fn segments(&self) -> usize {
+        self.inner.commands.len()
+    }
+
+    /// Device memory recording the graph took beyond blocks.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_bytes
+    }
+}
+
+
+/// Shared by the graph and the submissions replaying it, so its buffers and
 /// argument blocks outlive every replay.
 struct GraphInner {
     device: Device,
-    command: vk::CommandBuffer,
+    commands: Vec<vk::CommandBuffer>,
     arguments: Vec<Range>,
     /// Timeline value of the latest submission that replays it.
     last_use: AtomicU64,
@@ -263,12 +335,16 @@ struct GraphInner {
 
 impl Drop for GraphInner {
     fn drop(&mut self) {
-        self.device.retire(Retired {
-            value: self.last_use.load(Ordering::Acquire),
-            command: RetiredCommand::Secondary(self.command),
-            queries: None,
-            arguments: std::mem::take(&mut self.arguments),
-        });
+        let value = self.last_use.load(Ordering::Acquire);
+        let mut arguments = std::mem::take(&mut self.arguments);
+        for command in self.commands.drain(..) {
+            self.device.retire(Retired {
+                value,
+                command: RetiredCommand::Secondary(command),
+                queries: None,
+                arguments: std::mem::take(&mut arguments),
+            });
+        }
     }
 }
 
@@ -292,8 +368,106 @@ pub struct DirectBatch {
     /// Graphs replayed by this batch; the submission keeps them alive and
     /// records itself as their last use.
     replayed: Vec<std::sync::Arc<GraphInner>>,
+    /// Host timelines the batch's queue submission waits on before it runs,
+    /// and the ones it signals once it completes, with their values.
+    waits: Vec<(vk::Semaphore, u64)>,
+    signals: Vec<(vk::Semaphore, u64)>,
     /// Set by `commit`; an uncommitted batch returns its resources on drop.
     committed: bool,
+}
+
+/// A timeline semaphore the host and the device's queue submissions both
+/// advance and wait on.
+pub struct HostTimeline {
+    device: Device,
+    semaphore: vk::Semaphore,
+}
+
+impl HostTimeline {
+    /// A timeline at 0.
+    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+        let mut timeline = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let semaphore = call(
+            unsafe {
+                device.inner.device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                    None,
+                )
+            },
+            "vkCreateSemaphore",
+        )?;
+        Ok(Self {
+            device: device.clone(),
+            semaphore,
+        })
+    }
+
+    /// Raise the timeline to `value` from the host; a value it has reached
+    /// already changes nothing.
+    ///
+    /// Host writes made before the signal are visible to the device work
+    /// that waits on `value` (`DirectBatch::wait_timeline`):
+    /// - the writes are to `HOST_COHERENT` memory (every upload allocation,
+    ///   `Memory::new`, which host-shared tensors are), so they are
+    ///   available in the host domain without `vkFlushMappedMemoryRanges`
+    ///   (spec, "Host Access to Device Memory Objects": a flush is required
+    ///   only of memory without `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`);
+    /// - `vkSignalSemaphore`'s first synchronization scope includes every
+    ///   host operation that happened-before it (spec, "Semaphore Signaling",
+    ///   `vkSignalSemaphore`), and the waiting batch's semaphore wait
+    ///   operation's second synchronization and access scopes include every
+    ///   command of the batch and all its device memory accesses, at the
+    ///   stages of its wait mask (spec, "Semaphore Waiting"), which is
+    ///   `COMPUTE_SHADER | ALL_COMMANDS` (`Device::submit_with`).
+    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+        if self.value() >= value {
+            return Ok(());
+        }
+        let info = vk::SemaphoreSignalInfo::default()
+            .semaphore(self.semaphore)
+            .value(value);
+        call(
+            unsafe { self.device.inner.device.signal_semaphore(&info) },
+            "vkSignalSemaphore",
+        )
+    }
+
+    /// The value reached. A failed query reads as reached everything: the
+    /// device cannot make progress.
+    pub fn value(&self) -> u64 {
+        unsafe {
+            self.device
+                .inner
+                .device
+                .get_semaphore_counter_value(self.semaphore)
+        }
+        .unwrap_or(u64::MAX)
+    }
+
+    /// Wait at most `timeout` for the timeline to reach `value`; whether it
+    /// did.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        let semaphores = [self.semaphore];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        unsafe { self.device.inner.device.wait_semaphores(&info, nanoseconds) }.is_ok()
+            && self.value() >= value
+    }
+}
+
+impl Drop for HostTimeline {
+    /// A submission may still wait on or signal the semaphore: every one
+    /// submitted so far completes first. Precondition: every value a
+    /// submission waits on was signaled, or is signaled by one before it.
+    fn drop(&mut self) {
+        let _ = self.device.wait(self.device.submitted());
+        unsafe { self.device.inner.device.destroy_semaphore(self.semaphore, None) };
+    }
 }
 
 impl DirectBatch {
@@ -334,6 +508,8 @@ impl DirectBatch {
             arguments: Arguments::new(),
             launched: false,
             replayed: Vec::new(),
+            waits: Vec::new(),
+            signals: Vec::new(),
             committed: false,
         };
         let begun = begin(
@@ -375,6 +551,23 @@ impl DirectBatch {
         };
         self.written += 1;
         query
+    }
+
+    /// The batch's queue submission waits, before any of its work, until
+    /// `timeline` reaches `value`: the host gate. Precondition: nothing is
+    /// recorded in the batch yet.
+    pub fn wait_timeline(&mut self, timeline: &HostTimeline, value: u64) {
+        assert!(
+            !self.launched,
+            "DirectBatch::wait_timeline precondition: the batch records nothing yet"
+        );
+        self.waits.push((timeline.semaphore, value));
+    }
+
+    /// `timeline` reaches `value` once the batch's queue submission
+    /// completes. Precondition: the batch records nothing after this.
+    pub fn signal_timeline(&mut self, timeline: &HostTimeline, value: u64) {
+        self.signals.push((timeline.semaphore, value));
     }
 
     /// Record a launch that does no device work (inactive, or an empty
@@ -422,6 +615,23 @@ impl DirectBatch {
 
     /// Execute every launch of `graph` in its order.
     pub fn replay(&mut self, graph: &DirectGraph) -> Result<(), ExecutionError> {
+        self.execute(graph, &graph.inner.commands)
+    }
+
+    /// Execute the launches of one segment of `graph`.
+    pub fn replay_segment(
+        &mut self,
+        graph: &DirectGraph,
+        segment: usize,
+    ) -> Result<(), ExecutionError> {
+        self.execute(graph, std::slice::from_ref(&graph.inner.commands[segment]))
+    }
+
+    fn execute(
+        &mut self,
+        graph: &DirectGraph,
+        commands: &[vk::CommandBuffer],
+    ) -> Result<(), ExecutionError> {
         assert!(
             self.marks.is_none(),
             "DirectBatch::replay precondition: a timed batch times each launch"
@@ -432,10 +642,16 @@ impl DirectBatch {
             if self.launched {
                 compute_barrier(raw, self.command);
             }
-            raw.cmd_execute_commands(self.command, &[graph.inner.command]);
+            raw.cmd_execute_commands(self.command, commands);
         }
         self.launched = true;
-        self.replayed.push(graph.inner.clone());
+        if !self
+            .replayed
+            .iter()
+            .any(|replayed| std::sync::Arc::ptr_eq(replayed, &graph.inner))
+        {
+            self.replayed.push(graph.inner.clone());
+        }
         Ok(())
     }
 
@@ -463,7 +679,9 @@ impl DirectBatch {
         );
         drop(recording);
         ended?;
-        let value = self.device.submit(self.command)?;
+        let value = self
+            .device
+            .submit_with(self.command, &self.waits, &self.signals)?;
         for graph in &self.replayed {
             graph.last_use.fetch_max(value, Ordering::AcqRel);
         }

@@ -6,18 +6,31 @@ pub(crate) mod graph;
 
 use super::{PlanError, WeightPush};
 use crate::RecurrentBinding;
-use magnitude_family_contracts::{GatedDelta, WeightKind};
+use magnitude_family_contracts::{GateFunction, GatedDelta, WeightKind};
 use seismic::Element;
 
 /// The recurrent entries take one norm epsilon: the recurrent norm's must be
-/// the input norm's.
+/// the input norm's. Their output gate is SiLU or sigmoid.
 pub(super) fn admit(delta: &GatedDelta, input_epsilon: f64) -> Result<(), PlanError> {
     if delta.norm.epsilon != input_epsilon {
         return Err(PlanError::Unsupported(
             "gated delta norm epsilon differing from its input norm",
         ));
     }
+    if delta.output_gate == GateFunction::Softplus {
+        return Err(PlanError::Unsupported("softplus gated delta output gate"));
+    }
     Ok(())
+}
+
+/// The recurrent entries' `gate_function` code: 0 SiLU, 1 sigmoid
+/// (`output_gate` in functions.seismic). [`admit`] rejects every other gate.
+pub(crate) fn gate_function(delta: &GatedDelta) -> i32 {
+    match delta.output_gate {
+        GateFunction::Silu => 0,
+        GateFunction::Sigmoid => 1,
+        GateFunction::Softplus => unreachable!("admission rejects softplus gated delta gates"),
+    }
 }
 
 /// The weights the operator binds, in the order its entries consume them.
@@ -37,8 +50,13 @@ pub(super) fn weights<'a>(delta: &'a GatedDelta, push: &mut WeightPush<'_, 'a>) 
 /// its weights.
 pub(super) fn shape_key(delta: &GatedDelta) -> String {
     format!(
-        "gated delta {} {} {} {} {:?}",
-        delta.convolution_width, delta.key_heads, delta.value_heads, delta.width, delta.head_mapping
+        "gated delta {} {} {} {} {:?} {:?}",
+        delta.convolution_width,
+        delta.key_heads,
+        delta.value_heads,
+        delta.width,
+        delta.head_mapping,
+        delta.output_gate
     )
 }
 

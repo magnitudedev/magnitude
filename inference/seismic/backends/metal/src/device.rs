@@ -14,7 +14,10 @@ use objc2_metal::{
 use seismic_compiler::errors::{ExecutionError, TargetError};
 use seismic_compiler::executable::DeviceService;
 use std::fmt;
-use std::{any::Any, ptr::NonNull, sync::{Arc, Mutex}};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::Duration;
+use std::{any::Any, ptr::NonNull};
 
 /// A retained `MTLDevice`. `MTLDevice` is `Send + Sync`; identity is the
 /// device's registry id.
@@ -32,15 +35,17 @@ impl DeviceHandle {
     /// Cheap enumeration of unopened physical Metal devices. This performs no
     /// queue creation, native compilation, or profiling.
     pub fn discover() -> Vec<Self> {
-        MTLCopyAllDevices()
-            .into_iter()
-            .map(|device| Self { device })
-            .collect()
+        crate::pooled(|| {
+            MTLCopyAllDevices()
+                .into_iter()
+                .map(|device| Self { device })
+                .collect()
+        })
     }
 
     /// The system default Metal device.
     pub fn system_default() -> Result<Self, TargetError> {
-        let device = MTLCreateSystemDefaultDevice()
+        let device = crate::pooled(|| MTLCreateSystemDefaultDevice())
             .ok_or_else(|| TargetError::DeviceUnavailable("no Metal device".into()))?;
         Ok(Self { device })
     }
@@ -50,7 +55,7 @@ impl DeviceHandle {
     }
 
     pub fn name(&self) -> String {
-        self.device.name().to_string()
+        crate::pooled(|| self.device.name().to_string())
     }
 
     /// `MTLDevice.maxBufferLength`: the single-allocation limit. It is neither
@@ -98,13 +103,112 @@ impl fmt::Debug for DeviceHandle {
     }
 }
 
-type ResidencySet = Arc<Mutex<Retained<ProtocolObject<dyn MTLResidencySet>>>>;
+/// macOS lets a residency set's requested residency lapse about 1 s after
+/// the set's last GPU work and un-wires its allocations until the next GPU
+/// work wires them again, about 10 ms per GB before that work's first result
+/// (M1 Ultra, macOS 26.7: 26 GB un-wired 1.05 s after a request, +0.26 s to
+/// the next first token). Renewing ten times inside that second keeps them
+/// wired through every idle gap; stopping wakes the renewer at once, so the
+/// interval adds no latency to an unload or exit.
+const RESIDENCY_RENEWAL: Duration = Duration::from_millis(100);
+
+/// The device's residency set and its renewal. While the set holds an
+/// allocation one thread renews the set's residency every
+/// `RESIDENCY_RENEWAL`; the release of its last allocation stops and joins
+/// that thread, and the next allocation starts another. Wired memory is
+/// released by releasing allocations, never by letting residency lapse.
+struct Residency {
+    wired: Mutex<Wired>,
+    stop: Condvar,
+}
+
+struct Wired {
+    set: Retained<ProtocolObject<dyn MTLResidencySet>>,
+    renewer: Option<JoinHandle<()>>,
+    generation: u64,
+    renewals: u64,
+}
+
+// The set is used only under the residency mutex, on whichever thread holds
+// it.
+unsafe impl Send for Wired {}
+
+impl Residency {
+    fn new(set: Retained<ProtocolObject<dyn MTLResidencySet>>) -> Arc<Self> {
+        Arc::new(Self {
+            wired: Mutex::new(Wired {
+                set,
+                renewer: None,
+                generation: 0,
+                renewals: 0,
+            }),
+            stop: Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Wired> {
+        self.wired.lock().expect("Metal residency lock poisoned")
+    }
+
+    fn add(self: &Arc<Self>, buffer: &ProtocolObject<dyn MTLBuffer>) {
+        let mut wired = self.lock();
+        crate::pooled(|| {
+            wired.set.addAllocation(ProtocolObject::from_ref(buffer));
+            wired.set.commit();
+        });
+        if wired.renewer.is_none() {
+            let residency = self.clone();
+            let generation = wired.generation;
+            let renewer = std::thread::Builder::new()
+                .name("metal-residency".into())
+                .spawn(move || residency.renew(generation))
+                .expect("could not start the Metal residency renewer");
+            wired.renewer = Some(renewer);
+        }
+    }
+
+    fn remove(&self, buffer: &ProtocolObject<dyn MTLBuffer>) {
+        let renewer = {
+            let mut wired = self.lock();
+            crate::pooled(|| {
+                wired.set.removeAllocation(ProtocolObject::from_ref(buffer));
+                wired.set.commit();
+            });
+            if wired.set.allocationCount() > 0 {
+                return;
+            }
+            wired.generation += 1;
+            wired.renewer.take()
+        };
+        self.stop.notify_all();
+        if let Some(renewer) = renewer {
+            renewer.join().expect("the Metal residency renewer panicked");
+        }
+    }
+
+    /// Renews residency until `generation` is stopped. The first renewal is
+    /// immediate: a request made before the set held anything may already
+    /// have lapsed.
+    fn renew(&self, generation: u64) {
+        let mut wired = self.lock();
+        while wired.generation == generation {
+            crate::pooled(|| wired.set.requestResidency());
+            wired.renewals += 1;
+            wired = self
+                .stop
+                .wait_timeout(wired, RESIDENCY_RENEWAL)
+                .expect("Metal residency lock poisoned")
+                .0;
+        }
+    }
+}
 
 /// A buffer's membership of its device's residency set. The buffer is wired
 /// from the commit that adds it until its last handle is dropped, so the
-/// kernel never compresses or swaps it.
+/// kernel never compresses or swaps it while macOS honors the set's renewed
+/// residency.
 struct WiredAllocation {
-    residency: ResidencySet,
+    residency: Arc<Residency>,
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
 }
 
@@ -112,10 +216,8 @@ unsafe impl Send for WiredAllocation {}
 unsafe impl Sync for WiredAllocation {}
 
 impl WiredAllocation {
-    fn wire(residency: &ResidencySet, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
-        let set = residency.lock().expect("Metal residency lock poisoned");
-        set.addAllocation(ProtocolObject::from_ref(&**buffer));
-        set.commit();
+    fn wire(residency: &Arc<Residency>, buffer: &Retained<ProtocolObject<dyn MTLBuffer>>) -> Self {
+        residency.add(buffer);
         Self {
             residency: residency.clone(),
             buffer: buffer.clone(),
@@ -125,9 +227,7 @@ impl WiredAllocation {
 
 impl Drop for WiredAllocation {
     fn drop(&mut self) {
-        let set = self.residency.lock().expect("Metal residency lock poisoned");
-        set.removeAllocation(ProtocolObject::from_ref(&*self.buffer));
-        set.commit();
+        self.residency.remove(&self.buffer);
     }
 }
 
@@ -207,7 +307,7 @@ pub struct MetalDevice {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     /// Every buffer this device allocates. The queue carries the set, so
     /// command buffers inherit it without per-buffer encodings.
-    residency: ResidencySet,
+    residency: Arc<Residency>,
 }
 
 unsafe impl Send for MetalDevice {}
@@ -215,6 +315,10 @@ unsafe impl Sync for MetalDevice {}
 
 impl MetalDevice {
     pub fn open(handle: DeviceHandle) -> Result<Self, TargetError> {
+        crate::pooled(|| Self::form(handle))
+    }
+
+    fn form(handle: DeviceHandle) -> Result<Self, TargetError> {
         // Compilation is shared by every native entry formed on this device.
         // Metal defaults to a small compiler pool; allow the system to scale
         // compilation concurrency to the machine before forming any kernels.
@@ -229,12 +333,10 @@ impl MetalDevice {
                 "could not create a Metal residency set: {error}"
             )))?;
         queue.addResidencySet(&residency);
-        // Requested once while empty: each later commit wires what it adds.
-        residency.requestResidency();
         Ok(Self {
             handle,
             queue,
-            residency: Arc::new(Mutex::new(residency)),
+            residency: Residency::new(residency),
         })
     }
 
@@ -253,13 +355,14 @@ impl MetalDevice {
         let length = usize::try_from(bytes.max(1)).map_err(|_| {
             ExecutionError::AllocationFailed(format!("{bytes} bytes exceed the host address space"))
         })?;
-        let buffer = self
-            .handle
-            .raw()
-            .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| {
-                ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
-            })?;
+        let buffer = crate::pooled(|| {
+            self.handle
+                .raw()
+                .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
+        })
+        .ok_or_else(|| {
+            ExecutionError::AllocationFailed(format!("Metal refused a {bytes}-byte buffer"))
+        })?;
         let wired = WiredAllocation::wire(&self.residency, &buffer);
         Ok(MetalBuffer {
             buffer,
@@ -297,7 +400,7 @@ impl MetalDevice {
                 "Metal host mapping exceeds maximum buffer length".into(),
             ));
         }
-        let buffer = unsafe {
+        let buffer = crate::pooled(|| unsafe {
             self.handle
                 .raw()
                 .newBufferWithBytesNoCopy_length_options_deallocator(
@@ -306,7 +409,7 @@ impl MetalDevice {
                     MTLResourceOptions::StorageModeShared,
                     None,
                 )
-        }
+        })
         .ok_or_else(|| {
             ExecutionError::AllocationFailed("Metal refused a read-only host mapping".into())
         })?;
@@ -419,7 +522,7 @@ mod mapped_tests {
         assert_eq!(byte, [73]);
         assert!(device.write(&buffer, 0, &[1]).is_err());
         // A host mapping stays file-backed: it never joins the residency set.
-        assert_eq!(device.residency.lock().unwrap().allocationCount(), 0);
+        assert_eq!(device.residency.lock().set.allocationCount(), 0);
         drop(buffer);
         assert!(weak.upgrade().is_none());
     }
@@ -431,7 +534,7 @@ mod mapped_tests {
         };
         let device = MetalDevice::open(handle).unwrap();
         let wired = |buffer: &MetalBuffer| {
-            let set = device.residency.lock().unwrap();
+            let set = &device.residency.lock().set;
             (
                 set.containsAllocation(ProtocolObject::from_ref(buffer.raw())),
                 set.allocationCount(),
@@ -449,6 +552,55 @@ mod mapped_tests {
         drop(handle);
         assert_eq!(wired(&second), (true, 1, 1 << 16));
         drop(second);
-        assert_eq!(device.residency.lock().unwrap().allocationCount(), 0);
+        assert_eq!(device.residency.lock().set.allocationCount(), 0);
+    }
+
+    #[test]
+    fn residency_is_renewed_while_the_set_holds_an_allocation() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle).unwrap();
+        let renewing = || {
+            let wired = device.residency.lock();
+            (wired.renewer.is_some(), wired.renewals)
+        };
+        assert_eq!(renewing(), (false, 0));
+
+        let first = device.allocate_bytes(1 << 16).unwrap();
+        let second = device.allocate_bytes(1 << 16).unwrap();
+        std::thread::sleep(RESIDENCY_RENEWAL * 3 + RESIDENCY_RENEWAL / 2);
+        let (running, renewals) = renewing();
+        assert!(running);
+        assert!((3..=5).contains(&renewals), "{renewals} renewals");
+
+        drop(first);
+        assert!(renewing().0);
+        drop(second);
+        let (running, stopped_at) = renewing();
+        assert!(!running);
+        std::thread::sleep(RESIDENCY_RENEWAL * 2);
+        assert_eq!(renewing(), (false, stopped_at));
+
+        let third = device.allocate_bytes(1 << 16).unwrap();
+        std::thread::sleep(RESIDENCY_RENEWAL / 2);
+        assert_eq!(renewing(), (true, stopped_at + 1));
+        drop(third);
+        assert!(!renewing().0);
+    }
+
+    #[test]
+    fn stopping_the_renewer_does_not_wait_for_its_interval() {
+        let Ok(handle) = DeviceHandle::system_default() else {
+            return;
+        };
+        let device = MetalDevice::open(handle).unwrap();
+        for _ in 0..20 {
+            let buffer = device.allocate_bytes(1 << 12).unwrap();
+            let started = std::time::Instant::now();
+            drop(buffer);
+            assert!(started.elapsed() < RESIDENCY_RENEWAL / 2);
+        }
+        assert_eq!(device.residency.lock().generation, 20);
     }
 }

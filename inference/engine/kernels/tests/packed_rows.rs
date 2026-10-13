@@ -46,8 +46,10 @@ fn packed_stages_on(device: &seismic::Device) {
             seismic::NativeSpecialization::new(),
             |statics, name| {
                 let value = match name.as_str() {
-                    "H" | "D" | "W" => 32,
-                    "NK" | "NV" | "Q" => 1,
+                    "H" | "D" | "W" | "NM" => 32,
+                    "NK" | "NV" | "Q" | "PT" | "SN" => 1,
+                    "IN" => 0,
+                    "QB" | "ZB" | "OB" => 0,
                     _ => panic!("unexpected static {name}"),
                 };
                 statics.with_static(name.clone(), value)
@@ -109,11 +111,26 @@ fn packed_stages_on(device: &seismic::Device) {
     let previous_bank = indices(&device, &[1], &[0]);
     let previous_tape = indices(&device, &[1], &[0]);
     let following_bank = indices(&device, &[1], &[1]);
-    let mut slabs = seismic::SlabTensor::new(&device, 2, 2, vec![
-        seismic::SlabRegion { element: bf16, row_shape: vec![2, 96] },
-        seismic::SlabRegion { element: seismic::Element::f32(), row_shape: vec![1, 32, 32] },
-        seismic::SlabRegion { element: seismic::Element::f32(), row_shape: vec![1, 65] },
-    ]).unwrap();
+    let mut slabs = seismic::SlabTensor::new(
+        &device,
+        2,
+        2,
+        vec![
+            seismic::SlabRegion {
+                element: bf16,
+                row_shape: vec![2, 96],
+            },
+            seismic::SlabRegion {
+                element: seismic::Element::f32(),
+                row_shape: vec![1, 32, 32],
+            },
+            seismic::SlabRegion {
+                element: seismic::Element::f32(),
+                row_shape: vec![1, 65],
+            },
+        ],
+    )
+    .unwrap();
     slabs.add_slab().unwrap();
     let mut window = slabs.logical_region(0).unwrap();
     let mut delta = slabs.logical_region(1).unwrap();
@@ -145,6 +162,8 @@ fn packed_stages_on(device: &seismic::Device) {
         alpha_weight: &alpha_weight,
         beta_weight: &beta_weight,
         epsilon,
+        qkv_bound: &tensor(&device, &[0], &[]),
+        gate_bound: &tensor(&device, &[0], &[]),
     })
     .unwrap()
     .value;
@@ -189,6 +208,7 @@ fn packed_stages_on(device: &seismic::Device) {
         norm_epsilon: epsilon,
         epsilon,
         grouped: true,
+        gate_function: 0,
         slab_banks: 2,
     })
     .unwrap()
@@ -201,8 +221,10 @@ fn packed_stages_on(device: &seismic::Device) {
     .unwrap()
     .call(attention_output::Args {
         hidden: &hidden,
+        inject: &no_inject(&device, hidden.extents()[0]),
         gated: &gated,
         output_weight: &zero_weight,
+        output_bound: &tensor(&device, &[0], &[]),
     })
     .unwrap()
     .value;
@@ -271,4 +293,9 @@ fn packed_entries_are_the_only_generated_target_surface() {
             "obsolete generated entry {obsolete}"
         );
     }
+}
+
+/// The inject port of a single residual stream: no columns.
+fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
+    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
 }

@@ -25,8 +25,8 @@ pub(crate) mod graph;
 use crate::error::PlanError;
 use crate::{DenseScales, RoutedBinding, ScalableWeight};
 use magnitude_family_contracts::{
-    ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn,
-    RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
+    ActivationFunction, ExpertSelection, FeedForwardUp, RouteNormalization, RoutedFfn, RouterInput,
+    ScoreFunction, SharedExpert, SharedExpertGate, WeightKind,
 };
 use seismic::Element;
 
@@ -107,7 +107,7 @@ impl GeneralRoutedShape {
                 ScoreFunction::Softmax => 0,
                 ScoreFunction::Sigmoid => 1,
                 ScoreFunction::SqrtSoftplus => {
-                    return Err(PlanError::Unsupported("sqrt-softplus expert scores"))
+                    return Err(PlanError::Unsupported("sqrt-softplus expert scores"));
                 }
             },
             normalization,
@@ -219,7 +219,10 @@ pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
     if !matches!(router.selection, ExpertSelection::TopK { .. }) {
         return Err(PlanError::Unsupported("expert selection"));
     }
-    if !matches!(router.score, ScoreFunction::Softmax | ScoreFunction::Sigmoid) {
+    if !matches!(
+        router.score,
+        ScoreFunction::Softmax | ScoreFunction::Sigmoid
+    ) {
         return Err(PlanError::Unsupported("expert score function"));
     }
     if !router.scale.is_finite() {
@@ -230,7 +233,9 @@ pub(crate) fn admit(routed: &RoutedFfn) -> Result<(), PlanError> {
         .as_ref()
         .is_some_and(|shared| shared.gate != SharedExpertGate::None)
     {
-        return Err(PlanError::Unsupported("gated shared expert with general routing"));
+        return Err(PlanError::Unsupported(
+            "gated shared expert with general routing",
+        ));
     }
     Ok(())
 }
@@ -302,7 +307,9 @@ pub(super) fn fused_binding(
         shared: routed
             .shared
             .as_ref()
-            .ok_or(PlanError::Unsupported("routed feed-forward without shared expert"))?
+            .ok_or(PlanError::Unsupported(
+                "routed feed-forward without shared expert",
+            ))?
             .intermediate,
         normalize_selected: routed.router.normalization == RouteNormalization::Sum,
         norm: lookup(WeightKind::InputNorm)?,

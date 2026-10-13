@@ -7,6 +7,7 @@
 #define KERNEL_W0 SEISMIC_TABLE
 #endif
 #include "lib/core/activation.cuh"
+#include "lib/core/gathered.cuh"
 #include "lib/core/reduce.cuh"
 #include <seismic/packets.cuh>
 
@@ -56,8 +57,9 @@ extern "C" __global__ void embedding_rows(SEISMIC_KERNEL_PARAMS) {
     const u64 width = SEISMIC_DIM_D;
     const float scale = __uint_as_float((unsigned)SEISMIC_PARAM_SCALE);
     const bool normalize = SEISMIC_PARAM_NORMALIZE != 0;
-    // (token, status) rows; a failed selection (-1) embeds token 0.
-    const u64 token = (u64)max(tokens[row * SEISMIC_TOKENS_STRIDE_0], 0);
+    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
     const u64 out0 = row * SEISMIC_RESULT_0_STRIDE_0;
     const u64 out1 = row * SEISMIC_RESULT_1_STRIDE_0;
     const u64 stride1 = SEISMIC_RESULT_0_STRIDE_1, wide1 = SEISMIC_RESULT_1_STRIDE_1;

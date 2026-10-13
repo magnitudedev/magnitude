@@ -1,11 +1,14 @@
-//! Post-install kernel tuning: after a catalog download, one inference worker prepares the
-//! model's programs on the device a load would select, so the first load finds its tuning in the
-//! kernel cache. The job resolves and previews exactly as a load does, holds the residency side
-//! of the device exclusion, and never imports the model. A load of the same bundle stops it.
+//! Post-install kernel tuning: after a catalog download, one inference worker runs the model's
+//! Prepare on the device a load would select, so the first load finds every tuning record in the
+//! kernel cache and is one worker, as any later load. The job resolves and previews exactly as a
+//! load does, holds the residency side of the device exclusion, and never imports the model. A
+//! load of the same bundle stops it; the records it published stand, and the load has its own
+//! Prepare search the units the job had not reached.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use magnitude_engine::worker::Preparation as WorkerPreparation;
 use magnitude_engine::worker::protocol::LoadProgress;
 use magnitude_executor::platform::DeviceRequest;
 use magnitude_service_contracts::models::{
@@ -119,7 +122,7 @@ pub(crate) async fn optimize(
             %model_id,
             code = failure.code(),
             message = failure.message(),
-            "installed model optimization did not finish; its next load tunes"
+            "installed model optimization did not finish; its next load's preparation continues it"
         ),
     }
 }
@@ -157,11 +160,15 @@ async fn prepare(
     manifest.device = DeviceRequest::Selector(preview.device);
     let prepared = crate::spawn_blocking_traced(move || {
         let mut progression = OptimizationProgression::new(device);
-        spawned.prepare(manifest, move |update| {
-            if let Some(update) = progression.advance(update) {
-                progress(update);
-            }
-        })
+        magnitude_engine::worker::prepare(
+            &manifest,
+            || Ok(spawned.into_process()),
+            move |update| {
+                if let Some(update) = progression.advance(update) {
+                    progress(update);
+                }
+            },
+        )
     })
     .await
     .map_err(|error| {
@@ -172,9 +179,14 @@ async fn prepare(
         )
     })?;
     match prepared {
-        Ok(()) => Ok(Preparation::Prepared),
-        Err(_) if job.stopped() => Ok(Preparation::Skipped("a load of the model stopped it")),
-        Err(error) => Err(ModelOperationFailure::new(
+        Ok(WorkerPreparation::Prepared | WorkerPreparation::Unneeded) => Ok(Preparation::Prepared),
+        Ok(WorkerPreparation::Unshared) => {
+            Ok(Preparation::Skipped("the configuration names no kernel cache"))
+        }
+        Ok(WorkerPreparation::Incomplete(_)) | Err(_) if job.stopped() => {
+            Ok(Preparation::Skipped("a load of the model stopped it"))
+        }
+        Ok(WorkerPreparation::Incomplete(error)) | Err(error) => Err(ModelOperationFailure::new(
             "model_optimization_failed",
             match worker.diagnostics() {
                 diagnostics if diagnostics.is_empty() => error.to_string(),

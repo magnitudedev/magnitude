@@ -44,8 +44,9 @@
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32)
 #define REPACK_IQ4 1
 #define REPACK_CODE_BITS 4u
-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)
-// block_q4_0: d (f16) | qs[16].
+#elif (defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)) || \
+    (defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_NL_BLOCK) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32S))
+// block_q4_0 and one block_iq4_nl: d (f16) | qs[16].
 #define REPACK_BLOCK32 1
 #define REPACK_SCALE_BYTES 2u
 #define REPACK_QS 2u
@@ -77,6 +78,21 @@
 #define REPACK_E2M1 1
 #define REPACK_SCALE_BYTES 4u
 #define REPACK_CODE_BITS 4u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XS)
+// block_iq2_xs: d (f16) | qs[32] (u16: 9-bit grid index, 7 signs) |
+// scales[8] (two 4-bit sub-block scales each, low first). The resident
+// factor is d / 8.
+#define REPACK_GRID 1
+#define REPACK_GRID_FACTOR 0.125f
+#define REPACK_CODE_BITS 2u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ3_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ3XXS)
+// block_iq3_xxs: d (f16) | qs[64] (8-bit grid indices of four values) |
+// eight u32, one per 32 values: four 7-bit sign groups, then the 4-bit
+// scale. The resident factor is d / 4.
+#define REPACK_GRID 1
+#define REPACK_IQ3XXS 1
+#define REPACK_GRID_FACTOR 0.25f
+#define REPACK_CODE_BITS 3u
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -157,9 +173,30 @@ constant uint iq3s_grid[512] = {
 };
 #endif
 
-// Raw code of position `p` (0 <= p < GROUP) of one source packet.
+#if defined(REPACK_GRID)
+// Resident vector-code entry `e` (values 8e .. 8e + 7) of a source block: the
+// grid indices, then the seven signs (registry `gguf_iq2_xs`,
+// `gguf_iq3_xxs`).
+inline uint grid_entry(device const uchar *in, uint e) {
+#if defined(REPACK_IQ3XXS)
+    uint block = e / 4, group = e % 4;
+    uint signs = uint(in[66 + 4 * block]) | (uint(in[67 + 4 * block]) << 8) | (uint(in[68 + 4 * block]) << 16) |
+                 (uint(in[69 + 4 * block]) << 24);
+    return uint(in[2 + 8 * block + 2 * group]) | (uint(in[3 + 8 * block + 2 * group]) << 8) |
+           (((signs >> (7 * group)) & 127u) << 16);
+#else
+    return uint(in[2 + 2 * e]) | (uint(in[3 + 2 * e]) << 8);
+#endif
+}
+#endif
+
+// Raw code of position `p` (0 <= p < GROUP) of one source packet; for vector
+// codes, the position's REPACK_CODE_BITS slice of its entry (an entry is its
+// eight positions' slices).
 inline uint source_code(device const uchar *in, uint p) {
-#if defined(REPACK_KQUANT) && REPACK_CODE_BITS == 4u
+#if defined(REPACK_GRID)
+    return (grid_entry(in, p / 8) >> (REPACK_CODE_BITS * (p % 8))) & ((1u << REPACK_CODE_BITS) - 1u);
+#elif defined(REPACK_KQUANT) && REPACK_CODE_BITS == 4u
     return (in[16 + (p / 64) * 32 + p % 32] >> ((p % 64 / 32) * 4)) & 15u;
 #elif defined(REPACK_KQUANT)
     uint low = (in[48 + (p / 64) * 32 + p % 32] >> ((p % 64 / 32) * 4)) & 15u;
@@ -261,6 +298,11 @@ inline void write_scales(device const uchar *in, device uchar *out) {
 #elif defined(REPACK_IQ3S)
     // Both halves of 32-value sub-block b take 1 + 2 s, s its four-bit scale.
     for (uint j = 0; j < 16; ++j) out[j] = uchar(1u + 2u * ((uint(in[106 + j / 4]) >> (4 * (j / 2 % 2))) & 15u));
+#elif defined(REPACK_IQ3XXS)
+    // Sub-block b's scale is the top nibble of its u32, nibble b of the plane.
+    for (uint j = 0; j < 4; ++j) out[j] = uchar((in[69 + 8 * j] >> 4) | (in[73 + 8 * j] & 0xf0u));
+#elif defined(REPACK_GRID)
+    for (uint j = 0; j < 8; ++j) out[j] = in[66 + j];
 #endif
 }
 
@@ -276,6 +318,10 @@ inline void write_supers(device const uchar *in, device uchar *out) {
     reinterpret_cast<device ushort *>(out)[0] = ushort(uint(in[0]) | (uint(in[1]) << 8));
 #elif defined(REPACK_Q8)
     reinterpret_cast<device ushort *>(out)[0] = ushort(uint(in[0]) | (uint(in[1]) << 8));
+#elif defined(REPACK_GRID)
+    // d widened and scaled by a power of two, exactly.
+    reinterpret_cast<device float *>(out)[0] =
+        float(as_type<half>(ushort(uint(in[0]) | (uint(in[1]) << 8)))) * REPACK_GRID_FACTOR;
 #elif defined(REPACK_IQ4NL)
     // Each block's f16 scale, widened exactly.
     for (uint j = 0; j < 8; ++j)
@@ -296,6 +342,18 @@ inline uint pack_eight(device const uchar *in, uint first, uint shift, uint bits
     uint value = 0;
     for (uint i = 0; i < 8; ++i)
         value |= ((source_code(in, first + i) >> shift) & ((1u << bits) - 1u)) << (i * bits);
+    return value;
+}
+
+// Word `word` of the codes of positions `first ..`, REPACK_CODE_BITS each,
+// packed little-endian (a code may straddle two words).
+inline uint code_word(device const uchar *in, uint first, uint word) {
+    uint value = 0;
+    for (uint code = (word * 32) / REPACK_CODE_BITS; code <= (word * 32 + 31) / REPACK_CODE_BITS; ++code) {
+        int shift = int(code * REPACK_CODE_BITS) - int(word * 32);
+        uint raw = source_code(in, first + code);
+        value |= shift >= 0 ? raw << uint(shift) : raw >> uint(-shift);
+    }
     return value;
 }
 
@@ -364,14 +422,7 @@ kernel void repack_weight(
         if (n >= SEISMIC_DIM_N) continue;
         device const uchar *in = source_packet(source, seismic_words, b, n, packet);
         uint word = within / 32 * code_words + item % code_words;
-        uint first = (word * 32) / REPACK_CODE_BITS;
-        uint last = (word * 32 + 31) / REPACK_CODE_BITS;
-        uint value = 0;
-        for (uint code = first; code <= last; ++code) {
-            int shift = int(code * REPACK_CODE_BITS) - int(word * 32);
-            uint raw = source_code(in, code);
-            value |= shift >= 0 ? raw << uint(shift) : raw >> uint(-shift);
-        }
+        uint value = code_word(in, 0, word);
         device uchar *out = destination_packet(destination, seismic_words, b, n, packet);
 #if SEISMIC_ELEMENT_U_PACKET_SIZE % 4 == 0
         reinterpret_cast<device uint *>(out + SEISMIC_ELEMENT_U_PLANE_0_OFFSET)[word] = value;
@@ -385,7 +436,8 @@ kernel void repack_weight(
     const ulong n = row0 + lane;
     device const uchar *in = source_packet(source, seismic_words, b, n, packet);
     device uchar *out = destination_packet(destination, seismic_words, b, n, packet);
-#if defined(REPACK_KQUANT) || defined(REPACK_Q6K) || defined(REPACK_Q3K) || defined(REPACK_IQ3S)
+#if defined(REPACK_KQUANT) || defined(REPACK_Q6K) || defined(REPACK_Q3K) || defined(REPACK_IQ3S) || \
+    defined(REPACK_GRID)
     write_scales(in, out + SEISMIC_ELEMENT_U_PLANE_1_OFFSET);
     write_supers(in, out + SEISMIC_ELEMENT_U_PLANE_2_OFFSET);
 #else
@@ -507,7 +559,12 @@ kernel void repack_weight(
         const bool stored = n < SEISMIC_DIM_N;
         const ulong unit = column0 / TILE_COLUMNS;
         device const uchar *in = source_packet(source, seismic_words, b, stored ? n : 0ul, column0 / GROUP);
-#if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+        // The unit's four grid entries, REPACK_CODE_BITS words.
+        device uint *grids = reinterpret_cast<device uint *>(plane_unit(destination, seismic_words, b, n,
+            SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET, 4ul * REPACK_CODE_BITS, unit));
+        for (uint word = 0; word < REPACK_CODE_BITS; ++word) grids[word] = stored ? code_word(in, within, word) : 0u;
+#elif defined(SEISMIC_ELEMENT_U_PLANE_CODES)
         device uint4 *codes = reinterpret_cast<device uint4 *>(plane_unit(destination, seismic_words, b, n,
             SEISMIC_RESULT_0_PLANE_CODES_ROW_OFFSET, 32ul, unit));
         codes[0] = stored ? uint4(pack_four_bytes(in, within), pack_four_bytes(in, within + 4),
@@ -539,7 +596,23 @@ kernel void repack_weight(
     {
         const uint block = column0 / 64;
         const uint step0 = (column0 % 64) / 16;
-#if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+        // Grid entries stay whole: the tile sequence is [k-block][row][k-block
+        // bytes]; row `lane`'s 32 columns (steps `step0`, `step0 + 1`) are
+        // half of its k-block bytes.
+        if (lane < TILE_ROWS) {
+            const ulong n = row0 + lane;
+            const bool stored = n < SEISMIC_DIM_N;
+            device const uchar *in = source_packet(source, seismic_words, b, stored ? n : 0ul, column0 / GROUP);
+            const ulong position = (ulong(block) * TILE_ROWS + lane) * 8 * REPACK_CODE_BITS +
+                                   step0 / 2 * 4 * REPACK_CODE_BITS;
+            for (uint word = 0; word < REPACK_CODE_BITS; ++word)
+                *reinterpret_cast<device uint *>(tile_plane_byte(destination, seismic_words, b, row0, position + 4 * word,
+                                                                 SEISMIC_RESULT_0_PLANE_GRIDS_BYTES_PER_ROW,
+                                                                 SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET)) =
+                    stored ? code_word(in, within, word) : 0u;
+        }
+#elif defined(SEISMIC_ELEMENT_U_PLANE_CODES)
         {
             uint4 value;
             for (uint half_step = 0; half_step < 2; ++half_step) {

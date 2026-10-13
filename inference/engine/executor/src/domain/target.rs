@@ -23,6 +23,59 @@ pub struct TargetHostTiming {
 }
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
+    pub(super) fn trace_target_submission(
+        &self,
+        operations: &[Operation],
+    ) -> Option<seismic::SubmissionTrace> {
+        let trace_position = std::env::var("MAGNITUDE_TRACE_TARGET_PREFILL_MIN_POSITION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let trace_prefill = std::env::var_os("MAGNITUDE_TRACE_TARGET_PREFILL_LAUNCHES").is_some()
+            && operations.iter().any(|operation| {
+                matches!(operation, Operation::Forward { position, kind: WorkKind::Prefill, .. }
+                    if *position >= trace_position)
+            });
+        let verify_position = std::env::var("MAGNITUDE_TRACE_TARGET_VERIFY_MIN_POSITION")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let trace_verify = std::env::var_os("MAGNITUDE_TRACE_TARGET_VERIFY_LAUNCHES").is_some()
+            && operations.iter().any(|operation| {
+                matches!(operation, Operation::Forward {
+                    position,
+                    kind: WorkKind::Verify | WorkKind::Decode,
+                    ..
+                } if *position >= verify_position)
+            });
+        let traced = if trace_prefill && !TARGET_PREFILL_LAUNCH_TRACED.swap(true, Ordering::Relaxed)
+        {
+            Some(&TARGET_PREFILL_LAUNCH_TRACED)
+        } else if trace_verify && !TARGET_VERIFY_LAUNCH_TRACED.swap(true, Ordering::Relaxed) {
+            Some(&TARGET_VERIFY_LAUNCH_TRACED)
+        } else {
+            None
+        };
+        if let Some(traced) = traced {
+            match self.domain.device().trace_submissions(
+                if std::env::var("MAGNITUDE_TRACE_TARGET_DETAIL").as_deref() == Ok("submissions") {
+                    seismic::TraceDetail::Submissions
+                } else {
+                    seismic::TraceDetail::Launches
+                },
+            ) {
+                Ok(trace) => Some(trace),
+                Err(error) => {
+                    traced.store(false, Ordering::Relaxed);
+                    eprintln!("target launch attribution unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
     /// Submit one target group with state advances already reserved, or
     /// claim the queued lookahead step it equals. A continuable group queues
     /// its own lookahead behind it, in the bindings the flight holds until
@@ -44,7 +97,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             }
         };
-        // The step is on the device: any failure from here drops it.
+        // The step is on the device: any failure from here drops it. Its
+        // tokens, now known whether launched or claimed, follow the
+        // sequences' accepted ones.
+        self.feed_tokens(operations)
+            .map_err(|error| SubmitFailure::Failed(DomainError::invariant(error)))?;
         self.queue_lookahead(&mut bindings, &work, operations)
             .map_err(SubmitFailure::Failed)?;
         Ok(TargetFlight { work, bindings })
@@ -62,7 +119,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             Ok(work) => work,
             Err(failure) => {
                 if let (Some(priming), [operation]) = (priming, operations) {
-                    self.head.insert(operation.request(), priming.advance.abort());
+                    self.head
+                        .insert(operation.request(), priming.advance.abort());
                 }
                 return Err(failure);
             }
@@ -75,11 +133,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         else {
             return Ok(work);
         };
-        let [Operation::Forward {
-            request,
-            prime: Some(prime),
-            ..
-        }] = operations
+        let [
+            Operation::Forward {
+                request,
+                prime: Some(prime),
+                ..
+            },
+        ] = operations
         else {
             return Err(Unsubmitted::Failed(DomainError::invariant(
                 "a drafter entry was reserved for an unprimed group",
@@ -90,6 +150,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             *request,
             prime,
             TentativeAdvance::Accepted(advance),
+            self.input
+                .get(request)
+                .and_then(|input| input.boundary.clone()),
             graph_workspace,
             graph_output,
         )
@@ -107,6 +170,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         request: RequestId,
         prime: &Priming,
         advance: TentativeAdvance,
+        previous: Option<FeatureRef>,
         graph_workspace: NativeGraphWorkspaceLease,
         graph_output: NativeGraphOutputLease,
     ) -> Result<TargetWork<F>, DomainError> {
@@ -149,13 +213,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         .map_err(DomainError::invariant)?;
         // Entry rows every window drops before the first draft skip the
         // windowed layers (see `submit_head`).
-        let windowed = super::head::skippable_window(&store).is_none_or(|window| {
-            prime.position + prime.tokens.len() + window > prime.draft_from
-        });
+        let windowed = super::head::skippable_window(&store)
+            .is_none_or(|window| prime.position + prime.tokens.len() + window > prime.draft_from);
         let inputs = HeadLaunchInputs::new(
             batch,
             vec![advance],
-            HeadConditioning::Features(features),
+            HeadConditioning::Features {
+                current: features,
+                previous: prime.boundary.then_some(previous).flatten(),
+            },
             windowed,
             graph_workspace,
             graph_output,
@@ -193,6 +259,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout_workspace,
             readout_output,
             priming: _,
+            boundary,
         } = reservation;
         let advances = advances
             .into_iter()
@@ -226,7 +293,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 ..
             } = operation
             else {
-                return Err(broken("target group contains another operation kind".into()));
+                return Err(broken(
+                    "target group contains another operation kind".into(),
+                ));
             };
             if !seen.insert(*request) {
                 return Err(broken("target group repeats a request".into()));
@@ -254,6 +323,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let class_limits = self.target_class_limits();
         let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
             .map_err(|error| broken(error.to_string()))?;
+        let preceding = self.target_preceding(operations).map_err(broken)?;
         let mut metadata = Vec::with_capacity(operations.len());
         for operation in operations {
             let request = operation.request();
@@ -319,12 +389,15 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             graph_outputs,
             readout_workspace,
             readout_output,
-        );
+        )
+        .with_boundary(boundary)
+        .with_preceding(preceding);
         let launch = match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
             self.domain.id(),
             self.definition.decoder.hidden as usize,
+            self.definition.head.as_ref().map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder)) as usize,
         ) {
             Ok(launch) => launch,
             Err((inputs, error)) => {
@@ -333,51 +406,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(Unsubmitted::Failed(DomainError::Invariant(error)));
             }
         };
-        let trace_position = std::env::var("MAGNITUDE_TRACE_TARGET_PREFILL_MIN_POSITION")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let trace_prefill = std::env::var_os("MAGNITUDE_TRACE_TARGET_PREFILL_LAUNCHES").is_some()
-            && operations.iter().any(|operation| {
-                matches!(operation, Operation::Forward { position, kind: WorkKind::Prefill, .. }
-                    if *position >= trace_position)
-            });
-        let verify_position = std::env::var("MAGNITUDE_TRACE_TARGET_VERIFY_MIN_POSITION")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let trace_verify = std::env::var_os("MAGNITUDE_TRACE_TARGET_VERIFY_LAUNCHES").is_some()
-            && operations.iter().any(|operation| {
-                matches!(operation, Operation::Forward {
-                    position,
-                    kind: WorkKind::Verify | WorkKind::Decode,
-                    ..
-                } if *position >= verify_position)
-            });
-        let traced = if trace_prefill && !TARGET_PREFILL_LAUNCH_TRACED.swap(true, Ordering::Relaxed)
-        {
-            Some(&TARGET_PREFILL_LAUNCH_TRACED)
-        } else if trace_verify && !TARGET_VERIFY_LAUNCH_TRACED.swap(true, Ordering::Relaxed) {
-            Some(&TARGET_VERIFY_LAUNCH_TRACED)
-        } else {
-            None
-        };
-        let launch_trace = if let Some(traced) = traced {
-            match self
-                .domain
-                .device()
-                .trace_submissions(seismic::TraceDetail::Launches)
-            {
-                Ok(trace) => Some(trace),
-                Err(error) => {
-                    traced.store(false, Ordering::Relaxed);
-                    eprintln!("target launch attribution unavailable: {error}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let launch_trace = self.trace_target_submission(operations);
         let started = Instant::now();
         let submission = match self.family.submit_target(launch) {
             Ok(submission) => submission,
@@ -406,6 +435,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// views before choosing physical prefixes. Returns the bindings the
     /// flight held, with the lookahead it queued; an error consumes them, as
     /// the domain cannot continue.
+    /// Per operation of a target group, the accepted tokens its sequence
+    /// holds before the operation's first row, as many as the model's row
+    /// rules read (`TargetLaunchCore::preceding`); none of a model without
+    /// one.
+    pub(super) fn target_preceding(&self, operations: &[Operation]) -> Result<Vec<Vec<u64>>, String> {
+        let context = crate::operators::row_rule_context(&self.definition.decoder);
+        if context == 0 {
+            return Ok(Vec::new());
+        }
+        operations
+            .iter()
+            .map(|operation| {
+                let Operation::Forward {
+                    request, position, ..
+                } = operation
+                else {
+                    return Err("target group contains another operation kind".to_owned());
+                };
+                Ok(self
+                    .preceding_tokens(*request, *position, context)?
+                    .iter()
+                    .map(|token| u64::from(token.0))
+                    .collect())
+            })
+            .collect()
+    }
+
     pub fn finish_target(
         &mut self,
         flight: TargetFlight<F>,
@@ -429,44 +485,37 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // The drafter entry follows its chunk on the device; its advance
         // commits with the chunk. A claimed lookahead's entry attaches to the
         // accepted drafter state; an unclaimed one's rows are discarded.
-        let mut primed = match flight.priming {
-            None => None,
-            Some(priming) => {
-                let completed = priming.submission.finish().map_err(DomainError::Device)?;
-                let (core, _) = completed.into_parts();
-                let (_, advances, _) = core.into_parts();
-                let [advance]: [TentativeAdvance; 1] = advances.try_into().map_err(|_| {
-                    DomainError::invariant("a drafter entry has other than one slot")
-                })?;
-                match (advance, priming.continuation) {
-                    (TentativeAdvance::Accepted(advance), None) => Some((priming.request, advance)),
-                    (TentativeAdvance::Successor(successor), Some(Some(state))) => {
-                        match successor.attach(state.into_state()) {
-                            Ok(advance) => Some((priming.request, advance)),
-                            Err((state, error)) => {
-                                self.head.insert(priming.request, state);
-                                return Err(DomainError::invariant(format!(
-                                    "claimed drafter entry no longer follows its state: {error}"
-                                )));
-                            }
-                        }
-                    }
-                    (TentativeAdvance::Successor(_), Some(None)) => None,
-                    _ => {
-                        return Err(DomainError::invariant(
-                            "drafter entry advance differs from its continuation",
-                        ))
-                    }
-                }
-            }
-        };
+        let mut primed = flight
+            .priming
+            .map(|priming| self.finish_priming_work(priming))
+            .transpose()?
+            .flatten();
         if let Some(trace) = &flight.launch_trace {
             let submissions = trace
                 .collect()
                 .map_err(|error| DomainError::Input(error.to_string()))?;
             let mut entries = BTreeMap::<String, (usize, f64)>::new();
+            let mut geometry =
+                BTreeMap::<(String, usize, [u64; 3], [u64; 3], u64), (usize, usize, f64)>::new();
+            eprintln!("target trace scope: {} submissions", submissions.len());
             for submission in submissions {
                 for launch in submission.launches {
+                    if let Some(physical) = launch.geometry {
+                        let entry = geometry
+                            .entry((
+                                launch.entry.clone(),
+                                launch.launch,
+                                physical.workgroups,
+                                physical.threads_per_workgroup,
+                                physical.shared_bytes,
+                            ))
+                            .or_default();
+                        entry.0 += 1;
+                        entry.1 = entry.1.max(launch.occurrence + 1);
+                        if let Some((start, end)) = launch.device {
+                            entry.2 += (end - start) * 1_000.0;
+                        }
+                    }
                     if let Some((start, end)) = launch.device {
                         let label = if launch.launch == 0 {
                             launch.entry
@@ -480,8 +529,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             }
             let mut entries = entries.into_iter().collect::<Vec<_>>();
-            entries.sort_by(|a, b| b.1 .1.total_cmp(&a.1 .1));
-            eprintln!("target launch attribution (one flight):");
+            entries.sort_by(|a, b| b.1.1.total_cmp(&a.1.1));
+            for ((entry, launch, groups, threads, shared), (count, occurrences, gpu_ms)) in geometry
+            {
+                eprintln!(
+                    "target geometry entry={entry} launch={launch} groups={groups:?} threads={threads:?} shared_bytes={shared} count={count} max_occurrences={occurrences} gpu_ms={gpu_ms:.3}"
+                );
+            }
+            eprintln!("target timed launch attribution (trace scope):");
             for (entry, (launches, ms)) in entries {
                 eprintln!("  {entry}: {ms:.3} ms across {launches} launches");
             }
@@ -500,9 +555,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             );
         }
         let (core, output) = completed.into_parts();
+        // A sequence whose stored-table rows could not be read in this step
+        // read other rows: it is poisoned, and this outcome and every later
+        // one of it fail. The step's other sequences are unaffected.
+        for (slot, (request, ..)) in flight.requests.iter().enumerate() {
+            if let Some(error) = output.table_read_failure(slot) {
+                self.poisoned.entry(*request).or_insert(error);
+            }
+        }
+        output.retire_stored_reads();
         let crate::TargetOutput {
             readout: output,
             commits,
+            boundary,
+            selected_rows: _,
+            stored_reads: _,
         } = output;
         let batch = core.batch();
         if batch.actual_slots() != flight.requests.len() {
@@ -610,6 +677,12 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     .domain
                     .publish_graph_features(view)
                     .map_err(|error| error.to_string())?;
+                let aggregate = match &boundary {
+                    Some(boundary) => aggregate
+                        .with_boundary(boundary.clone())
+                        .map_err(|error| error.to_string())?,
+                    None => aggregate,
+                };
                 for (_, row) in feature_outputs {
                     physical[row].features = Some(aggregate.clone());
                 }
@@ -650,12 +723,16 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 _ => {
                     return Err(DomainError::invariant(
                         "target flight advances differ from its continuation",
-                    ))
+                    ));
                 }
+            };
+            let outcome = match self.poisoned.get(&request) {
+                Some(error) => Outcome::TableReadFailed(error.clone()),
+                None => Outcome::Forward { rows: result },
             };
             pending.push(PendingOperationOutcome {
                 request,
-                outcome: Outcome::Forward { rows: result },
+                outcome,
                 advance: Some(advance),
                 primed: primed
                     .take_if(|(primed, _)| *primed == request)
@@ -692,8 +769,101 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 timing.finish.as_micros(),
             );
         }
+        // Finish already times result reads/materialization. Include that
+        // work in completed service without another timer or device wait.
+        for item in &mut pending {
+            item.physical_duration += timing.finish;
+        }
         self.target_timing = Some(timing);
         Ok(pending)
+    }
+
+    fn finish_priming_work(
+        &mut self,
+        priming: PrimingFlight<F::HeadSubmission>,
+    ) -> Result<Option<(RequestId, OwnedStateAdvance)>, DomainError> {
+        let completed = priming.submission.finish().map_err(DomainError::Device)?;
+        let (core, _) = completed.into_parts();
+        let (_, advances, _) = core.into_parts();
+        let [advance]: [TentativeAdvance; 1] = advances
+            .try_into()
+            .map_err(|_| DomainError::invariant("a drafter entry has other than one slot"))?;
+        match (advance, priming.continuation) {
+            (TentativeAdvance::Accepted(advance), None) => Ok(Some((priming.request, advance))),
+            (TentativeAdvance::Successor(successor), Some(Some(state))) => {
+                match successor.attach(state.into_state()) {
+                    Ok(advance) => Ok(Some((priming.request, advance))),
+                    Err((state, error)) => {
+                        self.head.insert(priming.request, state);
+                        return Err(DomainError::invariant(format!(
+                            "claimed drafter entry no longer follows its state: {error}"
+                        )));
+                    }
+                }
+            }
+            (TentativeAdvance::Successor(_), Some(None)) => Ok(None),
+            _ => {
+                return Err(DomainError::invariant(
+                    "drafter entry advance differs from its continuation",
+                ));
+            }
+        }
+    }
+
+    /// Finish a target chunk for publication without returning the binding
+    /// right while its final drafter entry still uses it. The ordinary
+    /// finish remains useful to callers that consume the whole chunk.
+    pub fn finish_target_for_publication(
+        &mut self,
+        mut flight: TargetFlight<F>,
+        final_prompt_chunk: bool,
+    ) -> Result<(Vec<PendingOperationOutcome>, TargetContinuation<F>), DomainError> {
+        let priming = final_prompt_chunk
+            .then(|| flight.detach_priming())
+            .flatten();
+        let (outcomes, bindings) = self.finish_target(flight)?;
+        let continuation = match priming {
+            None => TargetContinuation::Ready(bindings),
+            Some((work, target_end)) => TargetContinuation::Priming(PrimingCompletionFlight {
+                work,
+                target_end,
+                bindings,
+                started: Instant::now(),
+            }),
+        };
+        Ok((outcomes, continuation))
+    }
+
+    pub fn finish_priming(
+        &mut self,
+        flight: PrimingCompletionFlight<F>,
+    ) -> Result<(RequestId, Duration, StateBindings<F>), DomainError> {
+        let request = flight.work.request;
+        if let Some((_, advance)) = self.finish_priming_work(flight.work)? {
+            if self.head.contains_key(&request) {
+                return Err(DomainError::invariant(
+                    "deferred entry has another head owner",
+                ));
+            }
+            let accepted = self
+                .target
+                .get(&request)
+                .is_some_and(|state| state.position() == flight.target_end);
+            let state = if accepted {
+                let rows = advance.rows();
+                let (OwnedAdvanceResolution::Aborted(state)
+                | OwnedAdvanceResolution::Committed(state)) =
+                    advance.commit(rows).map_err(|(state, error)| {
+                        self.head.insert(request, state);
+                        DomainError::from(error)
+                    })?;
+                state
+            } else {
+                advance.abort()
+            };
+            self.head.insert(request, state);
+        }
+        Ok((request, flight.started.elapsed(), flight.bindings))
     }
 
     fn restore_advances(
@@ -749,6 +919,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             request,
             tokens,
             position,
+            kind,
             ..
         } = operation
         else {
@@ -767,21 +938,64 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .find(|(start, end)| (*start..*end).contains(&index))
                 .map(|(_, end)| end)
         };
+        let appends = SlotAppends::of(&self.target_store, advance);
         let mut rows = Vec::with_capacity(tokens.len());
+        let audit_history = matches!(kind, WorkKind::Verify | WorkKind::Decode)
+            && std::env::var_os("MAGNITUDE_TRACE_TARGET_VERIFY_LAUNCHES").is_some()
+            && *position
+                >= std::env::var("MAGNITUDE_TRACE_TARGET_VERIFY_MIN_POSITION")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+            && !TARGET_VERIFY_LAUNCH_TRACED.load(Ordering::Relaxed);
         for (index, token) in tokens.iter().enumerate() {
             let coordinates = *coordinates
                 .get(index)
                 .ok_or("prepared input coordinate count differs from tokens")?;
+            let histories = row_histories(
+                &self.target_store,
+                advance,
+                &appends,
+                index,
+                span_end(index),
+                &bidirectional,
+            )?;
+            if audit_history && index < 4 {
+                for domain in self.target_store.history_domains() {
+                    let history = &histories[domain.0];
+                    let visible_rows: i64 = history
+                        .visible
+                        .iter()
+                        .map(|range| i64::from(range[1]) - i64::from(range[0]))
+                        .sum();
+                    eprintln!(
+                        "target history position={} row={index} domain={} kind={:?} visible_rows={visible_rows} spans={} first_span={:?} last_span={:?} fresh_start={} slab_rows={}",
+                        position + index,
+                        domain.0,
+                        self.target_store.history_domain_kind(domain),
+                        history.visible.len(),
+                        history.visible.first(),
+                        history.visible.last(),
+                        history.fresh_start,
+                        self.target_store.history_slab_rows(domain)
+                    );
+                    if index == 0 {
+                        for component in self.target_store.history_components(domain) {
+                            eprintln!(
+                                "target history component layer={:?} heads={} codec={:?} planes={:?}",
+                                component.layer,
+                                component.heads,
+                                component.codec,
+                                component.planes()
+                            );
+                        }
+                    }
+                }
+            }
             rows.push(Row {
                 token: i32::try_from(token.0).map_err(|_| "token exceeds i32")?,
                 coordinates,
-                histories: row_histories(
-                    &self.target_store,
-                    advance,
-                    index,
-                    span_end(index),
-                    &bidirectional,
-                )?,
+                histories,
                 demand: row_demand(operation, index),
                 select: selection(operation, index),
             });
@@ -807,9 +1021,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// from the same start (through the row, or, for a media row of a read in
 /// `bidirectional`, through its media span's end `span_end`), and the row's
 /// destination. A Shared source domain's (`shared_read_history`) follow.
+/// `appends` is the advance's (`SlotAppends::of`), formed once for its rows.
 pub(super) fn row_histories(
     store: &StateStore,
     advance: &TentativeAdvance,
+    appends: &SlotAppends,
     index: usize,
     span_end: Option<usize>,
     bidirectional: &[bool],
@@ -817,7 +1033,22 @@ pub(super) fn row_histories(
     let binding = advance.bindings();
     let end = |read: usize| span_end.filter(|_| bidirectional[read]);
     let stored = store.history_domains().map(|domain| {
-        let (visible, fresh_start) = accepted_history(store, advance, domain, index)?;
+        if indexer_domain(store, domain) {
+            let appended = appends.causal[domain.0]
+                .as_ref()
+                .ok_or("an indexer domain has no appended rows")?;
+            return indexer_history(store, advance, appended, domain, index);
+        }
+        let (mut visible, mut fresh_start) = accepted_history(store, advance, domain, index)?;
+        // Policy comes from this target row's declared causal/media behavior,
+        // never a window size or the shape of a drafter's block.
+        if let Some(appended) = appends.causal[domain.0]
+            .as_ref()
+            .filter(|_| end(domain.0).is_none())
+        {
+            visible.extend(appended.causal_prior(fresh_start, index)?);
+            fresh_start = index;
+        }
         let destination = binding.destinations[domain.0]
             .get(index)
             .map_or(Ok(-1), |value| {
@@ -833,14 +1064,314 @@ pub(super) fn row_histories(
         })
     });
     let stored_reads = store.history_domains().count();
-    let shared = store
-        .shared_source_domains()
-        .into_iter()
+    let shared = appends
+        .shared
+        .iter()
         .enumerate()
-        .map(|(position, domain)| {
-            shared_read_history(store, advance, domain, index, end(stored_reads + position))
+        .map(|(position, (domain, appended))| {
+            shared_read_history(
+                store,
+                advance,
+                *domain,
+                appended,
+                index,
+                end(stored_reads + position),
+            )
         });
     stored.chain(shared).collect()
+}
+
+/// Whether `domain` holds a selected read's indexer keys
+/// (`ComponentDescriptor::attended`): no attention reads it, its indexer
+/// does (`indexer_history`).
+pub(crate) fn indexer_domain(store: &StateStore, domain: magnitude_state::HistoryDomainId) -> bool {
+    !store
+        .history_components(domain)
+        .iter()
+        .all(magnitude_state::ComponentDescriptor::attended)
+}
+
+/// What row `index` of `advance` reads of an indexer's `domain`
+/// (`indexer_select`), every row as stored history, this launch's earlier
+/// rows at their destinations: in its raw keys' Window domain the rows of
+/// the `rows` positions before it, and its own destination; in its block
+/// keys' Block domain every block complete before it, and the destination
+/// of the block it completes (or -1). Its fresh span is the row alone.
+/// `appended` is the advance's runs in `domain` (`AppendedRuns::of`).
+pub(crate) fn indexer_history(
+    store: &StateStore,
+    advance: &TentativeAdvance,
+    appended: &AppendedRuns,
+    domain: magnitude_state::HistoryDomainId,
+    index: usize,
+) -> Result<RowHistory, String> {
+    let start = advance.position();
+    let position = start
+        .checked_add(index)
+        .ok_or("target row position overflows")?;
+    let destinations = &advance.bindings().destinations[domain.0];
+    let (from, prior, destination) = match store.history_domain_kind(domain) {
+        magnitude_state::HistoryDomainKind::Window { rows } => {
+            let from = position.saturating_sub(rows);
+            (from, from.saturating_sub(start)..index, destinations.get(index))
+        }
+        magnitude_state::HistoryDomainKind::Block { rate } => {
+            // The blocks the advance completed before the row, then the one
+            // it completes.
+            let before = position / rate - start / rate;
+            let completes = (position + 1) % rate == 0;
+            (
+                0,
+                0..before,
+                completes.then(|| destinations.get(before)).flatten(),
+            )
+        }
+        kind => return Err(format!("an indexer in a {kind:?} history domain")),
+    };
+    let mut visible = advance
+        .visible_ranges(domain, from)
+        .into_iter()
+        .map(|(start, count)| {
+            Ok([
+                i32::try_from(start).map_err(|_| "history start exceeds i32")?,
+                i32::try_from(start.checked_add(count).ok_or("history end overflow")?)
+                    .map_err(|_| "history end exceeds i32")?,
+            ])
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    visible.extend(appended.causal_prior(prior.start, prior.end)?);
+    Ok(RowHistory {
+        visible,
+        fresh_start: i32::try_from(index).map_err(|_| "fresh start exceeds i32")?,
+        bidirectional_end: None,
+        destination: destination.map_or(Ok(-1), |value| {
+            i32::try_from(*value).map_err(|_| "indexer destination exceeds i32")
+        })?,
+    })
+}
+
+/// Target domains whose rows read their launch's earlier rows as stored
+/// history even while those rows belong to the same launch: a compressed
+/// history's, whose prior causal rows must use their stored representation,
+/// and a selected read's, whose indexer selects among stored rows and whose
+/// rows read only themselves fresh.
+pub(crate) fn cached_causal_domain(
+    store: &StateStore,
+    domain: magnitude_state::HistoryDomainId,
+) -> bool {
+    store.history_components(domain).iter().any(|component| {
+        component.causal_rows_use_cache()
+            || matches!(component.layer, magnitude_state::LayerRef::Target(block)
+                if store.indexer_domains(block).is_some())
+    })
+}
+
+/// The rows one advance appends to one stored history domain, in slot order,
+/// as runs of consecutive rows within one slab: what `coalesce_within_slabs`
+/// makes of the destinations taken one row at a time. Formed once per slot;
+/// what a row reads of them is a clip of the runs, never a pass over the
+/// destinations.
+pub(crate) struct AppendedRuns {
+    runs: Vec<AppendedRun>,
+    /// The appended rows as ascending intervals `[first, last]`, no two of
+    /// them overlapping or adjacent.
+    intervals: Vec<[usize; 2]>,
+    rows: usize,
+    slab_rows: usize,
+}
+
+/// `rows` consecutive history rows from `first`, appended by the slot rows
+/// from `offset`.
+struct AppendedRun {
+    offset: usize,
+    first: usize,
+    rows: usize,
+}
+
+/// The refusals of one reader of an advance's appended rows.
+struct AppendedRefusals {
+    outside: &'static str,
+    exceeds: &'static str,
+    overflows: &'static str,
+}
+
+impl AppendedRuns {
+    pub(crate) fn new(destinations: &[usize], slab_rows: usize) -> Self {
+        let mut runs: Vec<AppendedRun> = Vec::new();
+        for (offset, &row) in destinations.iter().enumerate() {
+            match runs.last_mut() {
+                Some(run)
+                    if run.first.checked_add(run.rows) == Some(row)
+                        && run.first / slab_rows == row / slab_rows =>
+                {
+                    run.rows += 1
+                }
+                _ => runs.push(AppendedRun {
+                    offset,
+                    first: row,
+                    rows: 1,
+                }),
+            }
+        }
+        let mut sorted = runs
+            .iter()
+            .map(|run| [run.first, run.first + (run.rows - 1)])
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        let mut intervals: Vec<[usize; 2]> = Vec::with_capacity(sorted.len());
+        for [first, last] in sorted {
+            match intervals.last_mut() {
+                Some(previous) if first <= previous[1].saturating_add(1) => {
+                    previous[1] = previous[1].max(last)
+                }
+                _ => intervals.push([first, last]),
+            }
+        }
+        Self {
+            runs,
+            intervals,
+            rows: destinations.len(),
+            slab_rows,
+        }
+    }
+
+    /// The runs of the rows `advance` appends to `domain`.
+    pub(crate) fn of(
+        store: &StateStore,
+        advance: &TentativeAdvance,
+        domain: magnitude_state::HistoryDomainId,
+    ) -> Self {
+        Self::new(
+            &advance.bindings().destinations[domain.0],
+            store.history_slab_rows(domain),
+        )
+    }
+
+    /// The runs of the slot rows `start..end`, each as its first history row
+    /// and row count: the destinations of those slot rows coalesced within
+    /// slabs. `None` when the slot rows are not rows of the advance.
+    fn between(&self, start: usize, end: usize) -> Option<Vec<[usize; 2]>> {
+        if start > end || end > self.rows {
+            return None;
+        }
+        if start == end {
+            return Some(Vec::new());
+        }
+        let from = self
+            .runs
+            .partition_point(|run| run.offset + run.rows <= start);
+        Some(
+            self.runs[from..]
+                .iter()
+                .take_while(|run| run.offset < end)
+                .map(|run| {
+                    let low = start.max(run.offset);
+                    let high = end.min(run.offset + run.rows);
+                    [run.first + (low - run.offset), high - low]
+                })
+                .collect(),
+        )
+    }
+
+    /// `between` as packed `[start, end)` history ranges.
+    fn ranges(
+        &self,
+        start: usize,
+        end: usize,
+        refusals: AppendedRefusals,
+    ) -> Result<Vec<[i32; 2]>, String> {
+        let ranges = self
+            .between(start, end)
+            .ok_or(refusals.outside)?
+            .into_iter()
+            .map(|[first, rows]| {
+                let start = i32::try_from(first).map_err(|_| refusals.exceeds)?;
+                let end = i32::try_from(rows)
+                    .ok()
+                    .and_then(|rows| start.checked_add(rows))
+                    .ok_or(refusals.overflows)?;
+                Ok([start, end])
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        u32::try_from(self.slab_rows).map_err(|_| "slab rows exceed u32")?;
+        Ok(ranges)
+    }
+
+    /// The history ranges a compressed causal row at slot row `end` reads of
+    /// its own launch: the rows appended by the slot rows from `start` (its
+    /// first fresh row) up to itself.
+    pub(crate) fn causal_prior(&self, start: usize, end: usize) -> Result<Vec<[i32; 2]>, String> {
+        self.ranges(
+            start,
+            end,
+            AppendedRefusals {
+                outside: "causal prior rows exceed destinations",
+                exceeds: "causal prior destination exceeds i32",
+                overflows: "causal prior range overflows",
+            },
+        )
+    }
+
+    /// The history ranges a Shared reader reads of the rows its source
+    /// appends by the slot rows `start..end`. An advance that appends nothing
+    /// to the domain has no batch rows in it.
+    fn shared_appended(&self, start: usize, end: usize) -> Result<Vec<[i32; 2]>, String> {
+        let (start, end) = if self.rows == 0 { (0, 0) } else { (start, end) };
+        self.ranges(
+            start,
+            end,
+            AppendedRefusals {
+                outside: "shared history row exceeds the advance's destinations",
+                exceeds: "history row exceeds i32",
+                overflows: "history row exceeds i32",
+            },
+        )
+    }
+
+    /// Whether the advance appends every history row of `[start, end)` (an
+    /// empty range has none to append).
+    pub(crate) fn covers(&self, start: i32, end: i32) -> bool {
+        if start >= end {
+            return true;
+        }
+        let (Ok(first), Ok(last)) = (usize::try_from(start), usize::try_from(end - 1)) else {
+            return false;
+        };
+        let after = self
+            .intervals
+            .partition_point(|interval| interval[0] <= first);
+        after > 0 && last <= self.intervals[after - 1][1]
+    }
+}
+
+/// The appended runs the rows of one advance read, formed once for its slot:
+/// of each compressed causal stored domain (`cached_causal_domain`) and each
+/// indexer domain (`indexer_domain`), by domain, and of each Shared source
+/// domain, in `shared_source_domains` order.
+pub(super) struct SlotAppends {
+    causal: Vec<Option<AppendedRuns>>,
+    shared: Vec<(magnitude_state::HistoryDomainId, AppendedRuns)>,
+}
+
+impl SlotAppends {
+    pub(super) fn of(store: &StateStore, advance: &TentativeAdvance) -> Self {
+        Self {
+            // An indexer reads its launch's earlier rows as stored history
+            // too (`indexer_history`).
+            causal: store
+                .history_domains()
+                .map(|domain| {
+                    (cached_causal_domain(store, domain) || indexer_domain(store, domain))
+                        .then(|| AppendedRuns::of(store, advance, domain))
+                })
+                .collect(),
+            shared: store
+                .shared_source_domains()
+                .into_iter()
+                .map(|domain| (domain, AppendedRuns::of(store, advance, domain)))
+                .collect(),
+        }
+    }
 }
 
 /// The history ranges a launch reserves per row for an advance of `rows`
@@ -855,6 +1386,9 @@ pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -
         + store
             .shared_source_domains()
             .into_iter()
+            .chain(store.history_domains().filter(|&domain| {
+                rows > 1 && (cached_causal_domain(store, domain) || indexer_domain(store, domain))
+            }))
             .map(|domain| rows.div_ceil(store.history_page_rows(domain)) + 1)
             .max()
             .unwrap_or(0)
@@ -895,34 +1429,17 @@ pub(crate) fn accepted_history(
 /// source appended for the advance from the window start through the row
 /// (through its media span's end `bidirectional_end` for a row attending its
 /// span bidirectionally), each range within one slab. Its fresh span and
-/// destination are unused.
-pub(crate) fn shared_read_history(
+/// destination are unused. `appended` is the advance's runs in `domain`.
+fn shared_read_history(
     store: &StateStore,
     advance: &TentativeAdvance,
     domain: magnitude_state::HistoryDomainId,
+    appended: &AppendedRuns,
     index: usize,
     bidirectional_end: Option<usize>,
 ) -> Result<RowHistory, String> {
     let (mut visible, fresh_start) = accepted_history(store, advance, domain, index)?;
-    let destinations = &advance.bindings().destinations[domain.0];
-    // An advance that appends nothing to the domain has no batch rows in it.
-    let appended = if destinations.is_empty() {
-        &[][..]
-    } else {
-        destinations
-            .get(fresh_start..bidirectional_end.unwrap_or(index + 1))
-            .ok_or("shared history row exceeds the advance's destinations")?
-    };
-    let rows = appended
-        .iter()
-        .map(|&row| {
-            let row = i32::try_from(row).map_err(|_| "history row exceeds i32")?;
-            Ok([row, row + 1])
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let slab_rows =
-        u32::try_from(store.history_slab_rows(domain)).map_err(|_| "slab rows exceed u32")?;
-    visible.extend(super::draft::coalesce_within_slabs(&rows, slab_rows));
+    visible.extend(appended.shared_appended(fresh_start, bidirectional_end.unwrap_or(index + 1))?);
     Ok(RowHistory {
         visible,
         fresh_start: i32::try_from(index).map_err(|_| "fresh start exceeds i32")?,
@@ -981,5 +1498,206 @@ pub(super) fn select_row(spec: &crate::SelectSpec) -> Select {
             .history
             .as_ref()
             .map_or_else(Vec::new, |value| value.to_vec()),
+    }
+}
+
+#[cfg(test)]
+mod causal_cache_tests {
+    use super::*;
+    use magnitude_state::{
+        BankCapacity, ComponentDescriptor, HistoryDomainLayout, HistoryDomainPlan, KvCodec,
+        LayerRef, OwnedStateAdvance, RowDemand,
+    };
+
+    #[test]
+    fn compressed_causal_rows_read_prepared_prior_but_media_keeps_dense_block() {
+        let Ok(catalog) = seismic::DeviceCatalog::discover() else {
+            return;
+        };
+        let Ok(device) = catalog.open_backend(seismic::BackendName::Cpu) else {
+            return;
+        };
+        let device = Rc::new(device);
+        for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
+            let (store, mut bindings) = StateStore::new(
+                Rc::clone(&device),
+                16,
+                16,
+                vec![HistoryDomainPlan {
+                    layout: HistoryDomainLayout::Token {
+                        components: vec![
+                            ComponentDescriptor::new(
+                                LayerRef::Target(0),
+                                codec.spec(seismic::DType::F32, 64, 64),
+                                1,
+                            )
+                            .unwrap(),
+                        ],
+                    },
+                    logical_rows: 16,
+                }],
+                vec![],
+                BankCapacity {
+                    active: 1,
+                    in_flight: 1,
+                    retained: 0,
+                },
+            )
+            .unwrap();
+            let domain = store.sole_history_domain().unwrap();
+            bindings
+                .provision(&[RowDemand { domain, rows: 3 }], 0)
+                .unwrap();
+            let advance = TentativeAdvance::Accepted(
+                OwnedStateAdvance::begin(store.create().unwrap(), 3)
+                    .ok()
+                    .unwrap(),
+            );
+            let appends = SlotAppends::of(&store, &advance);
+            let causal = row_histories(&store, &advance, &appends, 1, None, &[true]).unwrap();
+            let media = row_histories(&store, &advance, &appends, 1, Some(3), &[true]).unwrap();
+            assert_eq!(media[0].fresh_start, 0);
+            assert_eq!(media[0].bidirectional_end, Some(3));
+            assert!(media[0].visible.is_empty());
+            if codec == KvCodec::AffineK8V4 {
+                let prior = advance.bindings().destinations[domain.0][0] as i32;
+                assert_eq!(causal[0].visible, vec![[prior, prior + 1]]);
+                assert_eq!(causal[0].fresh_start, 1);
+            } else {
+                assert!(causal[0].visible.is_empty());
+                assert_eq!(causal[0].fresh_start, 0);
+            }
+            assert_eq!(causal[0].bidirectional_end, None);
+            let first = row_histories(&store, &advance, &appends, 0, None, &[false]).unwrap();
+            assert!(first[0].visible.is_empty());
+            assert_eq!(first[0].fresh_start, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod appended_runs_tests {
+    use super::super::draft::coalesce_within_slabs;
+    use super::AppendedRuns;
+
+    /// Destination lists with slab crossings, gaps, returns to earlier rows
+    /// and a repeated row, each with the slab sizes it is read under.
+    fn cases() -> Vec<(Vec<usize>, Vec<usize>)> {
+        let mut generated = Vec::new();
+        let mut state = 0x9e37_79b9_u32;
+        let mut next = |bound: u32| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 16) % bound
+        };
+        for _ in 0..24 {
+            let mut row = next(40) as usize;
+            let mut destinations = Vec::new();
+            for _ in 0..next(48) {
+                destinations.push(row);
+                row = match next(8) {
+                    0 => row + 2 + next(9) as usize,
+                    1 => row.saturating_sub(next(12) as usize),
+                    _ => row + 1,
+                };
+            }
+            generated.push(destinations);
+        }
+        let mut cases = vec![
+            (Vec::new(), vec![1, 4]),
+            (vec![7], vec![1, 4, 8]),
+            ((0..40).collect(), vec![1, 4, 16, 64]),
+            ((13..77).collect(), vec![8, 16, 32]),
+            (vec![3, 4, 5, 9, 10, 16, 17, 18, 2, 3, 4], vec![1, 4, 8]),
+            (vec![5, 5, 6, 7, 7, 8], vec![4, 16]),
+        ];
+        cases.extend(
+            generated
+                .into_iter()
+                .map(|destinations| (destinations, vec![1, 3, 4, 16, 512])),
+        );
+        cases
+    }
+
+    #[test]
+    fn clipped_runs_equal_the_coalesced_destinations_of_every_slot_range() {
+        for (destinations, slabs) in cases() {
+            for slab_rows in slabs {
+                let runs = AppendedRuns::new(&destinations, slab_rows);
+                for start in 0..=destinations.len() {
+                    for end in start..=destinations.len() {
+                        let single = destinations[start..end]
+                            .iter()
+                            .map(|&row| [row as i32, row as i32 + 1])
+                            .collect::<Vec<_>>();
+                        let expected = coalesce_within_slabs(&single, slab_rows as u32);
+                        assert_eq!(
+                            runs.causal_prior(start, end).unwrap(),
+                            expected,
+                            "{destinations:?} slab {slab_rows} rows {start}..{end}"
+                        );
+                        assert_eq!(runs.shared_appended(start, end).unwrap(), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_rows_outside_the_advance_are_refused_as_before() {
+        let runs = AppendedRuns::new(&[4, 5, 6], 4);
+        assert_eq!(
+            runs.causal_prior(0, 4).unwrap_err(),
+            "causal prior rows exceed destinations"
+        );
+        assert_eq!(
+            runs.causal_prior(2, 1).unwrap_err(),
+            "causal prior rows exceed destinations"
+        );
+        assert_eq!(
+            runs.shared_appended(1, 4).unwrap_err(),
+            "shared history row exceeds the advance's destinations"
+        );
+        // An advance that appends nothing to a Shared source has no batch
+        // rows in it, whatever the row asks for.
+        let empty = AppendedRuns::new(&[], 4);
+        assert!(empty.shared_appended(2, 7).unwrap().is_empty());
+        assert_eq!(
+            empty.causal_prior(0, 1).unwrap_err(),
+            "causal prior rows exceed destinations"
+        );
+        let wide = AppendedRuns::new(&[i32::MAX as usize - 1, i32::MAX as usize], 1 << 20);
+        assert_eq!(
+            wide.causal_prior(0, 2).unwrap_err(),
+            "causal prior range overflows"
+        );
+        let beyond = AppendedRuns::new(&[i32::MAX as usize + 1], 1 << 20);
+        assert_eq!(
+            beyond.causal_prior(0, 1).unwrap_err(),
+            "causal prior destination exceeds i32"
+        );
+        assert_eq!(
+            beyond.shared_appended(0, 1).unwrap_err(),
+            "history row exceeds i32"
+        );
+    }
+
+    #[test]
+    fn covered_ranges_are_exactly_those_whose_every_row_is_appended() {
+        for (destinations, slabs) in cases() {
+            let runs = AppendedRuns::new(&destinations, slabs[0]);
+            let limit = destinations.iter().max().map_or(4, |row| *row as i32 + 4);
+            for start in -2..limit {
+                for end in -2..limit {
+                    let every_row_appended = (start..end).all(|row| {
+                        usize::try_from(row).is_ok_and(|row| destinations.contains(&row))
+                    });
+                    assert_eq!(
+                        runs.covers(start, end),
+                        every_row_appended,
+                        "{destinations:?} range {start}..{end}"
+                    );
+                }
+            }
+        }
     }
 }

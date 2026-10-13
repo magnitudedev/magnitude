@@ -15,7 +15,6 @@
 // gate logit (normalized . shared_router), formed like an expert's logit.
 
 #include "router.h"
-#include "../core/arrive.h"
 #include "../core/reduce.h"
 
 typedef element::Act Act;
@@ -117,24 +116,29 @@ typedef routing::EagerDense<element::F32> SharedGate;
 // rows, then the shared-expert gate column.
 constant constexpr uint route_groups = (uint(SEISMIC_DIM_E) + SEISMIC_TUNE_SIMDGROUPS - 1) / SEISMIC_TUNE_SIMDGROUPS + 1;
 
+// The entry's router input: normalized rows, or without a norm the sum of
+// the mix site's partials (`form_input`).
+typedef routing::Rows<Norm, uint(SEISMIC_DIM_PT), (SEISMIC_DIM_NM == 0)> RouteRows;
+
 // The router input of the decode rows in this threadgroup: the rows' RMS
 // inverses (in the stage launch's order) reduced into `inverses` (8 floats)
 // through `parts` (8 * route_simdgroups floats). Every thread calls it.
-inline routing::Rows<Norm> decode_rows(device const float *residual, device const uchar *norm,
+inline RouteRows decode_rows(device const float *residual, device const uchar *norm,
     threadgroup float *parts, threadgroup float *inverses, constant ulong *seismic_words, uint simd, uint lane,
     uint tid) {
     routing::inverses(residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, uint(SEISMIC_DIM_H),
         as_type<float>(uint(SEISMIC_PARAM_EPS)), uint(SEISMIC_DIM_M), parts, inverses, SEISMIC_TUNE_SIMDGROUPS, simd,
         lane, tid);
-    return routing::Rows<Norm>{residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm,
+    return RouteRows{residual, SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1, norm,
         SEISMIC_NORM_STRIDE_0, inverses, uint(SEISMIC_DIM_H)};
 }
 
 // Router threadgroup `group` (< route_groups) over the decode rows `in`.
 // Every thread calls it; `last` is one threadgroup word.
-inline void route_group(thread const routing::Rows<Norm> &in, device const uchar *router,
+inline void route_group(thread const RouteRows &in, device const uchar *router,
     device const float *shared_router, device int *routes, device float *scores, device uchar *normalized,
-    device float *coefficient, device float *logits, device atomic_uint *arrivals, constant ulong *seismic_words,
+    device float *coefficient, arrive::coherent_device<float> logits, device atomic_uint *arrivals,
+    constant ulong *seismic_words,
     threadgroup uchar *shared, threadgroup uint *last, uint group, uint tid, uint simd, uint lane) {
     const uint rows = uint(SEISMIC_DIM_M);
     const uint k = uint(SEISMIC_DIM_H);

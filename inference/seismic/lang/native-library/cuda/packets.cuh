@@ -22,6 +22,7 @@
 // [B, N, K] tensor, such as one expert). Slots W0..W3 exist. Dense element types are `element` (<seismic/element.cuh>).
 
 #include <seismic/element.cuh>
+#include <seismic/grids.cuh>
 
 namespace packets {
 
@@ -110,7 +111,7 @@ struct OpF16 {
     __device__ static __forceinline__ u32 bytes(u32 slots_low, u32 slots_high, int i) {
         // 1024 + (code + 128) in each half, then subtract 1152.
         const u32 pair =
-            prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 8));
+            prmt(slots_low ^ 0x80808080u, slots_high ^ 0x80808080u, (u32)i | ((u32)(4 + i) << 4));
         const u32 biased = prmt(pair, 0x64646464u, 0x4140u);
         u32 value;
         asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(value) : "r"(biased), "r"(0x3C003C00u), "r"(0xE480E480u));
@@ -893,8 +894,232 @@ template <class C, class S, bool WHOLE, bool SCALED> struct Coded4 {
 
 typedef Coded4<Iq4Codes, F32Scale, true, false> IQ4;
 typedef Coded4<LinearCodes, F16Scale, false, true> Q4G32S;
+// IQ4_NL blocks of a row whose width is not a multiple of 256 (iq4g32s).
+typedef Coded4<Iq4Codes, F16Scale, false, true> IQ4G32S;
 typedef Coded4<E2M1Codes, E8M0Scale, false, true> MXFP4;
 typedef Coded4<E2M1Codes, UE4M3Scale, false, true> NVFP4;
+
+// ---------------------------------------------------------------------------
+// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs). An entry
+// of the grids plane codes eight values: grid indices name their magnitudes
+// (<seismic/grids.cuh>), and seven sign bits, completed by an eighth of even
+// parity, their signs. Entries cannot be split across fragment lanes, so a
+// tile's grids plane is [k-block][row][k-block bytes] (registry
+// `PackedRowLayout::code_bit`): lane (g, t) reads the k-block bytes of rows
+// g and g + 8 whole (the four lanes of a row share each load) and forms its
+// slots of step s from lanes 2t, 2t + 1 of entries 2s (k 2t, 2t + 1) and
+// 2s + 1 (k 2t + 8, 2t + 9). From the slots on every path is q8's: the
+// codes are s8 (magnitudes up to 62), exact 16-bit operands and s8
+// fragments. Every 16 (iq2xs) or 32 (iq3xxs) values have an odd scale code
+// 2s + 1 (a nibble of the scales plane) and every 256 one f32 factor: value
+// = factor * (2s + 1) * code, exact in F32. Rows hold whole 256-value
+// groups.
+
+// The eight lane sign bits of an entry's seven: the eighth makes the count
+// of set bits even.
+__device__ __forceinline__ u32 grid_signs(u32 signs) { return signs | ((__popc(signs) & 1u) << 7); }
+
+// Four sign bits as four 0x00 / 0xff bytes (bit i to byte i).
+__device__ __forceinline__ u32 sign_bytes(u32 bits) { return ((bits * 0x00204081u) & 0x01010101u) * 0xFFu; }
+
+// iq2xs: sixteen-bit entries (a 9-bit index into the 512-point grid, then
+// the signs); a scale per 16 values.
+struct Iq2XsGrid {
+    static constexpr int WORDS = 4;       // words of a row's k-block entries
+    static constexpr int GROUP = 16;
+    static constexpr int SCALE_WORDS = 2; // scales plane words per 256 values
+    __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
+        const uint4 v = seismic_ld_nc_v4(global);
+        w[0] = v.x, w[1] = v.y, w[2] = v.z, w[3] = v.w;
+    }
+    __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
+        const uint4 v = *reinterpret_cast<const uint4 *>(shared);
+        w[0] = v.x, w[1] = v.y, w[2] = v.z, w[3] = v.w;
+    }
+    // Lanes 2t, 2t + 1 of entry e: their magnitudes (bytes 0, 1) and sign
+    // bits (bits 0, 1).
+    __device__ static __forceinline__ u32 lanes(const u32 (&w)[WORDS], int e, u32 t, u32 &signs) {
+        const u32 entry = (w[e / 2] >> (16 * (e % 2))) & 0xFFFFu;
+        signs = grid_signs(entry >> 9) >> (2 * t);
+        return seismic_ld_nc_u32(reinterpret_cast<const u32 *>(grids::iq2xs) + 2 * (entry & 511u) + t / 2) >>
+               (16 * (t % 2));
+    }
+};
+
+// iq3xxs: three-byte entries (two 8-bit indices into the 256-point grid of
+// four values, then the signs); a scale per 32 values.
+struct Iq3XxsGrid {
+    static constexpr int WORDS = 6;
+    static constexpr int GROUP = 32;
+    static constexpr int SCALE_WORDS = 1;
+    __device__ static __forceinline__ void load(const u8 *global, u32 (&w)[WORDS]) {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const uint2 v = seismic_ld_nc_v2(global + 8 * i);
+            w[2 * i] = v.x, w[2 * i + 1] = v.y;
+        }
+    }
+    __device__ static __forceinline__ void load_shared(const u8 *shared, u32 (&w)[WORDS]) {
+#pragma unroll
+        for (int i = 0; i < 3; ++i) {
+            const uint2 v = reinterpret_cast<const uint2 *>(shared)[i];
+            w[2 * i] = v.x, w[2 * i + 1] = v.y;
+        }
+    }
+    __device__ static __forceinline__ u32 lanes(const u32 (&w)[WORDS], int e, u32 t, u32 &signs) {
+        const int word = 3 * e / 4, shift = 8 * (3 * e % 4);
+        const u32 spill = shift > 8 ? w[word + 1] << (32 - shift) : 0u;
+        const u32 entry = ((w[word] >> shift) | spill) & 0xFFFFFFu;
+        signs = grid_signs((entry >> 16) & 127u) >> (2 * t);
+        return seismic_ld_nc_u32(grids::iq3xxs + ((entry >> (8 * (t / 2))) & 255u)) >> (16 * (t % 2));
+    }
+};
+
+template <class G> struct Grid {
+    const u8 *base;
+    u64 stride;
+    CodePlane grids;
+    u64 scales;
+    u64 supers;
+
+    static constexpr int GROUP = G::GROUP;
+    static constexpr int GROUPS = 64 / GROUP;
+    static constexpr bool BIAS = false;
+    static constexpr bool DENSE = false;
+    static constexpr bool SCALED_GEMM = true;
+    // Bytes of a row's k-block of entries.
+    static constexpr int KBLOCK_BYTES = 4 * G::WORDS;
+    // A lane's entries of one k-block: rows g and g + 8, and its t.
+    struct Raw {
+        u32 g[G::WORDS];
+        u32 g8[G::WORDS];
+        u32 t;
+    };
+
+    __device__ __forceinline__ Raw fetch(u64 tile, u64 kblock, u32 lane) const {
+        Raw raw;
+        const u64 row = (kblock * 16 + lane / 4) * KBLOCK_BYTES;
+        G::load(grids.chunk(base, stride, tile, row), raw.g);
+        G::load(grids.chunk(base, stride, tile, row + 8 * KBLOCK_BYTES), raw.g8);
+        raw.t = lane % 4;
+        return raw;
+    }
+    struct Super {
+        Raw raw[4];
+    };
+    __device__ __forceinline__ Super fetch_superblock(u64 tile, u64 superblock, u64, u32 lane) const {
+        Super super;
+#pragma unroll
+        for (int q = 0; q < 4; ++q)
+            super.raw[q] = fetch(tile, 4 * superblock + q, lane);
+        return super;
+    }
+    __device__ __forceinline__ Raw raw(const Super &super, int q, u32) const { return super.raw[q]; }
+    // Slots 0..3 (low) and 4..7 (high) of step `step`, as q8's: the codes at
+    // k 2t of (row g, entry 2s), (row g + 8, entry 2s), (row g, entry 2s + 1)
+    // and (row g + 8, entry 2s + 1), and at k 2t + 1. A byte negates where
+    // its sign bit is set (mask 0xff: (m ^ mask) - mask).
+    __device__ static __forceinline__ void slots(const Raw &raw, int step, u32 &low, u32 &high) {
+        u32 s0, s1, s2, s3;
+        const u32 m0 = G::lanes(raw.g, 2 * step, raw.t, s0);
+        const u32 m1 = G::lanes(raw.g8, 2 * step, raw.t, s1);
+        const u32 m2 = G::lanes(raw.g, 2 * step + 1, raw.t, s2);
+        const u32 m3 = G::lanes(raw.g8, 2 * step + 1, raw.t, s3);
+        const u32 x = (m0 & 0xFFFFu) | (m1 << 16), y = (m2 & 0xFFFFu) | (m3 << 16);
+        const u32 mx = sign_bytes((s0 & 3u) | ((s1 & 3u) << 2)), my = sign_bytes((s2 & 3u) | ((s3 & 3u) << 2));
+        const u32 sx = __vsub4(x ^ mx, mx), sy = __vsub4(y ^ my, my);
+        low = prmt(sx, sy, 0x6420u);
+        high = prmt(sx, sy, 0x7531u);
+    }
+    template <class O> __device__ __forceinline__ void decode(const Raw &raw, int step, u32 (&a)[4]) const {
+        u32 low, high;
+        slots(raw, step, low, high);
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+            a[i] = O::bytes(low, high, i);
+    }
+    __device__ __forceinline__ S8Pair s8(const Raw &raw, int step) const {
+        u32 low, high;
+        slots(raw, step, low, high);
+        return S8Pair{prmt(low, high, 0x6240u), prmt(low, high, 0x7351u)};
+    }
+    // The scale of a group of scale code `field` under `factor`.
+    __device__ static __forceinline__ float scaled(float factor, u32 field) {
+        return factor * (float)(2u * field + 1u);
+    }
+    __device__ __forceinline__ void coefficient(u64 row, u64 kblock, int group, float &scale, float &bias) const {
+        const u8 *at = base + row * stride;
+        const u64 index = kblock * GROUPS + group;
+        const u32 field = (at[scales + index / 2] >> (4 * (index % 2))) & 15u;
+        scale = scaled(*reinterpret_cast<const float *>(at + supers + 4 * (kblock / 4)), field);
+        bias = 0.0f;
+    }
+    // A superblock's scale fields and factor of rows g, g + 8.
+    struct Block {
+        u32 fields[2][G::SCALE_WORDS];
+        float factor[2];
+    };
+    __device__ __forceinline__ Block block(u64 tile, u64 superblock, u32 lane) const {
+        Block block;
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const u8 *at = base + (tile * 16 + lane / 4 + 8 * r) * stride;
+#pragma unroll
+            for (int w = 0; w < G::SCALE_WORDS; ++w)
+                block.fields[r][w] = seismic_ld_nc_u32(at + scales + 4 * (G::SCALE_WORDS * superblock + w));
+            block.factor[r] = __uint_as_float(seismic_ld_nc_u32(at + supers + 4 * superblock));
+        }
+        return block;
+    }
+    __device__ __forceinline__ void coefficients(const Block &block, int q, Coefficients<GROUPS> &c) const {
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int group = 0; group < GROUPS; ++group) {
+                const int n = q * GROUPS + group;
+                c.scale[r][group] = scaled(block.factor[r], (block.fields[r][n / 8] >> (4 * (n % 8))) & 15u);
+            }
+    }
+    // GEMM staging: the superblock's scale words, then its factor.
+    static constexpr int SUPER_WORDS = G::SCALE_WORDS + 1;
+    __device__ __forceinline__ const u8 *super_word(u64 row, u64 superblock, int word) const {
+        const u8 *at = base + row * stride;
+        return word < G::SCALE_WORDS ? at + scales + 4 * (G::SCALE_WORDS * superblock + word)
+                                     : at + supers + 4 * superblock;
+    }
+    __device__ static __forceinline__ int word_kblock(int word) {
+        return word < G::SCALE_WORDS ? word * (4 / G::SCALE_WORDS) : 0;
+    }
+    __device__ __forceinline__ void staged_coefficient(const u32 *words, u64 kblock, int group, float &scale,
+                                                       float &bias) const {
+        const int n = (int)(kblock % 4) * GROUPS + group;
+        scale = scaled(__uint_as_float(words[G::SCALE_WORDS]), (words[n / 8] >> (4 * (n % 8))) & 15u);
+        bias = 0.0f;
+    }
+    __device__ __forceinline__ u32 code(const Raw &raw, int step, u32 slot) const {
+        u32 low, high;
+        slots(raw, step, low, high);
+        return ((slot < 4 ? low : high) >> (8 * (slot % 4))) & 0xFFu;
+    }
+    __device__ static __forceinline__ float apply(u32 code, float scale, float) {
+        return (float)(int)(signed char)code * scale;
+    }
+    // A tile's k-block is its 16 rows' k-block bytes, row by row.
+    static constexpr int CHUNKS = KBLOCK_BYTES;
+    __device__ __forceinline__ const u8 *chunk_source(u64 tile, u64 kblock, u32 chunk) const {
+        return grids.chunk(base, stride, tile, kblock * 16 * KBLOCK_BYTES + chunk * 16);
+    }
+    __device__ __forceinline__ Raw from_shared(const u8 *staged, u32 lane) const {
+        Raw raw;
+        G::load_shared(staged + (lane / 4) * KBLOCK_BYTES, raw.g);
+        G::load_shared(staged + (lane / 4 + 8) * KBLOCK_BYTES, raw.g8);
+        raw.t = lane % 4;
+        return raw;
+    }
+};
+
+typedef Grid<Iq2XsGrid> IQ2XS;
+typedef Grid<Iq3XxsGrid> IQ3XXS;
 
 // q5g32s (GGUF Q5_0: value = d * (code - 16)) and q5g32 (GGUF Q5_1: value =
 // d * code + m, the bias -m): q5k's code planes, one f16 d (and m) per 32.
@@ -1225,6 +1450,12 @@ template <class W> __device__ __forceinline__ void row_values16(const W &w, u64 
             ELEMENT_CAT(P, _PLANE_SUPERS_BYTES_PER_ROW)                                                  \
     }
 
+#define PACKETS_MAKE_GRID(TYPE, P, pointer)                                                              \
+    packets::TYPE {                                                                                      \
+        (const packets::u8 *)(pointer), ELEMENT_CAT(P, _ROW_STRIDE_BYTES), PACKETS_PLANE(P, GRIDS),                \
+            ELEMENT_CAT(P, _PLANE_SCALES_ROW_OFFSET), ELEMENT_CAT(P, _PLANE_SUPERS_ROW_OFFSET)                \
+    }
+
 // Dense weights: the tensor's rows (extent 0) at its row stride (stride 0,
 // elements). A rank-2 [rows, K] tensor is required.
 #define PACKETS_MAKE_DENSE(P, pointer)                                                                   \
@@ -1276,6 +1507,9 @@ namespace packets { typedef IQ4 W0; }
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q4G32S)
 namespace packets { typedef Q4G32S W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ4G32S)
+namespace packets { typedef IQ4G32S W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(IQ4G32S, KERNEL_W0, pointer)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_MXFP4G32)
 namespace packets { typedef MXFP4 W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W0, pointer)
@@ -1288,6 +1522,12 @@ namespace packets { typedef Q5G32<false> W0; }
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_Q5G32)
 namespace packets { typedef Q5G32<true> W0; }
 #define KERNEL_W0_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ2XS)
+namespace packets { typedef IQ2XS W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_GRID(IQ2XS, KERNEL_W0, pointer)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ3XXS)
+namespace packets { typedef IQ3XXS W0; }
+#define KERNEL_W0_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W0, pointer)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
@@ -1322,6 +1562,9 @@ namespace packets { typedef IQ4 W1; }
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q4G32S)
 namespace packets { typedef Q4G32S W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ4G32S)
+namespace packets { typedef IQ4G32S W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(IQ4G32S, KERNEL_W1, pointer)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_MXFP4G32)
 namespace packets { typedef MXFP4 W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W1, pointer)
@@ -1334,6 +1577,12 @@ namespace packets { typedef Q5G32<false> W1; }
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_Q5G32)
 namespace packets { typedef Q5G32<true> W1; }
 #define KERNEL_W1_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ2XS)
+namespace packets { typedef IQ2XS W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_GRID(IQ2XS, KERNEL_W1, pointer)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ3XXS)
+namespace packets { typedef IQ3XXS W1; }
+#define KERNEL_W1_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W1, pointer)
 #else
 #error "KERNEL_W1: unsupported weight representation"
 #endif
@@ -1368,6 +1617,9 @@ namespace packets { typedef IQ4 W2; }
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q4G32S)
 namespace packets { typedef Q4G32S W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ4G32S)
+namespace packets { typedef IQ4G32S W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(IQ4G32S, KERNEL_W2, pointer)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_MXFP4G32)
 namespace packets { typedef MXFP4 W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W2, pointer)
@@ -1380,6 +1632,12 @@ namespace packets { typedef Q5G32<false> W2; }
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_Q5G32)
 namespace packets { typedef Q5G32<true> W2; }
 #define KERNEL_W2_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ2XS)
+namespace packets { typedef IQ2XS W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_GRID(IQ2XS, KERNEL_W2, pointer)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ3XXS)
+namespace packets { typedef IQ3XXS W2; }
+#define KERNEL_W2_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W2, pointer)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
@@ -1414,6 +1672,9 @@ namespace packets { typedef IQ4 W3; }
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q4G32S)
 namespace packets { typedef Q4G32S W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(Q4G32S, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ4G32S)
+namespace packets { typedef IQ4G32S W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(IQ4G32S, KERNEL_W3, pointer)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_MXFP4G32)
 namespace packets { typedef MXFP4 W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_C4(MXFP4, KERNEL_W3, pointer)
@@ -1426,6 +1687,12 @@ namespace packets { typedef Q5G32<false> W3; }
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_Q5G32)
 namespace packets { typedef Q5G32<true> W3; }
 #define KERNEL_W3_AT(pointer) PACKETS_MAKE_Q5(true, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ2XS)
+namespace packets { typedef IQ2XS W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_GRID(IQ2XS, KERNEL_W3, pointer)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ3XXS)
+namespace packets { typedef IQ3XXS W3; }
+#define KERNEL_W3_AT(pointer) PACKETS_MAKE_GRID(IQ3XXS, KERNEL_W3, pointer)
 #else
 #error "KERNEL_W3: unsupported weight representation"
 #endif

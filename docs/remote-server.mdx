@@ -128,7 +128,7 @@ To serve only until you stop it, for example to try things out:
 magnitude serve
 ```
 
-It runs in the foreground and Ctrl+C stops it. Opening the desktop app stops it and takes over serving. For network access without the service, see [Network access](/api/network-access).
+It runs in the foreground and Ctrl+C stops it. On Linux, `nohup magnitude serve &` keeps it serving after you disconnect, until the machine restarts; on macOS, closing the terminal stops it. Opening the desktop app stops it and takes over serving. For network access without the service, see [Network access](/api/network-access).
 
 ## Windows
 

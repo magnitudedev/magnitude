@@ -405,6 +405,16 @@ pub enum ClosedOpView<'a, B: PhysicalDialect> {
         plane_info: seismic_lang::registry::PlaneInfo,
         indices: Vec<ClosedIndexValue>,
     },
+    /// The U32 position of the indexed logical element among the
+    /// `plane_info.group` elements one entry of the plane covers (a vector
+    /// code's lane).
+    ReadPlaneLane {
+        out: ClosedValue,
+        place: ClosedPackedPlace,
+        plane: u32,
+        plane_info: seismic_lang::registry::PlaneInfo,
+        indices: Vec<ClosedIndexValue>,
+    },
     ReadPlane {
         out: ClosedValue,
         place: ClosedPackedPlace,
@@ -701,6 +711,12 @@ pub enum Op<B: PhysicalDialect> {
         field: u32,
         index: Vec<ErasedValue>,
     },
+    ReadPlaneLane {
+        out: ErasedValue,
+        place: PlaceRef,
+        plane: u32,
+        index: Vec<ErasedValue>,
+    },
     ReadPlane {
         out: ErasedValue,
         place: PlaceRef,
@@ -804,6 +820,7 @@ impl<B: PhysicalDialect> Op<B> {
             | Self::Read { out, .. }
             | Self::VectorRead { out, .. }
             | Self::ReadPlaneField { out, .. }
+            | Self::ReadPlaneLane { out, .. }
             | Self::ReadPlane { out, .. }
             | Self::Extent { out, .. } => std::slice::from_ref(out),
             Self::Intrinsic { outs, .. }
@@ -834,6 +851,7 @@ pub enum ConstantValue {
     BF16(u16),
     I32(i32),
     U32(u32),
+    U64(u64),
     Bool(bool),
     Index(u64),
 }
@@ -848,6 +866,7 @@ impl ConstantValue {
             ReferenceScalar::BF16(bits) => Self::BF16(bits),
             ReferenceScalar::I32(value) => Self::I32(value),
             ReferenceScalar::U32(value) => Self::U32(value),
+            ReferenceScalar::U64(value) => Self::U64(value),
             ReferenceScalar::Bool(value) => Self::Bool(value),
         }
     }

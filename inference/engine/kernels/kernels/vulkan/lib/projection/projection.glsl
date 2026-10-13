@@ -63,6 +63,7 @@
 #include <seismic/packets.glsl>
 #include "../core/reduce.glsl"
 #include "../core/functions.glsl"
+#include "../core/matrix.glsl"
 
 #include "stage.glsl"
 
@@ -78,6 +79,10 @@
 #define PROJECTION_MUL 5
 #define PROJECTION_ACTIVATED_MUL 6
 #define PROJECTION_LOGITS 7
+#define PROJECTION_SCATTER 8
+#define PROJECTION_MIX_LOW 9
+#define PROJECTION_MIX_INJECT 10
+#define PROJECTION_MIX 11
 
 // Further epilogues (the Metal and CUDA vocabulary):
 //   Glu           y = round_A(round_A(act(round_A(gate))) * round_A(up))  (paired)
@@ -92,15 +97,19 @@ struct projection_epilogue {
     uint64_t y;
     uint64_t y0;
     uint64_t y1;
-    uint64_t column;    // Store: first destination column
-    uint64_t residual;  // Residual: F32 residual rows; ActivatedMul: F32 multipliers
+    uint64_t column;    // Store: first destination column; Mix: the norm weights
+    uint64_t residual;  // Residual: F32 residual rows; ActivatedMul: F32 multipliers; Mix: F32 streams
     uint64_t r0;
     uint64_t r1;
     uint64_t rows;      // Residual: row map of the residual (0: AllRows)
-    int function;       // Glu, Activated, ActivatedMul: FUNCTIONS_* code
+    int function;       // Glu, Activated, ActivatedMul: FUNCTIONS_* code; Mix: the norm's ELEMENT_*
     float cap;          // Logits: the softcap (0: none)
     float scale;        // a weight's second-level scale on the accumulator (paired: the gate stream's)
     float scale2;       // paired: the up stream's second-level scale
+    uint64_t inject;    // Scatter: F32 inject rows [M, streams]; Mix: F32 inverses [M, streams]
+    uint64_t inject0;
+    uint streams;       // Scatter, Mix*: hyper-connection streams of `width` columns
+    uint width;
 };
 
 // A weight's second-level scale (NVFP4 `.scale`, per tensor or per expert)
@@ -123,44 +132,107 @@ float projection_scale_factor(uint64_t scale, uint64_t extent, uint64_t stride, 
 
 projection_epilogue projection_store(const int element, uint64_t y, uint64_t stride0, uint64_t stride1, uint64_t column) {
     return projection_epilogue(PROJECTION_STORE, element, y, stride0, stride1, column, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0);
+        1.0, 0ul, 0ul, 1u, 0u);
 }
 
 projection_epilogue projection_residual(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows) {
     return projection_epilogue(PROJECTION_RESIDUAL, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows,
-        0, 0.0, 1.0, 1.0);
+        0, 0.0, 1.0, 1.0, 0ul, 0ul, 1u, 0u);
+}
+
+// `scatter`: `streams` hyper-connection streams of `width` columns, each the
+// residual plus the output times the stream's inject value (`inject` rows of
+// stride `inject0`).
+projection_epilogue projection_scatter(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
+    uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows, uint64_t inject, uint64_t inject0,
+    uint streams, uint width) {
+    return projection_epilogue(PROJECTION_SCATTER, act, y, stride0, stride1, 0ul, residual, residual0, residual1, rows,
+        0, 0.0, 1.0, 1.0, inject, inject0, streams, width);
+}
+
+// An output entry's epilogue by its inject extent `inject_extent`: the
+// residual, or the scatter into `streams` streams of `width` columns.
+projection_epilogue projection_output(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
+    uint64_t residual, uint64_t residual0, uint64_t residual1, uint64_t rows, uint64_t inject, uint64_t inject0,
+    const uint inject_extent, const uint streams, uint width) {
+    return inject_extent != 0u
+        ? projection_scatter(act, y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0,
+            streams, width)
+        : projection_residual(act, y, stride0, stride1, residual, residual0, residual1, rows);
+}
+
+// A mix site's low-rank rows (`stream_mix_down`): round_A(silu(v / streams)).
+projection_epilogue projection_mix_low(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, uint streams) {
+    return projection_epilogue(PROJECTION_MIX_LOW, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
+        1.0, 0ul, 0ul, streams, 0u);
+}
+
+// A mix site's inject values (`stream_mix_down`): 2 sigmoid(v / streams), F32.
+projection_epilogue projection_mix_inject(uint64_t y, uint64_t stride0, uint64_t stride1, uint streams) {
+    return projection_epilogue(PROJECTION_MIX_INJECT, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0,
+        0.0, 1.0, 1.0, 0ul, 0ul, streams, 0u);
+}
+
+// A mix site's per-stream partials (`stream_mix_up`): column n of stream
+// n / width, sigmoid(v) * x[m, n] * inverse[m, n / width] * norm[n] / streams,
+// F32 (`x` the streams' rows, `inverse` their [M, streams] inverses).
+projection_epilogue projection_mix(uint64_t y, uint64_t stride0, uint64_t stride1, uint64_t x, uint64_t x0,
+    uint64_t x1, uint64_t inverse, uint64_t inverse0, uint64_t norm, const int norm_kind, uint streams, uint width) {
+    return projection_epilogue(PROJECTION_MIX, ELEMENT_F32, y, stride0, stride1, norm, x, x0, x1, 0ul, norm_kind,
+        0.0, 1.0, 1.0, inverse, inverse0, streams, width);
 }
 
 projection_epilogue projection_silu_mul(const int act, uint64_t y, uint64_t stride0, uint64_t stride1) {
     return projection_epilogue(PROJECTION_SILU_MUL, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0);
+        1.0, 0ul, 0ul, 1u, 0u);
 }
 
 projection_epilogue projection_glu(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, int function) {
     return projection_epilogue(PROJECTION_GLU, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, function, 0.0, 1.0,
-        1.0);
+        1.0, 0ul, 0ul, 1u, 0u);
 }
 
 projection_epilogue projection_activated(const int act, uint64_t y, uint64_t stride0, uint64_t stride1, int function) {
     return projection_epilogue(PROJECTION_ACTIVATED, act, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, function, 0.0,
-        1.0, 1.0);
+        1.0, 1.0, 0ul, 0ul, 1u, 0u);
 }
 
 projection_epilogue projection_mul(uint64_t y, uint64_t stride0, uint64_t stride1) {
     return projection_epilogue(PROJECTION_MUL, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, 0.0, 1.0,
-        1.0);
+        1.0, 0ul, 0ul, 1u, 0u);
 }
 
 projection_epilogue projection_activated_mul(const int act, uint64_t y, uint64_t stride0, uint64_t stride1,
     uint64_t multiplier, uint64_t multiplier0, uint64_t multiplier1, int function) {
     return projection_epilogue(PROJECTION_ACTIVATED_MUL, act, y, stride0, stride1, 0ul, multiplier, multiplier0,
-        multiplier1, 0ul, function, 0.0, 1.0, 1.0);
+        multiplier1, 0ul, function, 0.0, 1.0, 1.0, 0ul, 0ul, 1u, 0u);
 }
 
 projection_epilogue projection_logits(uint64_t y, uint64_t stride0, uint64_t stride1, float cap) {
     return projection_epilogue(PROJECTION_LOGITS, ELEMENT_F32, y, stride0, stride1, 0ul, 0ul, 0ul, 0ul, 0ul, 0, cap, 1.0,
-        1.0);
+        1.0, 0ul, 0ul, 1u, 0u);
+}
+
+// A routed sublayer's column n of row m joining the residual (`routed_output`,
+// `routed_combine`): residual + selected + expert, in that order (`expert` the
+// shared expert's weighted output), or with an inject (`inject_extent` != 0)
+// for each of the `streams` streams of `width` columns
+// residual[s] + (selected + expert) * inject[s].
+void projection_routed_join(uint64_t y, uint64_t y0, uint64_t y1, uint64_t residual, uint64_t residual0,
+    uint64_t residual1, uint64_t inject, uint64_t inject0, const uint inject_extent, const uint streams, uint width,
+    uint64_t m, uint64_t n, float selected, float expert) {
+    if (inject_extent == 0u) {
+        element_f32_put(y + (m * y0 + n * y1) * 4ul,
+            element_f32_at(residual + (m * residual0 + n * residual1) * 4ul) + selected + expert);
+        return;
+    }
+    for (uint s = 0u; s < streams; ++s) {
+        const uint64_t column = uint64_t(s * width) + n;
+        element_f32_put(y + (m * y0 + column * y1) * 4ul,
+            element_f32_at(residual + (m * residual0 + column * residual1) * 4ul)
+                + (selected + expert) * element_f32_at(inject + (m * inject0 + s) * 4ul));
+    }
 }
 
 // Publishes one output of an unpaired epilogue.
@@ -180,6 +252,27 @@ void projection_put(projection_epilogue out_, uint m, uint n, float value) {
         element_put(out_.act, out_.y, at, activated * element_f32_at(out_.residual + source * 4ul));
     } else if (out_.kind == PROJECTION_LOGITS) {
         element_f32_put(out_.y + at * 4ul, out_.cap > 0.0 ? functions_softcap(out_.cap, value) : value);
+    } else if (out_.kind == PROJECTION_SCATTER) {
+        const float rounded = element_round(out_.act, value);
+        const uint64_t row = uint64_t(projection_row(out_.rows, m)) * out_.r0;
+        for (uint s = 0u; s < out_.streams; ++s) {
+            const uint64_t column = uint64_t(s * out_.width + n);
+            element_f32_put(out_.y + (uint64_t(m) * out_.y0 + column * out_.y1) * 4ul,
+                element_f32_at(out_.residual + (row + column * out_.r1) * 4ul)
+                    + rounded * element_f32_at(out_.inject + (uint64_t(m) * out_.inject0 + s) * 4ul));
+        }
+    } else if (out_.kind == PROJECTION_MIX_LOW) {
+        const float v = seismic_div_rn(value, float(out_.streams));
+        element_put(out_.act, out_.y, at, seismic_div_rn(v, 1.0 + exp(-v)));
+    } else if (out_.kind == PROJECTION_MIX_INJECT) {
+        element_f32_put(out_.y + at * 4ul,
+            seismic_div_rn(2.0, 1.0 + exp(-seismic_div_rn(value, float(out_.streams)))));
+    } else if (out_.kind == PROJECTION_MIX) {
+        const float normalized = element_f32_at(out_.residual + (uint64_t(m) * out_.r0 + uint64_t(n) * out_.r1) * 4ul)
+            * element_f32_at(out_.inject + (uint64_t(m) * out_.inject0 + uint64_t(n / out_.width)) * 4ul)
+            * element_at(out_.function, out_.column, uint64_t(n));
+        const float gate = seismic_div_rn(1.0, 1.0 + exp(-value));
+        element_f32_put(out_.y + at * 4ul, seismic_div_rn(gate * normalized, float(out_.streams)));
     } else {
         const uint64_t source = uint64_t(projection_row(out_.rows, m)) * out_.r0 + uint64_t(n) * out_.r1;
         element_f32_put(out_.y + at * 4ul, element_f32_at(out_.residual + source * 4ul) + element_round(out_.act, value));
@@ -219,10 +312,11 @@ struct projection_weights {
     packets_rows16 geometry;
     uint k;
     uint64_t table;     // 0: rows in order
+    uint64_t table_stride;
 };
 
 uint64_t projection_weights_row(projection_weights w, uint n) {
-    const uint64_t r = w.table == 0ul ? uint64_t(n) : uint64_t(element_i32_at(w.table + uint64_t(n) * 4ul));
+    const uint64_t r = w.table == 0ul ? uint64_t(n) : uint64_t(element_i32_at(w.table + uint64_t(n) * w.table_stride * 4ul));
     return w.base + r * w.geometry.stride;
 }
 
@@ -258,6 +352,35 @@ void projection_stage(projection_prologue in_, uint m, uint64_t x, uint columns)
                 element_put(in_.act, x, row + i + j, (j & 1u) != 0u ? odd[j >> 1] : even[j >> 1]);
         }
     }
+}
+
+// `projection_stage` over one hyper-connection stream (`group_rms`): the
+// workgroup normalizes columns stream * width .. of row m of an Rms
+// prologue over whole rows of streams by the stream's own inverse, stores
+// them in A at x[m * columns + stream * width ..] and returns the inverse.
+float projection_stage_stream(projection_prologue in_, uint m, uint stream, uint width, uint64_t x, uint columns) {
+    const uint thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
+    const uint first = stream * width;
+    float squares = 0.0;
+    for (uint i = thread; i < width; i += threads) {
+        const float v = projection_norm_input(in_, m, first + i);
+        squares = seismic_fma_rn(v, v, squares);
+    }
+    squares = reduce_group_sum(squares, 0u);
+    const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
+    const uint64_t row = uint64_t(m) * columns + first;
+    const bool vector = (columns & 7u) == 0u && (first & 7u) == 0u;
+    for (uint i = 8u * thread; i < width; i += 8u * threads) {
+        vec4 even, odd;
+        projection_load8(in_, m, first + i, inverse, even, odd);
+        if (vector && i + 8u <= width) {
+            element_uvec4_put(x + (row + i) * 2ul, element_pack8(in_.act, even, odd));
+        } else {
+            for (uint j = 0u; j < 8u && i + j < width; ++j)
+                element_put(in_.act, x, row + i + j, (j & 1u) != 0u ? odd[j >> 1] : even[j >> 1]);
+        }
+    }
+    return inverse;
 }
 
 // ---------------------------------------------------------------------------
@@ -569,12 +692,6 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 #define PROJECTION_GEMM_ROW_MAXIMUM 16u
 #define PROJECTION_GEMM_ROW_EXPONENT 17u
 
-#if SEISMIC_HAS_MATRIX
-#define PROJECTION_FRAGMENT_A coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
-#define PROJECTION_FRAGMENT_B coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
-#define PROJECTION_FRAGMENT_C coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
-#endif
-
 // The accumulators of one subgroup's WM x WN sub-tile: (WM / 16) x (WN / 16)
 // fragments (fragment (i, j) at i * (WN / 16) + j), or per 32 x 32 block
 // (bi, bj) (block bi * (WN / 32) + bj) a 4 x 8 register tile per lane (rows 4
@@ -582,7 +699,7 @@ void projection_gemv(const int wk, const int uk, const bool paired, const uint r
 // each of the lane's output rows (see `projection_gemm_pair`).
 struct projection_gemm_acc {
 #if SEISMIC_HAS_MATRIX
-    PROJECTION_FRAGMENT_C c[PROJECTION_GEMM_MAX_FRAGMENTS];
+    MATRIX_FRAGMENT_C c[PROJECTION_GEMM_MAX_FRAGMENTS];
 #else
     float c[32 * PROJECTION_GEMM_MAX_BLOCKS];
 #endif
@@ -737,6 +854,8 @@ void projection_gemm_load_b(int kind, const uint threads, projection_weights w, 
         projection_gemm_load_b_of(PACKETS_Q8, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_IQ4))
         projection_gemm_load_b_of(PACKETS_IQ4, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ4S))
+        projection_gemm_load_b_of(PACKETS_IQ4S, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_Q4G32S))
         projection_gemm_load_b_of(PACKETS_Q4G32S, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_MXFP4))
@@ -747,6 +866,10 @@ void projection_gemm_load_b(int kind, const uint threads, projection_weights w, 
         projection_gemm_load_b_of(PACKETS_Q5G32S, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_Q5G32))
         projection_gemm_load_b_of(PACKETS_Q5G32, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XS))
+        projection_gemm_load_b_of(PACKETS_IQ2XS, threads, w, first, count, rows, k0, k, regs);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ3XXS))
+        projection_gemm_load_b_of(PACKETS_IQ3XXS, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_BF16))
         projection_gemm_load_b_of(PACKETS_BF16, threads, w, first, count, rows, k0, k, regs);
     else if (projection_gemm_kind_is(kind, PACKETS_F16))
@@ -767,6 +890,8 @@ void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b reg
         projection_gemm_store_b_of(PACKETS_Q8, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_IQ4))
         projection_gemm_store_b_of(PACKETS_IQ4, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ4S))
+        projection_gemm_store_b_of(PACKETS_IQ4S, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_Q4G32S))
         projection_gemm_store_b_of(PACKETS_Q4G32S, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_MXFP4))
@@ -777,6 +902,10 @@ void projection_gemm_store_b(int kind, const uint threads, projection_gemm_b reg
         projection_gemm_store_b_of(PACKETS_Q5G32S, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_Q5G32))
         projection_gemm_store_b_of(PACKETS_Q5G32, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ2XS))
+        projection_gemm_store_b_of(PACKETS_IQ2XS, threads, regs, count, tile_row0, spacing, b_word);
+    else if (projection_gemm_kind_is(kind, PACKETS_IQ3XXS))
+        projection_gemm_store_b_of(PACKETS_IQ3XXS, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_BF16))
         projection_gemm_store_b_of(PACKETS_BF16, threads, regs, count, tile_row0, spacing, b_word);
     else if (projection_gemm_kind_is(kind, PACKETS_F16))
@@ -797,13 +926,13 @@ void projection_gemm_multiply(const uint tm, const uint tn, const uint wm, const
 #if SEISMIC_HAS_MATRIX
     const uint fm = wm / 16u, fn = wn / 16u;
     [[unroll]] for (uint kk = 0u; kk < PROJECTION_GEMM_K; kk += 16u) {
-        PROJECTION_FRAGMENT_B b[4];
+        MATRIX_FRAGMENT_B b[4];
         [[unroll]] for (uint j = 0u; j < fn; ++j)
             coopMatLoad(b[j], seismic_shared_f16, b0 + (column0 + 16u * j) * PROJECTION_GEMM_LDA + kk,
                 PROJECTION_GEMM_LDA, gl_CooperativeMatrixLayoutColumnMajor);
         [[unroll]] for (uint i = 0u; i < fm; ++i) {
             if (i < live) {
-                PROJECTION_FRAGMENT_A a;
+                MATRIX_FRAGMENT_A a;
                 coopMatLoad(a, seismic_shared_f16, (row0 + 16u * i) * PROJECTION_GEMM_LDA + kk, PROJECTION_GEMM_LDA,
                     gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint j = 0u; j < fn; ++j)
@@ -851,7 +980,7 @@ void projection_gemm_accumulate(const int wk, const int uk, const bool paired, c
     const uint b_word = tm * (PROJECTION_GEMM_LDA / 8u);
 #if SEISMIC_HAS_MATRIX
     [[unroll]] for (uint i = 0u; i < (wm / 16u) * (wn / 16u); ++i)
-        acc.c[i] = PROJECTION_FRAGMENT_C(0.0);
+        acc.c[i] = matrix_zero();
     const uint scales = wm / 16u;
 #else
     [[unroll]] for (uint i = 0u; i < wm * wn / 32u; ++i)

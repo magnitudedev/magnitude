@@ -2008,6 +2008,7 @@ mod tests {
                         ConstantValue::F32(value) => ReferenceScalar::F32(value.to_bits()),
                         ConstantValue::I32(value) => ReferenceScalar::I32(value),
                         ConstantValue::U32(value) => ReferenceScalar::U32(value),
+                        ConstantValue::U64(value) => ReferenceScalar::U64(value),
                         ConstantValue::Bool(value) => ReferenceScalar::Bool(value),
                         ConstantValue::Index(_) => panic!("source constant became a natural"),
                     };

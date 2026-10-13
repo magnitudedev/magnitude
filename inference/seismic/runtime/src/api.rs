@@ -89,6 +89,17 @@ pub enum WorkflowError {
     NativePortAlreadyBound {
         port: usize,
     },
+    /// A run's timeline node was not bound to a timeline.
+    NativeTimelineUnbound {
+        node: usize,
+    },
+    NativeTimelineAlreadyBound {
+        node: usize,
+    },
+    /// A timeline node was bound to another device's timeline.
+    NativeTimelineMismatch {
+        node: usize,
+    },
     NativeGraphSlotMismatch,
     NativeGraphLayoutMismatch,
     NativeOutputLeaseConsumed,
@@ -152,6 +163,15 @@ impl fmt::Display for CallError {
             }
             Self::Workflow(WorkflowError::NativePortAlreadyBound { port }) => {
                 write!(f, "native graph port {port} was bound twice")
+            }
+            Self::Workflow(WorkflowError::NativeTimelineUnbound { node }) => {
+                write!(f, "native graph timeline node {node} is unbound")
+            }
+            Self::Workflow(WorkflowError::NativeTimelineAlreadyBound { node }) => {
+                write!(f, "native graph timeline node {node} was bound twice")
+            }
+            Self::Workflow(WorkflowError::NativeTimelineMismatch { node }) => {
+                write!(f, "native graph timeline node {node} names another device's timeline")
             }
             Self::Workflow(WorkflowError::NativeGraphSlotMismatch) => {
                 f.write_str("native graph slot belongs to another graph")
@@ -353,6 +373,15 @@ pub mod device {
         pub(crate) artifacts: Option<Arc<dyn crate::artifacts::ArtifactStore>>,
         /// Native submission order and CUDA graph replays.
         pub(crate) native: crate::native::NativeQueue,
+        /// Kernels tuning chose and formed, handed to the serving
+        /// preparation of the same specialization so nothing is formed twice
+        /// (`NativePrepared::hand_off`). Taken on first use.
+        pub(crate) chosen: std::sync::Mutex<
+            std::collections::HashMap<
+                crate::native::NativeHandoffKey,
+                crate::native::NativeHandoff,
+            >,
+        >,
     }
     impl DeviceInner {
         pub(crate) fn active_trace(&self) -> Option<Arc<crate::native::trace::TraceSink>> {
@@ -363,6 +392,10 @@ pub mod device {
         }
         pub fn info(&self) -> &DeviceInfo {
             &self.info
+        }
+        /// How many native programs this device has formed.
+        pub fn programs_formed(&self) -> usize {
+            self.programs.formed()
         }
         pub fn capabilities(&self) -> &[String] {
             self.capabilities
@@ -429,6 +462,13 @@ pub mod device {
         pub fn tuning_identity(&self) -> String {
             format!("{};{}", self.info.name, self.kind.tuning_identity())
         }
+        /// Lend the device `workers` for the programs it forms off the
+        /// calling thread, or take them back (none). The device starts no
+        /// thread of its own: without workers it forms in turn on the
+        /// thread that asks.
+        pub fn staff(&self, workers: Option<Arc<seismic_native_target::workers::Workers>>) {
+            self.programs.staff(workers);
+        }
         /// Whether this opened device forms Metal tensor operations (the
         /// fact its native sources are formed under); false on every other
         /// backend. `DeviceInfo::forms_tensor_operations` answers the same
@@ -453,6 +493,10 @@ pub mod device {
         /// count against the limit; they are never charged twice.
         pub fn set_memory_limit(&self, limit: Option<u64>) {
             self.kind.set_memory_limit(limit)
+        }
+        /// Start [`MemoryUsage::high_water`] again from the current charge.
+        pub fn restart_memory_high_water(&self) {
+            self.kind.restart_memory_high_water()
         }
         pub fn memory_status(&self) -> Result<DeviceMemoryStatus, ObservationError> {
             self.kind.memory_status()
@@ -962,6 +1006,75 @@ pub mod tensor {
             Ok(layout::canonical(representation, extents)?.byte_len)
         }
 
+        /// A zero-filled tensor in storage the host writes and reads in
+        /// place while device work that uses it is queued or running
+        /// (`OpenedKind::allocate_upload`: host-visible on every backend,
+        /// mapped pinned host memory on CUDA).
+        pub fn shared(
+            device: &Arc<DeviceInner>,
+            representation: RepresentationId,
+            extents: &[u64],
+        ) -> Result<Self, TensorError> {
+            if !device.supports_representation(representation) {
+                return Err(TensorError::UnsupportedRepresentation {
+                    backend: device.info().backend,
+                    representation: representation_info(representation).name,
+                });
+            }
+            let layout = layout::canonical(representation, extents)?;
+            let allocation = device.allocate_upload(layout.byte_len, layout.alignment)?;
+            write_zeros(allocation.storage(), layout.byte_len)?;
+            Ok(Self::new_view(
+                device.clone(),
+                allocation,
+                0,
+                layout.byte_len,
+                representation,
+                extents.to_vec(),
+                layout.strides,
+            ))
+        }
+
+        /// Write `bytes` at `offset` bytes into this view without waiting
+        /// for device work that uses its storage.
+        ///
+        /// # Safety
+        /// The tensor was made by [`Self::shared`] (or is a view of one),
+        /// and no device work in flight reads or writes these bytes.
+        pub unsafe fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<(), TensorError> {
+            offset
+                .checked_add(bytes.len() as u64)
+                .filter(|end| *end <= self.byte_len)
+                .ok_or(TensorError::HostByteLength {
+                    expected: self.byte_len,
+                    actual: offset.saturating_add(bytes.len() as u64),
+                })?;
+            self.allocation
+                .storage()
+                .write(self.byte_offset + offset, bytes)
+                .map_err(TensorError::Execution)
+        }
+
+        /// Read `into.len()` bytes at `offset` bytes into this view without
+        /// waiting for device work that uses its storage.
+        ///
+        /// # Safety
+        /// The tensor was made by [`Self::shared`] (or is a view of one),
+        /// and no device work in flight writes these bytes.
+        pub unsafe fn read_shared(&self, offset: u64, into: &mut [u8]) -> Result<(), TensorError> {
+            offset
+                .checked_add(into.len() as u64)
+                .filter(|end| *end <= self.byte_len)
+                .ok_or(TensorError::HostByteLength {
+                    expected: self.byte_len,
+                    actual: offset.saturating_add(into.len() as u64),
+                })?;
+            self.allocation
+                .storage()
+                .read(self.byte_offset + offset, into)
+                .map_err(TensorError::Execution)
+        }
+
         pub fn zeros(
             device: &Arc<DeviceInner>,
             representation: RepresentationId,
@@ -1208,7 +1321,8 @@ pub mod tensor {
                 ));
             }
             let _guard = self.allocation.acquire(true);
-            let mut scratch = [0u8; 1024 * 1024];
+            // On the heap: a 1 MiB array would fill a whole Windows main-thread stack.
+            let mut scratch = vec![0u8; 1024 * 1024];
             let mut written = 0u64;
             while written < self.byte_len {
                 let count = usize::try_from((self.byte_len - written).min(scratch.len() as u64))
@@ -1441,6 +1555,39 @@ pub mod tensor {
             }
         }
     }
+
+    #[cfg(test)]
+    mod reader_tests {
+        use super::TensorInner;
+        use seismic_lang::registry;
+        use seismic_lang::types::DType;
+
+        /// A reader upload runs on a Windows main thread (1 MiB of stack) in a
+        /// model's Prepare; it must not need a stack of its own size.
+        #[test]
+        fn reader_upload_fits_a_small_thread_stack() {
+            std::thread::Builder::new()
+                .stack_size(256 * 1024)
+                .spawn(|| {
+                    let catalog = crate::devices::Catalog::discover().unwrap();
+                    let device = catalog.open_backend(registry::BackendName::Cpu).unwrap();
+                    let count = 3 * 1024 * 1024 / 4 + 5;
+                    let tensor = TensorInner::from_host(
+                        &device,
+                        registry::dense(DType::F32),
+                        &[count],
+                        &vec![0; count as usize * 4],
+                    )
+                    .unwrap();
+                    let bytes = (0..count * 4).map(|i| i as u8).collect::<Vec<_>>();
+                    tensor.write_from_reader(&mut bytes.as_slice()).unwrap();
+                    assert_eq!(tensor.read_to_host().unwrap(), bytes);
+                })
+                .unwrap()
+                .join()
+                .unwrap();
+        }
+    }
 }
 
 pub mod kernel {
@@ -1476,6 +1623,14 @@ pub mod kernel {
         }
         pub fn implementation(&self) -> &seismic_lang::checked::NativeImplementation {
             self.inner.implementation()
+        }
+        /// Check the launches of a call whose dimensions are `dimensions`
+        /// against the formed functions and the device limits.
+        pub fn admits(
+            &self,
+            dimensions: &std::collections::BTreeMap<String, u64>,
+        ) -> Result<(), super::CallError> {
+            self.inner.admits(dimensions)
         }
         /// Time calls cycling through `rotation` on the device.
         pub fn measure(
@@ -1622,6 +1777,7 @@ pub mod kernel {
                 Self::BF16(value) => ArgumentValue::BF16(value),
                 Self::I32(value) => ArgumentValue::I32(value),
                 Self::U32(value) => ArgumentValue::U32(value),
+                Self::U64(value) => ArgumentValue::U64(value),
                 Self::Bool(value) => ArgumentValue::Bool(value),
                 Self::Index(value) => ArgumentValue::Index(value),
                 Self::Range { start, end } => ArgumentValue::Range { start, end },
@@ -1642,27 +1798,6 @@ pub mod kernel {
             Self {
                 arguments: Vec::new(),
             }
-        }
-        /// Preserve scalar arguments while replacing tensor bindings by ordinal.
-        pub(crate) fn map_tensors<E>(
-            &self,
-            mut map: impl FnMut(usize, &Arc<TensorInner>) -> Result<Arc<TensorInner>, E>,
-        ) -> Result<Self, E> {
-            Ok(Self {
-                arguments: self
-                    .arguments
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, argument)| match argument {
-                        EncodedArgument::Tensor(tensor) => {
-                            map(ordinal, tensor).map(EncodedArgument::Tensor)
-                        }
-                        EncodedArgument::Scalar(value) => {
-                            Ok(EncodedArgument::Scalar(value.clone()))
-                        }
-                    })
-                    .collect::<Result<_, _>>()?,
-            })
         }
         pub(crate) fn into_workflow(self) -> EncodedWorkflowArgs {
             let arguments = self
@@ -1862,7 +1997,7 @@ pub mod kernel {
                 seismic_lang::failure::SourceTermination::Failed(failure) => {
                     return Err(super::CallError::Execution(
                         seismic_compiler::errors::ExecutionError::DataCheckFailed(failure),
-                    ))
+                    ));
                 }
             };
             let values = outputs
@@ -2024,9 +2159,24 @@ pub mod kernel {
         device: &Arc<DeviceInner>,
         options: seismic_compiler::feedback::PreparationOptions,
     ) -> Result<PreparedAny, PrepareError> {
+        let logical = module
+            .entry(entry, &bindings)
+            .map_err(PrepareError::Source)?;
+        prepare_logical(logical, bindings, device, options)
+    }
+
+    /// Prepare an already checked computation through the ordinary compiler,
+    /// cache and device-admission path. Bound numerical recipes enter its
+    /// logical identity; they do not add invocation arguments or another cache.
+    pub(crate) fn prepare_logical(
+        logical: seismic_lang::entry::LogicalEntry,
+        bindings: ElementBindings,
+        device: &Arc<DeviceInner>,
+        options: seismic_compiler::feedback::PreparationOptions,
+    ) -> Result<PreparedAny, PrepareError> {
         device
             .kind
-            .prepare(module, entry, bindings, device, options)
+            .prepare(logical, bindings, device, options)
             .map(|inner| PreparedAny { inner })
     }
     pub fn call(kernel: &Arc<PreparedAny>, args: EncodedArgs) -> Result<DecodedResults, CallError> {

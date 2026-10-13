@@ -457,9 +457,20 @@ fn run_family(
     let case = &named.case;
     let slab_rows = named.slab_rows as u32;
     let elements = Element::bf16();
+    // The prefills in their Visible form: no WorkList bitmap (B = 0, a static
+    // of the GPU natives).
+    let prefill = matches!(kind, Kind::Prefill | Kind::PrefillK8V4);
+    let specialization = &if !prefill || is_cpu(device) {
+        specialization.clone()
+    } else {
+        specialization.clone().with_static("B", 0)
+    };
+    let rows = inputs.destinations.extents()[0];
+    let selection = Tensor::from_host(device, Element::u32(), &[rows, 0], &[]).unwrap();
+    let every_key = block_slots(device, 1);
     {
         macro_rules! dense {
-            ($module:ident) => {{
+            ($module:ident $(, $extra:ident: $value:expr)*) => {{
                 let kernel = $module::native_for_device_with(
                     device,
                     $module::Elements { A: elements },
@@ -485,6 +496,7 @@ fn run_family(
                         visible: &inputs.visible,
                         fresh: &inputs.fresh,
                         destinations: &inputs.destinations,
+                        $($extra: $value,)*
                         history_key,
                         history_value,
                         epsilon: case.epsilon,
@@ -497,7 +509,7 @@ fn run_family(
             }};
         }
         macro_rules! affine {
-            ($module:ident $(, $extra:ident: $value:expr)?) => {{
+            ($module:ident $(, $extra:ident: $value:expr)*) => {{
                 let kernel = $module::native_for_device_with(
                     device,
                     $module::Elements { A: elements },
@@ -524,7 +536,7 @@ fn run_family(
                         visible: &inputs.visible,
                         fresh: &inputs.fresh,
                         destinations: &inputs.destinations,
-                        $($extra: $value,)?
+                        $($extra: $value,)*
                         history_key_codes: key_codes,
                         history_key_coefficients: key_coefficients,
                         history_value_codes: value_codes,
@@ -540,10 +552,11 @@ fn run_family(
         }
         let result = match kind {
             Kind::Decode => dense!(attention_decode),
-            Kind::Prefill => dense!(attention_prefill),
+            Kind::Prefill => dense!(attention_prefill, selection: &selection, block_slots: &every_key),
             Kind::DecodeK8V4 => affine!(attention_decode_k8v4),
             Kind::PrefillK8V4 => {
-                affine!(attention_prefill_k8v4, history_tiles: &inputs.history_tiles)
+                affine!(attention_prefill_k8v4, selection: &selection, block_slots: &every_key,
+                    history_tiles: &inputs.history_tiles)
             }
         };
         Ok(outputs(&result, history))
@@ -637,6 +650,7 @@ fn attention_golden() {
                                     .with_param("MATRIX", 0)
                                     .with_param("STAGES", 2)
                                     .with_param("COLUMNS", 1)
+                                    .with_param("QREG", 0)
                             }
                             BackendName::Vulkan => {
                                 specialization = specialization.with_param("MATRIX", 0);

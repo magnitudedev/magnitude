@@ -60,23 +60,37 @@ pub enum Rounded {
     UnsignedConversion,
 }
 
+impl OpenError {
+    /// Why the device does not meet the floor, when that is the error: the
+    /// reason discovery reports as the device's unavailability.
+    pub fn floor_reason(&self) -> Option<String> {
+        match self {
+            Self::Floor(reason) => Some(reason.clone()),
+            Self::MultiplyAdd { fma, separate } => Some(format!(
+                "it lacks VK_KHR_shader_fma and its fma is not fused beside a NoContraction multiply-add \
+                 (witness fma {fma:#010x}, multiply-add {separate:#010x}; fused {:#010x}, rounded twice {:#010x})",
+                crate::probe::FUSED,
+                crate::probe::ROUNDED_TWICE,
+            )),
+            Self::Rounding { operation, operands, expected, actual } => Some(format!(
+                "without RoundingModeRTE 32 its fp32 {operation:?} of witness {operands:#010x?} gives \
+                 {actual:#010x}, not the nearest-even {expected:#010x}"
+            )),
+            Self::Loader(_) | Self::Missing | Self::Creation(_) => None,
+        }
+    }
+}
+
 impl fmt::Display for OpenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Loader(error) => write!(f, "{error}"),
             Self::Missing => f.write_str("the Vulkan device is no longer present"),
-            Self::Floor(reason) => write!(f, "the Vulkan device does not meet the floor: {reason}"),
             Self::Creation(reason) => write!(f, "opening the Vulkan device failed: {reason}"),
-            Self::MultiplyAdd { fma, separate } => write!(
+            Self::Floor(_) | Self::MultiplyAdd { .. } | Self::Rounding { .. } => write!(
                 f,
-                "the Vulkan device does not meet the floor: it lacks VK_KHR_shader_fma and its fma is not fused \
-                 beside a NoContraction multiply-add (witness fma {fma:#010x}, multiply-add {separate:#010x}; \
-                 fused 0x33800000, rounded twice 0x00000000)"
-            ),
-            Self::Rounding { operation, operands, expected, actual } => write!(
-                f,
-                "the Vulkan device does not meet the floor: without RoundingModeRTE 32 its fp32 {operation:?} of \
-                 witness {operands:#010x?} gives {actual:#010x}, not the nearest-even {expected:#010x}"
+                "the Vulkan device does not meet the floor: {}",
+                self.floor_reason().expect("a floor error has a reason")
             ),
         }
     }
@@ -145,6 +159,13 @@ pub(crate) struct Inner {
     queue: Mutex<Queue>,
     recording: Mutex<Recording>,
     staging: Mutex<Option<Staging>>,
+    /// Device memory the driver took for this device outside every block:
+    /// the logical device itself, pipelines, shader scratch.
+    driver: std::sync::atomic::AtomicU64,
+    /// Device memory recorded graphs took (their command memory), measured
+    /// while each is recorded; the device keeps it for the command buffers
+    /// it reuses.
+    pub(crate) graphs: std::sync::atomic::AtomicU64,
     physical: vk::PhysicalDevice,
     instance: &'static Instance,
 }
@@ -162,11 +183,150 @@ pub struct MemoryBudget {
     pub heap_usage_bytes: u64,
 }
 
+/// The process's Vulkan devices: the one logical device of each opened
+/// physical device, and each probed physical device's numerical verdict.
+#[derive(Default)]
+struct Registry {
+    opened: Vec<Device>,
+    numerics: Vec<([u8; 16], Result<(), OpenError>)>,
+}
+
+fn registry() -> MutexGuard<'static, Registry> {
+    static REGISTRY: std::sync::OnceLock<Mutex<Registry>> = std::sync::OnceLock::new();
+    REGISTRY
+        .get_or_init(Mutex::default)
+        .lock()
+        .expect("the device registry lock is never poisoned")
+}
+
+/// Whether a device with these facts must pass the open-time probes:
+/// without `RoundingModeRTE 32` its default fp32 rounding, and without
+/// `VK_KHR_shader_fma` its `fma`, are established only by running them.
+fn probed(facts: &Facts) -> bool {
+    !facts.rounding_rte_32 || !facts.shader_fma.float32
+}
+
+/// Run the numerical probes a device with these facts needs.
+fn probe(device: &Device) -> Result<(), OpenError> {
+    if !device.facts().rounding_rte_32 {
+        crate::probe::rounding(device)?;
+    }
+    if !device.facts().shader_fma.float32 {
+        crate::probe::multiply_add(device)?;
+    }
+    Ok(())
+}
+
+impl Registry {
+    /// The numerical verdict of `device`: recorded once per physical device
+    /// and process, by discovery or by the first open.
+    fn verdict(&mut self, device: &Device) -> Result<(), OpenError> {
+        let uuid = device.facts().uuid;
+        if let Some((_, verdict)) = self.numerics.iter().find(|(probed, _)| *probed == uuid) {
+            return verdict.clone();
+        }
+        let verdict = probe(device);
+        self.numerics.push((uuid, verdict.clone()));
+        verdict
+    }
+}
+
+/// Whether a physical device meeting the static floor also meets its
+/// numerical part (§16.1), so discovery reports the availability an open
+/// keeps. A device needing probes is opened briefly to run them, once per
+/// process; the verdict is recorded and the probing device released, so a
+/// process that only discovers holds no device. A device already open passed
+/// at its open.
+pub(crate) fn numerical_floor(
+    instance: &'static Instance,
+    physical: vk::PhysicalDevice,
+    facts: &Facts,
+) -> Result<(), OpenError> {
+    if !probed(facts) {
+        return Ok(());
+    }
+    let mut registry = registry();
+    if registry
+        .opened
+        .iter()
+        .any(|device| device.facts().uuid == facts.uuid)
+    {
+        return Ok(());
+    }
+    if let Some((_, verdict)) = registry
+        .numerics
+        .iter()
+        .find(|(uuid, _)| *uuid == facts.uuid)
+    {
+        return verdict.clone();
+    }
+    match Inner::create(instance, physical, facts.clone()) {
+        Ok(inner) => registry.verdict(&Device {
+            inner: Arc::new(inner),
+        }),
+        Err(error) => {
+            registry.numerics.push((facts.uuid, Err(error.clone())));
+            Err(error)
+        }
+    }
+}
+
+impl Inner {
+    /// This process's usage of the device-local heap.
+    fn heap_usage(&self) -> u64 {
+        memory_budget(self.instance, self.physical).heap_usage_bytes
+    }
+
+    /// Run a driver operation that may take device memory no allocation
+    /// charges (pipeline creation; recording and submitting work, for which
+    /// the driver may grow its command memory and shader scratch), counting
+    /// the growth of the process's heap usage across it, less blocks it
+    /// created, as driver memory the device holds.
+    pub(crate) fn measured<R>(&self, operation: impl FnOnce() -> R) -> R {
+        thread_local! {
+            static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        // An operation measured inside another is part of the outer one.
+        if MEASURING.with(|measuring| measuring.replace(true)) {
+            return operation();
+        }
+        let start = self.unheld_mark();
+        let result = operation();
+        self.driver.fetch_add(
+            self.unheld_since(start),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        MEASURING.with(|measuring| measuring.set(false));
+        result
+    }
+
+    /// The process's heap usage with the blocks and recorded graphs this
+    /// device holds, to measure what an operation takes beyond them.
+    pub(crate) fn unheld_mark(&self) -> (u64, u64) {
+        (
+            self.heap_usage(),
+            self.memory.device_local_block_bytes()
+                + self.graphs.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Growth of the heap usage since `mark` that neither a new block nor a
+    /// recorded graph accounts for.
+    pub(crate) fn unheld_since(&self, (usage, held): (u64, u64)) -> u64 {
+        let grown = self.heap_usage().saturating_sub(usage);
+        let held = (self.memory.device_local_block_bytes()
+            + self.graphs.load(std::sync::atomic::Ordering::Relaxed))
+        .saturating_sub(held);
+        grown.saturating_sub(held)
+    }
+}
+
 impl Device {
     /// Open the physical device with this UUID, revalidating it against
-    /// the floor; without `RoundingModeRTE 32`, its default fp32 rounding
-    /// must pass the rounding probe, and without `VK_KHR_shader_fma`, its
-    /// `fma` must pass the multiply-add probe.
+    /// the floor, including its numerical part: without `RoundingModeRTE 32`
+    /// its default fp32 rounding must pass the rounding probe, and without
+    /// `VK_KHR_shader_fma` its `fma` must pass the multiply-add probe. A
+    /// verdict discovery recorded is kept rather than probed again.
     ///
     /// A physical device has one logical device for the process, created by
     /// the first open and shared by every later one, like CUDA's primary
@@ -174,16 +334,16 @@ impl Device {
     /// while another compiles pipelines, which independent opens in one
     /// process would do.
     pub fn open(uuid: [u8; 16]) -> Result<Self, OpenError> {
-        static OPENED: std::sync::OnceLock<Mutex<Vec<Device>>> = std::sync::OnceLock::new();
-        let mut opened = OPENED
-            .get_or_init(|| Mutex::new(Vec::new()))
-            .lock()
-            .expect("the opened-device registry lock is never poisoned");
-        if let Some(device) = opened.iter().find(|device| device.facts().uuid == uuid) {
+        let mut registry = registry();
+        if let Some(device) = registry
+            .opened
+            .iter()
+            .find(|device| device.facts().uuid == uuid)
+        {
             return Ok(device.clone());
         }
         let instance = crate::instance::instance().map_err(OpenError::Loader)?;
-        let (physical, Description { facts, floor }) = instance
+        let (physical, Description { facts, floor, .. }) = instance
             .physical_devices()
             .map_err(OpenError::Loader)?
             .into_iter()
@@ -194,13 +354,10 @@ impl Device {
         let device = Self {
             inner: Arc::new(Inner::create(instance, physical, facts)?),
         };
-        if !device.facts().rounding_rte_32 {
-            crate::probe::rounding(&device)?;
+        if probed(device.facts()) {
+            registry.verdict(&device)?;
         }
-        if !device.facts().shader_fma.float32 {
-            crate::probe::multiply_add(&device)?;
-        }
-        opened.push(device.clone());
+        registry.opened.push(device.clone());
         Ok(device)
     }
 
@@ -208,15 +365,27 @@ impl Device {
         &self.inner.facts
     }
 
-    /// Device-local storage.
-    pub fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        self.allocate_kind(StorageKind::Device, bytes, alignment)
+    /// Device-local storage. `room`, when given, bounds the device usage the
+    /// allocation may add, block slack included.
+    pub fn allocate(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        room: Option<u64>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_kind(StorageKind::Device, bytes, alignment, room)
     }
 
     /// Storage the host writes before each submission with plain memory
-    /// writes that never wait for device work.
-    pub fn allocate_upload(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        self.allocate_kind(StorageKind::Upload, bytes, alignment)
+    /// writes that never wait for device work; `room` as for
+    /// [`Device::allocate`].
+    pub fn allocate_upload(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        room: Option<u64>,
+    ) -> Result<Buffer, ExecutionError> {
+        self.allocate_kind(StorageKind::Upload, bytes, alignment, room)
     }
 
     fn allocate_kind(
@@ -224,11 +393,12 @@ impl Device {
         kind: StorageKind,
         bytes: u64,
         alignment: u64,
+        room: Option<u64>,
     ) -> Result<Buffer, ExecutionError> {
         let range = self
             .inner
             .memory
-            .allocate(&self.inner.device, kind, bytes, alignment)?;
+            .allocate(&self.inner.device, kind, bytes, alignment, room)?;
         Ok(Buffer::new(self.inner.clone(), range))
     }
 
@@ -362,27 +532,71 @@ impl Device {
 
     /// Submit `command`, signalling the timeline with the next value.
     pub(crate) fn submit(&self, command: vk::CommandBuffer) -> Result<u64, ExecutionError> {
+        self.submit_with(command, &[], &[])
+    }
+
+    /// Submit `command` once every timeline semaphore of `waits` reaches its
+    /// value, signalling the device timeline with the next value and each
+    /// of `signals` with its own once the command completes.
+    pub(crate) fn submit_with(
+        &self,
+        command: vk::CommandBuffer,
+        waits: &[(vk::Semaphore, u64)],
+        signals: &[(vk::Semaphore, u64)],
+    ) -> Result<u64, ExecutionError> {
         let inner = &self.inner;
         let mut queue = inner.queue.lock().expect("queue lock is never poisoned");
         let value = queue.next;
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(inner.timeline)
-            .value(value)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let semaphore = |stages: vk::PipelineStageFlags2| {
+            move |(semaphore, value): (vk::Semaphore, u64)| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(value)
+                    .stage_mask(stages)
+            }
+        };
+        let signal = std::iter::once((inner.timeline, value))
+            .chain(signals.iter().copied())
+            .map(semaphore(vk::PipelineStageFlags2::ALL_COMMANDS))
+            .collect::<Vec<_>>();
+        // A host gate's wait: no stage of the batch, the compute shaders
+        // that read what the host wrote before signaling it included,
+        // starts before it (spec, "Semaphore Waiting": the wait's second
+        // synchronization scope is limited to the stages of its mask).
+        let wait = waits
+            .iter()
+            .copied()
+            .map(semaphore(
+                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_COMMANDS,
+            ))
+            .collect::<Vec<_>>();
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
         let submit = vk::SubmitInfo2::default()
             .command_buffer_infos(&commands)
+            .wait_semaphore_infos(&wait)
             .signal_semaphore_infos(&signal);
-        call(
-            unsafe {
-                inner
-                    .device
-                    .queue_submit2(queue.raw, &[submit], vk::Fence::null())
-            },
-            "vkQueueSubmit2",
-        )?;
+        inner.measured(|| {
+            call(
+                unsafe {
+                    inner
+                        .device
+                        .queue_submit2(queue.raw, &[submit], vk::Fence::null())
+                },
+                "vkQueueSubmit2",
+            )
+        })?;
         queue.next += 1;
         Ok(value)
+    }
+
+    /// The device timeline value of the latest submission.
+    pub(crate) fn submitted(&self) -> u64 {
+        self.inner
+            .queue
+            .lock()
+            .expect("queue lock is never poisoned")
+            .next
+            - 1
     }
 
     /// The timeline value every completed submission has reached. A failed
@@ -496,7 +710,7 @@ impl Device {
     ) -> Result<Range, ExecutionError> {
         match recording.free_chunks.pop() {
             Some(chunk) => Ok(chunk),
-            None => self.inner.memory.allocate(
+            None => self.inner.memory.allocate_internal(
                 &self.inner.device,
                 StorageKind::Upload,
                 ARGUMENT_CHUNK_BYTES,
@@ -514,30 +728,60 @@ impl Device {
             .push(retired);
     }
 
+    /// Record and submit device work with `operation`, counting the growth
+    /// of the process's heap usage across it that no block accounts for as
+    /// driver memory the device holds (command memory, shader scratch).
+    pub fn measured<R>(&self, operation: impl FnOnce() -> R) -> R {
+        self.inner.measured(operation)
+    }
+
+    /// Device-local memory the device's blocks hold beyond their ranges:
+    /// held by this process, charged to no allocation, and free for later
+    /// allocations.
+    pub fn unallocated_bytes(&self) -> u64 {
+        self.inner.memory.device_local_slack()
+    }
+
+    /// Device-local memory the device holds beyond its allocations: its
+    /// blocks' free space, its own ranges (argument chunks, staging) and
+    /// the driver's memory for the device (measured; see `Inner::measured`).
+    pub fn held_beyond_allocations(&self) -> u64 {
+        self.inner.memory.device_local_slack()
+            + self.inner.memory.internal_device_local()
+            + self.inner.driver.load(std::sync::atomic::Ordering::Relaxed)
+            + self.inner.graphs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// `VK_EXT_memory_budget` of the device-local heap.
     pub fn memory_budget(&self) -> MemoryBudget {
-        let inner = &self.inner;
-        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
-        let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
-        unsafe {
-            inner
-                .instance
-                .raw()
-                .get_physical_device_memory_properties2(inner.physical, &mut properties)
-        };
-        let memory = properties.memory_properties;
-        let heap = (0..memory.memory_heap_count as usize)
-            .filter(|index| {
-                memory.memory_heaps[*index]
-                    .flags
-                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-            })
-            .max_by_key(|index| memory.memory_heaps[*index].size)
-            .expect("the floor requires a device-local heap");
-        MemoryBudget {
-            heap_budget_bytes: budget.heap_budget[heap],
-            heap_usage_bytes: budget.heap_usage[heap],
-        }
+        memory_budget(self.inner.instance, self.inner.physical)
+    }
+}
+
+/// `VK_EXT_memory_budget` of the largest device-local heap of `physical`, a
+/// device meeting the floor (which requires the extension and the heap). The
+/// budget is what the driver grants this process of the heap, its own usage
+/// included; a physical-device query needs no logical device.
+pub(crate) fn memory_budget(instance: &Instance, physical: vk::PhysicalDevice) -> MemoryBudget {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    unsafe {
+        instance
+            .raw()
+            .get_physical_device_memory_properties2(physical, &mut properties)
+    };
+    let memory = properties.memory_properties;
+    let heap = (0..memory.memory_heap_count as usize)
+        .filter(|index| {
+            memory.memory_heaps[*index]
+                .flags
+                .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        })
+        .max_by_key(|index| memory.memory_heaps[*index].size)
+        .expect("the floor requires a device-local heap");
+    MemoryBudget {
+        heap_budget_bytes: budget.heap_budget[heap],
+        heap_usage_bytes: budget.heap_usage[heap],
     }
 }
 
@@ -571,6 +815,7 @@ impl Inner {
         physical: vk::PhysicalDevice,
         facts: Facts,
     ) -> Result<Self, OpenError> {
+        let usage_before = memory_budget(instance, physical).heap_usage_bytes;
         let raw = instance.raw();
         let mut extensions: Vec<&CStr> = facts::FLOOR_EXTENSIONS.to_vec();
         if facts.matrix {
@@ -681,6 +926,8 @@ impl Inner {
                 retired: Vec::new(),
             }),
             staging: Mutex::new(None),
+            driver: std::sync::atomic::AtomicU64::new(0),
+            graphs: std::sync::atomic::AtomicU64::new(0),
             physical,
             instance,
         };
@@ -725,6 +972,11 @@ impl Inner {
             .get_mut()
             .expect("recording lock is never poisoned")
             .pool = pool;
+        // What creating the device took of the heap, before any block.
+        inner.driver.store(
+            inner.heap_usage().saturating_sub(usage_before),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(inner)
     }
 
@@ -752,7 +1004,7 @@ impl Inner {
         };
         let range = match self
             .memory
-            .allocate(device, StorageKind::Staging, STAGING_BYTES, 256)
+            .allocate_internal(device, StorageKind::Staging, STAGING_BYTES, 256)
         {
             Ok(range) => range,
             Err(error) => {

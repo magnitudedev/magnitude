@@ -130,18 +130,16 @@ pub(crate) const QWEN35_CONFIGURATIONS: [DeclaredConfiguration; 5] = [
     ),
 ];
 use magnitude_artifacts::{
-    gguf::TensorDescriptor, ArtifactIdentity, ComponentFile, ComponentManifest,
-    PackageIdentity, PackageManifest,
+    ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+    gguf::TensorDescriptor,
 };
 use magnitude_family_contracts::{
     ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder, DenseFfn,
-    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp,
-    GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, InputNorm,
-    InputSemantics, KeyValue, MediaRowAttention, ModelDefinition, Operator, OutputForm,
-    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn,
-    Router, RouterInput,
-    ScoreFunction, SharedExpert, SharedExpertGate, Sublayer,
-    ValueNorm, ValueSource, WeightDescriptor,
+    EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FeedForwardUp, GateFunction,
+    GatedDelta, HeadNorm, HistoryDomain, HistoryReads, InputNorm, InputSemantics, KeyValue,
+    MediaRowAttention, ModelDefinition, Operator, OutputForm, RecurrentHeadMapping, ResidualForm,
+    RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
+    SharedExpert, SharedExpertGate, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
 };
 
 /// A header-shaped definition and manifest of a declared configuration.
@@ -169,7 +167,7 @@ pub(crate) fn declared_model(
         } else {
             Encoding::F32
         };
-        let nbytes = source_element(encoding)
+        let nbytes = source_element(encoding, *shape.last().unwrap())
             .unwrap()
             .canonical_byte_len(&shape)
             .unwrap();
@@ -270,6 +268,7 @@ pub(crate) fn declared_model(
                 decay: tensor(name("ssm_a"), vec![c.value_heads], false),
                 time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
                 norm: rms(tensor(name("ssm_norm"), vec![c.state_width], false)),
+                output_gate: GateFunction::Silu,
                 output: tensor(name("ssm_out"), vec![c.hidden, inner], true),
             }))
         };
@@ -371,9 +370,7 @@ pub(crate) fn declared_model(
     let definition = ModelDefinition {
         family: magnitude_family_contracts::FamilyId("declared-qwen35".into()),
         artifact_identity: identity,
-        inputs: InputSemantics {
-            coordinate_axes: 1,
-        },
+        inputs: InputSemantics { coordinate_axes: 1 },
         decoder: Decoder {
             activation_dtype: ActivationDType::BF16,
             hidden: c.hidden,
@@ -413,4 +410,3 @@ pub(crate) fn declared_model(
     };
     (definition, manifest)
 }
-

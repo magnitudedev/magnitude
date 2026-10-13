@@ -64,7 +64,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             .input
             .get(&request)
             .ok_or_else(|| DomainError::invariant("request has no installed input"))?;
-        if installed.resident || self.target.contains_key(&request) || self.head.contains_key(&request)
+        if installed.resident
+            || self.target.contains_key(&request)
+            || self.head.contains_key(&request)
         {
             return Err(DomainError::invariant(format!(
                 "request {} is already resident",
@@ -82,6 +84,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
+        installed.boundary = from.and_then(|from| from.boundary.clone());
+        // A resumed sequence holds the tokens of the state it resumes.
+        installed.tokens = from.map_or_else(Default::default, |from| {
+            input::TokenHistory::starting(&from.tokens)
+        });
         let spans = installed.input.layout().spans();
         let mut encodes = Vec::new();
         for (identity, slot) in &mut installed.images {
@@ -137,7 +144,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         from: &ResumeState,
     ) -> Result<(SequenceState, Option<SequenceState>), DomainError> {
         let target = from.target.fork();
-        if !target.belongs_to(&self.target_store) || from.head.is_some() != self.head_store.is_some()
+        if !target.belongs_to(&self.target_store)
+            || from.head.is_some() != self.head_store.is_some()
         {
             return Err(DomainError::invariant(
                 "resume state differs from domain state arenas",
@@ -190,9 +198,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
             .collect::<Result<_, String>>()?;
         Ok(ResumeState {
+            tokens: installed.tokens.before(position)?.into(),
             target,
             head,
             features,
+            boundary: installed.boundary.clone(),
         })
     }
 
@@ -209,6 +219,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.head.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
+        self.poisoned.remove(&request);
         Ok(())
     }
 
@@ -244,6 +255,23 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 )
                 .ok_or("reclaim byte count overflow")?;
         }
+        let features = requests
+            .iter()
+            .filter_map(|request| self.input.get(request))
+            .flat_map(|input| {
+                input.boundary.iter().chain(
+                    input
+                        .images
+                        .values()
+                        .filter_map(|image| image.features.as_ref()),
+                )
+            })
+            .collect::<Vec<_>>();
+        bytes = bytes
+            .checked_add(
+                FeatureRef::reclaimable_bytes(&features).map_err(|error| error.to_string())?,
+            )
+            .ok_or("feature reclaim byte count overflows")?;
         Ok(bytes)
     }
 
@@ -258,6 +286,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 .get_mut(request)
                 .ok_or("evicted request has no installed input")?;
             installed.resident = false;
+            installed.boundary = None;
             for slot in installed.images.values_mut() {
                 slot.features = None;
             }

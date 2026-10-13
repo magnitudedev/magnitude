@@ -83,7 +83,11 @@ declaration names the exact projector path in that repository. Package construct
 validation are one operation: an image target requires an exact projector component and a typed
 relationship to the package weights. Native assessment establishes whether MTMD recognizes image
 input. Primary-weight metadata and projector presence alone never establish runnable image
-capability. A missing, ambiguous, incompatible, or MTP-combined projector fails generation.
+capability. A missing, ambiguous, or incompatible projector fails generation. Embedded MTP
+combined with a projector is rejected: its head embeds every prompt token and cannot enter
+media rows. A separately packaged Gemma QAT assistant reads the target's history, media rows
+included, and is admitted only with its matching target and validated composed capability.
+Generation independently refuses a token-embedding drafter for a request with media spans.
 Speculative decoding is explicit as either capability embedded in the target GGUF or an exact draft
 file in the target or another repository. Every package source is locked.
 
@@ -136,6 +140,13 @@ longer available. It must not change package identity, bundle composition, capab
 inputs, or ranking scores. Authentication, authorization, rate-limit, timeout, and server
 failures preserve their original classification. A fallback is accepted only when every required
 path, size, and digest matches.
+
+Acquisition presents only an explicit `HF_TOKEN`; implicit Hugging Face credentials (the token
+file under `HF_HOME`) are never discovered. When the Hub rejects the presented credential itself
+(HTTP 401, as for an expired or revoked token, which Hugging Face rejects even on public
+repositories), the package is resolved and downloaded anonymously instead. A rejected credential
+therefore never makes public packages unavailable; content that still requires authorization fails
+with its anonymous classification.
 
 ## Artifact stores and inventory
 
@@ -228,12 +239,22 @@ record and that package's current exact file evidence. It does not await invento
 reconciliation. Global reconciliation remains the discovery path for external filesystem changes;
 it is never a prerequisite for acknowledging a known catalog download.
 
+Development tooling acquires one catalog model outside ICN through the catalog tool, into an explicit model store. It uses the same per-variant resolution at locked commits and the same download and verification path as the service:
+- it fetches only missing or invalid files;
+- it reports the resolved target, the catalog's drafter (embedded or separate) and the projector, each with its hash.
+
+It creates no installation occurrence and never touches a product store implicitly.
+
 The catalog installation occurrence retains `ModelId`, aggregates bounded progress, and has one
 terminal outcome. ACN observes and addresses that occurrence by `CatalogInstallationOperationId`.
 Equivalent operations may share private package work, but sharing never changes their public
 model identity or operation state.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
-shared package work only when no other live occurrence depends on it. A retry creates a new
+shared package work only when no other live occurrence depends on it. Package work whose
+cancellation was requested is never joined: a later occurrence admits new work, which waits for the
+cancelled work to release the repository and resumes from its checkpoint. An occurrence fails when any
+of its packages fails; its other package work then stops under the same rule as cancellation, so a
+retry never joins work that belongs to the failed occurrence. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 
@@ -266,7 +287,9 @@ An engine update that changes tuning keys leaves models to retune on their next 
 are not re-optimized after an update.
 
 Expected failures distinguish insufficient disk space, interruption, unavailable source content,
-unavailable network, local storage failure, and corrupt content. Cancellation is a separate
+unavailable network, local storage failure, and corrupt content. A source that delivers nothing for
+a bounded interval is unavailable network, never an indefinite wait: the attempt keeps its
+checkpoint, bounded retries resume from it, and exhausting them fails the occurrence as resumable. Cancellation is a separate
 terminal result. Structured facts, including required and available byte counts, cross boundaries
 without parsing diagnostic prose.
 

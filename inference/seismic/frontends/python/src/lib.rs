@@ -230,6 +230,7 @@ impl Scalar {
                 u32::try_from(word)
                     .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("u32 word"))?,
             ),
+            "u64" => d::Scalar::U64(word),
             "bool" if word <= 1 => d::Scalar::Bool(word != 0),
             "index" => d::Scalar::Index(word.into()),
             "range" => d::Scalar::Range(word.into(), end.into()),
@@ -283,6 +284,7 @@ fn result(py: Python<'_>, v: d::Value) -> PyResult<Py<PyAny>> {
                 d::Scalar::BF16(v) => ("bf16", v as u64, 0),
                 d::Scalar::I32(v) => ("i32", v as u32 as u64, 0),
                 d::Scalar::U32(v) => ("u32", v as u64, 0),
+                d::Scalar::U64(v) => ("u64", v, 0),
                 d::Scalar::Bool(v) => ("bool", v as u64, 0),
                 d::Scalar::Index(v) => (
                     "index",
@@ -449,6 +451,7 @@ fn options(text: &str) -> PyResult<seismic::PreparationOptions> {
     Ok(seismic::PreparationOptions {
         precision,
         evaluation,
+        deadline: None,
     })
 }
 #[pymethods]

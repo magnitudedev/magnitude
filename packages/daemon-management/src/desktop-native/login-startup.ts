@@ -16,7 +16,8 @@ export const renderXdgLoginStartup = (executable: string, enabled: boolean) => {
   // GLib checks argv[0] before expanding %% escapes. A literal percent in the app
   // path would therefore fail admission. env execs the absolute path after expansion,
   // preserving the environment and PID without introducing shell interpretation.
-  return `[Desktop Entry]\nType=Application\nName=Magnitude\nExec=/usr/bin/env "${argument}" --background\nTerminal=false\nHidden=${!enabled}\n`
+  // TryExec makes sessions skip the entry once the application is uninstalled.
+  return `[Desktop Entry]\nType=Application\nName=Magnitude\nExec=/usr/bin/env "${argument}" --background\nTryExec=${executable.replaceAll("\\", "\\\\")}\nTerminal=false\nHidden=${!enabled}\n`
 }
 
 export const makeXdgLoginStartup = (options: {
@@ -56,7 +57,9 @@ export const makeXdgLoginStartup = (options: {
     if (fields.get("Type") !== "Application" || fields.get("Exec") !== expected || fields.get("DBusActivatable") === "true" || fields.has("AutostartCondition")) {
       return { _tag: "Unavailable", message: "The desktop login entry has changed. Enable launch at login again to restore it." } as const
     }
-    const tryExec = fields.get("TryExec")
+    // Desktop-entry string values escape \s, \n, \t, \r and \\.
+    const tryExec = fields.get("TryExec")?.replace(/\\([sntr\\])/g, (_, escape: string) =>
+      ({ s: " ", n: "\n", t: "\t", r: "\r", "\\": "\\" })[escape]!)
     if (tryExec) {
       if (!isAbsolute(tryExec)) return { _tag: "Unavailable", message: "The login entry has an unverified executable condition." } as const
       const exists = yield* Effect.tryPromise({ try: () => access(tryExec, constants.X_OK).then(() => true), catch: failed }).pipe(Effect.orElseSucceed(() => false))

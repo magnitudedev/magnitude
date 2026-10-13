@@ -6,11 +6,11 @@
 //! only a fitting model is estimated, from its decode demand over the
 //! device's bandwidth.
 
+use super::AssessmentError;
 use super::bandwidth::DeviceBandwidth;
 use super::demand::DecodeDemand;
-use super::estimate::{estimate_performance, performance_depths, PerformanceEstimate};
-use super::AssessmentError;
-use crate::platform::{fit_capacities, DomainRole, MemoryReserves};
+use super::estimate::{PerformanceEstimate, estimate_performance, performance_depths};
+use crate::platform::{DomainRole, MemoryReserves, fit_capacities};
 use crate::{
     AssessmentFitVerdict, AssessmentGraphResourceBounds, AssessmentHeaderBounds,
     AssessmentMemoryCharge, AssessmentMemoryTerms, ExecutionPlanDraft, ResourceCapacity,
@@ -70,6 +70,11 @@ impl PreparedExecutionAssessment {
     /// The plain decode step's demand under the planned history codec.
     pub fn demand(&self) -> &DecodeDemand {
         &self.demand
+    }
+
+    /// The checked header and graph charge, shared with physical finalization.
+    pub fn memory_charge(&self) -> &AssessmentMemoryCharge {
+        &self.charge
     }
 }
 
@@ -169,9 +174,11 @@ pub fn finish_execution_assessment(
         })?;
     let capacities = fit_capacities(topology, device, host, &request.reserves)
         .map_err(|error| AssessmentError::Memory(error.to_string()))?;
+    let shared = crate::platform::shared_role(device)
+        .map_err(|error| AssessmentError::Memory(error.to_string()))?;
     let fit = prepared
         .charge
-        .assess_fit(&capacities)
+        .assess_fit(&capacities, shared)
         .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = prepared.fit_context_tokens;
     match fit.verdict {
@@ -317,10 +324,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![25_000, 50_000, 150_000]
         );
-        assert!(performance
-            .iter()
-            .all(|estimate| estimate.tokens_per_second.is_finite()
-                && estimate.tokens_per_second > 0.0));
+        assert!(
+            performance
+                .iter()
+                .all(|estimate| estimate.tokens_per_second.is_finite()
+                    && estimate.tokens_per_second > 0.0)
+        );
         assert_eq!(domains[0].role, DomainRole::Allocation);
         assert!(domains.iter().all(|domain| domain.remaining_bytes >= 0));
         for domain in &domains {

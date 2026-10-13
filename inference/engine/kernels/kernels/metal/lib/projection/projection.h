@@ -87,10 +87,11 @@ struct Weights {
     device const int *table;
     // The tensor row of this view's row 0 (a view over a row range).
     ulong first;
+    ulong table_stride = 1;
     // Rows of one stored row tile (1: rows stored one after another).
     uint tile() const { return layout.tile; }
     // The tensor row behind row n.
-    ulong stored(uint n) const { return (table ? ulong(table[n]) : ulong(n)) + first; }
+    ulong stored(uint n) const { return (table ? ulong(table[ulong(n) * table_stride]) : ulong(n)) + first; }
     // Row n as the packet decoders address it: its base (its row tile's
     // first row) and its geometry (`Rows16::of`).
     device const uchar *row(uint n) const { return layout.base_of(base, stored(n)); }
@@ -240,6 +241,151 @@ struct Residual {
     }
 };
 
+// `scatter`: each of the STREAMS hyper-connection streams of the residual
+// plus the output times the stream's inject value,
+//   y[m, s * width + n] = residual[row(m), s * width + n] + round_A(acc) * inject[m, s]   (F32),
+// with `Residual`'s interface (column strides are the streams' too).
+template <typename A, typename Rows, uint STREAMS>
+struct Scatter {
+    device float *y;
+    ulong stride0, stride1;
+    device const float *residual;
+    ulong residual0, residual1;
+    Rows rows;
+    device const float *inject;
+    ulong inject0;
+    uint width;
+    struct Row {
+        device float *y;
+        device const float *residual;
+        ulong stride1, residual1;
+        device const float *inject;
+        uint width;
+        void store(uint n, float value) const {
+            const float rounded = A::round(value);
+            PROJECTION_UNROLL
+            for (uint s = 0; s < STREAMS; ++s) {
+                const ulong column = ulong(s * width + n);
+                y[column * stride1] = residual[column * residual1] + rounded * inject[s];
+            }
+        }
+        void store8(uint n, float4 even, float4 odd) const {
+            PROJECTION_UNROLL
+            for (uint i = 0; i < 4; ++i) {
+                store(n + 2u * i, even[i]);
+                store(n + 2u * i + 1u, odd[i]);
+            }
+        }
+    };
+    Row row(uint m) const {
+        return Row{y + ulong(m) * stride0, residual + ulong(rows.at(m)) * residual0, stride1, residual1,
+            inject + ulong(m) * inject0, width};
+    }
+    void store(uint m, uint n, float value) const { row(m).store(n, value); }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
+// when the entry takes inject values. `make` forms either from every field
+// (`Residual` reads the leading ones).
+template <typename A, typename Rows, uint STREAMS, bool INJECTED>
+struct OutputOf {
+    typedef Scatter<A, Rows, STREAMS> type;
+    static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
+        ulong residual1, Rows rows, device const float *inject, ulong inject0, uint width) {
+        return type{y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0, width};
+    }
+};
+template <typename A, typename Rows>
+struct OutputOf<A, Rows, 1, false> {
+    typedef Residual<A, Rows> type;
+    static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
+        ulong residual1, Rows rows, device const float *, ulong, uint) {
+        return type{y, stride0, stride1, residual, residual0, residual1, rows};
+    }
+};
+
+// A routed sublayer's column n joining its row's residual (`routed_output`,
+// `routed_combine`): residual + selected + shared, in that order, or (INJECTED)
+// for each of the STREAMS streams residual[s] + (selected + shared) * inject[s].
+// `out`, `residual` and `inject` point at the row; strides are column strides.
+template <uint STREAMS, bool INJECTED>
+inline void routed_join(device float *out, ulong out1, device const float *residual, ulong residual1,
+    device const float *inject, ulong width, ulong n, float selected, float shared) {
+    if (!INJECTED) {
+        out[n * out1] = residual[n * residual1] + selected + shared;
+        return;
+    }
+    PROJECTION_UNROLL
+    for (uint s = 0; s < STREAMS; ++s) {
+        const ulong column = ulong(s) * width + n;
+        out[column * out1] = residual[column * residual1] + (selected + shared) * inject[s];
+    }
+}
+
+// A mix site's low-rank rows (`stream_mix_down`), over S streams:
+//   y = round_A(silu(acc / S))
+template <typename A>
+struct MixLow {
+    device uchar *y;
+    ulong stride0, stride1;
+    float streams;
+    void store(uint m, uint n, float value) const {
+        const float v = value / streams;
+        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
+            A::store(v / (1.0f + metal::exp(-v)));
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// A mix site's inject values (`stream_mix_down`), over S streams:
+//   y = 2 sigmoid(acc / S)                                              (F32)
+struct MixInject {
+    device float *y;
+    ulong stride0, stride1;
+    float streams;
+    void store(uint m, uint n, float value) const {
+        y[ulong(m) * stride0 + ulong(n) * stride1] = 2.0f / (1.0f + metal::exp(-value / streams));
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// A mix site's per-stream partials (`stream_mix_up`): column n of stream
+// s = n / width, gated by its sum,
+//   y = sigmoid(acc) * x[m, n] * inverse[m, s] * norm[n] / S             (F32)
+template <typename N>
+struct Mix {
+    device float *y;
+    ulong stride0, stride1;
+    device const float *x;
+    ulong x0, x1;
+    device const float *inverse;
+    ulong inverse0, inverse1;
+    device const uchar *norm;
+    ulong norm_stride;
+    uint width;
+    float streams;
+    void store(uint m, uint n, float value) const {
+        const float normalized = x[ulong(m) * x0 + ulong(n) * x1] * inverse[ulong(m) * inverse0
+            + ulong(n / width) * inverse1] * element::at<N>(norm, ulong(n) * norm_stride);
+        const float gate = 1.0f / (1.0f + metal::exp(-value));
+        y[ulong(m) * stride0 + ulong(n) * stride1] = gate * normalized / streams;
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
 template <typename A>
 struct SiluMul {
     device uchar *y;
@@ -386,6 +532,18 @@ inline float scale_factor(device const float *scale, ulong extent, ulong stride,
 // ---------------------------------------------------------------------------
 // The normalizing pre-pass.
 
+// The sum of PARTS partial square sums in a fixed pairwise tree.
+template <uint PARTS>
+inline float sum_parts(threadgroup const float *p);
+template <>
+inline float sum_parts<1>(threadgroup const float *p) {
+    return p[0];
+}
+template <>
+inline float sum_parts<8>(threadgroup const float *p) {
+    return ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
+}
+
 // The pre-pass of a normed prologue: threadgroup `item` (THREADS threads)
 // normalizes one (row, group) and stores that group's prologue output, in A,
 // at x[m * columns + group * width ..]. The projection launches then read `x`
@@ -401,30 +559,29 @@ struct RowOrder {
     }
 };
 
+// One fixed RMS recipe, whether the caller stages an operand or publishes
+// normalized features through its own strides.
+template <uint THREADS, typename In>
+inline float normalization_inverse(thread const In &in, uint m, uint group,
+    threadgroup float *partials, uint thread_index) {
+    static_assert(THREADS % 32 == 0 && THREADS <= 1024, "whole normalizing simdgroups");
+    for (uint part = thread_index / 32u; part < In::parts; part += THREADS / 32u) {
+        const float partial = simd_sum(in.squares(m, group, part, thread_index % 32u));
+        if (thread_index % 32u == 0)
+            partials[part] = partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float squares = sum_parts<In::parts>(partials);
+    return metal::rsqrt(squares / float(in.width()) + in.epsilon());
+}
+
 // `Order` lays the rows out: `RowOrder` (the default), or the tall GEMM's
 // `TallOrder` when whole 8-column words are written (columns and every
 // group's first column multiples of 8).
 template <uint THREADS, typename Order, typename In>
-inline void device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
-    threadgroup float *partials, uint thread_index) {
-    static_assert(THREADS % 32 == 0 && THREADS <= 1024, "a normalizing threadgroup is whole simdgroups");
+inline void device_normalize_with(thread const In &in, uint m, uint group, float inverse, device uchar *x,
+    uint columns, uint thread_index) {
     typedef typename In::activation A;
-    uint m = item / in.groups(), group = item % in.groups();
-    float squares = 0.0f;
-    for (uint i = thread_index; i < in.width(); i += THREADS) {
-        float v = in.norm_input(m, group, i);
-        squares = metal::fma(v, v, squares);
-    }
-    squares = simd_sum(squares);
-    if (THREADS > 32) {
-        if (thread_index % 32u == 0)
-            partials[thread_index / 32u] = squares;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        squares = 0.0f;
-        for (uint j = 0; j < THREADS / 32u; ++j)
-            squares += partials[j];
-    }
-    float inverse = metal::rsqrt(squares / float(in.width()) + in.epsilon());
     device typename A::storage *row = reinterpret_cast<device typename A::storage *>(x) + ulong(m) * columns;
     uint first = group * in.width();
     bool vector = (columns & 7u) == 0 && (first & 7u) == 0;
@@ -440,10 +597,23 @@ inline void device_normalize(thread const In &in, uint item, device uchar *x, ui
     }
 }
 
-template <uint THREADS, typename In>
-inline void device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
+// Row m's norm group `group` (item m * groups + group) normalized by its
+// reduced inverse, which the threadgroup returns.
+template <uint THREADS, typename Order, typename In>
+inline float device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
     threadgroup float *partials, uint thread_index) {
-    device_normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials, thread_index);
+    static_assert(THREADS % 32 == 0 && THREADS <= 1024, "a normalizing threadgroup is whole simdgroups");
+    uint m = item / in.groups(), group = item % in.groups();
+    const float inverse = normalization_inverse<THREADS>(in, m, group, partials, thread_index);
+    device_normalize_with<THREADS, Order>(in, m, group, inverse, x, columns, thread_index);
+    return inverse;
+}
+
+template <uint THREADS, typename In>
+inline float device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
+    threadgroup float *partials, uint thread_index) {
+    return device_normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials,
+        thread_index);
 }
 
 // ---------------------------------------------------------------------------
@@ -481,18 +651,6 @@ inline void threadgroup_squares(thread const In &in, uint m_rows, threadgroup fl
     threadgroup_squares_runtime(in, m_rows, squares, SG, sg, lane);
 }
 
-// The sum of PARTS partial square sums in a fixed pairwise tree.
-template <uint PARTS>
-inline float sum_parts(threadgroup const float *p);
-template <>
-inline float sum_parts<1>(threadgroup const float *p) {
-    return p[0];
-}
-template <>
-inline float sum_parts<8>(threadgroup const float *p) {
-    return ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
-}
-
 // A normed prologue with its rows' partial square sums in threadgroup memory
 // (from threadgroup_squares), read by the GEMV staging as a plain operand.
 template <typename In>
@@ -506,6 +664,20 @@ struct SharedNorm {
         in.load8(m, k, metal::rsqrt(sum / float(in.width()) + in.epsilon()), even, odd);
     }
 };
+
+// Every norm group's inverse of the `m_rows` rows, from the square sums of
+// `threadgroup_squares` (after a barrier publishes them), exactly as
+// SharedNorm applies it: inverses[m * stride0 + group * stride1].
+template <typename In>
+inline void publish_inverses(thread const In &in, uint m_rows, threadgroup const float *squares,
+    device float *inverses, ulong stride0, ulong stride1, uint thread_index, uint threads) {
+    for (uint item = thread_index; item < m_rows * in.groups(); item += threads) {
+        uint m = item / in.groups(), group = item % in.groups();
+        float sum = sum_parts<In::parts>(squares + item * In::parts);
+        inverses[ulong(m) * stride0 + ulong(group) * stride1] =
+            metal::rsqrt(sum / float(in.width()) + in.epsilon());
+    }
+}
 
 // `in` as a SharedNorm over `squares`. The operand's type is deduced from a
 // value: `decltype` of a local carries its address space under Metal 4.1,
@@ -2595,6 +2767,11 @@ struct matrix_codes<packets::Q6K> {
     static constant constexpr bool available = true;
 };
 
+template <>
+struct matrix_codes<packets::Q4G32S> {
+    static constant constexpr bool available = true;
+};
+
 // Bits 12 b .. 12 b + 11 of a k-quant block's 96 bits of (scale6, min6)
 // pairs.
 inline uint matrix_field(uint3 fields, uint b) {
@@ -2822,6 +2999,91 @@ inline void gemv_matrix_q6k_body(thread const In &in, thread const Out &out,
     }
 }
 
+// Symmetric 32-column Q4: decode each code once into an exact integer
+// matrix operand, share it across the activation rows, then fold the F16
+// block scale into the F32 sums. No rounded weight operand or token packing.
+template <bool PAIRED, uint NB, uint PARTS, bool UNIT, typename In, typename Out>
+inline void gemv_matrix_q4_body(thread const In &in, thread const Out &out,
+    thread const Weights<packets::Q4G32S> &w, thread const Weights<packets::Q4G32S> &u,
+    uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
+    uint simdgroups, uint sg, uint lane) {
+    typedef typename In::activation A;
+    threadgroup float2 *parts = reinterpret_cast<threadgroup float2 *>(shared);
+    const ushort2 at = fragment_coordinate(lane);
+    const uint index = group * simdgroups + sg, piece = index / PARTS, part = index % PARTS;
+    const uint n = piece * 8u + at.y;
+    const auto row = w.locate(min(n, rows - 1u));
+    const uint codes = uint(row.geometry.at(row.row, w.layout.codes, 16ul, 0ul) - w.base) + (at.x / 2u) * 4u;
+    const auto up_row = u.locate(min(n, rows - 1u));
+    const uint up_codes = uint(up_row.geometry.at(up_row.row, u.layout.codes, 16ul, 0ul) - u.base) + (at.x / 2u) * 4u;
+    const uint blocks = k / 32u;
+    device const typename A::storage *stored_rows[NB][2];
+    float2 y[NB], y_up[NB];
+    PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
+        y[f] = float2(0.0f);
+        if constexpr (PAIRED) y_up[f] = float2(0.0f);
+        PROJECTION_UNROLL for (uint j = 0; j < 2; ++j)
+            stored_rows[f][j] = reinterpret_cast<device const typename A::storage *>(in.x)
+                + ulong(in.rows.at(min(8u * f + at.x + j, m_rows - 1u))) * in.stride0;
+    }
+    for (uint g = part * blocks / PARTS; g < (part + 1u) * blocks / PARTS; ++g) {
+        const uint word = *reinterpret_cast<device const uint *>(w.base + codes + g * 16u * w.layout.tile);
+        const float d = float(*reinterpret_cast<device const half *>(row.geometry.super_at(row.row, 2ul * g)));
+        uint up_word;
+        float up_d;
+        if constexpr (PAIRED) {
+            up_word = *reinterpret_cast<device const uint *>(u.base + up_codes + g * 16u * u.layout.tile);
+            up_d = float(*reinterpret_cast<device const half *>(up_row.geometry.super_at(up_row.row, 2ul * g)));
+        }
+        uint2 stored[NB][2];
+        simdgroup_float8x8 acc[NB], acc_up[NB];
+        PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
+            PROJECTION_UNROLL for (uint j = 0; j < 2; ++j)
+                stored[f][j] = matrix_stored<UNIT>(in, stored_rows[f][j], 32u * g,
+                    8u * (at.y / 2u) + 4u * (at.y & 1u));
+        }
+        PROJECTION_UNROLL for (uint s = 0; s < 4; ++s) {
+            const uint pair = (word >> (4u * s)) & 0x000f000fu;
+            simdgroup_half8x8 left, up_left;
+            reinterpret_cast<thread half2 &>(left.thread_elements()) =
+                half2(int2(int(pair & 0xffffu), int(pair >> 16)) - 8);
+            if constexpr (PAIRED) {
+                const uint up_pair = (up_word >> (4u * s)) & 0x000f000fu;
+                reinterpret_cast<thread half2 &>(up_left.thread_elements()) =
+                    half2(int2(int(up_pair & 0xffffu), int(up_pair >> 16)) - 8);
+            }
+            PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
+                simdgroup_float8x8 right;
+                reinterpret_cast<thread float2 &>(right.thread_elements()) = float2(
+                    matrix_value<A>(stored[f][0], s), matrix_value<A>(stored[f][1], s));
+                if (s == 0) simdgroup_multiply(acc[f], left, right);
+                else simdgroup_multiply_accumulate(acc[f], left, right, acc[f]);
+                if constexpr (PAIRED) {
+                    if (s == 0) simdgroup_multiply(acc_up[f], up_left, right);
+                    else simdgroup_multiply_accumulate(acc_up[f], up_left, right, acc_up[f]);
+                }
+            }
+        }
+        PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
+            y[f] = metal::fma(float2(d), reinterpret_cast<thread float2 &>(acc[f].thread_elements()), y[f]);
+            if constexpr (PAIRED)
+                y_up[f] = metal::fma(float2(up_d), reinterpret_cast<thread float2 &>(acc_up[f].thread_elements()), y_up[f]);
+        }
+    }
+    if constexpr (PAIRED) {
+        const bool owner = matrix_exchange<NB, PARTS>(y, parts, part, sg, lane);
+        matrix_exchange<NB, PARTS>(y_up, parts, part, sg, lane);
+        if (!owner) return;
+    } else if (!matrix_exchange<NB, PARTS>(y, parts, part, sg, lane)) return;
+    if (n >= rows) return;
+    PROJECTION_UNROLL for (uint f = 0; f < NB; ++f) {
+        if (8u * f + at.x < m_rows)
+            emit<PAIRED>::run(out, 8u * f + at.x, n, y[f].x, PAIRED ? y_up[f].x : 0.0f);
+        if (8u * f + at.x + 1u < m_rows)
+            emit<PAIRED>::run(out, 8u * f + at.x + 1u, n, y[f].y, PAIRED ? y_up[f].y : 0.0f);
+    }
+}
+
 // NB activation fragments (8 rows each) against the eight weight rows of
 // fragment `(group * simdgroups + sg) / PARTS`. UNIT is `matrix_unit` of the
 // operand and STAGED whether the block sums fit the threadgroup memory
@@ -3026,6 +3288,7 @@ inline void gemv_matrix_body(thread const In &in, thread const Out &out, thread 
 // operand's strides and by whether the block sums are staged.
 template <typename W>
 struct matrix_form {
+    static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = true;
     template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
     static void run(thread const In &in, thread const Out &out, thread const Weights<W> &w, uint m_rows, uint rows,
@@ -3049,6 +3312,7 @@ struct matrix_form {
 };
 template <>
 struct matrix_form<packets::Q6K> {
+    static constant constexpr bool symmetric32 = false;
     static constant constexpr bool stages_block_sums = false;
     template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
     static void run(thread const In &in, thread const Out &out, thread const Weights<packets::Q6K> &w, uint m_rows,
@@ -3058,6 +3322,21 @@ struct matrix_form<packets::Q6K> {
         else
             gemv_matrix_q6k_body<NB, PARTS, false>(in, out, w, m_rows, rows, k, group, shared, simdgroups, sg,
                 lane);
+    }
+};
+
+template <>
+struct matrix_form<packets::Q4G32S> {
+    static constant constexpr bool stages_block_sums = false;
+    static constant constexpr bool symmetric32 = true;
+    template <uint NB, uint PARTS, bool PREPARED = false, typename In, typename Out>
+    static void run(thread const In &in, thread const Out &out, thread const Weights<packets::Q4G32S> &w,
+        uint m_rows, uint rows, uint k, uint group, threadgroup uchar *shared,
+        uint simdgroups, uint sg, uint lane) {
+        if (matrix_unit(in))
+            gemv_matrix_q4_body<false, NB, PARTS, true>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        else
+            gemv_matrix_q4_body<false, NB, PARTS, false>(in, out, w, w, m_rows, rows, k, group, shared, simdgroups, sg, lane);
     }
 };
 
@@ -3157,6 +3436,13 @@ inline void gemv_matrix_paired_body(thread const In &in, thread const Out &out,
     thread const Weights<G> &gate, thread const Weights<U> &up, uint m_rows,
     uint rows, uint k, uint group, threadgroup uchar *shared, uint simdgroups,
     uint sg, uint lane) {
+    if constexpr (matrix_form<G>::symmetric32 && matrix_form<U>::symmetric32) {
+        if (matrix_unit(in))
+            gemv_matrix_q4_body<true, NB, PARTS, true>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        else
+            gemv_matrix_q4_body<true, NB, PARTS, false>(in, out, gate, up, m_rows, rows, k, group, shared, simdgroups, sg, lane);
+        return;
+    }
     // Q4K/Q5K products share each loaded and decoded activation fragment.
     // Each accumulator keeps the single-product instruction order.
     if constexpr (matrix_form<G>::stages_block_sums && matrix_form<U>::stages_block_sums) {

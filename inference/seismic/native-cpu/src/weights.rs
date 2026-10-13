@@ -15,9 +15,9 @@
 //! index order and combine the lanes in the fixed tree of `reduce`, so a
 //! result depends only on the values, never on the tier or the row block.
 
-use crate::element::{f16_to_f32, Dense};
-use crate::quant::{Q8Block, Q8_BLOCK};
-use crate::reduce::{combine, LANES};
+use crate::element::{Dense, f16_to_f32};
+use crate::quant::{Q8_BLOCK, Q8Block};
+use crate::reduce::{LANES, combine};
 
 /// Values of one packet.
 pub const PACKET: usize = 32;
@@ -1268,6 +1268,201 @@ impl Format for Q8 {
     }
 }
 
+/// A vector-coded representation (the GGUF IQ grids: registry `iq2xs`,
+/// `iq3xxs`). Per storage group of 256 values: 32 entries, each coding eight
+/// values through a grid (`GridSpec::codes`), one 4-bit scale code `s` per
+/// `GridSpec::GROUP` values, and one f32 factor. A value is
+/// `(factor * (2 s + 1)) * code`, the scale and the value each rounded once
+/// as the registry's decode rounds them. Rows are `rows16`: the entries,
+/// the scale codes, then the factors of each storage group.
+pub trait GridSpec: Copy + Send + Sync + 'static {
+    const NAME: &'static str;
+    const ROWS8_NAME: &'static str;
+    /// Bytes of one storage group's entries.
+    const ENTRY_BYTES: usize;
+    /// Values sharing one scale code: 16 or 32.
+    const GROUP: usize;
+    /// The codes of packet `local` (values `32 local ..`) of a storage
+    /// group's `entries`.
+    fn codes(entries: &[u8], local: usize) -> [i8; PACKET];
+}
+
+/// The eight codes one grid entry gives: `point`'s magnitudes (byte `j` the
+/// lane-`j` magnitude), negated where the seven sign bits `signs` and their
+/// even-parity eighth are set. Bit `j` of the signs becomes byte `j` of a
+/// mask; a magnitude is nonzero and below 128, so `(m ^ 0xff) + 1 = -m`
+/// bytewise without carries.
+#[inline(always)]
+fn grid_codes(point: u64, signs: u32) -> [i8; 8] {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let signs = u64::from(signs | ((signs.count_ones() & 1) << 7));
+    let spread = signs.wrapping_mul(ONES) & 0x8040_2010_0804_0201;
+    let negative = (spread.wrapping_add(0x7f7f_7f7f_7f7f_7f7f) >> 7) & ONES;
+    ((point ^ (negative * 0xff)).wrapping_add(negative))
+        .to_le_bytes()
+        .map(|byte| byte as i8)
+}
+
+/// Registry `iq2xs`: sixteen-bit entries (a 9-bit index into the 512-point
+/// grid, then 7 sign bits), a scale per 16 values.
+#[derive(Clone, Copy, Debug)]
+pub struct Iq2XsGrid;
+
+impl GridSpec for Iq2XsGrid {
+    const NAME: &'static str = "iq2xs@rows16";
+    const ROWS8_NAME: &'static str = "iq2xs@rows8";
+    const ENTRY_BYTES: usize = 64;
+    const GROUP: usize = 16;
+
+    #[inline(always)]
+    fn codes(entries: &[u8], local: usize) -> [i8; PACKET] {
+        let mut codes = [0i8; PACKET];
+        for e in 0..4 {
+            let at = 2 * (4 * local + e);
+            let entry = u32::from(u16::from_le_bytes([entries[at], entries[at + 1]]));
+            let point = crate::grids::IQ2XS_GRID[(entry & 511) as usize];
+            codes[8 * e..8 * e + 8].copy_from_slice(&grid_codes(point, entry >> 9));
+        }
+        codes
+    }
+}
+
+/// Registry `iq3xxs`: three-byte entries (two 8-bit indices into the
+/// 256-point grid of four values, then 7 sign bits), a scale per 32 values.
+#[derive(Clone, Copy, Debug)]
+pub struct Iq3XxsGrid;
+
+impl GridSpec for Iq3XxsGrid {
+    const NAME: &'static str = "iq3xxs@rows16";
+    const ROWS8_NAME: &'static str = "iq3xxs@rows8";
+    const ENTRY_BYTES: usize = 96;
+    const GROUP: usize = 32;
+
+    #[inline(always)]
+    fn codes(entries: &[u8], local: usize) -> [i8; PACKET] {
+        // The packet's four entries, a fixed 12 bytes.
+        let packet: &[u8; 12] = entries[12 * local..12 * local + 12]
+            .try_into()
+            .expect("a packet of entries");
+        let mut codes = [0i8; PACKET];
+        for e in 0..4 {
+            let low = crate::grids::IQ3XXS_GRID[usize::from(packet[3 * e])];
+            let high = crate::grids::IQ3XXS_GRID[usize::from(packet[3 * e + 1])];
+            let point = low | (high << 32);
+            let signs = u32::from(packet[3 * e + 2] & 127);
+            codes[8 * e..8 * e + 8].copy_from_slice(&grid_codes(point, signs));
+        }
+        codes
+    }
+}
+
+/// A vector-coded weight format (`GridSpec`).
+#[derive(Clone, Copy, Debug)]
+pub struct Grid<G: GridSpec>(G);
+
+impl<G: GridSpec> Grid<G> {
+    const SCALE_BYTES: usize = 256 / G::GROUP / 2;
+
+    /// Packet `p`'s codes and scale codes `2 s + 1` (one per `GROUP`
+    /// values, in order), and its storage group's factor.
+    #[inline(always)]
+    unsafe fn packet(
+        row: *const u8,
+        geometry: &RowGeometry,
+        p: usize,
+    ) -> ([i8; PACKET], [i32; 2], f32) {
+        let (block, local) = (p >> 3, p & 7);
+        let entries = unsafe {
+            std::slice::from_raw_parts(geometry.group(row, Plane::Codes, block), G::ENTRY_BYTES)
+        };
+        let codes = G::codes(entries, local);
+        let scales = unsafe {
+            std::slice::from_raw_parts(geometry.group(row, Plane::Scales, block), Self::SCALE_BYTES)
+        };
+        let local_scales = std::array::from_fn(|half| {
+            let n = (32 * local + 16 * half) / G::GROUP;
+            2 * i32::from((scales[n / 2] >> (4 * (n % 2))) & 15) + 1
+        });
+        let factor = f32::from_bits(unsafe { read(geometry.group(row, Plane::Supers, block)) });
+        (codes, local_scales, factor)
+    }
+}
+
+impl<G: GridSpec> Format for Grid<G> {
+    const NAME: &'static str = G::NAME;
+    const DENSE_BYTES: usize = 0;
+
+    fn geometry(k: usize, _dense_stride: usize) -> RowGeometry {
+        let planes = [G::ENTRY_BYTES, Self::SCALE_BYTES, 4];
+        let ([codes, scales, supers, _], stride) = rows16(k, 256, &planes);
+        RowGeometry {
+            stride,
+            codes,
+            high: 0,
+            scales,
+            supers,
+            groups: [G::ENTRY_BYTES, 0, Self::SCALE_BYTES, 4],
+            base: 0,
+            matrix_rows: 0,
+            rows8: false,
+            row_address: None,
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn decode(
+        row: *const u8,
+        geometry: &RowGeometry,
+        p: usize,
+        _k: usize,
+        out: &mut [f32; PACKET],
+    ) {
+        let (codes, local_scales, factor) = unsafe { Self::packet(row, geometry, p) };
+        let scales = local_scales.map(|scale| factor * scale as f32);
+        for (i, (target, code)) in out.iter_mut().zip(codes).enumerate() {
+            *target = scales[i / 16] * f32::from(code);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn dot_q8<const MODE: u8>(
+        row: *const u8,
+        geometry: &RowGeometry,
+        b: usize,
+        k: usize,
+        x: &Q8Block,
+    ) -> f32 {
+        let mut scaled = 0i32;
+        let mut factor = 0.0f32;
+        for p in block_packets(b, k) {
+            let (codes, local_scales, block_factor) = unsafe { Self::packet(row, geometry, p) };
+            factor = block_factor;
+            let activations: &[i8; PACKET] = x.codes[32 * (p - 8 * b)..32 * (p - 8 * b) + PACKET]
+                .try_into()
+                .expect("a packet of codes");
+            if G::GROUP == PACKET {
+                scaled += local_scales[0] * dot_i8_i8::<MODE>(&codes, activations);
+            } else {
+                let mut first = [0i8; PACKET];
+                let mut second = [0i8; PACKET];
+                first[..16].copy_from_slice(&activations[..16]);
+                second[16..].copy_from_slice(&activations[16..]);
+                scaled += local_scales[0] * dot_i8_i8::<MODE>(&codes, &first)
+                    + local_scales[1] * dot_i8_i8::<MODE>(&codes, &second);
+            }
+        }
+        x.d * (factor * scaled as f32)
+    }
+}
+
+impl<G: GridSpec> Rows8Format for Grid<G> {
+    const ROWS8_NAME: &'static str = G::ROWS8_NAME;
+}
+
+/// The two vector-coded formats.
+pub type Iq2Xs = Grid<Iq2XsGrid>;
+pub type Iq3Xxs = Grid<Iq3XxsGrid>;
+
 /// A 4-bit coded representation (the `c4g{16,32}` family): a 4-bit code
 /// names one of sixteen exact integer values, and every `GROUP` values share
 /// one scale. A value is `scale * VALUES[code]`, rounded once to `f32` as the
@@ -1311,6 +1506,25 @@ impl Codebook4 for Iq4Book {
     #[inline(always)]
     fn scale(field: &[u8]) -> f32 {
         f32::from_le_bytes([field[0], field[1], field[2], field[3]])
+    }
+}
+
+/// Registry `iq4g32s` (GGUF IQ4_NL blocks of a row whose width is not a
+/// multiple of 256): the IQ4 codebook, one f16 scale per 32.
+#[derive(Clone, Copy, Debug)]
+pub struct Iq4SBook;
+
+impl Codebook4 for Iq4SBook {
+    const NAME: &'static str = "iq4g32s@rows16";
+    const ROWS8_NAME: &'static str = "iq4g32s@rows8";
+    const STORAGE: usize = 32;
+    const GROUP: usize = 32;
+    const SCALE_BYTES: usize = 2;
+    const VALUES: [i8; 16] = Iq4Book::VALUES;
+
+    #[inline(always)]
+    fn scale(field: &[u8]) -> f32 {
+        f16_to_f32(u16::from_le_bytes([field[0], field[1]]))
     }
 }
 
@@ -1391,6 +1605,7 @@ pub struct Coded4<B: Codebook4>(B);
 
 pub type Iq4 = Coded4<Iq4Book>;
 pub type Q4G32 = Coded4<Q4Book>;
+pub type Iq4S = Coded4<Iq4SBook>;
 pub type Mxfp4 = Coded4<Mxfp4Book>;
 pub type Nvfp4 = Coded4<Nvfp4Book>;
 
@@ -1814,19 +2029,21 @@ pub unsafe fn dot_rows<W: Format, const R: usize>(
 ) -> [f32; R] {
     let x = &x[..k];
     let mut lanes = [[0.0f32; LANES]; R];
-    let mut decoded = [[0.0f32; PACKET]; R];
+    // One packet buffer, consumed by its row before the next row decodes:
+    // with every row's packet live at once, x86 vectorizers transpose the
+    // accumulation across rows into a gather per multiply-add.
+    let mut packet = [0.0f32; PACKET];
     let resolved = std::array::from_fn::<_, R, _>(|r| {
         geometry.for_row(unsafe { rows.add(r * geometry.stride) })
     });
     let full = k / PACKET;
     for p in 0..full {
-        for (r, packet) in decoded.iter_mut().enumerate() {
-            unsafe { W::decode(rows.add(r * geometry.stride), &resolved[r], p, k, packet) };
-        }
         let xs: &[f32; PACKET] = x[p * PACKET..(p + 1) * PACKET]
             .try_into()
             .expect("a whole packet");
-        for (lanes, packet) in lanes.iter_mut().zip(&decoded) {
+        for (r, lanes) in lanes.iter_mut().enumerate() {
+            let row = unsafe { rows.add(r * geometry.stride) };
+            unsafe { W::decode(row, &resolved[r], p, k, &mut packet) };
             for chunk in 0..PACKET / LANES {
                 for lane in 0..LANES {
                     let i = chunk * LANES + lane;
@@ -1837,11 +2054,10 @@ pub unsafe fn dot_rows<W: Format, const R: usize>(
     }
     let tail = k - full * PACKET;
     if tail > 0 {
-        for (r, packet) in decoded.iter_mut().enumerate() {
-            unsafe { W::decode(rows.add(r * geometry.stride), &resolved[r], full, k, packet) };
-        }
         let xs = &x[full * PACKET..];
-        for (lanes, packet) in lanes.iter_mut().zip(&decoded) {
+        for (r, lanes) in lanes.iter_mut().enumerate() {
+            let row = unsafe { rows.add(r * geometry.stride) };
+            unsafe { W::decode(row, &resolved[r], full, k, &mut packet) };
             for (i, value) in xs.iter().enumerate() {
                 lanes[i % LANES] = packet[i].mul_add(*value, lanes[i % LANES]);
             }
@@ -1903,7 +2119,7 @@ pub unsafe fn dot_q8_rows<W: Format, const R: usize, const MODE: u8>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seismic_lang::registry::{representation, representation_info, RepresentationKind};
+    use seismic_lang::registry::{RepresentationKind, representation, representation_info};
 
     #[test]
     fn nibble_dot_keeps_registry_order_and_exact_integer_sum() {
@@ -2019,6 +2235,7 @@ mod tests {
                 );
             }
             coded::<Q4G32>(k);
+            coded::<Iq4S>(k);
             coded::<Mxfp4>(k);
             coded::<Nvfp4>(k);
             five::<Q5G32S>(k);
@@ -2107,6 +2324,7 @@ mod tests {
         }
         for k in [64usize, 704, 2112, 2688] {
             check::<Q4G32>(k);
+            check::<Iq4S>(k);
             check::<Mxfp4>(k);
             check::<Nvfp4>(k);
             check::<Q5G32S>(k);

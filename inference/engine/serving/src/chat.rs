@@ -657,7 +657,10 @@ pub(crate) async fn collect(
                 journal.push(&event).map_err(ServingError::Output)?
             }
             Some(GenerationEvent::Completed(completion)) => {
-                return Ok((journal.finish().map_err(ServingError::Output)?, completion));
+                let output = journal
+                    .finish(&completion.termination)
+                    .map_err(ServingError::Output)?;
+                return Ok((output, completion));
             }
             Some(GenerationEvent::Failed(error)) => return Err(error),
             None => return Err(ended_without_outcome()),
@@ -947,6 +950,11 @@ pub(crate) fn adapt_request(request: ChatCompletionRequest) -> Result<AdaptedCha
         timings_per_token,
         include_usage,
     })
+}
+
+/// Convert a completion request to the host input shared by rendering and counting.
+pub fn chat_input(request: ChatCompletionRequest) -> Result<ChatInput, ApiError> {
+    Ok(adapt_request(request)?.request.input)
 }
 
 fn finite_in(value: f32, range: std::ops::RangeInclusive<f32>) -> bool {

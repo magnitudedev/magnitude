@@ -402,7 +402,7 @@ fn check_oracle(
                 Arg::Tensor(interpreter.add_tensor(data))
             }
             GeneratedArgument::Scalar { dtype, bits } => {
-                Arg::Scalar(ReferenceScalar::from_bits(dtype.dtype(), bits as u32))
+                Arg::Scalar(ReferenceScalar::from_bits(dtype.dtype(), bits))
             }
             GeneratedArgument::Index(value) => Arg::Index(BigUint::from(value)),
             GeneratedArgument::Range { start, end } => {

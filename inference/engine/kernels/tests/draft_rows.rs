@@ -102,6 +102,14 @@ fn half_to_f32(bits: u16) -> f32 {
     }
 }
 
+fn i32_tensor(device: &Device, shape: &[u64], values: &[i32]) -> Tensor {
+    let bytes = values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect::<Vec<_>>();
+    Tensor::from_host(device, Element::i32(), shape, &bytes).unwrap()
+}
+
 fn bf16_tensor(device: &Device, shape: &[u64], values: &[f32]) -> Tensor {
     let bytes = values
         .iter()
@@ -198,6 +206,7 @@ fn draft_rows_match_on(device: &Device) {
         draft_rows::native_for_device_with(
             device,
             draft_rows::Elements {
+                C: Element::bf16(),
                 EW: resident_q8(device),
                 A: Element::bf16(),
                 EN: Element::bf16(),
@@ -258,9 +267,12 @@ fn draft_rows_match_on(device: &Device) {
         let conditioning = bf16_tensor(&device, &[rows as u64, width as u64], &conditioning_values);
         let embedding_norm = bf16_tensor(&device, &[width as u64], &embedding_norm_values);
         let hidden_norm = bf16_tensor(&device, &[width as u64], &hidden_norm_values);
+        // An empty directory: the selections are the table's rows.
+        let direct = i32_tensor(device, &[0, 1], &[]);
         let result = kernel
             .call(draft_rows::Args {
                 tokens: &tokens,
+                directory: &direct,
                 table: &table,
                 conditioning: &conditioning,
                 embedding_norm: &embedding_norm,
@@ -298,10 +310,64 @@ fn draft_rows_match_on(device: &Device) {
                 device.backend()
             );
         }
+        // Through a directory of a table's slots: a selection reads its
+        // row's slot, exactly as a direct read of that slot does. Every
+        // other logical row has a slot; a row without one and a failed
+        // selection read slot 0.
+        let logical = 3 * vocabulary;
+        let directory_values = (0..logical)
+            .map(|row| {
+                if row % 2 == 0 {
+                    ((row / 2 + 1) % vocabulary) as i32
+                } else {
+                    -1
+                }
+            })
+            .collect::<Vec<_>>();
+        let selected = (0..rows)
+            .map(|row| match row % 4 {
+                3 => [-1, 1],
+                _ => [((row * 5 + 1) % logical) as i32, (row % 2) as i32],
+            })
+            .collect::<Vec<_>>();
+        let slots = selected
+            .iter()
+            .map(|[row, status]| {
+                let slot = usize::try_from(*row).map_or(0, |row| directory_values[row].max(0));
+                [slot, *status]
+            })
+            .collect::<Vec<_>>();
+        let read = |tokens: &[[i32; 2]], directory: &Tensor| {
+            kernel
+                .call(draft_rows::Args {
+                    tokens: &i32_tensor(device, &[rows as u64, 2], tokens.as_flattened()),
+                    directory,
+                    table: &table,
+                    conditioning: &conditioning,
+                    embedding_norm: &embedding_norm,
+                    hidden_norm: &hidden_norm,
+                    combine: &combine,
+                    epsilon,
+                })
+                .unwrap()
+                .value
+                .read_to_host()
+                .unwrap()
+        };
+        assert_eq!(
+            read(
+                &selected,
+                &i32_tensor(device, &[logical as u64, 1], &directory_values)
+            ),
+            read(&slots, &direct),
+            "{:?} width {width} rows {rows}: a read through the directory",
+            device.backend()
+        );
         if device.backend() == seismic::BackendName::Cpu {
             let quantized = prepare(width, true)
                 .call(draft_rows::Args {
                     tokens: &tokens,
+                    directory: &direct,
                     table: &table,
                     conditioning: &conditioning,
                     embedding_norm: &embedding_norm,
@@ -327,6 +393,120 @@ fn draft_rows_match_on(device: &Device) {
                 "CPU INT8 draft width {width} rows {rows}: relative error {}",
                 (error / scale).sqrt()
             );
+        }
+    }
+}
+
+#[test]
+fn draft_rows_preserve_distinct_f32_streams() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    for backend in [
+        seismic::BackendName::Cuda,
+        seismic::BackendName::Metal,
+        seismic::BackendName::Cpu,
+        seismic::BackendName::Vulkan,
+    ] {
+        let Ok(device) = catalog.open_backend(backend) else {
+            continue;
+        };
+        let width = 64;
+        let streams = 4;
+        for rows in [1, 4, 5, 16, 17, 65] {
+            let mut random = Random(291 + rows as u64);
+            let (table, tv) = q8_weight(&device, 3, width, 0.03125, &mut random);
+            let (combine, cv) = q8_weight(&device, width, 2 * width, 0.0078125, &mut random);
+            let hv = (0..rows * streams * width)
+                .map(|i| random.symmetric() * (1 + i / width % streams) as f32 + 0.00317)
+                .collect::<Vec<_>>();
+            let hn = (0..streams * width)
+                .map(|i| bf16_round(0.5 + i as f32 / (streams * width) as f32))
+                .collect::<Vec<_>>();
+            let en = vec![1.0; width];
+            let tokens = i32_tensor(
+                &device,
+                &[rows as u64, 2],
+                &(0..rows)
+                    .flat_map(|i| [(i % 3) as i32, 0])
+                    .collect::<Vec<_>>(),
+            );
+            let conditioning = Tensor::from_host(
+                &device,
+                Element::f32(),
+                &[rows as u64, (streams * width) as u64],
+                &hv.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let embedding_norm = bf16_tensor(&device, &[width as u64], &en);
+            let hidden_norm = bf16_tensor(&device, &[(streams * width) as u64], &hn);
+            let direct = i32_tensor(&device, &[0, 1], &[]);
+            let implementation = draft_rows::native_implementation(&device).unwrap().unwrap();
+            let statics = implementation
+                .statics
+                .iter()
+                .fold(NativeSpecialization::new(), |s, name| {
+                    s.with_static(name.clone(), width as u64)
+                });
+            let mut statics = implementation.default_specialization(&statics).unwrap();
+            if backend == seismic::BackendName::Cpu {
+                statics = statics.with_param("INT8", 0);
+            }
+            let kernel = draft_rows::native_for_device_with(
+                &device,
+                draft_rows::Elements {
+                    C: Element::f32(),
+                    A: Element::bf16(),
+                    EW: resident_q8(&device),
+                    EN: Element::bf16(),
+                    HN: Element::bf16(),
+                    CW: resident_q8(&device),
+                },
+                &statics,
+            )
+            .unwrap();
+            let result = kernel
+                .call(draft_rows::Args {
+                    tokens: &tokens,
+                    directory: &direct,
+                    table: &table,
+                    conditioning: &conditioning,
+                    embedding_norm: &embedding_norm,
+                    hidden_norm: &hidden_norm,
+                    combine: &combine,
+                    epsilon: 1e-6,
+                })
+                .unwrap()
+                .value;
+            assert_eq!(result.extents(), &[rows as u64, (streams * width) as u64]);
+            let actual = result
+                .read_to_host()
+                .unwrap()
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            for row in 0..rows {
+                for stream in 0..streams {
+                    let offset = (row * streams + stream) * width;
+                    let (expected, magnitude) = reference(
+                        &[(row % 3) as i32],
+                        &tv,
+                        &hv[offset..offset + width],
+                        &en,
+                        &hn[stream * width..(stream + 1) * width],
+                        &cv,
+                        width,
+                        1e-6,
+                    );
+                    for column in 0..width {
+                        let bound = magnitude[column] * 2f32.powi(-8) + 1e-5;
+                        assert!(
+                            (actual[offset + column] - expected[column]).abs() <= bound,
+                            "{backend:?}: row {row} stream {stream} column {column}: {} vs {}",
+                            actual[offset + column],
+                            expected[column]
+                        );
+                    }
+                }
+            }
         }
     }
 }

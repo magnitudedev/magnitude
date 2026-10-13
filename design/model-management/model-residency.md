@@ -39,6 +39,12 @@ not sleeping timer tasks or generation fences. Client presence, HTTP connections
 observations, downloads, session residency, loading time, and unrelated work do not refresh it.
 There is no mutable residency-policy API.
 
+Every load, whether a warm demand from a client, CLI, or API or an on-demand load for an inference
+request, first consults the model's current assessment. A load whose assessment for the served
+profile is Does not fit is refused with the typed `model_does_not_fit` failure (HTTP 422, not
+retryable) before the residency replaces anything, so the resident model keeps serving. A model
+whose assessment is still pending is admitted, and the engine's own resource plan still guards it.
+
 Explicit Stop, replacement, memory-pressure eviction, worker failure, and ICN teardown remain
 distinct release causes. Session runtimes keep their own two-minute zero-use plus Quiescent
 offloading policy. Subscription keepalives remain transport-liveness frames, and admitted shared
@@ -47,6 +53,7 @@ operations such as downloads outlive initiating callers according to their domai
 ## Guarantees
 
 - First-party and external inference requests protect residency through the same exact lease.
+- A load assessed as Does not fit never displaces a resident instance.
 - A Ready instance with an active lease cannot idle-release.
 - Final lease release and equivalent warm demand each start a full one-hour interval.
 - Closing ordinary clients or the desktop window cannot change a model deadline; full owner Quit stops the tree.

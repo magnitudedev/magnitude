@@ -37,8 +37,8 @@ use super::{
     AnyExpr, ArenaId, Assignment, BinaryOp, BoolExpr, CmpOp, DecisionId, DurationEstimate,
     DurationExpr, DurationTerm, ErasedScalarExpr, EvalError, Expr, ExprDigest, FiniteDomain,
     FoldOp, IntExpr, LoopBinderId, NaryOp, NatExpr, NodeView, PartialAssignment, RootId, RootName,
-    ScalarArgument, ScalarComponent, ScalarExpr, ScalarSort, SymbolId, SymbolKind, SymbolSort,
-    SymbolValue, TargetConstantId, UnaryOp,
+    ScalarArgument, ScalarComponent, ScalarExpr, ScalarOperand, ScalarSort, SymbolId, SymbolKind,
+    SymbolSort, SymbolValue, TargetConstantId, UnaryOp,
 };
 use crate::reference_math::{self, ReferenceScalar, ScalarOp};
 use crate::types::DType;
@@ -93,11 +93,11 @@ enum Node {
     BoolConst(bool),
     ScalarConst {
         dtype: DType,
-        bits: u32,
+        bits: u64,
     },
     ScalarInteger {
         operation: ScalarOp,
-        operands: Box<[(DType, IntExpr)]>,
+        operands: Box<[ScalarOperand]>,
     },
     Symbol(SymbolId),
     Unary {
@@ -155,7 +155,7 @@ pub(super) struct Arena {
     decision_count: u32,
     binder_symbols: HashMap<LoopBinderId, Vec<SymbolId>>,
     loop_binder_count: u32,
-    proof_variable_count: u32,
+    checker_variable_count: u32,
     decisions: HashMap<DecisionId, (FiniteDomain, SymbolId)>,
     call_strides: HashMap<(crate::ids::ParameterId, u32), SymbolId>,
     nodes: Vec<Node>,
@@ -186,7 +186,7 @@ struct ArenaFields<'a> {
     decision_count: u32,
     binder_symbols: Vec<(&'a LoopBinderId, &'a Vec<SymbolId>)>,
     loop_binder_count: u32,
-    proof_variable_count: u32,
+    checker_variable_count: u32,
     decisions: Vec<(&'a DecisionId, &'a (FiniteDomain, SymbolId))>,
     call_strides: Vec<(&'a (crate::ids::ParameterId, u32), &'a SymbolId)>,
     nodes: &'a [Node],
@@ -206,7 +206,7 @@ struct ArenaParts {
     decision_count: u32,
     binder_symbols: Vec<(LoopBinderId, Vec<SymbolId>)>,
     loop_binder_count: u32,
-    proof_variable_count: u32,
+    checker_variable_count: u32,
     decisions: Vec<(DecisionId, (FiniteDomain, SymbolId))>,
     call_strides: Vec<((crate::ids::ParameterId, u32), SymbolId)>,
     nodes: Vec<Node>,
@@ -233,7 +233,7 @@ impl Serialize for Arena {
             decision_count,
             binder_symbols,
             loop_binder_count,
-            proof_variable_count,
+            checker_variable_count,
             decisions,
             call_strides,
             nodes,
@@ -251,7 +251,7 @@ impl Serialize for Arena {
             decision_count: *decision_count,
             binder_symbols: sorted(binder_symbols),
             loop_binder_count: *loop_binder_count,
-            proof_variable_count: *proof_variable_count,
+            checker_variable_count: *checker_variable_count,
             decisions: sorted(decisions),
             call_strides: sorted(call_strides),
             nodes,
@@ -287,7 +287,7 @@ impl Arena {
             decision_count,
             binder_symbols,
             loop_binder_count,
-            proof_variable_count,
+            checker_variable_count,
             decisions,
             call_strides,
             nodes,
@@ -377,7 +377,7 @@ impl Arena {
             decision_count,
             binder_symbols: unique(binder_symbols)?,
             loop_binder_count,
-            proof_variable_count,
+            checker_variable_count,
             decisions: unique(decisions)?,
             call_strides: unique(call_strides)?,
             nodes,
@@ -404,7 +404,7 @@ impl Arena {
             decision_count: 0,
             binder_symbols: HashMap::new(),
             loop_binder_count: 0,
-            proof_variable_count: 0,
+            checker_variable_count: 0,
             decisions: HashMap::new(),
             call_strides: HashMap::new(),
             nodes: Vec::new(),
@@ -472,6 +472,9 @@ impl Arena {
         binder.index
     }
 
+    pub(super) fn identity(&self) -> ArenaId {
+        self.id
+    }
     fn node(&self, i: u32) -> &Node {
         self.nodes.get(i as usize).expect(OUT_OF_ARENA)
     }
@@ -535,9 +538,10 @@ impl Arena {
             Node::Unary { operand, .. } => vec![*operand],
             Node::Binary { lhs, rhs, .. } | Node::Cmp { lhs, rhs, .. } => vec![*lhs, *rhs],
             Node::Nary { operands, .. } => operands.to_vec(),
-            Node::ScalarInteger { operands, .. } => {
-                operands.iter().map(|(_, value)| (*value).into()).collect()
-            }
+            Node::ScalarInteger { operands, .. } => operands
+                .iter()
+                .map(|operand| operand.expression())
+                .collect(),
             Node::Select {
                 cond,
                 then,
@@ -585,7 +589,10 @@ impl Arena {
                 operation,
                 operands,
             } => {
-                let types = operands.iter().map(|(dtype, _)| *dtype).collect::<Vec<_>>();
+                let types = operands
+                    .iter()
+                    .map(|operand| self.scalar_operand_dtype(*operand))
+                    .collect::<Vec<_>>();
                 reference_math::scalar_recipe(*operation, &types)
                     .failures()
                     .is_empty()
@@ -662,6 +669,9 @@ impl Arena {
         let holds = |arena: &Self, facts: &[BoolExpr], condition: BoolExpr| {
             arena.bool_of(condition) == Some(true)
                 || facts.contains(&condition)
+                || facts
+                    .iter()
+                    .any(|fact| arena.comparison_entails(*fact, condition))
                 || facts
                     .iter()
                     .any(|fact| arena.nat_upper_bound_dominates(*fact, condition, facts))
@@ -836,15 +846,30 @@ impl Arena {
         let symbol = self.symbol(SymbolKind::RuntimeValue(value), SymbolSort::Int);
         (symbol, self.int_symbol(symbol))
     }
+    pub(super) fn runtime_scalar_value(
+        &mut self,
+        value: crate::ids::SemanticValueId,
+        dtype: DType,
+    ) -> (SymbolId, ErasedScalarExpr) {
+        let symbol = self.symbol(SymbolKind::RuntimeValue(value), SymbolSort::Scalar(dtype));
+        let index = self.symbol_node(symbol);
+        (
+            symbol,
+            ErasedScalarExpr {
+                owner: self.id,
+                index,
+            },
+        )
+    }
     pub(super) fn call_scalar(&mut self, argument: ScalarArgument, sort: SymbolSort) -> SymbolId {
         self.symbol(SymbolKind::CallScalar(argument), sort)
     }
-    pub(super) fn proof_variable(&mut self, sort: SymbolSort) -> SymbolId {
-        let index = self.proof_variable_count;
-        self.proof_variable_count = index
+    pub(super) fn checker_variable(&mut self, sort: SymbolSort) -> SymbolId {
+        let index = self.checker_variable_count;
+        self.checker_variable_count = index
             .checked_add(1)
-            .expect("ExprArena proof-variable identity space exhausted");
-        self.symbol(SymbolKind::ProofVariable(index), sort)
+            .expect("ExprArena checker-variable identity space exhausted");
+        self.symbol(SymbolKind::CheckerVariable(index), sort)
     }
     pub(super) fn call_stride_symbol(
         &mut self,
@@ -1360,16 +1385,17 @@ impl Arena {
     pub(super) fn int_from_scalar(&mut self, value: ErasedScalarExpr) -> IntExpr {
         let ordinal = self.index(AnyExpr::Scalar(value));
         assert!(
-            matches!(self.sort(ordinal), Sort::Scalar(DType::I32 | DType::U32)),
+            matches!(self.sort(ordinal), Sort::Scalar(dtype) if dtype.is_int()),
             "mathematical integer injection requires an integer word"
         );
         if let Node::ScalarConst { dtype, bits } = *self.node(ordinal) {
             let integer = match dtype {
-                DType::I32 => i64::from(bits as i32),
-                DType::U32 => i64::from(bits),
+                DType::I32 => BigInt::from(bits as u32 as i32),
+                DType::U32 => BigInt::from(bits as u32),
+                DType::U64 => BigInt::from(bits),
                 _ => unreachable!(),
             };
-            return self.int_const(integer);
+            return self.int_exact(integer);
         }
         handle(
             self.id,
@@ -1382,18 +1408,30 @@ impl Arena {
             ),
         )
     }
+    pub(super) fn scalar_dtype(&self, value: ErasedScalarExpr) -> DType {
+        match self.sort(self.index(AnyExpr::Scalar(value))) {
+            Sort::Scalar(dtype) => dtype,
+            _ => panic!("scalar operand is not a scalar expression"),
+        }
+    }
+    fn scalar_operand_dtype(&self, operand: ScalarOperand) -> DType {
+        match operand {
+            ScalarOperand::Word { dtype, value } => {
+                self.expr_index(value);
+                assert!(dtype.is_int(), "word operand requires I32/U32");
+                dtype
+            }
+            ScalarOperand::Scalar(value) => self.scalar_dtype(value),
+        }
+    }
     pub(super) fn scalar_integer(
         &mut self,
         operation: ScalarOp,
-        operands: &[(DType, IntExpr)],
+        operands: &[ScalarOperand],
     ) -> IntExpr {
         let types = operands
             .iter()
-            .map(|(dtype, value)| {
-                self.expr_index(*value);
-                assert!(dtype.is_int(), "scalar integer operand must be I32/U32");
-                *dtype
-            })
+            .map(|operand| self.scalar_operand_dtype(*operand))
             .collect::<Vec<_>>();
         let recipe = reference_math::scalar_recipe(operation, &types);
         assert!(
@@ -1402,14 +1440,23 @@ impl Arena {
         );
         let constants = operands
             .iter()
-            .map(|(dtype, value)| {
-                self.int_of(*value)
-                    .map(|integer| integer_word(*dtype, &integer.into()))
+            .map(|operand| match *operand {
+                ScalarOperand::Word { dtype, value } => self
+                    .int_of(value)
+                    .map(|integer| integer_word(dtype, &integer.into())),
+                ScalarOperand::Scalar(value) => {
+                    match *self.node(self.index(AnyExpr::Scalar(value))) {
+                        Node::ScalarConst { dtype, bits } => {
+                            Some(ReferenceScalar::from_bits(dtype, bits))
+                        }
+                        _ => None,
+                    }
+                }
             })
             .collect::<Option<Vec<_>>>();
         if let Some(inputs) = constants {
             if let Ok(value) = reference_math::evaluate(&recipe, &inputs) {
-                return self.int_const(scalar_integer_value(value));
+                return self.int_exact(scalar_integer_value(value));
             }
         }
         handle(
@@ -1646,6 +1693,16 @@ impl Arena {
         if self.expr_total(a) && self.conjunction_contains(a, b) {
             return self.bool_const(true);
         }
+        // A total antecedent comparison decides a comparison of the same
+        // operands by the order relation alone; those operands are defined
+        // wherever the antecedent is evaluated.
+        if self.expr_total(a) {
+            let mut facts = Vec::new();
+            self.conjuncts(a, &mut facts);
+            if facts.iter().any(|fact| self.comparison_entails(*fact, b)) {
+                return self.bool_const(true);
+            }
+        }
         let guarded = self.under_guard(a, b);
         if guarded != b {
             return self.implies(a, guarded);
@@ -1673,8 +1730,27 @@ impl Arena {
     /// hold: a fact is true there, and the folds that otherwise need total
     /// operands apply.
     fn assume_defined(&mut self, facts: &mut Vec<BoolExpr>, predicate: BoolExpr) -> BoolExpr {
-        if facts.contains(&predicate) {
+        if facts.contains(&predicate)
+            || facts
+                .iter()
+                .any(|fact| self.comparison_entails(*fact, predicate))
+        {
             return self.bool_const(true);
+        }
+        // A selection between equal values is that value wherever its
+        // condition is defined; the condition is defined where the
+        // predicate containing it is.
+        if let Node::Cmp { op, lhs, rhs } = self.node(self.expr_index(predicate)).clone() {
+            let folded = match (self.equal_branches(lhs), self.equal_branches(rhs)) {
+                (AnyExpr::Nat(x), AnyExpr::Nat(y)) => Some(self.nat_cmp(op, x, y)),
+                (AnyExpr::Int(x), AnyExpr::Int(y)) => Some(self.int_cmp(op, x, y)),
+                _ => None,
+            };
+            if let Some(folded) = folded {
+                if folded != predicate {
+                    return self.assume_defined(facts, folded);
+                }
+            }
         }
         match self.node(self.expr_index(predicate)).clone() {
             Node::Cmp {
@@ -1742,6 +1818,68 @@ impl Arena {
             }
             _ => predicate,
         }
+    }
+
+    /// An operand that selects between equal values, as that value; any other
+    /// operand as itself.
+    fn equal_branches(&self, operand: AnyExpr) -> AnyExpr {
+        match *self.node(self.index(operand)) {
+            Node::Select {
+                then, otherwise, ..
+            } if then == otherwise => then,
+            _ => operand,
+        }
+    }
+
+    /// Whether a comparison of two integer or natural operands entails a
+    /// comparison of the same operands (in either order) by the order
+    /// relation alone: `a < b` entails `a <= b`, `b > a` and `a != b`.
+    fn comparison_entails(&self, fact: BoolExpr, predicate: BoolExpr) -> bool {
+        let (
+            Node::Cmp {
+                op: known,
+                lhs: a,
+                rhs: b,
+            },
+            Node::Cmp {
+                op: wanted,
+                lhs: c,
+                rhs: d,
+            },
+        ) = (
+            self.node(self.expr_index(fact)).clone(),
+            self.node(self.expr_index(predicate)).clone(),
+        )
+        else {
+            return false;
+        };
+        let ordered = |x: AnyExpr| matches!(x, AnyExpr::Nat(_) | AnyExpr::Int(_));
+        if !ordered(a) || !ordered(b) {
+            return false;
+        }
+        let wanted = if (c, d) == (a, b) {
+            wanted
+        } else if (c, d) == (b, a) {
+            match wanted {
+                CmpOp::Lt => CmpOp::Gt,
+                CmpOp::Gt => CmpOp::Lt,
+                CmpOp::Le => CmpOp::Ge,
+                CmpOp::Ge => CmpOp::Le,
+                CmpOp::Eq => CmpOp::Eq,
+                CmpOp::Ne => CmpOp::Ne,
+            }
+        } else {
+            return false;
+        };
+        matches!(
+            (known, wanted),
+            (CmpOp::Lt, CmpOp::Lt | CmpOp::Le | CmpOp::Ne)
+                | (CmpOp::Gt, CmpOp::Gt | CmpOp::Ge | CmpOp::Ne)
+                | (CmpOp::Le, CmpOp::Le)
+                | (CmpOp::Ge, CmpOp::Ge)
+                | (CmpOp::Eq, CmpOp::Eq | CmpOp::Le | CmpOp::Ge)
+                | (CmpOp::Ne, CmpOp::Ne)
+        )
     }
 
     pub(super) fn entails(&self, antecedent: BoolExpr, consequent: BoolExpr) -> bool {
@@ -1980,19 +2118,36 @@ impl Arena {
         }
         self.bool_binary(BinaryOp::Iff, a, b)
     }
+    /// The short-circuit conjunction of `terms` in order. Conjunction is
+    /// associative (including where each term is evaluated), so the terms
+    /// are joined pairwise: the expression's depth grows with the logarithm
+    /// of the term count, never linearly, and every recursive walk over it
+    /// stays shallow however many constraints a construction collects.
     pub(super) fn all(&mut self, terms: &[BoolExpr]) -> BoolExpr {
-        let mut acc = self.bool_const(true);
-        for &t in terms {
-            acc = self.and(acc, t);
+        match terms {
+            [] => self.bool_const(true),
+            [term] => *term,
+            _ => {
+                let (left, right) = terms.split_at(terms.len() / 2);
+                let left = self.all(left);
+                let right = self.all(right);
+                self.and(left, right)
+            }
         }
-        acc
     }
+    /// The short-circuit disjunction of `terms` in order, joined pairwise
+    /// as [`Self::all`] joins a conjunction.
     pub(super) fn any(&mut self, terms: &[BoolExpr]) -> BoolExpr {
-        let mut acc = self.bool_const(false);
-        for &t in terms {
-            acc = self.or(acc, t);
+        match terms {
+            [] => self.bool_const(false),
+            [term] => *term,
+            _ => {
+                let (left, right) = terms.split_at(terms.len() / 2);
+                let left = self.any(left);
+                let right = self.any(right);
+                self.or(left, right)
+            }
         }
-        acc
     }
     fn cmp_node(&mut self, op: CmpOp, lhs: AnyExpr, rhs: AnyExpr) -> BoolExpr {
         handle(self.id, self.intern(Node::Cmp { op, lhs, rhs }, Sort::Bool))
@@ -2165,6 +2320,30 @@ impl Arena {
 
     // ----- Scalar ----------------------------------------------------------
 
+    pub(super) fn scalar_symbol_erased(&mut self, symbol: SymbolId) -> ErasedScalarExpr {
+        assert!(
+            matches!(self.record(symbol).sort, SymbolSort::Scalar(_)),
+            "scalar leaf requires a scalar symbol"
+        );
+        ErasedScalarExpr {
+            owner: self.id,
+            index: self.symbol_node(symbol),
+        }
+    }
+    pub(super) fn scalar_const_erased(&mut self, value: ReferenceScalar) -> ErasedScalarExpr {
+        let dtype = value.dtype();
+        let index = self.intern(
+            Node::ScalarConst {
+                dtype,
+                bits: value.bits(),
+            },
+            Sort::Scalar(dtype),
+        );
+        ErasedScalarExpr {
+            owner: self.id,
+            index,
+        }
+    }
     pub(super) fn scalar_symbol<T: ScalarSort>(&mut self, s: SymbolId) -> ScalarExpr<T> {
         if self.record(s).sort != SymbolSort::Scalar(T::DTYPE) {
             panic!("ExprArena: {s:?} is not a {:?} scalar symbol", T::DTYPE);
@@ -2500,14 +2679,23 @@ impl Arena {
                     ScalarOp::Cast(dtype) => {
                         digest.update([3, dtype_tag(*dtype)]);
                     }
+                    ScalarOp::Bitcast(dtype) => {
+                        digest.update([5, dtype_tag(*dtype)]);
+                    }
                     ScalarOp::IntegerToFloat(dtype) => {
                         digest.update([4, dtype_tag(*dtype)]);
                     }
                 }
                 digest.update((operands.len() as u64).to_le_bytes());
-                for (dtype, value) in operands.iter() {
-                    digest.update([dtype_tag(*dtype)]);
-                    child!(AnyExpr::Int(*value));
+                for operand in operands.iter() {
+                    digest.update([
+                        match operand {
+                            ScalarOperand::Word { .. } => 0,
+                            ScalarOperand::Scalar(_) => 1,
+                        },
+                        dtype_tag(self.scalar_operand_dtype(*operand)),
+                    ]);
+                    child!(operand.expression());
                 }
             }
             Node::Symbol(symbol) => {
@@ -2799,7 +2987,7 @@ fn hash_symbol_kind(digest: &mut Sha256, kind: SymbolKind) {
             digest.update([6]);
             digest.update(ordinal.to_le_bytes());
         }
-        SymbolKind::ProofVariable(_) => {
+        SymbolKind::CheckerVariable(_) => {
             unreachable!("proof variables never enter an entry arena")
         }
     }
@@ -2813,6 +3001,7 @@ fn dtype_tag(dtype: DType) -> u8 {
         DType::F32 => 3,
         DType::I32 => 4,
         DType::U32 => 5,
+        DType::U64 => 6,
     }
 }
 fn symbol_sort_tag(sort: SymbolSort) -> u8 {
@@ -2889,7 +3078,7 @@ fn reflexive(op: CmpOp) -> bool {
     matches!(op, CmpOp::Eq | CmpOp::Le | CmpOp::Ge)
 }
 
-fn scalar_bits<T: ScalarSort>(value: T::Value) -> u32 {
+fn scalar_bits<T: ScalarSort>(value: T::Value) -> u64 {
     T::encode(value)
 }
 
@@ -2904,6 +3093,7 @@ fn symbol_value_matches(sort: SymbolSort, value: SymbolValue) -> bool {
             | (SymbolSort::Scalar(DType::Bool), SymbolValue::Bool(_))
             | (SymbolSort::Scalar(DType::I32), SymbolValue::I32(_))
             | (SymbolSort::Scalar(DType::U32), SymbolValue::U32(_))
+            | (SymbolSort::Scalar(DType::U64), SymbolValue::U64(_))
     )
 }
 
@@ -2915,14 +3105,27 @@ enum ScalarVal {
     Bool(bool),
     I32(i32),
     U32(u32),
+    U64(u64),
 }
 
 impl ScalarVal {
-    fn decode(dtype: DType, bits: u32) -> Self {
+    fn reference(self) -> ReferenceScalar {
+        match self {
+            Self::F32(value) => ReferenceScalar::F32(value.to_bits()),
+            Self::F16(value) => ReferenceScalar::F16(value),
+            Self::BF16(value) => ReferenceScalar::BF16(value),
+            Self::Bool(value) => ReferenceScalar::Bool(value),
+            Self::I32(value) => ReferenceScalar::I32(value),
+            Self::U32(value) => ReferenceScalar::U32(value),
+            Self::U64(value) => ReferenceScalar::U64(value),
+        }
+    }
+    fn decode(dtype: DType, bits: u64) -> Self {
         match dtype {
             DType::I32 => Self::I32(bits as i32),
-            DType::U32 => Self::U32(bits),
-            DType::F32 => Self::F32(f32::from_bits(bits)),
+            DType::U32 => Self::U32(bits as u32),
+            DType::U64 => Self::U64(bits),
+            DType::F32 => Self::F32(f32::from_bits(bits as u32)),
             DType::F16 => Self::F16(bits as u16),
             DType::BF16 => Self::BF16(bits as u16),
             DType::Bool => Self::Bool(bits != 0),
@@ -2936,6 +3139,7 @@ impl ScalarVal {
             SymbolValue::Bool(v) => Some(Self::Bool(v)),
             SymbolValue::I32(v) => Some(Self::I32(v)),
             SymbolValue::U32(v) => Some(Self::U32(v)),
+            SymbolValue::U64(v) => Some(Self::U64(v)),
             SymbolValue::Nat(_) | SymbolValue::Int(_) => None,
         }
     }
@@ -2944,20 +3148,15 @@ impl ScalarVal {
             (self, dtype),
             (Self::I32(_), DType::I32)
                 | (Self::U32(_), DType::U32)
+                | (Self::U64(_), DType::U64)
                 | (Self::F32(_), DType::F32)
                 | (Self::F16(_), DType::F16)
                 | (Self::BF16(_), DType::BF16)
                 | (Self::Bool(_), DType::Bool)
         )
     }
-    fn bits(self) -> u32 {
-        match self {
-            Self::F32(value) => value.to_bits(),
-            Self::F16(value) | Self::BF16(value) => value as u32,
-            Self::Bool(value) => u32::from(value),
-            Self::I32(value) => value as u32,
-            Self::U32(value) => value,
-        }
+    fn bits(self) -> u64 {
+        self.reference().bits()
     }
     /// Comparison with IEEE semantics for floats: every ordered comparison
     /// and equality with a NaN is false, inequality is true.
@@ -2965,6 +3164,7 @@ impl ScalarVal {
         match (self, other) {
             (Self::I32(x), Self::I32(y)) => compare(op, x, y),
             (Self::U32(x), Self::U32(y)) => compare(op, x, y),
+            (Self::U64(x), Self::U64(y)) => compare(op, x, y),
             (Self::Bool(x), Self::Bool(y)) => compare(op, x, y),
             (Self::F32(x), Self::F32(y)) => match op {
                 CmpOp::Eq => x == y,
@@ -3113,6 +3313,11 @@ impl Arena {
         }
         let node = self.node(i).clone();
         let sc = match node {
+            Node::Binary {
+                op: BinaryOp::And | BinaryOp::Implies | BinaryOp::Or,
+                lhs: AnyExpr::Bool(_),
+                rhs: AnyExpr::Bool(_),
+            } => return self.connective_side_conditions(i, memo),
             Node::NatConst(_)
             | Node::IntConst(_)
             | Node::BoolConst(_)
@@ -3121,7 +3326,7 @@ impl Arena {
             Node::ScalarInteger { operands, .. } => {
                 let mut conditions = operands
                     .iter()
-                    .map(|(_, value)| self.side_conditions_of(self.expr_index(*value), memo))
+                    .map(|operand| self.side_conditions_of(self.index(operand.expression()), memo))
                     .collect::<Vec<_>>();
                 conditions.push(self.scalar_integer_defined(self.h(i)));
                 self.all(&conditions)
@@ -3150,17 +3355,6 @@ impl Arena {
             Node::Binary { op, lhs, rhs } => {
                 let l = self.side_conditions_of(self.index(lhs), memo);
                 match (op, lhs, rhs) {
-                    (BinaryOp::And | BinaryOp::Implies, AnyExpr::Bool(a), AnyExpr::Bool(b)) => {
-                        let r = self.side_conditions_of(self.expr_index(b), memo);
-                        let guarded = self.implies(a, r);
-                        self.and(l, guarded)
-                    }
-                    (BinaryOp::Or, AnyExpr::Bool(a), AnyExpr::Bool(b)) => {
-                        let r = self.side_conditions_of(self.expr_index(b), memo);
-                        let not_a = self.not(a);
-                        let guarded = self.implies(not_a, r);
-                        self.and(l, guarded)
-                    }
                     (BinaryOp::Sub, AnyExpr::Nat(a), AnyExpr::Nat(b)) => {
                         let r = self.side_conditions_of(self.expr_index(b), memo);
                         let both = self.and(l, r);
@@ -3283,6 +3477,49 @@ impl Arena {
         sc
     }
 
+    /// Side conditions of a short-circuit connective `a op b`: those of `a`,
+    /// and those of `b` where `b` is evaluated. A conjunction or disjunction
+    /// of many terms (`all`, `any`) is a left-deep chain as long as its term
+    /// count, so the chain's left spine is walked iteratively; each level
+    /// still forms exactly the conditions, in the same order, as it would
+    /// recursively.
+    fn connective_side_conditions(
+        &mut self,
+        top: u32,
+        memo: &mut HashMap<u32, BoolExpr>,
+    ) -> BoolExpr {
+        let mut spine = Vec::new();
+        let mut i = top;
+        loop {
+            if i != top && (self.is_total(i) || memo.contains_key(&i)) {
+                break;
+            }
+            match self.node(i).clone() {
+                Node::Binary {
+                    op: op @ (BinaryOp::And | BinaryOp::Implies | BinaryOp::Or),
+                    lhs: AnyExpr::Bool(a),
+                    rhs: AnyExpr::Bool(b),
+                } => {
+                    spine.push((i, op, a, b));
+                    i = self.expr_index(a);
+                }
+                _ => break,
+            }
+        }
+        let mut conditions = self.side_conditions_of(i, memo);
+        for (index, op, a, b) in spine.into_iter().rev() {
+            let r = self.side_conditions_of(self.expr_index(b), memo);
+            let evaluated = match op {
+                BinaryOp::Or => self.not(a),
+                _ => a,
+            };
+            let guarded = self.implies(evaluated, r);
+            conditions = self.and(conditions, guarded);
+            memo.insert(index, conditions);
+        }
+        conditions
+    }
+
     pub(super) fn partial<Sort>(&mut self, node: Expr<Sort>, a: &PartialAssignment) -> Expr<Sort> {
         for (symbol, value) in a.iter() {
             let sort = self.record(symbol).sort;
@@ -3299,6 +3536,36 @@ impl Arena {
         )
     }
 
+    pub(super) fn substitute_any(
+        &mut self,
+        node: AnyExpr,
+        values: &[(SymbolId, AnyExpr)],
+    ) -> AnyExpr {
+        let mut expressions = HashMap::new();
+        for (symbol, value) in values {
+            let index = self.index(*value);
+            let expected = match self.record(*symbol).sort {
+                SymbolSort::Nat => Sort::Nat,
+                SymbolSort::Int => Sort::Int,
+                SymbolSort::Scalar(dtype) => Sort::Scalar(dtype),
+            };
+            assert_eq!(
+                self.sort(index),
+                expected,
+                "substitution changed symbol sort"
+            );
+            expressions.insert(*symbol, index);
+        }
+        let index = self.index(node);
+        let result = self.partial_of(
+            index,
+            &PartialAssignment::new(),
+            &expressions,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+        self.erased(result)
+    }
     pub(super) fn substitute_nat<Sort>(
         &mut self,
         node: Expr<Sort>,
@@ -3329,14 +3596,33 @@ impl Arena {
         node: Expr<Sort>,
         values: &[(crate::ids::SemanticValueId, IntExpr)],
     ) -> Expr<Sort> {
+        let values = values
+            .iter()
+            .map(|(value, expression)| (*value, AnyExpr::Int(*expression)))
+            .collect::<Vec<_>>();
+        self.resolve_runtime_symbols(node, &values)
+    }
+
+    /// Replace each runtime value symbol with the expression `values` gives
+    /// it, when that expression has the symbol's own sort: an integer value
+    /// by its exact integer, a word value by its reached word.
+    pub(super) fn resolve_runtime_symbols<Sort>(
+        &mut self,
+        node: Expr<Sort>,
+        values: &[(crate::ids::SemanticValueId, AnyExpr)],
+    ) -> Expr<Sort> {
         let mut expressions = HashMap::new();
         let node = self.expr_index(node);
-        for symbol in &self.free[node as usize] {
-            if let SymbolKind::RuntimeValue(value) = self.record(*symbol).kind {
+        for symbol in self.free[node as usize].clone() {
+            if let SymbolKind::RuntimeValue(value) = self.record(symbol).kind {
                 if let Some((_, expression)) =
                     values.iter().find(|(candidate, _)| *candidate == value)
                 {
-                    expressions.insert(*symbol, self.expr_index(*expression));
+                    let replacement = self.index(*expression);
+                    let symbol_node = self.symbol_node(symbol);
+                    if self.sort(replacement) == self.sort(symbol_node) {
+                        expressions.insert(symbol, replacement);
+                    }
                 }
             }
         }
@@ -3423,10 +3709,24 @@ impl Arena {
             } => {
                 let operands = operands
                     .iter()
-                    .map(|(dtype, value)| {
-                        let node =
-                            self.partial_of(self.expr_index(*value), a, expressions, shadow, memo);
-                        (*dtype, self.h(node))
+                    .map(|operand| {
+                        let node = self.partial_of(
+                            self.index(operand.expression()),
+                            a,
+                            expressions,
+                            shadow,
+                            memo,
+                        );
+                        match *operand {
+                            ScalarOperand::Word { dtype, .. } => ScalarOperand::Word {
+                                dtype,
+                                value: self.h(node),
+                            },
+                            ScalarOperand::Scalar(_) => ScalarOperand::Scalar(ErasedScalarExpr {
+                                owner: self.id,
+                                index: node,
+                            }),
+                        }
                     })
                     .collect::<Vec<_>>();
                 self.scalar_integer(operation, &operands).index
@@ -3708,7 +4008,18 @@ impl Arena {
                     operation,
                     operands: operands
                         .iter()
-                        .map(|(dtype, value)| (*dtype, self.h(map[&self.expr_index(*value)])))
+                        .map(|operand| match *operand {
+                            ScalarOperand::Word { dtype, value } => ScalarOperand::Word {
+                                dtype,
+                                value: self.h(map[&self.expr_index(value)]),
+                            },
+                            ScalarOperand::Scalar(value) => {
+                                ScalarOperand::Scalar(ErasedScalarExpr {
+                                    owner: self.id,
+                                    index: map[&self.index(AnyExpr::Scalar(value))],
+                                })
+                            }
+                        })
                         .collect(),
                 },
                 Node::Unary { op, operand } => Node::Unary {
@@ -4148,14 +4459,24 @@ impl<'a> Evaluator<'a> {
             } => {
                 let operation = *operation;
                 let mut inputs = Vec::with_capacity(operands.len());
-                for (dtype, value) in operands.iter() {
-                    inputs.push(integer_word(*dtype, &self.int((*value).into())?));
+                for operand in operands.iter() {
+                    inputs.push(match *operand {
+                        ScalarOperand::Word { dtype, value } => {
+                            integer_word(dtype, &self.int(value.into())?)
+                        }
+                        ScalarOperand::Scalar(value) => {
+                            match self.run(ordinal(AnyExpr::Scalar(value)))? {
+                                Val::Scalar(value) => value.reference(),
+                                _ => return Err(EvalError::Unrepresentable),
+                            }
+                        }
+                    });
                 }
                 let types = inputs.iter().map(|value| value.dtype()).collect::<Vec<_>>();
                 let recipe = reference_math::scalar_recipe(operation, &types);
                 let result =
                     reference_math::evaluate(&recipe, &inputs).map_err(EvalError::ScalarFailure)?;
-                Val::Int(scalar_integer_value(result).into())
+                Val::Int(scalar_integer_value(result))
             }
             Node::Symbol(s) => self.symbol(*s)?,
             Node::Unary { op, operand } => match op {
@@ -4182,7 +4503,8 @@ impl<'a> Evaluator<'a> {
                 UnaryOp::IntFromScalar => match self.run(ordinal(*operand))? {
                     Val::Scalar(ScalarVal::I32(value)) => Val::Int(value.into()),
                     Val::Scalar(ScalarVal::U32(value)) => Val::Int(value.into()),
-                    _ => unreachable!("integer injection is constructed only for I32/U32"),
+                    Val::Scalar(ScalarVal::U64(value)) => Val::Int(value.into()),
+                    _ => unreachable!("integer injection is constructed only for integer words"),
                 },
             },
             Node::Binary { op, lhs, rhs } => {
@@ -4398,18 +4720,17 @@ impl<'a> Evaluator<'a> {
 }
 
 fn integer_word(dtype: DType, value: &BigInt) -> ReferenceScalar {
-    let bits = value.rem_euclid(&(BigInt::one() << 32_u32));
-    let bits = u32::try_from(bits).expect("word residue is within u32");
-    match dtype {
-        DType::I32 => ReferenceScalar::I32(bits as i32),
-        DType::U32 => ReferenceScalar::U32(bits),
-        _ => unreachable!("integer projection has only integer word operands"),
-    }
+    assert!(dtype.is_int(), "integer projection has only integer word operands");
+    let width = 8 * dtype.bytes();
+    let bits = value.rem_euclid(&(BigInt::one() << width));
+    let bits = u64::try_from(bits).expect("word residue is within u64");
+    ReferenceScalar::from_bits(dtype, bits)
 }
-fn scalar_integer_value(value: ReferenceScalar) -> i64 {
+fn scalar_integer_value(value: ReferenceScalar) -> BigInt {
     match value {
-        ReferenceScalar::I32(value) => i64::from(value),
-        ReferenceScalar::U32(value) => i64::from(value),
+        ReferenceScalar::I32(value) => BigInt::from(value),
+        ReferenceScalar::U32(value) => BigInt::from(value),
+        ReferenceScalar::U64(value) => BigInt::from(value),
         _ => unreachable!("integer projection has only integer word results"),
     }
 }

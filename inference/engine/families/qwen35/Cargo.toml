@@ -8,4 +8,4 @@ license.workspace = true
 magnitude-artifacts = { path = "../../artifacts" }
 magnitude-family-common = { path = "../common" }
 magnitude-family-contracts = { path = "../contracts" }
-sha2 = "=0.11.0"
+magnitude-family-qwen = { path = "../qwen" }

@@ -30,7 +30,7 @@ struct BoundOut {
         // cannot raise it, so it skips the noise.
         const float lower = value - radius[ulong(n) * radius_stride] * lengths[m];
         const uint best = atomic_load_explicit(&lowest[m], memory_order_relaxed);
-        if (best != 0u && lower / selection.divisor(m) + PROGRESSIVE_NOISE < progressive::value_of(best))
+        if (best != 0u && selection.transform(lower) / selection.divisor(m) + PROGRESSIVE_NOISE < progressive::value_of(best))
             return;
         atomic_fetch_max_explicit(&lowest[m], progressive::key(selection.score(m, n, lower)), memory_order_relaxed);
     }
@@ -127,8 +127,9 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
 #define TOP_ROWS_OPERANDS                                                               \
     const uint d = uint(SEISMIC_DIM_D);                                                 \
     const uint rows = uint(SEISMIC_DIM_O);                                              \
-    projection::Rms<progressive::activation, norm_element, projection::SelectedRows> in{hidden, \
-        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,  \
+    projection::InputOf<progressive::activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, \
+        SEISMIC_DIM_PT>::type in{hidden, \
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,  \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), d, {out_rows}};                    \
     const projection::Weights<packets::ProgressiveTop> w{top, SEISMIC_TOP_STRIDE_0, scales, \
         SEISMIC_SCALES_STRIDE_0};                                                       \
@@ -145,7 +146,7 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
     const BoundOut out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, radius, \
         SEISMIC_RADIUS_STRIDE_0, lengths, lowest,                                       \
         {draws, SEISMIC_DRAWS_STRIDE_0, SEISMIC_DRAWS_STRIDE_1, temperature, SEISMIC_TEMPERATURE_STRIDE_0, mask, \
-            SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained, SEISMIC_CONSTRAINED_STRIDE_0}}
+            SEISMIC_MASK_STRIDE_0, SEISMIC_MASK_STRIDE_1, constrained, SEISMIC_CONSTRAINED_STRIDE_0, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}}
 
 #ifdef SEISMIC_FORMING_READOUT_TOP_ROWS_GEMV
 template <uint ROWS, uint LANES>

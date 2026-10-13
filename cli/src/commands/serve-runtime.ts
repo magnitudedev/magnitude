@@ -11,6 +11,7 @@ import { isDevelopmentBuild } from "../runtime/environment"
 import { idleInstallationSystem, initializeServeUpdates, makeIdleInstallation, prepareServeStartup } from "../server/serve-updates"
 import { resolveServeOwner } from "../server/serve-owner"
 import { readServerReach, renderServeReady } from "../server/server-reach"
+import { serveStopSignals } from "./serve-signals"
 
 class ServeRefused extends Schema.TaggedError<ServeRefused>()("ServeRefused", { message: Schema.String }) {}
 
@@ -18,7 +19,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const stopped = yield* Deferred.make<void>()
   const effects = yield* Effect.runtime<never>()
   const stop = () => Runtime.runSync(effects)(Deferred.succeed(stopped, undefined))
-  const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM", "SIGBREAK"] as const : ["SIGINT", "SIGTERM", "SIGHUP"] as const
+  const signals = yield* serveStopSignals(process.platform)
   yield* Effect.acquireRelease(Effect.sync(() => { for (const signal of signals) process.on(signal, stop) }),
     () => Effect.sync(() => { for (const signal of signals) process.removeListener(signal, stop) }))
   const runtime: ApplicationRuntime = isDevelopmentBuild()

@@ -21,16 +21,20 @@ pub enum DType {
     I32,
     U32,
     Bool,
+    /// An unsigned 64-bit word: wrapping arithmetic and bitwise operations
+    /// modulo 2^64 (hashes over token ids, wide row indices).
+    U64,
 }
 
 impl DType {
-    pub const ALL: [DType; 6] = [
+    pub const ALL: [DType; 7] = [
         DType::F32,
         DType::BF16,
         DType::F16,
         DType::I32,
         DType::U32,
         DType::Bool,
+        DType::U64,
     ];
 
     pub fn from_name(name: &str) -> Option<DType> {
@@ -41,6 +45,7 @@ impl DType {
             "i32" => DType::I32,
             "u32" => DType::U32,
             "bool" => DType::Bool,
+            "u64" => DType::U64,
             _ => return None,
         })
     }
@@ -53,6 +58,7 @@ impl DType {
             DType::I32 => "i32",
             DType::U32 => "u32",
             DType::Bool => "bool",
+            DType::U64 => "u64",
         }
     }
 
@@ -61,7 +67,7 @@ impl DType {
     }
 
     pub fn is_int(self) -> bool {
-        matches!(self, DType::I32 | DType::U32)
+        matches!(self, DType::I32 | DType::U32 | DType::U64)
     }
 
     pub fn is_numeric(self) -> bool {
@@ -70,6 +76,7 @@ impl DType {
 
     pub fn bytes(self) -> u32 {
         match self {
+            DType::U64 => 8,
             DType::F32 | DType::I32 | DType::U32 => 4,
             DType::BF16 | DType::F16 => 2,
             DType::Bool => 1,
@@ -97,6 +104,7 @@ impl DType {
             DType::I32 => 3,
             DType::U32 => 4,
             DType::Bool => 5,
+            DType::U64 => 6,
         }
     }
 }

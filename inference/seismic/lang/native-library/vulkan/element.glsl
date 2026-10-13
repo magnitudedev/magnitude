@@ -39,6 +39,7 @@ layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer ele
 layout(buffer_reference, scalar, buffer_reference_align = 1) readonly buffer element_ro_i8 { int8_t v; };
 layout(buffer_reference, scalar, buffer_reference_align = 2) readonly buffer element_ro_u16 { uint16_t v; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer element_ro_u32 { uint v; };
+layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer element_ro_u64 { uint64_t v; };
 layout(buffer_reference, scalar, buffer_reference_align = 8) readonly buffer element_ro_uvec2 { uvec2 v; };
 layout(buffer_reference, scalar, buffer_reference_align = 16) readonly buffer element_ro_uvec4 { uvec4 v; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer element_ro_f32 { float v; };
@@ -49,6 +50,7 @@ int element_i8_at(uint64_t address) { return int(element_ro_i8(address).v); }
 uint element_u16_at(uint64_t address) { return uint(element_ro_u16(address).v); }
 uint element_u32_at(uint64_t address) { return element_ro_u32(address).v; }
 int element_i32_at(uint64_t address) { return int(element_ro_u32(address).v); }
+uint64_t element_u64_at(uint64_t address) { return element_ro_u64(address).v; }
 uvec2 element_uvec2_at(uint64_t address) { return element_ro_uvec2(address).v; }
 uvec4 element_uvec4_at(uint64_t address) { return element_ro_uvec4(address).v; }
 float element_f32_at(uint64_t address) { return element_ro_f32(address).v; }

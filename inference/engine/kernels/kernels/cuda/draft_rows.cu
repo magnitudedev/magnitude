@@ -1,18 +1,9 @@
-// draft_rows: the draft head's input row; the CUDA form of
-// `metal/draft_rows.metal`. Block (x, row) owns outputs 32x..32x+31 of
-// one row: it decodes the successor token's embedding row (mma16 lane chunks
-// or a dense table) and reads the conditioning row, RMS-normalizes both into
-// the joined [2D] input rounded to A (F32 in shared memory), then each warp
-// reduces four combine rows over the joined input.
-#if defined(SEISMIC_TABLE_KIND_PACKED)
+// Decode forms a joined input inside each output group. Prefill forms each
+// row/stream once, then uses the shared tiled projection to reuse weights.
 #define KERNEL_W0 SEISMIC_TABLE
-#endif
-#if defined(SEISMIC_COMBINE_KIND_PACKED)
 #define KERNEL_W1 SEISMIC_COMBINE
-#endif
-#include "lib/core/activation.cuh"
-#include <seismic/packets.cuh>
-#include "lib/core/reduce.cuh"
+#include "lib/projection/projection.cuh"
+#include "lib/core/gathered.cuh"
 
 namespace {
 
@@ -25,23 +16,29 @@ constexpr unsigned DRAFT_ROWS_PER_WARP = 4;
 
 } // namespace
 
-extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
+struct DraftInput {
+    packets::W0 table;
+    const unsigned char *table_bytes, *conditioning, *embedding_norm, *hidden_norm;
+    u64 table_row_stride, table_column_stride;
+    u64 conditioning_row_stride, conditioning_column_stride;
+    u64 embedding_norm_stride, hidden_norm_stride;
+};
+
+#define DRAFT_INPUT DraftInput{KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE)), \
+    SEISMIC_PTR(SEISMIC_BUFFER_TABLE), SEISMIC_PTR(SEISMIC_BUFFER_CONDITIONING), \
+    SEISMIC_PTR(SEISMIC_BUFFER_EMBEDDING_NORM), SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN_NORM), \
+    SEISMIC_TABLE_STRIDE_0, SEISMIC_TABLE_STRIDE_1, SEISMIC_CONDITIONING_STRIDE_0, \
+    SEISMIC_CONDITIONING_STRIDE_1, SEISMIC_EMBEDDING_NORM_STRIDE_0, SEISMIC_HIDDEN_NORM_STRIDE_0}
+
+__device__ __forceinline__ void draft_join(const DraftInput &input, u64 token, u64 row, u64 stream,
+                                          u64 D, float epsilon, float *joined, float *partials) {
     using Conditioning = ELEMENT_OF(SEISMIC_CONDITIONING);
     using EmbeddingNorm = ELEMENT_OF(SEISMIC_EMBEDDING_NORM);
     using HiddenNorm = ELEMENT_OF(SEISMIC_HIDDEN_NORM);
-    extern __shared__ float joined[];
-    __shared__ float partials[DRAFT_WARPS];
-    const u64 D = SEISMIC_DIM_D;
-    const u64 row = blockIdx.y;
-    const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
-    const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
-    // Column 0 of a (token, status) selection row; a failed selection is -1.
-    const u64 token = (u64)max(tokens[row * SEISMIC_TOKENS_STRIDE_0], 0);
-
     // The embedding row rounded to A, and its sum of squares.
     float embedding_squares = 0.0f;
 #if defined(SEISMIC_TABLE_KIND_PACKED)
-    const auto table = KERNEL_W0_AT(SEISMIC_PTR(SEISMIC_BUFFER_TABLE));
+    const auto table = input.table;
     for (u64 item = threadIdx.x; item < D / 64 * 4; item += blockDim.x) {
         const u64 kb = item / 4;
         const u32 t = (u32)(item % 4);
@@ -61,17 +58,17 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     using Table = ELEMENT_OF(SEISMIC_TABLE);
     for (u64 column = threadIdx.x; column < D; column += blockDim.x) {
         const float value = Act::round(element::at<Table>(
-            SEISMIC_PTR(SEISMIC_BUFFER_TABLE), token * SEISMIC_TABLE_STRIDE_0 + column * SEISMIC_TABLE_STRIDE_1));
+            input.table_bytes, token * input.table_row_stride + column * input.table_column_stride));
         joined[column] = value;
         embedding_squares = seismic_fma_rn(value, value, embedding_squares);
     }
 #endif
-    // The conditioning row (already A) and its sum of squares.
+    // The conditioning stream (activation or raw F32) and its sum of squares.
     float hidden_squares = 0.0f;
     for (u64 column = threadIdx.x; column < D; column += blockDim.x) {
-        const float value = element::at<Conditioning>(SEISMIC_PTR(SEISMIC_BUFFER_CONDITIONING),
-                                                      row * SEISMIC_CONDITIONING_STRIDE_0
-                                                          + column * SEISMIC_CONDITIONING_STRIDE_1);
+        const float value = element::at<Conditioning>(input.conditioning,
+                                                      row * input.conditioning_row_stride
+                                                          + (stream * D + column) * input.conditioning_column_stride);
         joined[D + column] = value;
         hidden_squares = seismic_fma_rn(value, value, hidden_squares);
     }
@@ -82,14 +79,29 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
     for (u64 column = threadIdx.x; column < D; column += blockDim.x) {
         joined[column] = Act::round(
             joined[column] * embedding_inverse
-            * element::at<EmbeddingNorm>(SEISMIC_PTR(SEISMIC_BUFFER_EMBEDDING_NORM),
-                                         column * SEISMIC_EMBEDDING_NORM_STRIDE_0));
+            * element::at<EmbeddingNorm>(input.embedding_norm,
+                                         column * input.embedding_norm_stride));
         joined[D + column] = Act::round(
             joined[D + column] * hidden_inverse
-            * element::at<HiddenNorm>(SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN_NORM), column * SEISMIC_HIDDEN_NORM_STRIDE_0));
+            * element::at<HiddenNorm>(input.hidden_norm, (stream * D + column) * input.hidden_norm_stride));
     }
     __syncthreads();
 
+}
+
+extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
+    extern __shared__ float joined[];
+    __shared__ float partials[DRAFT_WARPS];
+    const u64 D = SEISMIC_DIM_D;
+    const u64 row = blockIdx.y / SEISMIC_DIM_S;
+    const u64 stream = blockIdx.y % SEISMIC_DIM_S;
+    const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
+    const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
+    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+
+    draft_join(DRAFT_INPUT, token, row, stream, D, epsilon, joined, partials);
     // Four combine rows per warp over the 2D joined inputs.
     const unsigned warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     float *result = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
@@ -125,6 +137,46 @@ extern "C" __global__ void draft_rows(SEISMIC_KERNEL_PARAMS) {
 #endif
         sum = seismic_warp_sum_f32(sum);
         if (lane == 0)
-            result[row * SEISMIC_RESULT_0_STRIDE_0 + output * SEISMIC_RESULT_0_STRIDE_1] = sum;
+            result[row * SEISMIC_RESULT_0_STRIDE_0 + (stream * D + output) * SEISMIC_RESULT_0_STRIDE_1] = sum;
     }
+}
+
+extern "C" __global__ void draft_rows_join(SEISMIC_KERNEL_PARAMS) {
+    extern __shared__ float joined[];
+    __shared__ float partials[DRAFT_WARPS];
+    const u64 D = SEISMIC_DIM_D;
+    const u64 row = blockIdx.y / SEISMIC_DIM_S;
+    const u64 stream = blockIdx.y % SEISMIC_DIM_S;
+    const float epsilon = __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON);
+    const int *tokens = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS));
+    const u64 token = gathered::row(reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY)),
+                                    SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R, SEISMIC_DIM_F,
+                                    tokens[row * SEISMIC_TOKENS_STRIDE_0]);
+
+    draft_join(DRAFT_INPUT, token, row, stream, D, epsilon, joined, partials);
+    auto *staged = SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED);
+    for (u64 column = threadIdx.x; column < 2 * D; column += blockDim.x)
+        element::put<Act>(staged, (row * SEISMIC_DIM_S + stream) * 2 * D + column, joined[column]);
+}
+
+template <class Shape>
+__device__ __forceinline__ void draft_gemm(const unsigned char *staged, unsigned char *result,
+                                          const packets::W1 &combine, u64 rows, u64 width) {
+    extern __shared__ uint4 dynamic_shared[];
+    const projection::Store<element::F32> out{result, width, 0};
+    projection::gemm_run<Shape, false>(reinterpret_cast<projection::u8 *>(dynamic_shared),
+        staged, 2 * width, nullptr, rows, 2 * width, projection::gemm_column<Shape>(), width,
+        combine, projection::NoWeight{}, out);
+}
+
+extern "C" __global__ void draft_rows_gemm_small(SEISMIC_KERNEL_PARAMS) {
+    draft_gemm<projection::SmallGemm>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED),
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE)),
+        SEISMIC_DIM_M * SEISMIC_DIM_S, SEISMIC_DIM_D);
+}
+
+extern "C" __global__ void draft_rows_gemm(SEISMIC_KERNEL_PARAMS) {
+    draft_gemm<projection::LargeGemm<2>>(SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_JOINED),
+        SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER), KERNEL_W1_AT(SEISMIC_PTR(SEISMIC_BUFFER_COMBINE)),
+        SEISMIC_DIM_M * SEISMIC_DIM_S, SEISMIC_DIM_D);
 }

@@ -26,7 +26,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-pub const VERSION: &str = "seismic-scalar-reference-bits-v3";
+pub const VERSION: &str = "seismic-scalar-reference-bits-v5";
 
 /// Operation identities describe source semantics, never physical approximations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -35,6 +35,8 @@ pub enum ScalarOp {
     Unary(ast::UnaryOp),
     Math(MathOp),
     Cast(DType),
+    /// Exact payload transport between F32 and U32.
+    Bitcast(DType),
     /// A signed 64-bit two's-complement integer, given as the U32 words
     /// `(low, high)`, rounded once to nearest-even in the float dtype. It equals
     /// `integer_to_float` for every value in `[-2^63, 2^63)`.
@@ -50,6 +52,7 @@ pub fn scalar_operation(primitive: &crate::intrinsics::PrimitiveId) -> Option<Sc
         PrimitiveId::Binary(op) => ScalarOp::Binary(*op),
         PrimitiveId::Math(op) => ScalarOp::Math(*op),
         PrimitiveId::Cast(dtype) => ScalarOp::Cast(*dtype),
+        PrimitiveId::Bitcast(dtype) => ScalarOp::Bitcast(*dtype),
         _ => return None,
     })
 }
@@ -62,6 +65,7 @@ pub enum ReferenceScalar {
     F32(u32),
     I32(i32),
     U32(u32),
+    U64(u64),
     Bool(bool),
 }
 impl ReferenceScalar {
@@ -72,24 +76,29 @@ impl ReferenceScalar {
             Self::F32(_) => DType::F32,
             Self::I32(_) => DType::I32,
             Self::U32(_) => DType::U32,
+            Self::U64(_) => DType::U64,
             Self::Bool(_) => DType::Bool,
         }
     }
-    pub fn bits(self) -> u32 {
+    /// The payload, zero-extended. Only a U64 payload exceeds 32 bits.
+    pub fn bits(self) -> u64 {
         match self {
-            Self::F16(x) | Self::BF16(x) => u32::from(x),
-            Self::F32(x) | Self::U32(x) => x,
-            Self::I32(x) => x as u32,
-            Self::Bool(x) => u32::from(x),
+            Self::F16(x) | Self::BF16(x) => u64::from(x),
+            Self::F32(x) | Self::U32(x) => u64::from(x),
+            Self::I32(x) => u64::from(x as u32),
+            Self::U64(x) => x,
+            Self::Bool(x) => u64::from(x),
         }
     }
-    pub fn from_bits(dtype: DType, bits: u32) -> Self {
+    /// The payload of a dtype; bits above its width are discarded.
+    pub fn from_bits(dtype: DType, bits: u64) -> Self {
         match dtype {
             DType::F16 => Self::F16(bits as u16),
             DType::BF16 => Self::BF16(bits as u16),
-            DType::F32 => Self::F32(bits),
+            DType::F32 => Self::F32(bits as u32),
             DType::I32 => Self::I32(bits as i32),
-            DType::U32 => Self::U32(bits),
+            DType::U32 => Self::U32(bits as u32),
+            DType::U64 => Self::U64(bits),
             DType::Bool => Self::Bool(bits != 0),
         }
     }
@@ -101,6 +110,7 @@ impl ReferenceScalar {
             Self::F32(x) => f32::from_bits(x) as f64,
             Self::I32(x) => f64::from(x),
             Self::U32(x) => f64::from(x),
+            Self::U64(x) => x as f64,
             Self::Bool(x) => f64::from(u8::from(x)),
         }
     }
@@ -136,6 +146,8 @@ enum BitOp {
     Shr,
 }
 
+/// Word operations act on two words of one width, U32 or U64. A shift count
+/// is a word of the shifted width and is below that width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WordOp {
     Add,
@@ -167,8 +179,12 @@ pub enum ReferenceNode {
     And { a: V, b: V },
     Not { value: V },
     Select { condition: V, yes: V, no: V },
+    /// The payload word of a value: U64 for a U64 value, else U32.
     Bits { value: V },
     FromBits { value: V, dtype: DType },
+    /// A word of the other width: zero extension from U32 to U64, or the low
+    /// word of a U64.
+    Resize { value: V, dtype: DType },
 }
 impl ReferenceNode {
     fn operands(&self) -> Vec<V> {
@@ -177,17 +193,21 @@ impl ReferenceNode {
             Self::Word { a, b, .. } | Self::Compare { a, b, .. } | Self::And { a, b } => {
                 vec![a, b]
             }
-            Self::Not { value } | Self::Bits { value } | Self::FromBits { value, .. } => {
-                vec![value]
-            }
+            Self::Not { value }
+            | Self::Bits { value }
+            | Self::FromBits { value, .. }
+            | Self::Resize { value, .. } => vec![value],
             Self::Select { condition, yes, no } => vec![condition, yes, no],
         }
     }
     fn ty(&self) -> DType {
         match *self {
-            Self::Input { dtype, .. } | Self::FromBits { dtype, .. } => dtype,
+            Self::Input { dtype, .. }
+            | Self::FromBits { dtype, .. }
+            | Self::Resize { dtype, .. } => dtype,
             Self::Constant(value) => value.dtype(),
-            Self::Word { .. } | Self::Bits { .. } => DType::U32,
+            Self::Word { a, .. } => a.ty,
+            Self::Bits { value } => word_type(value.ty),
             Self::Compare { .. } | Self::And { .. } | Self::Not { .. } => DType::Bool,
             Self::Select { yes, .. } => yes.ty,
         }
@@ -204,7 +224,7 @@ impl ScalarFailure {
         match self {
             Self::IntegerDivisionByZero => "integer division by zero",
             Self::SignedDivisionOverflow => "signed integer division overflow",
-            Self::ShiftCount => "integer shift count must be in 0..32",
+            Self::ShiftCount => "integer shift count must be below the operand width",
         }
     }
 }
@@ -272,6 +292,10 @@ impl ReferenceRecipe {
                     value: at(value),
                     dtype,
                 },
+                ReferenceNode::Resize { value, dtype } => ReferenceNode::Resize {
+                    value: at(value),
+                    dtype,
+                },
             };
             renumbered[ordinal] = Some(V {
                 ordinal: nodes.len() as u32,
@@ -287,12 +311,25 @@ impl ReferenceRecipe {
     }
 }
 
+/// The word type carrying the payload of a dtype.
+pub fn word_type(dtype: DType) -> DType {
+    if dtype == DType::U64 {
+        DType::U64
+    } else {
+        DType::U32
+    }
+}
 fn terminal(node: &ReferenceNode, get: impl Fn(V) -> ReferenceScalar) -> ReferenceScalar {
-    let word = |v| {
-        let ReferenceScalar::U32(x) = get(v) else {
-            panic!("non-word terminal")
-        };
-        x
+    // A word of either width, with the width of its operands.
+    let words = |a: V, b: V| match (get(a), get(b)) {
+        (ReferenceScalar::U32(a), ReferenceScalar::U32(b)) => (u64::from(a), u64::from(b), 32),
+        (ReferenceScalar::U64(a), ReferenceScalar::U64(b)) => (a, b, 64),
+        _ => panic!("non-word terminal"),
+    };
+    let word = |v| match get(v) {
+        ReferenceScalar::U32(x) => u64::from(x),
+        ReferenceScalar::U64(x) => x,
+        _ => panic!("non-word terminal"),
     };
     let boolean = |v| {
         let ReferenceScalar::Bool(x) = get(v) else {
@@ -304,19 +341,25 @@ fn terminal(node: &ReferenceNode, get: impl Fn(V) -> ReferenceScalar) -> Referen
         ReferenceNode::Input { .. } => unreachable!("input resolved by recipe invocation"),
         ReferenceNode::Constant(x) => x,
         ReferenceNode::Word { op, a, b } => {
-            let (a, b) = (word(a), word(b));
-            ReferenceScalar::U32(match op {
+            let (a, b, width) = words(a, b);
+            let mask = u64::MAX >> (64 - width);
+            let shift = |shifted: fn(u64, u32) -> Option<u64>| {
+                assert!(b < width, "constructed word shift");
+                shifted(a, b as u32).unwrap()
+            };
+            let value = match op {
                 WordOp::Add => a.wrapping_add(b),
                 WordOp::Sub => a.wrapping_sub(b),
                 WordOp::And => a & b,
                 WordOp::Or => a | b,
                 WordOp::Xor => a ^ b,
-                WordOp::Shl => a.checked_shl(b).expect("constructed word shift"),
-                WordOp::Shr => a.checked_shr(b).expect("constructed word shift"),
-            })
+                WordOp::Shl => shift(u64::checked_shl),
+                WordOp::Shr => shift(u64::checked_shr),
+            } & mask;
+            ReferenceScalar::from_bits(if width == 64 { DType::U64 } else { DType::U32 }, value)
         }
         ReferenceNode::Compare { op, a, b } => {
-            let (a, b) = (word(a), word(b));
+            let (a, b, _) = words(a, b);
             ReferenceScalar::Bool(match op {
                 CmpOp::Eq => a == b,
                 CmpOp::Ne => a != b,
@@ -335,8 +378,12 @@ fn terminal(node: &ReferenceNode, get: impl Fn(V) -> ReferenceScalar) -> Referen
                 get(no)
             }
         }
-        ReferenceNode::Bits { value } => ReferenceScalar::U32(get(value).bits()),
+        ReferenceNode::Bits { value } => {
+            let value = get(value);
+            ReferenceScalar::from_bits(word_type(value.dtype()), value.bits())
+        }
         ReferenceNode::FromBits { value, dtype } => ReferenceScalar::from_bits(dtype, word(value)),
+        ReferenceNode::Resize { value, dtype } => ReferenceScalar::from_bits(dtype, word(value)),
     }
 }
 pub fn evaluate(
@@ -372,6 +419,7 @@ pub fn evaluate(
 }
 const F32_TY: DType = DType::F32;
 const U32_TY: DType = DType::U32;
+const U64_TY: DType = DType::U64;
 const I32_TY: DType = DType::I32;
 #[derive(Default)]
 struct RecipeBuilder {
@@ -435,6 +483,9 @@ impl Recipe {
     fn u(&self, x: u32) -> V {
         self.constant(ReferenceScalar::U32(x))
     }
+    fn u64(&self, x: u64) -> V {
+        self.constant(ReferenceScalar::U64(x))
+    }
     fn i(&self, x: i32) -> V {
         self.constant(ReferenceScalar::I32(x))
     }
@@ -442,29 +493,49 @@ impl Recipe {
         self.constant(ReferenceScalar::Bool(x))
     }
     fn word(&self, op: WordOp, a: V, b: V) -> V {
-        assert_eq!(a.ty, U32_TY);
-        assert_eq!(b.ty, U32_TY);
-        self.push(U32_TY, ReferenceNode::Word { op, a, b })
+        assert!(a.ty == U32_TY || a.ty == U64_TY);
+        assert_eq!(b.ty, a.ty);
+        self.push(a.ty, ReferenceNode::Word { op, a, b })
     }
     fn word_cmp(&self, op: CmpOp, a: V, b: V) -> V {
-        assert_eq!(a.ty, U32_TY);
-        assert_eq!(b.ty, U32_TY);
+        assert!(a.ty == U32_TY || a.ty == U64_TY);
+        assert_eq!(b.ty, a.ty);
         self.push(DType::Bool, ReferenceNode::Compare { op, a, b })
     }
     fn bits(&self, v: V) -> V {
-        if v.ty == U32_TY {
+        if v.ty == U32_TY || v.ty == U64_TY {
             v
         } else {
             self.push(U32_TY, ReferenceNode::Bits { value: v })
         }
     }
     fn typed(&self, v: V, dtype: DType) -> V {
-        assert_eq!(v.ty, U32_TY);
-        if dtype == DType::U32 {
+        assert_eq!(v.ty, word_type(dtype));
+        if dtype == v.ty {
             v
         } else {
             self.push(dtype, ReferenceNode::FromBits { value: v, dtype })
         }
+    }
+    fn resize(&self, v: V, dtype: DType) -> V {
+        assert!(v.ty == U32_TY || v.ty == U64_TY);
+        assert!(dtype == U32_TY || dtype == U64_TY);
+        if v.ty == dtype {
+            v
+        } else {
+            self.push(dtype, ReferenceNode::Resize { value: v, dtype })
+        }
+    }
+    /// The 32-bit limbs of a U64 word, low first.
+    fn limbs(&self, v: V) -> [V; 2] {
+        assert_eq!(v.ty, U64_TY);
+        let high = self.word(WordOp::Shr, v, self.u64(32));
+        [self.resize(v, U32_TY), self.resize(high, U32_TY)]
+    }
+    /// The U64 word of two 32-bit limbs, low first.
+    fn joined(&self, limbs: [V; 2]) -> V {
+        let high = self.word(WordOp::Shl, self.resize(limbs[1], U64_TY), self.u64(32));
+        self.word(WordOp::Or, self.resize(limbs[0], U64_TY), high)
     }
     fn and(&self, a: V, b: V) -> V {
         self.push(DType::Bool, ReferenceNode::And { a, b })
@@ -537,6 +608,7 @@ enum RecipeKey {
     Scalar(ScalarOp, Vec<DType>),
     Code(crate::registry::CodeInterpretation, u32),
     FloatCode(crate::registry::FloatCodeFormat),
+    GridCode(&'static crate::registry::GridCodes),
 }
 fn cached_recipe(key: RecipeKey, build: impl FnOnce() -> ReferenceRecipe) -> Arc<ReferenceRecipe> {
     static RECIPES: OnceLock<Mutex<HashMap<RecipeKey, Arc<ReferenceRecipe>>>> = OnceLock::new();
@@ -597,8 +669,99 @@ pub fn code_recipe(
                 }
                 value
             }
+            CodeInterpretation::Grid(_) => unreachable!(
+                "a vector code depends on its value's lane: `DecodeStep::InterpretGridCode`"
+            ),
         };
         let out = b.typed(word, DType::I32);
+        b.finish(out)
+    })
+}
+
+/// The code of a vector-coded value (`GridCodes::code`) from its entry
+/// (operand 0) and its lane (operand 1, below `GRID_VALUES`), in ordinary
+/// word operations: the grid is finite registry data, expanded into
+/// comparisons and selections before kernel closure like a code table.
+pub fn grid_code_recipe(grid: &'static crate::registry::GridCodes) -> Arc<ReferenceRecipe> {
+    use crate::registry::GRID_SIGN_BITS;
+    cached_recipe(RecipeKey::GridCode(grid), || {
+        let b = Recipe::default();
+        let entry = b.input(0, DType::U32);
+        let lane = b.input(1, DType::U32);
+        let lane_shift = grid.lanes.trailing_zeros();
+        assert_eq!(1 << lane_shift, grid.lanes, "grid lanes are a power of two");
+        // The index this lane reads: index `lane / lanes` of the entry.
+        let mut shift = b.u(0);
+        for which in 1..grid.indices() {
+            shift = b.select(
+                b.word_cmp(
+                    CmpOp::Eq,
+                    b.word(WordOp::Shr, lane, b.u(lane_shift)),
+                    b.u(which),
+                ),
+                b.u(which * grid.index_bits),
+                shift,
+            );
+        }
+        let index = b.word(
+            WordOp::And,
+            b.word(WordOp::Shr, entry, shift),
+            b.u((1 << grid.index_bits) - 1),
+        );
+        // The point's magnitudes as two words of four lanes each.
+        let half = |high: bool| {
+            let word = |point: u64| (if high { point >> 32 } else { point }) as u32;
+            let mut value = b.u(word(grid.points[0]));
+            for (i, &point) in grid.points.iter().enumerate().skip(1) {
+                value = b.select(
+                    b.word_cmp(CmpOp::Eq, index, b.u(i as u32)),
+                    b.u(word(point)),
+                    value,
+                );
+            }
+            value
+        };
+        let sub = b.word(WordOp::And, lane, b.u(grid.lanes - 1));
+        let point = if grid.lanes > 4 {
+            b.select(b.word_cmp(CmpOp::Lt, sub, b.u(4)), half(false), half(true))
+        } else {
+            half(false)
+        };
+        let magnitude = b.word(
+            WordOp::And,
+            b.word(
+                WordOp::Shr,
+                point,
+                b.word(WordOp::Shl, b.word(WordOp::And, sub, b.u(3)), b.u(3)),
+            ),
+            b.u(0xff),
+        );
+        // Seven sign bits and their even-parity eighth.
+        let signs = b.word(
+            WordOp::And,
+            b.word(WordOp::Shr, entry, b.u(grid.indices() * grid.index_bits)),
+            b.u((1 << GRID_SIGN_BITS) - 1),
+        );
+        let mut parity = signs;
+        for fold in [4, 2, 1] {
+            parity = b.word(WordOp::Xor, parity, b.word(WordOp::Shr, parity, b.u(fold)));
+        }
+        let signs = b.word(
+            WordOp::Or,
+            signs,
+            b.word(
+                WordOp::Shl,
+                b.word(WordOp::And, parity, b.u(1)),
+                b.u(GRID_SIGN_BITS),
+            ),
+        );
+        let negative = b.word(WordOp::And, b.word(WordOp::Shr, signs, lane), b.u(1));
+        let code = b.select(
+            b.word_cmp(CmpOp::Eq, negative, b.u(1)),
+            b.word(WordOp::Sub, b.u(0), magnitude),
+            magnitude,
+        );
+        let out = b.typed(code, DType::I32);
         b.finish(out)
     })
 }
@@ -628,6 +791,7 @@ fn transcendental(b: &Recipe, op: MathOp, input: V) -> V {
     let x = b.cast(input, F32_TY);
     let result = match op {
         MathOp::Exp => exp(b, x),
+        MathOp::Exp2 => exp2(b, x),
         MathOp::Log => log(b, x),
         MathOp::Sin => primitive::sine_or_cosine(b, x, false),
         MathOp::Cos => primitive::sine_or_cosine(b, x, true),
@@ -664,6 +828,47 @@ pub fn digest() -> [u8; 32] {
         hash.update(include_bytes!("reference_math.rs"));
         hash.finalize().into()
     })
+}
+
+// Base-two exponential has its own range reduction. Its source recipe does
+// not first round the entire x*ln(2), which would lose the exact integer scale.
+// The bounded fraction uses the existing F32 exponential recipe; power-of-two
+// scaling and exceptional values are constructed from owned payload operations.
+fn exp2(b: &Recipe, x: V) -> V {
+    let bits = b.fbits(x);
+    let magnitude = b.bit(BitOp::And, bits, b.u(0x7fffffff));
+    let nan = b.cmp(CmpOp::Gt, magnitude, b.u(0x7f800000));
+    let overflow = b.cmp(CmpOp::Ge, x, b.f(128f32.to_bits()));
+    let underflow = b.cmp(CmpOp::Le, x, b.f((-150f32).to_bits()));
+    let safe = b.select(b.or(nan, b.or(overflow, underflow)), b.f(0), x);
+    let rounded = primitive::operation(b, ScalarOp::Math(MathOp::Rint), &[safe]);
+    let k = b.cast(rounded, I32_TY);
+    let fraction = b.bin(BinaryOp::Sub, safe, rounded);
+    let hi = b.bin(BinaryOp::Mul, fraction, b.f(0x3f317200));
+    let lo = b.bin(BinaryOp::Mul, fraction, b.f(0x35bfbe8e));
+    let y = exp(b, b.bin(BinaryOp::Add, hi, lo));
+    let deep = b.cmp(CmpOp::Lt, k, b.i(-126));
+    let top = b.cmp(CmpOp::Eq, k, b.i(128));
+    let scale_k = b.select(top, b.i(127), k);
+    let field = b.bin(
+        BinaryOp::Add,
+        scale_k,
+        b.select(deep, b.i(127 + 24), b.i(127)),
+    );
+    let scale = b.from_bits(b.bit(BitOp::Shl, b.cast(field, U32_TY), b.u(23)));
+    let result = b.bin(BinaryOp::Mul, y, scale);
+    let result = b.select(deep, b.bin(BinaryOp::Mul, result, b.f(0x33800000)), result);
+    let result = b.select(
+        top,
+        b.bin(BinaryOp::Mul, result, b.f(2f32.to_bits())),
+        result,
+    );
+    let result = b.select(
+        overflow,
+        b.f(0x7f800000),
+        b.select(underflow, b.f(0), result),
+    );
+    b.select(nan, b.f(0x7fc00000), result)
 }
 
 // Sun/FreeBSD e_expf.c, expressed with explicit f32 operations and bit-built
@@ -880,6 +1085,87 @@ mod tests {
         }
     }
     #[test]
+    fn base_two_exponential_keeps_integer_scale_and_exceptional_values() {
+        let compute = |bits| {
+            apply(ScalarOp::Math(MathOp::Exp2), &[ReferenceScalar::F32(bits)])
+                .unwrap()
+                .bits() as u32
+        };
+        for exponent in -149i32..=127 {
+            let expected = if exponent < -126 {
+                1u32 << (exponent + 149)
+            } else {
+                ((exponent + 127) as u32) << 23
+            };
+            assert_eq!(compute((exponent as f32).to_bits()), expected);
+        }
+        for (input, output) in [
+            (-150f32, 0u32),
+            (128f32, 0x7f800000),
+            (f32::INFINITY, 0x7f800000),
+            (f32::NEG_INFINITY, 0),
+        ] {
+            assert_eq!(compute(input.to_bits()), output);
+        }
+        assert_eq!(compute(0x7f800001), 0x7fc00000);
+        // Both signs of zero map to exactly one.
+        assert_eq!(compute(0), 1f32.to_bits());
+        assert_eq!(compute(0x80000000), 1f32.to_bits());
+    }
+
+    #[test]
+    fn integral_rounding_and_payload_reinterpretation_are_distinct() {
+        let round = |x: f32| {
+            apply(
+                ScalarOp::Math(MathOp::Rint),
+                &[ReferenceScalar::F32(x.to_bits())],
+            )
+            .unwrap()
+            .bits() as u32
+        };
+        for (x, y) in [
+            (0.5, 0.0),
+            (1.5, 2.0),
+            (2.5, 2.0),
+            (3.5, 4.0),
+            (-0.5, -0.0),
+            (-1.5, -2.0),
+            (-2.5, -2.0),
+        ] {
+            assert_eq!(round(x), (y as f32).to_bits());
+        }
+        assert_eq!(round(f32::from_bits(1)), 0);
+        assert_eq!(round(f32::from_bits(0x80000001)), 0x80000000);
+        assert_eq!(round(f32::INFINITY), f32::INFINITY.to_bits());
+        assert_eq!(round(f32::NEG_INFINITY), f32::NEG_INFINITY.to_bits());
+        assert_eq!(round(f32::from_bits(0x7f800001)), 0x7fc00000);
+        // Reinterpretation transports payloads, including signaling NaNs; a
+        // numeric cast or arithmetic operation would destroy this distinction.
+        for bits in [0, 0x80000000, 1, 0x7f800001, 0x7fc01234, 0xffffffff] {
+            let value =
+                apply(ScalarOp::Bitcast(DType::F32), &[ReferenceScalar::U32(bits)]).unwrap();
+            assert_eq!(value.bits() as u32, bits);
+            assert_eq!(
+                apply(ScalarOp::Bitcast(DType::U32), &[value]).unwrap(),
+                ReferenceScalar::U32(bits)
+            );
+        }
+        for dtype in [DType::F16, DType::BF16] {
+            for (x, expected) in [(0.5f32, 0.0f32), (1.5, 2.0), (-0.5, -0.0)] {
+                let input =
+                    apply(ScalarOp::Cast(dtype), &[ReferenceScalar::F32(x.to_bits())]).unwrap();
+                let result = apply(ScalarOp::Math(MathOp::Rint), &[input]).unwrap();
+                let expected = apply(
+                    ScalarOp::Cast(dtype),
+                    &[ReferenceScalar::F32(expected.to_bits())],
+                )
+                .unwrap();
+                assert_eq!(result, expected);
+            }
+        }
+    }
+
+    #[test]
     fn literal_quantization_rounds_once_from_parsed_f64() {
         assert_eq!(
             float_literal(DType::F16, 1.0004882812500002),
@@ -952,6 +1238,102 @@ mod tests {
         );
     }
     #[test]
+    fn u64_recipes_are_modular_words() {
+        use ReferenceScalar::{U64, Bool, F32, I32, U32};
+        let random = std::cell::RefCell::new(xorshift(0x5eed_6400));
+        let random = || random.borrow_mut()();
+        let word = || {
+            // Mix full words with small and boundary values.
+            let x = u64::from(random()) << 32 | u64::from(random());
+            match random() % 8 {
+                0 => 0,
+                1 => u64::MAX,
+                2 => x >> (random() % 64),
+                3 => u64::from(random()),
+                _ => x,
+            }
+        };
+        let binary = |op, a, c| apply(ScalarOp::Binary(op), &[U64(a), U64(c)]);
+        for _ in 0..600 {
+            let (a, c) = (word(), word());
+            assert_eq!(binary(B::Add, a, c), Ok(U64(a.wrapping_add(c))));
+            assert_eq!(binary(B::Sub, a, c), Ok(U64(a.wrapping_sub(c))));
+            assert_eq!(binary(B::Mul, a, c), Ok(U64(a.wrapping_mul(c))));
+            assert_eq!(binary(B::BitAnd, a, c), Ok(U64(a & c)));
+            assert_eq!(binary(B::BitOr, a, c), Ok(U64(a | c)));
+            assert_eq!(binary(B::BitXor, a, c), Ok(U64(a ^ c)));
+            assert_eq!(binary(B::Lt, a, c), Ok(Bool(a < c)));
+            assert_eq!(binary(B::Eq, a, a), Ok(Bool(true)));
+            if c == 0 {
+                assert_eq!(
+                    binary(B::Div, a, c),
+                    Err(ScalarFailure::IntegerDivisionByZero)
+                );
+            } else {
+                assert_eq!(binary(B::Div, a, c), Ok(U64(a / c)));
+                assert_eq!(binary(B::Rem, a, c), Ok(U64(a % c)));
+            }
+            let count = c % 80;
+            let shifted = |shift: fn(u64, u32) -> Option<u64>| {
+                shift(a, count as u32).ok_or(ScalarFailure::ShiftCount).map(U64)
+            };
+            assert_eq!(binary(B::Shl, a, count), shifted(u64::checked_shl));
+            assert_eq!(binary(B::Shr, a, count), shifted(u64::checked_shr));
+            assert_eq!(
+                apply(ScalarOp::Binary(B::Shr), &[U64(a), U32(count as u32)]),
+                shifted(u64::checked_shr)
+            );
+            assert_eq!(
+                apply(ScalarOp::Math(MathOp::Max), &[U64(a), U64(c)]),
+                Ok(U64(a.max(c)))
+            );
+            assert_eq!(
+                apply(ScalarOp::Unary(ast::UnaryOp::BitNot), &[U64(a)]),
+                Ok(U64(!a))
+            );
+            assert_eq!(
+                apply(ScalarOp::Unary(ast::UnaryOp::Neg), &[U64(a)]),
+                Ok(U64(a.wrapping_neg()))
+            );
+            // Modular integer conversion in both directions.
+            let low = a as u32;
+            assert_eq!(apply(ScalarOp::Cast(DType::U32), &[U64(a)]), Ok(U32(low)));
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::I32), &[U64(a)]),
+                Ok(I32(low as i32))
+            );
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::U64), &[I32(low as i32)]),
+                Ok(U64(low as i32 as u64))
+            );
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::U64), &[U32(low)]),
+                Ok(U64(u64::from(low)))
+            );
+            assert_eq!(apply(ScalarOp::Cast(DType::Bool), &[U64(a)]), Ok(Bool(a != 0)));
+            // Floating conversion rounds once and saturates.
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::F32), &[U64(a)]),
+                Ok(F32((a as f32).to_bits()))
+            );
+            let x = f32::from_bits(random());
+            let expected = if x.is_nan() { 0 } else { x as u64 };
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::U64), &[F32(x.to_bits())]),
+                Ok(U64(expected)),
+                "u64({x:e})"
+            );
+        }
+        for x in [0.0f32, 1.0, 1.5, 4294967296.0, 1.8446743e19, f32::INFINITY, -3.0] {
+            assert_eq!(
+                apply(ScalarOp::Cast(DType::U64), &[F32(x.to_bits())]),
+                Ok(U64(x as u64))
+            );
+        }
+        assert_eq!(apply(ScalarOp::Cast(DType::U64), &[Bool(true)]), Ok(U64(1)));
+        assert_eq!(integer_literal(DType::U64, i128::from(u64::MAX)), U64(u64::MAX));
+    }
+    #[test]
     fn source_integer_failures_are_outputs_of_total_recipes() {
         use ReferenceScalar::{I32, U32};
         for (a, c, failure) in [
@@ -999,13 +1381,13 @@ mod tests {
             let neg = scalar_recipe(ScalarOp::Unary(ast::UnaryOp::Neg), &[dtype]);
             let identity = scalar_recipe(ScalarOp::Cast(dtype), &[dtype]);
             for bits in 0..=u16::MAX {
-                let value = ReferenceScalar::from_bits(dtype, u32::from(bits));
+                let value = ReferenceScalar::from_bits(dtype, u64::from(bits));
                 assert_eq!(
-                    evaluate(&abs, &[value]).unwrap().bits(),
+                    evaluate(&abs, &[value]).unwrap().bits() as u32,
                     u32::from(bits & 0x7fff)
                 );
                 assert_eq!(
-                    evaluate(&neg, &[value]).unwrap().bits(),
+                    evaluate(&neg, &[value]).unwrap().bits() as u32,
                     u32::from(bits ^ 0x8000)
                 );
                 assert_eq!(evaluate(&identity, &[value]).unwrap(), value);
@@ -1056,7 +1438,7 @@ mod tests {
                 let result =
                     evaluate(recipe, &[ReferenceScalar::F32(a), ReferenceScalar::F32(c)]).unwrap();
                 assert_eq!(
-                    result.bits(),
+                    result.bits() as u32,
                     canonical(expected.to_bits()),
                     "{op:?}({a:08x},{c:08x})"
                 );
@@ -1071,7 +1453,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                result.bits(),
+                result.bits() as u32,
                 canonical(x.mul_add(y, w).to_bits()),
                 "fma({a:08x},{c:08x},{z:08x})"
             );
@@ -1168,9 +1550,9 @@ mod tests {
     fn unary(op: MathOp, dtype: DType) -> impl Fn(u32) -> u32 {
         let recipe = scalar_recipe(ScalarOp::Math(op), &[dtype]);
         move |bits| {
-            evaluate(&recipe, &[ReferenceScalar::from_bits(dtype, bits)])
+            evaluate(&recipe, &[ReferenceScalar::from_bits(dtype, bits.into())])
                 .unwrap()
-                .bits()
+                .bits() as u32
         }
     }
     /// Distance in representable F32 values; +0 and -0 are one value.
@@ -1203,7 +1585,7 @@ mod tests {
                 let expected = if x.is_nan() || x < 0.0 {
                     nan
                 } else {
-                    float_literal(dtype, x.sqrt()).bits()
+                    float_literal(dtype, x.sqrt()).bits() as u32
                 };
                 assert_eq!(sqrt(bits), expected, "sqrt({dtype:?} {bits:04x})");
             }
@@ -1243,7 +1625,7 @@ mod tests {
     #[test]
     fn rsqrt_is_one_over_sqrt_in_the_operand_dtype() {
         for (dtype, one) in [
-            (DType::F32, 0x3f80_0000),
+            (DType::F32, 0x3f80_0000u32),
             (DType::F16, 0x3c00),
             (DType::BF16, 0x3f80),
         ] {
@@ -1261,12 +1643,12 @@ mod tests {
                 let expected = evaluate(
                     &divide,
                     &[
-                        ReferenceScalar::from_bits(dtype, one),
-                        ReferenceScalar::from_bits(dtype, sqrt(bits)),
+                        ReferenceScalar::from_bits(dtype, one.into()),
+                        ReferenceScalar::from_bits(dtype, sqrt(bits).into()),
                     ],
                 )
                 .unwrap()
-                .bits();
+                .bits() as u32;
                 assert_eq!(rsqrt(bits), expected, "rsqrt({dtype:?} {bits:08x})");
             }
         }
@@ -1349,7 +1731,7 @@ mod tests {
             for bits in (0..=u32::from(u16::MAX)).step_by(13) {
                 let x = conversion::exact_f64(DType::F16, bits);
                 let result = f(bits);
-                let expected = float_literal(DType::F16, reference(x)).bits();
+                let expected = float_literal(DType::F16, reference(x)).bits() as u32;
                 if expected & 0x7c00 == 0x7c00 && expected & 0x3ff != 0 {
                     assert_eq!(result, 0x7e00, "{op:?}(f16 {bits:04x})");
                 } else {
@@ -1382,7 +1764,7 @@ mod tests {
                 for payload in payloads {
                     let args = vec![ReferenceScalar::from_bits(dtype, payload); op.arity()];
                     assert_eq!(
-                        evaluate(&recipe, &args).unwrap().bits(),
+                        evaluate(&recipe, &args).unwrap().bits() as u32,
                         nan,
                         "{op:?}({dtype:?} {payload:08x})"
                     );
@@ -1394,7 +1776,7 @@ mod tests {
     #[test]
     fn quantity_to_float_rounds_the_exact_integer_once() {
         use num_bigint::BigInt;
-        let convert = |dtype: DType, value: BigInt| integer_to_float(dtype, &value).bits();
+        let convert = |dtype: DType, value: BigInt| integer_to_float(dtype, &value).bits() as u32;
         assert_eq!(convert(DType::F32, BigInt::from(16_777_217)), 0x4b80_0000);
         assert_eq!(convert(DType::F16, BigInt::from(65_520)), 0x7c00);
         assert_eq!(convert(DType::F16, BigInt::from(65_519)), 0x7bff);
@@ -1418,7 +1800,7 @@ mod tests {
             for dtype in [DType::F16, DType::BF16] {
                 assert_eq!(
                     convert(dtype, BigInt::from(narrow)),
-                    float_literal(dtype, narrow as f64).bits(),
+                    float_literal(dtype, narrow as f64).bits() as u32,
                     "{dtype:?}({narrow})"
                 );
             }
@@ -1515,13 +1897,13 @@ mod tests {
             assert_eq!(
                 apply(ScalarOp::Binary(B::Div), &[least, largest])
                     .unwrap()
-                    .bits(),
+                    .bits() as u32,
                 0
             );
             assert_eq!(
                 apply(ScalarOp::Binary(B::Div), &[largest, least])
                     .unwrap()
-                    .bits(),
+                    .bits() as u32,
                 infinity
             );
         }

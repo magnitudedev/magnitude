@@ -9,10 +9,12 @@ use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
 use magnitude_family_muse_glimmer::MuseGlimmerFamily;
 use magnitude_family_nemotron_h::NemotronHFamily;
+use magnitude_family_qwen4exp::Qwen4ExpFamily;
 use magnitude_family_qwen35::Qwen35Family;
 
 static FAMILIES: &[&dyn ModelFamily] = &[
     &Qwen35Family,
+    &Qwen4ExpFamily,
     &LlamaFamily,
     &NemotronHFamily,
     &Lfm2Family,

@@ -1,15 +1,19 @@
+import { mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs"
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { Effect, Schedule } from "effect"
-import { describe, expect, it } from "vitest"
+import { afterAll, describe, expect, it } from "vitest"
 import { makeXdgLoginStartup, renderXdgLoginStartup } from "./login-startup"
 
 const setup = Effect.acquireRelease(Effect.promise(() => mkdtemp(join(tmpdir(), "magnitude-login-"))), root => Effect.promise(() => rm(root, { recursive: true, force: true })))
 const run = <A, E>(effect: Effect.Effect<A, E, import("effect").Scope.Scope>) => Effect.runPromise(Effect.scoped(effect))
-const executable = "/opt/Magnitude/magnitude"
+const installation = mkdtempSync(join(tmpdir(), "magnitude-login-app-"))
+const executable = join(installation, "magnitude")
+writeFileSync(executable, "#!/bin/sh\n", { mode: 0o755 })
+afterAll(() => rmSync(installation, { recursive: true, force: true }))
 describe("graphical-session login startup", () => {
   it("is observational until changed and always launches the desktop in background", () => run(Effect.gen(function* () {
     const root = yield* setup
@@ -19,7 +23,8 @@ describe("graphical-session login startup", () => {
     expect(yield* Effect.promise(() => readFile(join(configHome, "autostart/dev.magnitude.desktop"), "utf8").catch(() => null))).toBeNull()
     expect((yield* startup.set(true))._tag).toBe("Enabled")
     const entry = yield* Effect.promise(() => readFile(join(configHome, "autostart/dev.magnitude.desktop"), "utf8"))
-    expect(entry).toContain('Exec=/usr/bin/env "/opt/Magnitude/magnitude" --background')
+    expect(entry).toContain(`Exec=/usr/bin/env "${executable}" --background`)
+    expect(entry).toContain(`TryExec=${executable}`)
     expect(entry).not.toContain("magnitude-service")
     expect((yield* startup.set(false))._tag).toBe("Disabled")
   })))
@@ -50,6 +55,17 @@ describe("graphical-session login startup", () => {
     yield* Effect.promise(() => writeFile(path, renderXdgLoginStartup(executable, true) + condition + "\n"))
     expect((yield* startup.read)._tag).toBe(expected)
     expect(yield* Effect.promise(() => readFile(path, "utf8"))).toContain(condition)
+  })))
+  it("is skipped by the session and observed as disabled once the application is uninstalled", () => run(Effect.gen(function* () {
+    const root = yield* setup
+    const application = join(root, "My App\\bin")
+    writeFileSync(application, "#!/bin/sh\n", { mode: 0o755 })
+    const startup = yield* makeXdgLoginStartup({ executable: application, configHome: root, configDirectories: [] })
+    expect((yield* startup.set(true))._tag).toBe("Enabled")
+    expect(yield* Effect.promise(() => readFile(join(root, "autostart/dev.magnitude.desktop"), "utf8")))
+      .toContain(`TryExec=${application.replaceAll("\\", "\\\\")}`)
+    unlinkSync(application)
+    expect((yield* startup.read)._tag).toBe("Disabled")
   })))
   it("escapes both desktop-entry and argv quoting and rejects malformed paths", () => {
     expect(renderXdgLoginStartup('/opt/My $App/100%/a\\b"c', true)).toContain('Exec=/usr/bin/env "/opt/My \\\\$App/100%%/a\\\\\\\\b\\\\"c" --background')

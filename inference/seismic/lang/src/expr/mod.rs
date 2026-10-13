@@ -10,7 +10,9 @@
 //! for the arena that produced it. Mixing arenas is a panic (§13.3.2).
 //!
 //! Semantics: `NatExpr` and `IntExpr` denote mathematical integers. Runtime
-//! representability is a domain restriction (§5.2), never wrapping.
+//! representability is a domain restriction (§5.2), never wrapping. Typed source
+//! word recipes execute their declared modular semantics before injecting their
+//! result into mathematical Int.
 //!
 //! Ownership: W3 owns the internals of this module; the public surface below
 //! is frozen by W0.
@@ -171,7 +173,7 @@ pub enum SymbolKind {
     ScheduleSlot(u32),
     /// A checker-internal fresh variable. Never in an entry arena;
     /// `is_invocation() == false`.
-    ProofVariable(u32),
+    CheckerVariable(u32),
 }
 
 /// One scalar component of a call-schema parameter: the value of a scalar or
@@ -323,6 +325,11 @@ impl ExprArena {
         }
     }
 
+    /// Immutable identity for arena-scoped checker metadata.
+    pub(crate) fn identity(&self) -> ArenaId {
+        self.inner.identity()
+    }
+
     // ----- symbols ---------------------------------------------------------
 
     pub fn call_dimension(&mut self, dimension: DimensionId) -> (SymbolId, NatExpr) {
@@ -345,8 +352,8 @@ impl ExprArena {
     }
 
     /// A fresh checker-internal proof variable.
-    pub(crate) fn proof_variable(&mut self, sort: SymbolSort) -> SymbolId {
-        self.inner.proof_variable(sort)
+    pub(crate) fn checker_variable(&mut self, sort: SymbolSort) -> SymbolId {
+        self.inner.checker_variable(sort)
     }
 
     /// The `Nat` symbol for the element stride of `axis` of root tensor
@@ -488,6 +495,12 @@ impl ExprArena {
     pub fn nat_from_int(&mut self, i: IntExpr) -> NatExpr {
         self.inner.nat_from_int(i)
     }
+    /// `i` as the natural expression it identically is, when its polynomial
+    /// normal form has nonnegative coefficients over natural atoms
+    /// (`poly::natural_integer`). Its conversion then needs no side condition.
+    pub fn natural_integer(&mut self, i: IntExpr) -> Option<NatExpr> {
+        poly::natural_integer(self, i)
+    }
 
     // ----- Int -------------------------------------------------------------
 
@@ -508,15 +521,54 @@ impl ExprArena {
     pub(crate) fn int_from_scalar_value(&mut self, value: ErasedScalarExpr) -> IntExpr {
         self.inner.int_from_scalar(value)
     }
-    /// The exact integer value of a typed I32/U32 source operation. Operands
-    /// enter their declared word representation before the shared scalar recipe
-    /// runs. Partial operations remain partial; this is not a success assertion.
+    /// Interpret a mathematical integer in the actual I32/U32/U64
+    /// representation. This is a conversion boundary, not an
+    /// already-converted word operand.
+    pub fn int_to_word(&mut self, quantity: IntExpr, dtype: DType) -> IntExpr {
+        assert!(
+            dtype.is_int(),
+            "mathematical word conversion requires an integer word"
+        );
+        let bits = dtype.bytes() as usize * 8;
+        let modulus = self.int_exact(BigInt::from(1u32) << bits);
+        let unsigned = self.int_rem(quantity, modulus);
+        if dtype != DType::I32 {
+            return unsigned;
+        }
+        let half = self.int(1_i64 << 31);
+        let signed = self.int_sub(unsigned, modulus);
+        let high = self.int_cmp(CmpOp::Ge, unsigned, half);
+        self.int_select(high, signed, unsigned)
+    }
+
+    /// Exact word-result recipe with actual typed scalar or integer-word inputs.
+    /// Partial operands and partial recipes retain their failure semantics.
     pub fn scalar_integer(
         &mut self,
         operation: crate::reference_math::ScalarOp,
-        operands: &[(DType, IntExpr)],
+        operands: &[ScalarOperand],
     ) -> IntExpr {
         self.inner.scalar_integer(operation, operands)
+    }
+    pub fn scalar_symbol_erased(&mut self, symbol: SymbolId) -> ErasedScalarExpr {
+        self.inner.scalar_symbol_erased(symbol)
+    }
+    pub fn scalar_const_erased(
+        &mut self,
+        value: crate::reference_math::ReferenceScalar,
+    ) -> ErasedScalarExpr {
+        self.inner.scalar_const_erased(value)
+    }
+    /// Same-sort substitution through the existing expression DAG.
+    pub fn substitute_any(&mut self, node: AnyExpr, values: &[(SymbolId, AnyExpr)]) -> AnyExpr {
+        self.inner.substitute_any(node, values)
+    }
+    pub(crate) fn runtime_scalar_value(
+        &mut self,
+        value: crate::ids::SemanticValueId,
+        dtype: DType,
+    ) -> (SymbolId, ErasedScalarExpr) {
+        self.inner.runtime_scalar_value(value, dtype)
     }
     pub(crate) fn scalar_integer_defined(&mut self, value: IntExpr) -> BoolExpr {
         self.inner.scalar_integer_defined(value)
@@ -740,6 +792,16 @@ impl ExprArena {
         self.inner.substitute_nat(node, values)
     }
 
+    /// Replaces runtime value symbols by same-sorted expressions: integer
+    /// values by exact integers, word values by reached words.
+    pub fn resolve_runtime_symbols(
+        &mut self,
+        node: IntExpr,
+        values: &[(crate::ids::SemanticValueId, AnyExpr)],
+    ) -> IntExpr {
+        self.inner.resolve_runtime_symbols(node, values)
+    }
+
     /// The `NatExpr` counterpart of [`ExprArena::resolve_runtime_values`].
     pub fn resolve_runtime_nat(
         &mut self,
@@ -867,7 +929,7 @@ pub trait ScalarSort: 'static + Copy + fmt::Debug + private::Sealed {
     type Value: Copy + fmt::Debug + PartialEq;
     const DTYPE: DType;
     #[doc(hidden)]
-    fn encode(value: Self::Value) -> u32;
+    fn encode(value: Self::Value) -> u64;
 }
 
 mod private {
@@ -882,19 +944,20 @@ macro_rules! scalar_sort {
         impl ScalarSort for $name {
             type Value = $value;
             const DTYPE: DType = $dtype;
-            fn encode(value: Self::Value) -> u32 {
+            fn encode(value: Self::Value) -> u64 {
                 ($encode)(value)
             }
         }
     };
 }
 
-scalar_sort!(F32, f32, DType::F32, f32::to_bits);
-scalar_sort!(F16, u16, DType::F16, u32::from);
-scalar_sort!(BF16, u16, DType::BF16, u32::from);
-scalar_sort!(BoolScalar, bool, DType::Bool, u32::from);
-scalar_sort!(I32, i32, DType::I32, |value: i32| value as u32);
-scalar_sort!(U32, u32, DType::U32, |value: u32| value);
+scalar_sort!(F32, f32, DType::F32, |value: f32| u64::from(value.to_bits()));
+scalar_sort!(F16, u16, DType::F16, u64::from);
+scalar_sort!(BF16, u16, DType::BF16, u64::from);
+scalar_sort!(BoolScalar, bool, DType::Bool, u64::from);
+scalar_sort!(I32, i32, DType::I32, |value: i32| u64::from(value as u32));
+scalar_sort!(U32, u32, DType::U32, u64::from);
+scalar_sort!(U64, u64, DType::U64, |value: u64| value);
 
 /// One additive contribution to a physical duration interval, in nanoseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1025,6 +1088,32 @@ pub enum AnyExpr {
     Bool(BoolExpr),
     Duration(DurationExpr),
     Scalar(ErasedScalarExpr),
+}
+
+/// An actual typed input to the shared word-result scalar recipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScalarOperand {
+    Word { dtype: DType, value: IntExpr },
+    Scalar(ErasedScalarExpr),
+}
+
+impl ScalarOperand {
+    pub fn expression(self) -> AnyExpr {
+        match self {
+            Self::Word { value, .. } => value.into(),
+            Self::Scalar(value) => AnyExpr::Scalar(value),
+        }
+    }
+    pub fn dtype(self, arena: &ExprArena) -> DType {
+        match self {
+            Self::Word { dtype, value } => {
+                arena.view(value.into());
+                assert!(dtype.is_int(), "word operand requires I32/U32");
+                dtype
+            }
+            Self::Scalar(value) => arena.inner.scalar_dtype(value),
+        }
+    }
 }
 
 /// Sort-erased scalar handle. Its fields remain private so `AnyExpr` does not
@@ -1268,11 +1357,11 @@ pub enum NodeView<'a> {
     BoolConst(bool),
     ScalarConst {
         dtype: DType,
-        bits: u32,
+        bits: u64,
     },
     ScalarInteger {
         operation: crate::reference_math::ScalarOp,
-        operands: &'a [(DType, IntExpr)],
+        operands: &'a [ScalarOperand],
     },
     Symbol(SymbolId),
     Unary {
@@ -1390,6 +1479,7 @@ pub enum SymbolValue {
     Bool(bool),
     I32(i32),
     U32(u32),
+    U64(u64),
 }
 
 impl SymbolValue {
@@ -1414,6 +1504,7 @@ impl SymbolValue {
             Self::F16(value) | Self::BF16(value) => u64::from(value),
             Self::I32(value) => u64::from(value as u32),
             Self::U32(value) => u64::from(value),
+            Self::U64(value) => value,
             Self::Bool(value) => u64::from(value),
         })
     }
@@ -1714,6 +1805,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mathematical_word_conversion_preserves_wrap_and_partial_inputs() {
+        let mut arena = ExprArena::new();
+        for (input, signed, unsigned) in [
+            (-1, -1, 4294967295),
+            (2147483648, -2147483648, 2147483648),
+            (4294967296, 0, 0),
+            (-4294967297, -1, 4294967295),
+        ] {
+            let quantity = arena.int(input);
+            let i = arena.int_to_word(quantity, DType::I32);
+            let u = arena.int_to_word(quantity, DType::U32);
+            assert_eq!(arena.eval_int_i64(i, &Assignment::new()).unwrap(), signed);
+            assert_eq!(arena.eval_int_i64(u, &Assignment::new()).unwrap(), unsigned);
+        }
+        for (input, wide) in [
+            (BigInt::from(-1), BigInt::from(u64::MAX)),
+            (BigInt::from(4294967296_u64), BigInt::from(4294967296_u64)),
+            (BigInt::from(1u32) << 64usize, BigInt::from(0)),
+            ((BigInt::from(1u32) << 64usize) + 5, BigInt::from(5)),
+        ] {
+            let quantity = arena.int_exact(input);
+            let word = arena.int_to_word(quantity, DType::U64);
+            assert_eq!(arena.eval_int(word, &Assignment::new()).unwrap(), wide);
+        }
+        let one = arena.int(1);
+        let zero = arena.int(0);
+        let partial = arena.int_div(one, zero);
+        let word = arena.int_to_word(partial, DType::I32);
+        assert!(!arena.is_total(word.into()));
+        assert!(arena.eval_int(word, &Assignment::new()).is_err());
+    }
+
+    #[test]
+    fn typed_scalar_operands_preserve_payloads_substitution_and_shared_recipe() {
+        use crate::reference_math::{ReferenceScalar, ScalarOp};
+        let mut arena = ExprArena::new();
+        let (_, symbol) = arena.target_constant(SymbolSort::Scalar(DType::F32));
+        let leaf = arena.scalar_symbol_erased(symbol);
+        let bits = arena.scalar_integer(
+            ScalarOp::Bitcast(DType::U32),
+            &[ScalarOperand::Scalar(leaf)],
+        );
+        assert_eq!(arena.free_symbols(bits.into()), &[symbol]);
+        assert!(arena.is_total(bits.into()));
+        let mut assignment = Assignment::new();
+        assignment.bind(symbol, SymbolValue::F32(-0.0));
+        assert_eq!(arena.eval_int_i64(bits, &assignment).unwrap(), 0x80000000);
+        let replacement = arena.scalar_const_erased(ReferenceScalar::F32(0x7fc01234));
+        let folded = arena.substitute_any(bits.into(), &[(symbol, AnyExpr::Scalar(replacement))]);
+        assert!(matches!(arena.view(folded), NodeView::IntConst(0x7fc01234)));
+        let literal = arena.scalar_const_erased(ReferenceScalar::Bool(true));
+        let converted = arena.scalar_integer(
+            ScalarOp::Cast(DType::I32),
+            &[ScalarOperand::Scalar(literal)],
+        );
+        assert!(matches!(
+            arena.view(converted.into()),
+            NodeView::IntConst(1)
+        ));
+    }
+
+    #[test]
     fn typed_word_projection_folds_the_actual_wrapped_result() {
         use crate::reference_math::ScalarOp;
         use crate::syntax::ast::BinaryOp;
@@ -1722,14 +1875,29 @@ mod tests {
         let one = arena.int(1);
         let wrapped = arena.scalar_integer(
             ScalarOp::Binary(BinaryOp::Add),
-            &[(DType::I32, max), (DType::I32, one)],
+            &[
+                ScalarOperand::Word {
+                    dtype: DType::I32,
+                    value: max,
+                },
+                ScalarOperand::Word {
+                    dtype: DType::I32,
+                    value: one,
+                },
+            ],
         );
         assert!(matches!(
             arena.view(wrapped.into()),
             NodeView::IntConst(-2147483648)
         ));
         let unsigned = arena.int(i64::from(u32::MAX));
-        let signed = arena.scalar_integer(ScalarOp::Cast(DType::I32), &[(DType::U32, unsigned)]);
+        let signed = arena.scalar_integer(
+            ScalarOp::Cast(DType::I32),
+            &[ScalarOperand::Word {
+                dtype: DType::U32,
+                value: unsigned,
+            }],
+        );
         assert!(matches!(arena.view(signed.into()), NodeView::IntConst(-1)));
     }
 
@@ -1744,7 +1912,16 @@ mod tests {
         let two = arena.int(2);
         let projected = arena.scalar_integer(
             ScalarOp::Binary(BinaryOp::Div),
-            &[(DType::U32, input), (DType::U32, two)],
+            &[
+                ScalarOperand::Word {
+                    dtype: DType::U32,
+                    value: input,
+                },
+                ScalarOperand::Word {
+                    dtype: DType::U32,
+                    value: two,
+                },
+            ],
         );
         let mut values = Assignment::new();
         values.bind(symbol, SymbolValue::Nat(((1_u64 << 32) + 2).into()));
@@ -1769,7 +1946,16 @@ mod tests {
         let numerator = arena.int(i64::from(i32::MIN));
         let quotient = arena.scalar_integer(
             ScalarOp::Binary(BinaryOp::Div),
-            &[(DType::I32, numerator), (DType::I32, denominator)],
+            &[
+                ScalarOperand::Word {
+                    dtype: DType::I32,
+                    value: numerator,
+                },
+                ScalarOperand::Word {
+                    dtype: DType::I32,
+                    value: denominator,
+                },
+            ],
         );
         let defined = arena.side_conditions(quotient.into());
         let guard_defined = arena.side_conditions(defined.into());

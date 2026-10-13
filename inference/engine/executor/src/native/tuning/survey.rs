@@ -19,7 +19,7 @@
 //! GPU lock: its model load, the tuning of entries it does not survey and
 //! its bench cells use the device as much as the survey does.
 //!
-//! Only `forward_bench` enables the feature (`--tuning-survey DIR`). The
+//! Only `magnitude-harness` enables the feature (`--tuning-survey DIR`). The
 //! survey is process-global so that no production API carries it.
 
 use super::TuningKey;
@@ -113,7 +113,7 @@ pub const REPLAY_RUNS: usize = 1000;
 /// and per point, the time of the overall best configuration against the
 /// best at that point alone (what a per-size launch could recover).
 pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
-    use seismic::replay::{replay, Objective, Recording};
+    use seismic::replay::{Objective, Recording, replay};
     use std::fmt::Write;
     let mut files = std::fs::read_dir(directory)
         .map_err(|error| format!("reading {}: {error}", directory.display()))?
@@ -151,12 +151,9 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             ((allowance / per_configuration.max(f64::MIN_POSITIVE)).floor() as usize).max(1);
         let recording =
             Recording::new(&result).map_err(|error| format!("{}: {error}", path.display()))?;
-        let space = recording.space().len();
+        let space = recording.len();
         // The settings the recorded entry's search runs with.
-        let settings = super::search_settings(
-            seismic::BackendName::parse(&result.backend)
-                .ok_or_else(|| format!("{}: unknown backend", path.display()))?,
-        );
+        let settings = super::SEARCH_SETTINGS;
         writeln!(
             report,
             "### {} [{}] {}\n\n{} admissible, {} measured, allowance {allowance:.2} s ({budget} evaluations); true best {:?}\n",
@@ -165,7 +162,7 @@ pub fn replay_report(directory: &std::path::Path) -> Result<String, String> {
             field("statics")?,
             space,
             recording.measured(),
-            recording.space().values(recording.best()),
+            recording.values(recording.best()),
         )
         .expect("writing to a string");
         writeln!(

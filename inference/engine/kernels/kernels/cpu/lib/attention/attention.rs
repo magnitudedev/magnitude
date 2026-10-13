@@ -27,12 +27,9 @@ pub const BLOCK: usize = 32;
 /// The fewest keys of a decode partition: shorter rows use fewer partitions.
 pub const PARTITION_KEYS: usize = 128;
 
-/// Columns per affine (scale, zero) pair: the codec's group.
+/// Columns of the native SIMD affine group32 implementation. Its entry
+/// eligibility checks the descriptor coefficient extent before dispatch.
 pub const GROUP: usize = 32;
-/// Code bits of affine history keys and values.
-pub const KEY_BITS: u32 = 8;
-pub const VALUE_BITS: u32 = 4;
-
 /// The head geometry of an entry: KV key/value heads of G query heads each,
 /// rows of W = 2P + S columns whose first 2P rotate.
 #[derive(Clone, Copy, Debug)]
@@ -232,20 +229,31 @@ pub fn total(spans: impl Iterator<Item = (i32, i32)>, fresh: (i32, i32)) -> usiz
 
 /// Calls `run(keys, first, count)` for each run of the row's key sequence
 /// (its admitted history spans in order, then its fresh span) inside
-/// `range`, positions counted along the sequence.
+/// `range` whose keys `selected` reads, positions counted along the
+/// sequence.
 pub fn walk(
     spans: impl Iterator<Item = (i32, i32)>,
     fresh: (i32, i32),
     range: Range<usize>,
+    selected: impl Fn(usize) -> bool,
     mut run: impl FnMut(Keys, usize, usize),
 ) {
     let mut position = 0usize;
     let mut visit = |keys: Keys, lo: i32, hi: i32| {
         let count = (hi - lo) as usize;
-        let start = range.start.max(position);
+        let mut start = range.start.max(position);
         let end = range.end.min(position + count);
-        if start < end {
-            run(keys, lo as usize + (start - position), end - start);
+        while start < end {
+            if !selected(start) {
+                start += 1;
+                continue;
+            }
+            let mut stop = start + 1;
+            while stop < end && selected(stop) {
+                stop += 1;
+            }
+            run(keys, lo as usize + (start - position), stop - start);
+            start = stop;
         }
         position += count;
     };
@@ -370,11 +378,11 @@ impl Online<'_> {
             row,
             |j, out| {
                 let (codes, coefficients) = key(j);
-                affine_decode(codes, coefficients, KEY_BITS, out)
+                affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
             },
             |j, out| {
                 let (codes, coefficients) = value(j);
-                affine_decode(codes, coefficients, VALUE_BITS, out)
+                affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
             },
         );
     }
@@ -451,11 +459,11 @@ mod affine_neon {
                 row,
                 |j, out| {
                     let (codes, coefficients) = key(j);
-                    super::affine_decode(codes, coefficients, super::KEY_BITS, out)
+                    super::affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
                 },
                 |j, out| {
                     let (codes, coefficients) = value(j);
-                    super::affine_decode(codes, coefficients, super::VALUE_BITS, out)
+                    super::affine_decode(codes, coefficients, (32 * codes.len() / out.len()) as u32, out)
                 },
             ),
         }
@@ -584,12 +592,13 @@ pub fn attend_rows(
     spans: impl Iterator<Item = (i32, i32)>,
     fresh: (i32, i32),
     range: Range<usize>,
+    selected: impl Fn(usize) -> bool,
     mut history_key: impl FnMut(usize, &mut [f32]),
     mut history_value: impl FnMut(usize, &mut [f32]),
     mut fresh_key: impl FnMut(usize, &mut [f32]),
     mut fresh_value: impl FnMut(usize, &mut [f32]),
 ) {
-    walk(spans, fresh, range, |keys, first, count| match keys {
+    walk(spans, fresh, range, selected, |keys, first, count| match keys {
         Keys::History => state.absorb(
             queries,
             scale,
@@ -611,6 +620,22 @@ pub fn attend_rows(
     });
 }
 
+/// Whether a row's WorkList `bitmap` (one bit per block of `block_rows`
+/// keys, word block / 32) reads key `ordinal`; a block past the bitmap is
+/// not read, and an empty bitmap reads every key (the portable `selected`
+/// under `B > 0`, and the Visible form).
+#[inline(always)]
+pub fn selected(bitmap: &[u32], block_rows: i32, ordinal: usize) -> bool {
+    if bitmap.is_empty() {
+        return true;
+    }
+    if block_rows <= 0 {
+        return false;
+    }
+    let block = ordinal / block_rows as usize;
+    bitmap.get(block / 32).is_some_and(|word| word >> (block % 32) & 1 != 0)
+}
+
 /// [`attend_rows`] with affine K8/V4 history rows `history_key(token)` and
 /// `history_value(token)`, absorbed by [`Online::absorb_affine`].
 #[inline(always)]
@@ -629,7 +654,7 @@ pub fn attend_affine_rows<'h>(
     mut fresh_key: impl FnMut(usize, &mut [f32]),
     mut fresh_value: impl FnMut(usize, &mut [f32]),
 ) {
-    walk(spans, fresh, range, |keys, first, count| match keys {
+    walk(spans, fresh, range, |_| true, |keys, first, count| match keys {
         Keys::History => state.absorb_affine(
             queries,
             scale,

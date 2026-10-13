@@ -60,5 +60,12 @@ fn gated_delta_step_gate<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group:
     let r = recurrence(cx);
     let (norm, values) = seismic::cpu::tensor::floats(shared, 2 * r.width).split_at_mut(r.width);
     cx.arg_recurrent_norm().decode_row(0, norm);
-    r.gate_row(group[0] as usize, norm, cx.arg_epsilon(), &cx.result_0(), values);
+    r.gate_row(
+        group[0] as usize,
+        norm,
+        cx.arg_epsilon(),
+        cx.arg_gate_function(),
+        &cx.result_0(),
+        values,
+    );
 }

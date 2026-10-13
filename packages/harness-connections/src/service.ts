@@ -55,7 +55,7 @@ export {
   updateYaml,
 } from "./shared"
 export { clineModelCatalog, clineModelRegistryEntry, clineProviderSettings } from "./connectors/cline"
-export { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
+export { CLAUDE_AUTH_TOKEN_PLACEHOLDER, CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
 export { codexModelCatalog } from "./connectors/codex"
 export { hermesProviderConfig, hermesReasoningOverrides } from "./connectors/hermes"
 export { ohMyPiProviderConfig } from "./connectors/oh-my-pi"

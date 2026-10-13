@@ -1,21 +1,25 @@
 use super::specialization::{Specializer, Tuning};
+use super::tuning::readout_choice::{
+    QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
+};
+use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
+    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
     attention::{
-        history_window, AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix,
-        AttentionOutputTuning, AttentionPrefillK8V4Tuning, AttentionPrefillTuning,
-        AttentionProjectTuning,
+        AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
+        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
+        IndexerProjectTuning, PrefillListing, history_window,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
-        routing_shape, RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning,
-        RoutedGateUpTuning, RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectTuning,
-        RoutedUpTilesTuning, RoutedUpTuning,
+        RoutedDownTuning, RoutedExpandDecodeTuning, RoutedExpertTilesTuning, RoutedGateUpTuning,
+        RoutedGatedTilesTuning, RoutedScatterTuning, RoutedSelectTuning, RoutedUpTilesTuning,
+        RoutedUpTuning, routing_shape,
     },
     post_norm::ProjectRowsTuning,
     readout::{
-        DraftRowsTuning, ExactRowsTuning, HeadLogitsTuning, HeadRowsTuning, PlanesRowsTuning,
-        ProgressiveTuning, RefineRowsTuning, SampleRowsTuning, SelectedRowsTuning, ShapeRowsTuning,
-        TopRowsTuning,
+        DraftRowsTuning, HeadRowsTuning, PreparedProjectionTuning, SampleRowsTuning,
+        SelectedRowsTuning, ShapeRowsTuning,
     },
     recurrent::{
         RecurrentChunkTuning, RecurrentOutputTuning, RecurrentProjectConvolvedTuning,
@@ -32,24 +36,50 @@ use super::tuning::{
         StateSpaceChunkTuning, StateSpaceOutputTuning, StateSpaceProjectTuning, StateSpaceState,
         StateSpaceStepTuning,
     },
-    ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
 };
 use super::*;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
+use crate::operators::streams::StreamsBinding;
+use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
-    DenseBinding, GeneralRoutedBinding, HeadProjection, ModelLoadPlan, ReadoutHead, ShortConvBinding,
+    DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
 };
-use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, WeightScope};
-use magnitude_kernels::{
-    attention_append_dense, conditioning_overlay, draft_confidence, draft_convolve_input, draft_convolve_residual,
-    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, moe_tail,
-    per_layer_inputs, post_norm_residual, repack_weight, tap_rows, widen_rows,
+use magnitude_family_contracts::{
+    InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
 };
-use magnitude_state::KvCodec;
+use magnitude_kernels::{
+    attention_append_dense, cluster_token_rows, conditioning_overlay, draft_convolve_input,
+    draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
+    feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
+    per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
+    selection_notice, stored_rows, tap_rows, widen_rows,
+};
 use seismic::KernelRequest;
 use std::collections::HashSet;
+use std::{cell::RefCell, rc::Rc};
+#[derive(Default)]
+struct ReadoutStates {
+    choices: HashMap<String, RecipeState>,
+    programs: HashMap<String, RecipePreparation>,
+}
+type ReadoutRecipeStates = Rc<RefCell<ReadoutStates>>;
+
+/// The affine Metal matrix form can share one decoded tile across four
+/// rows for these head geometries. Give that row band its own objective,
+/// independently of the model or the configuration that tuning selects.
+pub(super) fn separates_packed_attention_rows(
+    backend: seismic::BackendName,
+    group: u64,
+    width: u64,
+    max_rows: u64,
+) -> bool {
+    backend == seismic::BackendName::Metal
+        && (1..=8).contains(&group)
+        && matches!(width, 128 | 256)
+        && max_rows >= 4
+}
 
 /// The phase-one catalog. Every handle is prepared before qualification and
 /// retained for warm calls; this type has no API capable of preparing again.
@@ -60,9 +90,14 @@ pub(super) struct NativePreparationCache {
     pub(super) glue: GlueKernels,
     pub(super) target: TargetKernels,
     pub(super) head: Option<HeadKernels>,
+    pub(super) shared_head: Option<SharedHeadKernels>,
     pub(super) draft: Option<DraftKernels>,
     pub(super) vision: Option<VisionKernels>,
     pub(super) tuned: Vec<TunedEntry>,
+    /// Units prepared at their canonical defaults for want of a stored
+    /// tuning record.
+    pub(super) unprepared: usize,
+    pub(super) readout_choices: Vec<crate::ReadoutClassChoice>,
 }
 
 /// Everything program preparation reads.
@@ -72,6 +107,10 @@ pub(super) struct PreparationInputs<'a> {
     pub load: &'a ModelLoadPlan,
     pub limits: TuningLimits,
     pub tuning: TuningContext<'a>,
+    /// What a search is held to; a load, which never searches, has none.
+    pub room: Option<super::tuning::TuningRoom>,
+    pub selection_limits: crate::ResourceLimits,
+    pub graph_demand: GraphInvocationDemand,
 }
 
 /// Prepare one entry that has no tuning case. Evaluates to `Option`: `None`
@@ -129,14 +168,26 @@ fn head_sublayer_scope(index: usize, sublayer: u32) -> WeightScope {
 }
 
 impl NativePreparationCache {
-    pub(super) fn prepare_programs(inputs: PreparationInputs<'_>) -> Result<Self, CatalogFailure> {
+    /// A load's preparation: one walk forms every entry at the choice its
+    /// stored tuning record names, or at its canonical default where no
+    /// record is stored, when the load serves defaults; a load that reports
+    /// such units ends at the first with [`CatalogFailure::Unprepared`].
+    /// Nothing is searched, measured or published.
+    pub(super) fn prepare_programs(
+        inputs: PreparationInputs<'_>,
+        unprepared: super::tuning::UnpreparedUnits,
+    ) -> Result<Self, CatalogFailure> {
         let PreparationInputs {
             device,
             plan,
             load,
             limits,
             tuning,
+            room: _,
+            selection_limits,
+            graph_demand,
         } = inputs;
+        let recipe_states = ReadoutRecipeStates::default();
         let mut spec = Specializer::new(device);
         let import = imports(&mut spec, plan)?;
         let owner = Tensor::zeros(device, Element::u32(), &[1]).map_err(|error| {
@@ -147,30 +198,143 @@ impl NativePreparationCache {
             }
         })?;
         let epsilon = epsilon(tuning.definition)?;
-        // Tuning walks the program three times: a count finds the units that
-        // will search and their launches, a census measures their defaults
-        // at their points within the tuning time left (keeping the inputs it
-        // builds and each unit's opened search). The units are then searched
-        // together within the tuning time left, and the last walk prepares
-        // each with its choice.
-        // Each walk's preparation ends with its walk: the tuner, which
-        // borrows the import kernels, passes on to the next.
-        let counted = {
+        let invocations = invocation_demand(
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            selection_limits,
+            &graph_demand,
+            epsilon,
+            &recipe_states,
+        )?;
+        let (glue, target, head, shared_head, draft, vision, tuned, unprepared, readout_choices) = {
+            let mut preparation = Preparation::new(
+                plan,
+                tuning.definition,
+                limits,
+                epsilon,
+                recipe_states.clone(),
+                Some(selection_limits),
+                spec,
+                Tuning::Tuner(Tuner::serve(
+                    device,
+                    tuning,
+                    limits,
+                    TuningWeights::new(device, load, tuning.weights, &import),
+                    invocations,
+                    unprepared,
+                )),
+            );
+            preparation.graph_demand = Some(graph_demand);
+            let glue = preparation.walk(plan)?;
+            let Preparation {
+                tuning,
+                target,
+                head,
+                shared_head,
+                draft,
+                vision,
+                readout_choices,
+                ..
+            } = preparation;
+            let tuner = tuning.into_tuner();
+            let unprepared = tuner.unprepared();
+            (
+                glue,
+                target,
+                head,
+                shared_head,
+                draft,
+                vision,
+                tuner.conclude(),
+                unprepared,
+                readout_choices,
+            )
+        };
+        Ok(Self {
+            readout_choices,
+            owner,
+            import,
+            glue,
+            target,
+            head,
+            shared_head,
+            draft,
+            vision,
+            tuned,
+            unprepared,
+        })
+    }
+
+    /// The search: every unit without a stored tuning record is searched on
+    /// the device within the tuning budget and its record published. A count
+    /// walk finds those units and their launches, and the entries without
+    /// tuning parameters; the mandatory phase forms and publishes each
+    /// unit's canonical default and forms those entries; a census walk
+    /// collects the units with optional work, which are then searched
+    /// together within the tuning time left. Each walk's preparation ends
+    /// with its walk: the tuner, which borrows the import kernels, passes on
+    /// to the next. No walk prepares the choices for serving: a load does,
+    /// from the records. Returns every unit's outcome.
+    pub(super) fn search_programs(
+        inputs: PreparationInputs<'_>,
+    ) -> Result<Vec<TunedEntry>, CatalogFailure> {
+        let PreparationInputs {
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            room,
+            selection_limits,
+            graph_demand,
+        } = inputs;
+        let recipe_states = ReadoutRecipeStates::default();
+        // The search imports the weights its units measure through the
+        // import kernels.
+        let import = imports(&mut Specializer::new(device), plan)?;
+        let epsilon = epsilon(tuning.definition)?;
+        let invocations = invocation_demand(
+            device,
+            plan,
+            load,
+            limits,
+            tuning,
+            selection_limits,
+            &graph_demand,
+            epsilon,
+            &recipe_states,
+        )?;
+        // The count also collects every entry without tuning parameters:
+        // the mandatory phase forms them with the units' canonical
+        // programs, so a load after the search forms nothing the search
+        // did not.
+        let (counted, untuned) = {
             let mut count = Preparation::new(
                 plan,
                 tuning.definition,
                 limits,
                 epsilon,
-                Specializer::count(device),
-                Tuning::Tuner(Tuner::count(
-                    device,
-                    tuning,
-                    limits,
-                    TuningWeights::new(device, load, tuning.weights, &import),
-                )),
+                recipe_states.clone(),
+                Some(selection_limits),
+                Specializer::count_untuned(device),
+                Tuning::Tuner(
+                    Tuner::count(
+                        device,
+                        tuning,
+                        limits,
+                        TuningWeights::new(device, load, tuning.weights, &import),
+                        invocations,
+                    )
+                    .held_to(room),
+                ),
             );
+            count.graph_demand = Some(graph_demand.clone());
             count.walk(plan)?;
-            count.tuning.into_tuner()
+            let Preparation { spec, tuning, .. } = count;
+            (tuning.into_tuner(), spec.into_untuned())
         };
         let censused = {
             let mut census = Preparation::new(
@@ -178,50 +342,80 @@ impl NativePreparationCache {
                 tuning.definition,
                 limits,
                 epsilon,
+                recipe_states.clone(),
+                Some(selection_limits),
                 Specializer::count(device),
-                Tuning::Tuner(counted.census()),
+                Tuning::Tuner(counted.census(untuned)?),
             );
+            census.graph_demand = Some(graph_demand.clone());
             census.walk(plan)?;
             census.tuning.into_tuner()
         };
-        let (glue, target, head, draft, vision, tuned) = {
-            let mut preparation = Preparation::new(
+        let searched = censused.search()?;
+        // A development survey measures the units it owns in the search's
+        // process, after the search: one more walk that forms nothing and
+        // reads every other unit's published choice.
+        #[cfg(feature = "tuning-survey")]
+        let searched = {
+            let mut survey = Preparation::new(
                 plan,
                 tuning.definition,
                 limits,
                 epsilon,
-                spec,
-                Tuning::Tuner(censused.search()?),
+                recipe_states,
+                Some(selection_limits),
+                Specializer::count(device),
+                Tuning::Tuner(searched),
             );
-            let glue = preparation.walk(plan)?;
-            let Preparation {
-                tuning,
-                target,
-                head,
-                draft,
-                vision,
-                ..
-            } = preparation;
-            (
-                glue,
-                target,
-                head,
-                draft,
-                vision,
-                tuning.into_tuner().tuned(),
-            )
+            survey.graph_demand = Some(graph_demand);
+            survey.walk(plan)?;
+            survey.tuning.into_tuner()
         };
-        Ok(Self {
-            owner,
-            import,
-            glue,
-            target,
-            head,
-            draft,
-            vision,
-            tuned,
-        })
+        // The tuner borrows the import kernels: it ends here, before them.
+        let tuned = searched.conclude();
+        Ok(tuned)
     }
+}
+
+/// The logical calls of every tuned entry, collected by a metadata-only walk
+/// before any tuner reads a record or opens a search: the same operator walk
+/// under the same settings, so every key it records is the key the tuner
+/// looks up. Physical weight provenance is absent from this map's role and
+/// frequency decisions.
+#[allow(clippy::too_many_arguments)]
+fn invocation_demand(
+    device: &Device,
+    plan: &ProgramPlan,
+    load: &ModelLoadPlan,
+    limits: TuningLimits,
+    tuning: TuningContext<'_>,
+    selection_limits: crate::ResourceLimits,
+    graph_demand: &GraphInvocationDemand,
+    epsilon: f32,
+    recipe_states: &ReadoutRecipeStates,
+) -> Result<super::specialization::InvocationDemand, CatalogFailure> {
+    let mut demand = Preparation::new(
+        plan,
+        tuning.definition,
+        limits,
+        epsilon,
+        recipe_states.clone(),
+        Some(selection_limits),
+        Specializer::count(device),
+        Tuning::demand(
+            ModelInputs {
+                definition: tuning.definition,
+                limits,
+                load,
+            },
+            device,
+            tuning.settings,
+            super::tuning::Objective::new(graph_demand.terms.clone()),
+        ),
+    );
+    demand.graph_demand = Some(graph_demand.clone());
+    demand.walk(plan)?;
+    Ok(demand.tuning.into_invocations())
 }
 
 /// The requests of the native kernels preparing `plan` on `backend` prepares,
@@ -241,6 +435,8 @@ pub(crate) fn kernel_requests(
         definition,
         limits,
         epsilon(definition)?,
+        ReadoutRecipeStates::default(),
+        None,
         spec,
         Tuning::Listing(ModelInputs {
             definition,
@@ -271,10 +467,14 @@ fn epsilon(definition: &ModelDefinition) -> Result<f32, CatalogFailure> {
 }
 
 /// Prepare the weight-import entries of `plan`'s import slots.
-fn imports(spec: &mut Specializer<'_>, plan: &ProgramPlan) -> Result<ImportKernels, CatalogFailure> {
+fn imports(
+    spec: &mut Specializer<'_>,
+    plan: &ProgramPlan,
+) -> Result<ImportKernels, CatalogFailure> {
     let mut import = ImportKernels {
         import_dense: HashMap::new(),
         repack_weight: HashMap::new(),
+        packing_bound: HashMap::new(),
     };
     for slot in plan.imports() {
         match *slot {
@@ -296,6 +496,20 @@ fn imports(spec: &mut Specializer<'_>, plan: &ProgramPlan) -> Result<ImportKerne
                 }
             }
             ImportProgramSlot::Repack { source, resident } => {
+                // A resident element with a packing bound makes it with its
+                // own entry after every import into it.
+                if crate::planning::packing_run(resident).is_some()
+                    && !import.packing_bound.contains_key(&resident)
+                {
+                    if let Some(kernel) = fixed!(
+                        spec,
+                        packing_bound,
+                        resident.name().to_owned(),
+                        packing_bound::Elements { W: resident }
+                    ) {
+                        import.packing_bound.insert(resident, kernel);
+                    }
+                }
                 if import.repack_weight.contains_key(&(source, resident)) {
                     continue;
                 }
@@ -317,17 +531,49 @@ fn imports(spec: &mut Specializer<'_>, plan: &ProgramPlan) -> Result<ImportKerne
     Ok(import)
 }
 
+/// Which reader of a projection scope a readout recipe serves: where its
+/// kernels are kept.
+#[derive(Clone, Copy)]
+enum ReadoutReader {
+    Target(crate::ReadoutBinding),
+    HeadBlock(crate::HeadBinding),
+    /// A head's own projection, which nothing else reads.
+    SharedHead,
+}
+
+/// A reader of a candidate scope that selected no class of its own. A scope
+/// is stored in one form, so when another reader of the scope selects one
+/// this reader reads the views too, through their full pass, and is given
+/// their kernels.
+struct ReadoutFollower {
+    reader: ReadoutReader,
+    scope: WeightScope,
+    recipe: ReadoutRecipe,
+    preparation: RecipePreparation,
+}
+
 struct Preparation<'a> {
     limits: TuningLimits,
+    graph_demand: Option<GraphInvocationDemand>,
     spec: Specializer<'a>,
     tuning: Tuning<'a>,
+    recipe_states: ReadoutRecipeStates,
+    selection_limits: Option<crate::ResourceLimits>,
+    readout_choices: Vec<crate::ReadoutClassChoice>,
+    /// Readers of a candidate scope that selected no class of their own
+    /// ([`Preparation::follow_readout_scopes`]).
+    readout_followers: Vec<ReadoutFollower>,
     epsilon: f32,
+    softcap: f32,
     /// Model width: the static dimension of the feature readout.
     hidden: u64,
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
+    /// The scopes of the decoder's sublayer mix sites (`operators::streams`).
+    stream_sites: Vec<WeightScope>,
     target: TargetKernels,
     head: Option<HeadKernels>,
+    shared_head: Option<SharedHeadKernels>,
     draft: Option<DraftKernels>,
     vision: Option<VisionKernels>,
 }
@@ -338,28 +584,451 @@ impl<'a> Preparation<'a> {
         definition: &ModelDefinition,
         limits: TuningLimits,
         epsilon: f32,
+        recipe_states: ReadoutRecipeStates,
+        selection_limits: Option<crate::ResourceLimits>,
         spec: Specializer<'a>,
         tuning: Tuning<'a>,
     ) -> Self {
         Self {
             limits,
+            graph_demand: None,
             spec,
             tuning,
+            recipe_states,
+            selection_limits,
+            readout_choices: Vec::new(),
+            readout_followers: Vec::new(),
             epsilon,
+            softcap: crate::programs::graph::readout::readout_softcap(&definition.decoder),
             hidden: definition.decoder.hidden,
             vocabulary: definition.decoder.vocabulary,
+            stream_sites: definition
+                .decoder
+                .sublayers()
+                .filter(|(_, sublayer)| matches!(sublayer.input, InputNorm::HyperConnectionMix(_)))
+                .map(|(index, _)| WeightScope::TargetSublayer(index))
+                .collect(),
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
+            shared_head: plan.shared_head().map(|_| SharedHeadKernels::default()),
             draft: plan.draft().map(|_| DraftKernels::default()),
             vision: plan.vision().map(|_| VisionKernels::default()),
         }
     }
 
+    /// Register one complete physical recipe per served selected-row class.
+    /// A cache hit forms retained configurations but never measures or searches.
+    /// A reader that selects no class still gets the views' kernels when its
+    /// scope is stored as them for another reader.
+    fn qualified_readout(
+        &mut self,
+        reader: ReadoutReader,
+        scope: WeightScope,
+        norm_scope: WeightScope,
+        norm: Element,
+        weight: Element,
+        activation: Element,
+        softcap: f32,
+        prepared: bool,
+        row_bound: usize,
+        canonical: Option<ProjectionKernels>,
+    ) -> Result<Option<ProjectionKernels>, CatalogFailure> {
+        if self
+            .selection_limits
+            .is_none_or(|limits| limits.exported_logits_rows != 0)
+        {
+            return Ok(None);
+        }
+        let Some(device) = self.tuning.device() else {
+            return Ok(None);
+        };
+        let dependency = if prepared {
+            self.tuning.dependency(&PreparedProjectionTuning {
+                scope,
+                kind: WeightKind::Output,
+                weight,
+                activation,
+                columns: None,
+                indexed: false,
+                softcap,
+            })?
+        } else {
+            self.tuning.dependency(&HeadRowsTuning {
+                projection_scope: scope,
+                norm_scope,
+                norm,
+                weight,
+                activation,
+                epsilon: self.epsilon,
+                rows: None,
+            })?
+        };
+        let Some(dependency) = dependency else {
+            return Ok(None);
+        };
+        let model = self.tuning.model();
+        let scale_extent = model
+            .scale_extent(scope, WeightKind::Output)
+            .map_err(|error| CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome: error,
+            })?;
+        let candidates = model.load.readout_candidates();
+        let Some(rest) = candidates.iter().find(|plan| {
+            plan.role
+                == magnitude_family_contracts::WeightRole {
+                    scope,
+                    kind: WeightKind::OutputPlane(
+                        magnitude_family_contracts::ProgressivePlane::Rest,
+                    ),
+                }
+        }) else {
+            return Ok(None);
+        };
+        let packed = super::tuning::weight_plan(model.load, scope, WeightKind::Output).map_err(
+            |outcome| CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome,
+            },
+        )?;
+        let [stored_vocabulary, hidden] = packed.shape[..] else {
+            return Ok(None);
+        };
+        let vocabulary = stored_vocabulary.min(self.vocabulary);
+        let [_, _, low_planes] = rest.shape[..] else {
+            return Ok(None);
+        };
+        let (parts, norm_extent) = model.readout_form(norm_scope, hidden).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome,
+            }
+        })?;
+        // A readout of unnormalized partials (`NM = 0`) has no norm.
+        let norm_plan = (norm_extent > 0)
+            .then(|| super::tuning::weight_plan(model.load, norm_scope, WeightKind::OutputNorm))
+            .transpose()
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome,
+            })?;
+        let recipe = ReadoutRecipe {
+            scope,
+            norm_scope,
+            norm,
+            weight,
+            activation,
+            epsilon: self.epsilon,
+            softcap,
+            prepared,
+            vocabulary,
+            hidden,
+            parts,
+            norm_extent,
+            low_planes,
+            scale_extent,
+        };
+        let bound = seismic::NativeSpecialization::new()
+            .with_static("V", vocabulary)
+            .with_static("D", hidden)
+            .with_static("PT", parts)
+            .with_static("NM", norm_extent)
+            .with_static("P", low_planes);
+        let digest = magnitude_kernels::readout_top_rows::native_digest_with(
+            device,
+            magnitude_kernels::readout_top_rows::Elements {
+                NW: norm,
+                A: activation,
+            },
+            &bound,
+        )
+        .map_err(|error| CatalogFailure::Preparation {
+            entry: "readout_recipe",
+            bindings: format!("{scope:?}"),
+            outcome: error.to_string(),
+        })?;
+        let additional_digests = [
+            magnitude_kernels::readout_refine_rows::native_digest_with(
+                device,
+                magnitude_kernels::readout_refine_rows::Elements { A: activation },
+                &bound,
+            ),
+            magnitude_kernels::readout_exact_rows::native_digest_with(
+                device,
+                magnitude_kernels::readout_exact_rows::Elements { A: activation },
+                &bound,
+            ),
+            magnitude_kernels::readout_planes_rows::native_digest_with(
+                device,
+                magnitude_kernels::readout_planes_rows::Elements {
+                    NW: norm,
+                    A: activation,
+                },
+                &bound,
+            ),
+            if prepared {
+                magnitude_kernels::readout_project_rows::native_digest_with(
+                    device,
+                    magnitude_kernels::readout_project_rows::Elements {
+                        OW: weight,
+                        A: activation,
+                    },
+                    &seismic::NativeSpecialization::new()
+                        .with_static("V", vocabulary)
+                        .with_static("D", hidden)
+                        .with_static("S", vocabulary)
+                        .with_static("I", 0)
+                        .with_static("WS", scale_extent),
+                )
+            } else {
+                magnitude_kernels::readout_head_rows::native_digest_with(
+                    device,
+                    magnitude_kernels::readout_head_rows::Elements {
+                        NW: norm,
+                        OW: weight,
+                        A: activation,
+                    },
+                    &seismic::NativeSpecialization::new()
+                        .with_static("V", vocabulary)
+                        .with_static("D", hidden)
+                        .with_static("PT", parts)
+                        .with_static("NM", norm_extent)
+                        .with_static("WS", scale_extent),
+                )
+            },
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| CatalogFailure::Preparation {
+            entry: "readout_recipe",
+            bindings: format!("{scope:?}"),
+            outcome: error.to_string(),
+        })?;
+        let preparation_key = format!(
+            "readout-physical-programs/device={:?}/top={digest}/levels={:?}",
+            device.tuning_identity(),
+            &additional_digests[..3],
+        );
+        let preparation = self
+            .recipe_states
+            .borrow_mut()
+            .programs
+            .entry(preparation_key)
+            .or_insert_with(|| Rc::new(RefCell::new(None)))
+            .clone();
+        let digest = format!("{digest}/{additional_digests:?}");
+        let norm_identity = norm_plan.map_or_else(
+            || "no-norm".to_owned(),
+            |plan| format!("{:?}", plan.storage_identity()),
+        );
+        let mut selected_rows = Vec::new();
+        let mut selected_state = None;
+        for rows in magnitude_batching::row_classes(row_bound) {
+            let point = super::tuning::PointShape {
+                label: format!("m{rows}"),
+                weight: 1.0,
+                terms: Vec::new(),
+                rows: rows as u64,
+                sequences: 1,
+                context: None,
+                class: None,
+            };
+            // The choice is a tuning result: it is read only under the
+            // budget it was qualified within.
+            let budget = self.tuning.settings().map(|settings| settings.budget);
+            let key = crate::TuningCacheKey::of(&format!(
+                "readout-recipe-v4/budget={budget:?}/device={:?}/{:?}/{}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
+                device.tuning_identity(),
+                packed.storage_identity(),
+                norm_identity,
+                self.epsilon.to_bits(),
+                softcap.to_bits(),
+                point.rows
+            ));
+            let state = self
+                .recipe_states
+                .borrow_mut()
+                .choices
+                .entry(key.as_str().to_owned())
+                .or_insert_with(|| Rc::new(RefCell::new(QualifiedRecipe::default())))
+                .clone();
+            let contender = ReadoutContender::new(
+                recipe,
+                point.clone(),
+                key.clone(),
+                self.tuning.cache(),
+                self.tuning.stored_results(),
+                state.clone(),
+                dependency.clone(),
+                preparation.clone(),
+            );
+            if self
+                .tuning
+                .register_composed(Box::new(contender), point.rows)?
+                == Some(true)
+            {
+                let Some(specification) = self
+                    .tuning
+                    .choice(&dependency)
+                    .map(|choice| format!("{choice:?}"))
+                else {
+                    continue;
+                };
+                let evidence = state.borrow().canonical_specification.clone().or_else(|| {
+                    self.tuning
+                        .stored_results()
+                        .and_then(|cache| cache.readout_canonical_choice(&key))
+                });
+                // Cached evidence is consumed as-is. A mismatch falls back;
+                // it never grants a new search or post-budget qualification.
+                if evidence.as_ref() != Some(&specification) {
+                    continue;
+                }
+                let needs_formation = state.borrow().progressive.is_none();
+                if needs_formation {
+                    *state.borrow_mut() = recipe.form_shared(device, &preparation)?;
+                }
+                {
+                    let mut state = state.borrow_mut();
+                    state.selected = true;
+                    state.canonical_specification = Some(specification);
+                }
+                selected_rows.push(point.rows);
+                selected_state = Some(state);
+            }
+        }
+        let Some(state) = selected_state else {
+            // The scope's readers are prepared in a fixed order: one that
+            // selected before this reader is known here, one that selects
+            // after it is met in `follow_readout_scopes`.
+            if !self
+                .readout_choices
+                .iter()
+                .any(|choice| choice.scope == scope)
+            {
+                self.readout_followers.push(ReadoutFollower {
+                    reader,
+                    scope,
+                    recipe,
+                    preparation,
+                });
+                return Ok(None);
+            }
+            let Some(packed) = canonical else {
+                return Ok(None);
+            };
+            return Ok(Some(ProjectionKernels::Qualified {
+                packed: Box::new(packed),
+                progressive: recipe
+                    .form_shared(device, &preparation)?
+                    .progressive
+                    .expect("a formed recipe retains bounded kernels"),
+            }));
+        };
+        selected_rows.sort_unstable();
+        selected_rows.dedup();
+        if let Some(choice) = self.readout_choices.iter_mut().find(|choice| {
+            choice.scope == scope && choice.norm_scope == norm_scope && choice.prepared == prepared
+        }) {
+            choice.rows.extend(&selected_rows);
+            choice.rows.sort_unstable();
+            choice.rows.dedup();
+        } else {
+            self.readout_choices.push(crate::ReadoutClassChoice {
+                scope,
+                norm_scope,
+                prepared,
+                rows: selected_rows,
+            });
+        }
+        // A count or a listing forms no kernels, the canonical projection
+        // among them: the class choice above is all such a pass records. A
+        // search over a cache that already stores this recipe's choice
+        // reaches here in its count.
+        let Some(packed) = canonical else {
+            return Ok(None);
+        };
+        let state = state.borrow();
+        Ok(Some(ProjectionKernels::Qualified {
+            packed: Box::new(packed),
+            progressive: state
+                .progressive
+                .clone()
+                .expect("completed recipe retains bounded kernels"),
+        }))
+    }
+
+    /// Give the views' kernels to each reader that was prepared before
+    /// another reader of its scope selected a class: the target's projection
+    /// is read by the target readout and by an embedded head's blocks, and
+    /// is stored in one form for all of them.
+    fn follow_readout_scopes(&mut self) -> Result<(), CatalogFailure> {
+        let Some(device) = self.tuning.device() else {
+            return Ok(());
+        };
+        for follower in std::mem::take(&mut self.readout_followers) {
+            if !self
+                .readout_choices
+                .iter()
+                .any(|choice| choice.scope == follower.scope)
+            {
+                continue;
+            }
+            let progressive = follower
+                .recipe
+                .form_shared(device, &follower.preparation)?
+                .progressive
+                .expect("a formed recipe retains bounded kernels");
+            match follower.reader {
+                ReadoutReader::Target(binding) => {
+                    if let Some(readout) = self.target.readout.get_mut(&binding) {
+                        readout.head = ReadoutHeadKernels::Qualified {
+                            packed: Box::new(readout.head.clone()),
+                            progressive,
+                        };
+                    }
+                }
+                ReadoutReader::HeadBlock(binding) => {
+                    if let Some(logits) = self
+                        .head
+                        .as_mut()
+                        .and_then(|head| head.logits.get_mut(&binding))
+                    {
+                        *logits = ProjectionKernels::Qualified {
+                            packed: Box::new(logits.clone()),
+                            progressive,
+                        };
+                    }
+                }
+                ReadoutReader::SharedHead => {
+                    unreachable!("a head's own projection has one reader")
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare every program entry, in a fixed order.
     fn walk(&mut self, plan: &ProgramPlan) -> Result<GlueKernels, CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            let mut selection = demand.target.clone();
+            if plan.head().is_some() || plan.shared_head().is_some() {
+                selection.add(&demand.head);
+            }
+            self.tuning.set_invocations(selection, true);
+        }
         let glue = self.glue(plan)?;
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.target.clone(), true);
+        }
         self.target(plan)?;
         self.head(plan)?;
+        self.follow_readout_scopes()?;
+        self.shared_head(plan)?;
         self.draft(plan)?;
         self.vision(plan)?;
         Ok(glue)
@@ -393,14 +1062,39 @@ impl<'a> Preparation<'a> {
                 },
             )?,
             conditioning_overlay: fixed!(self.spec, conditioning_overlay, "fixed"),
+            feature_copy: fixed!(
+                self.spec,
+                feature_copy,
+                "activation",
+                feature_copy::Elements {
+                    A: plan
+                        .head()
+                        .and_then(|head| head.blocks().first())
+                        .map_or(plan.target().embedding().activation, |head| head
+                            .conditioning)
+                }
+            ),
             copy_rows_f32: copy(&mut self.spec, Element::f32(), "A=f32")?,
             copy_rows_f16: copy(&mut self.spec, Element::f16(), "A=f16")?,
             copy_rows_bf16: copy(&mut self.spec, Element::bf16(), "A=bf16")?,
             copy_rows_u32: copy(&mut self.spec, Element::u32(), "A=u32")?,
+            copy_rows_i32: copy(&mut self.spec, Element::i32(), "A=i32")?,
         })
     }
 
     fn target(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if plan.head().is_some_and(|head| {
+            head.blocks()
+                .iter()
+                .any(|head| head.conditioning == Element::f32())
+        }) {
+            self.target.residual_features = fixed!(
+                self.spec,
+                feature_rows,
+                "residual",
+                feature_rows::Elements { A: Element::f32() }
+            );
+        }
         let spec = &mut self.spec;
         let target = plan.target();
         let b = target.embedding();
@@ -414,12 +1108,50 @@ impl<'a> Preparation<'a> {
         )? {
             self.target.embedding.insert(b, kernel);
         }
-        let attention_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
-            |(index, block)| match block.mixer() {
-                MixerProgramSlot::Attention(binding) => Some((binding, sublayer_scope(index, 0))),
-                _ => None,
-            },
-        ));
+        // The decoder blocks of a draft head reading target history are
+        // prepared with the target's, by binding: their layers are the
+        // head's.
+        let head_blocks = plan
+            .shared_head()
+            .map_or(&[][..], |head| head.blocks.as_slice());
+        let mut mixer_demand = HashMap::new();
+        let mut feed_demand = HashMap::new();
+        if let Some(demand) = &self.graph_demand {
+            for (blocks, calls) in [
+                (target.blocks(), &demand.target),
+                (head_blocks, &demand.head),
+            ] {
+                for block in blocks {
+                    mixer_demand
+                        .entry(block.mixer())
+                        .or_insert_with(InvocationCounts::default)
+                        .add(calls);
+                    if let Some(feed) = block.feed_forward() {
+                        feed_demand
+                            .entry(feed)
+                            .or_insert_with(InvocationCounts::default)
+                            .add(calls);
+                    }
+                }
+            }
+        }
+        let attention_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (block, sublayer_scope(index, 0)))
+                .chain(
+                    head_blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, block)| (block, head_sublayer_scope(index, 0))),
+                )
+                .filter_map(|(block, scope)| match block.mixer() {
+                    MixerProgramSlot::Attention(binding) => Some((binding, scope)),
+                    _ => None,
+                }),
+        );
         let recurrent_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
             |(index, block)| match block.mixer() {
                 MixerProgramSlot::Recurrent(binding) => Some((binding, sublayer_scope(index, 0))),
@@ -438,14 +1170,25 @@ impl<'a> Preparation<'a> {
                 _ => None,
             },
         ));
-        let dense_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
-            |(index, block)| match block.feed_forward()? {
-                FeedForwardProgramSlot::Dense(binding) => Some((binding, sublayer_scope(index, 1))),
-                FeedForwardProgramSlot::Routed(_)
-                | FeedForwardProgramSlot::GeneralRouted(_)
-                | FeedForwardProgramSlot::Parallel(_) => None,
-            },
-        ));
+        let dense_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .map(|(index, block)| (block, sublayer_scope(index, 1)))
+                .chain(
+                    head_blocks
+                        .iter()
+                        .enumerate()
+                        .map(|(index, block)| (block, head_sublayer_scope(index, 1))),
+                )
+                .filter_map(|(block, scope)| match block.feed_forward()? {
+                    FeedForwardProgramSlot::Dense(binding) => Some((binding, scope)),
+                    FeedForwardProgramSlot::Routed(_)
+                    | FeedForwardProgramSlot::GeneralRouted(_)
+                    | FeedForwardProgramSlot::Parallel(_) => None,
+                }),
+        );
         let routed_layers = BindingLayers::of(target.blocks().iter().enumerate().filter_map(
             |(index, block)| match block.feed_forward()? {
                 FeedForwardProgramSlot::Routed(binding) => {
@@ -486,18 +1229,17 @@ impl<'a> Preparation<'a> {
         // counted once per layer.
         let mut mixers = HashSet::new();
         let mut feeds = HashSet::new();
-        for block in target.blocks() {
+        for block in target.blocks().iter().chain(head_blocks) {
+            if let Some(calls) = mixer_demand.get(&block.mixer()) {
+                self.tuning.set_invocations(calls.clone(), false);
+            }
             match Some(block.mixer()).filter(|slot| mixers.insert(*slot)) {
-                Some(MixerProgramSlot::Attention(b))
-                    if !self.target.attention.contains_key(&b) =>
-                {
+                Some(MixerProgramSlot::Attention(b)) if !self.target.attention.contains_key(&b) => {
                     if let Some(kernels) = self.attention(b, attention_layers.scopes(b))? {
                         self.target.attention.insert(b, kernels);
                     }
                 }
-                Some(MixerProgramSlot::Recurrent(b))
-                    if !self.target.recurrent.contains_key(&b) =>
-                {
+                Some(MixerProgramSlot::Recurrent(b)) if !self.target.recurrent.contains_key(&b) => {
                     if let Some(kernels) = self.recurrent(b, recurrent_layers.scopes(b))? {
                         self.target.recurrent.insert(b, kernels);
                     }
@@ -524,10 +1266,10 @@ impl<'a> Preparation<'a> {
                 )
                 | None => {}
             }
-            match block
-                .feed_forward()
-                .filter(|slot| feeds.insert(*slot))
-            {
+            if let Some(calls) = block.feed_forward().and_then(|feed| feed_demand.get(&feed)) {
+                self.tuning.set_invocations(calls.clone(), false);
+            }
+            match block.feed_forward().filter(|slot| feeds.insert(*slot)) {
                 Some(FeedForwardProgramSlot::Dense(b)) if !self.target.dense.contains_key(&b) => {
                     if let Some(kernels) = self.dense(b, dense_layers.scopes(b))? {
                         self.target.dense.insert(b, kernels);
@@ -563,6 +1305,9 @@ impl<'a> Preparation<'a> {
                 | None => {}
             }
         }
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.target.clone(), true);
+        }
         let per_layer_layers = BindingLayers::of(
             target
                 .blocks()
@@ -583,14 +1328,42 @@ impl<'a> Preparation<'a> {
                 self.target.per_layer_entry.insert(b, kernels);
             }
         }
+        let ngram_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| Some((block.ngram()?, sublayer_scope(index, 2)))),
+        );
+        let mut ngrams = HashSet::new();
+        for b in target.blocks().iter().filter_map(|block| block.ngram()) {
+            if ngrams.insert(b) && !self.target.ngram.contains_key(&b) {
+                if let Some(kernels) = self.ngram(b, ngram_layers.scopes(b))? {
+                    self.target.ngram.insert(b, kernels);
+                }
+            }
+        }
+        let mut streams = HashSet::new();
+        for b in target.blocks().iter().filter_map(|block| block.streams()) {
+            if streams.insert(b) && !self.target.streams.contains_key(&b) {
+                if let Some(kernels) =
+                    self.streams(b, self.stream_sites.clone(), WeightScope::Target)?
+                {
+                    self.target.streams.insert(b, kernels);
+                }
+            }
+        }
         let b = target.readout();
         let bindings = format!("{b:?}");
-        let features = self.features(&bindings, b.norm, b.activation)?;
+        let features = self.target_features(&bindings, b.norm, b.activation)?;
+        let weight = b.head.packed();
         let head = match b.head {
-            ReadoutHead::Packed { weight, .. } => {
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
                 let head = self.spec.tuned(
                     &mut self.tuning,
                     &HeadRowsTuning {
+                        projection_scope: WeightScope::Target,
+                        norm_scope: WeightScope::Target,
                         norm: b.norm,
                         weight,
                         activation: b.activation,
@@ -610,9 +1383,34 @@ impl<'a> Preparation<'a> {
                 head.zip(selected)
                     .map(|(head, selected)| ReadoutHeadKernels::Packed { head, selected })
             }
-            ReadoutHead::Progressive => self
-                .progressive(b.norm, b.activation, None)?
-                .map(ReadoutHeadKernels::Progressive),
+        };
+        let qualified = self.qualified_readout(
+            ReadoutReader::Target(b),
+            WeightScope::Target,
+            WeightScope::Target,
+            b.norm,
+            weight.element,
+            b.activation,
+            self.softcap,
+            false,
+            self.selection_limits
+                .map_or(0, |limits| limits.max_selected_rows),
+            head.as_ref().map(|head| match head {
+                ReadoutHeadKernels::Packed { head, .. } => {
+                    ProjectionKernels::RawPacked(head.clone())
+                }
+                _ => unreachable!("ordinary target readout is canonical packed"),
+            }),
+        )?;
+        let head = match (head, qualified) {
+            (
+                Some(ReadoutHeadKernels::Packed { head, selected }),
+                Some(ProjectionKernels::Qualified { progressive, .. }),
+            ) => Some(ReadoutHeadKernels::Qualified {
+                packed: Box::new(ReadoutHeadKernels::Packed { head, selected }),
+                progressive,
+            }),
+            (head, _) => head,
         };
         if let (Some(features), Some(head)) = (features, head) {
             self.target
@@ -620,7 +1418,7 @@ impl<'a> Preparation<'a> {
                 .insert(b, ReadoutKernels { features, head });
         }
         if let Some(b) = target.features() {
-            if let Some(kernel) = self.features(&format!("{b:?}"), b.norm, b.activation)? {
+            if let Some(kernel) = self.target_features(&format!("{b:?}"), b.norm, b.activation)? {
                 self.target.features.insert(b, kernel);
             }
         }
@@ -667,46 +1465,50 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
-    /// A progressive head's certified levels and full exact pass over its
-    /// planes' leading `rows` (every row when `None`).
-    fn progressive(
-        &mut self,
-        norm: Element,
-        activation: Element,
-        rows: Option<u64>,
-    ) -> Result<Option<ProgressiveReadoutKernels>, CatalogFailure> {
-        let tuning = ProgressiveTuning {
-            norm,
-            activation,
-            epsilon: self.epsilon,
-            certified_rows: crate::programs::graph::readout::certified_rows(self.spec.backend()),
-            rows,
-        };
-        let top = self.spec.tuned(&mut self.tuning, &TopRowsTuning(tuning))?;
-        let refine = self.spec.tuned(&mut self.tuning, &RefineRowsTuning(tuning))?;
-        let exact = self.spec.tuned(&mut self.tuning, &ExactRowsTuning(tuning))?;
-        let planes = self.spec.tuned(&mut self.tuning, &PlanesRowsTuning(tuning))?;
-        Ok(match (top, refine, exact, planes) {
-            (Some(top), Some(refine), Some(exact), Some(planes)) => Some(ProgressiveReadoutKernels {
-                top,
-                refine,
-                exact,
-                planes,
-            }),
-            _ => None,
-        })
-    }
-
-    /// `readout_features_rows` at this model's width.
+    /// `readout_features_rows` over one normalized row at this model's
+    /// width.
     fn features(
         &mut self,
         bindings: &str,
         norm: Element,
         activation: Element,
     ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
+        self.features_at(bindings, norm, activation, self.hidden, (1, self.hidden))
+    }
+
+    /// `readout_features_rows` over the target decoder's exit: the exit
+    /// site's partial rows, or the final row under the output norm.
+    fn target_features(
+        &mut self,
+        bindings: &str,
+        norm: Element,
+        activation: Element,
+    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
+        let form = self
+            .tuning
+            .model()
+            .readout_form(WeightScope::Target, self.hidden)
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "readout_features_rows",
+                bindings: bindings.into(),
+                outcome,
+            })?;
+        self.features_at(bindings, norm, activation, self.hidden, form)
+    }
+
+    /// `readout_features_rows` over rows `width` wide in the input form
+    /// `(parts, norm extent)`.
+    fn features_at(
+        &mut self,
+        bindings: &str,
+        norm: Element,
+        activation: Element,
+        width: u64,
+        (parts, norm_extent): (u64, u64),
+    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
         self.spec.fixed(
             bindings,
-            &[("D", self.hidden)],
+            &[("D", width), ("PT", parts), ("NM", norm_extent)],
             readout_features_rows::native_entry_with(readout_features_rows::Elements {
                 NW: norm,
                 A: activation,
@@ -741,22 +1543,33 @@ impl<'a> Preparation<'a> {
             }
         })?;
         let mix = || AttentionMix {
+            codec: binding.history,
             activation,
             shape,
             scopes: scopes.clone(),
             epsilon: self.epsilon,
             decode_rows: None,
-            listed: false,
+            listing: PrefillListing::Every,
             window,
+            selection: binding.selection,
         };
-        let history = match binding.history {
-            KvCodec::Dense => {
+        // The history's prefill reads every visible row (a selected read's
+        // classes without scoring too); its WorkList form is the selection's.
+        let visible = || AttentionMix {
+            selection: None,
+            ..mix()
+        };
+        let history = match binding.history.encoding() {
+            magnitude_state::HistoryEncoding::Dense => {
                 // As for K8/V4, multi-row launches (draft blocks,
                 // verification) get their own tuning identity, so their
-                // grouped form is not displaced by the single-row one.
+                // grouped form is not displaced by the single-row one. CUDA
+                // also changes history-tile row capacity with its warp count.
                 let split_decode = matches!(
                     self.spec.backend(),
-                    seismic::BackendName::Metal | seismic::BackendName::Vulkan
+                    seismic::BackendName::Metal
+                        | seismic::BackendName::Vulkan
+                        | seismic::BackendName::Cuda
                 ) && self.limits.max_rows >= 2;
                 let mut single = mix();
                 if split_decode {
@@ -776,41 +1589,56 @@ impl<'a> Preparation<'a> {
                 };
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?;
-                let append = fixed!(self.spec, attention_append_dense, format!("{shape:?}"),
-                    attention_append_dense::Elements { A: binding.activation },
-                    statics &shape.append_statics());
+                    .tuned(&mut self.tuning, &AttentionPrefillTuning(visible()))?;
+                let append = fixed!(
+                    self.spec,
+                    attention_append_dense,
+                    format!("{shape:?}"),
+                    attention_append_dense::Elements {
+                        A: binding.activation
+                    },
+                    statics & shape.append_statics()
+                );
                 decode
                     .zip(prefill)
                     .zip(append)
-                    .map(|((decode, prefill), append)| AttentionHistoryKernels::Dense {
-                        append,
-                        decode,
-                        verify,
-                        prefill,
-                    })
+                    .map(
+                        |((decode, prefill), append)| AttentionHistoryKernels::Dense {
+                            append,
+                            decode,
+                            verify,
+                            prefill,
+                        },
+                    )
             }
-            KvCodec::AffineK8V4 => {
+            magnitude_state::HistoryEncoding::Affine => {
                 let split_decode = matches!(
                     self.spec.backend(),
-                    seismic::BackendName::Metal | seismic::BackendName::Vulkan
+                    seismic::BackendName::Metal
+                        | seismic::BackendName::Vulkan
+                        | seismic::BackendName::Cuda
                 ) && self.limits.max_rows >= 2;
                 let mut single = mix();
-                if self.spec.backend() == seismic::BackendName::Vulkan && split_decode {
+                // The base kernel serves only single-row decode when the
+                // graph binds separate verification kernels. Pricing their
+                // rows here as well would duplicate the same served work.
+                if split_decode {
                     single.decode_rows = Some(1..2);
                 }
                 let decode = self
                     .spec
                     .tuned(&mut self.tuning, &AttentionDecodeK8V4Tuning(single))?;
-                let specialized_m4 = split_decode
-                    && self.spec.backend() == seismic::BackendName::Metal
-                    && shape.group == 8
-                    && shape.width == 256
-                    && self.limits.max_rows >= 4;
+                let packed_four_rows = split_decode
+                    && separates_packed_attention_rows(
+                        self.spec.backend(),
+                        shape.group,
+                        shape.width,
+                        self.limits.max_rows,
+                    );
                 let verify = if split_decode {
                     let mut selected = mix();
                     selected.decode_rows = Some(
-                        2..if specialized_m4 {
+                        2..if packed_four_rows {
                             4
                         } else {
                             crate::operators::attention::graph::DECODE_ROWS + 1
@@ -824,7 +1652,7 @@ impl<'a> Preparation<'a> {
                 // The packed form reuses each K/V tile across four Verify
                 // rows. Give that workload its own tuning identity so
                 // shorter and wider rows cannot displace its form.
-                let verify_four = if specialized_m4 {
+                let verify_four = if packed_four_rows {
                     let mut selected = mix();
                     selected.decode_rows = Some(4..5);
                     self.spec
@@ -832,7 +1660,7 @@ impl<'a> Preparation<'a> {
                 } else {
                     None
                 };
-                let verify_eight = if specialized_m4 && self.limits.max_rows >= 5 {
+                let verify_eight = if packed_four_rows && self.limits.max_rows >= 5 {
                     let mut selected = mix();
                     selected.decode_rows =
                         Some(5..crate::operators::attention::graph::DECODE_ROWS + 1);
@@ -846,45 +1674,128 @@ impl<'a> Preparation<'a> {
                 // are two kernels with their own admissible forms.
                 // (`StateResourcePlan::lists_history_tiles`, of the opened
                 // device's own fact; graph preparation checks they agree.)
-                let lists = binding.history == KvCodec::AffineK8V4
+                let lists = crate::operators::attention::graph::lists_history_tiles(binding)
                     && crate::planning::reads_decoded_history(
                         self.spec.backend(),
                         self.spec.forms_tensor_operations(),
                         shape.width,
                     );
+                // A launch whose rows see at most one request's history
+                // lists the tiles they see; the unlisted kernel serves the
+                // others, or every launch where nothing lists.
+                let capacity = super::tuning::request_history_rows(
+                    &self.tuning.model(),
+                    magnitude_state::KvCodec::AffineK8V4,
+                    window,
+                )
+                .map_err(|outcome| CatalogFailure::Preparation {
+                    entry: "attention_prefill_k8v4",
+                    bindings: format!("{shape:?}"),
+                    outcome,
+                })?;
+                let mut unlisted = visible();
+                if lists {
+                    unlisted.listing = PrefillListing::Unlisted { capacity };
+                }
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?;
+                    .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(unlisted))?;
                 let prefill_listed = if lists {
-                    let mut listed = mix();
-                    listed.listed = true;
+                    let mut listed = visible();
+                    listed.listing = PrefillListing::Listed { capacity };
                     self.spec
                         .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(listed))?
                 } else {
                     None
                 };
-                let append = fixed!(self.spec, attention_append_k8v4, format!("{shape:?}"),
-                    attention_append_k8v4::Elements { A: binding.activation },
-                    statics &shape.append_statics());
+                let mut append_statics = shape.append_statics();
+                append_statics.extend(
+                    crate::operators::attention::graph::affine_dimensions(binding.history)
+                        .map_err(|error| CatalogFailure::Preparation {
+                            entry: "attention_append_k8v4",
+                            bindings: format!("{:?}", binding.history),
+                            outcome: error.to_string(),
+                        })?,
+                );
+                let append = fixed!(
+                    self.spec,
+                    attention_append_k8v4,
+                    format!("{shape:?};codec={:?}", binding.history),
+                    attention_append_k8v4::Elements {
+                        A: binding.activation
+                    },
+                    statics & append_statics
+                );
                 decode
                     .zip(prefill)
                     .zip(append)
-                    .map(|((decode, prefill), append)| AttentionHistoryKernels::AffineK8V4 {
-                        append,
-                        decode,
-                        verify,
-                        verify_four,
-                        verify_eight,
-                        prefill,
-                        prefill_listed,
-                    })
+                    .map(
+                        |((decode, prefill), append)| AttentionHistoryKernels::AffineK8V4 {
+                            append,
+                            decode,
+                            verify,
+                            verify_four,
+                            verify_eight,
+                            prefill,
+                            prefill_listed,
+                        },
+                    )
             }
-            KvCodec::RotatedK4V4 => {
+            magnitude_state::HistoryEncoding::Unsupported => {
                 return Err(CatalogFailure::Preparation {
                     entry: "attention_decode",
                     bindings: format!("{shape:?}"),
                     outcome: "the native path has no rotated K4/V4 history entries".into(),
-                })
+                });
+            }
+        };
+        // A selected read's indexer: its projection, tuned over the layers'
+        // indexer weights, and its selection at the attention's rotary.
+        let selection = match binding.selection {
+            None => Some(None),
+            Some(selection) => {
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &IndexerProjectTuning {
+                        binding,
+                        selection,
+                        scopes: scopes.clone(),
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                let select = fixed!(
+                    self.spec,
+                    indexer_select,
+                    format!("{selection:?};P={}", shape.rotary_pairs),
+                    indexer_select::Elements {
+                        A: binding.activation
+                    },
+                    statics
+                        & [
+                            ("H", selection.shape.heads),
+                            ("P", shape.rotary_pairs),
+                            ("S", selection.shape.width - 2 * shape.rotary_pairs),
+                            ("SB", selection.shape.block),
+                        ]
+                );
+                let prefill = match binding.history.encoding() {
+                    magnitude_state::HistoryEncoding::Affine => self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?
+                        .map(SelectedPrefillKernel::AffineK8V4),
+                    _ => self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?
+                        .map(SelectedPrefillKernel::Dense),
+                };
+                match (project, select, prefill) {
+                    (Some(project), Some(select), Some(prefill)) => Some(Some(SelectionKernels {
+                        project,
+                        select,
+                        prefill,
+                    })),
+                    _ => None,
+                }
             }
         };
         let output = match binding.tail {
@@ -910,12 +1821,16 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(SublayerOutput::PostNorm),
         };
-        Ok(match (project, history, output) {
-            (Some(project), Some(history), Some(output)) => Some(AttentionKernels {
-                project,
-                history,
-                output,
-            }),
+        Ok(match (project, history, output, selection) {
+            (Some(project), Some(history), Some(output), Some(selection)) => {
+                Some(AttentionKernels {
+                    codec: binding.history,
+                    project,
+                    history,
+                    output,
+                    selection,
+                })
+            }
             _ => None,
         })
     }
@@ -961,9 +1876,10 @@ impl<'a> Preparation<'a> {
                     ("P", shape.head_width)
                 ]
         );
-        let output = self
-            .spec
-            .tuned(&mut self.tuning, &StateSpaceOutputTuning { binding, scopes })?;
+        let output = self.spec.tuned(
+            &mut self.tuning,
+            &StateSpaceOutputTuning { binding, scopes },
+        )?;
         Ok(match (project, step, chunk, gate, output) {
             (Some(project), Some(step), Some(chunk), Some(gate), Some(output)) => {
                 Some(StateSpaceKernels {
@@ -1101,6 +2017,7 @@ impl<'a> Preparation<'a> {
             up,
             down,
             activation,
+            function,
             tail,
             // The tunings read their scale ports' extents from the plan.
             scales: _,
@@ -1114,8 +2031,7 @@ impl<'a> Preparation<'a> {
                 activation,
                 gate_kind: WeightKind::DenseGate,
                 up_kind: WeightKind::DenseUp,
-                // SiLU: the admitted dense form.
-                function: 0,
+                function,
                 scopes: scopes.clone(),
                 epsilon: self.epsilon,
             },
@@ -1174,6 +2090,132 @@ impl<'a> Preparation<'a> {
         Ok(gate
             .zip(output)
             .map(|(gate, output)| PerLayerKernels { gate, output }))
+    }
+
+    /// An n-gram input sublayer; `scopes` are its sublayers' scopes.
+    fn ngram(
+        &mut self,
+        binding: crate::NGramBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<NGramKernels>, CatalogFailure> {
+        let projection = |kind| ProjectRowsTuning {
+            weight: match kind {
+                WeightKind::NGramKey => binding.key,
+                _ => binding.value,
+            },
+            activation: binding.activation,
+            kind,
+            output: Element::f32(),
+            scopes: scopes.clone(),
+        };
+        let key = self
+            .spec
+            .tuned(&mut self.tuning, &projection(WeightKind::NGramKey))?;
+        let value = self
+            .spec
+            .tuned(&mut self.tuning, &projection(WeightKind::NGramValue))?;
+        let rows = self.spec.fixed(
+            "fixed",
+            &[("C", binding.context), ("P", binding.heads_per_order)],
+            ngram_rows::native_entry(),
+        )?;
+        let stored = self.spec.fixed(
+            &format!(
+                "E={},A={}",
+                binding.table_source.name(),
+                binding.activation.name()
+            ),
+            &[("W", binding.width)],
+            stored_rows::native_entry_with(stored_rows::Elements {
+                E: binding.table_source,
+                U: binding.table,
+                A: binding.activation,
+            }),
+        )?;
+        let norm = format!("NW={}", binding.norm.name());
+        let gate = self.spec.fixed(
+            &norm,
+            &[("H", binding.hidden), ("S", binding.streams)],
+            ngram_gate::native_entry_with(ngram_gate::Elements { NW: binding.norm }),
+        )?;
+        let inject = self.spec.fixed(
+            &norm,
+            &[
+                ("H", binding.hidden),
+                ("S", binding.streams),
+                ("K", binding.kernel),
+            ],
+            ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
+        )?;
+        let notice = self
+            .spec
+            .fixed("fixed", &[], selection_notice::native_entry())?;
+        Ok(match (rows, stored, key, value, gate, inject, notice) {
+            (
+                Some(rows),
+                Some(stored),
+                Some(key),
+                Some(value),
+                Some(gate),
+                Some(inject),
+                Some(notice),
+            ) => Some(NGramKernels {
+                rows,
+                stored,
+                key,
+                value,
+                gate,
+                inject,
+                notice,
+            }),
+            _ => None,
+        })
+    }
+
+    /// A decoder's hyper-connection streams: the sublayers' mix sites, the
+    /// exit site, and the widening of the embedded rows.
+    fn streams(
+        &mut self,
+        binding: StreamsBinding,
+        sites: Vec<WeightScope>,
+        exit_scope: WeightScope,
+    ) -> Result<Option<StreamsKernels>, CatalogFailure> {
+        let down = self.spec.tuned(
+            &mut self.tuning,
+            &StreamMixDownTuning {
+                binding,
+                injected: true,
+                scopes: sites.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let exit = self.spec.tuned(
+            &mut self.tuning,
+            &StreamMixDownTuning {
+                binding,
+                injected: false,
+                scopes: vec![exit_scope],
+                epsilon: self.epsilon,
+            },
+        )?;
+        let up = self.spec.tuned(
+            &mut self.tuning,
+            &StreamMixUpTuning {
+                binding,
+                scopes: sites.iter().copied().chain([exit_scope]).collect(),
+            },
+        )?;
+        let spec = &mut self.spec;
+        let repeat = fixed!(spec, repeat_rows, "fixed");
+        Ok(match (down, exit, up, repeat) {
+            (Some(down), Some(exit), Some(up), Some(repeat)) => Some(StreamsKernels {
+                down,
+                exit,
+                up,
+                repeat,
+            }),
+            _ => None,
+        })
     }
 
     /// The per-layer entry: the embedding's projection into F32 per-layer
@@ -1288,7 +2330,7 @@ impl<'a> Preparation<'a> {
                 activation: dense.activation,
                 gate_kind: WeightKind::DenseGate,
                 up_kind: WeightKind::DenseUp,
-                function: 0,
+                function: dense.function,
                 scopes: dense_scopes.clone(),
                 epsilon: self.epsilon,
             },
@@ -1474,7 +2516,7 @@ impl<'a> Preparation<'a> {
                     entry: "dense_output",
                     bindings: format!("{binding:?}"),
                     outcome: "the shared expert's shape and binding disagree".into(),
-                })
+                });
             }
         };
         let latent = match binding.latent {
@@ -1541,13 +2583,12 @@ impl<'a> Preparation<'a> {
             features: b.features,
             shared: b.shared,
         };
-        let form = DecodeForm::of(self.spec.backend()).map_err(|outcome| {
-            CatalogFailure::Preparation {
+        let form =
+            DecodeForm::of(self.spec.backend()).map_err(|outcome| CatalogFailure::Preparation {
                 entry: "routed_route_shared",
                 bindings: format!("{b:?}"),
                 outcome,
-            }
-        })?;
+            })?;
         let route_tuning = RoutedRouteTuning {
             norm: b.norm,
             router: b.router,
@@ -1658,6 +2699,11 @@ impl<'a> Preparation<'a> {
     }
 
     fn head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            let mut calls = demand.head.clone();
+            calls.add(&demand.head_prefix);
+            self.tuning.set_invocations(calls, true);
+        }
         let Some(head_plan) = plan.head() else {
             return Ok(());
         };
@@ -1673,18 +2719,53 @@ impl<'a> Preparation<'a> {
         let layers = scoped(head_scope);
         let attention_layers = scoped(|index| head_sublayer_scope(index, 0));
         let feed_forward_layers = scoped(|index| head_sublayer_scope(index, 1));
-        for &b in head_plan.blocks() {
-            if self
-                .head
-                .as_ref()
-                .is_some_and(|head| head.input.contains_key(&b))
+        let mut registered = HashSet::new();
+        for (head_index, &b) in head_plan.blocks().iter().enumerate() {
+            if !registered.insert(b)
+                || self
+                    .head
+                    .as_ref()
+                    .is_some_and(|head| head.input.contains_key(&b))
             {
                 continue;
             }
+            if let Some(demand) = &self.graph_demand {
+                let mut calls = demand.head.clone();
+                calls.add(&demand.head_prefix);
+                self.tuning.set_invocations(calls, true);
+            }
             let bindings = format!("{b:?}");
+            let stream_kernels = b
+                .streams
+                .map(|streams| {
+                    self.streams(
+                        streams,
+                        vec![
+                            head_sublayer_scope(head_index, 0),
+                            head_sublayer_scope(head_index, 1),
+                        ],
+                        head_scope(head_index),
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let copy = fixed!(
+                self.spec,
+                feature_copy,
+                &bindings,
+                feature_copy::Elements { A: b.conditioning }
+            );
+            let gather = fixed!(
+                self.spec,
+                feature_rows,
+                &bindings,
+                feature_rows::Elements { A: b.conditioning }
+            );
             let input = self.spec.tuned(
                 &mut self.tuning,
                 &DraftRowsTuning {
+                    conditioning: b.conditioning,
+                    streams: b.streams.map_or(1, |s| s.geometry.streams),
                     embedding: b.embedding_table,
                     embedding_norm: b.embedding_norm,
                     hidden_norm: b.hidden_norm,
@@ -1694,13 +2775,30 @@ impl<'a> Preparation<'a> {
                     epsilon: self.epsilon,
                 },
             )?;
+            // Priming injects K/V only: it does not run attention or FFN.
+            if let Some(demand) = &self.graph_demand {
+                self.tuning.set_invocations(demand.head.clone(), true);
+            }
             // The draft head's history is always dense (its binding says so).
             let attention = self.attention(b.attention, attention_layers.scopes(b))?;
-            let priming_project = self.spec.tuned(&mut self.tuning, &AttentionProjectTuning {
-                binding: AttentionBinding { key_value_only: true, ..b.attention },
-                scopes: attention_layers.scopes(b),
-                epsilon: self.epsilon,
-            })?;
+            if let Some(demand) = &self.graph_demand {
+                self.tuning
+                    .set_invocations(demand.head_prefix.clone(), true);
+            }
+            let priming_project = self.spec.tuned(
+                &mut self.tuning,
+                &AttentionProjectTuning {
+                    binding: AttentionBinding {
+                        key_value_only: true,
+                        ..b.attention
+                    },
+                    scopes: attention_layers.scopes(b),
+                    epsilon: self.epsilon,
+                },
+            )?;
+            if let Some(demand) = &self.graph_demand {
+                self.tuning.set_invocations(demand.head.clone(), true);
+            }
             let feed_forward = match b.feed_forward {
                 FeedForwardProgramSlot::Dense(binding) => self
                     .dense(binding, feed_forward_layers.scopes(b))?
@@ -1714,25 +2812,54 @@ impl<'a> Preparation<'a> {
                         entry: "routed_select",
                         bindings: format!("{b:?}"),
                         outcome: "draft heads run the fused routed form only".into(),
-                    })
+                    });
                 }
             };
-            let features = self.features(&bindings, b.output_norm, b.activation)?;
+            if let Some(demand) = &self.graph_demand {
+                let mut calls = InvocationCounts::default();
+                for _ in &layers.scopes(b) {
+                    calls.add(&demand.head);
+                }
+                self.tuning.set_invocations(calls, false);
+            }
+            let form = b
+                .streams
+                .map_or((1, self.hidden), |streams| (streams.geometry.streams, 0));
+            let features =
+                self.features_at(&bindings, b.output_norm, b.activation, self.hidden, form)?;
+            let weight = b.projection.packed();
             let logits = match b.projection {
-                HeadProjection::Packed(weight) => self
+                ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
                     .spec
                     .tuned(
                         &mut self.tuning,
-                        &HeadLogitsTuning {
+                        &PreparedProjectionTuning {
+                            scope: WeightScope::Target,
+                            kind: WeightKind::Output,
                             weight,
                             activation: b.activation,
+                            columns: None,
+                            indexed: false,
+                            softcap: 0.0,
                         },
                     )?
-                    .map(HeadLogitsKernels::Packed),
-                HeadProjection::Progressive => self
-                    .progressive(b.output_norm, b.activation, None)?
-                    .map(HeadLogitsKernels::Progressive),
+                    .map(ProjectionKernels::PreparedPacked),
             };
+            let qualified = self.qualified_readout(
+                ReadoutReader::HeadBlock(b),
+                WeightScope::Target,
+                head_scope(head_index),
+                b.output_norm,
+                weight.element,
+                b.activation,
+                0.0,
+                true,
+                self.selection_limits.map_or(0, |limits| {
+                    limits.max_launch_slots.min(limits.max_launch_rows)
+                }),
+                logits.clone(),
+            )?;
+            let logits = qualified.or(logits);
             let head = self
                 .head
                 .as_mut()
@@ -1744,8 +2871,23 @@ impl<'a> Preparation<'a> {
                 Some(feed_forward),
                 Some(features),
                 Some(logits),
-            ) = (input, attention, priming_project, feed_forward, features, logits)
-            {
+            ) = (
+                input,
+                attention,
+                priming_project,
+                feed_forward,
+                features,
+                logits,
+            ) {
+                if let Some(streams) = stream_kernels {
+                    head.streams.insert(b, streams);
+                }
+                if let Some(copy) = copy {
+                    head.copy.insert(b, copy);
+                }
+                if let Some(gather) = gather {
+                    head.gather.insert(b, gather);
+                }
                 head.input.insert(b, input);
                 head.attention.insert(b, attention);
                 head.priming_project.insert(b, priming_project);
@@ -1761,7 +2903,7 @@ impl<'a> Preparation<'a> {
                             entry: "routed_select",
                             bindings: format!("{b:?}"),
                             outcome: "draft heads run the fused routed form only".into(),
-                        })
+                        });
                     }
                 }
                 head.features.insert(b, features);
@@ -1785,10 +2927,143 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
+    /// A draft head reading target history, apart from its decoder blocks
+    /// (prepared with the target's): the join of its input halves, the
+    /// projections into and out of its width, its normalized output and its
+    /// own vocabulary table.
+    fn shared_head(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.head.clone(), true);
+        }
+        let Some(head) = plan.shared_head() else {
+            return Ok(());
+        };
+        let activation = head.activation;
+        let scopes = vec![head_scope(0)];
+        let bindings = format!("A={}", activation.name());
+        let join = fixed!(
+            self.spec,
+            tap_rows,
+            bindings,
+            tap_rows::Elements { A: activation }
+        );
+        // Both projections publish F32 rows: the residual the blocks read,
+        // and the hidden row the next step joins.
+        let project = |this: &mut Self, weight: Element, kind: WeightKind| {
+            this.spec.tuned(
+                &mut this.tuning,
+                &ProjectRowsTuning {
+                    weight,
+                    activation,
+                    kind,
+                    output: Element::f32(),
+                    scopes: scopes.clone(),
+                },
+            )
+        };
+        let input = project(self, head.input.element, WeightKind::HeadInputProjection)?;
+        let chain = project(self, head.chain.element, WeightKind::HeadChainProjection)?;
+        let features = self.features_at(
+            &format!("NW={},A={}", head.output_norm.name(), activation.name()),
+            head.output_norm,
+            activation,
+            head.width,
+            (1, head.width),
+        )?;
+        let compact_columns = head.clustered.as_ref().map(|cluster| {
+            cluster.selected_clusters * (cluster.token_order.len() as u64 / cluster.clusters)
+        });
+        let projection = match head.projection {
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &PreparedProjectionTuning {
+                        scope: head_scope(0),
+                        kind: WeightKind::Output,
+                        weight,
+                        activation,
+                        columns: compact_columns,
+                        indexed: head.clustered.is_some(),
+                        softcap: 0.0,
+                    },
+                )?
+                .map(ProjectionKernels::PreparedPacked),
+        };
+        let qualified = if head.clustered.is_none() {
+            let weight = head.projection.packed();
+            self.qualified_readout(
+                ReadoutReader::SharedHead,
+                head_scope(0),
+                head_scope(0),
+                head.output_norm,
+                weight.element,
+                activation,
+                0.0,
+                true,
+                self.selection_limits.map_or(0, |limits| {
+                    limits
+                        .max_launch_slots
+                        .min(limits.max_launch_rows)
+                        .min(limits.max_drafting_slots)
+                }),
+                projection.clone(),
+            )?
+        } else {
+            None
+        };
+        let projection = qualified.or(projection);
+        let centroids = head
+            .clustered
+            .as_ref()
+            .map(|cluster| {
+                self.spec.tuned(
+                    &mut self.tuning,
+                    &PreparedProjectionTuning {
+                        scope: head_scope(0),
+                        kind: WeightKind::OutputCentroids,
+                        weight: cluster.centroids.element,
+                        activation,
+                        columns: None,
+                        indexed: false,
+                        softcap: 0.0,
+                    },
+                )
+            })
+            .transpose()?
+            .flatten();
+        let (cluster_selection, cluster_rows, placement) = if head.clustered.is_some() {
+            (
+                fixed!(self.spec, draft_top_k, ""),
+                fixed!(self.spec, cluster_token_rows, ""),
+                fixed!(self.spec, place_logits_rows, ""),
+            )
+        } else {
+            (None, None, None)
+        };
+        let kernels = self
+            .shared_head
+            .as_mut()
+            .expect("a shared head plan creates its group");
+        kernels.join = join;
+        kernels.input = input;
+        kernels.features = features;
+        kernels.projection = projection;
+        kernels.centroids = centroids;
+        kernels.cluster_selection = cluster_selection;
+        kernels.cluster_rows = cluster_rows;
+        kernels.placement = placement;
+        kernels.chain = chain;
+        Ok(())
+    }
+
     /// A separate draft: per distinct binding, its layers' attention (block
     /// and injection) and dense entries; the block embedding; the output
     /// norm and projection of the proposing rows; DSpark's chain entries.
     fn draft(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.draft.clone(), true);
+        }
         let Some(draft_plan) = plan.draft() else {
             return Ok(());
         };
@@ -1813,9 +3088,13 @@ impl<'a> Preparation<'a> {
                 .enumerate()
                 .map(|(index, b)| (b.feed_forward, draft_scope(index, 1))),
         );
+        let mut registered_attention = HashSet::new();
+        let mut registered_dense = HashSet::new();
         for b in draft_plan.blocks() {
             for attention in [b.attention, b.injection] {
-                if self.draft_kernels().attention.contains_key(&attention) {
+                if !registered_attention.insert(attention)
+                    || self.draft_kernels().attention.contains_key(&attention)
+                {
                     continue;
                 }
                 if let Some(kernels) =
@@ -1824,7 +3103,9 @@ impl<'a> Preparation<'a> {
                     self.draft_kernels().attention.insert(attention, kernels);
                 }
             }
-            if !self.draft_kernels().dense.contains_key(&b.feed_forward) {
+            if registered_dense.insert(b.feed_forward)
+                && !self.draft_kernels().dense.contains_key(&b.feed_forward)
+            {
                 if let Some(kernels) =
                     self.dense(b.feed_forward, dense_layers.scopes(b.feed_forward))?
                 {
@@ -1841,16 +3122,23 @@ impl<'a> Preparation<'a> {
                 A: b.activation,
             }),
         )?;
-        let head = self.spec.tuned(
-            &mut self.tuning,
-            &HeadRowsTuning {
-                norm: draft_plan.output_norm(),
-                weight: draft_plan.projection(),
-                activation: draft_plan.activation(),
-                epsilon: self.epsilon,
-                rows: None,
-            },
-        )?;
+        let head = match draft_plan.projection() {
+            ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
+                .spec
+                .tuned(
+                    &mut self.tuning,
+                    &HeadRowsTuning {
+                        projection_scope: draft_plan.projection_scope(),
+                        norm_scope: WeightScope::Draft,
+                        norm: draft_plan.output_norm(),
+                        weight,
+                        activation: draft_plan.activation(),
+                        epsilon: self.epsilon,
+                        rows: Some(self.vocabulary),
+                    },
+                )?
+                .map(ProjectionKernels::RawPacked),
+        };
         let shape = self.spec.tuned(
             &mut self.tuning,
             &ShapeRowsTuning {
@@ -1894,23 +3182,11 @@ impl<'a> Preparation<'a> {
                         scopes: vec![WeightScope::Draft],
                     },
                 )?;
-                let features = self.features(&bindings, draft_plan.output_norm(), activation)?;
-                let confidence = fixed!(
-                    self.spec,
-                    draft_confidence,
-                    bindings,
-                    draft_confidence::Elements { A: activation },
-                    statics & [("D", self.hidden), ("R", rank)]
-                );
-                match (embedding, projection, features, confidence) {
-                    (Some(embedding), Some(projection), Some(features), Some(confidence)) => {
-                        Some(MarkovKernels {
-                            embedding,
-                            projection,
-                            features,
-                            confidence,
-                        })
-                    }
+                match (embedding, projection) {
+                    (Some(embedding), Some(projection)) => Some(MarkovKernels {
+                        embedding,
+                        projection,
+                    }),
                     _ => None,
                 }
             }
@@ -2047,6 +3323,9 @@ impl<'a> Preparation<'a> {
     }
 
     fn vision(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if let Some(demand) = &self.graph_demand {
+            self.tuning.set_invocations(demand.target.clone(), true);
+        }
         let Some(vision_plan) = plan.vision() else {
             return Ok(());
         };
@@ -2066,8 +3345,7 @@ impl<'a> Preparation<'a> {
             macro_rules! prepare {
                 ($module:ident, $map:ident, $elements:expr) => {{
                     let elements = $elements;
-                    if let Some(native) =
-                        fixed!(spec, $module, label, elements, statics & statics)
+                    if let Some(native) = fixed!(spec, $module, label, elements, statics & statics)
                     {
                         vision.$map.insert(kernel.clone(), native);
                     }

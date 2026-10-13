@@ -12,7 +12,6 @@
 #define RST_BLOCK (2048 / SEISMIC_DIM_W)
 
 #include "lib/recurrent/recurrent.h"
-#include "lib/core/arrive.h"
 
 kernel void gated_delta_step_convolved(
     device const recurrent::Storage *projection [[buffer(SEISMIC_BUFFER_PROJECTION)]],
@@ -28,7 +27,7 @@ kernel void gated_delta_step_convolved(
     device const ulong *delta [[buffer(SEISMIC_BUFFER_DELTA)]],
     device const ulong *tape [[buffer(SEISMIC_BUFFER_TAPE)]],
     device recurrent::Storage *gated [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device recurrent::Storage *mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
+    arrive::coherent_device<recurrent::Storage> mixed [[buffer(SEISMIC_BUFFER_SCRATCH_MIXED)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint3 group [[threadgroup_position_in_grid]],

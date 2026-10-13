@@ -3,7 +3,7 @@
 
 #[cfg(test)]
 mod source_check_tests {
-    use crate::checked::{check_source, SourceFile, SourceSet};
+    use crate::checked::{SourceFile, SourceSet, check_source};
     use crate::entry::{ElementBindings, SemanticNodeView};
     use crate::expr::{AnyExpr, NodeView};
 
@@ -13,11 +13,26 @@ mod source_check_tests {
         // Every slice of the first source is proved in its loop scope, so no
         // axis carries a runtime check; the second source proves nothing.
         for (source, expects_omission) in [
-            ("fn run[N](dst: &mut tensor[N] f32):\n    for i in 0..N:\n        dst[i:i+1] = zeros_like(dst[i:i+1])\n", true),
-            ("fn run(dst: &tensor[4] f32, lo: i32, hi: i32):\n    let view = dst[lo:hi]\n", false),
+            (
+                "fn run[N](dst: &mut tensor[N] f32):\n    for i in 0..N:\n        dst[i:i+1] = zeros_like(dst[i:i+1])\n",
+                true,
+            ),
+            (
+                "fn run(dst: &tensor[4] f32, lo: i32, hi: i32):\n    let view = dst[lo:hi]\n",
+                false,
+            ),
         ] {
-            let module = check_source(SourceSet::new(vec![SourceFile { path: "slice-premise.seismic".into(), text: source.into() }])).unwrap();
-            let entry = module.entry(module.entry_named("run").unwrap(), &ElementBindings::default()).unwrap();
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "slice-premise.seismic".into(),
+                text: source.into(),
+            }]))
+            .unwrap();
+            let entry = module
+                .entry(
+                    module.entry_named("run").unwrap(),
+                    &ElementBindings::default(),
+                )
+                .unwrap();
             let program = entry.program();
             let function = program.function(program.family(program.root()).reference().function());
             let mut regions = vec![function.root()];
@@ -27,16 +42,27 @@ mod source_check_tests {
                 for (_, node) in function.nodes(region) {
                     match node.view() {
                         SemanticNodeView::Loop { body, .. } => regions.push(body),
-                        SemanticNodeView::If { then, otherwise, .. } => regions.extend([then, otherwise]),
-                        SemanticNodeView::View { transform: ViewTransform::Slice { axes }, .. } => {
+                        SemanticNodeView::If {
+                            then, otherwise, ..
+                        } => regions.extend([then, otherwise]),
+                        SemanticNodeView::View {
+                            transform: ViewTransform::Slice { axes },
+                            ..
+                        } => {
                             for axis in axes {
-                                if let SliceAxis::Range { check_start, check_order, check_end, .. } = axis {
+                                if let SliceAxis::Range {
+                                    check_start,
+                                    check_order,
+                                    check_end,
+                                    ..
+                                } = axis
+                                {
                                     omitted |= !check_start && !check_order && !check_end;
                                     checked |= *check_start && *check_order && *check_end;
                                 }
                             }
                         }
-                        _ => {},
+                        _ => {}
                     }
                 }
             }
@@ -46,6 +72,57 @@ mod source_check_tests {
                 "runtime slice checks must remain attached to their actual operands: {source}"
             );
         }
+    }
+
+    #[test]
+    fn runtime_bounds_elision_uses_established_branch_facts() {
+        for (source, needs_check) in [
+            (
+                "fn run(x: &tensor[4] f32, i: i32) -> f32:\n    let mut result = 0.0\n    if i >= 0 and i < 4:\n        result = x[i]\n    return result\n",
+                false,
+            ),
+            (
+                "fn run(x: &tensor[4] f32, i: i32) -> f32:\n    return x[i]\n",
+                true,
+            ),
+        ] {
+            let module = check_source(SourceSet::new(vec![SourceFile {
+                path: "runtime-bounds.seismic".into(),
+                text: source.into(),
+            }]))
+            .unwrap();
+            let entry = module
+                .entry(
+                    module.entry_named("run").unwrap(),
+                    &ElementBindings::default(),
+                )
+                .unwrap();
+            let program = entry.program();
+            let function = program.function(program.family(program.root()).reference().function());
+            let mut regions = vec![function.root()];
+            let mut checks = 0;
+            while let Some(region) = regions.pop() {
+                for (_, node) in function.nodes(region) {
+                    match node.view() {
+                        SemanticNodeView::If {
+                            then, otherwise, ..
+                        } => regions.extend([then, otherwise]),
+                        SemanticNodeView::Loop { body, .. } => regions.push(body),
+                        SemanticNodeView::Check { .. } => checks += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(checks != 0, needs_check, "{source}");
+        }
+        let invalid = check_source(SourceSet::new(vec![SourceFile {
+            path: "invalid-static-bounds.seismic".into(),
+            text: "fn run(x: &tensor[4] f32) -> f32:\n    return x[4]\n".into(),
+        }]));
+        assert!(
+            invalid.is_err(),
+            "static invalid index must not become a runtime continuation"
+        );
     }
 
     #[test]
@@ -139,12 +216,13 @@ mod source_check_tests {
                 outcome.inputs().next().unwrap().tensor().read(0).unwrap(),
                 7.0
             );
-            assert!(function.nodes(function.root()).any(|(id, node)| node
-                .events()
-                .iter()
-                .any(|e| matches!(e.kind(), crate::entry::SemanticEventKind::MayFail))
-                && crate::failure::SourceFailure::at(function, id, failure.cause.clone())
-                    == *failure));
+            assert!(function.nodes(function.root()).any(|(id, node)| {
+                node.events()
+                    .iter()
+                    .any(|e| matches!(e.kind(), crate::entry::SemanticEventKind::MayFail))
+                    && crate::failure::SourceFailure::at(function, id, failure.cause.clone())
+                        == *failure
+            }));
         }
     }
 
@@ -246,7 +324,7 @@ fn bound(dst: &mut tensor[1] i32, index: i32):
 #[cfg(test)]
 mod result_schema_tests {
     use super::*;
-    use crate::checked::{check_source, SourceFile, SourceSet};
+    use crate::checked::{SourceFile, SourceSet, check_source};
     use crate::interp::{Arg, Interpreter, OutcomeValue, TensorData};
     use crate::reference_math::ReferenceScalar;
 
@@ -256,6 +334,71 @@ mod result_schema_tests {
             text: source.into(),
         }]))
         .unwrap()
+    }
+
+    #[test]
+    fn integer_min_max_evaluates_effectful_operands_once() {
+        let module = module(
+            "fn bump(x: &mut tensor[1] f32) -> index[1]:\n    x[0] = x[0] + 1.0\n    return index[1](0)\n\nfn probe(x: &mut tensor[1] f32) -> i32:\n    return i32(min(bump(x), max(bump(x), bump(x))))\n",
+        );
+        let entry = module
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
+            .unwrap();
+        let mut interpreter = Interpreter::new(&entry);
+        let input = interpreter.add_tensor(TensorData::dense(DType::F32, vec![1], vec![0.0]));
+        let outcome = interpreter.run(&[Arg::Tensor(input)]).unwrap();
+        assert!(matches!(
+            outcome.results().next().unwrap().value(),
+            OutcomeValue::Scalar(ReferenceScalar::I32(0))
+        ));
+        assert_eq!(
+            outcome.inputs().next().unwrap().tensor().read(0).unwrap(),
+            3.0
+        );
+    }
+
+    #[test]
+    fn mixed_quantity_min_max_preserves_word_wrapping_before_comparison() {
+        let module = module(
+            "fn mixed[N](x: i32) -> i32:\n    return max(N, x)\n\nfn probe() -> i32:\n    return mixed[N=4294967295](i32(0))\n",
+        );
+        let entry = module
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
+            .unwrap();
+        let interpreter = Interpreter::new(&entry);
+        let outcome = interpreter.run(&[]).unwrap();
+        assert!(matches!(
+            outcome.results().next().unwrap().value(),
+            OutcomeValue::Scalar(ReferenceScalar::I32(0))
+        ));
+    }
+
+    #[test]
+    fn word_max_preserves_nonnegative_range_proof_and_actual_value() {
+        let module = module(
+            "fn probe(x: i32) -> i32:\n    let mut total = i32(0)\n    for i in 0..max(x, i32(0)):\n        total = total + i32(1)\n    return total\n",
+        );
+        let entry = module
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
+            .unwrap();
+        for (input, expected) in [(-1, 0), (2, 2)] {
+            let interpreter = Interpreter::new(&entry);
+            let outcome = interpreter
+                .run(&[Arg::Scalar(ReferenceScalar::I32(input))])
+                .unwrap();
+            assert!(
+                matches!(outcome.results().next().unwrap().value(), OutcomeValue::Scalar(ReferenceScalar::I32(value)) if value == expected)
+            );
+        }
     }
 
     /// A1 §2.3.6 (1): a `T` element read carries the binding's decoded
@@ -300,7 +443,9 @@ mod result_schema_tests {
 
     #[test]
     fn declared_result_paths_survive_semantic_leaf_flattening() {
-        let module = module("fn probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, range[4])):\n    return (to_owned(x), pair)\n");
+        let module = module(
+            "fn probe(x: &tensor[1] f32, pair: (f32, range[4])) -> (tensor[1] f32, (f32, range[4])):\n    return (to_owned(x), pair)\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -318,7 +463,9 @@ mod result_schema_tests {
 
     #[test]
     fn declared_result_geometry_does_not_capture_body_runtime_values() {
-        let module = module("fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = to_owned(x)\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n    return y\n");
+        let module = module(
+            "fn probe(x: &tensor[2,3] f32) -> tensor[2,3] f32:\n    let mut y = to_owned(x)\n    for i in 0..2:\n        y = reshape(y.T, (2,3))\n    return y\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -335,7 +482,9 @@ mod result_schema_tests {
 
     #[test]
     fn return_rounding_is_an_ordered_semantic_producer() {
-        let module = module("fn scalar(x: f32) -> f16:\n    return x\n\nfn tensor(x: &tensor[2] f32) -> tensor[2] f16:\n    return to_owned(x)\n");
+        let module = module(
+            "fn scalar(x: f32) -> f16:\n    return x\n\nfn tensor(x: &tensor[2] f32) -> tensor[2] f16:\n    return to_owned(x)\n",
+        );
         for (name, expected) in [
             ("scalar", SemanticType::Scalar(DType::F16)),
             (
@@ -401,15 +550,19 @@ mod result_schema_tests {
             .entry(module.entry_named("probe").unwrap(), &bindings)
             .unwrap_err();
         let error = &errors.diagnostics().items()[0];
-        assert!(error
-            .message
-            .contains("no defined source installation conversion"));
+        assert!(
+            error
+                .message
+                .contains("no defined source installation conversion")
+        );
         assert!(error.location.span.start >= conversion_source.find("to_owned(x)").unwrap() as u32);
     }
 
     #[test]
     fn scalar_installations_and_compound_assignment_preserve_rounding_order() {
-        let module = module("fn assigned(x: f32) -> f16:\n    let mut y = f16(0.0)\n    y = x\n    return y\n\nfn called(x: f32) -> f16:\n    return helper(x)\n\nfn helper(x: f16) -> f16:\n    return x\n\nfn added(x: f32) -> f16:\n    let mut y = f16(1.0)\n    y += x\n    return y\n\nfn element_added(x: f32) -> tensor[1] f16:\n    let mut y = tensor[1] f16\n    y[0] = f16(1.0)\n    y[0] += x\n    return y\n");
+        let module = module(
+            "fn assigned(x: f32) -> f16:\n    let mut y = f16(0.0)\n    y = x\n    return y\n\nfn called(x: f32) -> f16:\n    return helper(x)\n\nfn helper(x: f16) -> f16:\n    return x\n\nfn added(x: f32) -> f16:\n    let mut y = f16(1.0)\n    y += x\n    return y\n\nfn element_added(x: f32) -> tensor[1] f16:\n    let mut y = tensor[1] f16\n    y[0] = f16(1.0)\n    y[0] += x\n    return y\n",
+        );
         let input = ReferenceScalar::F32(0x3a00_0800);
         for name in ["assigned", "called", "added"] {
             let entry = module
@@ -464,10 +617,14 @@ mod result_schema_tests {
         // L23 (a): a reassigned local keeps its declared element; the
         // conversion is written explicitly.
         assert_eq!(
-            type_error("fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = to_owned(x)\n    return y\n"),
+            type_error(
+                "fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = to_owned(x)\n    return y\n"
+            ),
             "`y` has type tensor[2] f16 but the value has type tensor[2] f32"
         );
-        let module = module("fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = f16(x)\n    return y\n\nfn stored(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y[0:2] = to_owned(x)\n    return y\n");
+        let module = module(
+            "fn assigned(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y = f16(x)\n    return y\n\nfn stored(x: &tensor[2] f32) -> tensor[2] f16:\n    let mut y = tensor[2] f16\n    y[0:2] = to_owned(x)\n    return y\n",
+        );
         for name in ["assigned", "stored"] {
             let entry = module
                 .entry(
@@ -527,9 +684,10 @@ mod result_schema_tests {
             .bind("U", packed)
             .bind("T", crate::registry::dense(DType::F32));
         let error = module.entry(entry_id, &invalid).unwrap_err();
-        assert!(error.diagnostics().items().iter().any(|item| item
-            .message
-            .contains("no defined source installation conversion")));
+        assert!(error.diagnostics().items().iter().any(|item| {
+            item.message
+                .contains("no defined source installation conversion")
+        }));
     }
 
     #[test]
@@ -537,7 +695,9 @@ mod result_schema_tests {
         // L23 (a): a reassigned `T` local takes only a `T` value, whatever
         // the bindings; storing a `U` value into it is the installation.
         assert_eq!(
-            type_error("fn assigned(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z = y\n    return z\n"),
+            type_error(
+                "fn assigned(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z = y\n    return z\n"
+            ),
             "`z` has type tensor[64] T but the value has type tensor[64] U"
         );
         let source = "fn assigned(x: tensor[64] T, y: tensor[64] T) -> tensor[64] T:\n    let mut z = x\n    z = y\n    return z\n\nfn stored(x: tensor[64] T, y: tensor[64] U) -> tensor[64] T:\n    let mut z = x\n    z[0:64] = y\n    return z\n\nfn casted(x: &tensor[64] U) -> tensor[64] f16:\n    return f16(x)\n\nfn decoded(x: &tensor[64] U) -> tensor[64] f32:\n    return f32(x)\n";
@@ -561,29 +721,34 @@ mod result_schema_tests {
         let error = module
             .entry(module.entry_named("stored").unwrap(), &same_packed)
             .unwrap_err();
-        assert!(error
-            .diagnostics()
-            .items()
-            .iter()
-            .any(|item| item.message.contains("decode-only")));
+        assert!(
+            error
+                .diagnostics()
+                .items()
+                .iter()
+                .any(|item| item.message.contains("decode-only"))
+        );
         let mixed = ElementBindings::new()
             .bind("T", crate::registry::dense(DType::F32))
             .bind("U", packed);
         let error = module
             .entry(module.entry_named("stored").unwrap(), &mixed)
             .unwrap_err();
-        assert!(error.diagnostics().items().iter().any(|item| item
-            .message
-            .contains("no defined source installation conversion")));
+        assert!(error.diagnostics().items().iter().any(|item| {
+            item.message
+                .contains("no defined source installation conversion")
+        }));
         let bound = ElementBindings::new().bind("U", packed);
         let error = module
             .entry(module.entry_named("casted").unwrap(), &bound)
             .unwrap_err();
-        assert!(error
-            .diagnostics()
-            .items()
-            .iter()
-            .any(|item| item.message.contains("packed values decode with `f32(v)`")));
+        assert!(
+            error
+                .diagnostics()
+                .items()
+                .iter()
+                .any(|item| item.message.contains("packed values decode with `f32(v)`"))
+        );
         module
             .entry(module.entry_named("decoded").unwrap(), &bound)
             .expect("f32 packed decode is source-defined");
@@ -591,7 +756,9 @@ mod result_schema_tests {
 
     #[test]
     fn compound_integer_quantity_projects_to_source_word_first() {
-        let module = module("fn probe(x: index[10000000000]) -> i32:\n    let mut y = i32(1)\n    y += x\n    return y\n");
+        let module = module(
+            "fn probe(x: index[10000000000]) -> i32:\n    let mut y = i32(1)\n    y += x\n    return y\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -612,12 +779,16 @@ mod result_schema_tests {
         // `y += y` is `y = y + y`, whose value is decoded `f32`: L23 (a)
         // rejects it for every binding of `U`, so no encoding is implied.
         assert_eq!(
-            type_error("fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y += y\n    return y\n"),
+            type_error(
+                "fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y += y\n    return y\n"
+            ),
             "`y` has type tensor[64] U but the value has type tensor[64] f32"
         );
         // The explicit store installs into `U`: defined for a dense float
         // binding, never an encoding into packed storage.
-        let module = module("fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y[:] = y + y\n    return y\n");
+        let module = module(
+            "fn probe(x: tensor[64] U) -> tensor[64] U:\n    let mut y = x\n    y[:] = y + y\n    return y\n",
+        );
         let entry = module.entry_named("probe").unwrap();
         module
             .entry(
@@ -641,7 +812,9 @@ mod result_schema_tests {
 
     #[test]
     fn mixed_narrow_float_compound_promotes_but_equal_f16_stays_f16() {
-        let module = module("fn mixed(x: bf16) -> f16:\n    let mut y = f16(1.0)\n    y += x\n    return y\n\nfn equal(x: f16) -> f16:\n    let mut y = f16(1.0)\n    y += x\n    return y\n");
+        let module = module(
+            "fn mixed(x: bf16) -> f16:\n    let mut y = f16(1.0)\n    y += x\n    return y\n\nfn equal(x: f16) -> f16:\n    let mut y = f16(1.0)\n    y += x\n    return y\n",
+        );
         for (name, argument, expected) in [
             ("mixed", ReferenceScalar::BF16(0x3a01), 0x3c01),
             ("equal", ReferenceScalar::F16(0x1000), 0x3c00),
@@ -665,7 +838,9 @@ mod result_schema_tests {
 
     #[test]
     fn named_call_arguments_install_against_canonical_formals() {
-        let module = module("fn helper(a: f16, b: f32) -> f16:\n    return a\n\nfn probe(x: f32, y: f32) -> f16:\n    return helper(b=y, a=x)\n");
+        let module = module(
+            "fn helper(a: f16, b: f32) -> f16:\n    return a\n\nfn probe(x: f32, y: f32) -> f16:\n    return helper(b=y, a=x)\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -686,7 +861,9 @@ mod result_schema_tests {
 
     #[test]
     fn nested_helper_dimension_comes_from_the_actual_sliced_argument() {
-        let module = module("fn seed[M,K](x: &tensor[M,K] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[8,2] i32, visible: &tensor[2] i32) -> i32:\n    let lo = visible[0]\n    let hi = visible[1]\n    let mut result = 0\n    if hi > lo:\n        result = seed(input[lo:hi,:])\n    return result\n");
+        let module = module(
+            "fn seed[M,K](x: &tensor[M,K] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[8,2] i32, visible: &tensor[2] i32) -> i32:\n    let lo = visible[0]\n    let hi = visible[1]\n    let mut result = 0\n    if hi > lo:\n        result = seed(input[lo:hi,:])\n    return result\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -709,7 +886,9 @@ mod result_schema_tests {
 
     #[test]
     fn nested_helper_compound_dimension_inverts_actual_sliced_extent() {
-        let module = module("fn seed[M,K](x: &tensor[M+1,K] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[8,2] i32, visible: &tensor[2] i32) -> i32:\n    let lo = visible[0]\n    return seed(input[lo:lo+3,:])\n");
+        let module = module(
+            "fn seed[M,K](x: &tensor[M+1,K] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[8,2] i32, visible: &tensor[2] i32) -> i32:\n    let lo = visible[0]\n    return seed(input[lo:lo+3,:])\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -732,7 +911,9 @@ mod result_schema_tests {
 
     #[test]
     fn nested_helper_compound_dimension_uses_exact_division() {
-        let module = module("fn seed[M](x: &tensor[2*M+1] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[8] i32, visible: &tensor[1] i32) -> i32:\n    let lo = visible[0]\n    return seed(input[lo:lo+5])\n");
+        let module = module(
+            "fn seed[M](x: &tensor[2*M+1] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[8] i32, visible: &tensor[1] i32) -> i32:\n    let lo = visible[0]\n    return seed(input[lo:lo+5])\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -753,7 +934,9 @@ mod result_schema_tests {
 
     #[test]
     fn fixed_width_word_slice_checks_wrapped_endpoint_before_view() {
-        let module = module("fn probe(input: &tensor[8] i32, lo: i32) -> i32:\n    let view = input[lo:lo+3]\n    return i32(extent(view,0))\n");
+        let module = module(
+            "fn probe(input: &tensor[8] i32, lo: i32) -> i32:\n    let view = input[lo:lo+3]\n    return i32(extent(view,0))\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -781,7 +964,9 @@ mod result_schema_tests {
 
     #[test]
     fn explicit_helper_dimension_uses_its_reached_source_value() {
-        let module = module("fn seed[N](x: &tensor[N] i32) -> i32:\n    return i32(N)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return seed[N=extent(input,0)](input)\n");
+        let module = module(
+            "fn seed[N](x: &tensor[N] i32) -> i32:\n    return i32(N)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return seed[N=extent(input,0)](input)\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -798,18 +983,64 @@ mod result_schema_tests {
     }
 
     #[test]
+    fn explicit_recipe_and_product_seed_have_one_call_owned_inference_plan() {
+        let module = module(
+            "fn split[N, G, MODE](x: &tensor[N*G] i32) -> i32:\n    return i32(N) + i32(MODE)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return split[G=2, MODE=3](input)\n",
+        );
+        // Private dimensions have an explicit call binding, never an implicit
+        // external value or a guessed inversion of the ambiguous product.
+        assert!(
+            module
+                .entry(
+                    module.entry_named("split").unwrap(),
+                    &ElementBindings::default()
+                )
+                .is_err()
+        );
+        let entry = module
+            .entry(
+                module.entry_named("probe").unwrap(),
+                &ElementBindings::default(),
+            )
+            .unwrap();
+        let mut interpreter = Interpreter::new(&entry);
+        let input = interpreter.add_tensor(TensorData::dense(DType::I32, vec![4], vec![0.0; 4]));
+        let outcome = interpreter.run(&[Arg::Tensor(input)]).unwrap();
+        assert!(matches!(
+            outcome.results().next().unwrap().value(),
+            OutcomeValue::Scalar(ReferenceScalar::I32(5))
+        ));
+    }
+
+    #[test]
+    fn helper_call_requires_every_unobservable_recipe_binding() {
+        let source = "fn private[N, MODE](x: &tensor[N] i32) -> i32:\n    return i32(MODE)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return private(input)\n";
+        assert!(
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "missing-recipe-binding.seismic".into(),
+                text: source.into()
+            }]))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn zero_extent_cannot_infer_negative_helper_dimension() {
         let source = "fn seed[M](x: &tensor[M+1] i32) -> i32:\n    return i32(M)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return seed(input[0:0])\n";
-        assert!(check_source(SourceSet::new(vec![SourceFile {
-            path: "negative-call-shape.seismic".into(),
-            text: source.into(),
-        }]))
-        .is_err());
+        assert!(
+            check_source(SourceSet::new(vec![SourceFile {
+                path: "negative-call-shape.seismic".into(),
+                text: source.into(),
+            }]))
+            .is_err()
+        );
     }
 
     #[test]
     fn zero_admitting_helper_dimension_accepts_empty_actual_view() {
-        let module = module("fn seed[M](x: &tensor[M] i32) -> i32 where M >= 0:\n    return i32(M)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return seed(input[0:0])\n");
+        let module = module(
+            "fn seed[M](x: &tensor[M] i32) -> i32 where M >= 0:\n    return i32(M)\n\nfn probe(input: &tensor[4] i32) -> i32:\n    return seed(input[0:0])\n",
+        );
         let entry = module
             .entry(
                 module.entry_named("probe").unwrap(),
@@ -827,7 +1058,7 @@ mod result_schema_tests {
 }
 
 use super::{dimensions, ir, xfer};
-use crate::checked::{internals::Module, SourceDiagnostic};
+use crate::checked::{SourceDiagnostic, internals::Module};
 use crate::entry::*;
 use crate::expr::{
     AnyExpr, BoolExpr, CmpOp, ExprArena, IntExpr, NodeView, ScalarArgument, ScalarComponent,
@@ -856,8 +1087,8 @@ pub(crate) fn build_entry(
     let mut arena = ExprArena::new();
     let mut dimensions = Vec::new();
     let mut shape_values = Vec::new();
-    for (ordinal, dimension) in contract.dimensions.iter().enumerate() {
-        let id = CallSchema::dimension_id(schema_id, ordinal);
+    for dimension in &contract.dimensions {
+        let id = CallSchema::dimension_id(schema_id, dimensions.len());
         let (symbol, value) = arena.call_dimension(id);
         dimensions.push(Dimension {
             id,
@@ -1247,6 +1478,15 @@ fn applicability(
         terms.push(builder.arena.int_cmp(CmpOp::Ge, shapes[ordinal], lower));
     }
     for conjunct in &definition.predicates {
+        if let ir::Predicate::Boolean(predicate) = conjunct.predicate {
+            terms.push(transfer_template_bool(
+                &mut builder.arena,
+                definition,
+                shapes,
+                predicate,
+            ));
+            continue;
+        }
         let expression = transfer_template_int(
             &mut builder.arena,
             definition,
@@ -1258,10 +1498,28 @@ fn applicability(
             ir::Predicate::NonNegative(_) => builder.arena.int_cmp(CmpOp::Ge, expression, zero),
             ir::Predicate::Zero(_) => builder.arena.int_cmp(CmpOp::Eq, expression, zero),
             ir::Predicate::NonZero(_) => builder.arena.int_cmp(CmpOp::Ne, expression, zero),
+            ir::Predicate::Boolean(_) => unreachable!("boolean predicate handled above"),
         });
     }
     let predicate = builder.arena.all(&terms);
     TargetPredicate::new(&builder.arena, predicate).ok()
+}
+
+fn transfer_template_bool(
+    arena: &mut ExprArena,
+    definition: &ir::Definition,
+    shapes: &[IntExpr],
+    expression: BoolExpr,
+) -> BoolExpr {
+    let mut map = |symbol: SymbolId, _: &mut ExprArena| {
+        let ordinal = definition
+            .dimensions
+            .iter()
+            .position(|dimension| dimension.symbol == symbol)
+            .expect("template predicate symbol names a dimension");
+        AnyExpr::Int(shapes[ordinal])
+    };
+    xfer::transfer_bool(&definition.arena, expression, arena, &mut map)
 }
 
 fn transfer_template_int(
@@ -1481,6 +1739,9 @@ fn predicate_terms(
         .predicates
         .iter()
         .map(|conjunct| {
+            if let ir::Predicate::Boolean(predicate) = conjunct.predicate {
+                return transfer_template_bool(arena, definition, shapes, predicate);
+            }
             let expression =
                 transfer_template_int(arena, definition, shapes, conjunct.predicate.expression());
             let zero = arena.int(0);
@@ -1488,6 +1749,7 @@ fn predicate_terms(
                 ir::Predicate::NonNegative(_) => arena.int_cmp(CmpOp::Ge, expression, zero),
                 ir::Predicate::Zero(_) => arena.int_cmp(CmpOp::Eq, expression, zero),
                 ir::Predicate::NonZero(_) => arena.int_cmp(CmpOp::Ne, expression, zero),
+                ir::Predicate::Boolean(_) => unreachable!("boolean predicate handled above"),
             }
         })
         .collect()
@@ -1532,6 +1794,37 @@ struct RegionWork {
     initialization: Option<crate::initialization::LoopInitialization>,
 }
 
+/// An assignment address evaluated once before its RHS. This is transient
+/// lowering state, not a second source or semantic representation.
+enum PreparedAssignment {
+    Local {
+        place: super::ownership::LocalPlace,
+        ty: SemanticType,
+    },
+    Tuple {
+        targets: Vec<PreparedAssignment>,
+        ty: SemanticType,
+    },
+    Element {
+        root: super::ownership::LocalPlace,
+        // A tensor value is a captured descriptor of shared backing, not a
+        // snapshot of its contents. RHS calls/atomics mutate that same backing.
+        base: SemanticValueId,
+        inputs: Vec<SemanticValueId>,
+        slice_axes: Vec<SliceAxis>,
+        participants: Option<ParticipantDomain>,
+        ty: SemanticType,
+    },
+}
+
+impl PreparedAssignment {
+    fn ty(&self) -> &SemanticType {
+        match self {
+            Self::Local { ty, .. } | Self::Tuple { ty, .. } | Self::Element { ty, .. } => ty,
+        }
+    }
+}
+
 struct FunctionLowering<'a, 'm> {
     builder: &'a mut Builder,
     module: &'m Module,
@@ -1546,8 +1839,8 @@ struct FunctionLowering<'a, 'm> {
     locals: Vec<Option<SemanticValueId>>,
     /// Evaluated formals remain immutable when their source local is reassigned.
     formals: Vec<SemanticValueId>,
-    symbols: HashMap<SymbolId, IntExpr>,
-    runtime_values: HashMap<SemanticValueId, IntExpr>,
+    symbols: HashMap<SymbolId, AnyExpr>,
+    runtime_values: HashMap<SemanticValueId, AnyExpr>,
     parameters: Vec<FunctionParameter>,
     parallel_depth: u32,
     parallel_participants: Vec<BinderId>,
@@ -1568,7 +1861,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
     ) -> Self {
         let mut symbols = HashMap::new();
         for (dimension, value) in definition.dimensions.iter().zip(&shapes) {
-            symbols.insert(dimension.symbol, *value);
+            symbols.insert(dimension.symbol, AnyExpr::Int(*value));
         }
         Self {
             builder,
@@ -1613,8 +1906,18 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     access: ParameterAccess::Scalar,
                 });
                 let actual = self.runtime_int(value);
-                self.shapes[ordinal] = actual;
-                self.symbols.insert(dimension.symbol, actual);
+                // A propagated private recipe remains an exact value even
+                // when this helper also receives a shape ABI parameter.
+                let closed = self
+                    .builder
+                    .arena
+                    .compile_int(self.shapes[ordinal])
+                    .evaluate(&crate::expr::compiled::InvocationValues::new())
+                    .is_ok();
+                if !closed {
+                    self.shapes[ordinal] = actual;
+                    self.symbols.insert(dimension.symbol, actual.into());
+                }
             }
         }
         for (source, parameter) in self.definition.params.clone().into_iter().enumerate() {
@@ -1629,11 +1932,10 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 parameter.span,
             )?;
             self.locals[parameter.local.index()] = Some(value);
-            if let Some(source_symbol) = self.definition.body.locals[parameter.local.index()].symbol
-            {
-                let runtime = self.runtime_int(value);
-                self.symbols.insert(source_symbol, runtime);
-            }
+            let source_value = self.definition.body.locals[parameter.local.index()]
+                .value
+                .clone();
+            self.bind_source_product(root, &source_value, value, parameter.span);
         }
         self.formals = self
             .parameters
@@ -1721,11 +2023,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             &mut self.builder.arena,
             &leaves,
             &mut |symbol, _| {
-                AnyExpr::Int(
-                    *symbols
-                        .get(&symbol)
-                        .expect("closed initialization symbol is a shape or formal parameter"),
-                )
+                *symbols
+                    .get(&symbol)
+                    .expect("closed initialization symbol is a shape or formal parameter")
             },
         );
         for (symbol, ordinal) in dimensions {
@@ -2342,12 +2642,11 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
 
     fn transfer_int(&mut self, expression: IntExpr) -> IntExpr {
         let symbols = &self.symbols;
-        let mut map =
-            |symbol: SymbolId, _: &mut ExprArena| {
-                AnyExpr::Int(*symbols.get(&symbol).unwrap_or_else(|| {
-                    panic!("checked expression contains an unbound body symbol")
-                }))
-            };
+        let mut map = |symbol: SymbolId, _: &mut ExprArena| {
+            *symbols
+                .get(&symbol)
+                .unwrap_or_else(|| panic!("checked expression contains an unbound body symbol"))
+        };
         let transferred = xfer::transfer_int(
             &self.definition.arena,
             expression,
@@ -2369,12 +2668,135 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
     }
 
     fn runtime_int(&mut self, value: SemanticValueId) -> IntExpr {
-        if let Some(expression) = self.runtime_values.get(&value) {
-            return *expression;
+        // A constant word is its own mathematical value; it is never
+        // observed at run time, so it names no runtime symbol.
+        if let Some(constant) = self.constant_word(value) {
+            return self.builder.arena.int_exact(constant);
+        }
+        if let Some(expression) = self.runtime_values.get(&value).copied() {
+            return match expression {
+                AnyExpr::Int(expression) => expression,
+                AnyExpr::Scalar(expression) => {
+                    self.builder.arena.int_from_scalar_value(expression)
+                }
+                _ => panic!("a typed non-integral source result cannot become a quantity"),
+            };
+        }
+        if let SemanticType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) =
+            self.values[value.index()].ty
+        {
+            // Observe the already evaluated word, including its wrapping and
+            // signed interpretation, rather than replaying its arithmetic.
+            let (_, scalar) = self.builder.arena.runtime_scalar_value(value, dtype);
+            self.runtime_values.insert(value, AnyExpr::Scalar(scalar));
+            return self.builder.arena.int_from_scalar_value(scalar);
         }
         let (_, expression) = self.builder.arena.runtime_value(value);
-        self.runtime_values.insert(value, expression);
+        self.runtime_values.insert(value, expression.into());
         expression
+    }
+
+    /// The value of a word produced by a `Constant` primitive.
+    fn constant_word(&self, value: SemanticValueId) -> Option<crate::expr::BigInt> {
+        let ValueOrigin::Node(node) = self.values[value.index()].origin else {
+            return None;
+        };
+        let work = self.regions[node.region().index()].as_ref()?;
+        let SemanticNodeView::Primitive {
+            primitive: PrimitiveId::Constant(constant),
+            ..
+        } = work.nodes[node.ordinal()].view()
+        else {
+            return None;
+        };
+        match *constant {
+            ReferenceScalar::I32(constant) => Some(constant.into()),
+            ReferenceScalar::U32(constant) => Some(constant.into()),
+            ReferenceScalar::U64(constant) => Some(constant.into()),
+            _ => None,
+        }
+    }
+
+    /// Publish this source occurrence's actual result, preserving its checked
+    /// interpretation. The symbolic recipe does not execute a second time.
+    fn bind_source_value(&mut self, symbol: SymbolId, value: SemanticValueId) {
+        let expression = match self.definition.arena.symbol_sort(symbol) {
+            crate::expr::SymbolSort::Int | crate::expr::SymbolSort::Nat => {
+                AnyExpr::Int(self.runtime_int(value))
+            }
+            crate::expr::SymbolSort::Scalar(dtype) => {
+                assert!(
+                    matches!(self.values[value.index()].ty, SemanticType::Scalar(actual) if actual == dtype),
+                    "source scalar publication changed its checked dtype"
+                );
+                if let Some(expression) = self.runtime_values.get(&value) {
+                    let AnyExpr::Scalar(_) = expression else {
+                        panic!("a source scalar publication changed its interpretation")
+                    };
+                    *expression
+                } else {
+                    let (_, scalar) = self.builder.arena.runtime_scalar_value(value, dtype);
+                    let expression = AnyExpr::Scalar(scalar);
+                    self.runtime_values.insert(value, expression);
+                    expression
+                }
+            }
+        };
+        self.symbols.insert(symbol, expression);
+    }
+
+    fn bind_source_product(
+        &mut self,
+        region: RegionId,
+        source: &ir::SourceValue,
+        value: SemanticValueId,
+        span: crate::span::Span,
+    ) {
+        for (path, symbol) in source.leaf_bindings() {
+            let mut current = value;
+            for projection in path {
+                let (kind, ty) = match projection {
+                    ir::SourceProjection::Tuple(index) => {
+                        let SemanticType::Tuple(parts) = &self.values[current.index()].ty else {
+                            panic!("source publication lost its checked tuple path")
+                        };
+                        (
+                            NodeKind::TupleGet {
+                                index: u32::try_from(index).expect("tuple path exceeds u32::MAX"),
+                            },
+                            parts[index].clone(),
+                        )
+                    }
+                    ir::SourceProjection::RangeStart | ir::SourceProjection::RangeEnd => {
+                        assert!(matches!(
+                            self.values[current.index()].ty,
+                            SemanticType::Range { .. }
+                        ));
+                        (
+                            NodeKind::Primitive(
+                                if matches!(projection, ir::SourceProjection::RangeStart) {
+                                    PrimitiveId::RangeStart
+                                } else {
+                                    PrimitiveId::RangeEnd
+                                },
+                            ),
+                            SemanticType::Integer,
+                        )
+                    }
+                };
+                current = self.emit(region, kind, vec![current], vec![ty], span)[0];
+            }
+            self.bind_source_value(symbol, current);
+        }
+        // A published word whose exact meaning is an opaque source quantity
+        // (a data read) denotes that quantity: checked types may state it.
+        if let ir::SourceValue::Scalar(ir::SourceScalar::Word { meaning, .. }) = source {
+            if let NodeView::Symbol(quantity) = self.definition.arena.view(AnyExpr::Int(*meaning)) {
+                if !self.symbols.contains_key(&quantity) {
+                    self.bind_source_value(quantity, value);
+                }
+            }
+        }
     }
 
     /// A1 §2.3.6 (1): the element read of a tensor yields its representation's
@@ -2555,15 +2977,22 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         statement: &ir::Stmt,
     ) -> Result<(), SourceDiagnostic> {
         match statement {
-            ir::Stmt::Let { pattern, value, .. } => {
+            ir::Stmt::Let {
+                pattern,
+                value,
+                value_bindings,
+            } => {
                 let span = value.span;
                 let value = self.lower_expr(region, value)?;
                 self.bind_pattern(region, pattern, value, span)?;
+                for (local, source) in value_bindings {
+                    self.bind_source_product(region, source, self.local(*local), span);
+                }
             }
             ir::Stmt::Assign {
                 place,
                 value,
-                value_symbols,
+                value_bindings,
                 authorities,
             } => {
                 fn contains_element(place: &ir::Place, region: &ir::Place) -> bool {
@@ -2594,12 +3023,12 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     );
                 }
                 let span = value.span;
+                let target = self.prepare_assignment(region, place, authorities, span)?;
                 let value = self.lower_expr(region, value)?;
-                self.assign(region, place, value, authorities, span)?;
-                for (local, symbol) in value_symbols {
+                self.assign(region, target, value, span)?;
+                for (local, source) in value_bindings {
                     let value = self.local(*local);
-                    let actual = self.runtime_int(value);
-                    self.symbols.insert(*symbol, actual);
+                    self.bind_source_product(region, source, value, span);
                 }
             }
             ir::Stmt::Evaluate(expression) => {
@@ -2609,15 +3038,15 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 condition,
                 then_body,
                 else_body,
-                capture_symbols,
-                join_symbols,
+                capture_bindings,
+                join_bindings,
             } => self.lower_if(
                 region,
                 condition,
                 then_body,
                 else_body,
-                capture_symbols,
-                join_symbols,
+                capture_bindings,
+                join_bindings,
             )?,
             ir::Stmt::Loop {
                 kind,
@@ -2625,7 +3054,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 start,
                 end,
                 body,
-                value_symbols,
+                value_versions,
                 initialization,
                 // Loop independence is not yet part of the entry graph.
                 separation: _,
@@ -2636,7 +3065,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 start,
                 end,
                 body,
-                value_symbols,
+                value_versions,
                 initialization,
             )?,
         }
@@ -2653,10 +3082,6 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         match pattern {
             ir::Pattern::Local(local) => {
                 self.locals[local.index()] = Some(value);
-                if let Some(source_symbol) = self.definition.body.locals[local.index()].symbol {
-                    let runtime = self.runtime_int(value);
-                    self.symbols.insert(source_symbol, runtime);
-                }
             }
             ir::Pattern::Tuple(patterns) => {
                 let SemanticType::Tuple(items) = self.values[value.index()].ty.clone() else {
@@ -2755,76 +3180,37 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         self.locals[place.local.index()] = Some(updated);
     }
 
-    fn assignment_place_type(&self, place: &ir::Place) -> SemanticType {
-        let local_type = |local: &super::ownership::LocalPlace| {
-            let value = self.local(local.local);
-            let mut ty = &self.values[value.index()].ty;
-            for index in &local.path {
-                let SemanticType::Tuple(parts) = ty else {
-                    panic!("checked local projection is not a tuple")
-                };
-                ty = &parts[*index];
-            }
-            ty.clone()
-        };
-        match place {
-            ir::Place::Local(local) => local_type(local),
-            ir::Place::Element { root, indices } => {
-                assert!(
-                    indices.is_empty(),
-                    "tuple assignment only installs whole named tensor state"
-                );
-                local_type(root)
-            }
-            ir::Place::Tuple(places) => SemanticType::Tuple(
-                places
-                    .iter()
-                    .map(|place| self.assignment_place_type(place))
-                    .collect(),
-            ),
-        }
-    }
-
-    fn assign(
+    fn prepare_assignment(
         &mut self,
         region: RegionId,
         place: &ir::Place,
-        value: SemanticValueId,
         authorities: &[ir::ExclusiveWriteCapability],
         span: crate::span::Span,
-    ) -> Result<(), SourceDiagnostic> {
-        match place {
+    ) -> Result<PreparedAssignment, SourceDiagnostic> {
+        Ok(match place {
             ir::Place::Local(local) => {
-                let target = self.local_place(region, local, span);
-                let expected = self.values[target.index()].ty.clone();
-                let value = self.install_value(region, value, &expected, span)?;
-                self.replace_local_place(region, local, value, span);
+                // A local target is an address, not a read or move of its old
+                // contents. Inspect its type without emitting TupleGet nodes.
+                let mut ty = &self.values[self.local(local.local).index()].ty;
+                for index in &local.path {
+                    let SemanticType::Tuple(parts) = ty else {
+                        panic!("checked local assignment path is not a tuple")
+                    };
+                    ty = &parts[*index];
+                }
+                PreparedAssignment::Local {
+                    place: local.clone(),
+                    ty: ty.clone(),
+                }
             }
             ir::Place::Tuple(places) => {
-                let target = self.assignment_place_type(place);
-                // Convert the complete RHS before installing any tuple leaf.
-                let value = self.install_value(region, value, &target, span)?;
-                let SemanticType::Tuple(items) = self.values[value.index()].ty.clone() else {
-                    panic!("checked tuple assignment received a non-tuple value")
-                };
-                assert_eq!(
-                    places.len(),
-                    items.len(),
-                    "checked tuple assignment arity changed during monomorphization"
-                );
-                for (index, (place, ty)) in places.iter().zip(items).enumerate() {
-                    let component = self.emit(
-                        region,
-                        NodeKind::TupleGet {
-                            index: u32::try_from(index)
-                                .expect("tuple has more than u32::MAX items"),
-                        },
-                        vec![value],
-                        vec![ty],
-                        span,
-                    )[0];
-                    self.assign(region, place, component, authorities, span)?;
+                let mut targets = Vec::with_capacity(places.len());
+                for place in places {
+                    targets.push(self.prepare_assignment(region, place, authorities, span)?);
                 }
+                let ty =
+                    SemanticType::Tuple(targets.iter().map(|target| target.ty().clone()).collect());
+                PreparedAssignment::Tuple { targets, ty }
             }
             ir::Place::Element { root, indices } => {
                 let supplied =
@@ -2845,9 +3231,11 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 let base = self.local_place(region, root, span);
                 let semantic_participants = supplied.map(|supplied| {
                     assert!(!supplied.is_empty());
-                    assert!(supplied
-                        .iter()
-                        .all(|participant| self.parallel_participants.contains(participant)));
+                    assert!(
+                        supplied
+                            .iter()
+                            .all(|participant| self.parallel_participants.contains(participant))
+                    );
                     let participants = ParticipantDomain::Parallel(supplied.into_boxed_slice());
                     participants
                 });
@@ -2868,6 +3256,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 }
                 let mut inputs = vec![base];
                 let mut slice_axes = Vec::with_capacity(indices.len());
+                let mut selected_axes = Vec::new();
                 for (axis, index) in indices.iter().enumerate() {
                     match index {
                         ir::Index::Point {
@@ -2890,8 +3279,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                             check_start,
                             check_order,
                             check_end,
-                            // L24 width checks are not emitted yet.
-                            check_width: _,
+                            check_width,
                         } => {
                             let start_value = match start {
                                 Some(start) => Some(self.lower_expr(region, start)?),
@@ -2910,6 +3298,35 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                                 (*check_start, *check_order, *check_end),
                                 span,
                             );
+                            let lo = start_value
+                                .map(|value| self.runtime_int(value))
+                                .unwrap_or_else(|| self.builder.arena.int(0));
+                            let hi = end_value
+                                .map(|value| self.runtime_int(value))
+                                .unwrap_or_else(|| {
+                                    let SemanticType::Tensor(tensor) =
+                                        &self.values[base.index()].ty
+                                    else {
+                                        panic!("checked assignment base is not a tensor")
+                                    };
+                                    self.builder.arena.int_from_nat(tensor.axes[axis])
+                                });
+                            let width = self.builder.arena.int_sub(hi, lo);
+                            selected_axes.push(self.builder.arena.nat_from_int(width));
+                            if *check_width {
+                                let nominal =
+                                    super::expr::static_width(&self.definition.arena, start, end)
+                                        .expect("checked L24 target omitted its nominal width");
+                                self.emit_range_width_check(
+                                    region,
+                                    base,
+                                    axis,
+                                    start_value,
+                                    end_value,
+                                    nominal,
+                                    span,
+                                );
+                            }
                             if let Some(start) = start_value {
                                 inputs.push(start);
                             }
@@ -2928,24 +3345,88 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                                 }
                             });
                         }
-                        ir::Index::Full => slice_axes.push(SliceAxis::Full),
+                        ir::Index::Full => {
+                            let SemanticType::Tensor(tensor) = &self.values[base.index()].ty else {
+                                panic!("checked assignment base is not a tensor")
+                            };
+                            selected_axes.push(tensor.axes[axis]);
+                            slice_axes.push(SliceAxis::Full);
+                        }
                     }
                 }
-                let SemanticType::Tensor(base_tensor) = &self.values[base.index()].ty else {
-                    panic!("checked element place has a non-tensor root")
+                let SemanticType::Tensor(tensor) = &self.values[base.index()].ty else {
+                    panic!("checked assignment base is not a tensor")
                 };
-                let expected = match &self.values[value.index()].ty {
-                    SemanticType::Tensor(tensor) => SemanticType::Tensor(TensorSemantics {
-                        representation: base_tensor.representation,
-                        axes: tensor.axes.clone(),
+                selected_axes.extend(tensor.axes[indices.len()..].iter().copied());
+                let ty = if selected_axes.is_empty() {
+                    SemanticType::Scalar(
+                        crate::registry::representation_info(tensor.representation).decoded,
+                    )
+                } else {
+                    SemanticType::Tensor(TensorSemantics {
+                        representation: tensor.representation,
+                        axes: selected_axes,
                         storage: TensorStorage::Computed,
-                    }),
-                    SemanticType::Scalar(_) => SemanticType::Scalar(
-                        crate::registry::representation_info(base_tensor.representation).decoded,
-                    ),
-                    _ => panic!("checked tensor store value is not numerical"),
+                    })
                 };
-                let stored_value = self.install_value(region, value, &expected, span)?;
+                PreparedAssignment::Element {
+                    root: root.clone(),
+                    base,
+                    inputs,
+                    slice_axes,
+                    participants: semantic_participants,
+                    ty,
+                }
+            }
+        })
+    }
+
+    fn assign(
+        &mut self,
+        region: RegionId,
+        target: PreparedAssignment,
+        value: SemanticValueId,
+        span: crate::span::Span,
+    ) -> Result<(), SourceDiagnostic> {
+        match target {
+            PreparedAssignment::Local { place, ty } => {
+                let value = self.install_value(region, value, &ty, span)?;
+                self.replace_local_place(region, &place, value, span);
+            }
+            PreparedAssignment::Tuple { targets, ty } => {
+                // Convert the complete RHS before installing any tuple leaf.
+                let value = self.install_value(region, value, &ty, span)?;
+                let SemanticType::Tuple(items) = self.values[value.index()].ty.clone() else {
+                    panic!("checked tuple assignment received a non-tuple value")
+                };
+                assert_eq!(
+                    targets.len(),
+                    items.len(),
+                    "checked tuple assignment arity changed"
+                );
+                for (index, (target, ty)) in targets.into_iter().zip(items).enumerate() {
+                    let component = self.emit(
+                        region,
+                        NodeKind::TupleGet {
+                            index: u32::try_from(index)
+                                .expect("tuple has more than u32::MAX items"),
+                        },
+                        vec![value],
+                        vec![ty],
+                        span,
+                    )[0];
+                    self.assign(region, target, component, span)?;
+                }
+            }
+            PreparedAssignment::Element {
+                root,
+                base,
+                mut inputs,
+                mut slice_axes,
+                participants: semantic_participants,
+                ty,
+            } => {
+                let stored_value = self.install_value(region, value, &ty, span)?;
                 let tensor_store = matches!(
                     self.values[stored_value.index()].ty,
                     SemanticType::Tensor(_)
@@ -3004,7 +3485,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 };
                 let ty = self.values[base.index()].ty.clone();
                 let updated = self.emit(region, kind, store_inputs, vec![ty], span)[0];
-                self.replace_local_place(region, root, updated, span);
+                self.replace_local_place(region, &root, updated, span);
             }
         }
         Ok(())
@@ -3051,6 +3532,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             | PrimitiveId::Unary(_)
             | PrimitiveId::Binary(_)
             | PrimitiveId::Cast(_)
+            | PrimitiveId::QuantizedComponentRead { .. }
+            | PrimitiveId::Bitcast(_)
             | PrimitiveId::Math(_)
             | PrimitiveId::Select => {
                 if matches!(output, SemanticType::Tensor(_)) {
@@ -3092,7 +3575,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 axis: u32::try_from(axis).expect("tensor rank exceeds u32::MAX"),
             },
             vec![base],
-            vec![SemanticType::Scalar(DType::I32)],
+            vec![SemanticType::Integer],
             span,
         )[0]
     }
@@ -3105,6 +3588,25 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         right: SemanticValueId,
         span: crate::span::Span,
     ) -> SemanticValueId {
+        // These predicates are generated access/shape checks, not authored
+        // word arithmetic. Compare mathematical observations of the actual
+        // evaluated endpoints against the actual descriptor extent.
+        let mut quantity = |value: SemanticValueId| {
+            if matches!(self.values[value.index()].ty, SemanticType::Integer) {
+                value
+            } else {
+                let expression = self.runtime_int(value);
+                self.emit(
+                    region,
+                    NodeKind::Primitive(PrimitiveId::Symbolic(expression)),
+                    Vec::new(),
+                    vec![SemanticType::Integer],
+                    span,
+                )[0]
+            }
+        };
+        let left = quantity(left);
+        let right = quantity(right);
         self.emit(
             region,
             NodeKind::Primitive(PrimitiveId::Binary(op)),
@@ -3267,6 +3769,53 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         }
     }
 
+    /// L24 compares the declared mathematical width with the realized source
+    /// endpoints. Keep both as quantities: casting the nominal width to a word
+    /// would make a wrapped width silently satisfy this contract.
+    fn emit_range_width_check(
+        &mut self,
+        region: RegionId,
+        base: SemanticValueId,
+        axis: usize,
+        start: Option<SemanticValueId>,
+        end: Option<SemanticValueId>,
+        nominal_width: IntExpr,
+        span: crate::span::Span,
+    ) {
+        let lo = start
+            .map(|value| self.runtime_int(value))
+            .unwrap_or_else(|| self.builder.arena.int(0));
+        let hi = match end {
+            Some(value) => self.runtime_int(value),
+            None => {
+                let SemanticType::Tensor(tensor) = &self.values[base.index()].ty else {
+                    panic!("checked slice width has a non-tensor base")
+                };
+                self.builder.arena.int_from_nat(tensor.axes[axis])
+            }
+        };
+        let realized = self.builder.arena.int_sub(hi, lo);
+        let nominal = self.transfer_int(nominal_width);
+        let mut quantity = |expression| {
+            self.emit(
+                region,
+                NodeKind::Primitive(PrimitiveId::Symbolic(expression)),
+                Vec::new(),
+                vec![SemanticType::Integer],
+                span,
+            )[0]
+        };
+        let realized = quantity(realized);
+        let nominal = quantity(nominal);
+        let equality = self.comparison(region, BinaryOp::Eq, realized, nominal, span);
+        self.check(
+            region,
+            equality,
+            CheckReason::Custom("slice width differs from its declared quantity".into()),
+            span,
+        );
+    }
+
     fn lower_expr(
         &mut self,
         region: RegionId,
@@ -3357,24 +3906,28 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                             })
                     })
                     .collect::<Vec<_>>();
-                assert!(checked_participants
-                    .iter()
-                    .all(|participant| self.parallel_participants.contains(participant)));
+                assert!(
+                    checked_participants
+                        .iter()
+                        .all(|participant| self.parallel_participants.contains(participant))
+                );
                 assert!(matches!(authority.order(), ir::CheckedAtomicOrder::Relaxed));
                 match authority.scope() {
                     ir::CheckedAtomicScope::Participant => {
                         assert!(checked_participants.is_empty())
                     }
                     ir::CheckedAtomicScope::Participants(participants) => {
-                        let scope =
-                            participants
-                                .iter()
-                                .map(|participant| {
-                                    *self.participant_bindings.get(participant).unwrap_or_else(|| {
-                                    panic!("checked atomic scope names an inactive participant")
-                                })
-                                })
-                                .collect::<Vec<_>>();
+                        let scope = participants
+                            .iter()
+                            .map(|participant| {
+                                *self
+                                    .participant_bindings
+                                    .get(participant)
+                                    .unwrap_or_else(|| {
+                                        panic!("checked atomic scope names an inactive participant")
+                                    })
+                            })
+                            .collect::<Vec<_>>();
                         assert_eq!(scope, checked_participants);
                     }
                 }
@@ -3497,20 +4050,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 Ok(self.loop_index(region, word, exact, expression.span))
             }
         }?;
-        // L31: a checker-minted word symbol stands for this node's reached
-        // value.
-        if let Some(sym) = expression.sym {
-            if let NodeView::Symbol(symbol) = self.definition.arena.view(sym.into()) {
-                if matches!(
-                    self.definition.arena.symbol_kind(symbol),
-                    crate::expr::SymbolKind::ProofVariable(_)
-                ) && !self.symbols.contains_key(&symbol)
-                {
-                    let runtime = self.runtime_int(value);
-                    self.symbols.insert(symbol, runtime);
-                }
-            }
-        }
+        // Publication belongs to the source occurrence, independently of how
+        // its exact meaning is represented or simplified by the checker.
+        self.bind_source_product(region, &expression.value, value, expression.span);
         Ok(value)
     }
 
@@ -3586,6 +4128,33 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         for operand in operands {
             inputs.push(self.lower_expr(region, operand)?);
         }
+        // Exact quantity min/max evaluates its actual operands before creating
+        // the symbolic value. No source call, check, or dynamic symbol binding
+        // is erased by the quantity representation.
+        if matches!(expression.ty, ValueType::Integer) {
+            if let PrimitiveId::Math(
+                op @ (crate::intrinsics::MathOp::Min | crate::intrinsics::MathOp::Max),
+            ) = primitive
+            {
+                let [lhs, rhs] = inputs.as_slice() else {
+                    panic!("checked integer min/max has wrong arity");
+                };
+                let lhs = self.runtime_int(*lhs);
+                let rhs = self.runtime_int(*rhs);
+                let exact = if *op == crate::intrinsics::MathOp::Min {
+                    self.builder.arena.int_min(lhs, rhs)
+                } else {
+                    self.builder.arena.int_max(lhs, rhs)
+                };
+                return Ok(self.emit(
+                    region,
+                    NodeKind::Primitive(PrimitiveId::Symbolic(exact)),
+                    Vec::new(),
+                    vec![SemanticType::Integer],
+                    expression.span,
+                )[0]);
+            }
+        }
         let transferred;
         let primitive = if let PrimitiveId::Symbolic(expression) = primitive {
             transferred = PrimitiveId::Symbolic(self.transfer_int(*expression));
@@ -3639,7 +4208,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     {
                         if !self.symbols.contains_key(&symbol) {
                             let semantic_axis = self.builder.arena.int_from_nat(*semantic_axis);
-                            self.symbols.insert(symbol, semantic_axis);
+                            self.symbols.insert(symbol, semantic_axis.into());
                         }
                     }
                 }
@@ -3707,9 +4276,16 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                         crate::registry::RepresentationKind::External(_) => false,
                     };
                     if !permitted {
-                        return Err(source_error(self.module, self.definition.file, expression.span,
-                            format!("cannot convert `{}` to `{}` elements; packed values decode with `f32(v)`",
-                                source_info.name, dtype.name())));
+                        return Err(source_error(
+                            self.module,
+                            self.definition.file,
+                            expression.span,
+                            format!(
+                                "cannot convert `{}` to `{}` elements; packed values decode with `f32(v)`",
+                                source_info.name,
+                                dtype.name()
+                            ),
+                        ));
                     }
                 }
             }
@@ -3767,8 +4343,29 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 expression.span,
             )[0]);
         }
+        if let PrimitiveId::QuantizedComponentRead { component, .. } = primitive {
+            let SemanticType::Tensor(tensor) = &self.values[inputs[0].index()].ty else {
+                unreachable!("checked component input is a tensor")
+            };
+            let supported = crate::registry::decode_recipe(tensor.representation, DType::F32)
+                .and_then(|recipe| recipe.component(*component))
+                .is_some();
+            if !supported {
+                return Err(SourceDiagnostic::new(
+                    &self.module.sources.files()[self.definition.file],
+                    expression.span,
+                    crate::checked::DiagnosticRule::Type,
+                    format!(
+                        "representation `{}` has no quantized {} role",
+                        crate::registry::representation_info(tensor.representation).name,
+                        component.name()
+                    ),
+                ));
+            }
+        }
         match primitive {
-            PrimitiveId::ElementRead { checks } => {
+            PrimitiveId::ElementRead { checks }
+            | PrimitiveId::QuantizedComponentRead { checks, .. } => {
                 let base = inputs[0];
                 for (axis, check) in checks.iter().enumerate() {
                     if *check {
@@ -3785,6 +4382,12 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             PrimitiveId::SliceView { indices } => {
                 let base = inputs[0];
                 let mut operand = 1;
+                let mut output_axis = 0;
+                let nominal_axes = &expression
+                    .ty
+                    .shaped()
+                    .expect("checked slice result is not shaped")
+                    .axes;
                 for (axis, slot) in indices.iter().enumerate() {
                     match slot {
                         crate::intrinsics::IndexSlot::Point { check } => {
@@ -3800,15 +4403,16 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                             operand += 1;
                         }
                         // The whole axis: no operands and no checks.
-                        crate::intrinsics::IndexSlot::Full => {}
+                        crate::intrinsics::IndexSlot::Full => {
+                            output_axis += 1;
+                        }
                         crate::intrinsics::IndexSlot::Range {
                             start,
                             end,
                             check_start,
                             check_order,
                             check_end,
-                            // L24 width checks are not emitted yet.
-                            check_width: _,
+                            check_width,
                         } => {
                             let start_value = if *start {
                                 let value = inputs[operand];
@@ -3833,6 +4437,18 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                                 (*check_start, *check_order, *check_end),
                                 expression.span,
                             );
+                            if *check_width {
+                                self.emit_range_width_check(
+                                    region,
+                                    base,
+                                    axis,
+                                    start_value,
+                                    end_value,
+                                    nominal_axes[output_axis],
+                                    expression.span,
+                                );
+                            }
+                            output_axis += 1;
                         }
                     }
                 }
@@ -3865,6 +4481,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             | PrimitiveId::Unary(_)
             | PrimitiveId::Binary(_)
             | PrimitiveId::Cast(_)
+            | PrimitiveId::Bitcast(_)
             | PrimitiveId::Math(_)
             | PrimitiveId::Select
             | PrimitiveId::TensorAlloc
@@ -3994,6 +4611,8 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             | PrimitiveId::Unary(_)
             | PrimitiveId::Binary(_)
             | PrimitiveId::Cast(_)
+            | PrimitiveId::QuantizedComponentRead { .. }
+            | PrimitiveId::Bitcast(_)
             | PrimitiveId::Math(_)
             | PrimitiveId::Select
             | PrimitiveId::Extent { .. } => self.primitive_kind(primitive, &ty),
@@ -4011,21 +4630,6 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         } else {
             self.emit(region, kind, node_inputs, vec![ty], expression.span)[0]
         };
-        if matches!(
-            primitive,
-            PrimitiveId::RangeStart | PrimitiveId::RangeEnd | PrimitiveId::ElementRead { .. }
-        ) {
-            // A checked integer projection denotes this one reached value.
-            // Bounds and guards are proof facts; neither the tensor read nor
-            // its source expression is reconstructed later.
-            if let Some(expression) = expression.sym {
-                let NodeView::Symbol(symbol) = self.definition.arena.view(expression.into()) else {
-                    unreachable!("checked integer projection must own its symbolic value")
-                };
-                let runtime = self.runtime_int(value);
-                self.symbols.insert(symbol, runtime);
-            }
-        }
         Ok(value)
     }
 
@@ -4070,7 +4674,22 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         for (dimension, value) in &seeds {
             captured_shapes[*dimension as usize] = Some(*value);
         }
-        for step in source_family.dimension_plan.steps() {
+        let plan = dimensions::plan_dimensions_with_seeds(
+            &contract.arena,
+            &contract.dimensions,
+            &contract
+                .params
+                .iter()
+                .map(|parameter| &parameter.ty)
+                .collect::<Vec<_>>(),
+            &call
+                .seeds
+                .iter()
+                .map(|(dimension, _)| *dimension)
+                .collect::<Vec<_>>(),
+        )
+        .expect("the checker planned this call's dimensions from the same contract");
+        for step in plan.steps() {
             let ordinal = step.dimension as usize;
             if captured_shapes[ordinal].is_some() {
                 continue;
@@ -4384,15 +5003,112 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         }
     }
 
+    /// Evaluate only closed scalar source expressions. Private recipe values
+    /// flow through ordinary helper dimensions; data/loop values remain unknown.
+    /// Use the language scalar recipe, never host casts or floating arithmetic.
+    fn constant_scalar(&mut self, expression: &ir::Expr) -> Option<ReferenceScalar> {
+        match &expression.kind {
+            ir::ExprKind::Literal(value) => Some(*value),
+            ir::ExprKind::Dimension(ordinal) => {
+                let value = self.shapes[*ordinal as usize];
+                let value = self
+                    .builder
+                    .arena
+                    .compile_int(value)
+                    .evaluate_i64(&crate::expr::compiled::InvocationValues::new())
+                    .ok()?;
+                Some(ReferenceScalar::I32(i32::try_from(value).ok()?))
+            }
+            ir::ExprKind::Primitive {
+                id: PrimitiveId::Constant(value),
+                ..
+            } => Some(*value),
+            // The `i32` value of a symbolic integer whose symbols are all
+            // bound to closed values here.
+            ir::ExprKind::Primitive {
+                id: PrimitiveId::Symbolic(value),
+                ..
+            } => {
+                if !self
+                    .definition
+                    .arena
+                    .free_symbols(AnyExpr::Int(*value))
+                    .iter()
+                    .all(|symbol| self.symbols.contains_key(symbol))
+                {
+                    return None;
+                }
+                let value = self.transfer_int(*value);
+                let value = self
+                    .builder
+                    .arena
+                    .compile_int(value)
+                    .evaluate_i64(&crate::expr::compiled::InvocationValues::new())
+                    .ok()?;
+                Some(ReferenceScalar::I32(i32::try_from(value).ok()?))
+            }
+            // A known operand that decides a conjunction or disjunction
+            // decides it whatever the other operand's value.
+            ir::ExprKind::Primitive {
+                id: PrimitiveId::Binary(op @ (BinaryOp::And | BinaryOp::Or)),
+                operands,
+                ..
+            } => {
+                let decisive = ReferenceScalar::Bool(*op == BinaryOp::Or);
+                let inputs = operands
+                    .iter()
+                    .map(|operand| self.constant_scalar(operand))
+                    .collect::<Vec<_>>();
+                if inputs.contains(&Some(decisive)) {
+                    return Some(decisive);
+                }
+                let inputs = inputs.into_iter().collect::<Option<Vec<_>>>()?;
+                let operation =
+                    crate::reference_math::scalar_operation(&PrimitiveId::Binary(*op))?;
+                let types = inputs.iter().map(|input| input.dtype()).collect::<Vec<_>>();
+                let recipe = crate::reference_math::scalar_recipe(operation, &types);
+                crate::reference_math::evaluate(&recipe, &inputs).ok()
+            }
+            ir::ExprKind::Primitive { id, operands, .. } => {
+                let operation = crate::reference_math::scalar_operation(id)?;
+                let inputs = operands
+                    .iter()
+                    .map(|operand| self.constant_scalar(operand))
+                    .collect::<Option<Vec<_>>>()?;
+                let types = inputs.iter().map(|input| input.dtype()).collect::<Vec<_>>();
+                let recipe = crate::reference_math::scalar_recipe(operation, &types);
+                crate::reference_math::evaluate(&recipe, &inputs).ok()
+            }
+            _ => None,
+        }
+    }
+
     fn lower_if(
         &mut self,
         parent_region: RegionId,
         condition: &ir::Expr,
         then_body: &ir::Block,
         else_body: &ir::Block,
-        capture_symbols: &[(ir::LocalId, SymbolId)],
-        join_symbols: &[(ir::LocalId, SymbolId)],
+        capture_bindings: &[(ir::LocalId, ir::SourceValue)],
+        join_bindings: &[(ir::LocalId, ir::SourceValue)],
     ) -> Result<(), SourceDiagnostic> {
+        if let Some(ReferenceScalar::Bool(taken)) = self.constant_scalar(condition) {
+            // Inactive recipe branches do not exist in this bound computation.
+            // The active branch still passes every ordinary representation-role,
+            // ownership, and semantic lowering check.
+            let parent_symbols = self.symbols.clone();
+            for (local, symbol) in capture_bindings {
+                let value = self.local(*local);
+                self.bind_source_product(parent_region, symbol, value, condition.span);
+            }
+            self.lower_block(parent_region, if taken { then_body } else { else_body })?;
+            self.symbols = parent_symbols;
+            for (local, symbol) in join_bindings {
+                let value = self.local(*local);
+                self.bind_source_product(parent_region, symbol, value, condition.span);
+            }
+            return Ok(());
+        }
         let condition_value = self.lower_expr(parent_region, condition)?;
         let before = self.locals.clone();
 
@@ -4457,11 +5173,10 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             else_formals.push(self.region_mut(else_region).parameters[ordinal]);
         }
         let parent_symbols = self.symbols.clone();
-        for (local, symbol) in capture_symbols {
+        for (local, symbol) in capture_bindings {
             let parameter =
                 then_locals[local.index()].expect("checked branch capture has no then parameter");
-            let actual = self.runtime_int(parameter);
-            self.symbols.insert(*symbol, actual);
+            self.bind_source_product(then_region, symbol, parameter, condition.span);
         }
         self.formals = then_formals;
         self.locals = then_locals;
@@ -4469,11 +5184,10 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         let then_after = self.locals.clone();
 
         self.symbols = parent_symbols.clone();
-        for (local, symbol) in capture_symbols {
+        for (local, symbol) in capture_bindings {
             let parameter =
                 else_locals[local.index()].expect("checked branch capture has no else parameter");
-            let actual = self.runtime_int(parameter);
-            self.symbols.insert(*symbol, actual);
+            self.bind_source_product(else_region, symbol, parameter, condition.span);
         }
         self.formals = else_formals;
         self.locals = else_locals;
@@ -4569,10 +5283,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 self.reconstruct_call_value(parent_region, &ty, &mut outputs, condition.span);
             self.locals[ordinal] = Some(value);
         }
-        for (local, symbol) in join_symbols {
+        for (local, symbol) in join_bindings {
             let value = self.local(*local);
-            let actual = self.runtime_int(value);
-            self.symbols.insert(*symbol, actual);
+            self.bind_source_product(parent_region, symbol, value, condition.span);
         }
         assert!(
             outputs.next().is_none(),
@@ -4589,9 +5302,18 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         start: &ir::Expr,
         end: &ir::Expr,
         body: &ir::Block,
-        value_symbols: &[(ir::LocalId, SymbolId, SymbolId)],
+        value_versions: &[(ir::LocalId, ir::SourceValue, ir::SourceValue)],
         initialization: &crate::initialization::LoopInitialization,
     ) -> Result<(), SourceDiagnostic> {
+        if matches!((self.constant_scalar(start), self.constant_scalar(end)),
+            (Some(ReferenceScalar::I32(start)), Some(ReferenceScalar::I32(end))) if start >= end)
+        {
+            for (local, _, exit) in value_versions {
+                let value = self.local(*local);
+                self.bind_source_product(parent_region, exit, value, end.span);
+            }
+            return Ok(());
+        }
         let start_value = self.lower_expr(parent_region, start)?;
         let end_value = self.lower_expr(parent_region, end)?;
         // Scheduling consumes the values that source execution actually
@@ -4614,8 +5336,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         let binder_ty = self.semantic_type(&binder_source.ty);
         let binder_value = self.region_parameter(body_region, binder_ty, binder_source.span);
         let (expression_binder, binder_symbol, binder_int) = self.builder.arena.loop_binder();
-        if let Some(source_symbol) = self.definition.body.locals[binder.index()].symbol {
-            self.symbols.insert(source_symbol, binder_int);
+        for (path, source_symbol) in binder_source.value.leaf_bindings() {
+            assert!(path.is_empty(), "loop binder must be a scalar source value");
+            self.symbols.insert(source_symbol, binder_int.into());
         }
         let mut child = before.clone();
         child[binder.index()] = Some(binder_value);
@@ -4644,11 +5367,10 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 ));
             }
         }
-        for (local, header, _) in value_symbols {
+        for (local, header, _) in value_versions {
             let parameter =
                 child[local.index()].expect("checked loop capture has no body parameter");
-            let actual = self.runtime_int(parameter);
-            self.symbols.insert(*header, actual);
+            self.bind_source_product(body_region, header, parameter, start.span);
         }
         fn leaf_paths(ty: &SemanticType, path: &mut Vec<usize>, result: &mut Vec<Vec<usize>>) {
             match ty {
@@ -4715,11 +5437,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             &mut self.builder.arena,
             &transfer_leaves,
             &mut |symbol, _| {
-                AnyExpr::Int(
-                    *symbols
-                        .get(&symbol)
-                        .expect("loop transfer symbol belongs to its checked scope"),
-                )
+                *symbols
+                    .get(&symbol)
+                    .expect("loop transfer symbol belongs to its checked scope")
             },
         );
         self.region_mut(body_region).initialization = Some(transferred_initialization);
@@ -4739,10 +5459,11 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 .unwrap_or_else(|| panic!("parallel loop nesting exceeds u32::MAX"));
             let participant = BinderId::new(body_region, 0);
             self.parallel_participants.push(participant);
-            assert!(self
-                .participant_bindings
-                .insert(binder, participant)
-                .is_none());
+            assert!(
+                self.participant_bindings
+                    .insert(binder, participant)
+                    .is_none()
+            );
         }
         let lowered = self.lower_block(body_region, body);
         if parallel {
@@ -4866,10 +5587,9 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
             );
             self.locals[ordinal] = Some(value);
         }
-        for (local, _, exit) in value_symbols {
+        for (local, _, exit) in value_versions {
             let value = self.local(*local);
-            let actual = self.runtime_int(value);
-            self.symbols.insert(*exit, actual);
+            self.bind_source_product(parent_region, exit, value, end.span);
         }
         Ok(())
     }
@@ -4898,3 +5618,4 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         )[0]
     }
 }
+

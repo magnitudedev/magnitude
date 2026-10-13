@@ -10,6 +10,7 @@
 // This file is independent of any entry ABI.
 
 #include "../projection/projection.h"
+#include "../core/arrive.h"
 
 namespace routing {
 
@@ -50,8 +51,9 @@ inline void inverses(device const float *residual, ulong residual0, ulong residu
 }
 
 // The router input of row m at `source`: round_A(r * inverse * norm), with
-// the norm's element N.
-template <typename N>
+// the norm's element N, or (`form_input` without a norm, SUMMED) the sum in
+// part order of the PARTS parts of a mix site's partials.
+template <typename N, uint PARTS = 1, bool SUMMED = false>
 struct Rows {
     typedef Act activation;
     device const float *residual;
@@ -61,6 +63,12 @@ struct Rows {
     threadgroup const float *inverses;
     uint columns;
     float value(uint m, ulong source) const {
+        if (SUMMED) {
+            float total = 0.0f;
+            for (ulong part = 0; part < PARTS; ++part)
+                total += residual[ulong(m) * residual0 + (part * columns + source) * residual1];
+            return Act::round(total);
+        }
         return Act::round(residual[ulong(m) * residual0 + source * residual1] * inverses[m]
             * element::at<N>(norm, source * norm0));
     }
@@ -77,7 +85,7 @@ struct Rows {
 
 // Logit column first + n of row m, rows `pitch` apart.
 struct Logits {
-    device float *logits;
+    arrive::coherent_device<float> logits;
     ulong pitch;
     ulong first;
     void store(uint m, uint n, float value) const { logits[ulong(m) * pitch + first + n] = value; }

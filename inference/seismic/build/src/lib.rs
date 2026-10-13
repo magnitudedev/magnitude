@@ -135,13 +135,22 @@ impl std::fmt::Display for BuildError {
                 "native ABI for `{entry}`: {}:{line}:{column}: `{symbol}` is not generated for this entry",
                 path.display()
             ),
-            Self::NativeTemplate { entry, path, kernel, detail } => write!(
+            Self::NativeTemplate {
+                entry,
+                path,
+                kernel,
+                detail,
+            } => write!(
                 f,
                 "native template for `{entry}` kernel `{kernel}` in {}: {detail}",
                 path.display()
             ),
             Self::NativeInclude(e) => write!(f, "{e}"),
-            Self::MetalBufferSlots { entry, slots, limit } => write!(
+            Self::MetalBufferSlots {
+                entry,
+                slots,
+                limit,
+            } => write!(
                 f,
                 "native Metal implementation of `{entry}` binds {slots} buffers; Metal admits {limit}"
             ),
@@ -160,7 +169,9 @@ impl std::fmt::Display for BuildError {
                 f,
                 "native Vulkan implementation of `{entry}` launches `{kernel}`, but its source defines no `void {kernel}()`"
             ),
-            Self::CpuNative { path, reason } => write!(f, "CPU native source {}: {reason}", path.display()),
+            Self::CpuNative { path, reason } => {
+                write!(f, "CPU native source {}: {reason}", path.display())
+            }
         }
     }
 }
@@ -641,10 +652,19 @@ mod internals {
         ("local_size_x_id", "the workgroup size is generated"),
         ("local_size_y_id", "the workgroup size is generated"),
         ("local_size_z_id", "the workgroup size is generated"),
-        ("push_constant", "the push constant is the generated argument block address"),
-        ("shared", "group memory is the generated `seismic_shared_*` views of `shared_bytes`"),
+        (
+            "push_constant",
+            "the push constant is the generated argument block address",
+        ),
+        (
+            "shared",
+            "group memory is the generated `seismic_shared_*` views of `shared_bytes`",
+        ),
         ("main", "`main` is generated and calls the launch's kernel"),
-        ("subgroupAdd", "float subgroup sums have no fixed order; use `seismic_subgroup_sum_f32` or `seismic_redux_add_*`"),
+        (
+            "subgroupAdd",
+            "float subgroup sums have no fixed order; use `seismic_subgroup_sum_f32` or `seismic_redux_add_*`",
+        ),
         ("subgroupInclusiveAdd", "subgroup scans have no fixed order"),
         ("subgroupExclusiveAdd", "subgroup scans have no fixed order"),
         ("subgroupClusteredAdd", "clustered sums have no fixed order"),
@@ -1059,6 +1079,11 @@ mod internals {
                     symbols.insert(format!("{prefix}_CODE_TABLE_{ordinal}"));
                 }
             }
+            CodeInterpretation::Grid(_) => {
+                symbols.insert(format!("{prefix}_CODE_GRID"));
+                symbols.insert(format!("{prefix}_CODE_GRID_LANES"));
+                symbols.insert(format!("{prefix}_CODE_GRID_INDEX_BITS"));
+            }
         }
     }
 
@@ -1147,7 +1172,9 @@ mod internals {
             format!("{name}.seismicbundle")
         ));
         out.push_str("static __MODULE: seismic::generated::OnceLock<Result<seismic::generated::Module, seismic::CheckedBundleError>> = seismic::generated::OnceLock::new();\n");
-        out.push_str("/// The checked module, an opaque token for Seismic's module-wide services.\n");
+        out.push_str(
+            "/// The checked module, an opaque token for Seismic's module-wide services.\n",
+        );
         out.push_str("pub fn module() -> Result<&'static seismic::generated::Module, seismic::CheckedBundleError> { seismic::generated::module_from_bundle(&__MODULE, __BUNDLE) }\n");
         out.push_str(&format!("pub const IDENTITY: &str = {:?};\n", identity));
         if let Some(library) = cpu_library {
@@ -1345,7 +1372,15 @@ mod internals {
             out.push_str("      let _ = outputs;\n");
         }
         out.push_str("      encoder.finish()\n    }\n");
-        out.push_str("    fn decode(mut results: seismic::generated::DecodedResults) -> Results { Results {\n");
+        // An entry without results has nothing to decode or publish.
+        let (decoded, published) = if entry.results.is_empty() {
+            ("_", "_")
+        } else {
+            ("mut results", "results")
+        };
+        out.push_str(&format!(
+            "    fn decode({decoded}: seismic::generated::DecodedResults) -> Results {{ Results {{\n"
+        ));
         for result in &entry.results {
             let getter = match &result.kind {
                 ResultSummaryKind::Tensor { .. } => "take_tensor",
@@ -1355,6 +1390,7 @@ mod internals {
                     DType::BF16 => "take_bf16",
                     DType::I32 => "take_i32",
                     DType::U32 => "take_u32",
+                    DType::U64 => "take_u64",
                     DType::Bool => "take_bool",
                 },
                 ResultSummaryKind::Index => "take_index",
@@ -1396,7 +1432,9 @@ mod internals {
             }
         }
         out.push_str("      encoder.finish()\n    }\n");
-        out.push_str("    fn decode_workflow(mut results: seismic::generated::PendingWorkflowResults) -> WorkflowResults { WorkflowResults {\n");
+        out.push_str(&format!(
+            "    fn decode_workflow({decoded}: seismic::generated::PendingWorkflowResults) -> WorkflowResults {{ WorkflowResults {{\n"
+        ));
         for result in &entry.results {
             let getter = match &result.kind {
                 ResultSummaryKind::Tensor { .. } => "take_workflow_tensor".to_owned(),
@@ -1414,7 +1452,9 @@ mod internals {
             ));
         }
         out.push_str("    } }\n");
-        out.push_str("    fn workflow_outputs(results: WorkflowResults) -> Vec<seismic::generated::WorkflowResultRef> { vec![\n");
+        out.push_str(&format!(
+            "    fn workflow_outputs({published}: WorkflowResults) -> Vec<seismic::generated::WorkflowResultRef> {{ vec![\n"
+        ));
         for result in &entry.results {
             let getter = match &result.kind {
                 ResultSummaryKind::Tensor { .. } => "workflow_tensor_ref",
@@ -1499,20 +1539,22 @@ mod internals {
             );
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
-            out.push_str("  pub fn native_entry_with(elements: Elements) -> seismic::BoundEntry<Entry> {\n");
+            out.push_str(
+                "  pub fn native_entry_with(elements: Elements) -> seismic::BoundEntry<Entry> {\n",
+            );
             out.push_str("    seismic::generated::bound_entry::<Entry>(&[\n");
             element_list(out);
             out.push_str(&format!("    ], {cpu})\n  }}\n"));
-            out.push_str("  pub fn native_tune_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: impl Into<seismic::TuningPrecision>, strategy: seismic::Strategy, reference: seismic::TuningReference) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
+            out.push_str("  pub fn native_tune_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::tune_native::<Entry>(device, statics, &[\n");
             element_list(out);
             out.push_str(&format!(
-                "    ], {cpu}, &mut points, validation, strategy, reference)\n  }}\n"
+                "    ], {cpu}, &mut points, validation, strategy)\n  }}\n"
             ));
-            out.push_str("  pub fn native_search_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, validation: impl Into<seismic::TuningPrecision>, reference: seismic::TuningReference) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
+            out.push_str("  pub fn native_search_with<'a>(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::search_native::<Entry>(device, statics, &[\n");
             element_list(out);
-            out.push_str(&format!("    ], {cpu}, validation, reference)\n  }}\n"));
+            out.push_str(&format!("    ], {cpu}, validation)\n  }}\n"));
             out.push_str("  pub fn native_digest_with(device: &seismic::Device, elements: Elements, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {\n");
             out.push_str("    seismic::generated::digest_native::<Entry>(device, statics, &[\n");
             element_list(out);
@@ -1520,16 +1562,9 @@ mod internals {
         } else {
             out.push_str(&format!("  pub fn native_for_device(device: &seismic::Device, specialization: &seismic::NativeSpecialization) -> Result<seismic::NativeKernel<Entry>, seismic::LoadError> {{ seismic::generated::prepare_native::<Entry>(device, specialization, &[], {cpu}) }}\n"));
             out.push_str(&format!("  pub fn native_entry() -> seismic::BoundEntry<Entry> {{ seismic::generated::bound_entry::<Entry>(&[], {cpu}) }}\n"));
-            out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: impl Into<seismic::TuningPrecision>, strategy: seismic::Strategy, reference: seismic::TuningReference) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy, reference) }}\n"));
-            out.push_str(&format!("  pub fn native_search<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, validation: impl Into<seismic::TuningPrecision>, reference: seismic::TuningReference) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(device, statics, &[], {cpu}, validation, reference) }}\n"));
+            out.push_str(&format!("  pub fn native_tune<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, mut points: impl seismic::PointSource<'a, Entry>, validation: seismic::NumericalRequirement, strategy: seismic::Strategy) -> Result<seismic::TuningResult, seismic::TuneError> {{ seismic::generated::tune_native::<Entry>(device, statics, &[], {cpu}, &mut points, validation, strategy) }}\n"));
+            out.push_str(&format!("  pub fn native_search<'a>(device: &seismic::Device, statics: &seismic::NativeSpecialization, validation: seismic::NumericalRequirement) -> Result<seismic::NativeSearch<'a, Entry>, seismic::TuneError> {{ seismic::generated::search_native::<Entry>(device, statics, &[], {cpu}, validation) }}\n"));
             out.push_str(&format!("  pub fn native_digest(device: &seismic::Device, statics: &seismic::NativeSpecialization) -> Result<String, seismic::TuneError> {{ seismic::generated::digest_native::<Entry>(device, statics, &[], {cpu}) }}\n"));
-        }
-        if elements {
-            out.push_str("  pub fn native_numerical_subjects(elements: Elements) -> Result<Vec<(String, seismic::DType)>, seismic::TuneError> { seismic::generated::native_numerical_subjects::<Entry>(&[\n");
-            element_list(out);
-            out.push_str("    ]) }\n");
-        } else {
-            out.push_str("  pub fn native_numerical_subjects() -> Result<Vec<(String, seismic::DType)>, seismic::TuneError> { seismic::generated::native_numerical_subjects::<Entry>(&[]) }\n");
         }
         out.push_str("  /// The checked native implementation for the device's backend.\n");
         out.push_str("  pub fn native_implementation(device: &seismic::Device) -> Result<Option<seismic::NativeImplementation>, seismic::CheckedBundleError> { seismic::generated::native_implementation::<Entry>(device) }\n");
@@ -1600,7 +1635,9 @@ mod internals {
                         if ident(module) != *module {
                             return Err(BuildError::CpuNative {
                                 path,
-                                reason: format!("`{module}` is not a Rust module name; CPU library paths become module paths"),
+                                reason: format!(
+                                    "`{module}` is not a Rust module name; CPU library paths become module paths"
+                                ),
                             });
                         }
                     }
@@ -1681,6 +1718,7 @@ mod internals {
             DType::F16 => "F16",
             DType::I32 => "I32",
             DType::U32 => "U32",
+            DType::U64 => "U64",
             DType::Bool => unreachable!("the checker admits no `bool` CPU element"),
         }
     }
@@ -1762,6 +1800,7 @@ mod internals {
                 "f16" => CpuView::Dense("seismic::cpu::F16".to_owned()),
                 "i32" => CpuView::Scalars("i32"),
                 "u32" => CpuView::Scalars("u32"),
+                "u64" => CpuView::Scalars("u64"),
                 "bool" => CpuView::Scalars("u8"),
                 _ => CpuView::Weights,
             },
@@ -1918,6 +1957,7 @@ mod internals {
                         DType::F16 | DType::BF16 => ("u16", "value as u16"),
                         DType::I32 => ("i32", "value as u32 as i32"),
                         DType::U32 => ("u32", "value as u32"),
+                        DType::U64 => ("u64", "value"),
                         DType::Bool => ("bool", "value != 0"),
                     };
                     out.push_str(&format!(
@@ -2284,6 +2324,7 @@ mod internals {
                         DType::BF16 => ("BF16", true),
                         DType::I32 => ("I32", false),
                         DType::U32 => ("U32", false),
+                        DType::U64 => ("U64", false),
                         DType::Bool => ("Bool", false),
                     };
                     render_range(
@@ -2350,6 +2391,7 @@ mod internals {
             DType::BF16 => "seismic::BF16",
             DType::I32 => "i32",
             DType::U32 => "u32",
+            DType::U64 => "u64",
             DType::Bool => "bool",
         }
     }

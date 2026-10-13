@@ -196,6 +196,7 @@ fn inventory_from(
         id: host_pool,
         kind: MemoryPoolKind::HostRam,
         capacity_bytes: capacity.bytes,
+        total_bytes: capacity.bytes,
         basis: capacity.basis,
         ledger: LedgerKey::Host,
     }];
@@ -207,18 +208,31 @@ fn inventory_from(
             } => DeviceMemory::Established(DeviceMemoryInfo {
                 allocation_pool: host_pool,
                 host_pool,
+                shared_pool: host_pool,
                 max_allocation_bytes,
             }),
             DiscoveredMemory::Dedicated {
                 capacity_bytes,
+                total_bytes,
                 basis,
                 ledger,
                 max_allocation_bytes,
+                shared_device_local,
             } => {
                 // Multiple views of one physical pool are merged only by
-                // proven identity; distinct devices are never summed.
-                let allocation_pool = match pools.iter().find(|pool| pool.ledger == ledger) {
-                    Some(pool) => pool.id,
+                // proven identity; distinct devices are never summed. A GPU
+                // with a CUDA view takes that view's capacity and total,
+                // whatever the enumeration order: one measurement defines a
+                // pool, and CUDA's counts the context a CUDA load creates.
+                let allocation_pool = match pools.iter_mut().find(|pool| pool.ledger == ledger) {
+                    Some(pool) => {
+                        if device.backend == BackendName::Cuda {
+                            pool.capacity_bytes = capacity_bytes;
+                            pool.total_bytes = total_bytes;
+                            pool.basis = basis;
+                        }
+                        pool.id
+                    }
                     None => {
                         let id = MemoryPoolId {
                             revision,
@@ -228,6 +242,7 @@ fn inventory_from(
                             id,
                             kind: MemoryPoolKind::DeviceLocal,
                             capacity_bytes,
+                            total_bytes,
                             basis,
                             ledger,
                         });
@@ -237,6 +252,11 @@ fn inventory_from(
                 DeviceMemory::Established(DeviceMemoryInfo {
                     allocation_pool,
                     host_pool,
+                    shared_pool: if shared_device_local {
+                        allocation_pool
+                    } else {
+                        host_pool
+                    },
                     max_allocation_bytes,
                 })
             }
@@ -302,13 +322,15 @@ mod tests {
             availability: Availability::Available,
             memory: DiscoveredMemory::Dedicated {
                 capacity_bytes: 24_000_000_000,
+                total_bytes: 24_000_000_000,
                 basis: if backend == BackendName::Cuda {
-                    CapacityBasis::CudaDeviceTotal
+                    CapacityBasis::CudaUsable
                 } else {
-                    CapacityBasis::VulkanDeviceLocalHeap
+                    CapacityBasis::VulkanHeapBudget
                 },
                 ledger: LedgerKey::PhysicalGpu(uuid),
                 max_allocation_bytes: 24_000_000_000,
+                shared_device_local: false,
             },
             memory_bandwidth: None,
             descriptor: match backend {
@@ -344,6 +366,30 @@ mod tests {
                 _ => panic!("GPU memory must be established"),
             })
             .collect()
+    }
+
+    /// Host-shared storage consumes host RAM unless the device reports it
+    /// device-local, then the device's own pool.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shared_storage_consumes_the_pool_the_device_reports() {
+        let mut local = gpu(BackendName::Vulkan, [5; 16]);
+        if let DiscoveredMemory::Dedicated {
+            shared_device_local,
+            ..
+        } = &mut local.memory
+        {
+            *shared_device_local = true;
+        }
+        let topology = gpu_topology(vec![gpu(BackendName::Cuda, [4; 16]), local]);
+        let host = topology.pools[0].id;
+        let memory = |index: usize| match &topology.devices[index].memory {
+            DeviceMemory::Established(memory) => *memory,
+            _ => panic!("GPU memory must be established"),
+        };
+        assert_eq!(memory(0).shared_pool, host);
+        assert_ne!(memory(0).allocation_pool, host);
+        assert_eq!(memory(1).shared_pool, memory(1).allocation_pool);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -397,6 +443,42 @@ mod tests {
             gpu(BackendName::Cuda, [7; 16]),
         ]);
         assert_eq!(gpu_pools(&reverse)[0], gpu_pools(&reverse)[1]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_shared_pool_takes_its_cuda_views_capacity_in_any_order() {
+        let sized = |backend, capacity, total| {
+            let mut device = gpu(backend, [8; 16]);
+            if let DiscoveredMemory::Dedicated {
+                capacity_bytes,
+                total_bytes,
+                ..
+            } = &mut device.memory
+            {
+                (*capacity_bytes, *total_bytes) = (capacity, total);
+            }
+            device
+        };
+        // The A10-8Q vGPU slice: CUDA's usable memory against Vulkan's budget.
+        let cuda = (6_603_640_832, 8_589_475_840);
+        let vulkan = (6_838_534_144, 7_643_791_360);
+        for devices in [
+            vec![
+                sized(BackendName::Cuda, cuda.0, cuda.1),
+                sized(BackendName::Vulkan, vulkan.0, vulkan.1),
+            ],
+            vec![
+                sized(BackendName::Vulkan, vulkan.0, vulkan.1),
+                sized(BackendName::Cuda, cuda.0, cuda.1),
+            ],
+        ] {
+            let topology = gpu_topology(devices);
+            let pool = topology.pool(gpu_pools(&topology)[0]).unwrap();
+            assert_eq!(pool.capacity_bytes, cuda.0);
+            assert_eq!(pool.total_bytes, cuda.1);
+            assert_eq!(pool.basis, CapacityBasis::CudaUsable);
+        }
     }
 
     #[test]

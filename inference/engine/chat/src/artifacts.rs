@@ -194,6 +194,7 @@ const INTERPRETED_KEYS: &[&str] = &[
     "tokenizer.ggml.scores",
     "tokenizer.ggml.bos_token_id",
     "tokenizer.ggml.eos_token_id",
+    "tokenizer.ggml.eos_token_ids",
     "tokenizer.ggml.eot_token_id",
     "tokenizer.ggml.eom_token_id",
     "tokenizer.ggml.unknown_token_id",
@@ -332,6 +333,7 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
         return Err("GGUF token kinds do not cover the vocabulary".into());
     }
     length("tokenizer.ggml.merges")?;
+    additional_eos(payload, vocabulary)?;
     match payload
         .value("tokenizer.ggml.eos_token_id")
         .and_then(|value| value.unsigned())
@@ -339,6 +341,23 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
         Some(eos) if eos < vocabulary as u64 => Ok((profile, vocabulary)),
         Some(_) => Err("tokenizer.ggml.eos_token_id is not a vocabulary token".into()),
         None => Err("missing EOS identity".into()),
+    }
+}
+
+/// Additional end-of-generation identities declared by the container.
+fn additional_eos(payload: &TokenizerPayload, vocabulary: usize) -> Result<Vec<TokenId>, TokenizerError> {
+    let key = "tokenizer.ggml.eos_token_ids";
+    match payload.value(key) {
+        None => Ok(Vec::new()),
+        Some(GgufValue::Array(values)) => values.iter().map(|value| {
+            match value {
+                Scalar::Unsigned(n) => u32::try_from(*n).ok(),
+                Scalar::Signed(n) => u32::try_from(*n).ok(),
+                _ => None,
+            }.filter(|&n| (n as usize) < vocabulary).map(TokenId)
+                .ok_or_else(|| TokenizerError::Invalid(format!("{key} requires vocabulary tokens")))
+        }).collect(),
+        Some(_) => Err(TokenizerError::Invalid(format!("{key} requires an array"))),
     }
 }
 
@@ -404,7 +423,8 @@ pub fn gguf_byte_bpe(
             token("tokenizer.ggml.eom_token_id")?,
         ]
         .into_iter()
-        .flatten(),
+        .flatten()
+        .chain(additional_eos(payload, pieces.len())?),
     );
     let add_bos = match profile.sequence_start {
         SequenceStart::Declared { default } => {
@@ -454,4 +474,23 @@ pub fn gguf_byte_bpe(
         stop_tokens,
         suppressed_tokens,
     })
+}
+
+#[cfg(test)]
+mod eos_tests {
+    use super::*;
+    use magnitude_artifacts::gguf::Metadata;
+
+    #[test]
+    fn eos_array_validates_integer_ids_and_vocabulary_bounds() {
+        let payload = |value| TokenizerPayload { metadata: vec![Metadata {
+            name: "tokenizer.ggml.eos_token_ids".into(), value,
+        }] };
+        assert_eq!(additional_eos(&TokenizerPayload {metadata: vec![]}, 4).unwrap(), vec![]);
+        let valid = payload(GgufValue::Array(vec![Scalar::Unsigned(1), Scalar::Signed(3)]));
+        assert_eq!(additional_eos(&valid, 4).unwrap(), vec![TokenId(1), TokenId(3)]);
+        for values in [vec![Scalar::Signed(-1)], vec![Scalar::Unsigned(4)], vec![Scalar::String("1".into())]] {
+            assert!(additional_eos(&payload(GgufValue::Array(values)), 4).is_err());
+        }
+    }
 }

@@ -29,8 +29,20 @@ kernel void routed_route_stage(
     uint tid [[thread_index_in_threadgroup]],
     uint simd [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float partials[route_simdgroups];
     const ulong row = ulong(row_index);
+    threadgroup float partials[route_simdgroups];
+    if (SEISMIC_DIM_NM == 0) {
+        // `form_input` without a norm: the sum in part order of the partials.
+        for (uint source = tid; source < SEISMIC_DIM_H; source += route_threads) {
+            float total = 0.0f;
+            for (ulong part = 0; part < SEISMIC_DIM_PT; ++part)
+                total += residual[row * SEISMIC_RESIDUAL_STRIDE_0
+                    + (part * SEISMIC_DIM_H + source) * SEISMIC_RESIDUAL_STRIDE_1];
+            element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
+                Act::round(total));
+        }
+        return;
+    }
     const float eps = as_type<float>(uint(SEISMIC_PARAM_EPS));
     float squares = 0.0f;
     for (uint source = tid; source < SEISMIC_DIM_H; source += route_threads) {
@@ -56,7 +68,7 @@ kernel void routed_route_gemv(
     device float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
     device uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
     device float *coefficient [[buffer(SEISMIC_RESULT_1_BUFFER)]],
-    device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     device atomic_uint *arrivals [[buffer(SEISMIC_BUFFER_SCRATCH_ARRIVALS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     threadgroup uchar *shared [[threadgroup(0)]],
@@ -67,7 +79,7 @@ kernel void routed_route_gemv(
     threadgroup float parts[8 * route_simdgroups];
     threadgroup float inverses[8];
     threadgroup uint last;
-    const routing::Rows<Norm> in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
+    const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     route_group(in, router, shared_router, routes, scores, normalized, coefficient, logits, arrivals, seismic_words,
         shared, &last, group, tid, simd, lane);
 }
@@ -83,7 +95,7 @@ kernel void routed_route_gemm(
     device const uchar *router [[buffer(SEISMIC_BUFFER_ROUTER)]],
     device const float *shared_router [[buffer(SEISMIC_BUFFER_SHARED_ROUTER)]],
     device const uchar *normalized [[buffer(SEISMIC_RESULT_0_BUFFER)]],
-    device float *logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
+    arrive::coherent_device<float> logits [[buffer(SEISMIC_BUFFER_SCRATCH_LOGITS)]],
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]],

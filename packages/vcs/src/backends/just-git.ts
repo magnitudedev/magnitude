@@ -8,7 +8,7 @@ import { createRestoreScopePredicate } from "../path-selector"
 import { createContentPatch } from "../diff-content"
 
 // ── just-git SDK + exec ─────────────────────────────────────────────
-import { type FileSystem, findRepo, type GitContext, createGit } from "just-git"
+import { type FileStat, type FileSystem, findRepo, type GitContext, createGit } from "just-git"
 import {
   createTreeAccessor,
   diffTrees as diffTreesRepo,
@@ -30,9 +30,32 @@ import {
   rm as fsRm,
   writeFile as nodeWriteFile,
 } from "node:fs/promises"
-import { existsSync } from "node:fs"
+import { existsSync, type Stats } from "node:fs"
 
 type FlatTreeEntry = Awaited<ReturnType<typeof flattenTreeRepo>>[number]
+
+/**
+ * Git records only four modes for worktree entries, so the adapter reports those rather than the raw
+ * `st_mode`: just-git stores any mode above 0o777 in the index verbatim, and a group-writable file
+ * (umask 002) would otherwise become the illegal tree mode `100664`. As in git, a regular file is
+ * executable when its owner-execute bit is set.
+ */
+function gitEntryMode(stats: Stats): number {
+  if (stats.isSymbolicLink()) return 0o120000
+  if (stats.isDirectory()) return 0o040000
+  return stats.mode & 0o100 ? 0o100755 : 0o100644
+}
+
+function toFileStat(stats: Stats): FileStat {
+  return {
+    isFile: stats.isFile(),
+    isDirectory: stats.isDirectory(),
+    isSymbolicLink: stats.isSymbolicLink(),
+    mode: gitEntryMode(stats),
+    size: stats.size,
+    mtime: stats.mtime,
+  }
+}
 
 export const realFs: FileSystem = {
   async readFile(p) {
@@ -49,26 +72,10 @@ export const realFs: FileSystem = {
     return existsSync(p)
   },
   async stat(p) {
-    const s = await fsStat(p)
-    return {
-      isFile: s.isFile(),
-      isDirectory: s.isDirectory(),
-      isSymbolicLink: s.isSymbolicLink(),
-      mode: s.mode,
-      size: s.size,
-      mtime: s.mtime,
-    }
+    return toFileStat(await fsStat(p))
   },
   async lstat(p) {
-    const s = await fsLstat(p)
-    return {
-      isFile: s.isFile(),
-      isDirectory: s.isDirectory(),
-      isSymbolicLink: s.isSymbolicLink(),
-      mode: s.mode,
-      size: s.size,
-      mtime: s.mtime,
-    }
+    return toFileStat(await fsLstat(p))
   },
   async readlink(p) {
     const { readlink } = await import("node:fs/promises")

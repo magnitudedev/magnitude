@@ -17,6 +17,7 @@ seismic-cuda.workspace = true
 seismic-vulkan = { workspace = true, optional = true }
 opentelemetry = "0.33.0"
 serde.workspace = true
+postcard.workspace = true
 sha2 = "=0.11.0"
 
 [features]
@@ -40,6 +41,7 @@ seismic-vulkan.workspace = true
 windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_JobObjects",
+  "Win32_System_Memory",
   "Win32_System_ProcessStatus",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",

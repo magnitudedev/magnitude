@@ -1,19 +1,28 @@
-//! The owned block allocator (§8.2, §15.4).
+//! The owned block allocator (§8.2, §15.4) over the shared block core
+//! (`seismic_compiler::blocks`).
 //!
 //! Device memory is allocated in blocks, each one `VkBuffer` with a device
 //! address; an allocation is a range of a block, and its address is the
 //! block's address plus the range's offset. Blocks of one storage kind grow
 //! from 64 MiB to the block cap (min(`maxMemoryAllocationSize`,
-//! `maxBufferSize`, 1 GiB)); a request beyond the cap gets a dedicated block,
-//! released with it. Host-visible blocks are persistently mapped.
+//! `maxBufferSize`, 1 GiB)); a request beyond the cap gets a dedicated block.
+//! A block is freed once it holds no allocation, so released storage returns
+//! to the device's memory budget: the engine reads the budget less usage as
+//! its headroom, and a block kept empty would hide released storage from it.
+//! A block's unallocated space counts against that budget too, so a new
+//! device-local block never exceeds the room the caller grants beyond the
+//! free space device-local blocks already hold, and when a doubled block
+//! does not fit that room the block holds only its allocation: an
+//! allocation that fits its grant never grows the device's usage past it. That free space is device
+//! memory this process holds beyond its charges
+//! ([`Memory::device_local_slack`]). Host-visible blocks are persistently
+//! mapped.
 
 use crate::device::{call, Inner};
 use ash::vk;
+use seismic_compiler::blocks::{block_bytes, FreeRanges, BLOCK_CAP_BYTES};
 use seismic_compiler::errors::ExecutionError;
 use std::sync::{Arc, Mutex};
-
-const FIRST_BLOCK_BYTES: u64 = 64 << 20;
-const BLOCK_CAP_BYTES: u64 = 1 << 30;
 /// Every allocation starts at least this aligned.
 const MINIMUM_ALIGNMENT: u64 = 16;
 
@@ -37,8 +46,7 @@ struct Block {
     /// Base of the persistent mapping; null for unmapped memory.
     mapped: *mut u8,
     dedicated: bool,
-    /// Free ranges `(offset, bytes)`, sorted and coalesced.
-    free: Mutex<Vec<(u64, u64)>>,
+    free: Mutex<FreeRanges>,
 }
 
 // The mapping is plain host memory; ranges are handed out exclusively.
@@ -47,42 +55,18 @@ unsafe impl Sync for Block {}
 
 impl Block {
     fn take(&self, bytes: u64, alignment: u64) -> Option<u64> {
-        let mut free = self
-            .free
-            .lock()
-            .expect("block free list lock is never poisoned");
-        let (index, start) = free
-            .iter()
-            .enumerate()
-            .find_map(|(index, (offset, size))| {
-                let start = offset.next_multiple_of(alignment);
-                (start + bytes <= offset + size).then_some((index, start))
-            })?;
-        let (offset, size) = free.remove(index);
-        if start + bytes < offset + size {
-            free.insert(index, (start + bytes, offset + size - start - bytes));
-        }
-        if start > offset {
-            free.insert(index, (offset, start - offset));
-        }
-        Some(start)
+        self.ranges().take(bytes, alignment)
     }
 
     /// Return a range; true when the block is entirely free afterwards.
     fn give(&self, offset: u64, bytes: u64) -> bool {
-        let mut free = self
-            .free
+        self.ranges().give(offset, bytes)
+    }
+
+    fn ranges(&self) -> std::sync::MutexGuard<'_, FreeRanges> {
+        self.free
             .lock()
-            .expect("block free list lock is never poisoned");
-        let index = free.partition_point(|(start, _)| *start < offset);
-        free.insert(index, (offset, bytes));
-        if index + 1 < free.len() && free[index].0 + free[index].1 == free[index + 1].0 {
-            free[index].1 += free.remove(index + 1).1;
-        }
-        if index > 0 && free[index - 1].0 + free[index - 1].1 == free[index].0 {
-            free[index - 1].1 += free.remove(index).1;
-        }
-        free.len() == 1 && free[0] == (0, self.bytes)
+            .expect("block free list lock is never poisoned")
     }
 }
 
@@ -91,11 +75,34 @@ struct Pool {
     kind: StorageKind,
     memory_type: u32,
     mapped: bool,
+    device_local: bool,
     blocks: Mutex<Vec<Arc<Block>>>,
+}
+
+impl Pool {
+    /// Return `range` to its block. A block left without an allocation
+    /// leaves the pool and is returned for the caller to free. The pool
+    /// lock is held across the return, so no allocation can take a range of
+    /// a block being removed.
+    fn give(&self, range: &Range) -> Option<Arc<Block>> {
+        let mut blocks = self.blocks.lock().expect("pool lock is never poisoned");
+        if !range.block.give(range.offset, range.bytes) {
+            return None;
+        }
+        let index = blocks
+            .iter()
+            .position(|block| Arc::ptr_eq(block, &range.block))
+            .expect("a live range's block belongs to its pool");
+        Some(blocks.remove(index))
+    }
 }
 
 pub(crate) struct Memory {
     pools: [Pool; 3],
+    /// Device-local bytes of the device's own ranges (argument chunks,
+    /// staging), which live until the device is destroyed: held, charged
+    /// to no allocation.
+    internal: std::sync::atomic::AtomicU64,
     block_cap: u64,
     max_allocation: u64,
 }
@@ -131,8 +138,9 @@ impl Memory {
         }
         .ok_or("no device-local memory type")?;
         // A small BAR window (typically 256 MiB) is not spent on upload
-        // regions; ReBAR/SAM and unified memory are.
-        let upload = if facts.host_visible_device_local_bytes > 256 << 20 {
+        // regions; ReBAR/SAM and unified memory are. Every upload type is
+        // HOST_COHERENT (`visible`): host writes need no flush.
+        let upload = if facts.uploads_device_local() {
             find(local | visible, local | visible)
         } else {
             find(visible, visible)
@@ -144,6 +152,7 @@ impl Memory {
             kind,
             memory_type,
             mapped: flags.contains(visible),
+            device_local: flags.contains(local),
             blocks: Mutex::new(Vec::new()),
         };
         Ok(Self {
@@ -152,6 +161,7 @@ impl Memory {
                 pool(StorageKind::Upload, upload),
                 pool(StorageKind::Staging, staging),
             ],
+            internal: std::sync::atomic::AtomicU64::new(0),
             block_cap: facts.limits.max_allocation_bytes.min(BLOCK_CAP_BYTES),
             max_allocation: facts.limits.max_allocation_bytes,
         })
@@ -164,12 +174,34 @@ impl Memory {
             .expect("every storage kind has a pool")
     }
 
+    /// Free space held by device-local blocks: device usage that no
+    /// allocation charges.
+    pub(crate) fn device_local_slack(&self) -> u64 {
+        self.pools
+            .iter()
+            .filter(|pool| pool.device_local)
+            .map(|pool| {
+                pool.blocks
+                    .lock()
+                    .expect("pool lock is never poisoned")
+                    .iter()
+                    .map(|block| block.ranges().free_bytes())
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// A range of `bytes`. `room`, when given, is the device usage the
+    /// caller may add: a new device-local block is sized within it less the
+    /// free space device-local blocks already hold, and an allocation that
+    /// needs a block larger than that is refused as a capacity shortfall.
     pub(crate) fn allocate(
         &self,
         device: &ash::Device,
         kind: StorageKind,
         bytes: u64,
         alignment: u64,
+        room: Option<u64>,
     ) -> Result<Range, ExecutionError> {
         if bytes > self.max_allocation {
             return Err(ExecutionError::AllocationCapacity {
@@ -180,6 +212,10 @@ impl Memory {
         let bytes = bytes.max(1);
         let alignment = alignment.max(MINIMUM_ALIGNMENT);
         let pool = self.pool(kind);
+        // Read before taking this pool's lock: the slack spans every pool.
+        let room = room
+            .filter(|_| pool.device_local)
+            .map(|room| room.saturating_sub(self.device_local_slack()));
         let mut blocks = pool.blocks.lock().expect("pool lock is never poisoned");
         let found = blocks
             .iter()
@@ -197,16 +233,9 @@ impl Memory {
                     .filter(|block| !block.dedicated)
                     .map(|block| block.bytes)
                     .max();
-                let size = largest
-                    .map_or(FIRST_BLOCK_BYTES, |largest| largest * 2)
-                    .min(self.block_cap);
-                let dedicated = bytes > size;
-                let block = create_block(
-                    device,
-                    pool,
-                    if dedicated { bytes } else { size },
-                    dedicated,
-                )?;
+                let size = block_bytes(largest, self.block_cap, bytes, room, 1)?;
+                let dedicated = bytes > self.block_cap;
+                let block = create_block(device, pool, size, dedicated)?;
                 let offset = block
                     .take(bytes, alignment)
                     .expect("a new block holds its first allocation");
@@ -222,17 +251,49 @@ impl Memory {
         })
     }
 
-    /// Return `range` to its block; a dedicated block is freed with it.
+    /// A range for the device's own use (argument chunks, staging), kept
+    /// until the device is destroyed and counted as held when device-local.
+    pub(crate) fn allocate_internal(
+        &self,
+        device: &ash::Device,
+        kind: StorageKind,
+        bytes: u64,
+        alignment: u64,
+    ) -> Result<Range, ExecutionError> {
+        let range = self.allocate(device, kind, bytes, alignment, None)?;
+        if self.pool(kind).device_local {
+            self.internal
+                .fetch_add(range.bytes, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(range)
+    }
+
+    /// Bytes of every device-local block.
+    pub(crate) fn device_local_block_bytes(&self) -> u64 {
+        self.pools
+            .iter()
+            .filter(|pool| pool.device_local)
+            .map(|pool| {
+                pool.blocks
+                    .lock()
+                    .expect("pool lock is never poisoned")
+                    .iter()
+                    .map(|block| block.bytes)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// Device-local bytes of the device's own ranges.
+    pub(crate) fn internal_device_local(&self) -> u64 {
+        self.internal.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return `range` to its block, and free the block once it holds no
+    /// allocation.
     pub(crate) fn release(&self, device: &ash::Device, range: &Range) {
-        let empty = range.block.give(range.offset, range.bytes);
-        if empty && range.block.dedicated {
-            let mut blocks = self
-                .pool(range.kind)
-                .blocks
-                .lock()
-                .expect("pool lock is never poisoned");
-            blocks.retain(|block| !Arc::ptr_eq(block, &range.block));
-            destroy_block(device, &range.block);
+        if let Some(block) = self.pool(range.kind).give(range) {
+            destroy_block(device, &block);
         }
     }
 
@@ -350,7 +411,7 @@ fn create_block(
         bytes,
         mapped,
         dedicated,
-        free: Mutex::new(vec![(0, bytes)]),
+        free: Mutex::new(FreeRanges::new(bytes)),
     }))
 }
 
@@ -446,5 +507,97 @@ impl Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         self.device.memory.release(&self.device.device, &self.range);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(bytes: u64) -> Arc<Block> {
+        Arc::new(Block {
+            memory: vk::DeviceMemory::null(),
+            buffer: vk::Buffer::null(),
+            address: 0,
+            bytes,
+            mapped: std::ptr::null_mut(),
+            dedicated: false,
+            free: Mutex::new(FreeRanges::new(bytes)),
+        })
+    }
+
+    fn range(pool: &Pool, block: &Arc<Block>, bytes: u64) -> Range {
+        Range {
+            kind: pool.kind,
+            block: block.clone(),
+            offset: block
+                .take(bytes, MINIMUM_ALIGNMENT)
+                .expect("the block has room"),
+            bytes,
+        }
+    }
+
+    /// What `VK_EXT_memory_budget` reports as the pool's usage: every block
+    /// it holds, whether or not any allocation remains in it.
+    fn usage(pool: &Pool) -> u64 {
+        pool.blocks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|block| block.bytes)
+            .sum()
+    }
+
+    /// Retained state fills blocks; releasing it (the engine's release order
+    /// evicting retained prefixes and shrinking their slabs) must return
+    /// every block it emptied to the device, or the budget less usage the
+    /// engine admits a claim against never grows and a claim larger than the
+    /// headroom is refused although the released bytes are free.
+    #[test]
+    fn released_storage_returns_emptied_blocks_to_the_device() {
+        const SLAB: u64 = 64 << 20;
+        let pool = Pool {
+            kind: StorageKind::Device,
+            memory_type: 0,
+            mapped: false,
+            device_local: true,
+            blocks: Mutex::new(Vec::new()),
+        };
+        let blocks = (0..4).map(|_| block(16 * SLAB)).collect::<Vec<_>>();
+        pool.blocks.lock().unwrap().extend(blocks.iter().cloned());
+        // The model's resident storage occupies the first block; retained
+        // state fills the rest, one slab beside it in the first block.
+        let model = range(&pool, &blocks[0], 15 * SLAB);
+        let retained = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(index, block)| {
+                let slabs = if index == 0 { 1 } else { 16 };
+                (0..slabs)
+                    .map(|_| range(&pool, block, SLAB))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage(&pool), 64 * SLAB);
+
+        let mut freed = Vec::new();
+        for slab in &retained {
+            freed.extend(pool.give(slab));
+        }
+        // Each emptied block left the pool once, for the caller to free; the
+        // block still holding the model stays.
+        assert_eq!(freed.len(), 3);
+        assert!(freed
+            .iter()
+            .all(|block| blocks[1..].iter().any(|other| Arc::ptr_eq(block, other))));
+        assert_eq!(usage(&pool), 16 * SLAB);
+        assert!(Arc::ptr_eq(&pool.blocks.lock().unwrap()[0], &blocks[0]));
+
+        // The block keeps its free space for later allocations until its
+        // last allocation is released too.
+        let reused = range(&pool, &blocks[0], SLAB);
+        assert!(pool.give(&reused).is_none());
+        assert!(pool.give(&model).is_some());
+        assert_eq!(usage(&pool), 0);
     }
 }

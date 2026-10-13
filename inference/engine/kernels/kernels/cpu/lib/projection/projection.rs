@@ -179,4 +179,4 @@ pub fn project_pair_staged_arithmetic(
     }
 }
 
-pub use super::stage::{normalize, quantize, rms_row, stage};
+pub use super::stage::{form_input, normalize, quantize, rms_row, stage, sum_parts};

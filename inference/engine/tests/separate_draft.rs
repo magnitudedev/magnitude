@@ -6,7 +6,8 @@
 //! commits and bounds its graph holdings. Run on a host with a target and its
 //! draft:
 //! `MAGNITUDE_TEST_TARGET_GGUF=T.gguf MAGNITUDE_TEST_DRAFT_GGUF=D.gguf
-//! [MAGNITUDE_TEST_DRAFT_METHOD=dflash|dspark|dflash2] cargo test
+//! [MAGNITUDE_TEST_DRAFT_METHOD=dflash|dspark|dflash2]
+//! [MAGNITUDE_TEST_DRAFT_WIDTH=4] [MAGNITUDE_TEST_DRAFT_DENSE_KV=1] cargo test
 //! -p magnitude-engine --test separate_draft -- --ignored --nocapture`.
 
 use magnitude_engine::{
@@ -16,7 +17,8 @@ use magnitude_engine::{
     build_native_domain,
     composition::{EngineConfiguration, ResolvedEngineConfiguration},
     options::{
-        standard_service_limits, ModelMethod, ModelPolicy, PackageOptions, ProjectorSelection,
+        standard_service_limits, DraftBudget, DraftPolicy, ModelMethod, ModelPolicy, PackageOptions,
+        ProjectorSelection,
     },
 };
 use magnitude_executor::{
@@ -45,9 +47,27 @@ fn method() -> ModelMethod {
 
 fn policy() -> ModelPolicy {
     ModelPolicy {
+        kv_codec: if std::env::var("MAGNITUDE_TEST_DRAFT_DENSE_KV").as_deref() == Ok("1") {
+            magnitude_state::KvCodec::Dense
+        } else {
+            ModelPolicy::default().kv_codec
+        },
+        draft_policy: test_width().map(|width| {
+            DraftPolicy::Fixed(DraftBudget {
+                generated: width,
+                verified: width,
+            })
+        }),
         method: method(),
         ..ModelPolicy::default()
     }
+}
+
+/// The generated width the load prepares instead of its whole proposal width.
+fn test_width() -> Option<usize> {
+    std::env::var("MAGNITUDE_TEST_DRAFT_WIDTH")
+        .ok()
+        .map(|width| width.parse::<u8>().unwrap() as usize)
 }
 
 fn resolved() -> ResolvedEngineConfiguration {
@@ -287,30 +307,54 @@ fn draft_state_copies_and_restores_reproduce_its_proposals() {
     let source = RequestId(1);
     open(&mut domain, &mut bindings, source, None);
     let (conditioning, bindings) = prefill(&mut domain, bindings, source, &tokens[..committed]);
+    let before_inject = domain.resume_state(source).unwrap();
     let bindings = inject(&mut domain, bindings, source, &tokens, &conditioning);
     let before_draft = domain.resume_state(source).unwrap();
+    let width = test_width().unwrap_or(proposals);
     let (drafted, mut bindings) =
-        draft(&mut domain, bindings, source, &tokens, &conditioning, proposals);
-    assert_eq!(drafted.len(), proposals);
+        draft(&mut domain, bindings, source, &tokens, &conditioning, width);
+    assert_eq!(drafted.len(), width);
 
     // Another request resumed from the state before the draft drafts the
     // same proposals.
     let copy = RequestId(2);
     open(&mut domain, &mut bindings, copy, Some(&before_draft));
-    let (copied, mut bindings) =
-        draft(&mut domain, bindings, copy, &tokens, &conditioning, proposals);
+    let (copied, mut bindings) = draft(&mut domain, bindings, copy, &tokens, &conditioning, width);
     assert_eq!(copied, drafted);
+    domain.close(copy).unwrap();
     // Evicting the source and resuming it from that state drafts them too.
     domain.release_state(&[source]).unwrap();
     domain
         .open_state(&mut bindings, source, Some(&before_draft))
         .unwrap();
-    let (resumed, _) = draft(&mut domain, bindings, source, &tokens, &conditioning, proposals);
+    let (resumed, mut bindings) =
+        draft(&mut domain, bindings, source, &tokens, &conditioning, width);
     assert_eq!(resumed, drafted);
-    eprintln!("proposals after {committed} committed rows: {drafted:?}");
-    for request in [source, copy] {
-        domain.close(request).unwrap();
+    eprintln!("width={width} proposals after {committed} committed rows: {drafted:?}");
+    // Catch up the same committed context in two injection transactions. It
+    // must produce the same proposals as one injection.
+    let catchup = RequestId(3);
+    open(&mut domain, &mut bindings, catchup, Some(&before_inject));
+    let injected = committed - 1;
+    let split = injected / 2;
+    for (start, end) in [(0, split), (split, injected)] {
+        let (none, returned) = transact(
+            &mut domain,
+            bindings,
+            catchup,
+            &tokens[start + 1..end + 1],
+            rows(&conditioning, start..end),
+            start,
+            0,
+        );
+        bindings = returned;
+        assert!(none.is_empty());
     }
+    let (caught_up, _) = draft(&mut domain, bindings, catchup, &tokens, &conditioning, width);
+    assert_eq!(caught_up, drafted);
+    domain.close(catchup).unwrap();
+    domain.close(source).unwrap();
+    drop(before_inject);
     drop(before_draft);
     let charge = domain.reconcile_memory_charge(&[]).unwrap();
     assert_eq!(charge.unattributed, 0, "{charge:?}");
@@ -324,7 +368,7 @@ fn header_only_assessment_charges_what_a_load_commits() {
         &catalog,
         DeviceRequest::Automatic,
         MemoryReserves::standard(),
-        ModelPolicy::default(),
+        policy(),
         standard_service_limits(),
     )
     .unwrap();

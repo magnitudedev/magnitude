@@ -9,7 +9,7 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{BackendName, DType, Device, Element, SlabLayout, SlabRegion};
+use seismic::{BackendName, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
 
 /// The service's bounds a load plans for. None is a request-count batch
@@ -152,11 +152,77 @@ pub struct StartupSlots {
 /// entry that reads history decoded for the call, for heads of `head_width`
 /// columns: on Metal the direct form on tensor operations (any head) and
 /// the co-issue form on simdgroup matrices (128-, 256- and 512-column heads,
-/// a 512-column head as two 256-column windows).
+/// a 512-column head as two 256-column windows); on CUDA the request-local
+/// F16 operand-staging form for the affine entry's32..512-column head bands.
 /// Such forms take the history row tiles their launch's rows see; every
 /// other form reads the history in place.
-pub fn reads_decoded_history(backend: BackendName, tensor_operations: bool, head_width: u64) -> bool {
-    backend == BackendName::Metal && (tensor_operations || matches!(head_width, 128 | 256 | 512))
+pub fn reads_decoded_history(
+    backend: BackendName,
+    tensor_operations: bool,
+    head_width: u64,
+) -> bool {
+    DecodedHistoryForm::of(backend, tensor_operations, head_width).is_some()
+}
+
+/// How a form of the affine K8/V4 prefill entry that reads history decoded
+/// for the call takes the history row tiles its launch lists. The form
+/// declares what its work follows, and with it the smallest listing class
+/// worth sealing a graph for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodedHistoryForm {
+    /// Metal's direct and co-issue forms decode the listed tiles into a
+    /// window of the call's partial-output scratch, a round per window. A
+    /// listing that fits the window is one round whatever its class, and a
+    /// tile the launch does not see reads no rows, so classes below the
+    /// floor would change nothing of what a launch does.
+    Windowed,
+    /// CUDA's operand-staging form stages the listed tiles into scratch
+    /// sized by the class (`history_keys`, `history_values`). An entry of
+    /// the list that names no tile stages nothing and is never looked up,
+    /// so the form's work follows the tiles a launch sees whatever its
+    /// class: one class of one request's worth serves every listing.
+    Staged,
+}
+
+impl DecodedHistoryForm {
+    /// The form a device of `backend` has for heads of `head_width`
+    /// columns, if any ([`reads_decoded_history`]).
+    pub fn of(backend: BackendName, tensor_operations: bool, head_width: u64) -> Option<Self> {
+        match backend {
+            BackendName::Metal
+                if tensor_operations || matches!(head_width, 128 | 256 | 512) =>
+            {
+                Some(Self::Windowed)
+            }
+            BackendName::Cuda if matches!(head_width, 32 | 64 | 128 | 256 | 512) => {
+                Some(Self::Staged)
+            }
+            _ => None,
+        }
+    }
+
+    /// The tile count of the form's smallest listing class below one
+    /// request's worth, if it has classes there.
+    pub fn smallest_listing_tiles(self) -> Option<u64> {
+        match self {
+            Self::Windowed => Some(16),
+            Self::Staged => None,
+        }
+    }
+
+    /// Whether the form's listing classes are sealed for every history
+    /// segment count, as the classes that list none are. Metal's forms
+    /// reserve threadgroup memory per segment, so theirs are. CUDA's reads
+    /// its rows' spans from a table of a few bytes a segment beside the
+    /// operand stages, and does nothing for a span that is empty: its
+    /// listing class is sealed for the most segments alone, and a launch
+    /// of fewer pads each row's spans with empty ones.
+    pub fn lists_every_segment_count(self) -> bool {
+        match self {
+            Self::Windowed => true,
+            Self::Staged => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -391,13 +457,17 @@ impl HistoryStorePlan {
     }
 
     /// The tile counts of the graph classes that list a launch's history
-    /// row tiles, ascending: powers of two from 16 tiles, then one request's
-    /// worth (`launch_tiles(1)`). A launch takes the smallest that holds the
-    /// tiles its rows see, so a form that attends the listed rows a part at
-    /// a time dispatches at most twice the parts the launch needs.
-    pub fn listed_tile_classes(&self) -> Result<Vec<u64>, String> {
+    /// row tiles for `form`, ascending: powers of two from the form's
+    /// smallest class ([`DecodedHistoryForm::smallest_listing_tiles`]),
+    /// then one request's worth (`launch_tiles(1)`). A launch takes the
+    /// smallest that holds the tiles its rows see, so a form that attends
+    /// the listed rows a part at a time dispatches at most twice the parts
+    /// the launch needs.
+    pub fn listed_tile_classes(&self, form: DecodedHistoryForm) -> Result<Vec<u64>, String> {
         let most = self.launch_tiles(1)?;
-        let mut classes = std::iter::successors(Some(16u64), |tiles| tiles.checked_mul(2))
+        let mut classes = std::iter::successors(form.smallest_listing_tiles(), |tiles| {
+            tiles.checked_mul(2)
+        })
             .take_while(|tiles| *tiles < most)
             .collect::<Vec<_>>();
         classes.push(most);
@@ -422,7 +492,7 @@ impl HistoryStorePlan {
             .iter()
             .flat_map(ComponentDescriptor::planes)
             .map(|plane| SlabRegion {
-                element: slab_element(plane.dtype),
+                element: Element::dense(plane.dtype),
                 row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
             })
             .collect::<Vec<_>>();
@@ -470,6 +540,23 @@ impl StateStorePlan {
         })
     }
 
+    /// The raw keys' (Window) and block keys' (Block) domains of target
+    /// block `block`'s indexer (`LayerRef::Indexer`). `None` for a block
+    /// without one.
+    pub fn indexer_history(&self, block: u32) -> Option<(&HistoryStorePlan, &HistoryStorePlan)> {
+        let layer = LayerRef::Indexer(block);
+        let find = |blocks: bool| {
+            self.domains.iter().find(|store| {
+                matches!(store.kind, HistoryDomainKind::Block { .. }) == blocks
+                    && store
+                        .components
+                        .iter()
+                        .any(|component| component.layer == layer)
+            })
+        };
+        Some((find(false)?, find(true)?))
+    }
+
     /// The store's one history domain, for a store whose history the
     /// caller addresses as one domain (the draft head's).
     pub fn sole_history(&self) -> Result<&HistoryStorePlan, String> {
@@ -495,7 +582,7 @@ impl StateStorePlan {
             .recurrent_components
             .iter()
             .map(|component| SlabRegion {
-                element: slab_element(component.dtype),
+                element: Element::dense(component.dtype),
                 row_shape: component.shape.iter().map(|&size| size as u64).collect(),
             })
             .collect::<Vec<_>>();
@@ -743,10 +830,7 @@ impl ResourcePlan {
         self.target_state.allocate(device)
     }
 
-    pub fn allocate_head_state(
-        &self,
-        device: Rc<Device>,
-    ) -> Result<Option<StoreBindings>, String> {
+    pub fn allocate_head_state(&self, device: Rc<Device>) -> Result<Option<StoreBindings>, String> {
         self.head_state
             .as_ref()
             .map(|plan| plan.allocate(device))
@@ -792,8 +876,21 @@ impl StateResourcePlan {
     /// planned device has a form of the affine prefill entry that reads
     /// history decoded for the call ([`reads_decoded_history`]).
     pub fn lists_history_tiles(&self, backend: BackendName, head_width: u64) -> bool {
-        self.codec == KvCodec::AffineK8V4
-            && reads_decoded_history(backend, self.tensor_operations(), head_width)
+        self.decoded_history_form(backend, head_width).is_some()
+    }
+
+    /// The form of the affine prefill entry that reads this plan's history
+    /// decoded for `head_width`-column heads on the planned device of
+    /// `backend`: what the listing classes of such a block's graphs follow
+    /// ([`HistoryStorePlan::listed_tile_classes`]). None where the graphs
+    /// list no tiles.
+    pub fn decoded_history_form(
+        &self,
+        backend: BackendName,
+        head_width: u64,
+    ) -> Option<DecodedHistoryForm> {
+        DecodedHistoryForm::of(backend, self.tensor_operations(), head_width)
+            .filter(|_| self.codec == KvCodec::AffineK8V4)
     }
 
     pub fn capacity(&self) -> StateCapacityPlan {
@@ -1191,9 +1288,8 @@ impl HistoryRows {
                     )
             }
             HistoryDomainKind::Shared { .. } => 0,
-            HistoryDomainKind::Block { .. } => {
-                return Err(format!("history domain {kind:?} is not supported"))
-            }
+            // A block row per `rate` of the Token domain's.
+            HistoryDomainKind::Block { rate } => self.token.div_ceil(rate),
         })
     }
 }
@@ -1270,22 +1366,60 @@ fn state_store_plan(
     })
 }
 
-fn slab_element(dtype: DType) -> Element {
-    match dtype {
-        DType::F32 => Element::f32(),
-        DType::F16 => Element::f16(),
-        DType::BF16 => Element::bf16(),
-        DType::I32 => Element::i32(),
-        DType::U32 => Element::u32(),
-        DType::Bool => Element::bool(),
-    }
-}
-
 #[cfg(test)]
 mod slab_plan_tests {
     use super::*;
     use magnitude_state::LayerRef;
-    use seismic::{BackendName, DeviceCatalog};
+    use seismic::{BackendName, DType, DeviceCatalog};
+
+    #[test]
+    fn listed_history_classes_bound_capacity_for_small_and_large_extents() {
+        for most in [1, 3, 5, 16, 17, 257, 1024] {
+            let plan = HistoryStorePlan {
+                kind: HistoryDomainKind::Token,
+                components: Vec::new(),
+                rows: most * magnitude_state::SLAB_ROW_TILE,
+                row_bytes: 1,
+                slab_rows: magnitude_state::SLAB_ROW_TILE as u32,
+                page_rows: magnitude_state::SLAB_ROW_TILE as u32,
+                span_limit: most,
+            };
+            // A form whose work follows the tiles a launch sees has one
+            // class: one request's worth.
+            assert_eq!(
+                plan.listed_tile_classes(DecodedHistoryForm::Staged).unwrap(),
+                [most as u64]
+            );
+            // A form that decodes into a window seals no class below its
+            // floor: powers of two from it, then one request's worth.
+            let windowed = plan
+                .listed_tile_classes(DecodedHistoryForm::Windowed)
+                .unwrap();
+            assert_eq!(windowed.last(), Some(&(most as u64)));
+            assert!(windowed.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                windowed[..windowed.len() - 1]
+                    .iter()
+                    .all(|tiles| *tiles >= 16 && tiles.is_power_of_two())
+            );
+        }
+    }
+
+    /// The form a backend's device has declares its listing classes: no
+    /// graph is sealed for a class its form does nothing different at.
+    #[test]
+    fn the_decoded_history_form_declares_its_smallest_listing_class() {
+        let form = |backend, tensor_operations, width| {
+            DecodedHistoryForm::of(backend, tensor_operations, width)
+        };
+        assert_eq!(form(BackendName::Metal, true, 64), Some(DecodedHistoryForm::Windowed));
+        assert_eq!(form(BackendName::Metal, false, 256), Some(DecodedHistoryForm::Windowed));
+        assert_eq!(form(BackendName::Metal, false, 64), None);
+        assert_eq!(form(BackendName::Cuda, false, 64), Some(DecodedHistoryForm::Staged));
+        assert_eq!(form(BackendName::Cpu, false, 256), None);
+        assert_eq!(DecodedHistoryForm::Windowed.smallest_listing_tiles(), Some(16));
+        assert_eq!(DecodedHistoryForm::Staged.smallest_listing_tiles(), None);
+    }
 
     #[test]
     fn startup_and_fit_charges_match_slab_storage() {
@@ -1354,16 +1488,23 @@ mod slab_plan_tests {
     }
 }
 
-/// History bytes per token of context: the rows of every Token domain.
-/// Window domains hold a bounded number of rows whatever the context (see
+/// History bytes per token of context: the rows of every Token domain, and
+/// a `rate`-th of every Block domain's (rounded up). Window domains hold a
+/// bounded number of rows whatever the context (see
 /// `StateStorePlan::history_bytes_at_depth`).
 pub(super) fn history_row_bytes(domains: &[HistoryDomainLayout]) -> Result<u64, String> {
     domains
         .iter()
-        .filter(|domain| domain.kind() == HistoryDomainKind::Token)
         .try_fold(0u64, |total, domain| {
+            let row_bytes = domain.row_bytes().map_err(|error| error.to_string())?;
+            // A Block domain keeps a row per `rate` tokens.
+            let bytes = match domain.kind() {
+                HistoryDomainKind::Token => row_bytes,
+                HistoryDomainKind::Block { rate } => row_bytes.div_ceil(rate as u64),
+                HistoryDomainKind::Window { .. } | HistoryDomainKind::Shared { .. } => 0,
+            };
             total
-                .checked_add(domain.row_bytes().map_err(|error| error.to_string())?)
+                .checked_add(bytes)
                 .ok_or_else(|| "history row byte count overflow".into())
         })
 }

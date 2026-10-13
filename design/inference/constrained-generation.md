@@ -95,5 +95,7 @@ budget to raise.
   on generated strings, near misses and masks.
 - Template grammars across tool choices, reasoning modes, response formats and
   argument schemas, including any-order argument lattices and recursive
-  argument values, compile with no character-level parts.
+  argument values, compile with no character-level parts. Real harness tool
+  sets (many tools, free-form arguments) bind and compute their first mask
+  over a real vocabulary in every catalog template family.
 - Per-token mask cost does not grow with the number of offered tools.

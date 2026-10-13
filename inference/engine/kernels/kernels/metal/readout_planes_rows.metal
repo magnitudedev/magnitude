@@ -21,10 +21,11 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 
 #define PLANES_ROWS_OPERANDS                                                              \
     const uint k = uint(SEISMIC_DIM_D);                                                 \
-    projection::Rms<activation, norm_element, projection::SelectedRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
-        SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,                           \
+    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+        in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
+        SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,                           \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
-    const projection::Logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, 0.0f}; \
+    const projection::Logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1, as_type<float>(uint(SEISMIC_PARAM_SOFTCAP))}; \
     const projection::Weights<packets::ProgressiveExact> w{top, SEISMIC_TOP_STRIDE_0, bit3, \
         SEISMIC_BIT3_STRIDE_0, rest, SEISMIC_REST_STRIDE_0, SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2, \
         scales, SEISMIC_SCALES_STRIDE_0}
@@ -41,10 +42,44 @@ kernel void readout_planes_rows_gemv(PLANES_ROWS_ARGUMENTS,
     uint rows = uint(SEISMIC_DIM_O);
     PROJECTION_SQUARES_SHARED(squares, decltype(in)::parts);
     projection::threadgroup_squares_runtime(in, rows, squares, simdgroups, sg, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     const auto x = projection::shared_norm(in, squares);
-    PROJECTION_FOR_ROWS(rows,
-        projection::gemv_runtime<packets::ProgressiveExact, ROWS, MAXM, LANES>(
-            x, out, w, rows, uint(SEISMIC_DIM_V), k, tile, shared, simdgroups, sg, lane));
+    // The certified survivor pass and its full small-row fallback must use
+    // the same dot recipe, so a near tie cannot change selection merely
+    // because a candidate survived pruning. Keep the existing output tile
+    // geometry, but each simdgroup sums every row with all 32 lanes.
+    const progressive::Planes planes{top, SEISMIC_TOP_STRIDE_0, bit3,
+        SEISMIC_BIT3_STRIDE_0, rest, SEISMIC_REST_STRIDE_0,
+        SEISMIC_REST_STRIDE_1, SEISMIC_REST_STRIDE_2,
+        scales, SEISMIC_SCALES_STRIDE_0};
+    constexpr uint outputs = ROWS * 32u / LANES;
+    const uint first = (tile * simdgroups + sg) * outputs;
+    for (uint r = 0; r < outputs; ++r) {
+        const uint n = first + r;
+        if (n >= uint(SEISMIC_DIM_V))
+            break;
+        float acc[PROGRESSIVE_ROWS] = {};
+        for (uint g = lane; g < k / 32u; g += 32u) {
+            const auto codes = progressive::exact_codes(planes.group(n, g));
+            const float scale = planes.scale(n, g);
+            PROJECTION_UNROLL
+            for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
+                if (m >= rows) break;
+                float4 xe[4], xo[4];
+                PROJECTION_UNROLL
+                for (uint q = 0; q < 4u; ++q)
+                    x.load8(m, g * 32u + q * 8u, 0.0f, xe[q], xo[q]);
+                acc[m] += progressive::exact(scale, codes, xe, xo);
+            }
+        }
+        PROJECTION_UNROLL
+        for (uint m = 0; m < PROGRESSIVE_ROWS; ++m) {
+            if (m >= rows) break;
+            const float logit = simd_sum(acc[m]);
+            if (lane == 0u)
+                out.store(m, n, logit);
+        }
+    }
 }
 #endif
 

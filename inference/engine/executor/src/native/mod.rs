@@ -5,6 +5,8 @@ mod head;
 mod import;
 mod preparation;
 mod qualification;
+mod readout;
+mod shared_head;
 mod specialization;
 mod target;
 mod tuning;
@@ -14,38 +16,42 @@ pub(crate) use attestation::AttestedImport;
 pub use attestation::AttestedPrograms;
 pub(crate) use attestation::{
     AttestedDraft, AttestedFeedForward, AttestedHead, AttestedHeadBlock, AttestedMixer,
-    AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision, OutputScales,
+    AttestedSharedHead, AttestedState, AttestedTarget, AttestedTargetBlock, AttestedVision,
+    OutputScales, output_tails, reads_layer_scale,
 };
 use draft::DraftKernels;
 pub(crate) use draft::{
-    AttestedDflash2, Dflash2Kernels, Dflash2Projections,
-    DraftBlockKernels, MarkovKernels,
+    AttestedDflash2, Dflash2Kernels, Dflash2Projections, DraftBlockKernels, MarkovKernels,
 };
 use glue::GlueKernels;
 use head::HeadKernels;
-pub use head::HeadLogitsKernels;
 pub(crate) use import::ImportKernels;
-pub(crate) use preparation::kernel_requests;
 use preparation::NativePreparationCache;
+pub(crate) use preparation::kernel_requests;
 use qualification::QualificationView;
+pub use readout::ProjectionKernels;
+use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
-    GeneralRoutedKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels, PostNormKernels,
-    ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels, RecurrentKernels,
-    RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
-    SublayerOutput, TableConversion, TapKernels,
+    GeneralRoutedKernels, NGramKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
+    PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
+    RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
+    SelectedPrefillKernel, SelectionKernels,
+    ShortConvKernels, StateSpaceKernels, StreamsKernels, SublayerOutput, TableConversion,
+    TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
+pub(crate) use tuning::workload as tuning_workload;
 pub use tuning::{
-    attention_points, row_points, AdmittedErrorClasses, PointShape, SearchProgress, TunedEntry,
-    TuningContext,
-    TuningEvent, TuningLimits, NO_ERROR_CLASSES,
-    TuningObserver, TuningOrigin, TuningWeightSource, UnreportedTuning, ZeroTuningWeights,
-    ROTATION_LAYERS, TUNING_CONTEXTS, TUNING_ROWS,
+    NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
+    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
+    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
+    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
+    UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
 };
 pub(crate) use vision::VisionKernels;
 
@@ -54,17 +60,17 @@ use crate::{
     ProgramPlan, RecurrentBinding, RoutedBinding, SublayerTail, VisionEntry,
 };
 use magnitude_kernels::{
-    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output, attention_prefill,
-    attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows, dense_expand,
-    dense_output, dense_up, draft_rows, embedding_rows, gated_delta_chunk, gated_delta_project,
-    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, head_logits_rows,
-    import_dense, moe_tail,
-    per_layer_gate, per_layer_inputs, post_norm_residual, project_rows, readout_exact_rows,
-    readout_features_rows, readout_head_rows, readout_planes_rows, readout_refine_rows,
-    readout_selected_rows, readout_top_rows, repack_weight, routed_combine, routed_down,
-    routed_expand, routed_experts, routed_experts_up, routed_gate_up, routed_group, routed_output,
-    routed_route, routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows,
-    shape_rows,
+    attention_append_k8v4, attention_decode, attention_decode_k8v4, attention_output,
+    attention_prefill, attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows,
+    dense_expand, dense_output, dense_up, draft_rows, embedding_rows, feature_copy,
+    gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
+    gated_delta_step_convolved, import_dense, indexer_select, moe_tail, per_layer_gate,
+    per_layer_inputs,
+    post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
+    readout_planes_rows, readout_project_rows, readout_refine_rows, readout_selected_rows,
+    readout_top_rows, repack_weight, routed_combine, routed_down, routed_expand, routed_experts,
+    routed_experts_up, routed_gate_up, routed_group, routed_output, routed_route,
+    routed_route_shared, routed_scatter, routed_select, routed_up, sample_rows, shape_rows,
     short_conv_project, short_conv_rows, state_space_chunk, state_space_gate, state_space_step,
     vision_attention, vision_clamp, vision_linear, vision_norm, vision_patch_stem, vision_pool,
     vision_position,
@@ -114,6 +120,14 @@ pub enum CatalogFailure {
         entry: &'static str,
         statics: Vec<(String, u64)>,
     },
+    /// Not a failure of the model or the device: a load asked to report
+    /// tuning units without a stored record
+    /// ([`UnpreparedUnits::Report`](tuning::UnpreparedUnits)) met this one
+    /// and stopped before placing anything.
+    Unprepared {
+        entry: &'static str,
+        bindings: String,
+    },
 }
 
 impl fmt::Display for CatalogError {
@@ -156,6 +170,10 @@ impl fmt::Display for CatalogError {
                     "{entry} has no admissible {backend} configuration at {statics}"
                 )
             }
+            CatalogFailure::Unprepared { entry, bindings } => write!(
+                formatter,
+                "{entry} on {path} ({backend}) with {bindings} has no stored tuning record"
+            ),
         }
     }
 }
@@ -234,7 +252,11 @@ mod qualification_tests {
             .with_static("NK", binding.key_heads)
             .with_static("NV", binding.value_heads)
             .with_static("W", binding.width);
-        let projections = heads.clone().with_static("H", 2560);
+        let projections = heads
+            .clone()
+            .with_static("H", 2560)
+            .with_static("PT", 1)
+            .with_static("NM", 2560);
         let statics = heads.with_static("C", binding.convolution_width);
         /// The declared defaults of `E` at `statics`.
         fn defaults<E: seismic::Entry>(
@@ -257,7 +279,14 @@ mod qualification_tests {
                 BW: binding.beta,
                 A: binding.activation,
             },
-            &defaults::<gated_delta_project::Entry>(&device, &projections),
+            // Unbounded projections (no packing bound).
+            &defaults::<gated_delta_project::Entry>(
+                &device,
+                &projections
+                    .clone()
+                    .with_static("QB", 0)
+                    .with_static("ZB", 0),
+            ),
         )
         .unwrap();
         let step = defaults::<gated_delta_step::Entry>(&device, &statics);
@@ -315,8 +344,11 @@ mod qualification_tests {
         .unwrap();
         let output = seismic::NativeSpecialization::new()
             .with_static("D", 2560)
+            .with_static("SN", 1)
+            .with_static("IN", 0)
             .with_static("Q", binding.value_heads)
-            .with_static("W", binding.width);
+            .with_static("W", binding.width)
+            .with_static("OB", 0);
         attention_output::native_for_device_with(
             &device,
             attention_output::Elements {

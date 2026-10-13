@@ -28,7 +28,10 @@ fn scalar_failure_scope(recipe: &seismic_lang::reference_math::ReferenceRecipe, 
             N::Word { a, b, .. } | N::Compare { a, b, .. } | N::And { a, b } => {
                 join(get(a), get(b))
             }
-            N::Not { value } | N::Bits { value } | N::FromBits { value, .. } => get(value),
+            N::Not { value }
+            | N::Bits { value }
+            | N::FromBits { value, .. }
+            | N::Resize { value, .. } => get(value),
             N::Select { condition, yes, no } => all([get(condition), get(yes), get(no)]),
         });
     }
@@ -148,7 +151,7 @@ impl Inference<'_> {
                 | SymbolKind::Decision(_)
                 | SymbolKind::ScheduleSlot(_) => U::Workgroup,
                 SymbolKind::TemplateDimension(_) => unreachable!("uninstantiated template"),
-                SymbolKind::ProofVariable(_) => {
+                SymbolKind::CheckerVariable(_) => {
                     unreachable!("proof variables never enter an entry arena")
                 }
             }
@@ -638,8 +641,11 @@ fn probe(x: i32, times: range[4]) -> i32:
                 U::Workgroup,
                 Meaning::Physical,
             );
-            assert_eq!(scalar(&values, function.results()[0]), input,
-                "the second carry must inherit the first carry's later scope, including through a call");
+            assert_eq!(
+                scalar(&values, function.results()[0]),
+                input,
+                "the second carry must inherit the first carry's later scope, including through a call"
+            );
         }
     }
 

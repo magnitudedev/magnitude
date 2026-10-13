@@ -20,6 +20,7 @@ typedef ELEMENT_OF(SEISMIC_ELEMENT_Y) published;
     device float *token_scales [[buffer(SEISMIC_BUFFER_SCRATCH_TOKEN_SCALES)]],         \
     device float *weight_scales [[buffer(SEISMIC_BUFFER_SCRATCH_WEIGHT_SCALES)]],       \
     device const float *weight_scale [[buffer(SEISMIC_BUFFER_WEIGHT_SCALE)]],           \
+    device const float *weight_bound [[buffer(SEISMIC_BUFFER_WEIGHT_BOUND)]],           \
     constant ulong *seismic_words [[buffer(SEISMIC_BUFFER_WORDS)]]
 
 #define PROJECT_ROWS_OPERANDS                                                           \
@@ -48,7 +49,7 @@ kernel void project_rows_gemv(PROJECT_ROWS_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_BATCH
-template <uint BATCH_ROWS>
+template <uint BATCH_ROWS, uint BATCH_PARTS>
 kernel void project_rows_batch(PROJECT_ROWS_ARGUMENTS,
     threadgroup uchar *shared [[threadgroup(0)]],
     uint tile [[threadgroup_position_in_grid]],
@@ -56,6 +57,12 @@ kernel void project_rows_batch(PROJECT_ROWS_ARGUMENTS,
     uint sg [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]) {
     PROJECT_ROWS_OPERANDS;
+    if constexpr (projection::matrix_form<packets::W0>::symmetric32) {
+        projection::gemv_matrix<packets::W0, BATCH_PARTS>(in, out, w,
+            uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane);
+        return;
+    }
+    if (tile * simdgroups * BATCH_ROWS * 8u >= uint(SEISMIC_DIM_N)) return;
     projection::gemv_batch_runtime<packets::W0, BATCH_ROWS>(in, out, w,
         uint(SEISMIC_DIM_M), uint(SEISMIC_DIM_N), k, tile, shared, simdgroups, sg, lane);
 }
@@ -139,6 +146,8 @@ kernel void project_rows_tall(PROJECT_ROWS_ARGUMENTS,
     const projection::packing_scratch scratch{packed, token_factors, token_scales, weight_factors, weight_scales}
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_PACK
+// RESIDUE: the operand's residue width for weights with residue bits.
+template <uint RESIDUE>
 kernel void project_rows_pack(PROJECT_ROWS_ARGUMENTS,
     uint pairs [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -149,9 +158,11 @@ kernel void project_rows_pack(PROJECT_ROWS_ARGUMENTS,
     threadgroup float4 peaks[8];
     PROJECT_ROWS_OPERANDS;
     PROJECT_ROWS_PACKING_SCRATCH;
-    projection::packing_operand<projection::packing_codes<packets::W0>::centre,
-        projection::packing_codes<packets::W0>::folds>(in, scratch, uint(SEISMIC_DIM_M), k, pairs, peaks,
-        thread_index, sg, lane);
+    typedef projection::packing_codes<packets::W0> coded;
+    constexpr uint BOUNDS = SEISMIC_DIM_WB != 0 ? 1 : 0;
+    const projection::packing_bounds<BOUNDS> bounds{{weight_bound}};
+    projection::packing_operand<coded::centre, coded::folds, (coded::residue != 0 ? RESIDUE : 0), BOUNDS>(in,
+        scratch, bounds, uint(SEISMIC_DIM_M), k, pairs, peaks, thread_index, sg, lane);
 }
 #endif
 
@@ -171,7 +182,7 @@ kernel void project_rows_pack_coefficients(PROJECT_ROWS_ARGUMENTS,
 #endif
 
 #ifdef SEISMIC_FORMING_PROJECT_ROWS_PACKED
-template <uint PACK_TOKENS, uint WEIGHTS_AHEAD>
+template <uint RESIDUE, uint PACK_TOKENS, uint WEIGHTS_AHEAD>
 kernel void project_rows_packed(PROJECT_ROWS_ARGUMENTS,
     uint tile [[threadgroup_position_in_grid]],
     uint sg [[simdgroup_index_in_threadgroup]],
@@ -181,7 +192,7 @@ kernel void project_rows_packed(PROJECT_ROWS_ARGUMENTS,
     PROJECT_ROWS_OPERANDS;
     PROJECT_ROWS_PACKING_SCRATCH;
     const uint m = uint(SEISMIC_DIM_M);
-    projection::gemm_packed<packets::W0, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,
+    projection::gemm_packed<packets::W0, RESIDUE, PACK_TOKENS, WEIGHTS_AHEAD>(out, w, scratch, m,
         (m + 127u) / 128u * 128u, uint(SEISMIC_DIM_N), k, tile * projection::packing_simdgroups + sg, lane);
 }
 #endif

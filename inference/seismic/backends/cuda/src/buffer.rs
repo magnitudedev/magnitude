@@ -2,7 +2,8 @@
 //! pinned host memory mapped into the device address space, or the backed
 //! prefix of a reserved device address range.
 
-use crate::driver::{self, Allocation, DriverError, HostMapped, Reservation};
+use crate::blocks::Range;
+use crate::driver::{self, DriverError, HostMapped, Reservation};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -11,7 +12,8 @@ pub struct Buffer {
 }
 
 enum Memory {
-    Device(Allocation),
+    /// A range of one of the device's blocks.
+    Device(Range),
     /// Host-written inputs: filled by the host without a driver call.
     Mapped(HostMapped),
     /// The leading `bytes` of a reservation, which are backed. Buffers of
@@ -23,9 +25,9 @@ enum Memory {
 }
 
 impl Buffer {
-    pub(crate) fn device(allocation: Allocation) -> Self {
+    pub(crate) fn device(range: Range) -> Self {
         Self {
-            memory: Arc::new(Memory::Device(allocation)),
+            memory: Arc::new(Memory::Device(range)),
         }
     }
     pub(crate) fn mapped(mapped: HostMapped) -> Self {
@@ -52,7 +54,7 @@ impl Buffer {
     }
     pub fn len(&self) -> u64 {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.bytes as u64,
+            Memory::Device(range) => range.bytes(),
             Memory::Mapped(mapped) => mapped.bytes as u64,
             Memory::Reserved { bytes, .. } => *bytes as u64,
         }
@@ -60,7 +62,7 @@ impl Buffer {
     /// The address kernels use.
     pub fn pointer(&self) -> u64 {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.pointer,
+            Memory::Device(range) => range.pointer(),
             Memory::Mapped(mapped) => mapped.device,
             Memory::Reserved { reservation, .. } => reservation.base,
         }
@@ -70,7 +72,7 @@ impl Buffer {
     /// access fence; mapped memory is written in place.
     pub(crate) fn upload_at(&self, offset: usize, bytes: &[u8]) -> Result<(), DriverError> {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.upload_at(offset, bytes),
+            Memory::Device(range) => range.upload_at(offset, bytes),
             Memory::Mapped(mapped) => {
                 mapped.write_at(offset, bytes);
                 Ok(())
@@ -91,7 +93,7 @@ impl Buffer {
     /// Synchronous host read.
     pub(crate) fn download_at(&self, offset: usize, bytes: &mut [u8]) -> Result<(), DriverError> {
         match &*self.memory {
-            Memory::Device(allocation) => allocation.download_at(offset, bytes),
+            Memory::Device(range) => range.download_at(offset, bytes),
             Memory::Mapped(mapped) => {
                 mapped.read_at(offset, bytes);
                 Ok(())

@@ -229,6 +229,9 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    /// The prefill's absent WorkList bitmap ([M, 0]).
+    selection: Tensor,
+    block_slots: Tensor,
     history_tiles: Tensor,
     _history_slabs: SlabTensor,
     key_codes: Tensor,
@@ -328,7 +331,11 @@ impl Bound {
         let value_codes = slabs.logical_region(2).unwrap();
         let value_coefficients = slabs.logical_region(3).unwrap();
         Self {
-            query: bf16_tensor(device, &[m, kv * g, 2 * w], &case.query_gate),
+            query: bf16_tensor(
+                device,
+                &[m, kv * g, case.query_gate.len() / (m * kv * g)],
+                &case.query_gate,
+            ),
             gate: bf16_tensor(device, &[m, kv * g, 0], &[]),
             key: bf16_tensor(device, &[1, m, kv * w], &case.key),
             value: bf16_tensor(device, &[1, m, kv * w], &case.value),
@@ -342,6 +349,8 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            selection: no_selection(device, m),
+            block_slots: block_slots(device, 1),
             history_tiles: {
                 let tiles = history_tiles(&case.visible);
                 i32_tensor(device, &[1, tiles.len()], &tiles)
@@ -432,6 +441,8 @@ macro_rules! prefill_args {
             visible: &$bound.visible,
             fresh: &$bound.fresh,
             destinations: &$bound.destinations,
+            selection: &$bound.selection,
+            block_slots: &$bound.block_slots,
             history_tiles: &$bound.history_tiles,
             history_key_codes: &mut $bound.key_codes,
             history_key_coefficients: &mut $bound.key_coefficients,
@@ -458,9 +469,11 @@ fn k8v4_devices() -> Vec<Device> {
             "cpu" => BackendName::Cpu,
             other => panic!("unsupported SEISMIC_TEST_BACKEND={other}"),
         };
-        return vec![catalog
-            .open_backend(backend)
-            .expect("selected backend opens")];
+        return vec![
+            catalog
+                .open_backend(backend)
+                .expect("selected backend opens"),
+        ];
     }
     [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
@@ -524,19 +537,28 @@ fn cuda_matrix_configs(
 ) -> Vec<Vec<(&'static str, u64)>> {
     configs
         .iter()
-        .filter(|(_, warps, stages, columns)| {
+        .flat_map(|&(parts, warps, stages, columns)| {
+            [0u64, 1].map(move |qreg| (parts, warps, stages, columns, qreg))
+        })
+        .filter(|&(_, warps, stages, columns, qreg)| {
             // The declaration's shared bound: the query tile, STAGES K-piece +
             // V-window stages (16-key tiles above W = 256), the exchange.
             let w = geometry.w() as u64;
             let keys = if w > 256 { 16 } else { 32 };
+            let query = warps * 16 * w;
+            let operands = stages * keys * (w.min(256) + w.min(256 * columns));
+            let region = if qreg == 1 {
+                query.max(operands)
+            } else {
+                query + operands
+            };
             geometry.g as u64 <= warps * 16
+                && (qreg == 0 || w <= 256)
                 && (w <= 256 || w % 256 == 0)
                 && w.min(256 * columns) % (16 * columns) == 0
-                && (warps * 16 * w + stages * keys * (w.min(256) + w.min(256 * columns))) * 2
-                    + warps * columns * w * 4
-                    <= 98304
+                && region * 2 + warps * columns * w * 4 <= 98304
         })
-        .map(|&(parts, warps, stages, columns)| {
+        .map(|(parts, warps, stages, columns, qreg)| {
             vec![
                 ("PARTS", parts),
                 ("WARPS", warps),
@@ -544,6 +566,7 @@ fn cuda_matrix_configs(
                 ("MATRIX", 1),
                 ("STAGES", stages),
                 ("COLUMNS", columns),
+                ("QREG", qreg),
             ]
         })
         .collect()
@@ -613,6 +636,16 @@ fn metal_matrix_configs(
     admitted
 }
 
+/// Whether the vector form's declaration admits `slices` at `geometry`: a
+/// lane holds at most `limit` elements unless the group cannot be split
+/// further.
+fn lane_admits(geometry: Geometry, slices: u64, limit: u64) -> bool {
+    let group = geometry.g as u64;
+    (group / slices) * (geometry.w() as u64 / 32) <= limit
+        || slices == 8
+        || group % (2 * slices) != 0
+}
+
 /// Declared decode configurations of `backend` at `geometry`.
 fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> {
     let group = geometry.g;
@@ -626,6 +659,7 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
                 .unwrap();
             let mut configs = [(12, 4, 1), (24, 8, 1), (48, 4, 1), (48, 8, slices)]
                 .into_iter()
+                .filter(|&(_, _, slices)| lane_admits(geometry, slices, 64))
                 .map(|(parts, warps, slices)| {
                     vec![
                         ("PARTS", parts),
@@ -634,6 +668,7 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
                         ("MATRIX", 0),
                         ("STAGES", 2),
                         ("COLUMNS", 1),
+                        ("QREG", 0),
                     ]
                 })
                 .collect::<Vec<_>>();
@@ -661,6 +696,7 @@ fn decode_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'static
                 (32, 16, 8, slices),
             ]
             .into_iter()
+            .filter(|&(_, _, _, slices)| lane_admits(geometry, slices, 32))
             .map(|(span, parts, simds, slices)| {
                 vec![
                     ("SPAN", span),
@@ -772,19 +808,37 @@ fn prefill_configs(backend: BackendName, geometry: Geometry) -> Vec<Vec<(&'stati
             // when the queries stay in registers.
             let w = geometry.w();
             let keys = if w > 256 { 16 } else { 32 };
-            let codes = if producers == 0 { stages * 56 * w } else { 0 };
+            // Split scores (two column warps above 256 columns) stage whole
+            // key tiles and decode from one code stage.
+            let split = columns >= 2 && w > 256;
+            let piece = if split { w } else { w.min(256) };
+            let codes = if producers == 0 {
+                (if split { 1 } else { stages }) * keys * (9 * piece + 5 * w.min(256 * columns)) / 8
+            } else {
+                0
+            };
             let (queries, stage_bytes) = (
                 warps * 16 * w * 2,
-                stages * keys * (w.min(256) + w.min(256 * columns)) * 2 + codes,
+                stages * keys * (piece + w.min(256 * columns)) * 2 + codes,
             );
             let region = if qreg == 1 {
                 queries.max(stage_bytes)
             } else {
                 queries + stage_bytes
             };
+            // Two column warps over a 512-column head stage whole key tiles,
+            // decode from one code stage and exchange their span scores through
+            // PARITIES * COLUMNS * WARPS * 1024 bytes.
+            let parities = if producers > 0 { 2 } else { 1 };
+            let region = region
+                + if columns >= 2 && w > 256 {
+                    parities * columns * warps * 1024
+                } else {
+                    0
+                };
             w.min(256 * columns) % (16 * columns) == 0
-                && (qreg == 0 || w <= 256)
-                && (producers > 0 || (128..=256).contains(&w))
+                && (qreg == 0 || w <= 256 || columns >= 2)
+                && (producers > 0 || (128..=256).contains(&w) || w == 512)
                 && region <= 98304
         })
         .map(|(warps, split, stages, columns, qreg, producers)| {
@@ -849,7 +903,19 @@ fn specialization_on(
     } else {
         statics(geometry)
     };
-    let base = qwen_form(base, geometry);
+    let base = qwen_form(base, geometry)
+        .with_static("KC", geometry.w() as u64 * KEY_BITS as u64 / 32)
+        .with_static("VC", geometry.w() as u64 * VALUE_BITS as u64 / 32)
+        .with_static("KP", coefficient_elements(geometry.w()) as u64)
+        .with_static("VP", coefficient_elements(geometry.w()) as u64);
+    let base = if device.backend() == BackendName::Metal
+        && params.iter().any(|(name, _)| *name == "TOKENS")
+        && !params.iter().any(|(name, _)| *name == "HEAD_BAND")
+    {
+        base.with_param("HEAD_BAND", 0)
+    } else {
+        base
+    };
     let spec = params
         .iter()
         .fold(base, |spec, (name, value)| spec.with_param(*name, *value));
@@ -884,6 +950,22 @@ fn decode_kernel(
     .unwrap()
 }
 
+fn dense_specialization(spec: &NativeSpecialization) -> NativeSpecialization {
+    let mut dense = NativeSpecialization::new();
+    for (name, value) in spec.statics() {
+        if !matches!(name.as_str(), "KC" | "KP" | "VC" | "VP") {
+            dense = dense.with_static(name, *value);
+        }
+    }
+    for (name, value) in spec.params() {
+        if matches!(name.as_str(), "HEAD_BAND" | "HISTORY_STAGE") {
+            continue;
+        }
+        dense = dense.with_param(name, *value);
+    }
+    dense
+}
+
 /// The affine prefill's specialization of `params` on `device`. Metal's has
 /// the COISSUE form, which a configuration takes only by naming it.
 fn prefill_specialization(
@@ -891,8 +973,16 @@ fn prefill_specialization(
     geometry: Geometry,
     params: &[(&'static str, u64)],
 ) -> NativeSpecialization {
-    let spec = specialization_on(device, geometry, params);
+    let spec = visible_prefill(device, specialization_on(device, geometry, params));
     let names = |name: &str| params.iter().any(|(param, _)| *param == name);
+    if device.backend() == BackendName::Cuda {
+        let spec = spec.with_static("L", 1);
+        return if names("HISTORY_STAGE") {
+            spec
+        } else {
+            spec.with_param("HISTORY_STAGE", 0)
+        };
+    }
     if device.backend() != BackendName::Metal {
         return spec;
     }
@@ -938,7 +1028,7 @@ fn coissue_prefill_configs(geometry: Geometry) -> Vec<Vec<(&'static str, u64)>> 
         .into_iter()
         .filter(|&(qt, _)| (qt == 8) == (w == 512))
         .filter(|&(qt, heads)| {
-            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 64 * 16 <= 32768
+            32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 65 * 64 + 16 <= 32768
         })
         .flat_map(|(qt, heads)| [1, 256].into_iter().map(move |split| (qt, heads, split)))
         .map(|(qt, heads, split)| {
@@ -977,6 +1067,132 @@ fn metal_coissue_prefill_agrees_with_the_default() {
     );
 }
 
+/// A larger admitted row grid still needs a history window and fold state,
+/// even when only a few rows are live. The eight-KV-head sliding geometry
+/// exhausted that reserve at 1024 rows before any device submission.
+#[test]
+fn metal_direct_prefill_retains_state_at_1024_rows() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for geometry in [GEMMA26_SLIDING, GEMMA26_FULL] {
+        let mut rows = prefill_rows(4, 512);
+        rows.resize_with(1024, || Row {
+            spans: vec![],
+            fresh: (0, 0),
+            destination: -1,
+            position: 0,
+        });
+        let encoded = Encoded::new(Case::new(geometry, 1536, 2, &rows, 7));
+        let expected = encoded.expected();
+        let heads = single_head_group(geometry.g);
+        let default = [
+            ("QT", 16),
+            ("HEADS", heads),
+            ("SPLIT_GROUPS", 256),
+            ("DIRECT", 0),
+        ];
+        let mut reference_bound = Bound::new(&device, &encoded);
+        let reference = bf16_values(
+            &prefill_kernel(&device, geometry, &default)
+                .call(prefill_args!(reference_bound, encoded.case))
+                .unwrap()
+                .value,
+        );
+        for coissue in [0, 1] {
+            let qt = if coissue == 1 && geometry.w() == 512 {
+                8
+            } else {
+                16
+            };
+            let config = [
+                ("QT", qt),
+                ("HEADS", if coissue == 1 { 1 } else { heads }),
+                ("SPLIT_GROUPS", 256),
+                ("DIRECT", 1),
+                ("COISSUE", coissue),
+            ];
+            let mut bound = Bound::new(&device, &encoded);
+            let gated = prefill_kernel(&device, geometry, &config)
+                .call(prefill_args!(bound, encoded.case))
+                .unwrap()
+                .value;
+            let label = format!(
+                "1024-row direct prefill kv {} g {} w {} coissue={coissue}",
+                geometry.kv,
+                geometry.g,
+                geometry.w()
+            );
+            check(&label, &encoded, &gated, &bound, &expected);
+            for (actual, expected) in bf16_values(&gated).iter().zip(&reference) {
+                assert!(
+                    (actual - expected).abs() <= 1.0e-2 + 1.0e-2 * expected.abs(),
+                    "{label}: BF16 agreement with staged reference"
+                );
+            }
+        }
+    }
+}
+
+/// Metal's COISSUE form admits only configurations whose attend launch fits
+/// the device's threadgroup memory at the largest segment class a graph is
+/// sealed for (64), not only at the one segment tuning measures: MiniCPM5's
+/// four pairs (QT 16, HEADS 2) need 33,328 bytes there, so it takes two.
+#[test]
+fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for geometry in [MINICPM5, QWEN, GEMMA_E4B_FULL] {
+        let w = geometry.w() as u64;
+        let keys = if w > 128 { 32 } else { 96 };
+        let windows = (w / 256).max(1);
+        let pair = 48 + 2 * (keys * 16 + 32) + 32 * w.min(256) + 2048 * (windows - 1);
+        for (qt, heads) in [(8, 1), (8, 2), (16, 1), (16, 2), (32, 1), (32, 2)] {
+            let config = [
+                ("QT", qt),
+                ("HEADS", heads),
+                ("SPLIT_GROUPS", 256),
+                ("DIRECT", 1),
+                ("COISSUE", 1),
+            ];
+            let admitted = attention_prefill_k8v4::native_for_device_with(
+                &device,
+                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &prefill_specialization(&device, geometry, &config),
+            )
+            .is_ok();
+            let bytes = 32 + qt * heads.min(geometry.g as u64) / 8 * windows * pair + 65 * 64 + 16;
+            assert!(
+                !admitted || bytes <= 32768,
+                "w {w} g {} {config:?} is admitted but its attend launch needs {bytes} bytes at 64 segments",
+                geometry.g
+            );
+        }
+    }
+    let minicpm = [
+        ("QT", 16),
+        ("HEADS", 2),
+        ("SPLIT_GROUPS", 128),
+        ("DIRECT", 1),
+        ("COISSUE", 1),
+    ];
+    assert!(
+        attention_prefill_k8v4::native_for_device_with(
+            &device,
+            attention_prefill_k8v4::Elements { A: Element::bf16() },
+            &prefill_specialization(&device, MINICPM5, &minicpm),
+        )
+        .is_err()
+    );
+}
+
 /// The COISSUE form of a 512-column head: a pair per 256-column window, the
 /// two score simdgroups of 8 rows adding their partial scores (a score is the
 /// sum of two F32 sums of 256 products where the default holds one sum of
@@ -994,6 +1210,82 @@ fn metal_coissue_prefill_of_two_windows_agrees_with_the_default() {
         ],
         coissue_prefill_configs,
     );
+}
+
+/// CUDA's prefill of a 512-column head (two 256-column key pieces), every
+/// admitted configuration against the host model: one warp per row block
+/// making a pass per output window (COLUMNS = 1), and column-warp pairs that
+/// split the scores by key piece and add them (COLUMNS = 2), over split key
+/// partitions and slab-stored history.
+#[test]
+fn cuda_prefill_of_two_piece_heads_matches_host_model() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Cuda)
+    else {
+        return;
+    };
+    for geometry in [GEMMA_E4B_FULL, GEMMA26_FULL] {
+        for (rows, history, total, slab_rows) in [
+            (40, 300, 512, None),
+            (128, 1000, 1280, None),
+            (64, 4096, 4352, Some(1088)),
+        ] {
+            let encoded = Encoded::new(Case::new(
+                geometry,
+                total,
+                2,
+                &prefill_rows(rows, history),
+                7,
+            ));
+            let expected = encoded.expected();
+            // The split-score column warps, also over key partitions.
+            // and with register queries and inline decoding.
+            let pairs = [
+                (2, 512, 1, 4),
+                (2, 256, 1, 2),
+                (4, 512, 1, 0),
+                (4, 1, 1, 0),
+                (2, 256, 1, 0),
+            ]
+            .map(|(warps, split, qreg, producers)| {
+                vec![
+                    ("WARPS", warps),
+                    ("SPLIT_GROUPS", split),
+                    ("STAGES", 2),
+                    ("COLUMNS", 2),
+                    ("QREG", qreg),
+                    ("PRODUCERS", producers),
+                ]
+            });
+            for config in prefill_configs(BackendName::Cuda, geometry)
+                .into_iter()
+                .chain(pairs)
+            {
+                let mut bound = match slab_rows {
+                    Some(slab_rows) => {
+                        Bound::new_with_slab_rows(&device, &encoded, slab_rows, false)
+                    }
+                    None => Bound::new(&device, &encoded),
+                };
+                let gated = prefill_kernel(&device, geometry, &config)
+                    .call(prefill_args!(bound, encoded.case))
+                    .unwrap()
+                    .value;
+                check(
+                    &format!(
+                        "cuda prefill width {} group {} {rows} rows after {history} {config:?}",
+                        geometry.w(),
+                        geometry.g
+                    ),
+                    &encoded,
+                    &gated,
+                    &bound,
+                    &expected,
+                );
+            }
+        }
+    }
 }
 
 /// The configurations `configs` gives of Metal's form `form`, for each
@@ -1014,9 +1306,9 @@ fn metal_form_agrees_with_the_default(
         return;
     };
     for (geometry, rows, history, total, slab_rows) in geometries.iter().flat_map(|&geometry| {
-        cases
-            .iter()
-            .map(move |&(rows, history, total, slab_rows)| (geometry, rows, history, total, slab_rows))
+        cases.iter().map(move |&(rows, history, total, slab_rows)| {
+            (geometry, rows, history, total, slab_rows)
+        })
     }) {
         let encoded = Encoded::new(Case::new(
             geometry,
@@ -1076,7 +1368,10 @@ fn metal_form_agrees_with_the_default(
                 peak / rms,
                 actual.len()
             );
-            assert_eq!(outside, 0, "{label}: elements outside the BF16 tolerance of the default");
+            assert_eq!(
+                outside, 0,
+                "{label}: elements outside the BF16 tolerance of the default"
+            );
             let (planes, direct_planes) = (bound.planes(), direct_bound.planes());
             for vector in 0..encoded.case.history_rows * geometry.kv {
                 assert_eq!(
@@ -1087,6 +1382,49 @@ fn metal_form_agrees_with_the_default(
             }
         }
     }
+}
+
+/// A COISSUE threadgroup holds its launch's span schedule beside its pairs,
+/// so the memory an attend launch takes grows with the history spans of its
+/// class. The declaration admits a configuration only when it fits the
+/// largest span class a store seals, so one it admits (two pairs of a
+/// 128-column head) is admitted at every class, which the kernel answers
+/// from a call's dimensions alone.
+#[test]
+fn metal_coissue_prefill_admits_the_span_classes_its_threadgroup_holds() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let kernel = prefill_kernel(
+        &device,
+        MINICPM5,
+        &[
+            ("QT", 16),
+            ("HEADS", 1),
+            ("SPLIT_GROUPS", 256),
+            ("DIRECT", 1),
+            ("COISSUE", 1),
+        ],
+    );
+    let at = |segments: u64| {
+        let dimensions = kernel
+            .specialization()
+            .statics()
+            .iter()
+            .map(|(name, value)| (name.clone(), *value))
+            .chain(
+                [("M", 64), ("T", 4352), ("R", segments), ("HT", 16)]
+                    .map(|(name, value)| (name.to_owned(), value)),
+            )
+            .collect::<std::collections::BTreeMap<_, _>>();
+        kernel.admits(&dimensions)
+    };
+    at(1).unwrap();
+    at(32).unwrap();
+    at(64).unwrap();
 }
 
 /// Two requests in one batch over a store much larger than what they see:
@@ -1116,10 +1454,19 @@ fn scattered_history(geometry: Geometry) -> (Encoded, Encoded, usize) {
             24..=43 => Row {
                 spans: fork.to_vec(),
                 fresh: (24, row + 1),
-                destination: if row % 7 == 3 { -1 } else { fork[2].1 + row - 24 },
+                destination: if row % 7 == 3 {
+                    -1
+                } else {
+                    fork[2].1 + row - 24
+                },
                 position: 544 + row - 24,
             },
-            _ => Row { spans: vec![], fresh: (0, 0), destination: -1, position: 0 },
+            _ => Row {
+                spans: vec![],
+                fresh: (0, 0),
+                destination: -1,
+                position: 0,
+            },
         })
         .collect::<Vec<_>>();
     let scattered = Case::new(geometry, 16 * SLAB as usize, 3, &rows, 31);
@@ -1137,7 +1484,9 @@ fn scattered_history(geometry: Geometry) -> (Encoded, Encoded, usize) {
     let slabs = |plane: &[f32]| {
         [2, 5, 9, 11]
             .into_iter()
-            .flat_map(|slab| plane[slab * SLAB as usize * vector..][..SLAB as usize * vector].to_vec())
+            .flat_map(|slab| {
+                plane[slab * SLAB as usize * vector..][..SLAB as usize * vector].to_vec()
+            })
             .collect::<Vec<_>>()
     };
     compact.history_key = slabs(&scattered.history_key);
@@ -1152,7 +1501,11 @@ fn scattered_history(geometry: Geometry) -> (Encoded, Encoded, usize) {
             *destination = moved(*destination);
         }
     }
-    (Encoded::new(scattered), Encoded::new(compact), SLAB as usize)
+    (
+        Encoded::new(scattered),
+        Encoded::new(compact),
+        SLAB as usize,
+    )
 }
 
 /// Metal's prefill forms read only the history row tiles the call lists,
@@ -1197,7 +1550,8 @@ fn metal_prefill_reads_scattered_history_tiles() {
             check(&label, &scattered, &gated, &bound, &expected);
             if config.contains(&("SPLIT_GROUPS", 1)) {
                 assert!(
-                    gated.read_to_host().unwrap() == run(&compact, &config).0.read_to_host().unwrap(),
+                    gated.read_to_host().unwrap()
+                        == run(&compact, &config).0.read_to_host().unwrap(),
                     "{label}: differs from the compact layout"
                 );
             }
@@ -1209,16 +1563,19 @@ fn metal_prefill_reads_scattered_history_tiles() {
             attention_prefill_k8v4::native_for_device_with(
                 &device,
                 attention_prefill_k8v4::Elements { A: Element::bf16() },
-                &specialization_on(
+                &visible_prefill(&device, specialization_on(
                     &device,
                     geometry,
                     &[("QT", 16), ("SPLIT_GROUPS", 256), ("DIRECT", direct)],
                 )
                 .with_static("L", 0)
-                .with_param("COISSUE", 0),
+                .with_param("COISSUE", 0)),
             )
         };
-        assert!(unlisted(1).is_err(), "the direct form takes a call without a tile list");
+        assert!(
+            unlisted(1).is_err(),
+            "the direct form takes a call without a tile list"
+        );
         let mut bound = Bound::new_with_slab_rows(&device, &scattered, slab_rows, false);
         bound.history_tiles = i32_tensor(&device, &[0, 1], &[]);
         let gated = unlisted(0)
@@ -1269,7 +1626,12 @@ fn metal_direct_prefill_resumes_across_rounds() {
                     destination: 12288 + row,
                     position: 10240 + row,
                 },
-                _ => Row { spans: vec![], fresh: (0, 0), destination: -1, position: 0 },
+                _ => Row {
+                    spans: vec![],
+                    fresh: (0, 0),
+                    destination: -1,
+                    position: 0,
+                },
             })
             .collect::<Vec<_>>();
         Case::new(geometry, STORE, 2, &rows, 17)
@@ -1277,26 +1639,28 @@ fn metal_direct_prefill_resumes_across_rounds() {
     // `form` names the form over the window (with its head group size);
     // `listed` pads the tile list to that many entries: the call of a class
     // that lists more tiles than its rows see.
-    let run_form = |encoded: &Encoded, split: u64, form: &[(&'static str, u64)], listed: Option<usize>| {
-        let mut bound = Bound::new(&device, encoded);
-        if let Some(listed) = listed {
-            let mut tiles = history_tiles(&encoded.case.visible);
-            tiles.resize(listed, -1);
-            bound.history_tiles = i32_tensor(&device, &[1, listed], &tiles);
-        }
-        let config = [("QT", 16), ("SPLIT_GROUPS", split), ("DIRECT", 1)]
-            .into_iter()
-            .chain(form.iter().copied())
-            .collect::<Vec<_>>();
-        let gated = prefill_kernel(&device, geometry, &config)
-            .call(prefill_args!(bound, encoded.case))
-            .unwrap()
-            .value;
-        (gated, bound)
-    };
+    let run_form =
+        |encoded: &Encoded, split: u64, form: &[(&'static str, u64)], listed: Option<usize>| {
+            let mut bound = Bound::new(&device, encoded);
+            if let Some(listed) = listed {
+                let mut tiles = history_tiles(&encoded.case.visible);
+                tiles.resize(listed, -1);
+                bound.history_tiles = i32_tensor(&device, &[1, listed], &tiles);
+            }
+            let config = [("QT", 16), ("SPLIT_GROUPS", split), ("DIRECT", 1)]
+                .into_iter()
+                .chain(form.iter().copied())
+                .collect::<Vec<_>>();
+            let gated = prefill_kernel(&device, geometry, &config)
+                .call(prefill_args!(bound, encoded.case))
+                .unwrap()
+                .value;
+            (gated, bound)
+        };
     let direct = [("HEADS", single_head_group(geometry.g))];
-    let run_listing =
-        |encoded: &Encoded, split: u64, listed: Option<usize>| run_form(encoded, split, &direct, listed);
+    let run_listing = |encoded: &Encoded, split: u64, listed: Option<usize>| {
+        run_form(encoded, split, &direct, listed)
+    };
     let run = |encoded: &Encoded, split: u64| run_listing(encoded, split, None);
 
     // The launch of 32 is the sixteen rows and sixteen that see nothing;
@@ -1320,21 +1684,37 @@ fn metal_direct_prefill_resumes_across_rounds() {
     let expected = rounds.expected();
     for split in [1, 256] {
         let (gated, bound) = run(&rounds, split);
-        check(&format!("aligned rounds, {split} split groups"), &rounds, &gated, &bound, &expected);
+        check(
+            &format!("aligned rounds, {split} split groups"),
+            &rounds,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
     // The co-issue form (on simdgroup matrices; two pairs a threadgroup)
     // takes the same rounds over the window, and matches the host model.
     for split in [1, 256] {
         let coissue = [("HEADS", 1), ("COISSUE", 1)];
         let (gated, bound) = run_form(&rounds, split, &coissue, None);
-        check(&format!("aligned rounds, co-issue, {split} split groups"), &rounds, &gated, &bound, &expected);
+        check(
+            &format!("aligned rounds, co-issue, {split} split groups"),
+            &rounds,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
     let resumed = bf16_values(&run(&rounds, 1).0);
     let whole = bf16_values(&run(&one_round, 1).0);
     assert_eq!(resumed.len() * 2, whole.len());
-    let scale = whole.iter().fold(0f32, |largest, value| largest.max(value.abs()));
+    let scale = whole
+        .iter()
+        .fold(0f32, |largest, value| largest.max(value.abs()));
     for (index, (resumed, whole)) in resumed.iter().zip(&whole).enumerate() {
-        let step = f32::from_bits((resumed.abs().max(whole.abs()).to_bits() & 0x7f80_0000).saturating_sub(7 << 23));
+        let step = f32::from_bits(
+            (resumed.abs().max(whole.abs()).to_bits() & 0x7f80_0000).saturating_sub(7 << 23),
+        );
         assert!(
             (resumed - whole).abs() <= (2.0 * step).max(scale / 2048.0),
             "element {index}: {resumed} over rounds, {whole} in one"
@@ -1346,7 +1726,10 @@ fn metal_direct_prefill_resumes_across_rounds() {
     // return at once, and the result is that of the exact list bit for bit.
     for split in [1, 256] {
         assert!(
-            run_listing(&one_round, split, Some(1024)).0.read_to_host().unwrap()
+            run_listing(&one_round, split, Some(1024))
+                .0
+                .read_to_host()
+                .unwrap()
                 == run(&one_round, split).0.read_to_host().unwrap(),
             "a longer tile list changes the result at {split} split groups"
         );
@@ -1360,7 +1743,13 @@ fn metal_direct_prefill_resumes_across_rounds() {
     let expected = rounds.expected();
     for split in [1, 256] {
         let (gated, bound) = run(&rounds, split);
-        check(&format!("ragged rounds, {split} split groups"), &rounds, &gated, &bound, &expected);
+        check(
+            &format!("ragged rounds, {split} split groups"),
+            &rounds,
+            &gated,
+            &bound,
+            &expected,
+        );
     }
 }
 
@@ -1445,7 +1834,7 @@ fn check(
 /// tolerance.
 fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile, check_source},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1458,6 +1847,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     sources.push(SourceFile {
         path: "attention.seismic".into(),
         text: include_str!("../kernels/attention.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
     });
     let module = check_source(sources).unwrap();
     let logical = module
@@ -1527,6 +1920,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     if entry == "attention_prefill_k8v4" {
         let tiles = history_tiles(&case.visible);
         args.insert(14, tensor(DType::I32, vec![1, tiles.len()], ints(&tiles)));
+        // Its WorkList bitmap (none: B = 0) and block keys (BR = 1) precede
+        // the tiles.
+        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -1559,9 +1956,15 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     let planes = args.len() - 8;
     let portable = Planes {
         key_codes: read(planes).into_iter().map(|x| x as u32).collect(),
-        key_coefficients: read(planes + 1).into_iter().map(|x| f16_bits(x as f32)).collect(),
+        key_coefficients: read(planes + 1)
+            .into_iter()
+            .map(|x| f16_bits(x as f32))
+            .collect(),
         value_codes: read(planes + 2).into_iter().map(|x| x as u32).collect(),
-        value_coefficients: read(planes + 3).into_iter().map(|x| f16_bits(x as f32)).collect(),
+        value_coefficients: read(planes + 3)
+            .into_iter()
+            .map(|x| f16_bits(x as f32))
+            .collect(),
     };
     assert_eq!(
         portable.value_codes, expected.1.value_codes,
@@ -2092,8 +2495,9 @@ impl DenseHistory {
 }
 
 macro_rules! dense_args {
-    ($module:ident, $bound:expr, $dense:expr, $case:expr) => {
+    ($module:ident, $bound:expr, $dense:expr, $case:expr $(, $extra:ident: $value:expr)*) => {
         $module::Args {
+            $($extra: $value,)*
             query: &$bound.query,
             gate: &$bound.gate,
             key: &$bound.key,
@@ -2312,6 +2716,59 @@ fn metal_packed_four_qwen35b_long_context_matches_host_model() {
     );
 }
 
+#[test]
+fn metal_packed_four_padded_heads_match_host_model() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|d| d.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    for (group, keys) in [(1, 8), (3, 32), (4, 32), (6, 8), (8, 8)] {
+        let geometry = Geometry {
+            kv: 4,
+            g: group,
+            p: 32,
+            s: 192,
+        };
+        for count in [1, 3, 5] {
+            let context = 4096;
+            let rows = (0..count)
+                .map(|j| Row {
+                    spans: vec![(0, context as i32 - 1)],
+                    fresh: (0, j + 1),
+                    destination: context as i32 - 1 + j,
+                    position: context as i32 - 1 + j,
+                })
+                .collect::<Vec<_>>();
+            let encoded = Encoded::new(Case::new(geometry, context + 64, 1, &rows, 3));
+            let expected = encoded.expected();
+            let config = [
+                ("SPAN", 128),
+                ("PARTS", 8),
+                ("SIMDS", 4),
+                ("SLICES", 1),
+                ("MATRIX", 1),
+                ("KEYS", keys),
+                ("TOKENS", 4),
+            ];
+            let kernel = decode_kernel(&device, geometry, &config);
+            let mut bound = Bound::new(&device, &encoded);
+            let gated = kernel
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value;
+            check(
+                &format!("packed padded G{group} M{count}"),
+                &encoded,
+                &gated,
+                &bound,
+                &expected,
+            );
+        }
+    }
+}
+
 /// Gemma 4 31B's full-attention layers: 4 kv heads of 8 query heads,
 /// W = 512.
 const GEMMA31_FULL: Geometry = Geometry {
@@ -2365,18 +2822,21 @@ fn timing_decode_configs(
                     .map(move |keys| (parts, simds, keys))
             })
             .flat_map(|(parts, simds, keys)| {
-                [32u64, 128]
+                [32u64, 64, 128]
                     .into_iter()
                     .map(move |span| (span, parts, simds, keys))
             })
             .collect::<Vec<_>>();
         configs.extend(metal_matrix_configs(geometry, &sweep));
         // The packed form: one simdgroup per token of four.
-        if geometry.g == 8 && geometry.w() == 256 {
+        if geometry.g <= 8 && geometry.w() == 256 {
             for parts in [16, 32, 64, 128, 256] {
-                for keys in [8, 16] {
+                for (keys, span) in [8, 16]
+                    .into_iter()
+                    .flat_map(|keys| [32, 64].into_iter().map(move |span| (keys, span)))
+                {
                     configs.push(vec![
-                        ("SPAN", 32),
+                        ("SPAN", span),
                         ("PARTS", parts),
                         ("SIMDS", 4),
                         ("SLICES", 1),
@@ -2459,6 +2919,7 @@ fn timing_decode_configs(
                         ("MATRIX", 0),
                         ("STAGES", 2),
                         ("COLUMNS", 1),
+                        ("QREG", 0),
                     ]);
                 }
             }
@@ -2479,11 +2940,23 @@ fn decode_timing_on(device: &Device) {
                 names
                     .split(',')
                     .map(|name| match name {
+                        "qwen27b" => Geometry {
+                            kv: 4,
+                            g: 6,
+                            p: 32,
+                            s: 192,
+                        },
                         "qwen4b" => QWEN,
                         "qwen35b" => QWEN35B,
                         "qwen122b" => QWEN122B,
                         "minicpm5" => MINICPM5,
                         "gemma31" => GEMMA31_FULL,
+                        "gemma12b" => Geometry {
+                            kv: 1,
+                            g: 16,
+                            p: 256,
+                            s: 0,
+                        },
                         "gemma26sliding" => GEMMA26_SLIDING,
                         "gemma26" => GEMMA26_FULL,
                         other => panic!("unknown K8V4_DECODE_GEOMETRY {other}"),
@@ -2535,6 +3008,10 @@ fn decode_timing_on(device: &Device) {
             })
             .collect::<Vec<_>>();
         let encoded = Encoded::new(Case::new(geometry, context + 64, 1, &rows, 3));
+        // Opt-in qualification for a bounded timing diagnostic. Compute the
+        // host reference once, outside every measured device interval.
+        let expected =
+            (std::env::var("K8V4_DECODE_CHECK").as_deref() == Ok("1")).then(|| encoded.expected());
         let mut dense = DenseHistory::new(device, &encoded.case);
         let configs = if sweep {
             timing_decode_configs(backend, geometry)
@@ -2565,11 +3042,27 @@ fn decode_timing_on(device: &Device) {
                         .to_string()
                         .contains("violates the native `where` condition") =>
                 {
-                    continue
+                    continue;
                 }
                 Err(error) => panic!("{backend:?} decode {config:?}: {error}"),
             };
             let mut bound = Bound::new(device, &encoded);
+            if let Some(expected) = &expected {
+                let gated = kernel
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value;
+                check(
+                    &format!("{backend:?} decode timing qualification {config:?}"),
+                    &encoded,
+                    &gated,
+                    &bound,
+                    expected,
+                );
+                // The check also inspects appended history. Restore the
+                // initial case before measuring the same workload.
+                bound = Bound::new(device, &encoded);
+            }
             let affine = kernel
                 .measure(
                     vec![args!(attention_decode_k8v4, bound, encoded.case)],
@@ -2601,7 +3094,7 @@ fn decode_timing_on(device: &Device) {
                     attention_decode::native_for_device_with(
                         device,
                         attention_decode::Elements { A: Element::bf16() },
-                        &specialization_on(device, geometry, &dense_config),
+                        &dense_specialization(&specialization_on(device, geometry, &dense_config)),
                     )
                     .ok()
                 })
@@ -2647,6 +3140,14 @@ fn prefill_timing() {
 
 fn prefill_timing_on(device: &Device) {
     let backend = device.backend();
+    let gemma12b = std::env::var("K8V4_PREFILL_GEOMETRY").as_deref() == Ok("gemma12b");
+    let form = |spec: NativeSpecialization| {
+        if gemma12b {
+            spec.with_static("I", 0).with_static("NV", 1)
+        } else {
+            spec
+        }
+    };
     let rows_history = match std::env::var("K8V4_PREFILL_SHAPES") {
         Ok(shapes) => shapes
             .split(',')
@@ -2667,12 +3168,24 @@ fn prefill_timing_on(device: &Device) {
         ],
     };
     // `K8V4_PREFILL_GEOMETRY=minicpm5` times MiniCPM5-2B's heads (2 kv heads
-    // of 8, W = 128), `gemma31`, `gemma26` and `gemma-e4b` those Gemma 4
+    // of 8, W = 128), `gemma31`, `gemma26`, `gemma-e2b` and `gemma-e4b` those Gemma 4
     // models' full layers (W = 512), instead of Qwen3.5-4B's.
     let geometry = match std::env::var("K8V4_PREFILL_GEOMETRY").as_deref() {
         Ok("minicpm5") => MINICPM5,
         Ok("gemma31") => GEMMA31_FULL,
+        Ok("gemma12b") => Geometry {
+            kv: 1,
+            g: 16,
+            p: 256,
+            s: 0,
+        },
         Ok("gemma26") => GEMMA26_FULL,
+        Ok("gemma-e2b") => Geometry {
+            kv: 1,
+            g: 8,
+            p: 256,
+            s: 0,
+        },
         Ok("gemma-e4b") => GEMMA_E4B_FULL,
         _ => QWEN,
     };
@@ -2695,13 +3208,15 @@ fn prefill_timing_on(device: &Device) {
             .map(|row| (history + row.fresh.1 - row.fresh.0) as f64)
             .sum::<f64>();
         let flop = pairs * (geometry.kv * geometry.g * geometry.w() * 4) as f64;
-        let encoded = Encoded::new(Case::new(
-            geometry,
-            history as usize + rows.len(),
-            1,
-            &rows,
-            9,
-        ));
+        let mut case = Case::new(geometry, history as usize + rows.len(), 1, &rows, 9);
+        if gemma12b {
+            case.query_gate = case
+                .query_gate
+                .chunks_exact(2 * geometry.w())
+                .flat_map(|head| head[..geometry.w()].iter().copied())
+                .collect();
+        }
+        let encoded = Encoded::new(case);
         let mut dense = DenseHistory::new(device, &encoded.case);
         let forms = if backend == BackendName::Metal {
             coissue_prefill_configs(geometry)
@@ -2724,6 +3239,7 @@ fn prefill_timing_on(device: &Device) {
                     .collect::<Vec<_>>()
             },
         );
+        let mut reference = None::<Vec<f32>>;
         for config in prefill_configs(backend, geometry).into_iter().chain(forms) {
             let value_of = |name: &str| {
                 config
@@ -2734,22 +3250,73 @@ fn prefill_timing_on(device: &Device) {
             if only.iter().any(|(name, value)| value_of(name) != *value) {
                 continue;
             }
-            let kernel = prefill_kernel(device, geometry, &config);
+            let specialization = form(visible_prefill(device, specialization_on(device, geometry, &config)));
+            if gemma12b {
+                eprintln!(
+                    "exact timing form KV={} G={} W={} M={} history={history} I=0 U=0 F=1 N=1 NV=1 config={config:?}",
+                    geometry.kv,
+                    geometry.g,
+                    geometry.w(),
+                    rows.len()
+                );
+            }
+            let kernel = attention_prefill_k8v4::native_for_device_with(
+                device,
+                attention_prefill_k8v4::Elements { A: Element::bf16() },
+                &specialization,
+            )
+            .unwrap();
             let mut bound = Bound::new(device, &encoded);
+            if gemma12b {
+                bound.value_norm = f32_tensor(device, &[1, geometry.w()], &vec![1.0; geometry.w()]);
+                let value = kernel
+                    .call(prefill_args!(bound, encoded.case))
+                    .unwrap()
+                    .value;
+                let actual = value
+                    .read_to_host()
+                    .unwrap()
+                    .chunks_exact(2)
+                    .map(|bytes| {
+                        f32::from_bits(
+                            u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(expected) = &reference {
+                    let mut peak = 0.0f32;
+                    for (&a, &b) in actual.iter().zip(expected) {
+                        peak = peak.max((a - b).abs());
+                        assert!(
+                            (a - b).abs() <= 0.01 + 0.01 * b.abs(),
+                            "candidate/default prefill output {a} vs {b}"
+                        );
+                    }
+                    eprintln!("exact timing candidate/default peak_absolute={peak}");
+                } else {
+                    reference = Some(actual);
+                }
+            }
             let affine = kernel
-                .measure(
-                    vec![prefill_args!(bound, encoded.case)],
-                    &TIMING,
-                )
+                .measure(vec![prefill_args!(bound, encoded.case)], &TIMING)
                 .unwrap()
                 .median;
+            if gemma12b {
+                eprintln!(
+                    "{backend:?} exact Gemma12B prefill {} rows after {history} history {config:?}: k8v4 {:.1} us ({:.2} TFLOP/s)",
+                    rows.len(),
+                    affine * 1e6,
+                    flop / affine / 1e12
+                );
+                continue;
+            }
             let dense_kernel = attention_prefill::native_for_device_with(
                 device,
                 attention_prefill::Elements { A: Element::bf16() },
                 // The dense entry has no producer warps and no co-issue
                 // form; its direct form takes 16-row query tiles, so an
                 // 8-row configuration is timed staged.
-                &specialization_on(
+                &form(visible_prefill(device, specialization_on(
                     device,
                     geometry,
                     &config
@@ -2761,12 +3328,13 @@ fn prefill_timing_on(device: &Device) {
                             _ => (name, value),
                         })
                         .collect::<Vec<_>>(),
-                ),
+                ))),
             )
             .unwrap();
             let dense_time = dense_kernel
                 .measure(
-                    vec![dense_args!(attention_prefill, bound, dense, encoded.case)],
+                    vec![dense_args!(attention_prefill, bound, dense, encoded.case,
+                        selection: &bound.selection, block_slots: &bound.block_slots)],
                     &TIMING,
                 )
                 .unwrap()
@@ -2807,7 +3375,7 @@ fn gemma_head_geometry_matches_synthetic_reference() {
     }];
     let encoded = Encoded::new(Case::new(geometry, 272, 2, &rows, 73));
     let expected = encoded.expected();
-    for (simds, slices) in [(8, 4), (4, 1), (8, 1), (4, 4)] {
+    for (simds, slices) in [(8, 4), (8, 8), (4, 4)] {
         let configuration = [
             ("PARTS", 16),
             ("SPAN", 32),
@@ -2878,39 +3446,27 @@ fn gemma_g8_tuning_uses_portable_reference() {
             weight: 1.,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
             initialize: Some(initialize),
             written: Default::default(),
         }],
-        seismic::PrecisionPolicy::bounded(seismic::precision::Tolerance {
-            absolute: seismic::precision::Limit::new(0.01).unwrap(),
-            relative: seismic::precision::Limit::new(0.01).unwrap(),
-            relative_floor: seismic::precision::Limit::ZERO,
-            ulps: None,
-        }),
+        tuning_requirement(1.),
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
-            admission: std::time::Duration::from_secs(600),
-            required: std::time::Duration::from_secs(600),
-            settings: seismic::SearchSettings {
-                improvement: 0.01,
-                restarts: 2,
-                confirmed: 3,
-                default_margin: 0.02,
-                samples: 1,
-                confirmation_samples: 3,
-            },
+
+            settings: seismic::SearchSettings { error_rate: 0.05 },
             min_sample_seconds: 0.0002,
-            start: vec![[
-                ("PARTS".into(), 16),
-                ("SIMDS".into(), 8),
-                ("SLICES".into(), 4),
-                ("SPAN".into(), 32),
-            ]
-            .into()],
+            start: vec![
+                [
+                    ("PARTS".into(), 16),
+                    ("SIMDS".into(), 8),
+                    ("SLICES".into(), 4),
+                    ("SPAN".into(), 32),
+                ]
+                .into(),
+            ],
         }),
-        seismic::TuningReference::Portable,
     );
     eprintln!("Gemma portable-reference tuning: {result:?}");
     assert!(result.is_ok());
@@ -2941,7 +3497,7 @@ fn gemma_form_decode_configurations_agree() {
         }];
         let encoded = Encoded::new(Case::new(geometry, history as usize + 1, 1, &rows, 73));
         let mut baseline: Option<(Vec<f32>, Vec<Vec<u8>>)> = None;
-        for (simds, slices) in [(4, 1), (8, 4), (8, 1), (4, 4)] {
+        for (simds, slices) in [(4, 4), (8, 4), (8, 8)] {
             let mut bound = Bound::new(&device, &encoded);
             let w = geometry.w();
             let query: Vec<_> = encoded
@@ -3008,13 +3564,25 @@ fn gemma_form_decode_configurations_agree() {
                         }
                     }
                 }
-                eprintln!("Gemma history={history} SIMDS={simds} SLICES={slices}: max_abs={worst} required_scale={required_scale}");
+                eprintln!(
+                    "Gemma history={history} SIMDS={simds} SLICES={slices}: max_abs={worst} required_scale={required_scale}"
+                );
             } else {
                 baseline = Some((actual, state));
             }
         }
     }
     assert_eq!(failures, 0, "Gemma output elements outside bounded policy");
+}
+
+/// What these tests hold a tuned configuration to against its default:
+/// `scale` times 8 rounding steps of the `bf16` activations, the engine's
+/// standard α.
+fn tuning_requirement(scale: f64) -> seismic::NumericalRequirement {
+    seismic::NumericalRequirement::RoundingSteps {
+        alpha: 8. * scale,
+        activation: Some(seismic::DType::BF16),
+    }
 }
 
 /// A single fresh key has a simple independent result: its normalized value,
@@ -3077,7 +3645,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
             weight: 1.,
             class: None,
             cost: 1.0,
-            required: false,
+            workload: seismic::WorkloadRotation::All,
             rotation: vec![args!(attention_decode_k8v4, bound, encoded.case)],
             initialize: Some(Box::new(move || {
                 for (tensor, bytes) in &mut pristine {
@@ -3087,12 +3655,7 @@ fn gemma_fresh_only_with_scale(scale: f64) {
             })),
             written: Default::default(),
         }],
-        seismic::PrecisionPolicy::bounded(seismic::Tolerance {
-            absolute: seismic::Limit::new(0.01 * scale).unwrap(),
-            relative: seismic::Limit::new(0.01 * scale).unwrap(),
-            relative_floor: seismic::Limit::ZERO,
-            ulps: None,
-        }),
+        tuning_requirement(scale),
         seismic::Strategy::Survey(seismic::SurveyPlan {
             samples: 2,
             min_sample_seconds: 0.0002,
@@ -3100,13 +3663,12 @@ fn gemma_fresh_only_with_scale(scale: f64) {
                 ("PARTS", vec![16]),
                 ("SPAN", vec![32]),
                 ("SIMDS", vec![4, 8]),
-                ("SLICES", vec![1, 4]),
+                ("SLICES", vec![2, 4]),
             ]
             .into_iter()
             .map(|(k, v)| (k.into(), v))
             .collect(),
         }),
-        seismic::TuningReference::NativeDefault,
     )
     .unwrap();
     let mut expected = Vec::new();
@@ -3117,8 +3679,14 @@ fn gemma_fresh_only_with_scale(scale: f64) {
             expected.extend(value.iter().map(|v| bf16(v * inverse)));
         }
     }
+    // A survey measures and times every configuration; the ones its
+    // requirement admits are the ones a search could serve.
+    let admitted = |record: &seismic::ConfigurationRecord| {
+        matches!(record.outcome, seismic::Outcome::Measured { .. })
+            && result.admitted(record).is_ok()
+    };
     for record in &result.configurations {
-        if let seismic::Outcome::Measured { .. } = &record.outcome {
+        if admitted(record) {
             let kernel = attention_decode_k8v4::native_for_device_with(
                 &device,
                 attention_decode_k8v4::Elements { A: Element::bf16() },
@@ -3146,17 +3714,117 @@ fn gemma_fresh_only_with_scale(scale: f64) {
         .find(|r| r.configuration.params["SIMDS"] == 8 && r.configuration.params["SLICES"] == 4)
         .unwrap();
     eprintln!(
-        "Historical Gemma configuration at precision scale {scale}: {:?}",
-        historical.outcome
+        "Historical Gemma configuration at precision scale {scale}: {:?}, {:?}",
+        historical.outcome,
+        result.admitted(historical)
     );
-    assert!(result
-        .configurations
-        .iter()
-        .any(|r| matches!(r.outcome, seismic::Outcome::Measured { .. })));
+    assert!(result.configurations.iter().any(admitted));
 }
 
+/// The target's ordered append and prepared-cache visibility preserve the
+/// serial dense-self computation across scalar and packed matrix forms.
+#[test]
+fn prepared_causal_verification_matches_committed_prefix() {
+    let geometry = Geometry {
+        kv: 1,
+        g: 1,
+        p: 0,
+        s: 64,
+    };
+    let mut batch = Case::new(
+        geometry,
+        4,
+        1,
+        &[
+            Row {
+                spans: vec![],
+                fresh: (0, 1),
+                destination: 0,
+                position: 0,
+            },
+            Row {
+                spans: vec![],
+                fresh: (0, 2),
+                destination: 1,
+                position: 1,
+            },
+        ],
+        721,
+    );
+    // Equal attention scores isolate value-codec semantics from reductions,
+    // RoPE, query/key normalization and softmax ordering.
+    batch.query_gate.fill(0.0);
+    batch.key.fill(0.0);
+    let mut serial = batch.clone();
+    serial.visible[2..4].copy_from_slice(&[0, 1]);
+    serial.fresh[2..4].copy_from_slice(&[1, 2]);
+    serial.history_key[..64].fill(0.0);
+    serial.history_value[..64].copy_from_slice(&batch.value[..64]);
+    // The committed prefix is immutable in this second launch.
+    serial.destinations[0] = -1;
+    let batch = Encoded::new(batch);
+    let serial = Encoded::new(serial);
+    for device in k8v4_devices() {
+        for config in decode_configs(device.backend(), geometry) {
+            let kernel = decode_kernel(&device, geometry, &config);
+            let run = |encoded: &Encoded| {
+                let mut bound = Bound::new(&device, encoded);
+                let result = kernel
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value;
+                bf16_values(&result)
+            };
+            let batched = run(&batch);
+            let committed = run(&serial);
+            // A separate preparation makes every destination available before
+            // attention. Redirect only the prior fresh row through the cache;
+            // the query's own row remains dense, preserving serial semantics.
+            let mut prepared = Bound::new(&device, &batch);
+            let append = attention_append_k8v4::native_for_device_with(
+                &device,
+                attention_append_k8v4::Elements { A: Element::bf16() },
+                &append_specialization(&specialization_on(&device, geometry, &[])),
+            )
+            .unwrap();
+            append
+                .call(args!(attention_append_k8v4, prepared, batch.case))
+                .unwrap();
+            let mut cached_view = Bound::new(&device, &serial);
+            std::mem::swap(&mut cached_view.key_codes, &mut prepared.key_codes);
+            std::mem::swap(
+                &mut cached_view.key_coefficients,
+                &mut prepared.key_coefficients,
+            );
+            std::mem::swap(&mut cached_view.value_codes, &mut prepared.value_codes);
+            std::mem::swap(
+                &mut cached_view.value_coefficients,
+                &mut prepared.value_coefficients,
+            );
+            let normalized = bf16_values(
+                &kernel
+                    .call(args!(attention_decode_k8v4, cached_view, serial.case))
+                    .unwrap()
+                    .value,
+            );
+            assert_eq!(
+                &normalized[64..128],
+                &committed[64..128],
+                "prepared cache view must preserve dense-self serial semantics"
+            );
+            eprintln!("prepared-cache prior + dense self matches committed prefix exactly");
+            let max = batched[64..128]
+                .iter()
+                .zip(&committed[64..128])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("same-prefix affine boundary {config:?} max_abs={max}");
+        }
+    }
+}
 
-/// State-only publication agrees with the existing fused codec.
+/// The ordered phase uses exactly the same normalization, rotary preparation,
+/// narrow rounding and codec as serial fused append, including absent rows.
 #[test]
 fn ordered_append_matches_fused_codec() {
     for device in k8v4_devices() {
@@ -3197,6 +3865,91 @@ fn ordered_append_matches_fused_codec() {
     }
 }
 
+/// With one visible key, attention returns its normalized value. Fully
+/// rotary 512-column scalar heads exposed native BF16 casts producing F16
+/// bits (1.0 became 0.0078125), hidden by comparison to the native default.
+#[test]
+fn metal_gemma_fresh_scalar_preserves_bf16_values() {
+    let Some(device) = k8v4_devices()
+        .into_iter()
+        .find(|device| device.backend() == BackendName::Metal)
+    else {
+        return;
+    };
+    let geometry = Geometry {
+        kv: 2,
+        g: 4,
+        p: 256,
+        s: 0,
+    };
+    let w = geometry.w();
+    let rows = [Row {
+        spans: vec![(0, 0)],
+        fresh: (0, 1),
+        destination: 0,
+        position: 0,
+    }];
+    for constant in [true, false] {
+        let mut encoded = Encoded::new(Case::new(geometry, 1, 1, &rows, 73));
+        if constant {
+            encoded.case.value.fill(1.0);
+        }
+        let expected: Vec<_> = encoded
+            .case
+            .value
+            .chunks_exact(w)
+            .flat_map(|value| {
+                let squares = value.iter().map(|v| v * v).sum::<f32>();
+                let inverse = 1.0 / (squares / w as f32 + encoded.case.epsilon).sqrt();
+                (0..geometry.g).flat_map(move |_| value.iter().map(move |v| bf16(v * inverse)))
+            })
+            .collect();
+        let mut bound = Bound::new(&device, &encoded);
+        let query: Vec<_> = encoded
+            .case
+            .query_gate
+            .chunks_exact(2 * w)
+            .flat_map(|head| head[..w].iter().copied())
+            .collect();
+        bound.query = bf16_tensor(&device, &[1, geometry.kv * geometry.g, w], &query);
+        bound.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
+        bound.components = i32_tensor(&device, &[geometry.p], &vec![0; geometry.p]);
+        let spec = specialization_on(
+            &device,
+            geometry,
+            &[
+                ("PARTS", 16),
+                ("SPAN", 32),
+                ("SIMDS", 4),
+                ("SLICES", 2),
+                ("MATRIX", 0),
+                ("KEYS", 16),
+                ("TOKENS", 1),
+            ],
+        )
+        .with_static("I", 0)
+        .with_static("NV", 1);
+        let kernel = attention_decode_k8v4::native_for_device_with(
+            &device,
+            attention_decode_k8v4::Elements { A: Element::bf16() },
+            &spec,
+        )
+        .unwrap();
+        let actual = bf16_values(
+            &kernel
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value,
+        );
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.01 + 0.01 * expected.abs(),
+                "constant={constant} column={index}: {actual} != {expected}"
+            );
+        }
+    }
+}
+
 fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecialization {
     specialization
         .statics()
@@ -3205,4 +3958,961 @@ fn append_specialization(specialization: &NativeSpecialization) -> NativeSpecial
         .fold(NativeSpecialization::new(), |spec, (name, value)| {
             spec.with_static(name, *value)
         })
+}
+
+/// Constituent codec audit: no normalization/rotary error can mask packed
+/// codes or affine coefficients, and one visible key returns its value.
+#[test]
+fn codec_group32_storage_and_single_history_value_match_independent_recipe() {
+    for device in k8v4_devices() {
+        let geometry = Geometry {
+            kv: 1,
+            g: 16,
+            p: 0,
+            s: 512,
+        };
+        let w = geometry.w();
+        let rows = [Row {
+            spans: vec![(0, 1)],
+            fresh: (0, 0),
+            destination: 0,
+            position: 1,
+        }];
+        let mut encoded = Encoded::new(Case::new(geometry, 1, 1, &rows, 734));
+        let values: Vec<_> = (0..w)
+            .map(|i| {
+                bf16(match (i / 32) % 4 {
+                    0 => -1.5,
+                    1 => -2.0 + (i % 32) as f32 * 0.125,
+                    2 => {
+                        if i % 32 == 31 {
+                            8.0
+                        } else {
+                            ((i % 5) as f32 - 2.0) * 0.015625
+                        }
+                    }
+                    _ => 0.000001 * (1 + i % 32) as f32,
+                })
+            })
+            .collect();
+        encoded.case.key = values.iter().rev().copied().collect();
+        encoded.case.value = values.clone();
+        let mut bound = Bound::new(&device, &encoded);
+        bound.key_norm = f32_tensor(&device, &[0, w], &[]);
+        bound.query_norm = f32_tensor(&device, &[0, w], &[]);
+        let base = specialization_on(&device, geometry, &[])
+            .with_static("N", 0)
+            .with_static("I", 0);
+        let append = attention_append_k8v4::native_for_device_with(
+            &device,
+            attention_append_k8v4::Elements { A: Element::bf16() },
+            &append_specialization(&base),
+        )
+        .unwrap();
+        append
+            .call(args!(attention_append_k8v4, bound, encoded.case))
+            .unwrap();
+        let actual = bound.planes();
+        let (key_codes, key_coefficients) = encode(&encoded.case.key, 8);
+        let (value_codes, value_coefficients) = encode(&values, 4);
+        assert_eq!(
+            actual,
+            Planes {
+                key_codes,
+                key_coefficients,
+                value_codes: value_codes.clone(),
+                value_coefficients: value_coefficients.clone()
+            },
+            "{:?}: packed codec differs from independent group32 recipe",
+            device.backend()
+        );
+        let decoded = decode(&value_codes, &value_coefficients, 4, w);
+        bound.query = bf16_tensor(&device, &[1, geometry.g, w], &vec![0.0; geometry.g * w]);
+        bound.key = bf16_tensor(&device, &[0, 1, w], &[]);
+        bound.value = bf16_tensor(&device, &[0, 1, w], &[]);
+        bound.destinations = i32_tensor(&device, &[1], &[-1]);
+        let config = decode_configs(device.backend(), geometry).remove(0);
+        let spec = specialization_on(&device, geometry, &config)
+            .with_static("N", 0)
+            .with_static("I", 0)
+            .with_static("F", 0);
+        let kernel = attention_decode_k8v4::native_for_device_with(
+            &device,
+            attention_decode_k8v4::Elements { A: Element::bf16() },
+            &spec,
+        )
+        .unwrap();
+        let attended = bf16_values(
+            &kernel
+                .call(args!(attention_decode_k8v4, bound, encoded.case))
+                .unwrap()
+                .value,
+        );
+        let mut maximum = 0.0f32;
+        for (i, value) in attended.iter().enumerate() {
+            let expected = bf16(decoded[i % w]);
+            maximum = maximum.max((value - expected).abs());
+            assert_eq!(
+                *value,
+                expected,
+                "{:?}: one-history value head {} column {}",
+                device.backend(),
+                i / w,
+                i % w
+            );
+        }
+        let mse = values
+            .iter()
+            .zip(&decoded)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / w as f32;
+        eprintln!(
+            "{:?} exact affine codes/coefficients; one-history max error {maximum}; constituent V4 RMS {}",
+            device.backend(),
+            mse.sqrt()
+        );
+    }
+}
+
+/// Actual Gemma raw projections, with a separately produced same-input
+/// normalization/rotary reference. Kept opt-in because the model fixture is
+/// an independent campaign artifact, not a kernel package dependency.
+#[test]
+#[ignore = "requires MAGNITUDE_GEMMA_PUBLICATION_FIXTURE independent model artifact"]
+fn actual_gemma_dense_and_affine_publication_share_prepared_values() {
+    let path = std::env::var("MAGNITUDE_GEMMA_PUBLICATION_FIXTURE")
+        .expect("explicit independent fixture path");
+    let bytes = std::fs::read(path).unwrap();
+    let mut cursor = 0;
+    let word = |cursor: &mut usize| {
+        let value = u32::from_le_bytes(bytes[*cursor..*cursor + 4].try_into().unwrap());
+        *cursor += 4;
+        value
+    };
+    let floats = |cursor: &mut usize, count: usize| {
+        let values = bytes[*cursor..*cursor + count * 4]
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        *cursor += count * 4;
+        values
+    };
+    let cases = word(&mut cursor);
+    let mut publications_match = true;
+    assert!(
+        cases >= 2,
+        "owned sliding and full source fixtures required"
+    );
+    for _ in 0..cases {
+        let (m, kv, w, p, layer) = (
+            word(&mut cursor) as usize,
+            word(&mut cursor) as usize,
+            word(&mut cursor) as usize,
+            word(&mut cursor) as usize,
+            word(&mut cursor),
+        );
+        let epsilon = f32::from_bits(word(&mut cursor));
+        let norm = floats(&mut cursor, w);
+        let frequencies = floats(&mut cursor, p);
+        let raw_key = floats(&mut cursor, m * kv * w);
+        let raw_value = floats(&mut cursor, m * kv * w);
+        let expected_key = floats(&mut cursor, m * kv * w);
+        let expected_value = floats(&mut cursor, m * kv * w);
+        let geometry = Geometry {
+            kv,
+            g: 1,
+            p,
+            s: w - 2 * p,
+        };
+        let rows = (0..m)
+            .map(|i| Row {
+                spans: vec![],
+                fresh: (0, 0),
+                destination: i as i32,
+                position: i as i32,
+            })
+            .collect::<Vec<_>>();
+        for device in k8v4_devices() {
+            let mut case = Case::new(geometry, m, 1, &rows, 8107);
+            case.key = raw_key.clone();
+            case.value = raw_value.clone();
+            case.key_norm = norm.clone();
+            case.components = vec![0; p];
+            case.frequencies = frequencies.clone();
+            case.epsilon = epsilon;
+            let encoded = Encoded::new(case);
+            let mut bound = Bound::new(&device, &encoded);
+            bound.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
+            let specialization = append_specialization(
+                &specialization_on(&device, geometry, &[]).with_static("NV", 1),
+            );
+            let mut dense_slabs = SlabTensor::new(
+                &device,
+                m as u64,
+                m as u64,
+                vec![
+                    SlabRegion {
+                        element: Element::bf16(),
+                        row_shape: vec![kv as u64, w as u64],
+                    },
+                    SlabRegion {
+                        element: Element::bf16(),
+                        row_shape: vec![kv as u64, w as u64],
+                    },
+                ],
+            )
+            .unwrap();
+            dense_slabs.add_slab().unwrap();
+            let mut dense_key = dense_slabs.logical_region(0).unwrap();
+            let mut dense_value = dense_slabs.logical_region(1).unwrap();
+            let dense = magnitude_kernels::attention_append_dense::native_for_device_with(
+                &device,
+                magnitude_kernels::attention_append_dense::Elements { A: Element::bf16() },
+                &dense_specialization(&specialization),
+            )
+            .unwrap();
+            dense
+                .call(magnitude_kernels::attention_append_dense::Args {
+                    key: &bound.key,
+                    value: &bound.value,
+                    key_norm: &bound.key_norm,
+                    value_norm: &bound.value_norm,
+                    rotary_components: &bound.components,
+                    rotary_frequencies: &bound.frequencies,
+                    rotary_amplitudes: &bound.amplitudes,
+                    coordinates: &bound.coordinates,
+                    destinations: &bound.destinations,
+                    history_key: &mut dense_key,
+                    history_value: &mut dense_value,
+                    epsilon,
+                    slab_rows: m as u32,
+                })
+                .unwrap();
+            let dense_k = bf16_values(&dense_key);
+            let dense_v = bf16_values(&dense_value);
+            for (name, actual, expected) in [
+                ("key", &dense_k, &expected_key),
+                ("value", &dense_v, &expected_value),
+            ] {
+                let mut max_error = 0.0f32;
+                for (i, (a, e)) in actual.iter().zip(expected).enumerate() {
+                    max_error = max_error.max((a - e).abs());
+                    assert!(
+                        (a - e).abs() <= 0.0125 * e.abs().max(1.0),
+                        "layer{layer}/{name}/{i}: {a} != independent{e}"
+                    );
+                }
+                eprintln!(
+                    "{:?} actual Gemma layer{layer} {name} publication maxabs {max_error}",
+                    device.backend()
+                );
+            }
+            let affine = attention_append_k8v4::native_for_device_with(
+                &device,
+                attention_append_k8v4::Elements { A: Element::bf16() },
+                &specialization,
+            )
+            .unwrap();
+            affine
+                .call(args!(attention_append_k8v4, bound, encoded.case))
+                .unwrap();
+            let actual = bound.planes();
+            let expected = Planes::encode(geometry, &dense_k, &dense_v);
+            for (name, a, e) in [
+                (
+                    "key codes",
+                    actual
+                        .key_codes
+                        .iter()
+                        .map(|x| *x as u32)
+                        .collect::<Vec<_>>(),
+                    expected.key_codes.clone(),
+                ),
+                (
+                    "key coefficients",
+                    actual.key_coefficients.iter().map(|x| *x as u32).collect(),
+                    expected
+                        .key_coefficients
+                        .iter()
+                        .map(|x| *x as u32)
+                        .collect(),
+                ),
+                (
+                    "value codes",
+                    actual.value_codes.clone(),
+                    expected.value_codes.clone(),
+                ),
+                (
+                    "value coefficients",
+                    actual
+                        .value_coefficients
+                        .iter()
+                        .map(|x| *x as u32)
+                        .collect(),
+                    expected
+                        .value_coefficients
+                        .iter()
+                        .map(|x| *x as u32)
+                        .collect(),
+                ),
+            ] {
+                let differences = a
+                    .iter()
+                    .zip(&e)
+                    .enumerate()
+                    .filter(|(_, (a, e))| a != e)
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "{:?} layer{layer} {name}: mismatches {}/{} first {:?}",
+                    device.backend(),
+                    differences.len(),
+                    a.len(),
+                    differences
+                        .iter()
+                        .take(4)
+                        .map(|(i, (a, e))| (*i, format!("{a:08x}"), format!("{e:08x}")))
+                        .collect::<Vec<_>>()
+                );
+            }
+            let mut representation_matches = actual.key_coefficients == expected.key_coefficients
+                && actual.value_coefficients == expected.value_coefficients;
+            for (name, bits, native, recipe, prepared) in [
+                (
+                    "key",
+                    KEY_BITS,
+                    &actual.key_codes,
+                    &expected.key_codes,
+                    &dense_k,
+                ),
+                (
+                    "value",
+                    VALUE_BITS,
+                    &actual.value_codes,
+                    &expected.value_codes,
+                    &dense_v,
+                ),
+            ] {
+                let coefficients = if name == "key" {
+                    &expected.key_coefficients
+                } else {
+                    &expected.value_coefficients
+                };
+                let per = 32 / bits;
+                let mask = (1u32 << bits) - 1;
+                let mut cells = 0;
+                for i in 0..prepared.len() {
+                    let a = (native[i / per as usize] >> ((i % per as usize) as u32 * bits)) & mask;
+                    let e = (recipe[i / per as usize] >> ((i % per as usize) as u32 * bits)) & mask;
+                    if a != e {
+                        cells += 1;
+                        let group = (i / w) * coefficient_elements(w) + (i % w) / GROUP * 2;
+                        let scale = f16_to_f32(coefficients[group]);
+                        let zero = f16_to_f32(coefficients[group + 1]);
+                        // These finite BF16/F16 inputs are binary rationals. A
+                        // reciprocal-based recipe can land on either side of
+                        // an exact mathematical half-step. Only its two
+                        // adjacent codes are admitted, with no epsilon.
+                        let coordinate =
+                            (f64::from(prepared[i]) - f64::from(zero)) / f64::from(scale);
+                        let lower = coordinate.floor();
+                        let exact_tie = coordinate.is_finite()
+                            && coordinate - lower == 0.5
+                            && f64::from(a.min(e)) == lower
+                            && f64::from(a.max(e)) == lower + 1.0;
+                        representation_matches &= exact_tie;
+                        if cells <= 4 {
+                            eprintln!(
+                                "layer{layer} {name} cell {i}: actual {a} expected {e}, prepared={} scale={scale} zero={zero} coordinate={coordinate:.9} exact-adjacent-tie={exact_tie}",
+                                prepared[i]
+                            );
+                        }
+                    }
+                }
+                let mut gap2 = 0.0f64;
+                let mut max_gap = 0.0f32;
+                let mut perturb2 = 0.0f64;
+                let mut max_perturb = 0.0f32;
+                for vector in 0..m * kv {
+                    let (ak, av) = actual.decoded(geometry, vector);
+                    let (ek, ev) = expected.decoded(geometry, vector);
+                    let (a, e) = if name == "key" { (ak, ek) } else { (av, ev) };
+                    for column in 0..w {
+                        let gap = a[column] - e[column];
+                        gap2 += f64::from(gap).powi(2);
+                        max_gap = max_gap.max(gap.abs());
+                        let perturb = a[column] - prepared[vector * w + column];
+                        perturb2 += f64::from(perturb).powi(2);
+                        max_perturb = max_perturb.max(perturb.abs());
+                    }
+                }
+                eprintln!(
+                    "{:?} layer{layer} {name}: differing cells {cells}, decoded native-vs-recipe rms={} max={max_gap}; native-vs-Dense rms={} max={max_perturb}",
+                    device.backend(),
+                    (gap2 / prepared.len() as f64).sqrt(),
+                    (perturb2 / prepared.len() as f64).sqrt()
+                );
+            }
+            publications_match &= representation_matches;
+        }
+    }
+    assert_eq!(cursor, bytes.len(), "fixture layout consumed exactly");
+    assert!(
+        publications_match,
+        "actual publication plane mismatch; see compact per-plane/cell diagnostics"
+    );
+}
+
+/// Isolates actual Gemma history consumers from whole-model propagation:
+/// prepared Q/K/V, the exact encoded history planes and an independent
+/// softmax oracle are identical across scalar and prefill invocations.
+#[test]
+#[ignore = "requires actual Gemma publication and query artifacts"]
+fn actual_gemma_prepared_history_consumers_match_decoded_oracle() {
+    struct Reader {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+    impl Reader {
+        fn open(name: &str) -> Self {
+            Self {
+                bytes: std::fs::read(std::env::var(name).expect(name)).unwrap(),
+                at: 0,
+            }
+        }
+        fn word(&mut self) -> u32 {
+            let v = u32::from_le_bytes(self.bytes[self.at..self.at + 4].try_into().unwrap());
+            self.at += 4;
+            v
+        }
+        fn floats(&mut self, n: usize) -> Vec<f32> {
+            (0..n).map(|_| f32::from_bits(self.word())).collect()
+        }
+    }
+    fn oracle(case: &Case, planes: Option<&Planes>) -> Vec<f32> {
+        let Geometry { kv, g, .. } = case.geometry;
+        let w = case.geometry.w();
+        let h = kv * g;
+        let mut hk = case.history_key.clone();
+        let mut hv = case.history_value.clone();
+        if let Some(planes) = planes {
+            for v in 0..case.history_rows * kv {
+                let (k, x) = planes.decoded(case.geometry, v);
+                hk[v * w..][..w].copy_from_slice(&k);
+                hv[v * w..][..w].copy_from_slice(&x);
+            }
+        }
+        let mut out = vec![0.0; case.rows * h * w];
+        for row in 0..case.rows {
+            for head in 0..h {
+                let kh = head / g;
+                let q = &case.query_gate[(row * h + head) * w..][..w];
+                let keys = (0..case.history_rows)
+                    .map(|t| (&hk[(t * kv + kh) * w..][..w], &hv[(t * kv + kh) * w..][..w]))
+                    .chain((0..=row).map(|t| {
+                        (
+                            &case.key[(t * kv + kh) * w..][..w],
+                            &case.value[(t * kv + kh) * w..][..w],
+                        )
+                    }))
+                    .collect::<Vec<_>>();
+                let scores = keys
+                    .iter()
+                    .map(|(k, _)| {
+                        q.iter()
+                            .zip(*k)
+                            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                            .sum::<f64>()
+                            * f64::from(case.scale)
+                    })
+                    .collect::<Vec<_>>();
+                let peak = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let p = scores.iter().map(|s| (s - peak).exp()).collect::<Vec<_>>();
+                let sum = p.iter().sum::<f64>();
+                for c in 0..w {
+                    out[(row * h + head) * w + c] = keys
+                        .iter()
+                        .zip(&p)
+                        .map(|((_, v), p)| f64::from(v[c]) * p / sum)
+                        .sum::<f64>() as f32;
+                }
+            }
+        }
+        out
+    }
+    fn errors(a: &[f32], e: &[f32]) -> (f64, f32, f64) {
+        assert_eq!(a.len(), e.len());
+        let mut sq = 0.0;
+        let mut peak = 0.0f32;
+        let mut base = 0.0;
+        for (a, e) in a.iter().zip(e) {
+            let d = a - e;
+            sq += f64::from(d).powi(2);
+            peak = peak.max(d.abs());
+            base += f64::from(*e).powi(2);
+        }
+        (
+            (sq / a.len() as f64).sqrt(),
+            peak,
+            (sq / base.max(1e-30)).sqrt(),
+        )
+    }
+    let mut f = Reader::open("MAGNITUDE_GEMMA_PUBLICATION_FIXTURE");
+    let mut q = Reader::open("MAGNITUDE_GEMMA_QUERY_FIXTURE");
+    let mut consumers_match = true;
+    let count = f.word();
+    assert_eq!(count, q.word());
+    for _ in 0..count {
+        let m = f.word() as usize;
+        let kv = f.word() as usize;
+        let w = f.word() as usize;
+        let p = f.word() as usize;
+        let layer = f.word();
+        let epsilon = f32::from_bits(f.word());
+        let norm = f.floats(w);
+        let frequencies = f.floats(p);
+        let raw_k = f.floats(m * kv * w);
+        let raw_v = f.floats(m * kv * w);
+        let _expected_k = f.floats(m * kv * w);
+        let _expected_v = f.floats(m * kv * w);
+        assert_eq!(q.word(), layer);
+        let heads = q.word() as usize;
+        assert_eq!(q.word() as usize, m);
+        assert_eq!(q.word() as usize, w);
+        assert_eq!(q.word() as usize, kv);
+        let queries = q.floats(m * heads * w);
+        assert_eq!(heads % kv, 0);
+        assert!(m >= 129);
+        for device in k8v4_devices() {
+            // Publish the actual raw projections through Dense native prep,
+            // not an independently normalized substitute.
+            let prep_geometry = Geometry {
+                kv,
+                g: 1,
+                p,
+                s: w - 2 * p,
+            };
+            let prep_rows = (0..m)
+                .map(|i| Row {
+                    spans: vec![],
+                    fresh: (0, 0),
+                    destination: i as i32,
+                    position: i as i32,
+                })
+                .collect::<Vec<_>>();
+            let mut prep = Case::new(prep_geometry, m, 1, &prep_rows, 1);
+            prep.key = raw_k.clone();
+            prep.value = raw_v.clone();
+            prep.key_norm = norm.clone();
+            prep.components = vec![0; p];
+            prep.frequencies = frequencies.clone();
+            prep.epsilon = epsilon;
+            let encoded_prep = Encoded::new(prep);
+            let mut inputs = Bound::new(&device, &encoded_prep);
+            inputs.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
+            let mut dense = SlabTensor::new(
+                &device,
+                m as u64,
+                m as u64,
+                vec![
+                    SlabRegion {
+                        element: Element::bf16(),
+                        row_shape: vec![kv as u64, w as u64],
+                    },
+                    SlabRegion {
+                        element: Element::bf16(),
+                        row_shape: vec![kv as u64, w as u64],
+                    },
+                ],
+            )
+            .unwrap();
+            dense.add_slab().unwrap();
+            let mut dk = dense.logical_region(0).unwrap();
+            let mut dv = dense.logical_region(1).unwrap();
+            let spec = dense_specialization(&append_specialization(
+                &specialization_on(&device, prep_geometry, &[]).with_static("NV", 1),
+            ));
+            let publish = magnitude_kernels::attention_append_dense::native_for_device_with(
+                &device,
+                magnitude_kernels::attention_append_dense::Elements { A: Element::bf16() },
+                &spec,
+            )
+            .unwrap();
+            publish
+                .call(magnitude_kernels::attention_append_dense::Args {
+                    key: &inputs.key,
+                    value: &inputs.value,
+                    key_norm: &inputs.key_norm,
+                    value_norm: &inputs.value_norm,
+                    rotary_components: &inputs.components,
+                    rotary_frequencies: &inputs.frequencies,
+                    rotary_amplitudes: &inputs.amplitudes,
+                    coordinates: &inputs.coordinates,
+                    destinations: &inputs.destinations,
+                    history_key: &mut dk,
+                    history_value: &mut dv,
+                    epsilon,
+                    slab_rows: m as u32,
+                })
+                .unwrap();
+            let affine_publish = attention_append_k8v4::native_for_device_with(
+                &device,
+                attention_append_k8v4::Elements { A: Element::bf16() },
+                &append_specialization(
+                    &specialization_on(&device, prep_geometry, &[]).with_static("NV", 1),
+                ),
+            )
+            .unwrap();
+            affine_publish
+                .call(args!(attention_append_k8v4, inputs, encoded_prep.case))
+                .unwrap();
+            let published_planes = inputs.planes();
+            let dk = bf16_values(&dk);
+            let dv = bf16_values(&dv);
+            let prefix = 65;
+            let rows = 64;
+            let geometry = Geometry {
+                kv,
+                g: heads / kv,
+                p: 0,
+                s: w,
+            };
+            let controls = (0..rows)
+                .map(|i| Row {
+                    spans: vec![(0, prefix as i32)],
+                    fresh: (0, i as i32 + 1),
+                    destination: -1,
+                    position: 0,
+                })
+                .collect::<Vec<_>>();
+            let mut case = Case::new(geometry, prefix, 1, &controls, 2);
+            case.query_gate = queries[prefix * heads * w..(prefix + rows) * heads * w].to_vec();
+            case.key = dk[prefix * kv * w..(prefix + rows) * kv * w].to_vec();
+            case.value = dv[prefix * kv * w..(prefix + rows) * kv * w].to_vec();
+            case.history_key = dk[..prefix * kv * w].to_vec();
+            case.history_value = dv[..prefix * kv * w].to_vec();
+            case.scale = 1.0;
+            let mut encoded = Encoded::new(case);
+            encoded.planes = Planes {
+                key_codes: published_planes.key_codes[..prefix * kv * w * KEY_BITS as usize / 32]
+                    .to_vec(),
+                key_coefficients: published_planes.key_coefficients
+                    [..prefix * kv * coefficient_elements(w)]
+                    .to_vec(),
+                value_codes: published_planes.value_codes
+                    [..prefix * kv * w * VALUE_BITS as usize / 32]
+                    .to_vec(),
+                value_coefficients: published_planes.value_coefficients
+                    [..prefix * kv * coefficient_elements(w)]
+                    .to_vec(),
+            };
+            let expected = oracle(&encoded.case, Some(&encoded.planes));
+            let dense_expected = oracle(&encoded.case, None);
+            let quant = errors(&expected, &dense_expected);
+            eprintln!(
+                "{:?} Gemma layer{layer} W{w} G{} scale1 history65/fresh64 oracle codec-vs-Dense rms={} max={} relative={}",
+                device.backend(),
+                geometry.g,
+                quant.0,
+                quant.1,
+                quant.2
+            );
+            for prefill in [false, true] {
+                let mut bound = Bound::new(&device, &encoded);
+                bound.query = bf16_tensor(&device, &[rows, heads, w], &encoded.case.query_gate);
+                bound.query_norm = f32_tensor(&device, &[0, w], &[]);
+                bound.key_norm = f32_tensor(&device, &[0, w], &[]);
+                let parameters = if device.backend() == BackendName::Metal {
+                    if prefill {
+                        vec![
+                            ("QT", 16),
+                            ("HEADS", geometry.g.min(16) as u64),
+                            ("SPLIT_GROUPS", 256),
+                            ("DIRECT", 0),
+                            ("COISSUE", 0),
+                        ]
+                    } else {
+                        vec![
+                            ("SPAN", 32),
+                            ("PARTS", 16),
+                            ("SIMDS", 4),
+                            ("SLICES", 1),
+                            ("MATRIX", 0),
+                            ("KEYS", 16),
+                            ("TOKENS", 1),
+                        ]
+                    }
+                } else if prefill {
+                    prefill_configs(device.backend(), geometry)
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                } else {
+                    decode_configs(device.backend(), geometry)
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                };
+                let spec = if prefill {
+                    prefill_specialization(&device, geometry, &parameters)
+                } else {
+                    specialization_on(&device, geometry, &parameters)
+                }
+                .with_static("I", 0)
+                .with_static("N", 0)
+                .with_static("NV", 0);
+                let actual = if prefill {
+                    attention_prefill_k8v4::native_for_device_with(
+                        &device,
+                        attention_prefill_k8v4::Elements { A: Element::bf16() },
+                        &spec,
+                    )
+                    .unwrap()
+                    .call(prefill_args!(bound, encoded.case))
+                    .unwrap()
+                    .value
+                } else {
+                    attention_decode_k8v4::native_for_device_with(
+                        &device,
+                        attention_decode_k8v4::Elements { A: Element::bf16() },
+                        &spec,
+                    )
+                    .unwrap()
+                    .call(args!(attention_decode_k8v4, bound, encoded.case))
+                    .unwrap()
+                    .value
+                };
+                let actual = bf16_values(&actual);
+                let gap = errors(&actual, &expected);
+                eprintln!(
+                    "{:?} Gemma layer{layer} {} consumer-vs-decodedoracle rms={} max={} relative={}",
+                    device.backend(),
+                    if prefill { "prefill64" } else { "scalar64" },
+                    gap.0,
+                    gap.1,
+                    gap.2
+                );
+                let worst = actual
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, e)| (a - e).abs() / (4.0e-3 + 1.6e-2 * e.abs()))
+                    .fold(0.0f32, f32::max);
+                eprintln!(
+                    "actual Gemma layer{layer} prefill={prefill}: established consumer pointwise bound factor{worst}"
+                );
+                consumers_match &= worst <= 1.0;
+                assert_eq!(
+                    bound.planes(),
+                    encoded.planes,
+                    "read-only prepared history planes changed"
+                );
+            }
+        }
+    }
+    assert_eq!(f.at, f.bytes.len());
+    assert_eq!(q.at, q.bytes.len());
+    assert!(
+        consumers_match,
+        "actual Gemma consumer differs beyond established pointwise bound; see diagnostics"
+    );
+}
+
+/// Same actual raw tokens and absolute positions, comparing the ordered
+/// batch publication with both sequential publication entry points.
+#[test]
+#[ignore = "requires actual Gemma publication artifact"]
+fn actual_gemma_sequential_publication_matches_batch() {
+    let bytes =
+        std::fs::read(std::env::var("MAGNITUDE_GEMMA_PUBLICATION_FIXTURE").expect("fixture"))
+            .unwrap();
+    let mut at = 0;
+    fn word(b: &[u8], at: &mut usize) -> u32 {
+        let x = u32::from_le_bytes(b[*at..*at + 4].try_into().unwrap());
+        *at += 4;
+        x
+    }
+    fn floats(b: &[u8], at: &mut usize, n: usize) -> Vec<f32> {
+        (0..n).map(|_| f32::from_bits(word(b, at))).collect()
+    }
+    let count = word(&bytes, &mut at);
+    let mut matches = true;
+    for _ in 0..count {
+        let m = word(&bytes, &mut at) as usize;
+        let kv = word(&bytes, &mut at) as usize;
+        let w = word(&bytes, &mut at) as usize;
+        let p = word(&bytes, &mut at) as usize;
+        let layer = word(&bytes, &mut at);
+        let epsilon = f32::from_bits(word(&bytes, &mut at));
+        let norm = floats(&bytes, &mut at, w);
+        let frequencies = floats(&bytes, &mut at, p);
+        let k = floats(&bytes, &mut at, m * kv * w);
+        let v = floats(&bytes, &mut at, m * kv * w);
+        let _ek = floats(&bytes, &mut at, m * kv * w);
+        let _ev = floats(&bytes, &mut at, m * kv * w);
+        let geometry = Geometry {
+            kv,
+            g: 1,
+            p,
+            s: w - 2 * p,
+        };
+        let rows = (0..m)
+            .map(|i| Row {
+                spans: vec![],
+                fresh: (0, 0),
+                destination: i as i32,
+                position: i as i32,
+            })
+            .collect::<Vec<_>>();
+        let mut case = Case::new(geometry, m, 1, &rows, 811);
+        case.key = k.clone();
+        case.value = v.clone();
+        case.key_norm = norm.clone();
+        case.components = vec![0; p];
+        case.frequencies = frequencies.clone();
+        case.epsilon = epsilon;
+        let encoded = Encoded::new(case);
+        for device in k8v4_devices() {
+            let append_spec = append_specialization(
+                &specialization_on(&device, geometry, &[]).with_static("NV", 1),
+            );
+            let append = attention_append_k8v4::native_for_device_with(
+                &device,
+                attention_append_k8v4::Elements { A: Element::bf16() },
+                &append_spec,
+            )
+            .unwrap();
+            let mut batch = Bound::new(&device, &encoded);
+            batch.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
+            append
+                .call(args!(attention_append_k8v4, batch, encoded.case))
+                .unwrap();
+            let expected = batch.planes();
+            let one = [Row {
+                spans: vec![],
+                fresh: (0, 0),
+                destination: 0,
+                position: 0,
+            }];
+            let mut one_case = Case::new(geometry, m, 1, &one, 811);
+            one_case.key_norm = norm.clone();
+            one_case.components = vec![0; p];
+            one_case.frequencies = frequencies.clone();
+            one_case.epsilon = epsilon;
+            let one_encoded = Encoded {
+                case: one_case,
+                planes: encoded.planes.clone(),
+            };
+            let params = if device.backend() == BackendName::Metal {
+                vec![
+                    ("SPAN", 32),
+                    ("PARTS", 16),
+                    ("SIMDS", 4),
+                    ("SLICES", 1),
+                    ("MATRIX", 0),
+                    ("KEYS", 16),
+                    ("TOKENS", 1),
+                ]
+            } else {
+                decode_configs(device.backend(), geometry)
+                    .into_iter()
+                    .next()
+                    .unwrap()
+            };
+            let decode = attention_decode_k8v4::native_for_device_with(
+                &device,
+                attention_decode_k8v4::Elements { A: Element::bf16() },
+                &specialization_on(&device, geometry, &params)
+                    .with_static("I", 0)
+                    .with_static("NV", 1),
+            )
+            .unwrap();
+            for fused in [false, true] {
+                let mut sequential = Bound::new(&device, &one_encoded);
+                sequential.value_norm = f32_tensor(&device, &[1, w], &vec![1.0; w]);
+                sequential.query = bf16_tensor(&device, &[1, kv, w], &vec![0.0; kv * w]);
+                for i in 0..m {
+                    sequential.key =
+                        bf16_tensor(&device, &[1, 1, kv * w], &k[i * kv * w..(i + 1) * kv * w]);
+                    sequential.value =
+                        bf16_tensor(&device, &[1, 1, kv * w], &v[i * kv * w..(i + 1) * kv * w]);
+                    sequential.coordinates = i32_tensor(&device, &[1, 4], &[i as i32, 0, 0, 0]);
+                    sequential.destinations = i32_tensor(&device, &[1], &[i as i32]);
+                    if fused {
+                        let mut args = args!(attention_decode_k8v4, sequential, one_encoded.case);
+                        args.gate_function = -1;
+                        decode.call(args).unwrap();
+                    } else {
+                        append
+                            .call(args!(attention_append_k8v4, sequential, one_encoded.case))
+                            .unwrap();
+                    }
+                }
+                let actual = sequential.planes();
+                let mut differences = 0;
+                for (name, a, e) in [
+                    (
+                        "key codes",
+                        actual.key_codes.clone(),
+                        expected.key_codes.clone(),
+                    ),
+                    (
+                        "key coefficients",
+                        actual.key_coefficients.iter().map(|x| *x as u32).collect(),
+                        expected
+                            .key_coefficients
+                            .iter()
+                            .map(|x| *x as u32)
+                            .collect(),
+                    ),
+                    (
+                        "value codes",
+                        actual.value_codes.clone(),
+                        expected.value_codes.clone(),
+                    ),
+                    (
+                        "value coefficients",
+                        actual
+                            .value_coefficients
+                            .iter()
+                            .map(|x| *x as u32)
+                            .collect(),
+                        expected
+                            .value_coefficients
+                            .iter()
+                            .map(|x| *x as u32)
+                            .collect(),
+                    ),
+                ] {
+                    let d = a
+                        .iter()
+                        .zip(&e)
+                        .enumerate()
+                        .filter(|(_, (a, e))| a != e)
+                        .collect::<Vec<_>>();
+                    differences += d.len();
+                    eprintln!(
+                        "{:?} Gemma layer{layer} {} sequential vs batch {name}: mismatches {}/{} first {:?}",
+                        device.backend(),
+                        if fused {
+                            "fused decode"
+                        } else {
+                            "ordered append"
+                        },
+                        d.len(),
+                        a.len(),
+                        d.iter()
+                            .take(4)
+                            .map(|(i, (a, e))| (*i, format!("{a:08x}"), format!("{e:08x}")))
+                            .collect::<Vec<_>>()
+                    );
+                }
+                matches &= differences == 0;
+            }
+        }
+    }
+    assert_eq!(at, bytes.len());
+    assert!(
+        matches,
+        "actual sequential publication differs from batch; see per-plane diagnostics"
+    );
 }

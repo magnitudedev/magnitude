@@ -80,8 +80,10 @@ that same installation through `/usr/bin/magnitude-desktop`, including login sta
 entry acquires shared installation admission before executing Electron and retains it until exit.
 The package manager obtains exclusive admission before replacement/removal and rejects while any
 participating user app remains alive. A root-owned installation gate spans the separate maintainer
-script lifetimes; launches fail with repair guidance until configuration succeeds. Interrupted
-installation never becomes an independently running service. The lock inode survives reinstall.
+script lifetimes; launches fail with repair guidance until configuration succeeds. Launches without
+a terminal (application menu, login) receive that guidance as a desktop notification. Interrupted
+installation never becomes an independently running service. The lock inode survives removal and
+reinstall; purging the Debian package deletes the gate.
 Pacman ignores package scriptlet failures, so the pacman package performs its exclusive admission in a
 PreTransaction hook with AbortOnFail, named to order after other packages' hooks, and completes it in
 its post-install, post-upgrade and post-remove scriptlets. Removal deletes the hook's own files before

@@ -1,0 +1,287 @@
+--- a/common/chat-peg-parser.cpp
++++ b/common/chat-peg-parser.cpp
+@@ -533,13 +533,16 @@ common_peg_parser common_chat_peg_builder::python_or_json_value() {
+ 
+         auto member  = sequence({ python_string(), ws, literal(":"), ws, value });
+         auto members = sequence({ member, zero_or_more(sequence({ ws, literal(","), ws, member })) });
++        // Whitespace around a value belongs to its container's separators: a
++        // value that also ended with it would meet a separator's whitespace,
++        // and the same text would read two ways.
+         auto dict    = rule("python-or-json-dict", [&]() {
+-            return sequence({ literal("{"), ws, choice({ literal("}"), sequence({ members, ws, literal("}") }) }), ws });
++            return sequence({ literal("{"), ws, choice({ literal("}"), sequence({ members, ws, literal("}") }) }) });
+         });
+ 
+-        auto elements = sequence({ value, zero_or_more(sequence({ literal(","), ws, value })) });
++        auto elements = sequence({ value, zero_or_more(sequence({ ws, literal(","), ws, value })) });
+         auto array    = rule("python-or-json-array", [&]() {
+-            return sequence({ literal("["), ws, choice({ literal("]"), sequence({ elements, ws, literal("]") }) }), ws });
++            return sequence({ literal("["), ws, choice({ literal("]"), sequence({ elements, ws, literal("]") }) }) });
+         });
+ 
+         return choice({ dict, array, python_string(), python_number(),
+--- a/common/parsers/lfm2.cpp
++++ b/common/parsers/lfm2.cpp
+@@ -23,6 +23,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+     const std::string THINK_START     = "<think>";
+     const std::string THINK_END       = "</think>";
+     const std::string GEN_PROMPT      = "<|im_start|>assistant\n";
++    const std::string UNTHOUGHT_TEXT  = "unthought-content";
+ 
+     // Copy reasoning to the "thinking" field the template expects
+     auto adjusted_messages = json::array();
+@@ -70,7 +71,7 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+ 
+         auto reasoning = p.eps();
+         if (extract_reasoning) {
+-            reasoning = p.optional(THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END);
++            reasoning = p.optional(p.rule("reasoning-block", THINK_START + p.reasoning(p.until(THINK_END)) + THINK_END));
+         }
+ 
+         if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+@@ -93,9 +94,15 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+             tool_calls = p.optional(tool_calls);
+         }
+ 
+-        auto content = p.text_before_calls(p.content(p.until(TOOL_CALL_START)), inputs.tool_choice);
++        auto content = p.text_before_calls(p.rule("content-text", p.content(p.until(TOOL_CALL_START))), inputs.tool_choice);
++        auto preamble = reasoning + content;
++        if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
++            // Text beginning with <think> reads as reasoning whenever it can, so
++            // content that no reasoning precedes never begins with it.
++            preamble = p.gbnf(preamble, "(reasoning-block content-text | " + UNTHOUGHT_TEXT + ")");
++        }
+ 
+-        return generation_prompt + reasoning + content + tool_calls + end;
++        return generation_prompt + preamble + tool_calls + end;
+     });
+ 
+     data.parser = parser.save();
+@@ -104,6 +111,10 @@ common_chat_params common_chat_params_init_lfm2(const common_chat_template &
+         data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
++            if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE &&
++                inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED && extract_reasoning) {
++                unopened_text_grammar(builder, UNTHOUGHT_TEXT, THINK_START, TOOL_CALL_START, false);
++            }
+         });
+ 
+         data.grammar_triggers = {
+--- a/common/parsers/minicpm5.cpp
++++ b/common/parsers/minicpm5.cpp
+@@ -1,5 +1,8 @@
+ #include "parsers.h"
+ 
++static const std::string MINICPM5_RAW_VALUE      = "raw-param-value";
++static const std::string MINICPM5_UNTHOUGHT_TEXT = "unthought-content";
++
+ // MiniCPM5 format:
+ // - Reasoning: <think>{reasoning}</think> (optional)
+ // - Tool calls: <function name="foo"><param name="bar">value</param></function>
+@@ -51,7 +54,7 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+ 
+         auto reasoning = p.eps();
+         if (extract_reasoning) {
+-            reasoning = p.optional(("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space());
++            reasoning = p.optional(p.rule("reasoning-block", ("<think>" << p.reasoning(p.until("</think>")) << "</think>") + p.space()));
+         }
+ 
+         // Response format parser
+@@ -64,7 +67,8 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+             // </param>); capture the inner text only, excluding the CDATA markers.
+             auto string_value = p.choice({
+                 p.literal("<![CDATA[") + p.ac(p.tool_arg_string_value(p.until("]]>")) + p.literal("]]>"), "]]>") + p.tool_arg_close(p.literal("</param>")),
+-                p.negate(p.literal("<![CDATA[")) + p.ac(p.tool_arg_string_value(p.until("</param>")) + p.tool_arg_close(p.literal("</param>")), "</param>")
++                p.gbnf(p.negate(p.literal("<![CDATA[")) + p.ac(p.tool_arg_string_value(p.until("</param>")) + p.tool_arg_close(p.literal("</param>")), "</param>"),
++                       MINICPM5_RAW_VALUE)
+             });
+ 
+             auto tool_choice = p.choice();
+@@ -95,10 +99,12 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+                     args = p.zero_or_more(p.choice(arg_rules) + p.space());
+                 }
+ 
++                // Each argument owns the whitespace after it, so none precedes the
++                // close: two adjacent optional spaces would read the same text many ways.
+                 auto tool_parser = p.tool(
+                     p.tool_open(p.literal("<function name=\"") + p.tool_name(p.literal(name)) + p.literal("\">"))
+                     << p.tool_args(args)
+-                    << p.tool_close(p.literal("</function>")));
++                    + p.tool_close(p.literal("</function>")));
+ 
+                 tool_choice |= p.rule("tool-" + name, tool_parser);
+             });
+@@ -110,9 +116,15 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+                 tool_calls = p.optional(tool_calls);
+             }
+ 
+-            auto content = p.text_before_calls(p.content(p.until("<function")), inputs.tool_choice);
++            auto content = p.text_before_calls(p.rule("content-text", p.content(p.until("<function"))), inputs.tool_choice);
++            auto preamble = reasoning + content;
++            if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
++                // Text beginning with <think> reads as reasoning whenever it can, so
++                // content that no reasoning precedes never begins with it.
++                preamble = p.gbnf(preamble, "(reasoning-block content-text | " + MINICPM5_UNTHOUGHT_TEXT + ")");
++            }
+ 
+-            return generation_prompt + reasoning + content + tool_calls + p.end();
++            return generation_prompt + preamble + tool_calls + p.end();
+         }
+ 
+         return generation_prompt + reasoning + p.content(p.rest()) + p.end();
+@@ -124,6 +136,12 @@ common_chat_params common_chat_params_init_minicpm5(const common_chat_template &
+         data.grammar_lazy = false;  // Enforce the whole completion, including trigger bytes.
+         data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+             parser.build_grammar(builder, data.grammar_lazy);
++            if (!has_response_format && has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
++                unopened_text_grammar(builder, MINICPM5_RAW_VALUE, "<![CDATA[", "</param>", true);
++                if (extract_reasoning && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
++                    unopened_text_grammar(builder, MINICPM5_UNTHOUGHT_TEXT, "<think>", "<function", false);
++                }
++            }
+         });
+ 
+         data.grammar_triggers = {
+--- a/common/parsers/parsers.cpp
++++ b/common/parsers/parsers.cpp
+@@ -1,5 +1,9 @@
+ #include "parsers.h"
+ 
++#include <cstdio>
++#include <map>
++#include <utility>
++
+ #include "templates-log.h"
+ 
+ void foreach_function(const json & tools, const std::function<void(const json &)> & fn) {
+@@ -30,3 +34,71 @@ void foreach_parameter(const json & function, const std::function<void(const com
+         fn(prop, doc);
+     }
+ }
++
++// The rules are the product of a prefix check for `open` and a scanner for
++// `close`.
++void unopened_text_grammar(const common_grammar_builder & builder,
++                           const std::string &            name,
++                           const std::string &            open,
++                           const std::string &            close,
++                           bool                           including) {
++    std::set<char> letters(close.begin(), close.end());
++    letters.insert(open.begin(), open.end());
++    // Progress through `open` (-1 once it can no longer match), and through `close`.
++    using state = std::pair<int, size_t>;
++    const auto advance_close = [&](size_t matched, char c) {
++        const std::string text = close.substr(0, matched) + c;
++        for (size_t length = std::min(text.size(), close.size()); length > 0; length--) {
++            if (text.compare(text.size() - length, length, close, 0, length) == 0) {
++                return length;
++            }
++        }
++        return size_t{0};
++    };
++    std::map<state, std::string> names;
++    std::vector<state> pending;
++    const auto name_of = [&](const state & s) {
++        auto found = names.find(s);
++        if (found != names.end()) {
++            return found->second;
++        }
++        auto rule = names.empty() ? name : name + "-" + std::to_string(names.size());
++        names.emplace(s, rule);
++        pending.push_back(s);
++        return rule;
++    };
++    const auto char_class = [](const std::set<char> & chars, bool negated) {
++        std::string out = negated ? "[^" : "[";
++        for (char c : chars) {
++            char escaped[5];
++            std::snprintf(escaped, sizeof(escaped), "\\x%02X", (unsigned char) c);
++            out += escaped;
++        }
++        return out + "]";
++    };
++    name_of({0, 0});
++    for (size_t index = 0; index < pending.size(); index++) {
++        const auto [opened, closed] = pending[index];
++        std::vector<std::string> alternatives;
++        if (!including) {
++            alternatives.push_back("");
++        }
++        for (char c : letters) {
++            int next_open = -1;
++            if (opened >= 0 && c == open[opened]) {
++                if ((size_t) opened + 1 == open.size()) {
++                    continue;  // the text begins with the opener
++                }
++                next_open = opened + 1;
++            }
++            const auto next_close = advance_close(closed, c);
++            if (next_close < close.size()) {
++                alternatives.push_back(char_class({ c }, false) + " " + name_of({ next_open, next_close }));
++            } else if (including) {
++                alternatives.push_back(char_class({ c }, false));
++            }
++        }
++        alternatives.push_back(char_class(letters, true) + " " + name_of({ -1, 0 }));
++        builder.add_rule(names.at({ opened, closed }), string_join(alternatives, " | "));
++    }
++}
+--- a/common/parsers/parsers.h
++++ b/common/parsers/parsers.h
+@@ -39,6 +39,18 @@ std::string common_chat_template_generation_prompt_impl(
+     const std::optional<json> & tools_override = std::nullopt,
+     const std::optional<json> & additional_context = std::nullopt);
+ 
++// Adds rule `name`: text that does not begin with `open` and either contains
++// no `close` (`including` false) or ends at its first `close`, inclusive. A
++// parser reads text beginning with `open` another way (an opened value, or
++// reasoning) by ordered choice or a negative lookahead, neither of which GBNF
++// can express; without this the same text reads two ways, which greedy lexing
++// cannot decide.
++void unopened_text_grammar(const common_grammar_builder & builder,
++                           const std::string &            name,
++                           const std::string &            open,
++                           const std::string &            close,
++                           bool                           including);
++
+ bool is_lfm2_template(const std::string & src);
+ 
+ namespace workaround {
+--- a/common/peg-parser.cpp
++++ b/common/peg-parser.cpp
+@@ -1347,14 +1347,14 @@ common_peg_parser common_peg_parser_builder::python_dict() {
+         auto ws = space();
+         auto member = sequence({python_string(), ws, literal(":"), ws, python_value()});
+         auto members = sequence({member, zero_or_more(sequence({ws, literal(","), ws, member}))});
++        // Whitespace around a value belongs to its container's separators.
+         return sequence({
+             literal("{"),
+             ws,
+             choice({
+                 literal("}"),
+                 sequence({members, ws, literal("}")})
+-            }),
+-            ws
++            })
+         });
+     });
+ }
+@@ -1362,15 +1362,14 @@ common_peg_parser common_peg_parser_builder::python_dict() {
+ common_peg_parser common_peg_parser_builder::python_array() {
+     return rule("python-array", [this]() {
+         auto ws = space();
+-        auto elements = sequence({python_value(), zero_or_more(sequence({literal(","), ws, python_value()}))});
++        auto elements = sequence({python_value(), zero_or_more(sequence({ws, literal(","), ws, python_value()}))});
+         return sequence({
+             literal("["),
+             ws,
+             choice({
+                 literal("]"),
+                 sequence({elements, ws, literal("]")})
+-            }),
+-            ws
++            })
+         });
+     });
+ }

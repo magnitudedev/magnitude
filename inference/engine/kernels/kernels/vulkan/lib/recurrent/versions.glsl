@@ -54,9 +54,9 @@ int versions_covered_end() {
 }
 
 // Rows the slot records in its successor's tape: those after the stop row, at
-// most T.
-int versions_tape_rows(versions_slot slot) {
-    return min(int(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
+// most the tape's `capacity` (T).
+int versions_tape_rows(versions_slot slot, int capacity) {
+    return min(capacity, slot.hi - slot.lo - slot.stop);
 }
 
 // Byte address of bank `index` of a slab-stored arena whose banks are `bytes`

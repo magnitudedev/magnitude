@@ -185,7 +185,11 @@ impl ManagedModelDownloads {
                     | DownloadAttempt::Cancelled { .. }
             );
             (completed_bytes, total_bytes) = attempt_progress(&attempt);
+            let failed = matches!(attempt, DownloadAttempt::Failed { .. });
             self.update(&id, attempt);
+            if failed {
+                self.stop_failed_bundle_work(&id).await;
+            }
             if is_terminal {
                 terminal = true;
                 break;
@@ -202,6 +206,41 @@ impl ManagedModelDownloads {
                     failure: DownloadFailure::Interrupted,
                 },
             );
+            self.stop_failed_bundle_work(&id).await;
+        }
+    }
+
+    /// A model download fails as a whole when one of its packages fails. Its other package work is
+    /// stopped like a cancellation, so a retry admits fresh work instead of joining an attempt that
+    /// belongs to the failed occurrence.
+    async fn stop_failed_bundle_work(&self, failed: &DownloadAttemptId) {
+        let siblings = {
+            let (Ok(attempts), Ok(downloads)) = (self.records.read(), self.downloads.read()) else {
+                return;
+            };
+            unshared_live_siblings(failed, &downloads, &attempts)
+                .into_iter()
+                .filter_map(|id| attempts.get(&id).map(|record| (id, record.clone())))
+                .collect::<Vec<_>>()
+        };
+        for (attempt_id, record) in siblings {
+            match self.manager.cancel_package_download(&record.package).await {
+                Ok(()) => {
+                    let (completed_bytes, total_bytes) = attempt_progress(&record.attempt);
+                    self.update(
+                        &attempt_id,
+                        DownloadAttempt::Cancelled {
+                            id: attempt_id.clone(),
+                            package_id: record.package.id,
+                            completed_bytes,
+                            total_bytes,
+                        },
+                    );
+                }
+                // The package work ended on its own after the snapshot above.
+                Err(InventoryError::NotFound(_)) => {}
+                Err(error) => tracing::warn!(%error, "could not stop package work of a failed model download"),
+            }
         }
     }
 }
@@ -371,6 +410,41 @@ fn attempt_has_other_live_download(
                 ModelDownloadState::Pending { .. } | ModelDownloadState::Downloading { .. }
             )
     })
+}
+
+/// Live package attempts of failed model downloads containing `failed` that no other live download
+/// depends on.
+fn unshared_live_siblings(
+    failed: &DownloadAttemptId,
+    downloads: &BTreeMap<ModelDownloadId, DownloadRecord>,
+    attempts: &BTreeMap<DownloadAttemptId, AttemptRecord>,
+) -> Vec<DownloadAttemptId> {
+    downloads
+        .values()
+        .filter(|download| {
+            !download.cancelled
+                && download.attempt_ids.contains(failed)
+                && matches!(
+                    model_download(download, attempts).state,
+                    ModelDownloadState::Failed { .. }
+                )
+        })
+        .flat_map(|download| {
+            download.attempt_ids.iter().filter(move |sibling| {
+                *sibling != failed
+                    && attempts.get(*sibling).is_some_and(|record| {
+                        matches!(
+                            record.attempt,
+                            DownloadAttempt::Pending { .. } | DownloadAttempt::Downloading { .. }
+                        )
+                    })
+                    && !attempt_has_other_live_download(sibling, &download.id, downloads, attempts)
+            })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn attempt_progress(attempt: &DownloadAttempt) -> (u64, u64) {
@@ -963,6 +1037,89 @@ mod tests {
             &downloads,
             &attempts,
         ));
+    }
+
+    #[test]
+    fn a_failed_bundle_stops_its_other_package_work_unless_another_live_download_needs_it() {
+        let target = package("package_target", 40);
+        let draft = package("package_draft", 10);
+        let attempt = |id: &str, package: &ModelPackage, attempt: DownloadAttempt| {
+            (
+                DownloadAttemptId(id.to_owned()),
+                AttemptRecord {
+                    attempt,
+                    package: package.clone(),
+                    sequence: 1,
+                },
+            )
+        };
+        let target_id = DownloadAttemptId("attempt_target".to_owned());
+        let draft_id = DownloadAttemptId("attempt_draft".to_owned());
+        let mut attempts = BTreeMap::from([
+            attempt(
+                "attempt_target",
+                &target,
+                DownloadAttempt::Downloading {
+                    id: target_id.clone(),
+                    package_id: target.id.clone(),
+                    stage: DownloadStage::Downloading,
+                    completed_bytes: 5,
+                    total_bytes: 40,
+                    bytes_per_second: None,
+                },
+            ),
+            attempt(
+                "attempt_draft",
+                &draft,
+                DownloadAttempt::Failed {
+                    id: draft_id.clone(),
+                    package_id: draft.id.clone(),
+                    completed_bytes: 3,
+                    total_bytes: 10,
+                    failure: DownloadFailure::NetworkUnavailable,
+                },
+            ),
+        ]);
+        let bundle_id = ModelDownloadId("model_download_bundle".to_owned());
+        let mut downloads = BTreeMap::from([(
+            bundle_id.clone(),
+            DownloadRecord {
+                id: bundle_id.clone(),
+                bundle: paired_bundle(target.clone(), draft.clone()),
+                attempt_ids: vec![target_id.clone(), draft_id.clone()],
+                cancelled: false,
+                failure_acknowledged: false,
+                sequence: 1,
+            },
+        )]);
+
+        assert_eq!(
+            unshared_live_siblings(&draft_id, &downloads, &attempts),
+            vec![target_id.clone()]
+        );
+
+        let standalone_id = ModelDownloadId("model_download_standalone".to_owned());
+        downloads.insert(
+            standalone_id.clone(),
+            DownloadRecord {
+                id: standalone_id,
+                bundle: ServableModelBundle::Standalone {
+                    package: target.clone(),
+                },
+                attempt_ids: vec![target_id.clone()],
+                cancelled: false,
+                failure_acknowledged: false,
+                sequence: 2,
+            },
+        );
+        assert!(unshared_live_siblings(&draft_id, &downloads, &attempts).is_empty());
+
+        downloads.retain(|id, _| *id == bundle_id);
+        attempts.get_mut(&target_id).expect("target attempt").attempt = DownloadAttempt::Completed {
+            id: target_id.clone(),
+            package_id: target.id.clone(),
+        };
+        assert!(unshared_live_siblings(&draft_id, &downloads, &attempts).is_empty());
     }
 
     #[test]

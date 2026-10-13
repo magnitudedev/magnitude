@@ -1,9 +1,10 @@
 //! CUDA execution of the core-owned command vocabulary.
 
+use crate::blocks::Blocks;
 use crate::buffer::Buffer;
 use crate::command::{CompiledKernel, LaunchFrame};
 use crate::driver::{
-    Allocation, Context, Driver, DriverError, HostMapped, PinnedUpload, Reservation, Stream,
+    Context, Driver, DriverError, HostMapped, PinnedUpload, Reservation, Stream,
 };
 use crate::{Cuda, CudaLaunchMode};
 use seismic_compiler::errors::ExecutionError;
@@ -17,12 +18,15 @@ use seismic_ir::schedule::{AnyScalarSlot, FillValue};
 use seismic_lang::expr::compiled::InvocationValues;
 use seismic_lang::expr::SymbolValue;
 use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Device {
     context: Arc<Context>,
     stream: Arc<Stream>,
+    blocks: Arc<Blocks>,
+    graph_bytes: Arc<AtomicU64>,
 }
 
 /// One `cuMemGetInfo` sample.
@@ -40,7 +44,13 @@ impl Device {
         })?;
         let context = Context::retain(driver, ordinal).map_err(submission_error)?;
         let stream = Stream::new(&context).map_err(submission_error)?;
-        Ok(Self { context, stream })
+        let blocks = Arc::new(Blocks::new(context.clone()));
+        Ok(Self {
+            context,
+            stream,
+            blocks,
+            graph_bytes: Arc::new(AtomicU64::new(0)),
+        })
     }
     pub fn ordinal(&self) -> u32 {
         self.context.ordinal() as u32
@@ -62,6 +72,36 @@ impl Device {
             free_bytes: free as u64,
             total_bytes: total as u64,
         })
+    }
+
+    /// Device storage of `bytes` as a range of a block. `room`, when given,
+    /// is the device memory this allocation may add, before the free space
+    /// the device's blocks already hold is taken off it.
+    pub fn allocate_within(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        room: Option<u64>,
+    ) -> Result<Buffer, ExecutionError> {
+        if alignment > 256 || !alignment.is_power_of_two() {
+            panic!("prepared CUDA allocation asks for unsupported alignment")
+        }
+        let room = room.map(|room| room.saturating_sub(self.blocks.unallocated_bytes()));
+        self.blocks
+            .allocate(bytes, alignment, room)
+            .map(Buffer::device)
+    }
+
+    /// Device memory held beyond the live ranges: the blocks' free space
+    /// and the instantiated graphs' driver memory. Held by this process,
+    /// charged to no allocation.
+    pub fn held_beyond_ranges(&self) -> u64 {
+        self.blocks.unallocated_bytes() + self.graph_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The device's count of instantiated graphs' driver memory.
+    pub(crate) fn graph_bytes(&self) -> &Arc<AtomicU64> {
+        &self.graph_bytes
     }
 
     pub(crate) fn context(&self) -> &Arc<Context> {
@@ -185,15 +225,21 @@ impl Device {
 impl DeviceService<Cuda> for Device {
     type Buffer = Buffer;
     fn allocate(&self, bytes: u64, alignment: u64) -> Result<Buffer, ExecutionError> {
-        if alignment > 256 || !alignment.is_power_of_two() {
-            panic!("prepared CUDA allocation asks for unsupported alignment")
-        }
-        let bytes = usize::try_from(bytes).map_err(|_| {
-            ExecutionError::AllocationFailed("CUDA allocation exceeds host address space".into())
-        })?;
-        Allocation::new(&self.context, bytes)
-            .map(Buffer::device)
-            .map_err(allocation_error)
+        Device::allocate_within(self, bytes, alignment, None)
+    }
+    fn allocate_within(
+        &self,
+        bytes: u64,
+        alignment: u64,
+        room: Option<u64>,
+    ) -> Result<Buffer, ExecutionError> {
+        Device::allocate_within(self, bytes, alignment, room)
+    }
+    fn held_beyond_allocations(&self) -> u64 {
+        self.held_beyond_ranges()
+    }
+    fn unallocated(&self) -> u64 {
+        self.blocks.unallocated_bytes()
     }
     fn write(&self, buffer: &Buffer, offset: u64, bytes: &[u8]) -> Result<(), ExecutionError> {
         let offset = usize::try_from(offset)
@@ -603,6 +649,37 @@ impl Submission {
                     ),
                     "device fill",
                 ),
+                // Each 32-bit half of every element: one strided pass per half,
+                // or a single pass when the halves agree.
+                FillValue::U64(pattern) => {
+                    let low = u32::from_le_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]);
+                    let high = u32::from_le_bytes([pattern[4], pattern[5], pattern[6], pattern[7]]);
+                    if low == high {
+                        driver.check(
+                            (driver.memset_d32_async)(
+                                pointer,
+                                low,
+                                count * 2,
+                                self.device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                    } else {
+                        [(0, low), (4, high)].into_iter().try_for_each(|(offset, half)| {
+                            driver.check(
+                                (driver.memset_d2d32_async)(
+                                    pointer + offset,
+                                    8,
+                                    half,
+                                    1,
+                                    count,
+                                    self.device.stream.raw(),
+                                ),
+                                "device fill",
+                            )
+                        })
+                    }
+                }
             }
             .map_err(submission_error)
         }
@@ -749,7 +826,7 @@ fn encode_symbol(value: SymbolValue) -> Result<u64, ExecutionError> {
         ))
     })
 }
-fn allocation_error(error: DriverError) -> ExecutionError {
+pub(crate) fn allocation_error(error: DriverError) -> ExecutionError {
     if error.is_device_loss() {
         ExecutionError::DeviceLost(error.to_string())
     } else {

@@ -30,8 +30,8 @@ pub(crate) use bindings::{
     BindingSelector, FrozenBindings,
 };
 use bindings::{
-    Bound, LoopConstruction, SegmentBound, SegmentTensor, SemanticBindings, TensorDefinition,
-    TensorDefinitionValue, TensorRealization,
+    Bound, LoopConstruction, Resolution, SegmentBound, SegmentTensor, SemanticBindings,
+    TensorDefinition, TensorDefinitionValue, TensorRealization,
 };
 use seismic_lang::failure::{SourceFailure, SourceFailureCause};
 use source_scalar::{SourceChecks, SourceStatuses};
@@ -97,6 +97,7 @@ pub(crate) fn construct_general<B: seismic_native_target::TargetFamily>(
 > {
     let mut calls = Vec::new();
     loop {
+        seismic_lang::cancellation::check();
         match state.advance(&mut context) {
             construction::ConstructionStep::Pending(next) => state = next,
             construction::ConstructionStep::Choice(mut next, choice) => {
@@ -111,9 +112,16 @@ pub(crate) fn construct_general<B: seismic_native_target::TargetFamily>(
                 state = next;
             }
             construction::ConstructionStep::Unresolved(_, reason) => {
+                if let crate::candidate_domain::ConstructionPending::Capacity(pending) = &reason {
+                    if pending.reason == capacity::CapacityReason::NativeQuantityUnrepresentable {
+                        return Err(crate::errors::PreparationError::TargetDomainUnrepresentable(
+                            format!("participant mathematical quantity {:?} cannot be certified for supported signed native arithmetic", pending.value),
+                        ));
+                    }
+                }
                 return Err(crate::errors::PreparationError::UnfinishedConstruction(
                     reason,
-                ))
+                ));
             }
             construction::ConstructionStep::Complete(candidate) => return Ok((candidate, calls)),
         }
@@ -843,7 +851,16 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 primitive,
                 inputs,
                 output,
-            } => self.lower_primitive(id, primitive, inputs, output),
+            } => match primitive {
+                PrimitiveId::QuantizedComponentRead { component, .. } => self
+                    .lower_element_read_component(
+                        inputs[0],
+                        &inputs[1..],
+                        output,
+                        Some(*component),
+                    ),
+                _ => self.lower_primitive(id, primitive, inputs, output),
+            },
             SemanticNodeView::Intrinsic {
                 intrinsic,
                 inputs,
@@ -1517,16 +1534,17 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             .map(|(axis, selection)| match selection {
                 SliceAxis::Full => Selection::Full,
                 SliceAxis::Point { value, .. } => Selection::Point(self.scalar_ref_nat(value)),
-                SliceAxis::Range { start, end, .. } => Selection::Range {
-                    start: start
+                SliceAxis::Range { start, end, .. } => {
+                    let start = start
                         .as_ref()
                         .map(|value| self.scalar_ref_nat(value))
-                        .unwrap_or_else(|| self.builder.arena().nat(0)),
-                    end: end
+                        .unwrap_or_else(|| self.builder.arena().nat(0));
+                    let end = end
                         .as_ref()
                         .map(|value| self.scalar_ref_nat(value))
-                        .unwrap_or(base.extents()[axis]),
-                },
+                        .unwrap_or(base.extents()[axis]);
+                    self.checked_range(start, end)
+                }
             })
             .collect();
         base.slice(selections, |end, start| {
@@ -1534,12 +1552,53 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         })
     }
 
+    /// A checked slice range `[start, end)`. The checker established
+    /// `0 <= start <= end` at every execution reaching the slice. Where that
+    /// order is not already an identity of the bounds' algebra (bounds read
+    /// from runtime words or slots), the reached start and length are
+    /// evaluated once into natural host quantities, so the slice's geometry
+    /// carries the established values rather than conversions whose
+    /// definedness would otherwise become an obligation over the invocation
+    /// domain, where runtime values are unknown.
+    fn checked_range(
+        &mut self,
+        start: NatExpr,
+        end: NatExpr,
+    ) -> seismic_ir::tensor_view::SliceAxis<NatExpr> {
+        use seismic_ir::tensor_view::SliceAxis as Selection;
+        let arena = self.builder.arena();
+        let length = arena.nat_sub(end, start);
+        let established = |arena: &mut ExprArena, value: NatExpr| {
+            let defined = arena.side_conditions(AnyExpr::Nat(value));
+            matches!(
+                arena.view(AnyExpr::Bool(defined)),
+                NodeView::BoolConst(true)
+            )
+        };
+        if established(arena, start) && established(arena, length) {
+            return Selection::Range { start, end };
+        }
+        let reached = |lowerer: &mut Self, value: NatExpr| {
+            let slot = lowerer.builder.portable_natural_slot();
+            lowerer.builder.schedule().evaluate_host(HostEvaluation {
+                value: HostValueExpr::Natural(value),
+                to: HostValueDestination::Quantity(slot),
+                failure: None,
+            });
+            lowerer.builder.arena().nat_symbol(slot.symbol())
+        };
+        let start = reached(self, start);
+        let length = reached(self, length);
+        let end = self.builder.arena().nat_add(start, length);
+        Selection::Range { start, end }
+    }
+
     fn scalar_ref_nat(&mut self, value: &ScalarRef) -> NatExpr {
         match value {
             ScalarRef::Static(value) => *value,
             ScalarRef::Value(value) => match self.prepared(&self.bound(*value)) {
                 PreparedArg::Index(value) => value,
-                PreparedArg::Integer(value) => self.builder.arena().nat_from_int(value),
+                PreparedArg::Integer(value) => quantity::natural(self.builder.arena(), value),
                 PreparedArg::Scalar(symbol, dtype) => {
                     // The checked slice continuation establishes nonnegative,
                     // in-range coordinates. Preserve the actual source word;
@@ -1573,6 +1632,15 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         indices: &[SemanticValueId],
         output: SemanticValueId,
     ) {
+        self.lower_element_read_component(place, indices, output, None)
+    }
+    fn lower_element_read_component(
+        &mut self,
+        place: SemanticValueId,
+        indices: &[SemanticValueId],
+        output: SemanticValueId,
+        component: Option<registry::QuantizedComponent>,
+    ) {
         let view = self.bound(place).tensor();
         let indices = indices
             .iter()
@@ -1591,7 +1659,10 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
                 portable_index(&mut kernel, value)
             })
             .collect::<Vec<_>>();
-        let value = kernel.tensor_read(&place, &indices);
+        let value = match component {
+            Some(role) => kernel.tensor_read_component(&place, &indices, role),
+            None => kernel.tensor_read(&place, &indices),
+        };
         let destination = kernel.result_slot(slot);
         kernel.store_slot(destination, value);
         let kernel = kernel.close();
@@ -2324,6 +2395,17 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             outer_captures
                 .push(self.segment_capture_plan(&bound, written_parameters.contains(parameter)));
         }
+        // Shapes and checked symbolic operations inside the body may name
+        // scalar values of the enclosing function (a callee's dimensions,
+        // for example) that are not region parameters. They enter the
+        // participant as arguments of their actual outer bindings.
+        let mut outer_values = Vec::new();
+        for value in region_outer_runtime_values(self.builder.arena(), self.function, body) {
+            if self.values.contains(value) {
+                let bound = self.bound(value);
+                outer_values.push((value, self.segment_capture_plan(&bound, false)));
+            }
+        }
         let function = self.function;
         let program = self.builder.portable_program_ref();
         let compiler_owned_base = self.mode != SemanticMode::AuthoredBackend;
@@ -2332,6 +2414,9 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
         let mut values = BTreeMap::new();
         for (parameter, capture) in capture_parameters.iter().zip(&outer_captures) {
             values.insert(*parameter, segment_capture(&mut kernel, capture));
+        }
+        for (value, capture) in &outer_values {
+            values.insert(*value, segment_capture(&mut kernel, capture));
         }
         let start_arg = kernel.nat_arg(start);
         let (global, logical_base) =
@@ -2367,6 +2452,7 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             alive,
             cohort: cohort.as_ref(),
             successful: uniformity::Values::new(),
+            quantity_bounds: BTreeMap::new(),
             lexical: registry::IntrinsicUniformity::Workgroup,
         };
         segment.initialize_successful_values(body);
@@ -2604,7 +2690,15 @@ impl<'f, 'b, B: seismic_native_target::TargetFamily> Lowerer<'f, 'b, B> {
             Bound::Tensor(TensorRealization::Computed(_)) => {
                 unreachable!("segment captures are materialized")
             }
-            Bound::Scalar(_) => SegmentCapture::Scalar(self.prepared(bound)),
+            // An exact quantity that is identically natural enters the
+            // participant as the index it is.
+            Bound::Scalar(_) => SegmentCapture::Scalar(match self.prepared(bound) {
+                PreparedArg::Integer(value) => match self.builder.arena().natural_integer(value) {
+                    Some(natural) => PreparedArg::Index(natural),
+                    None => PreparedArg::Integer(value),
+                },
+                prepared => prepared,
+            }),
             Bound::Range { start, end } => SegmentCapture::Range {
                 start: Box::new(self.segment_capture_plan(start, false)),
                 end: Box::new(self.segment_capture_plan(end, false)),
@@ -2633,6 +2727,7 @@ struct SegmentLowerer<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> {
     alive: PortableValue,
     cohort: Option<&'r cohort::Cohort>,
     successful: uniformity::Values,
+    quantity_bounds: BTreeMap<SemanticValueId, capacity::ShapeInterval>,
     lexical: registry::IntrinsicUniformity,
 }
 
@@ -2891,7 +2986,20 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                 output,
             } => {
                 let tensor = self.tensor(tensor);
-                let value = tensor.axes[axis as usize];
+                let extent = tensor.axes[axis as usize];
+                let value = match self.function.value(output).ty {
+                    // Internal mathematical extents have already passed the
+                    // participant's signed quantity admission. An authored
+                    // getter instead owns an intentional source-word cast.
+                    SemanticType::Integer => {
+                        self.kernel.cast(extent, ValueType::Scalar(DType::I32))
+                    }
+                    SemanticType::Index { .. } => extent,
+                    SemanticType::Scalar(dtype) if dtype.is_int() => {
+                        self.kernel.cast(extent, value_type(dtype))
+                    }
+                    _ => panic!("checked extent has no quantity or word publication"),
+                };
                 self.values.insert(output, SegmentBound::Scalar(value));
             }
             SemanticNodeView::TuplePack { inputs, output } => {
@@ -2947,6 +3055,21 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
         output: SemanticValueId,
     ) {
         match primitive {
+            PrimitiveId::QuantizedComponentRead { component, .. } => {
+                let tensor = self.physical_tensor(inputs[0]);
+                let indices = inputs[1..]
+                    .iter()
+                    .map(|value| {
+                        let value = self.scalar(*value);
+                        portable_index(self.kernel, value)
+                    })
+                    .collect::<Vec<_>>();
+                let value = self
+                    .kernel
+                    .tensor_read_component(&tensor, &indices, *component);
+                self.values.insert(output, SegmentBound::Scalar(value));
+            }
+
             PrimitiveId::RangeMake => {
                 self.values.insert(
                     output,
@@ -2979,6 +3102,11 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
                         _ => panic!("symbolic segment value has no scalar binding"),
                     },
                 );
+                let captured = if matches!(self.function.value(output).ty, SemanticType::Integer) {
+                    signed_quantity_capture(captured)
+                } else {
+                    captured
+                };
                 let mut value = lower_captured_expr(self.kernel, &captured);
                 if matches!(self.function.value(output).ty, SemanticType::Index { .. })
                     && value.ty() != ValueType::Index
@@ -2990,7 +3118,19 @@ impl<'s, 'k, 'f, 'r, B: seismic_native_target::TargetFamily> SegmentLowerer<'s, 
             _ => {
                 let arguments = inputs
                     .iter()
-                    .map(|value| self.scalar(*value))
+                    .map(|value| {
+                        let actual = self.scalar(*value);
+                        if matches!(self.function.value(output).ty, SemanticType::Integer)
+                            && !matches!(
+                                actual.ty(),
+                                ValueType::Bool | ValueType::Scalar(DType::Bool)
+                            )
+                        {
+                            self.kernel.cast(actual, ValueType::Scalar(DType::I32))
+                        } else {
+                            actual
+                        }
+                    })
                     .collect::<Vec<_>>();
                 let (value, successful) = source_scalar::lower(
                     self.kernel,
@@ -3348,6 +3488,66 @@ fn merge_exact<T: Copy + PartialEq>(slot: &mut Option<T>, value: Option<T>, what
     }
 }
 
+/// Scalar values of the enclosing function that the region's shapes and
+/// checked symbolic operations name by their runtime symbols, but that the
+/// region neither defines nor receives as a parameter.
+fn region_outer_runtime_values(
+    arena: &ExprArena,
+    function: &SemanticFunction,
+    region: RegionId,
+) -> BTreeSet<SemanticValueId> {
+    let mut regions = BTreeSet::new();
+    let mut pending = vec![region];
+    let mut symbolic = Vec::new();
+    while let Some(region) = pending.pop() {
+        regions.insert(region);
+        for (_, node) in function.nodes(region) {
+            match node.view() {
+                SemanticNodeView::If {
+                    then, otherwise, ..
+                } => pending.extend([then, otherwise]),
+                SemanticNodeView::Loop { body, .. } => pending.push(body),
+                SemanticNodeView::Primitive {
+                    primitive: PrimitiveId::Symbolic(expression),
+                    ..
+                }
+                | SemanticNodeView::Elementwise {
+                    primitive: PrimitiveId::Symbolic(expression),
+                    ..
+                } => symbolic.push(AnyExpr::Int(*expression)),
+                _ => {}
+            }
+        }
+    }
+    let inside = |value: &seismic_lang::entry::ValueInfo| match value.origin {
+        ValueOrigin::Node(node) => regions.contains(&node.region()),
+        ValueOrigin::RegionParameter(region) => regions.contains(&region),
+        ValueOrigin::Parameter => false,
+    };
+    let mut referenced = BTreeSet::new();
+    let mut name = |expression: AnyExpr| {
+        for symbol in arena.free_symbols(expression) {
+            if let SymbolKind::RuntimeValue(value) = arena.symbol_kind(symbol) {
+                referenced.insert(value);
+            }
+        }
+    };
+    for expression in symbolic {
+        name(expression);
+    }
+    for (_, value) in function.values().filter(|(_, value)| inside(value)) {
+        if let SemanticType::Tensor(tensor) = &value.ty {
+            for axis in &tensor.axes {
+                name(AnyExpr::Nat(*axis));
+            }
+        }
+    }
+    referenced
+        .into_iter()
+        .filter(|value| value.function() == function.id() && !inside(function.value(*value)))
+        .collect()
+}
+
 fn segment_capture<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     bound: &SegmentCapture,
@@ -3646,6 +3846,7 @@ fn zero_of<B: seismic_native_target::TargetFamily>(
         ValueType::Scalar(DType::F32) => kernel.constant(ConstantValue::F32(0.0), ty),
         ValueType::Scalar(DType::I32) => kernel.constant(ConstantValue::I32(0), ty),
         ValueType::Scalar(DType::U32) => kernel.constant(ConstantValue::U32(0), ty),
+        ValueType::Scalar(DType::U64) => kernel.constant(ConstantValue::U64(0), ty),
         ValueType::Scalar(DType::Bool) => kernel.constant(ConstantValue::Bool(false), ty),
         ValueType::Bool => kernel.constant(ConstantValue::Bool(false), ty),
         ValueType::Index => kernel.index_constant(0),
@@ -3669,6 +3870,7 @@ fn one_of<B: seismic_native_target::TargetFamily>(
         }
         ValueType::Scalar(DType::I32) => kernel.constant(ConstantValue::I32(1), ty),
         ValueType::Scalar(DType::U32) => kernel.constant(ConstantValue::U32(1), ty),
+        ValueType::Scalar(DType::U64) => kernel.constant(ConstantValue::U64(1), ty),
         ValueType::Scalar(DType::Bool) => kernel.constant(ConstantValue::Bool(true), ty),
         ValueType::Index => kernel.index_constant(1),
         ValueType::Bool | ValueType::Vector { .. } | ValueType::Opaque { .. } => {
@@ -3691,17 +3893,10 @@ fn portable_index<B: seismic_native_target::TargetFamily>(
 fn scalar_bits<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     dtype: DType,
-    bits: u32,
+    bits: u64,
 ) -> PortableValue {
     let ty = value_type(dtype);
-    let value = match dtype {
-        DType::F32 => ConstantValue::F32(f32::from_bits(bits)),
-        DType::F16 => ConstantValue::F16(bits as u16),
-        DType::BF16 => ConstantValue::BF16(bits as u16),
-        DType::I32 => ConstantValue::I32(bits as i32),
-        DType::U32 => ConstantValue::U32(bits),
-        DType::Bool => ConstantValue::Bool(bits != 0),
-    };
+    let value = ConstantValue::from_scalar(ReferenceScalar::from_bits(dtype, bits));
     kernel.constant(value, ty)
 }
 
@@ -3761,6 +3956,7 @@ fn lower_scalar_primitive<B: seismic_native_target::TargetFamily>(
                 value_type(*dtype)
             },
         ),
+        PrimitiveId::Bitcast(dtype) => kernel.bitcast(args[0], value_type(*dtype)),
         PrimitiveId::Math(op) => match op {
             MathOp::Fma => kernel.fma(args[0], args[1], args[2]),
             MathOp::Max => kernel.binary(BinaryOp::Max, args[0], args[1]),
@@ -3786,6 +3982,16 @@ fn lower_constant<B: seismic_native_target::TargetFamily>(
             );
             kernel.constant(ConstantValue::from_scalar(value), value_type(*dtype))
         }
+        SemanticType::Integer => {
+            let value = match value {
+                ReferenceScalar::I32(value) => value,
+                ReferenceScalar::U32(value) => {
+                    i32::try_from(value).expect("admitted native signed quantity")
+                }
+                _ => panic!("quantity constant is not integer"),
+            };
+            kernel.constant(ConstantValue::I32(value), ValueType::Scalar(DType::I32))
+        }
         SemanticType::Index { .. } => {
             let value = match value {
                 ReferenceScalar::I32(value) => {
@@ -3805,12 +4011,13 @@ enum CapturedExpr {
     Nat(u64),
     Int(i64),
     Bool(bool),
-    Scalar(DType, u32),
+    Scalar(DType, u64),
     NatArgument(NatExpr),
     ScalarArgument(seismic_lang::expr::SymbolId, DType),
     Value(PortableValue),
     Binder(LoopBinderId),
     Unary(ExprUnary, Box<CapturedExpr>),
+    SignedQuantity(Box<CapturedExpr>),
     Binary(ExprBinary, Box<CapturedExpr>, Box<CapturedExpr>),
     Nary(NaryOp, Vec<CapturedExpr>),
     Select(Box<CapturedExpr>, Box<CapturedExpr>, Box<CapturedExpr>),
@@ -3857,7 +4064,9 @@ fn capture_expr_with(
         NodeView::BoolConst(v) => CapturedExpr::Bool(v),
         NodeView::ScalarConst { dtype, bits } => CapturedExpr::Scalar(dtype, bits),
         NodeView::ScalarInteger { .. } => {
-            panic!("source word projection must resolve to its actual bound result before physical expression construction")
+            panic!(
+                "source word projection must resolve to its actual bound result before physical expression construction"
+            )
         }
         NodeView::Symbol(symbol) => match arena.symbol_kind(symbol) {
             SymbolKind::RuntimeValue(value) => runtime(arena, value),
@@ -3929,9 +4138,55 @@ fn capture_expr_with(
     }
 }
 
-/// Select the native natural representation only after the defining source
-/// result has proved every evaluated quantity intermediate lies in the Index
-/// domain. In particular, an `Int` literal is not inherently an I32 word.
+/// Apply signed storage only to a participant mathematical expression whose
+/// complete evaluated arithmetic has already passed quantity admission.
+fn signed_quantity_capture(expression: CapturedExpr) -> CapturedExpr {
+    match expression {
+        CapturedExpr::Nat(value) => {
+            CapturedExpr::Int(i64::try_from(value).expect("admitted native signed quantity"))
+        }
+        CapturedExpr::Value(value)
+            if matches!(value.ty(), ValueType::Bool | ValueType::Scalar(DType::Bool)) =>
+        {
+            CapturedExpr::Value(value)
+        }
+        value @ (CapturedExpr::Value(_)
+        | CapturedExpr::NatArgument(_)
+        | CapturedExpr::Binder(_)
+        | CapturedExpr::ScalarArgument(_, DType::U32)
+        | CapturedExpr::Scalar(DType::U32, _)) => CapturedExpr::SignedQuantity(Box::new(value)),
+        CapturedExpr::Unary(ExprUnary::IntFromScalar, value) => CapturedExpr::SignedQuantity(value),
+        CapturedExpr::Unary(op, value) => {
+            CapturedExpr::Unary(op, Box::new(signed_quantity_capture(*value)))
+        }
+        CapturedExpr::Binary(op, a, b) => CapturedExpr::Binary(
+            op,
+            Box::new(signed_quantity_capture(*a)),
+            Box::new(signed_quantity_capture(*b)),
+        ),
+        CapturedExpr::Nary(op, values) => CapturedExpr::Nary(
+            op,
+            values.into_iter().map(signed_quantity_capture).collect(),
+        ),
+        CapturedExpr::Select(c, a, b) => CapturedExpr::Select(
+            Box::new(signed_quantity_capture(*c)),
+            Box::new(signed_quantity_capture(*a)),
+            Box::new(signed_quantity_capture(*b)),
+        ),
+        CapturedExpr::Cmp(op, a, b) => CapturedExpr::Cmp(
+            op,
+            Box::new(signed_quantity_capture(*a)),
+            Box::new(signed_quantity_capture(*b)),
+        ),
+        CapturedExpr::In(value, members) => {
+            CapturedExpr::In(Box::new(signed_quantity_capture(*value)), members)
+        }
+        other => other,
+    }
+}
+
+/// Select native natural representation only after the defining source result
+/// proves every evaluated intermediate lies in the Index domain.
 fn native_natural_expr(expression: CapturedExpr) -> Option<CapturedExpr> {
     Some(match expression {
         CapturedExpr::Int(value) => CapturedExpr::Nat(u64::try_from(value).ok()?),
@@ -3975,6 +4230,7 @@ fn native_natural_expr(expression: CapturedExpr) -> Option<CapturedExpr> {
         CapturedExpr::Scalar(..)
         | CapturedExpr::ScalarArgument(..)
         | CapturedExpr::Value(_)
+        | CapturedExpr::SignedQuantity(_)
         | CapturedExpr::Fold { .. } => return None,
     })
 }
@@ -4006,9 +4262,9 @@ fn captured_uniformity<B: seismic_native_target::TargetFamily>(
         CapturedExpr::Binder(binder) => *binders
             .get(binder)
             .expect("symbolic fold uniformity requires its lexical binder"),
-        CapturedExpr::Unary(_, value) | CapturedExpr::In(value, _) => {
-            captured_uniformity(kernel, value, binders)
-        }
+        CapturedExpr::Unary(_, value)
+        | CapturedExpr::SignedQuantity(value)
+        | CapturedExpr::In(value, _) => captured_uniformity(kernel, value, binders),
         CapturedExpr::Binary(_, a, b) | CapturedExpr::Cmp(_, a, b) => uniformity::join(
             captured_uniformity(kernel, a, binders),
             captured_uniformity(kernel, b, binders),
@@ -4065,6 +4321,10 @@ fn lower_captured_expr_with<B: seismic_native_target::TargetFamily>(
         CapturedExpr::Binder(binder) => *binders
             .get(binder)
             .expect("symbolic fold body references a binder outside its lexical fold"),
+        CapturedExpr::SignedQuantity(value) => {
+            let value = lower_captured_expr_with(kernel, value, binders);
+            kernel.cast(value, ValueType::Scalar(DType::I32))
+        }
         CapturedExpr::Unary(op, a) => {
             let a = lower_captured_expr_with(kernel, a, binders);
             match op {

@@ -293,9 +293,10 @@ pub(crate) fn expression_detail(arena: &ExprArena, expression: AnyExpr, depth: u
             "{operation:?}({})",
             operands
                 .iter()
-                .map(|(dtype, value)| format!(
-                    "{dtype:?}:{}",
-                    expression_detail(arena, (*value).into(), depth - 1)
+                .map(|operand| format!(
+                    "{:?}:{}",
+                    operand.dtype(arena),
+                    expression_detail(arena, operand.expression(), depth - 1)
                 ))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -462,15 +463,15 @@ pub(crate) fn validate_universal_implementation<B: seismic_native_target::Target
                 .join(",")
         };
         return Err(crate::errors::PreparationError::UniversalClosure(format!(
-                "post-native legality is not constructionally total over TargetDomain (target={:?} target_symbols=[{}], semantic={:?}, hard={:?} hard_detail={} hard_symbols=[{}], implication={:?})",
-                arena.view(AnyExpr::Bool(target_domain)),
-                symbol_summary(target_domain),
-                arena.view(AnyExpr::Bool(semantic_coverage)),
-                arena.view(AnyExpr::Bool(hard_constraints)),
-                expression_detail(arena, AnyExpr::Bool(hard_constraints), 8),
-                symbol_summary(hard_constraints),
-                arena.view(AnyExpr::Bool(total)),
-            )));
+            "post-native legality is not constructionally total over TargetDomain (target={:?} target_symbols=[{}], semantic={:?}, hard={:?} hard_detail={} hard_symbols=[{}], implication={:?})",
+            arena.view(AnyExpr::Bool(target_domain)),
+            symbol_summary(target_domain),
+            arena.view(AnyExpr::Bool(semantic_coverage)),
+            arena.view(AnyExpr::Bool(hard_constraints)),
+            expression_detail(arena, AnyExpr::Bool(hard_constraints), 8),
+            symbol_summary(hard_constraints),
+            arena.view(AnyExpr::Bool(total)),
+        )));
     }
     Ok(())
 }
@@ -1029,6 +1030,14 @@ impl<'a, B: seismic_native_target::TargetFamily> ImplementationBuilder<'a, B> {
     }
     pub(crate) fn portable_publish(&mut self, value: SemanticValueId) -> ScalarPublication {
         self.inner.portable_publish(value)
+    }
+    /// A fresh natural host quantity slot of this construction.
+    pub(crate) fn portable_natural_slot(&mut self) -> seismic_ir::schedule::HostQuantitySlot {
+        self.inner
+            .state
+            .construction
+            .schedule_state()
+            .quantity_slot(self.inner.arena, HostQuantityKind::Natural)
     }
     pub(crate) fn portable_affine_view(
         &mut self,
@@ -2856,6 +2865,9 @@ mod internals {
                         SymbolSort::Scalar(DType::U32) => AnyExpr::from(
                             self.arena.scalar_symbol::<seismic_lang::expr::U32>(*symbol),
                         ),
+                        SymbolSort::Scalar(DType::U64) => AnyExpr::from(
+                            self.arena.scalar_symbol::<seismic_lang::expr::U64>(*symbol),
+                        ),
                         SymbolSort::Scalar(DType::Bool) => AnyExpr::from(
                             self.arena
                                 .scalar_symbol::<seismic_lang::expr::BoolScalar>(*symbol),
@@ -2969,6 +2981,9 @@ mod internals {
                                     .into(),
                                 DType::U32 => arena
                                     .scalar_symbol::<seismic_lang::expr::U32>(symbol)
+                                    .into(),
+                                DType::U64 => arena
+                                    .scalar_symbol::<seismic_lang::expr::U64>(symbol)
                                     .into(),
                                 DType::Bool => arena
                                     .scalar_symbol::<seismic_lang::expr::BoolScalar>(symbol)
@@ -3448,6 +3463,10 @@ mod internals {
                                 digest.bytes(b"u32");
                                 digest.hashed(value)
                             }
+                            seismic_ir::kernel::ops::ConstantValue::U64(value) => {
+                                digest.bytes(b"u64");
+                                digest.hashed(value)
+                            }
                             seismic_ir::kernel::ops::ConstantValue::Bool(value) => {
                                 digest.bytes(b"bool");
                                 digest.hashed(value)
@@ -3648,6 +3667,18 @@ mod internals {
                         place(digest, *source);
                         digest.hashed(plane);
                         digest.hashed(field);
+                        values(digest, index);
+                    }
+                    Op::ReadPlaneLane {
+                        out,
+                        place: source,
+                        plane,
+                        index,
+                    } => {
+                        digest.bytes(b"read-plane-lane");
+                        value(digest, *out);
+                        place(digest, *source);
+                        digest.hashed(plane);
                         values(digest, index);
                     }
                     Op::ReadPlane {

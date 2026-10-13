@@ -1,6 +1,6 @@
 use super::super::*;
 use super::*;
-use crate::HeadProjection;
+use crate::ReadoutHead;
 
 impl<'a> QualificationView<'a> {
     pub(super) fn qualify_head(&self, device: &Device) -> Result<(), CatalogFailure> {
@@ -8,10 +8,7 @@ impl<'a> QualificationView<'a> {
         let (Some(head_plan), Some(head)) = (self.plan.head(), self.programs.head.as_ref()) else {
             return Ok(());
         };
-        let (hidden, vocabulary) = (
-            self.geometry.hidden,
-            self.geometry.vocabulary,
-        );
+        let (hidden, vocabulary) = (self.geometry.hidden, self.geometry.vocabulary);
         for (index, (&binding, block)) in head_plan.blocks().iter().zip(&head.blocks).enumerate() {
             let label = format!("{binding:?}");
             // The head block's feed-forward sublayer.
@@ -24,6 +21,7 @@ impl<'a> QualificationView<'a> {
             );
             // One (token, status) selection row.
             let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
+            let direct = semantic_zeros(device, Element::i32(), &[0, 1], "head", &label)?;
             let table = semantic_pattern(
                 device,
                 binding.embedding_table,
@@ -31,13 +29,15 @@ impl<'a> QualificationView<'a> {
                 "head",
                 &label,
             )?;
-            let pattern = (0..hidden)
+            let streams = binding.streams.map_or(1, |s| s.geometry.streams);
+            let form = SublayerRows { form: crate::operators::InputForm { parts: streams, normalized: binding.streams.is_none() }, streams, injected: binding.streams.is_some() };
+            let pattern = (0..hidden * streams)
                 .map(|column| [1.0_f32, -2.0, 3.0, -4.0][column as usize % 4])
                 .collect::<Vec<_>>();
             let conditioning = semantic_dense_values(
                 device,
-                binding.activation,
-                &[1, hidden],
+                binding.conditioning,
+                &[1, hidden * streams],
                 &pattern,
                 "head",
                 &label,
@@ -45,7 +45,7 @@ impl<'a> QualificationView<'a> {
             let embedding_norm =
                 semantic_ones(device, binding.embedding_norm, &[hidden], "head", &label)?;
             let hidden_norm =
-                semantic_ones(device, binding.hidden_norm, &[hidden], "head", &label)?;
+                semantic_ones(device, binding.hidden_norm, &[hidden * streams], "head", &label)?;
             let combine = semantic_pattern(
                 device,
                 binding.combine,
@@ -57,6 +57,7 @@ impl<'a> QualificationView<'a> {
                 .input
                 .call(draft_rows::Args {
                     tokens: &tokens,
+                    directory: &direct,
                     table: &table,
                     conditioning: &conditioning,
                     embedding_norm: &embedding_norm,
@@ -66,7 +67,13 @@ impl<'a> QualificationView<'a> {
                 })
                 .map_err(|error| qualification_dynamic("draft_rows", &label, error))?
                 .value;
-            qualify_attention(device, &block.attention, binding.attention, &label)?;
+            qualify_attention(
+                device,
+                &block.attention,
+                binding.attention,
+                form,
+                &label,
+            )?;
             // The attention block keeps its residual (zero weights), so the
             // feed-forward stage continues from the head input.
             let attended = features;
@@ -112,6 +119,20 @@ impl<'a> QualificationView<'a> {
                             activation: 0,
                             gate_scale: &absent_scale,
                             up_scale: &absent_scale,
+                            gate_bound: &any_row_bound(
+                                device,
+                                &kernels.expand,
+                                "GB",
+                                "dense_expand",
+                                &label,
+                            )?,
+                            up_bound: &any_row_bound(
+                                device,
+                                &kernels.expand,
+                                "UB",
+                                "dense_expand",
+                                &label,
+                            )?,
                         })
                         .map_err(|error| qualification_dynamic("dense_expand", &label, error))?
                         .value;
@@ -129,12 +150,19 @@ impl<'a> QualificationView<'a> {
                             down_weight: &down,
                             out_rows: &out_rows,
                             down_scale: &absent_scale,
+                            down_bound: &any_row_bound(
+                                device,
+                                output,
+                                "DB",
+                                "dense_output",
+                                &label,
+                            )?,
                         })
                         .map_err(|error| qualification_dynamic("dense_output", &label, error))?
                         .value
                 }
                 (FeedForwardProgramSlot::Routed(binding), AttestedFeedForward::Routed(kernels)) => {
-                    super::target::qualify_routed(device, binding, kernels)?;
+                    super::target::qualify_routed(device, binding, kernels, form)?;
                     attended
                 }
                 _ => {
@@ -142,39 +170,37 @@ impl<'a> QualificationView<'a> {
                         "head",
                         &label,
                         "feed-forward binding and attestation disagree",
-                    ))
+                    ));
                 }
             };
             require_finite_nonzero_f32(&advanced, "head_feed_forward", &label)?;
             let output_norm =
-                semantic_ones(device, binding.output_norm, &[hidden], "head", &label)?;
+                semantic_ones(device, binding.output_norm, &[if binding.streams.is_some() { 0 } else { hidden }], "head", &label)?;
+            let parts = readout_parts(
+                &advanced,
+                block.features.specialization().statics(),
+                "readout_features_rows",
+                &label,
+            )?;
             let projected_features = block
                 .features
                 .call(readout_features_rows::Args {
-                    hidden: &advanced,
+                    hidden: &parts,
                     norm: &output_norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,
                 })
                 .map_err(|error| qualification_dynamic("readout_features_rows", &label, error))?
                 .value;
-            match (&block.logits, binding.projection) {
-                (HeadLogitsKernels::Packed(kernel), HeadProjection::Packed(element)) => {
-                    let projection =
-                        semantic_pattern(device, element, &[vocabulary, hidden], "head", &label)?;
-                    let logits = kernel
-                        .call(head_logits_rows::Args {
-                            features: &projected_features,
-                            weight: &projection,
-                        })
-                        .map_err(|error| qualification_dynamic("head_logits_rows", &label, error))?
-                        .value;
-                    require_finite_nonzero_f32(&logits, "head_logits_rows", &label)?;
-                }
-                (HeadLogitsKernels::Progressive(kernels), HeadProjection::Progressive) => {
+            let logits = match &block.logits {
+                ProjectionKernels::Qualified {
+                    packed,
+                    progressive,
+                    ..
+                } => {
                     super::target::qualify_progressive(
                         device,
-                        kernels,
+                        progressive,
                         &advanced,
                         &output_norm,
                         &out_rows,
@@ -182,13 +208,58 @@ impl<'a> QualificationView<'a> {
                         "head",
                         &label,
                     )?;
+                    packed.as_ref()
+                }
+                logits => logits,
+            };
+            match (logits, binding.projection) {
+                (
+                    ProjectionKernels::PreparedPacked(kernel),
+                    ReadoutHead::Packed {
+                        weight: element,
+                        weight_scale,
+                    }
+                    | ReadoutHead::Qualified {
+                        weight: element,
+                        weight_scale,
+                    },
+                ) => {
+                    let projection =
+                        semantic_pattern(device, element, &[vocabulary, hidden], "head", &label)?;
+                    let token_rows = semantic_zeros(
+                        device,
+                        Element::i32(),
+                        &[out_rows.extents()[0], 0, vocabulary],
+                        "head",
+                        &label,
+                    )?;
+                    let scale = semantic_ones(
+                        device,
+                        Element::f32(),
+                        &[u64::from(weight_scale)],
+                        "head",
+                        &label,
+                    )?;
+                    let logits = kernel
+                        .call(readout_project_rows::Args {
+                            features: &projected_features,
+                            weight: &projection,
+                            token_rows: &token_rows,
+                            weight_scale: &scale,
+                            softcap: 0.0,
+                        })
+                        .map_err(|error| {
+                            qualification_dynamic("readout_project_rows", &label, error)
+                        })?
+                        .value;
+                    require_finite_nonzero_f32(&logits, "readout_project_rows", &label)?;
                 }
                 _ => {
                     return Err(qualification_dynamic(
                         "head",
                         &label,
                         "the prepared projection differs from the planned projection",
-                    ))
+                    ));
                 }
             }
         }

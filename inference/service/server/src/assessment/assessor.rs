@@ -275,12 +275,7 @@ pub(crate) fn engine_material(
                     SpeculativeMethod::DFlash => ModelMethod::DFlash,
                     SpeculativeMethod::DFlash2 => ModelMethod::DFlash2,
                     SpeculativeMethod::DSpark => ModelMethod::DSpark,
-                    SpeculativeMethod::Mtp => {
-                        return Err(InventoryError::InvalidRequest(
-                            "MTP drafts with the target's own head, not a separate draft"
-                                .to_owned(),
-                        ));
-                    }
+                    SpeculativeMethod::Mtp => ModelMethod::Mtp,
                 };
                 (method, Some(draft_weights(draft)?))
             }
@@ -613,6 +608,7 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
         InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
         InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
         InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
+        InventoryError::DoesNotFit(_) => ("model_does_not_fit".to_owned(), false),
         InventoryError::Io(_) => ("io_failed".to_owned(), true),
         InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
         InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),
@@ -743,6 +739,7 @@ mod tests {
             (SpeculativeMethod::DFlash, ModelMethod::DFlash),
             (SpeculativeMethod::DFlash2, ModelMethod::DFlash2),
             (SpeculativeMethod::DSpark, ModelMethod::DSpark),
+            (SpeculativeMethod::Mtp, ModelMethod::Mtp),
         ] {
             let material = engine_material(&speculative(true, method)).unwrap();
             assert_eq!(material.target, PathBuf::from("/models/target.gguf"));
@@ -755,7 +752,6 @@ mod tests {
             (false, SpeculativeMethod::DFlash),
             (false, SpeculativeMethod::DFlash2),
             (false, SpeculativeMethod::DSpark),
-            (true, SpeculativeMethod::Mtp),
         ] {
             assert!(matches!(
                 engine_material(&speculative(draft, method)),

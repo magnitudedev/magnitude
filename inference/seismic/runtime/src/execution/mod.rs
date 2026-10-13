@@ -487,6 +487,7 @@ fn scalar_result(
         (seismic_lang::types::DType::BF16, Some(SymbolValue::BF16(v))) => ArgumentValue::BF16(v),
         (seismic_lang::types::DType::I32, Some(SymbolValue::I32(v))) => ArgumentValue::I32(v),
         (seismic_lang::types::DType::U32, Some(SymbolValue::U32(v))) => ArgumentValue::U32(v),
+        (seismic_lang::types::DType::U64, Some(SymbolValue::U64(v))) => ArgumentValue::U64(v),
         (seismic_lang::types::DType::Bool, Some(SymbolValue::Bool(v))) => ArgumentValue::Bool(v),
         _ => panic!("closed scalar result slot has the wrong scalar sort"),
     }
