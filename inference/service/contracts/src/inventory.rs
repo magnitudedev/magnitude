@@ -842,6 +842,9 @@ pub enum InventoryError {
     DeletionUnsafe(String),
     #[error("model source does not support this operation: {0}")]
     Unsupported(String),
+    /// The model's assessment says it cannot fit this machine's memory.
+    #[error("{0}")]
+    DoesNotFit(String),
     #[error("inventory I/O failed: {0}")]
     Io(String),
     #[error("upstream model service failed: {0}")]

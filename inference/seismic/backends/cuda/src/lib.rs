@@ -10,6 +10,8 @@ pub mod direct;
 mod driver;
 mod executor;
 pub mod model;
+#[cfg(not(target_os = "windows"))]
+mod nvml;
 pub mod nvrtc;
 mod open;
 mod profile;

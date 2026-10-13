@@ -23,9 +23,11 @@ use magnitude_engine::worker::protocol::{LoadProgress, MemoryObservation};
 use magnitude_executor::platform::{DeviceRequest, MemoryReserves};
 use magnitude_service_contracts::models::{
     CatalogModelOptimizer, CatalogOptimizationProgress, CatalogPackageRemover,
-    InstalledModelPackages as _, MemoryShortage, ModelId, ModelInstance, ModelInstanceId,
+    InstalledModelPackages as _, MemoryShortage, ModelAssessment, ModelAssessmentDomainSnapshot,
+    ModelAssessmentEntryState, ModelAssessments, ModelAssessmentsSnapshot, ModelId, ModelInstance,
+    ModelInstanceId,
     ModelInstancesInvalidation, ModelInstancesSnapshot, ModelLoadDevice, ModelLoadPlan,
-    ModelLoadStage, ModelPackageId, ModelServingConfiguration,
+    ModelLoadStage, ModelPackageId, ModelServingConfiguration, ServingProfile,
 };
 use magnitude_service_contracts::{HardwareDeviceId, InventoryError};
 use magnitude_service_models::{
@@ -96,6 +98,9 @@ pub struct ModelInstances {
     residency: ResidencyClient<ResidentEngine>,
     supervisor: MemorySupervisor,
     preparations: PreparationJobs,
+    /// The assessment pool whose verdicts admit loads. It is built from these instances, so it
+    /// is attached once both exist.
+    assessments: Arc<std::sync::OnceLock<Arc<dyn ModelAssessments>>>,
 }
 
 impl ModelInstances {
@@ -125,6 +130,25 @@ impl ModelInstances {
             residency: client,
             supervisor,
             preparations,
+            assessments: Arc::default(),
+        }
+    }
+
+    /// Admit loads by `assessments`' verdicts from now on.
+    pub fn attach_assessments(&self, assessments: Arc<dyn ModelAssessments>) {
+        let _ = self.assessments.set(assessments);
+    }
+
+    /// Refuse a load the assessment says cannot fit, before the residency replaces anything.
+    /// A model not yet assessed is admitted: the engine's own resource plan still guards it.
+    async fn admit(&self, target: &ResolvedResidencyTarget) -> Result<(), InventoryError> {
+        let Some(assessments) = self.assessments.get() else {
+            return Ok(());
+        };
+        let snapshot = assessments.snapshot().await?;
+        match assessed_fit(&snapshot, &target.model_id, &target.configuration.profile) {
+            Some(refusal) => Err(refusal),
+            None => Ok(()),
         }
     }
 
@@ -149,9 +173,11 @@ impl ModelInstances {
 
     /// Make `model_id` resident without leasing it.
     pub async fn ensure_resident(&self, model_id: &str) -> Result<ModelInstance, InventoryError> {
+        let target = self.target(model_id)?;
+        self.admit(&target).await?;
         match self
             .residency
-            .acquire(self.target(model_id)?, ResidencyAcquisition::Warm)
+            .acquire(target, ResidencyAcquisition::Warm)
             .await?
         {
             ResidencyGrant::Ready(instance) => Ok(instance),
@@ -165,10 +191,12 @@ impl ModelInstances {
         model_id: &str,
         progress: Option<LoadingObserver>,
     ) -> Result<ResidencyLease<ResidentEngine>, InventoryError> {
+        let target = self.target(model_id)?;
+        self.admit(&target).await?;
         match self
             .residency
             .acquire(
-                self.target(model_id)?,
+                target,
                 ResidencyAcquisition::Inference { progress },
             )
             .await?
@@ -302,6 +330,49 @@ impl CatalogPackageRemover for ModelInstances {
             drop(permits);
             Ok(reclaimed_bytes)
         })
+    }
+}
+
+/// The refusal for `model_id` served at `profile` when its assessment does not fit.
+fn assessed_fit(
+    snapshot: &ModelAssessmentsSnapshot,
+    model_id: &ModelId,
+    profile: &ServingProfile,
+) -> Option<InventoryError> {
+    [&snapshot.catalog, &snapshot.discovered]
+        .into_iter()
+        .flat_map(|domain| match domain {
+            ModelAssessmentDomainSnapshot::Available { entries, .. } => entries.as_slice(),
+            ModelAssessmentDomainSnapshot::Pending { .. } => &[],
+        })
+        .filter(|entry| entry.subject.model_id() == model_id)
+        .filter_map(|entry| match &entry.state {
+            ModelAssessmentEntryState::Assessed { profiles, .. } => Some(profiles),
+            _ => None,
+        })
+        .flatten()
+        .find_map(|assessment| match assessment {
+            ModelAssessment::DoesNotFit {
+                profile: assessed,
+                deficit_bytes,
+                ..
+            } if assessed == profile => Some(InventoryError::DoesNotFit(format!(
+                "{model_id} needs {} more memory than this computer can provide",
+                memory_size(*deficit_bytes)
+            ))),
+            _ => None,
+        })
+}
+
+/// `bytes` as the clients show a shortfall: binary units from MB, one decimal, rounded up.
+fn memory_size(bytes: u64) -> String {
+    const MEBIBYTE: f64 = 1024.0 * 1024.0;
+    let tenths = |amount: f64| (amount * 10.0).ceil() / 10.0;
+    let megabytes = tenths(bytes as f64 / MEBIBYTE);
+    if megabytes < 1024.0 {
+        format!("{megabytes:.1} MB")
+    } else {
+        format!("{:.1} GB", tenths(bytes as f64 / (MEBIBYTE * 1024.0)))
     }
 }
 
@@ -795,6 +866,90 @@ impl From<ModelOperationFailure> for InventoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MODEL: &str = "qwen3.5-4b:gguf:q4";
+
+    fn snapshot(model: &str, assessment: serde_json::Value) -> ModelAssessmentsSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "environmentId": "environment",
+            "catalog": {
+                "_tag": "Available",
+                "sourceRevision": 1,
+                "entries": [{
+                    "subject": { "_tag": "Catalog", "modelId": model, "selection": "Effective" },
+                    "state": {
+                        "_tag": "Assessed",
+                        "capabilities": {
+                            "vision": false, "tools": true, "structuredOutput": true,
+                            "reasoning": { "supported": false, "efforts": [] },
+                        },
+                        "templateFingerprint": "template",
+                        "profiles": [assessment],
+                    },
+                }],
+            },
+            "discovered": { "_tag": "Pending", "sourceRevision": 0 },
+        }))
+        .expect("assessment snapshot")
+    }
+
+    fn does_not_fit(context_length: u32, deficit_bytes: u64) -> serde_json::Value {
+        serde_json::json!({
+            "_tag": "DoesNotFit",
+            "profile": { "contextLength": context_length },
+            "assessmentId": "assessment",
+            "memory": [],
+            "limitingResource": "gpu",
+            "deficitBytes": deficit_bytes,
+        })
+    }
+
+    fn model_id(model: &str) -> ModelId {
+        model.parse().expect("model id")
+    }
+
+    #[test]
+    fn a_load_assessed_as_not_fitting_is_refused_with_the_shortfall() {
+        let snapshot = snapshot(MODEL, does_not_fit(262_144, 1_825_361_000));
+        let refusal = assessed_fit(
+            &snapshot,
+            &model_id(MODEL),
+            &ServingProfile { context_length: 262_144 },
+        );
+        let Some(InventoryError::DoesNotFit(message)) = refusal else {
+            panic!("expected a does-not-fit refusal, got {refusal:?}");
+        };
+        assert_eq!(
+            message,
+            format!("{MODEL} needs 1.7 GB more memory than this computer can provide")
+        );
+    }
+
+    #[test]
+    fn fitting_unassessed_or_other_profile_loads_are_admitted() {
+        let fits = serde_json::json!({
+            "_tag": "Fits",
+            "profile": { "contextLength": 262_144 },
+            "assessmentId": "assessment",
+            "memory": [],
+            "performance": [],
+        });
+        let profile = ServingProfile { context_length: 262_144 };
+        assert!(assessed_fit(&snapshot(MODEL, fits), &model_id(MODEL), &profile).is_none());
+        let other_profile = snapshot(MODEL, does_not_fit(131_072, 1));
+        assert!(assessed_fit(&other_profile, &model_id(MODEL), &profile).is_none());
+        let other_model = snapshot("other:gguf:q4", does_not_fit(262_144, 1));
+        assert!(assessed_fit(&other_model, &model_id(MODEL), &profile).is_none());
+    }
+
+    #[test]
+    fn shortfalls_read_as_the_clients_show_them() {
+        assert_eq!(memory_size(1_000), "0.1 MB");
+        assert_eq!(memory_size(359_000_000), "342.4 MB");
+        assert_eq!(memory_size(1_825_361_000), "1.7 GB");
+        assert_eq!(memory_size(3_758_096_384), "3.5 GB");
+    }
 
     fn weights(completed_bytes: u64, total_bytes: u64) -> LoadProgress {
         LoadProgress::ImportingWeights {

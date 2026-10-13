@@ -15,8 +15,9 @@ mod host;
 pub use crate::memory::MemoryUsage;
 pub use catalog::Catalog;
 pub use host::{
-    DisplacementWindow, HeadroomBasis, HeadroomEstimate, HostDisplacement, HostMeasurements,
-    HostMemoryStatus, KernelPressure, LimitVisibility, ProcessLimitKind, ProcessMemoryLimit,
+    DISPLACEMENT_HISTORY, DisplacementWindow, HeadroomBasis, HeadroomEstimate, HostDisplacement,
+    HostMeasurements, HostMemoryStatus, KernelPressure, LimitVisibility, ProcessLimitKind,
+    ProcessMemoryLimit,
 };
 
 use seismic_compiler::errors::TargetError;
@@ -197,8 +198,10 @@ pub enum CapacityBasis {
     /// Linux `MemTotal` / Windows `ullTotalPhys`: RAM usable by the OS after
     /// firmware and kernel reservations.
     OsUsableRam,
-    /// CUDA `cuMemGetInfo` free bytes once this process's context exists,
-    /// before it allocates.
+    /// The memory a CUDA device lets this process use
+    /// (`seismic_cuda::usable_memory_bytes`): under WDDM `cuMemGetInfo` free
+    /// bytes once this process's context exists, before it allocates;
+    /// elsewhere NVML's total less its reserve less that context.
     CudaUsable,
     /// The `VK_EXT_memory_budget` budget of the Vulkan device's largest
     /// device-local heap: WDDM's per-process budget.

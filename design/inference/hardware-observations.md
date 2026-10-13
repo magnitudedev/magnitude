@@ -20,7 +20,7 @@ Each execution device is identified by its serialized Seismic device selector (`
 The snapshot is the service process's own Seismic topology and host memory status; the service
 holds no device for it. Discovery measures the memory each dedicated GPU's driver lets one process
 use, once per process and before anything is allocated ([engine memory](engine/memory.md)): a CUDA
-device's primary context is created and released to read it, a Vulkan device's heap and budget
+device's primary context is created and released to read it (on Linux with NVML's device accounting across that creation), a Vulkan device's heap and budget
 are physical-device queries. The figure excludes the driver's reserve and the process's context and
 does not depend on other programs. Assessment, recommendations and the catalog's fit verdict therefore plan
 against the same capacity a loaded worker's claims are bounded by, measured the same way in the

@@ -1,13 +1,26 @@
 import { HarnessConnectionError } from "@magnitudedev/client-common"
 import { FileSystem } from "@effect/platform"
 import { Effect } from "effect"
-import { homedir } from "node:os"
+import { createHash } from "node:crypto"
+import { homedir, userInfo } from "node:os"
 import { dirname, resolve } from "node:path"
 
 export type SkillInstallationTarget = "shared-agents" | "hermes-user" | "claude-user" | "cline-user"
 
 export interface SkillInstallationPaths {
   readonly skillFile: string
+}
+
+export interface KeychainItem {
+  readonly service: string
+  readonly account: string
+}
+
+/** Where Claude Code keeps a login of its own; only the existence of a credential is ever read. */
+export interface ClaudeCodeLoginLocations {
+  readonly credentialFiles: ReadonlyArray<string>
+  readonly globalConfigFiles: ReadonlyArray<string>
+  readonly keychainItems: ReadonlyArray<KeychainItem>
 }
 
 export interface HarnessConnectionPaths {
@@ -22,11 +35,46 @@ export interface HarnessConnectionPaths {
   readonly codexUser: string
   readonly codexModels: string
   readonly claude: string
+  readonly claudeLogin: ClaudeCodeLoginLocations
   readonly ompModels: string
   readonly ompSettings: string
   readonly clineProviders: string
   readonly clineModels: string
   readonly skillInstallations: Readonly<Record<SkillInstallationTarget, SkillInstallationPaths>>
+}
+
+const keychainAccount = (environment: Readonly<Record<string, string | undefined>>): string => {
+  let account: string
+  try {
+    account = environment.USER || userInfo().username
+  } catch {
+    return "claude-code-user"
+  }
+  return /^[a-zA-Z0-9._-]+$/.test(account) ? account : "claude-code-user"
+}
+
+/**
+ * Mirrors Claude Code's own storage: OAuth credentials in `.credentials.json` under its configuration
+ * directory (the macOS Keychain first on a Mac), and a Console API key in the Keychain or the global
+ * config's `primaryApiKey`. A custom `CLAUDE_CONFIG_DIR` suffixes Keychain services with its hash.
+ */
+const claudeCodeLoginLocations = (
+  home: string,
+  environment: Readonly<Record<string, string | undefined>>,
+  keychain: boolean,
+): ClaudeCodeLoginLocations => {
+  const configDirectory = (environment.CLAUDE_CONFIG_DIR ?? `${home}/.claude`).normalize("NFC")
+  const suffix = environment.CLAUDE_CONFIG_DIR
+    ? `-${createHash("sha256").update(configDirectory).digest("hex").substring(0, 8)}`
+    : ""
+  const account = keychainAccount(environment)
+  return {
+    credentialFiles: [`${configDirectory}/.credentials.json`],
+    globalConfigFiles: [`${configDirectory}/.config.json`, `${environment.CLAUDE_CONFIG_DIR || home}/.claude.json`],
+    keychainItems: keychain
+      ? [`Claude Code-credentials${suffix}`, `Claude Code${suffix}`].map((service) => ({ service, account }))
+      : [],
+  }
 }
 
 export const harnessConnectionPaths = (isolatedHome?: string, inheritedEnvironment: Readonly<Record<string, string | undefined>> = process.env): HarnessConnectionPaths => {
@@ -61,6 +109,7 @@ export const harnessConnectionPaths = (isolatedHome?: string, inheritedEnvironme
     codexUser: `${codexRoot}/config.toml`,
     codexModels: `${codexRoot}/magnitude.models.json`,
     claude: `${environment.CLAUDE_CONFIG_DIR ?? `${home}/.claude`}/settings.json`,
+    claudeLogin: claudeCodeLoginLocations(home, environment, isolatedHome === undefined && process.platform === "darwin"),
     ompModels: `${ompRoot}/models.yml`,
     ompSettings: `${ompRoot}/config.yml`,
     clineProviders,

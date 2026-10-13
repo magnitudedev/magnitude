@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { LocalInferenceHardware, ModelLoadDevice, ModelOptimizationProgress } from "@magnitudedev/sdk"
 import {
-  MEMORY_SHORTAGE_TITLE,
+  MEMORY_PRESSURE_TITLE,
   describeMemoryShortage,
   describeModelLoadFailure,
   describeModelOptimization,
@@ -42,7 +42,7 @@ describe("memory shortage and stop wording", () => {
     expect(describeModelLoadFailure({
       _tag: "MemoryShortage", code: "memory_shortage", message: "private bytes", retryable: true,
       shortage: { _tag: "UnderPressure" },
-    })).toBe(`${MEMORY_SHORTAGE_TITLE}. Loading stopped because your computer ran low on memory. Quit apps you aren’t using, or choose a smaller model.`)
+    })).toBe(`${MEMORY_PRESSURE_TITLE}. Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment.`)
     expect(describeModelLoadFailure({ code: "worker_exited", message: "the worker exited", retryable: true }))
       .toBe("the worker exited")
   })

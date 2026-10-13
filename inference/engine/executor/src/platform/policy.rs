@@ -15,30 +15,33 @@
 //! - Headroom at or below the planning reserve is the Reclaim band. No
 //!   engine claim crosses that line.
 //! - A host that reports displacement is also in Reclaim while it is in
-//!   distress ([`HostDistress`]): programs' memory is being swapped out or
-//!   thrashed through the compressor, whoever caused it.
+//!   distress ([`HostDistress`]): programs' memory has been swapped out or
+//!   thrashed through the compressor for a sustained span, whoever caused
+//!   it.
 //!
 //! Process limits are the visible ones. A container's own cgroup limit is
 //! visible; limits of cgroups above it may be hidden, and are then bounded
 //! only by host headroom, which already reflects the host's memory.
 
 use seismic::{
-    DeviceCatalog, DeviceInfo, DeviceMeasurements, DeviceMemory, DeviceMemoryInfo, DeviceSelector,
-    DeviceTopology, DisplacementWindow, HostMemoryStatus, KernelPressure, MemoryPoolId,
-    MemoryPoolKind, ObservationError,
+    DISPLACEMENT_HISTORY, DeviceCatalog, DeviceInfo, DeviceMeasurements, DeviceMemory,
+    DeviceMemoryInfo, DeviceSelector, DeviceTopology, DisplacementWindow, HostMemoryStatus,
+    KernelPressure, MemoryPoolId, MemoryPoolKind, ObservationError,
 };
 use std::fmt;
+use std::time::Duration;
 
 /// Harm to other programs that host headroom does not show: their memory is
 /// leaving RAM faster than the system can absorb. A host in distress is in
 /// the Reclaim band whatever its headroom.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostDistress {
-    /// Pages were written to swap in each of the two most recent
-    /// displacement windows.
+    /// Pages were written to swap in windows covering most of the last
+    /// [`DISPLACEMENT_SPAN`] ([`sustained`]).
     Swapping,
-    /// Each of the two most recent displacement windows compressed and
-    /// decompressed pages at the rates the kernel itself treats as thrashing.
+    /// Windows covering most of the last [`DISPLACEMENT_SPAN`] compressed
+    /// and decompressed pages at the rates the kernel itself treats as
+    /// thrashing ([`sustained`]).
     Thrashing,
     /// The kernel classifies system memory pressure as critical.
     KernelCritical,
@@ -60,6 +63,26 @@ impl fmt::Display for HostDistress {
 const THRASHING_COMPRESSIONS_PER_SECOND: u64 = 2_000;
 const THRASHING_DECOMPRESSIONS_PER_SECOND: u64 = 5_000;
 
+/// The span displacement is judged over. Displacement harms other programs'
+/// speed, not the system's survival: headroom at the planning and emergency
+/// reserves and critical kernel pressure are the out-of-memory backstops,
+/// and they act on their first observation. A load wires its weights
+/// for as long as its import runs, and on a host whose memory is full of
+/// compressible data that wiring compresses other programs' pages and
+/// faults some back for most of the import: about 10 s for a 22 GB import on
+/// an M4 Max, and 14 to 16 s for the same import on an M1 Ultra whose memory
+/// a program filled. The span is
+/// about twice the longest; displacement that fills it is the system not
+/// absorbing demand, whoever caused it.
+pub const DISPLACEMENT_SPAN: Duration = Duration::from_secs(30);
+
+/// How much of [`DISPLACEMENT_SPAN`] displaced windows must cover. Genuine
+/// thrashing measured on the same Ultra left a quiet second every 20 to 40 s
+/// (`notes.md`), which a rule requiring every window would read as recovery.
+pub const DISPLACED_WITHIN_SPAN: Duration = Duration::from_secs(25);
+
+const _: () = assert!(DISPLACEMENT_SPAN.as_secs() <= DISPLACEMENT_HISTORY.as_secs());
+
 fn rate_reaches(pages: u64, window: &DisplacementWindow, per_second: u64) -> bool {
     u128::from(pages) * 1_000 >= u128::from(per_second) * window.duration.as_millis()
 }
@@ -76,20 +99,40 @@ fn thrashed(window: &DisplacementWindow) -> bool {
     )
 }
 
+/// Whether windows showing displacement by `displaced` cover at least
+/// [`DISPLACED_WITHIN_SPAN`] of the last [`DISPLACEMENT_SPAN`]. Windows are
+/// contiguous, most recent first; time before the first window counts as
+/// not displaced.
+fn sustained(windows: &[DisplacementWindow], displaced: fn(&DisplacementWindow) -> bool) -> bool {
+    let mut span = Duration::ZERO;
+    let mut covered = Duration::ZERO;
+    for window in windows {
+        if span >= DISPLACEMENT_SPAN {
+            break;
+        }
+        // The oldest window counts only up to the span's start.
+        let within = window.duration.min(DISPLACEMENT_SPAN - span);
+        span += within;
+        if displaced(window) {
+            covered += within;
+        }
+    }
+    covered >= DISPLACED_WITHIN_SPAN
+}
+
 /// The distress `host` reports, most severe first. A host that reports no
 /// displacement and no kernel pressure is never in distress. Displacement
-/// is distress only when two consecutive windows show it: one window of a
-/// load's own first compressions, or one burst of another program's swap,
-/// is the system absorbing demand.
+/// is distress only when it is sustained over [`DISPLACEMENT_SPAN`]: a load's
+/// own import, or a burst of another program's demand, is the system
+/// absorbing demand.
 pub fn host_distress(host: &HostMemoryStatus) -> Option<HostDistress> {
     if host.kernel_pressure == Some(KernelPressure::Critical) {
         return Some(HostDistress::KernelCritical);
     }
-    let displacement = host.displacement?;
-    let (latest, previous) = (displacement.latest?, displacement.previous?);
-    if thrashed(&latest) && thrashed(&previous) {
+    let windows = &host.displacement.as_ref()?.windows;
+    if sustained(windows, thrashed) {
         Some(HostDistress::Thrashing)
-    } else if latest.swapped_out_pages > 0 && previous.swapped_out_pages > 0 {
+    } else if sustained(windows, |window| window.swapped_out_pages > 0) {
         Some(HostDistress::Swapping)
     } else {
         None
@@ -670,16 +713,42 @@ mod tests {
         }
     }
 
-    fn displaced(
-        latest: Option<DisplacementWindow>,
-        previous: Option<DisplacementWindow>,
-    ) -> HostMemoryStatus {
+    /// A host whose displacement windows are `windows`, most recent first.
+    fn displaced(windows: Vec<DisplacementWindow>) -> HostMemoryStatus {
         HostMemoryStatus {
-            displacement: Some(HostDisplacement { latest, previous }),
+            displacement: Some(HostDisplacement { windows }),
             kernel_pressure: Some(KernelPressure::Normal),
             ..host(32 * GIB, Vec::new())
         }
     }
+
+    /// Enough 500 ms windows like `window` to span `span`.
+    fn lasting(window: DisplacementWindow, span: std::time::Duration) -> Vec<DisplacementWindow> {
+        let count = span.as_millis().div_ceil(window.duration.as_millis());
+        vec![window; usize::try_from(count).unwrap()]
+    }
+
+    /// 2,000 compressions/s and 5,000 decompressions/s over 500 ms.
+    fn thrashing_window() -> DisplacementWindow {
+        window(500, 1_000, 2_500, 0)
+    }
+
+    fn quiet_window() -> DisplacementWindow {
+        window(500, 0, 2_500, 0)
+    }
+
+    /// `displaced` windows of `active`, most recent first, then quiet ones
+    /// to fill the span.
+    fn within_span(
+        active: DisplacementWindow,
+        displaced: std::time::Duration,
+    ) -> Vec<DisplacementWindow> {
+        let mut windows = lasting(active, displaced);
+        windows.extend(lasting(quiet_window(), DISPLACEMENT_SPAN - displaced));
+        windows
+    }
+
+    const HALF_SECOND: std::time::Duration = std::time::Duration::from_millis(500);
 
     #[test]
     fn a_host_without_displacement_counters_is_never_in_distress() {
@@ -689,66 +758,118 @@ mod tests {
     #[test]
     fn compression_alone_is_not_distress() {
         // Other programs' idle data being compressed is the allowed cost of a load.
-        let compressing = displaced(
-            Some(window(500, 1_000_000, 0, 0)),
-            Some(window(500, 1_000_000, 0, 0)),
-        );
+        let compressing = displaced(lasting(window(500, 1_000_000, 0, 0), DISPLACEMENT_SPAN));
         assert_eq!(host_distress(&compressing), None);
         // Programs faulting compressed pages back without new compression is recovery.
-        let recovering = displaced(Some(window(500, 0, 1_000_000, 0)), None);
+        let recovering = displaced(lasting(window(500, 0, 1_000_000, 0), DISPLACEMENT_SPAN));
         assert_eq!(host_distress(&recovering), None);
     }
 
     #[test]
-    fn thrashing_needs_both_rates_in_two_consecutive_windows() {
-        // 2,000 compressions/s and 5,000 decompressions/s over 500 ms.
-        let at_rate = window(500, 1_000, 2_500, 0);
-        let thrashing = displaced(Some(at_rate), Some(at_rate));
-        assert_eq!(host_distress(&thrashing), Some(HostDistress::Thrashing));
-        // A load's first compressions beside a burst of faults is one window.
-        assert_eq!(host_distress(&displaced(Some(at_rate), None)), None);
-        let quiet = window(500, 0, 2_500, 0);
-        assert_eq!(host_distress(&displaced(Some(at_rate), Some(quiet))), None);
-        assert_eq!(host_distress(&displaced(Some(quiet), Some(at_rate))), None);
+    fn thrashing_needs_both_rates_over_most_of_the_span() {
+        let at_rate = thrashing_window();
+        let enough = within_span(at_rate, DISPLACED_WITHIN_SPAN);
+        assert_eq!(
+            host_distress(&displaced(enough.clone())),
+            Some(HostDistress::Thrashing)
+        );
+        // The quiet part may lie anywhere in the span.
+        let mut quiet_first = enough.clone();
+        quiet_first.reverse();
+        assert_eq!(
+            host_distress(&displaced(quiet_first)),
+            Some(HostDistress::Thrashing)
+        );
+        // A burst covering less, however intense, is absorbed demand.
+        let short = within_span(at_rate, DISPLACED_WITHIN_SPAN - HALF_SECOND);
+        assert_eq!(host_distress(&displaced(short)), None);
+        // Windows older than the span do not count, and a history shorter
+        // than the span counts its missing time as quiet.
+        let mut stale = within_span(at_rate, DISPLACED_WITHIN_SPAN - HALF_SECOND);
+        stale.extend(lasting(at_rate, DISPLACEMENT_SPAN));
+        assert_eq!(host_distress(&displaced(stale)), None);
+        let young = lasting(at_rate, DISPLACED_WITHIN_SPAN - HALF_SECOND);
+        assert_eq!(host_distress(&displaced(young)), None);
 
-        let below_decompression = displaced(Some(window(500, 1_000, 2_499, 0)), Some(at_rate));
-        assert_eq!(host_distress(&below_decompression), None);
-        let below_compression = displaced(Some(window(500, 999, 2_500, 0)), Some(at_rate));
-        assert_eq!(host_distress(&below_compression), None);
-        // The same page counts over a longer window are a lower rate.
-        let slower = displaced(Some(window(1_000, 1_000, 2_500, 0)), Some(at_rate));
-        assert_eq!(host_distress(&slower), None);
+        for below in [
+            window(500, 1_000, 2_499, 0),
+            window(500, 999, 2_500, 0),
+            // The same page counts over a longer window are a lower rate.
+            window(1_000, 1_000, 2_500, 0),
+        ] {
+            assert_eq!(
+                host_distress(&displaced(lasting(below, DISPLACEMENT_SPAN))),
+                None
+            );
+        }
     }
 
     #[test]
-    fn swapping_needs_swap_outs_in_two_consecutive_windows() {
-        let one_burst = displaced(Some(window(500, 0, 0, 40)), Some(window(500, 0, 0, 0)));
-        assert_eq!(host_distress(&one_burst), None);
-        let first_window = displaced(Some(window(500, 0, 0, 40)), None);
-        assert_eq!(host_distress(&first_window), None);
-        let ended = displaced(Some(window(500, 0, 0, 0)), Some(window(500, 0, 0, 40)));
-        assert_eq!(host_distress(&ended), None);
-        let sustained = displaced(Some(window(500, 0, 0, 1)), Some(window(500, 0, 0, 1)));
-        assert_eq!(host_distress(&sustained), Some(HostDistress::Swapping));
+    fn displacement_measured_on_the_ultra_is_judged_as_it_was_seen() {
+        // 1 s samples measured on an M1 Ultra, most
+        // recent first; T reached both thrashing rates.
+        let samples = |trace: &str| {
+            trace
+                .chars()
+                .rev()
+                .flat_map(|sample| {
+                    let window = if sample == 'T' {
+                        thrashing_window()
+                    } else {
+                        quiet_window()
+                    };
+                    [window, window]
+                })
+                .collect::<Vec<_>>()
+        };
+        // A 22 GB import into memory a program had filled (0.2.8 refused
+        // it), then the program's working set settling around the model.
+        let import = samples(
+            "................TTTTTTTTTTTTTTTT.......TTTTTT.....TTTTTTTTT....TTTTTTT..TTTT..",
+        );
+        for end in 1..=import.len() {
+            assert_eq!(
+                host_distress(&displaced(import[import.len() - end..].to_vec())),
+                None
+            );
+        }
+        // A program cycling a working set larger than the memory the model
+        // left it.
+        let thrashing = samples("TTTTTTTTTTTTTTTTTTTT.TTTTTTTTTTTTTTTTTTTTTTTTTT.TTTTTTTTTTTT");
+        assert_eq!(
+            host_distress(&displaced(thrashing)),
+            Some(HostDistress::Thrashing)
+        );
+    }
+
+    #[test]
+    fn swapping_needs_swap_outs_over_most_of_the_span() {
+        let swapping = within_span(window(500, 0, 0, 1), DISPLACED_WITHIN_SPAN);
+        assert_eq!(
+            host_distress(&displaced(swapping)),
+            Some(HostDistress::Swapping)
+        );
+        let burst = within_span(window(500, 0, 0, 40), DISPLACED_WITHIN_SPAN - HALF_SECOND);
+        assert_eq!(host_distress(&displaced(burst)), None);
     }
 
     #[test]
     fn critical_kernel_pressure_is_distress_without_any_window() {
         let critical = HostMemoryStatus {
             kernel_pressure: Some(KernelPressure::Critical),
-            ..displaced(None, None)
+            ..displaced(Vec::new())
         };
         assert_eq!(host_distress(&critical), Some(HostDistress::KernelCritical));
         let warning = HostMemoryStatus {
             kernel_pressure: Some(KernelPressure::Warning),
-            ..displaced(None, None)
+            ..displaced(Vec::new())
         };
         assert_eq!(host_distress(&warning), None);
     }
 
     #[test]
     fn host_distress_puts_host_domains_in_reclaim_whatever_their_headroom() {
-        let swapping = displaced(Some(window(500, 0, 0, 1)), Some(window(500, 0, 0, 1)));
+        let swapping = displaced(lasting(window(500, 0, 0, 1), DISPLACEMENT_SPAN));
         let host_backed = readings(&swapping, 32 * GIB, None, DeviceMeasurements::Host).unwrap();
         assert_eq!(host_backed[0].band, MemoryBand::Reclaim);
         assert_eq!(host_backed[0].distress, Some(HostDistress::Swapping));
@@ -770,6 +891,12 @@ mod tests {
         assert_eq!(dedicated[0].distress, None);
         assert_eq!(dedicated[1].band, MemoryBand::Reclaim);
         assert_eq!(band_of(&dedicated), MemoryBand::Reclaim);
+
+        // Thrashing for less than the span leaves the band to headroom.
+        let burst = within_span(thrashing_window(), DISPLACED_WITHIN_SPAN - HALF_SECOND);
+        let absorbed =
+            readings(&displaced(burst), 32 * GIB, None, DeviceMeasurements::Host).unwrap();
+        assert_eq!(absorbed[0].band, MemoryBand::Normal);
     }
 
     fn readings(

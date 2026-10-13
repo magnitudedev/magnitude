@@ -130,6 +130,82 @@ describe("Anthropic inference gateway", () => {
     expect(await forwarded?.text()).toBe(body)
   })
 
+  test("serves Claude models carrying Magnitude's placeholder credential from the loaded local model", async () => {
+    const requests: Array<Request> = []
+    const instances = {
+      revision: 3,
+      instances: [
+        { id: "a", modelId: "loading:model", lifecycle: { _tag: "Loading", fraction: 0.5 } },
+        { id: "b", modelId: "ready:model", lifecycle: { _tag: "Ready", allocation: {} } },
+      ],
+    }
+    const response = await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages?beta=true", {
+        method: "POST",
+        headers: { authorization: "Bearer magnitude-local", "content-type": "application/json" },
+        body: '{"model":"claude-opus-5","max_tokens":4,"messages":[]}',
+      }),
+      icn,
+      async (input, init) => {
+        const request = new Request(input, init)
+        requests.push(request)
+        return request.url.endsWith("/api/v1/instances") ? Response.json(instances) : Response.json({ ok: true })
+      },
+    )
+
+    expect(response.status).toBe(200)
+    expect(requests.map(({ url }) => url)).toEqual([
+      "http://127.0.0.1:9999/api/v1/instances",
+      "http://127.0.0.1:9999/anthropic/v1/messages",
+    ])
+    expect(requests[1]?.headers.get("authorization")).toBe("Bearer private-icn-token")
+    expect(requests[1]?.headers.get("magnitude-gateway-model")).toBe("anthropic-local/ready:model")
+    expect(await requests[1]?.json()).toMatchObject({ model: "ready:model", max_tokens: 4 })
+  })
+
+  test("explains a placeholder Claude request when no local model is loaded", async () => {
+    const requests: Array<string> = []
+    const response = await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages", {
+        method: "POST",
+        headers: { "x-api-key": "magnitude-local" },
+        body: '{"model":"claude-haiku-4-5","messages":[]}',
+      }),
+      icn,
+      async (input) => {
+        requests.push(String(input))
+        return Response.json({ revision: 0, instances: [] })
+      },
+    )
+
+    expect(requests).toEqual(["http://127.0.0.1:9999/api/v1/instances"])
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({
+      error: { type: "invalid_request_error", message: expect.stringContaining("No local model is loaded") },
+    })
+  })
+
+  test("forwards Claude models with a real bearer credential upstream unchanged", async () => {
+    const body = '{"model":"claude-sonnet-5","messages":[]}'
+    let forwarded: Request | undefined
+    await proxyAnthropicInferenceRequest(
+      new Request("http://127.0.0.1:10100/inference/anthropic/proxies/claude-code/v1/messages", {
+        method: "POST",
+        headers: { authorization: "Bearer sk-ant-oat-user" },
+        body,
+      }),
+      icn,
+      async (input, init) => {
+        forwarded = new Request(input, init)
+        return new Response("ok")
+      },
+    )
+
+    expect(forwarded?.url).toBe("https://api.anthropic.com/v1/messages")
+    expect(forwarded?.headers.get("authorization")).toBe("Bearer sk-ant-oat-user")
+    expect(await forwarded?.text()).toBe(body)
+  })
+
   test("preserves count-token bytes upstream and refuses the local operation", async () => {
     const upstreamBody = '{"model":"claude-upstream","future":true}'
     let forwarded: Request | undefined

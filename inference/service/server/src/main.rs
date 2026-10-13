@@ -208,6 +208,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 model_services.catalog.clone(),
                 model_services.discovered.clone(),
             );
+            instances.attach_assessments(assessments.clone());
             let mut state = AppState::new()
                 .with_model_downloads(model_downloads)
                 .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(inventory.clone())))

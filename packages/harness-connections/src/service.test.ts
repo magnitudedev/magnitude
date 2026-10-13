@@ -17,6 +17,7 @@ import { PiPackageSourceSchema } from "./connectors/pi-package-state"
 import { PiPackageEntrySchema } from "./connectors/pi-settings"
 import {
   ANTHROPIC_BASE_URL,
+  CLAUDE_AUTH_TOKEN_PLACEHOLDER,
   CLAUDE_GATEWAY_DISCOVERY,
   CODEX_PROXY_BASE_URL,
   OPENAI_BASE_URL,
@@ -104,6 +105,11 @@ const fixturePaths = (root: string): HarnessConnectionPaths => ({
   codexUser: `${root}/codex/config.toml`,
   codexModels: `${root}/codex/magnitude.models.json`,
   claude: `${root}/claude/settings.json`,
+  claudeLogin: {
+    credentialFiles: [`${root}/claude/.credentials.json`],
+    globalConfigFiles: [`${root}/claude.json`],
+    keychainItems: [],
+  },
   ompModels: `${root}/omp/models.yml`,
   ompSettings: `${root}/omp/config.yml`,
   clineProviders: `${root}/cline/providers.json`,
@@ -1341,6 +1347,8 @@ describe("HarnessConnection model-set behavior", () => {
         env: {
           USER_KEY: "preserve",
           ANTHROPIC_BASE_URL,
+          ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
+          ANTHROPIC_API_KEY: "",
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
         },
       })
@@ -1876,6 +1884,138 @@ describe("HarnessConnection model-set behavior", () => {
         theme: "dark",
         model: anthropicLocalModelId(model),
         env: { USER_KEY: "preserve", ANTHROPIC_BASE_URL: "https://user-gateway.example" },
+      })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  const claudeInspection = (service: { readonly inspect: Effect.Effect<ReadonlyArray<{ readonly id: string; readonly inspection: { readonly _tag: string } }>, unknown> }) =>
+    service.inspect.pipe(Effect.map((rows) => rows.find((row) => row.id === "claude-code")?.inspection._tag))
+
+  it("connects Claude Code without an Anthropic login and disconnects to exactly the prior settings", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-login-" })
+      const paths = fixturePaths(root)
+      const prior = { theme: "dark", model: "user/model" }
+      yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior) })
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+
+      yield* service.connect(id, { model: Option.some(model) })
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+        theme: "dark",
+        model: anthropicLocalModelId(model),
+        env: {
+          ANTHROPIC_BASE_URL,
+          ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
+          ANTHROPIC_API_KEY: "",
+          CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+        },
+      })
+      expect(yield* claudeInspection(service)).toBe("Connected")
+
+      const settings = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
+      delete settings.env.ANTHROPIC_AUTH_TOKEN
+      yield* fs.writeFileString(paths.claude, stringifyJson(settings))
+      expect(yield* claudeInspection(service)).toBe("Disconnected")
+
+      yield* service.connect(id, { model: Option.none() })
+      yield* service.disconnect(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  for (const [name, login] of [
+    ["an OAuth login", (paths: HarnessConnectionPaths) => ({ [paths.claudeLogin.credentialFiles[0]!]: stringifyJson({ claudeAiOauth: { accessToken: "test-only" } }) })],
+    ["a Console API key", (paths: HarnessConnectionPaths) => ({ [paths.claudeLogin.globalConfigFiles[0]!]: stringifyJson({ primaryApiKey: "test-only" }) })],
+  ] as const) {
+    it(`connects Claude Code with ${name} without a placeholder credential`, async () => {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-signed-in-" })
+        const paths = fixturePaths(root)
+        const prior = { theme: "dark", model: "user/model" }
+        yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior), ...login(paths) })
+        const service = yield* installedService(paths)
+        const id = HarnessIdSchema.make("claude-code")
+
+        yield* service.connect(id, { model: Option.some(model) })
+        expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+          theme: "dark",
+          model: anthropicLocalModelId(model),
+          env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY },
+        })
+        expect(yield* claudeInspection(service)).toBe("Connected")
+
+        yield* service.disconnect(id)
+        expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+      }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+    })
+  }
+
+  it("treats a credential in Claude settings as a login", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-settings-login-" })
+      const paths = fixturePaths(root)
+      for (const prior of [{ apiKeyHelper: "/bin/echo" }, { env: { ANTHROPIC_API_KEY: "test-only" } }]) {
+        yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior) })
+        const service = yield* installedService(paths)
+        yield* service.connect(HarnessIdSchema.make("claude-code"), { model: Option.some(model) })
+        const { env } = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
+        expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+        expect(yield* claudeInspection(service)).toBe("Connected")
+        yield* service.disconnect(HarnessIdSchema.make("claude-code"))
+        expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+      }
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("drops the Claude placeholder credentials on sync once a login appears", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-later-login-" })
+      const paths = fixturePaths(root)
+      const prior = { theme: "dark", model: "user/model" }
+      yield* writeFixtures({ ...initialFiles(paths), [paths.claude]: stringifyJson(prior) })
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+      yield* service.connect(id, { model: Option.some(model) })
+
+      yield* fs.writeFileString(paths.claudeLogin.credentialFiles[0]!, stringifyJson({ claudeAiOauth: { accessToken: "test-only" } }))
+      expect(yield* claudeInspection(service)).toBe("Connected")
+      yield* service.sync(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+        theme: "dark",
+        model: anthropicLocalModelId(model),
+        env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY },
+      })
+      expect(yield* claudeInspection(service)).toBe("Connected")
+
+      yield* service.disconnect(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(prior)
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("keeps a user's own Claude auth token on disconnect", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-token-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+      yield* service.connect(id, { model: Option.none() })
+      const settings = readJson(yield* fs.readFileString(paths.claude)) as { env: Record<string, string> }
+      settings.env.ANTHROPIC_AUTH_TOKEN = "user-token"
+      yield* fs.writeFileString(paths.claude, stringifyJson(settings))
+
+      yield* service.disconnect(id)
+
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
+        theme: "dark",
+        model: "user/model",
+        env: { USER_KEY: "preserve", ANTHROPIC_AUTH_TOKEN: "user-token" },
       })
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })

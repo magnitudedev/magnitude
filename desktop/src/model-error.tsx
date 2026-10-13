@@ -1,13 +1,13 @@
 import { Option } from "effect"
 import type { ModelAcquisitionFailure, ModelInstanceFailure, ModelFailure } from "@magnitudedev/sdk"
-import { MEMORY_SHORTAGE_TITLE, describeMemoryShortage, formatStorageSize, type LocalModelCommandFailure } from "@magnitudedev/client-common"
+import { MEMORY_SHORTAGE_TITLE, describeMemoryShortage, formatStorageSize, memoryShortageTitle, type LocalModelCommandFailure } from "@magnitudedev/client-common"
 import { ErrorNotice, type NoticeContent } from "./error-notice"
 import { Tooltip, TooltipContent, TooltipTrigger } from "../../web/src/components/ui/tooltip"
 import { WarningCircleIcon } from "@phosphor-icons/react"
 import type { ReactNode } from "react"
 
 export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent => {
-  if ("_tag" in failure) return { title: MEMORY_SHORTAGE_TITLE, description: describeMemoryShortage(failure.shortage) }
+  if ("_tag" in failure) return { title: memoryShortageTitle(failure.shortage), description: describeMemoryShortage(failure.shortage) }
   return { title: "This model couldn’t start", description: "Try loading it again. If it still won’t start, choose another model." }
 }
 
@@ -52,6 +52,9 @@ export const modelRemovalNotice = (failure: ModelFailure): NoticeContent => {
 export const modelCommandNotice = (failure: LocalModelCommandFailure): NoticeContent => {
   if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_instance_stopped") return {
     severity: "info", title: "Loading was stopped", description: "Load the model again when you’re ready.",
+  }
+  if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_does_not_fit") return {
+    title: "This model doesn’t fit this computer", description: "It needs more memory than this computer can provide. Choose a smaller model.",
   }
   if (Option.isSome(failure.rejection) && failure.rejection.value.code === "memory_shortage") return {
     title: MEMORY_SHORTAGE_TITLE, description: "Quit apps you aren’t using, or choose a smaller model.",
