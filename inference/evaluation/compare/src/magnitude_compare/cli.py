@@ -25,7 +25,7 @@ from pathlib import Path
 
 from magnitude_fixtures import FAMILIES
 from magnitude_remote.connection import HostUnavailable
-from magnitude_remote.flow import RESULTS, StepFailed
+from magnitude_remote.flow import RESULTS, Job, StepFailed
 from magnitude_remote.host.gate import GateSettings
 from magnitude_remote.hosts import Hosts
 
@@ -104,14 +104,14 @@ def _run(arguments, argv: list[str]) -> int:
     )
     gate = None if arguments.no_gate else GateSettings()
     if arguments.dry_run:
-        print(controller.describe(plan, arguments.model, arguments.host, gate))
+        print(controller.describe(plan, arguments.model, arguments.host, gate, arguments.max_hold))
         return EXIT["pass"]
     hosts = Hosts.load()
     prepared = controller.prepare(plan, Path(hosts.defaults.root).expanduser())
     code = EXIT["pass"]
     for model in arguments.model:
         try:
-            outcome = controller.run(prepared, model, arguments.host, gate, hosts)
+            outcome = controller.run(prepared, model, arguments.host, gate, hosts, arguments.max_hold)
         except (StepFailed, HostUnavailable, BuildUnavailable) as error:
             print(f"magnitude-compare: {model}: {error}", file=sys.stderr)
             code = EXIT["failed"]
@@ -219,6 +219,12 @@ def main(argv: list[str] | None = None) -> int:
         help="relative change a speed cell must exceed beyond its noise (default 0)",
     )
     run.add_argument("--no-gate", action="store_true", help="skip the thermal gate")
+    run.add_argument(
+        "--max-hold",
+        type=float,
+        default=Job.max_hold_seconds,
+        help="seconds the job may hold the host's lock",
+    )
     run.add_argument(
         "--dry-run", action="store_true", help="print the planned jobs and host schedule only"
     )

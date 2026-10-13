@@ -137,48 +137,50 @@ requires exact-artifact numerical witnesses throughout that contract, including 
 untimed points. The formed canonical default remains an explicitly distinguished unqualified fallback;
 its usability does not qualify an approximate alternative or establish artifact fidelity or model quality.
 
-The workload is declared from 137,170 turns of 1,631 hosted-provider coding-agent sessions
-(2026-10-07): new prompt tokens outnumber decoded tokens about 32 to 1; large prefill launches dominate
-prompt service, and single-row, verification and concurrent launches contribute decode service.
-The load-owned execution graph supplies invocation counts at its logical operator call sites,
-independently of weight ownership. Reusing a target output table in an assistant does not turn
-that assistant call into a target call. The same preparation walk collects a complete map of
-logical native specializations before opening searches; physical binding groups rotate their
-weights separately from this call map. Identical specializations aggregate actual call-site
-multiplicity once.
+The workload explicitly weights prefill and decode at 4k and 64k context equally, capped
+and deduplicated at the load's supported context limit, for one sequence. These are policy
+choices rather than inferred traffic frequencies. Each prepared draft width contributes an
+equal part of its decode metric, including plain decoding when prepared. The graph supplies
+actual logical launch counts, including draft and verification work, independently of weight
+ownership. Alternative implementations receive only the launches they serve.
 
-The plan distinguishes finite action support from frequency. Its speculative forecast is an
-explicit bounded action envelope: a chained action with G generated tokens invokes the head
-G times and verifies G+1 target rows once; a block drafter runs its generated block once.
-Alternative widths contribute maxima within an owned representative class, not invented
-probabilities or simultaneous actions. Target prefix and plain-decode demand remain present;
-heads with their own history also retain prefix priming, while shared-history heads do not
-acquire fictitious priming. Entry-owned row bands map logical calls to their representatives
-and reject calls outside that entry's support. The hosted history forecast remains a performance
-approximation independent of these call counts.
+The objective is the weighted mean of relative service time `Σ term_weight × time / baseline`.
+Baseline totals are measured once over the declared tunable workload. Consequently a unit's
+point weight is `Σ term_weight × launch_count / baseline_term_time`, and its contribution is
+exactly additive under this objective. There is no logarithmic objective or inferred probability
+of speculative acceptance. Fixed work outside the tunable workload is not measured by this
+objective; whole-engine evaluation establishes end-to-end improvements.
 
-Point weights are invocation demand, not a second latency surrogate. A candidate's objective is
-elapsed service under that declared forecast (demand times measured device latency), relative to
-the reference's service under the same demand. Unit scheduling uses the same service evidence
-and positive point weights for its conditional mean history; numerical-only witnesses do not
-contribute service. A unit with no invocation demand still prepares its canonical default inside
-the first-load clock, publishes that explicitly unqualified terminal choice, and receives no
-numerical census or candidate search.
-Invocation forecasts are first-load allocation inputs, never cache identities. A later request,
-adaptive action, or demand change consumes frozen choices and cannot reopen tuning or obtain
-another minute. Attention history
-sampling represents the declared mean history through neighboring points and clamps to a layer's
-physical window; this interpolation is a performance approximation, not a universal cost bound.
-The declared longest history remains part of numerical scope even when it carries no sampled
-demand. A full-context domain is not capped by the sampling ladder.
+History-dependent performance points are empty history, 4k and the layer's longest retained
+history. Intermediate launch demand is split linearly between neighboring points, with window
+limits applied first. This is an explicit representative-workload approximation, not a proof
+that every intermediate history has linear latency. Every candidate is measured at every
+selected point: no timing or ranking is transferred from a short history to a long one.
+Numerical history witnesses remain intact, including intermediate histories with zero
+performance demand; timing representatives do not define numerical scope.
 
-Representative discovery precedes opening a candidate frontier. It begins with an affordable
-region bootstrap and measures the workload representatives, rather than requiring the most
-expensive endpoint as the first informative sample. The timed cohort is then frozen: retained
-candidates are never compared across different point cohorts. An unfinished discovery remains
-pending within the original load and does not become a measured zero-cost workload. Canonical
-measurements discovered after census refresh scheduling priority; concluding a dependency retains
-that evidence. Missing measurements are reported explicitly when time expires.
+Baseline discovery measures every demanded unit before candidate search begins. Unknown
+units share discovery by elapsed effort, with declaration order breaking ties. Incomplete
+discovery is reported explicitly; it never contributes invented latency or zero service to a
+candidate objective. Once discovery completes, the measured baseline term totals normalize
+point weights, which remain fixed throughout the search.
+
+Search effort follows measured remaining service. Each available piece is ranked by its
+virtual finish time `(effort + price) / (share × opportunity)`, smallest first. `effort` is the
+unit's completed search work, including compilation even when it overlaps device work;
+`share` is its measured fraction of the baseline objective. For exploration, `opportunity`
+is the incumbent's remaining cost relative to its default; for a pending conversion it is
+the observed lead. This is an explicit allocation policy, not a probability of discovering a
+faster configuration. Neither model identities, reference-operation counts, nor the spread of
+previous winners predicts a candidate's value. A unit explores distinct forms before refining
+one. Resolved promotions take priority over further exploration so established gains
+reach serving before the allowance ends. Other stages impose no global barrier after discovery.
+
+Prices use this load's observed operation costs. Unobserved operations use the conservative
+admission forecast until observations exist; coverage costs are shared only within the same
+entry. Every admission still protects the original deadline, numerical coverage and publication
+obligations. A chosen kernel must establish a lead through matched measurements of the full
+performance cohort and satisfy its complete numerical scope.
 
 The runtime owns candidate generation, artifact qualification, retained measurements and complete
 pending-work quotes. The allocator owns admission, elapsed charging and deadlines. A quote states
@@ -187,14 +189,11 @@ Completed artifact witnesses and formed programs are removed from pending work r
 charged again. The allocator does not independently calibrate a runtime quote or price program
 formation. Quotes refresh after every step or canonical dependency seal.
 
-Unknown execution is an explicit bootstrap/discovery state. It receives a bounded fair share of
-currently available time among pending discovery units while terminal publication remains held.
-That share is an allowance, not a fabricated latency estimate. An unknown quote cannot authorize
-an optional performance candidate. Known candidate work is admitted only when execution, current
-terminal obligations and the added obligation fit. An admitted optional transaction executes once under the hard deadline and terminal guards;
-its forecast-sized scheduling slice is not a second admission deadline after adapter overhead.
-Its execution interval is not shortened by subtracting its own estimate a second time. Runtime hard deadlines protect other units' reserves;
-the runtime guards its own conclusion, and the adapter guards receipt publication.
+Unknown quotes cannot waive baseline discovery or numerical evidence. Known candidate work
+is admitted only when execution, current terminal obligations and the added obligation fit.
+An admitted transaction uses the original hard deadline; adapter overhead does not create a
+second forecast-sized deadline. The runtime protects its conclusion reserve, and the allocator
+protects the other units' reserves and publication.
 
 Ordinary and factored search produce complete prepared candidate artifacts during exploration.
 Factoring reuses keyed point measurements and generates assembled whole specializations; it does

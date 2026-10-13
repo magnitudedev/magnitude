@@ -5,10 +5,9 @@
 
 use seismic::{
     Availability, BackendName, CallError, Device, DeviceCatalog, Element, Exclusion,
-    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization,
-    NumericalRequirement, Outcome, SearchPlan, SearchSettings, Stage, Strategy,
-    SurveyPlan, Tensor, TraceDetail, TuneError, TuningInitializer, TuningMethod, TuningPoint,
-    UnitPlan,
+    InvocationError, MeasureOptions, NativeGraphFamily, NativeSpecialization, NumericalRequirement,
+    Outcome, SearchPlan, SearchSettings, Stage, Strategy, SurveyPlan, Tensor, TraceDetail,
+    TuneError, TuningInitializer, TuningMethod, TuningPoint, UnitPlan,
 };
 use seismic_native_tests::{accumulate, gated_sum, scale_rows, scoped_scale, split_sum};
 use std::time::Duration;
@@ -22,9 +21,7 @@ fn search() -> Strategy {
     Strategy::Search(SearchPlan {
         allowance: Duration::from_secs(3600),
 
-        settings: SearchSettings {
-            error_rate: 0.05,
-        },
+        settings: SearchSettings { error_rate: 0.05 },
         // Long enough that a sample of these µs-scale kernels measures the
         // kernel rather than the fixed cost of its submission.
         min_sample_seconds: 0.005,
@@ -698,9 +695,17 @@ fn tuning_searches_from_the_defaults_and_validates_its_choice() {
             let Outcome::Measured { points, .. } = &record.outcome else {
                 continue;
             };
-            let rounds = points.iter().map(|point| point.samples.len()).max().unwrap();
+            let rounds = points
+                .iter()
+                .map(|point| point.samples.len())
+                .max()
+                .unwrap();
             if result.served.contains(&record.configuration) {
-                assert!(rounds > 1, "{:?}: served {index} after {rounds} round", device.backend());
+                assert!(
+                    rounds > 1,
+                    "{:?}: served {index} after {rounds} round",
+                    device.backend()
+                );
             }
         }
         // The tuned configuration prepares and runs.
@@ -910,7 +915,8 @@ fn expiry_during_reset_preserves_the_choice_without_rejecting_the_candidate() {
         })),
         written: Default::default(),
     }];
-    let mut unit = split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+    let mut unit =
+        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
     unit.prepare_defaults(&mut source).unwrap();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -985,10 +991,7 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
             class: None,
             cost: 1.,
             workload: seismic::WorkloadRotation::All,
-            rotation: witnesses
-                .iter()
-                .map(|x| gated_sum::Args { x })
-                .collect(),
+            rotation: witnesses.iter().map(|x| gated_sum::Args { x }).collect(),
             // Called once as a configuration is placed, and once before
             // every observed invocation: the default's as the reference
             // and a candidate's.
@@ -1023,7 +1026,10 @@ fn a_numerical_observation_is_made_once_per_point_and_key() {
             panic!("{:?}", record.observations)
         };
         assert_eq!(survey.observations[observation].key, points[0].key);
-        assert_eq!(survey.observations[observation].rotations.len(), witnesses.len());
+        assert_eq!(
+            survey.observations[observation].rotations.len(),
+            witnesses.len()
+        );
         keys.insert(points[0].key.clone());
     }
     let candidates = survey.configurations.len() - 1;
@@ -1062,7 +1068,8 @@ fn the_census_retains_the_default_at_its_performance_invocations() {
             label: "two-witnesses".into(),
             weight: 1.,
             class: None,
-            cost: 1.,            workload,
+            cost: 1.,
+            workload,
             rotation: vec![
                 split_sum::Args { x: &first },
                 split_sum::Args { x: &adversarial },
@@ -1115,18 +1122,18 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
     let x = f32_tensor(&device, &[n], &exact_values(n as usize));
     let points = || {
         [("short", 1.0), ("required", 2.0), ("long", 3.0)]
-        .into_iter()
-        .map(|(label, cost)| TuningPoint {
-            label: label.into(),
-            weight: 1.0,
-            class: None,
-            cost,
-            workload: seismic::WorkloadRotation::All,
-            rotation: vec![split_sum::Args { x: &x }],
-            initialize: None,
-            written: Default::default(),
-        })
-        .collect::<Vec<_>>()
+            .into_iter()
+            .map(|(label, cost)| TuningPoint {
+                label: label.into(),
+                weight: 1.0,
+                class: None,
+                cost,
+                workload: seismic::WorkloadRotation::All,
+                rotation: vec![split_sum::Args { x: &x }],
+                initialize: None,
+                written: Default::default(),
+            })
+            .collect::<Vec<_>>()
     };
     let timed = |result: &seismic::TuningResult| {
         let defaults = result
@@ -1140,7 +1147,8 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
         }
     };
     // Direct tuning uses every positive-demand point as a representative.
-    let mut unit = split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
+    let mut unit =
+        split_sum::native_search(&device, &statics(n), NumericalRequirement::BitExact).unwrap();
     let mut source = points();
     let Strategy::Search(plan) = search() else {
         unreachable!()
@@ -1195,7 +1203,7 @@ fn canonical_discovery_transports_the_frozen_objective_without_remeasurement() {
     // performed as it stands compiles its own challengers' programs.
     let work = unit.next().unwrap();
     assert_eq!(work.stage, Stage::Measure);
-    assert!(work.gain > 0.);
+    assert!(work.opportunity > 0.);
     assert!(work.forming != seismic::Quote::default());
     let performed = unit.perform(&mut source, None).unwrap();
     assert!(performed.spent.compiling > 0.);
@@ -1977,7 +1985,11 @@ fn tuning_validates_in_place_parameters_and_excludes_misclassified_ones() {
                 (bias, outcome) => panic!("{:?}: BIAS {bias} gave {outcome:?}", device.backend()),
             }
         }
-        assert!(excluded >= 1, "{:?}: the hinted candidate was witnessed", device.backend());
+        assert!(
+            excluded >= 1,
+            "{:?}: the hinted candidate was witnessed",
+            device.backend()
+        );
         // Nothing serves on rounds alone: every choice promoted was
         // witnessed, and admitted.
         for served in result.served.iter().skip(1) {
@@ -2774,8 +2786,9 @@ fn a_disagreeing_candidate_ahead_in_its_rounds_is_witnessed_and_excluded() {
                 }
                 6 => {
                     slow += 1;
-                    slow_witnessed +=
-                        usize::from(disagreeing_candidate_is_not_served(&result, record, &device));
+                    slow_witnessed += usize::from(disagreeing_candidate_is_not_served(
+                        &result, record, &device,
+                    ));
                 }
                 pace => {
                     // The default's numerics: measured, and admitted where
@@ -2895,9 +2908,10 @@ fn measurement_identity_covers_the_comparison_and_no_alpha() {
         let shared = |left: &seismic::TuningResult, right: &seismic::TuningResult| {
             let mut biased = false;
             for observation in &left.observations {
-                let other = right.observations.iter().find(|other| {
-                    other.point == observation.point && other.key == observation.key
-                });
+                let other = right
+                    .observations
+                    .iter()
+                    .find(|other| other.point == observation.point && other.key == observation.key);
                 if let Some(other) = other {
                     assert_eq!(observation, other, "{:?}", device.backend());
                     biased |= observation.key.values.get("BIAS") == Some(&1);
@@ -3119,7 +3133,10 @@ fn stray_writes_are_observed_where_declared(device: Device) {
         "a point observed whole rejects the stray write"
     );
     assert!(
-        matches!(stray(Guard::Whole, anything.clone()), Outcome::Measured { .. }),
+        matches!(
+            stray(Guard::Whole, anything.clone()),
+            Outcome::Measured { .. }
+        ),
         "a point that declares no rows holds every row to the requirement alone"
     );
     for requirement in [exact, anything] {

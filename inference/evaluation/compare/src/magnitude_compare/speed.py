@@ -53,9 +53,11 @@ def sample_spread(samples: list[float]) -> float:
 
 
 def entry_times(cell: dict) -> dict[str, float]:
-    """Device milliseconds per step of each attributed entry, its launches summed."""
+    """Device milliseconds per step of each attributed entry, its launches summed; none for
+    a cell measured without attribution (a prefill cell, or a run without attribution steps)."""
     times: dict[str, float] = defaultdict(float)
-    for row in cell["detail"]["attribution"]["entries"]:
+    attribution = (cell.get("detail") or {}).get("attribution") or {}
+    for row in attribution.get("entries", []):
         times[row["entry"].split("#")[0]] += row["device_ms_per_step"]
     return times
 

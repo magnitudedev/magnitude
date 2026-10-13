@@ -47,8 +47,9 @@ Native invocation reuses the checked entry contract and public tensor runtime bu
 selection, retry, or fallback. Its only search is tuning, fast enough to run at program
 preparation; [native tuning](../../inference/docs/tuning.md) describes its lifecycle and ownership.
 Native tuning separates the immutable served numerical contract from a
-representative performance objective. Point weights are invocation demand; candidate cost is
-expected elapsed work `Σ demand × median`, normalized by the same canonical service. Row
+representative performance objective. Point weights express consumer-owned workload demand,
+including its measured baseline normalization; candidate cost is `Σ weight × median`,
+normalized by the same canonical service. Row
 classes identify physical regions, not independent normalization scales. Missing measurements
 remain unknown; discovery never transfers their demand to a cheaper measured region.
 
@@ -75,8 +76,11 @@ accumulate a tuning budget.
 
 Representative discovery is an explicit pending operation. Its selected points may include a
 zero-demand bootstrap for pricing; numerical `required` membership does not imply mandatory
-benchmarking. Unknown discovery receives a fair portion of the existing remaining minute.
-Once all selected representatives are measured, the objective is frozen. Bounded Run opening
+benchmarking. Unknown discovery shares the existing remaining minute by elapsed effort, without fabricated
+latency estimates. Candidate search begins after the consumer's baseline is complete. The
+consumer may then normalize weights once using measured baseline totals, before any candidate;
+after that the objective is frozen. Every selected point participates in candidate comparisons;
+short-point timings never substitute for long-point measurements. Bounded Run opening
 transports those exact default measurements and the prepared canonical artifact, performs
 cancellable planning, and evaluates no optional candidate.
 

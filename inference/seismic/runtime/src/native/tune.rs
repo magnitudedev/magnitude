@@ -22,16 +22,6 @@
 //! submissions and witnesses, retaining completed evidence when work is
 //! interrupted. Expiry is neither a numerical nor an execution rejection.
 
-use super::plan::{self, PointShape};
-use super::deadline::{Deadline, WorkError};
-use super::sampling::{Rates, Sequence, Shuffle, Tally, Verdict};
-use super::search::{Cost, ParameterValues, PointKey, SearchSettings};
-use super::timing::{self, OutputPool, PointPrices, PointTiming};
-pub use super::timing::{
-    Footprint, Linear, Observed, Quote, Raise, RaiseOutcome, SustainedClock,
-};
-pub use seismic_native_target::process::{return_freed_pages, ProcessMemory};
-pub use seismic_native_target::workers::{Narrowed, Workers};
 pub use super::admission::{
     Constraint, GOVERNING_STEP, GoverningStep, NumericalObservation, NumericalRequirement,
     Reselection, Violation, admit, governing_ratio, reselect,
@@ -39,6 +29,12 @@ pub use super::admission::{
 pub use super::comparison::{
     COMPARISON_VERSION, Difference, StepPower, SubjectComparison, SubjectMeasurement,
 };
+use super::deadline::{Deadline, WorkError};
+use super::plan::{self, PointShape};
+use super::sampling::{Rates, Sequence, Shuffle, Tally, Verdict};
+use super::search::{Cost, ParameterValues, PointKey, SearchSettings};
+use super::timing::{self, OutputPool, PointPrices, PointTiming};
+pub use super::timing::{Footprint, Linear, Observed, Quote, Raise, RaiseOutcome, SustainedClock};
 use super::validation::{PreparedPoint, Validator};
 use super::{
     FormationClass, HeldPrograms, MeasureOptions, NativePrepared, Rendered, median, median_of,
@@ -51,6 +47,8 @@ use seismic_lang::checked::{CheckedModule, NativeImplementation, NativeSpecializ
 use seismic_lang::entry::{ElementBindings, LogicalEntry, ParameterKind, TensorAccess};
 use seismic_lang::expr::SymbolValue;
 use seismic_lang::ids::EntryId;
+pub use seismic_native_target::process::{ProcessMemory, return_freed_pages};
+pub use seismic_native_target::workers::{Narrowed, Workers};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -643,12 +641,12 @@ pub struct Work {
     /// device, so a caller may run it ahead of the rest while the device
     /// does other work ([`UnitSearch::forming`]).
     pub forming: Quote,
-    /// The share of the unit's default service the work is expected to
-    /// recover. A lead ([`Stage::Promote`]): what it measured. A challenger
-    /// ([`Stage::Measure`]): what the unit still costs, times the chance
-    /// that one more measured configuration is the fastest of them all,
-    /// one in their number. Discovery recovers nothing itself.
-    pub gain: f64,
+    /// Recoverable service relative to the unit's default. A lead
+    /// ([`Stage::Promote`]): what it measured. A challenger
+    /// ([`Stage::Measure`]): its remaining measured cost, an upper bound
+    /// on recoverable service, not an expected gain. Discovery has no
+    /// measured service yet and is scheduled separately.
+    pub opportunity: f64,
     /// The bytes the work adds, at its most, to what is held when it
     /// starts: the inputs it has built that are not resident, and what its
     /// own operations hold while they run.
@@ -1323,7 +1321,10 @@ impl UnitSearch<'_, '_> {
             let price = self.formation_price.lock().expect("formation price lock");
             let canonical = price.canonical.as_secs_f64();
             let formed = price.of(formative, &toolchain);
-            owed.add(Some(formed.map_or(canonical, |formed| formed.max(canonical))), 1);
+            owed.add(
+                Some(formed.map_or(canonical, |formed| formed.max(canonical))),
+                1,
+            );
         }
         owed
     }
@@ -1939,7 +1940,11 @@ impl timing::Rounds for Matched<'_> {
             }
         }
         let error_rate = self.settings.error_rate;
-        for pairing in self.pairings.iter_mut().filter(|pairing| pairing.admitted > 0) {
+        for pairing in self
+            .pairings
+            .iter_mut()
+            .filter(|pairing| pairing.admitted > 0)
+        {
             let cost = pairing
                 .terms
                 .iter()
@@ -2173,7 +2178,11 @@ fn measure_matched(
                 .iter()
                 .map(|slot| (*slot, canonical(slots[*slot].0)))
                 .collect::<Vec<_>>();
-            let fresh = |point: usize| sampled[candidate].iter().any(|slot| slots[*slot].0 == point);
+            let fresh = |point: usize| {
+                sampled[candidate]
+                    .iter()
+                    .any(|slot| slots[*slot].0 == point)
+            };
             let apart = (0..points.len())
                 .filter(|point| measured[candidate][*point].key != incumbent.points[*point].key)
                 .filter(|point| !fresh(*point))
@@ -2257,7 +2266,11 @@ fn measure_matched(
     }
     // What a challenger's part of the rounds took: the session's, shared
     // among the challengers it sampled.
-    let took = rounds.pairings.iter().filter(|pairing| pairing.taken > 0).count();
+    let took = rounds
+        .pairings
+        .iter()
+        .filter(|pairing| pairing.taken > 0)
+        .count();
     let each = sampling.elapsed().as_secs_f64() / took.max(1) as f64;
     for (failure, pairing) in failures.iter().zip(&rounds.pairings) {
         if admission.is_some() && pairing.taken > 0 && failure.is_none() {
@@ -2470,8 +2483,11 @@ impl plan::Domain for Declared<'_> {
         baseline: &PointKey,
         specialization: &NativeSpecialization,
     ) -> PointKey {
-        self.keying
-            .key(self.implementation, baseline.launches.clone(), specialization)
+        self.keying.key(
+            self.implementation,
+            baseline.launches.clone(),
+            specialization,
+        )
     }
 }
 
@@ -2839,7 +2855,14 @@ impl Ledger {
         evidence: Tally,
     ) {
         let artifact = kernel.artifact().0.clone();
-        self.record(specialization, artifact, Some(kernel), points, cost, evidence);
+        self.record(
+            specialization,
+            artifact,
+            Some(kernel),
+            points,
+            cost,
+            evidence,
+        );
     }
 
     /// Record a configuration measured and admitted at the timed points
@@ -2884,9 +2907,7 @@ impl Ledger {
     fn rank(&mut self, configuration: &Configuration) {
         let incumbent = self.incumbent();
         let contender = &self.contenders[configuration];
-        let verdict = self
-            .evidence(contender)
-            .verdict(self.settings.error_rate);
+        let verdict = self.evidence(contender).verdict(self.settings.error_rate);
         let total = Total(contender.cost.total());
         match verdict {
             Some(Verdict::Trails) => {
@@ -2954,7 +2975,10 @@ impl Ledger {
             ..
         } = self;
         holding.retain(|configuration| {
-            let held = leaders.iter().flatten().any(|leader| leader == configuration);
+            let held = leaders
+                .iter()
+                .flatten()
+                .any(|leader| leader == configuration);
             if !held {
                 contenders
                     .get_mut(configuration)
@@ -3646,7 +3670,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             Progress::Discovering(_) => None,
         };
         searching
-            .or_else(|| self.measurer.as_ref().and_then(|measurer| measurer.clock.as_ref()))
+            .or_else(|| {
+                self.measurer
+                    .as_ref()
+                    .and_then(|measurer| measurer.clock.as_ref())
+            })
             .map_or_else(Vec::new, |clock| clock.raises())
     }
 
@@ -3804,8 +3832,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// What the unit's held programs hold, as forming them was observed to
     /// add: what giving them up is taken to give back.
     pub fn held_programs(&self) -> u64 {
-        self.program_price()
-            .map_or(0, |price| (price * self.programs_held() as f64).ceil() as u64)
+        self.program_price().map_or(0, |price| {
+            (price * self.programs_held() as f64).ceil() as u64
+        })
     }
 
     /// Give up the programs the unit's search holds. A piece that follows
@@ -4000,9 +4029,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 // there are operations of classes first observed by this
                 // very work; discovering the last point also plans the
                 // search.
-                let last = (index + 1..self.specs.len()).all(|later| {
-                    !discovery_selected(&self.specs, later) || slots[later].is_some()
-                });
+                let last = (index + 1..self.specs.len())
+                    .all(|later| !discovery_selected(&self.specs, later) || slots[later].is_some());
                 let mut footprint = Footprint::default();
                 footprint.add(most_bytes(&self.resident_bytes[index]), 1);
                 Some(Work {
@@ -4012,7 +4040,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                         unpriced: 2 + usize::from(last),
                     },
                     forming: Quote::default(),
-                    gain: 0.,
+                    opportunity: 0.,
                     footprint,
                 })
             }
@@ -4031,30 +4059,23 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                             .promotion_quote(searching, incumbent, leader)
                             .and(rebuilding),
                         forming: Quote::default(),
-                        gain: incumbent.cost.total() - leader.cost.total(),
+                        opportunity: incumbent.cost.total() - leader.cost.total(),
                         footprint: conversion,
                     });
                 }
-                // A nominal lead holds with the chance this unit's
-                // conversions have shown: of `n` with `s` promoted, the
-                // next succeeds with (s + 1) / (n + 2), were they
-                // exchangeable.
+                // A nominal lead is an observed possible saving. No
+                // probability of success is inferred from other candidates.
                 let ledger = &searching.ledger;
-                let confirm = ledger.nominal().map(|(leader, lead)| {
-                    Work {
-                        stage: Stage::Confirm,
-                        quote: self
-                            .promotion_quote(searching, incumbent, &ledger.contenders[leader])
-                            .and(rebuilding),
-                        forming: Quote::default(),
-                        gain: lead * (ledger.promotions + 1) as f64
-                            / (ledger.conversions + 2) as f64,
-                        footprint: conversion,
-                    }
+                let confirm = ledger.nominal().map(|(leader, lead)| Work {
+                    stage: Stage::Confirm,
+                    quote: self
+                        .promotion_quote(searching, incumbent, &ledger.contenders[leader])
+                        .and(rebuilding),
+                    forming: Quote::default(),
+                    opportunity: lead,
+                    footprint: conversion,
                 });
-                // Were the configurations measured exchangeable, each of
-                // the piece's challengers would be the fastest of all with
-                // the same chance as every one measured before it.
+                // Exploration can recover no more than the incumbent costs.
                 let structural = searching.run.search.structural;
                 let measure = searching.planned.as_ref().map(|piece| {
                     let challengers = piece.challengers().len();
@@ -4087,12 +4108,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                         forming: self
                             .formation()
                             .quote(&self.compiled_ahead(searching, piece)),
-                        // Every configuration the unit reached counts,
-                        // excluded ones too: each was a challenger that
-                        // did not lead, and the next one's chance falls
-                        // with their number.
-                        gain: incumbent.cost.total() * challengers as f64
-                            / (ledger.order.len() + challengers) as f64,
+                        // Remaining measured cost, an opportunity ceiling rather
+                        // than a prediction of the next configuration's gain.
+                        opportunity: incumbent.cost.total(),
                         footprint,
                     }
                 });
@@ -4105,7 +4123,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 // price, an unpriced operation taken as in its admission.
                 let longest = self.longest_operation().as_secs_f64();
                 let rate = |work: &Work| {
-                    work.gain
+                    work.opportunity
                         / (work.quote.priced.as_secs_f64() + longest * work.quote.unpriced as f64)
                             .max(f64::MIN_POSITIVE)
                 };
@@ -4230,7 +4248,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             .iter()
             .map(|point| point.prices().placement.price())
             .collect::<Vec<_>>();
-        quote = quote.and(searching.admission.quote(&run.sequence, &placements, admissions));
+        quote = quote.and(
+            searching
+                .admission
+                .quote(&run.sequence, &placements, admissions),
+        );
         for (point, (first, further)) in sampled {
             let price = searching.points[point].prices().sample.price();
             quote.add(price, first);
@@ -4303,8 +4325,8 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
                 .iter()
                 .filter_map(|index| self.checks[*index].price())
                 .collect::<Vec<_>>();
-            let nearest =
-                (!observed.is_empty()).then(|| observed.iter().sum::<f64>() / observed.len() as f64);
+            let nearest = (!observed.is_empty())
+                .then(|| observed.iter().sum::<f64>() / observed.len() as f64);
             let mut unseen = 0;
             for index in &searching.untimed {
                 match self.checks[*index].price().or(nearest) {
@@ -4675,9 +4697,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
 
     /// Plan the next challenger work of `searching`.
     fn replan(&self, searching: &mut Searching<'a>) -> Result<(), TuneError> {
-        let Run {
-            search, keying, ..
-        } = &mut searching.run;
+        let Run { search, keying, .. } = &mut searching.run;
         // Planning asks the declared domain for assignments, admissible or
         // not, and what it takes follows how many it asks: observed as one
         // call with its requests, the class the next piece's planning is
@@ -4842,7 +4862,10 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let began = Instant::now();
             let served = ledger.incumbent();
             let (served_kernel, served_points) = (
-                served.kernel.clone().expect("the served choice holds its kernel"),
+                served
+                    .kernel
+                    .clone()
+                    .expect("the served choice holds its kernel"),
                 served.points.clone(),
             );
             // Nothing is reused: every point that tells the two apart is
@@ -4968,7 +4991,9 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
     /// at every instant from [`UnitSearch::prepare_defaults`] on.
     pub fn terminal(&self) -> Result<TuningResult, TuneError> {
         let ground = self.ground.as_ref().ok_or_else(|| {
-            TuneError::Declaration("canonical defaults were not prepared before their record".into())
+            TuneError::Declaration(
+                "canonical defaults were not prepared before their record".into(),
+            )
         })?;
         let mut time = self.time.clone();
         time.reference_seconds = ground.validator.reference_seconds();
@@ -5036,6 +5061,44 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         Ok(result)
     }
 
+    /// Change objective weights after baseline discovery and before any candidate.
+    /// Every later comparison uses this same measured cohort and frozen objective.
+    pub fn reweigh(&mut self, weights: &[f64]) -> bool {
+        let Progress::Searching(searching) = &mut self.progress else {
+            return false;
+        };
+        if searching.ledger.order.len() > 1
+            || weights.len() != self.specs.len()
+            || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < 0.)
+        {
+            return false;
+        }
+        for (spec, weight) in self.specs.iter_mut().zip(weights) {
+            spec.weight = *weight;
+        }
+        for (point, index) in searching.points.iter_mut().zip(&searching.timed) {
+            point.reweigh(weights[*index]);
+        }
+        searching.run.search.weights = searching.points.iter().map(|point| point.weight).collect();
+        let cost = Weighing::of(&searching.points).cost(&searching.canonical, &searching.canonical);
+        let incumbent = searching.ledger.incumbent.clone();
+        searching
+            .ledger
+            .contenders
+            .get_mut(&incumbent)
+            .expect("incumbent exists")
+            .cost = cost;
+        self.offered.set(None);
+        true
+    }
+
+    /// All selected baseline points have been measured.
+    pub fn discovered(&self) -> bool {
+        matches!(self.progress, Progress::Searching(_))
+    }
+
     /// The defaults' measurements at the points discovered so far: what
     /// the unit's default service is known to take.
     pub fn service_measurements(&self) -> Vec<PointMeasurement> {
@@ -5076,7 +5139,11 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
             let partition =
                 plan::partition(implementation, &self.statics, shapes).map_err(planning)?;
             let keying = Keying::Launches(partition.boundary.clone());
-            (partition, keying, Programs::Launches(LaunchPrograms::default()))
+            (
+                partition,
+                keying,
+                Programs::Launches(LaunchPrograms::default()),
+            )
         } else {
             let (unserved, points) = unserved_parameters(implementation, &self.statics, shapes)?;
             let parameters = implementation
@@ -5099,8 +5166,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         };
         // The defaults' measurement, keyed as the search keys its own.
         for measured in &mut canonical {
-            measured.key =
-                keying.key(implementation, measured.key.launches.clone(), &self.default);
+            measured.key = keying.key(implementation, measured.key.launches.clone(), &self.default);
         }
         // A point with the same active launches and parameters runs the
         // same work under every candidate: its measurement is reused. A
@@ -5168,10 +5234,7 @@ impl<'m, 'a> UnitSearch<'m, 'a> {
         plan: SurveyPlan,
     ) -> Result<TuningResult, TuneError> {
         self.prepare_defaults(source)?;
-        let ground = self
-            .ground
-            .take()
-            .expect("the defaults were just prepared");
+        let ground = self.ground.take().expect("the defaults were just prepared");
         // A survey builds and times every point whatever it costs.
         let records = point_records(&self.specs);
         let mut points = Vec::with_capacity(self.specs.len());
@@ -5414,9 +5477,11 @@ impl Programs {
                 },
             ));
             match (&mut *self, call.formable, call.product) {
-                (Self::Launches(programs), Formable::Launches(sources), Product::Launches(held)) => {
-                    programs.hold(sources, held)?
-                }
+                (
+                    Self::Launches(programs),
+                    Formable::Launches(sources),
+                    Product::Launches(held),
+                ) => programs.hold(sources, held)?,
                 (
                     Self::Whole(programs),
                     Formable::Program(specialization),
@@ -5649,9 +5714,8 @@ impl LaunchPrograms {
         sources: Vec<plan::LaunchSource>,
         held: Result<HeldPrograms, String>,
     ) -> Result<(), TuneError> {
-        let held = Rc::new(
-            held.map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(error)))?,
-        );
+        let held =
+            Rc::new(held.map_err(|error| TuneError::DefaultUnusable(Exclusion::Formation(error)))?);
         for source in sources {
             self.formed.extend(
                 source
@@ -5724,7 +5788,11 @@ fn coverage_order(
         .map(|group| coordinate_starts(domain, group, base))
         .collect::<Result<Vec<_>, _>>()?;
     Ok((0..starts.iter().map(Vec::len).max().unwrap_or(0))
-        .flat_map(|round| starts.iter().filter_map(move |starts| starts.get(round).cloned()))
+        .flat_map(|round| {
+            starts
+                .iter()
+                .filter_map(move |starts| starts.get(round).cloned())
+        })
         .collect())
 }
 
@@ -6038,11 +6106,15 @@ impl GroupSearch {
             .partition
             .boundary_values
             .iter()
-            .fold(1u128, |product, values| product.saturating_mul(values.len() as u128));
+            .fold(1u128, |product, values| {
+                product.saturating_mul(values.len() as u128)
+            });
         self.partition
             .groups
             .iter()
-            .fold(boundary, |product, group| product.saturating_mul(group.declared()))
+            .fold(boundary, |product, group| {
+                product.saturating_mul(group.declared())
+            })
     }
 
     /// Whether the search has asked for everything its order reaches and
@@ -6102,7 +6174,8 @@ impl GroupSearch {
                 .zip(&self.weights)
                 .enumerate()
                 .all(|(point, (measured, weight))| {
-                    *weight <= 0. || domain.forecast(point, &measured.key, candidate) == measured.key
+                    *weight <= 0.
+                        || domain.forecast(point, &measured.key, candidate) == measured.key
                 })
     }
 
@@ -6115,7 +6188,12 @@ impl GroupSearch {
             .partition
             .boundary
             .iter()
-            .chain(self.partition.groups.iter().flat_map(|group| &group.parameters))
+            .chain(
+                self.partition
+                    .groups
+                    .iter()
+                    .flat_map(|group| &group.parameters),
+            )
             .collect::<Vec<_>>();
         let mut hints = Vec::new();
         for hint in &self.start {
@@ -6198,7 +6276,6 @@ impl GroupSearch {
             ahead: ahead.to_vec(),
         });
     }
-
 }
 
 impl Run {
@@ -6268,7 +6345,10 @@ impl Run {
         // configurations at every point, from the defaults'.
         let served = ledger.incumbent();
         let (served_kernel, served_points) = (
-            served.kernel.clone().expect("the served choice holds its kernel"),
+            served
+                .kernel
+                .clone()
+                .expect("the served choice holds its kernel"),
             served.points.clone(),
         );
         let (affected, baseline) = match &group {
@@ -6376,7 +6456,9 @@ impl GroupSearch {
                 sequence,
             ),
             Some(None) => {}
-            None => sweep.pending.push((sequence, configuration, specialization)),
+            None => sweep
+                .pending
+                .push((sequence, configuration, specialization)),
         }
     }
 
@@ -6416,7 +6498,9 @@ impl GroupSearch {
                     sequence,
                 ),
                 Some(None) => {}
-                None => sweep.pending.push((sequence, configuration, specialization)),
+                None => sweep
+                    .pending
+                    .push((sequence, configuration, specialization)),
             }
         }
         let wanted = SWEEP_CHUNK + SWEEP_AHEAD;
@@ -6448,7 +6532,9 @@ impl GroupSearch {
                         .map(|(leader, cost, _)| (leader.clone(), *cost))
                         .collect::<Vec<_>>();
                     leaders.sort_by(|left, right| {
-                        left.1.total_cmp(&right.1).then_with(|| left.0.cmp(&right.0))
+                        left.1
+                            .total_cmp(&right.1)
+                            .then_with(|| left.0.cmp(&right.0))
                     });
                     let leaders = leaders
                         .into_iter()
@@ -6647,19 +6733,20 @@ impl GroupSearch {
             self.reference.clone(),
             self.seed.clone(),
         )];
-        let lead = |bases: &mut Vec<(f64, Vec<u64>, Vec<PointMeasurement>, NativeSpecialization)>,
-                    default_boundary: &[u64]| {
-            bases.sort_by(|left, right| left.0.total_cmp(&right.0));
-            if let Some(default_index) = bases
-                .iter()
-                .position(|(_, boundary, _, _)| boundary == default_boundary)
-            {
-                if bases[default_index].0 <= bases[0].0 * 1.01 {
-                    let preferred = bases.remove(default_index);
-                    bases.insert(0, preferred);
+        let lead =
+            |bases: &mut Vec<(f64, Vec<u64>, Vec<PointMeasurement>, NativeSpecialization)>,
+             default_boundary: &[u64]| {
+                bases.sort_by(|left, right| left.0.total_cmp(&right.0));
+                if let Some(default_index) = bases
+                    .iter()
+                    .position(|(_, boundary, _, _)| boundary == default_boundary)
+                {
+                    if bases[default_index].0 <= bases[0].0 * 1.01 {
+                        let preferred = bases.remove(default_index);
+                        bases.insert(0, preferred);
+                    }
                 }
-            }
-        };
+            };
         // The boundaries one parameter from the leading base, again from
         // each base that takes the lead, until the leader's are all asked.
         let mut expanded = BTreeSet::<Vec<u64>>::new();
@@ -6773,8 +6860,7 @@ impl GroupSearch {
                             .iter()
                             .map(|(_, _, specialization)| specialization.clone())
                             .collect::<Vec<_>>();
-                        let (ready, rest) =
-                            pending.split_at(pending.len().min(SWEEP_CHUNK));
+                        let (ready, rest) = pending.split_at(pending.len().min(SWEEP_CHUNK));
                         self.propose_sweep(group_index, &baseline, ready, rest);
                     }
                     choices[group_index] = sweep.best.0.clone();
@@ -7130,9 +7216,7 @@ impl Tuned<'_> {
             })
             .min_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(index, _)| records[index].configuration.specialization())
-            .ok_or_else(|| {
-                TuneError::Reference("no measured configuration is admitted".into())
-            })?;
+            .ok_or_else(|| TuneError::Reference("no measured configuration is admitted".into()))?;
         time.validating_seconds += points.iter().map(|p| p.validation_seconds()).sum::<f64>();
         let mut served = vec![Configuration::of(self.default)];
         if Configuration::of(&chosen) != served[0] {
@@ -7372,7 +7456,10 @@ mod tests {
         let read_fast = recorded.compared(1, at(1, 0.6), tally(1, 0));
         assert_eq!(recorded.ledger.leader(), None);
         assert_eq!(
-            recorded.ledger.nominal().map(|(nominal, _)| nominal.clone()),
+            recorded
+                .ledger
+                .nominal()
+                .map(|(nominal, _)| nominal.clone()),
             Some(read_fast.clone())
         );
         // Six rounds ahead resolve nothing at one in twenty; seven do.
@@ -7387,7 +7474,10 @@ mod tests {
             ContenderStanding::Trailing
         );
         assert_eq!(
-            recorded.ledger.nominal().map(|(nominal, _)| nominal.clone()),
+            recorded
+                .ledger
+                .nominal()
+                .map(|(nominal, _)| nominal.clone()),
             Some(read_fast.clone())
         );
         // The resolved leader is promoted. The rounds of the others were
@@ -7402,9 +7492,18 @@ mod tests {
         assert_eq!(ledger.leader(), None);
         // Their measured costs still rank them: the cheapest is the
         // nominal lead, and the one that trailed stays dropped.
-        assert_eq!(ledger.nominal().map(|(nominal, _)| nominal.clone()), Some(stale));
-        assert_eq!(ledger.contenders[&six].standing, ContenderStanding::Measured);
-        assert_eq!(ledger.contenders[&trailing].standing, ContenderStanding::Trailing);
+        assert_eq!(
+            ledger.nominal().map(|(nominal, _)| nominal.clone()),
+            Some(stale)
+        );
+        assert_eq!(
+            ledger.contenders[&six].standing,
+            ContenderStanding::Measured
+        );
+        assert_eq!(
+            ledger.contenders[&trailing].standing,
+            ContenderStanding::Trailing
+        );
     }
 
     /// The leader owed its conversion is the cheapest measured challenger
@@ -7486,7 +7585,10 @@ mod tests {
         let gains = [0.019, 0.005, 0.012, 0.008, 0.015, 0.01, 0.006];
         for (round, gain) in gains.iter().enumerate() {
             assert_eq!(rounds.next(), vec![vec![1, 0]], "admitted round {round}");
-            assert_eq!(rounds.pairings[0].evidence.verdict(settings.error_rate), None);
+            assert_eq!(
+                rounds.pairings[0].evidence.verdict(settings.error_rate),
+                None
+            );
             rounds.sampled(&[(1, 2e-3), (0, 2e-3 * (1. - gain))]);
         }
         let pairing = &rounds.pairings[0];
@@ -7506,7 +7608,10 @@ mod tests {
         let read = recorded.compared(1, at(1), tally(1, 0));
         assert_eq!(recorded.ledger.leader(), None);
         assert_eq!(
-            recorded.ledger.nominal().map(|(nominal, _)| nominal.clone()),
+            recorded
+                .ledger
+                .nominal()
+                .map(|(nominal, _)| nominal.clone()),
             Some(read)
         );
         let resolved = recorded.compared(2, at(2), evidence);
@@ -7645,7 +7750,10 @@ mod tests {
         let Some(Piece::Whole(first)) = search.plan(&domain).unwrap() else {
             panic!("the first piece is the coverage");
         };
-        assert_eq!(first.iter().map(changed).collect::<Vec<_>>(), [0, 1, 0, 1, 0, 1]);
+        assert_eq!(
+            first.iter().map(changed).collect::<Vec<_>>(),
+            [0, 1, 0, 1, 0, 1]
+        );
     }
 
     /// The rule for what is not worth forming is one rule under either
@@ -7671,7 +7779,13 @@ mod tests {
         let parameters = implementation
             .params
             .iter()
-            .map(|parameter| (parameter.name.clone(), parameter.values.clone(), parameter.form))
+            .map(|parameter| {
+                (
+                    parameter.name.clone(),
+                    parameter.values.clone(),
+                    parameter.form,
+                )
+            })
             .collect::<Vec<_>>();
         let reference = [0usize, 1]
             .map(|launch| PointMeasurement {
@@ -7846,7 +7960,11 @@ mod tests {
         let seed = implementation.default_specialization(&statics).unwrap();
         let rows = [1u64, 2, 4];
         let partition = plan::partition(&implementation, &statics, &shapes(&rows)).unwrap();
-        assert_eq!(partition.boundary.len(), 1, "FROM only moves the row band's edge");
+        assert_eq!(
+            partition.boundary.len(),
+            1,
+            "FROM only moves the row band's edge"
+        );
         assert_eq!(partition.groups.len(), 2);
         let keying = launches(&partition);
         let measurements = |specialization: &NativeSpecialization| {
@@ -7885,14 +8003,20 @@ mod tests {
         );
         let mut pieces = 0;
         while let Some(piece) = search.plan(&domain).unwrap() {
-            assert!(!search.exhausted(), "a search that names a piece has work left");
+            assert!(
+                !search.exhausted(),
+                "a search that names a piece has work left"
+            );
             pieces += 1;
             assert!(pieces < 1000, "the search names pieces without end");
             for challenger in piece.challengers() {
                 search.record(challenger, Some(measurements(challenger)));
             }
         }
-        assert!(search.exhausted(), "planning names nothing only at the search's end");
+        assert!(
+            search.exhausted(),
+            "planning names nothing only at the search's end"
+        );
         // The sweeps ran: the domain was asked past the bases and coverage.
         assert!(search.requests > 0);
         assert!(
@@ -7938,7 +8062,11 @@ mod tests {
         assert_eq!(sweep.leaders[&group.form(&[3])].0, [3]);
         sweep.rank(group, vec![1], 0.9, 4);
         assert_eq!(sweep.leaders[&group.form(&[3])].0, [3]);
-        assert_eq!(sweep.best.0, [1], "the lower assignment of equals other than the seed");
+        assert_eq!(
+            sweep.best.0,
+            [1],
+            "the lower assignment of equals other than the seed"
+        );
     }
 
     /// What a search of [`searched`] did.
@@ -8000,7 +8128,11 @@ mod tests {
                     .params
                     .iter()
                     .map(|parameter| {
-                        (parameter.name.clone(), parameter.values.clone(), parameter.form)
+                        (
+                            parameter.name.clone(),
+                            parameter.values.clone(),
+                            parameter.form,
+                        )
                     })
                     .collect::<Vec<_>>();
                 (
@@ -8009,8 +8141,7 @@ mod tests {
                 )
             }
             None => {
-                let partition =
-                    plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
+                let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
                 let keying = launches(&partition);
                 (partition, keying)
             }
@@ -8021,13 +8152,17 @@ mod tests {
                 .iter()
                 .map(|address| match address {
                     plan::ParameterAddress::Entry(name)
-                    | plan::ParameterAddress::Launch { name, .. } => {
-                        (name[1..].parse::<usize>().unwrap(), address.value(specialization))
-                    }
+                    | plan::ParameterAddress::Launch { name, .. } => (
+                        name[1..].parse::<usize>().unwrap(),
+                        address.value(specialization),
+                    ),
                 })
                 .collect::<Vec<_>>();
             values.sort_unstable();
-            values.into_iter().map(|(_, value)| value).collect::<Vec<_>>()
+            values
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect::<Vec<_>>()
         };
         let measurement = |specialization: &NativeSpecialization| {
             let values = values(specialization);
@@ -8044,8 +8179,13 @@ mod tests {
             implementation: &implementation,
             keying: &keying,
         };
-        let mut search =
-            GroupSearch::new(partition, seed.clone(), reference.clone(), vec![1.], Vec::new());
+        let mut search = GroupSearch::new(
+            partition,
+            seed.clone(),
+            reference.clone(),
+            vec![1.],
+            Vec::new(),
+        );
         let mut best = (values(&seed), reference[0].median_seconds, 0);
         let mut structural = Vec::new();
         let mut count = 0;
@@ -8079,8 +8219,8 @@ mod tests {
     #[test]
     fn the_dense_output_search_reaches_the_packing_form_first() {
         // The engine's kernel sources as its build loads them.
-        let kernels = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../engine/kernels/kernels");
+        let kernels =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../engine/kernels/kernels");
         let module = seismic_lang::source::load(&[kernels], seismic_std::sources())
             .unwrap_or_else(|_| panic!("the engine's kernel sources load"))
             .module;
@@ -8199,7 +8339,10 @@ mod tests {
             .swept
             .iter()
             .filter_map(|(configuration, measured)| {
-                Some((configuration, weighing.cost(measured.as_ref()?, &reference).total()))
+                Some((
+                    configuration,
+                    weighing.cost(measured.as_ref()?, &reference).total(),
+                ))
             })
             .min_by(|left, right| left.1.total_cmp(&right.1))
             .unwrap()
@@ -8272,7 +8415,11 @@ mod tests {
         let forms = 6;
         let began = Instant::now();
         let searched = searched(20, &better, Some(forms));
-        assert!(began.elapsed() < Duration::from_secs(60), "{:?}", began.elapsed());
+        assert!(
+            began.elapsed() < Duration::from_secs(60),
+            "{:?}",
+            began.elapsed()
+        );
         assert_eq!(
             searched.reached,
             (0..20)
@@ -8282,7 +8429,11 @@ mod tests {
         // The first piece is the other forms' representatives, and no
         // later one is.
         assert!(searched.structural[0]);
-        assert!(searched.structural[1..].iter().all(|structural| !structural));
+        assert!(
+            searched.structural[1..]
+                .iter()
+                .all(|structural| !structural)
+        );
         let search = &searched.search;
         let group = &search.partition.groups[0];
         let seed = group.assignment(&search.seed);
@@ -8347,7 +8498,11 @@ mod tests {
     impl Recorded {
         /// Record challenger `challenger`, measured at `measured`, whose
         /// rounds beside the served choice resolved nothing.
-        fn challenge(&mut self, challenger: usize, measured: Vec<PointMeasurement>) -> Configuration {
+        fn challenge(
+            &mut self,
+            challenger: usize,
+            measured: Vec<PointMeasurement>,
+        ) -> Configuration {
             self.compared(challenger, measured, Tally::default())
         }
 
@@ -8519,7 +8674,10 @@ mod tests {
         let agrees = |ledger: &Ledger| {
             let (leader, nominal, _) = afresh(ledger);
             assert_eq!(ledger.leader().cloned(), leader);
-            assert_eq!(ledger.nominal().map(|(nominal, _)| nominal.clone()), nominal);
+            assert_eq!(
+                ledger.nominal().map(|(nominal, _)| nominal.clone()),
+                nominal
+            );
         };
         let (mut conversions, mut promotions, mut leads) = (0, 0, 0);
         for challenger in 1..=400 {
@@ -8570,13 +8728,21 @@ mod tests {
             ledger.release();
             agrees(ledger);
             if !promoted {
-                assert_eq!(ledger.contenders[&leader].standing, ContenderStanding::Trailing);
+                assert_eq!(
+                    ledger.contenders[&leader].standing,
+                    ContenderStanding::Trailing
+                );
             }
         }
         assert!(leads > 20, "the challengers do lead: {leads}");
-        assert!(conversions >= 3 && promotions >= 2, "{conversions} {promotions}");
+        assert!(
+            conversions >= 3 && promotions >= 2,
+            "{conversions} {promotions}"
+        );
         // Changed settings rank them again.
-        recorded.ledger.settings(&SearchSettings { error_rate: 0.01 });
+        recorded
+            .ledger
+            .settings(&SearchSettings { error_rate: 0.01 });
         agrees(&recorded.ledger);
     }
 
@@ -8608,17 +8774,17 @@ mod tests {
                 .join(", "),
             names.join(" * "),
         ));
-        let measurement =
-            move |implementation: &NativeImplementation, specialization: &NativeSpecialization| {
-                let sum = names
-                    .iter()
-                    .map(|name| specialization.launch_param(0, name).unwrap())
-                    .sum::<u64>();
-                PointMeasurement {
-                    key: launch_key(implementation, &[], vec![0], specialization),
-                    ..measured((parameters as u64 * values + 1 - sum) as f64, 0.)
-                }
-            };
+        let measurement = move |implementation: &NativeImplementation,
+                                specialization: &NativeSpecialization| {
+            let sum = names
+                .iter()
+                .map(|name| specialization.launch_param(0, name).unwrap())
+                .sum::<u64>();
+            PointMeasurement {
+                key: launch_key(implementation, &[], vec![0], specialization),
+                ..measured((parameters as u64 * values + 1 - sum) as f64, 0.)
+            }
+        };
         let statics = NativeSpecialization::new();
         let seed = implementation.default_specialization(&statics).unwrap();
         let partition = plan::partition(&implementation, &statics, &shapes(&[4])).unwrap();
@@ -8644,7 +8810,10 @@ mod tests {
             .unwrap()
             .filter(|_| !run.resting())?;
         for challenger in piece.challengers() {
-            run.record(challenger, Some(vec![measurement(implementation, challenger)]));
+            run.record(
+                challenger,
+                Some(vec![measurement(implementation, challenger)]),
+            );
         }
         Some(run.requests - before)
     }
@@ -8658,8 +8827,7 @@ mod tests {
     fn planning_a_piece_asks_the_same_however_much_was_measured() {
         let (implementation, mut run, measurement) = climbing(12, 16);
         let mut asked = Vec::new();
-        while let Some(requests) = planned_and_measured(&implementation, &mut run, &measurement)
-        {
+        while let Some(requests) = planned_and_measured(&implementation, &mut run, &measurement) {
             asked.push((run.swept.len(), requests));
         }
         let measured = run.swept.len();
@@ -8677,7 +8845,10 @@ mod tests {
         let (early, late) = (most(0..200), most(2000..usize::MAX));
         // A leader has at most 12 × 15 neighbours, and a planning that
         // finds everything asked measured takes up one more leader.
-        assert!(early <= 2 * 12 * 15 && late <= 2 * 12 * 15, "{early} {late}");
+        assert!(
+            early <= 2 * 12 * 15 && late <= 2 * 12 * 15,
+            "{early} {late}"
+        );
         assert!(late <= early, "{late} asked late against {early} early");
         // Each of the 12 × 15 steps uphill has one leader, asked for its
         // neighbours once.
@@ -8788,6 +8959,29 @@ mod tests {
         }
     }
 
+    /// A short-history loser may win the declared workload at long history.
+    /// Both candidates must use their actual long-history measurement.
+    #[test]
+    fn full_workload_keeps_a_long_history_winner() {
+        let weighing = Weighing {
+            weights: vec![1., 1.],
+        };
+        let baseline = timed(2, |_| 0, |point| [1., 16.][point]);
+        let long_winner = timed(2, |_| 1, |point| [1.2, 8.][point]);
+        let short_winner = timed(2, |_| 2, |point| [0.5, 20.][point]);
+        let default_cost = weighing.cost(&baseline, &baseline);
+        assert!(
+            weighing
+                .cost(&long_winner, &baseline)
+                .improves_on(&default_cost)
+        );
+        assert!(
+            !weighing
+                .cost(&short_winner, &baseline)
+                .improves_on(&default_cost)
+        );
+    }
+
     #[test]
     fn declaration_digest_uses_stable_entry_identity() {
         let source = |domain: &str| {
@@ -8879,8 +9073,8 @@ mod tests {
         let rows = |rows| default.clone().with_param("ROWS", rows);
         let mut programs = Programs::Launches(LaunchPrograms::default());
         let form = |programs: &mut Programs,
-                        specializations: &[NativeSpecialization],
-                        ahead: &[NativeSpecialization]| {
+                    specializations: &[NativeSpecialization],
+                    ahead: &[NativeSpecialization]| {
             let Programs::Launches(launches) = programs else {
                 unreachable!()
             };
@@ -8944,7 +9138,11 @@ mod tests {
         };
         let mut price = FormationPrice::default();
         price.calls = vec![
-            call(Formable::Launches(vec![source(0, 3), source(1, 2)]), 1.5, false),
+            call(
+                Formable::Launches(vec![source(0, 3), source(1, 2)]),
+                1.5,
+                false,
+            ),
             call(Formable::Launches(vec![source(0, 1)]), 0.25, true),
         ];
         let launches = Programs::Launches(LaunchPrograms::default());
@@ -9076,7 +9274,10 @@ mod tests {
         let launches = LaunchPrograms::default();
         let sources = launches.sources(&implementation, std::slice::from_ref(&default), &[]);
         assert_eq!(sources.len(), 1);
-        assert_eq!(formation.quote(&[Formable::Launches(sources.clone())]), quote);
+        assert_eq!(
+            formation.quote(&[Formable::Launches(sources.clone())]),
+            quote
+        );
         assert_eq!(
             launches.sources(&implementation, &[default.clone()], &[default.clone()]),
             sources,
@@ -9103,8 +9304,15 @@ mod tests {
             .unwrap()
             .of((FormationClass::Compiled, 1), &Linear::default());
         assert!(compiled.is_some_and(|mean| mean < 5.), "{compiled:?}");
-        assert!(programs.formables(&implementation, challengers, &[]).is_empty());
-        assert_eq!(formation.quote(&programs.formables(&implementation, challengers, &[])), Quote::default());
+        assert!(
+            programs
+                .formables(&implementation, challengers, &[])
+                .is_empty()
+        );
+        assert_eq!(
+            formation.quote(&programs.formables(&implementation, challengers, &[])),
+            Quote::default()
+        );
         let before = price.lock().unwrap().total();
         let held = programs
             .form(&formation, challengers, &[])
@@ -9148,11 +9356,19 @@ mod tests {
         let none = Linear::default();
         let mut price = FormationPrice::default();
         price.canonical = Duration::from_millis(180);
-        assert_eq!(price.of((Compiled, 4), &none), None, "a class never observed has no price");
+        assert_eq!(
+            price.of((Compiled, 4), &none),
+            None,
+            "a class never observed has no price"
+        );
         assert_eq!(price.longest(), Duration::from_millis(180));
         price.observe((Compiled, 4), Duration::from_secs(1));
         price.observe((Compiled, 4), Duration::from_secs(3));
-        assert_eq!(price.of((Kept, 0), &none), None, "a compile says nothing of a kept formation");
+        assert_eq!(
+            price.of((Kept, 0), &none),
+            None,
+            "a compile says nothing of a kept formation"
+        );
         price.observe((Kept, 0), Duration::ZERO);
         price.observe((Kept, 0), Duration::ZERO);
         // Calls of one size: their mean, whatever is asked.
@@ -9266,7 +9482,10 @@ mod tests {
     fn a_compile_call_is_priced_by_its_call_and_its_entries() {
         use FormationClass::Compiled;
         let close = |price: Option<f64>, expected: f64| {
-            assert!(price.is_some_and(|price| (price - expected).abs() < 1e-9), "{price:?}");
+            assert!(
+                price.is_some_and(|price| (price - expected).abs() < 1e-9),
+                "{price:?}"
+            );
         };
         // A toolchain whose calls cost 1 s and 0.05 s an entry (an NVRTC
         // call of 48 entries takes 3.4 s, one of 4 entries 1.2 s).
@@ -9361,7 +9580,9 @@ mod tests {
             |_| mixed.borrow().price(),
             |_, took| mixed.borrow_mut().observe(took),
         );
-        assert!(ended > budget, "one mean over both classes overruns: {ended}");
+        assert!(
+            ended > budget,
+            "one mean over both classes overruns: {ended}"
+        );
     }
-
 }

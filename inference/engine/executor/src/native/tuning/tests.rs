@@ -1,40 +1,174 @@
 use super::cases::DenseOutputTuning;
 use super::*;
-use seismic::TuningMethod;
 use crate::native::import::ImportKernels;
 use crate::planning::tests::{fixture_definition, fixture_manifest};
 use crate::{ComponentSelection, ModelLoadPlan};
 use magnitude_kernels::{dense_output, shape_rows};
+use seismic::TuningMethod;
 use seismic::{BackendName, ConfigurationRecord, DeviceCatalog, Outcome};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+const LIMITS: TuningLimits = TuningLimits {
+    max_rows: 512,
+    max_projected_rows: 8,
+    context_tokens: 16384,
+};
+
+/// What a demand walk collects for `case` alone, decoding without drafting:
+/// the target's launches as the case represents them, and the objective
+/// with the case's estimate of each term's time.
 fn fixture_invocations<T: EntryTuning>(
     case: &T,
     statics: &NativeSpecialization,
     limits: TuningLimits,
 ) -> super::super::specialization::InvocationDemand {
-    HashMap::from([(
-        (
+    let terms = workload::terms(limits, &[]);
+    let mut demand = super::super::specialization::InvocationDemand {
+        units: HashMap::new(),
+        objective: Objective::new(terms),
+    };
+    fixture_add(&mut demand, case, statics, limits);
+    demand
+}
+
+/// Add what a demand walk collects for `case` to `demand`.
+fn fixture_add<T: EntryTuning>(
+    demand: &mut super::super::specialization::InvocationDemand,
+    case: &T,
+    statics: &NativeSpecialization,
+    limits: TuningLimits,
+) {
+    let graph = crate::programs::invocation_demand::GraphInvocationDemand::new(
+        crate::PlannedMethod::Plain,
+        demand.objective.terms.clone(),
+        None,
+        limits.max_rows,
+    );
+    let mut representatives = case
+        .points(limits)
+        .into_iter()
+        .map(|point| point.rows)
+        .collect::<Vec<_>>();
+    representatives.sort_unstable();
+    representatives.dedup();
+    let calls = graph
+        .target
+        .represented(|launch| case.invocation_rows(launch, &representatives))
+        .scaled(case.launches());
+    let mut points = case.points(limits);
+    apply_invocation_counts(&mut points, &calls, &demand.objective);
+    // The fixtures weigh each term by its points' relative cost: a load
+    // estimates them from its entries' declarations ([`point_bytes`]).
+    for point in &points {
+        let time = point.cost();
+        for (term, launches) in &point.terms {
+            demand.objective.measured[*term] += launches * time;
+        }
+    }
+    demand
+        .units
+        .entry((
             <T::Entry as seismic::Entry>::NAME,
             case.bindings(),
             statics.statics().clone(),
-        ),
-        invocation_base(limits).scaled(case.launches()),
-    )])
+        ))
+        .or_default()
+        .add(&calls);
 }
 
-fn fixture_service_invocations(
-    limits: TuningLimits,
-    repetitions: usize,
-) -> crate::programs::invocation_demand::InvocationCounts {
-    crate::programs::invocation_demand::InvocationCounts::new(TUNING_ROWS.into_iter().map(|rows| {
-        (
-            rows,
-            workload::class_load(rows, limits).launches * repetitions as f64,
-        )
-    }))
+/// A unit's share is the mean over the objective's terms of its fraction
+/// of each term's time: a unit that is a small part of the longest term and
+/// most of a short one is worth as much as that short term.
+#[test]
+fn a_units_share_is_its_mean_fraction_of_every_terms_time() {
+    // Two equal terms: a long prefill and a short decode. The projection
+    // takes 90 of the prefill's 100 and 2 of the decode's 4; attention the
+    // rest.
+    let weights = [0.5, 0.5];
+    let measured = [vec![90., 2.], vec![10., 2.]];
+    let shares = shares(&measured, &weights);
+    assert!(
+        (shares[0] - (0.5 * 0.9 + 0.5 * 0.5)).abs() < 1e-12,
+        "{shares:?}"
+    );
+    assert!(
+        (shares[1] - (0.5 * 0.1 + 0.5 * 0.5)).abs() < 1e-12,
+        "{shares:?}"
+    );
+}
+
+/// The load's launches reach a unit's points: by rows and the sequences
+/// declared at or below theirs, a launch's history divided between the two
+/// declared histories around it and held to the longest (a window), each
+/// point weighing its terms' launches by the term's weight over its time.
+#[test]
+fn launches_reach_the_points_at_their_rows_sequences_and_histories() {
+    use crate::programs::invocation_demand::{InvocationCounts, Launch};
+    let mut objective = Objective::new(workload::terms(LIMITS, &[]));
+    objective.measured = vec![1.; objective.terms.len()];
+    let mut counts = InvocationCounts::default();
+    let launch = |term, rows, sequences, history| Launch {
+        term,
+        rows,
+        sequences,
+        history,
+    };
+    counts.launch(launch(0, 8, 8, 1024), 2.);
+    counts.launch(launch(1, 8, 1, 4096), 1.);
+    counts.launch(launch(2, 1, 1, 100_000), 1.);
+    let windowed = |points: Vec<PointShape>| with_contexts(LIMITS, Some(4096), points);
+    let mut points = windowed(vec![
+        row_point(1, 1.),
+        row_point(8, 1.),
+        across_sequences(&row_point(8, 1.), 8),
+    ]);
+    apply_invocation_counts(&mut points, &counts, &objective);
+    let at = |label: &str| {
+        points
+            .iter()
+            .find(|point| point.label == label)
+            .unwrap_or_else(|| panic!("{label}"))
+            .terms
+            .clone()
+    };
+    // 1024 lies between the empty history and 4096: a quarter of the way.
+    let quarter = 1024. / 4096.;
+    assert!(
+        at("m8s8-c256").is_empty(),
+        "numerical-only history has no timing demand"
+    );
+    assert_eq!(at("m8s8-c0"), [(0, 2. * (1. - quarter))]);
+    assert_eq!(at("m8s8-c4096"), [(0, 2. * quarter)]);
+    assert_eq!(at("m8-c4096"), [(1, 1.)]);
+    // A history past the window is read at the window.
+    assert_eq!(at("m1-c4096"), [(2, 1.)]);
+    let weight = objective.terms[1].weight;
+    let point = points
+        .iter()
+        .find(|point| point.label == "m8-c4096")
+        .unwrap();
+    assert!((point.weight - weight).abs() < 1e-12);
+    // The census discovers the weighed points and the empty history of
+    // their rows.
+    let census = points
+        .iter()
+        .zip(census_points(&points))
+        .filter(|(_, census)| *census)
+        .map(|(point, _)| point.label.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        census,
+        [
+            "m1-c0",
+            "m1-c4096",
+            "m8-c0",
+            "m8-c4096",
+            "m8s8-c0",
+            "m8s8-c4096"
+        ]
+    );
 }
 
 /// The requirement of the test units: `alpha` rounding steps of `bf16`.
@@ -115,7 +249,9 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
         coverage: None,
     };
     assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
-    result.observations.push(observation(&shapes[0].label, 4, 2.));
+    result
+        .observations
+        .push(observation(&shapes[0].label, 4, 2.));
     result.configurations[0].observations.push(0);
     assert!(
         ChosenEvidence::of(&result).qualified_at(&shapes).is_err(),
@@ -123,7 +259,9 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
     );
     // Another candidate's measurement at the untimed case is not the
     // selected one's.
-    result.observations.push(observation(&shapes[1].label, 8, 2.));
+    result
+        .observations
+        .push(observation(&shapes[1].label, 8, 2.));
     assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_err());
     result.configurations[0].observations.push(1);
     assert!(ChosenEvidence::of(&result).qualified_at(&shapes).is_ok());
@@ -131,7 +269,8 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
     // disqualifies the choice.
     result.observations[1] = observation(&shapes[1].label, 4, 8.5);
     assert!(
-        ChosenEvidence::of(&result).qualified_at(&shapes)
+        ChosenEvidence::of(&result)
+            .qualified_at(&shapes)
             .unwrap_err()
             .contains("error ratio 8.5 exceeds alpha 8")
     );
@@ -152,211 +291,6 @@ fn demanded_cache_requires_selected_native_default_evidence_for_every_case() {
         Outcome::Excluded(seismic::Exclusion::Execution("known defect".into()));
     assert!(ChosenEvidence::of(&result).usable_fallback().is_err());
 }
-
-#[test]
-fn graph_invocations_weight_service_without_counting_layer_rotations_again() {
-    use crate::programs::invocation_demand::InvocationCounts;
-    let head = [row_point(1, 3.)];
-    let verify = [row_point(4, 1.)];
-    let shares = step_shares(
-        &[
-            UnitTime {
-                invocations: InvocationCounts::new([(1, 3.)]),
-                served: &head,
-                shapes: &head,
-                seconds: &[0.001],
-            },
-            UnitTime {
-                invocations: InvocationCounts::new([(4, 1.)]),
-                served: &verify,
-                shapes: &verify,
-                seconds: &[0.001],
-            },
-        ],
-        LIMITS,
-    );
-    assert!((shares[0] - 0.75).abs() < 1e-12, "{shares:?}");
-    assert!((shares[1] - 0.25).abs() < 1e-12, "{shares:?}");
-}
-
-#[test]
-fn graph_demand_preserves_history_distribution_and_zero_weight_witnesses() {
-    use crate::programs::invocation_demand::InvocationCounts;
-    let mut points = vec![
-        row_point(1, 0.),
-        row_point(1, 0.2),
-        row_point(1, 0.8),
-        row_point(4, 1.),
-    ];
-    for (point, history) in points.iter_mut().zip([0, 64, 128, 64]) {
-        point.context = Some(history);
-    }
-    let support = points
-        .iter()
-        .map(|point| (point.rows, point.context))
-        .collect::<Vec<_>>();
-    apply_invocation_counts(&mut points, &InvocationCounts::new([(1, 3.), (4, 1.)]));
-    assert_eq!(
-        support,
-        points
-            .iter()
-            .map(|point| (point.rows, point.context))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(points[0].weight, 0.);
-    assert!((points[1].weight - 0.6).abs() < 1e-12);
-    assert!((points[2].weight - 2.4).abs() < 1e-12);
-    assert_eq!(points[3].weight, 1.);
-}
-
-/// A launch's rows are in one sequence or several, and a unit that declares
-/// points of several sequences is weighed at each by the launches of that
-/// shape: a decode step of eight requests at the point of eight sequences,
-/// a drafter's eight verification rows at the point of one. A unit that
-/// declares points of one sequence takes every launch of the row count
-/// there.
-#[test]
-fn launches_reach_the_points_of_their_rows_and_sequences() {
-    use crate::programs::invocation_demand::InvocationCounts;
-    let counts = InvocationCounts::across([(8, 8, 5.), (8, 1, 3.), (8, 2, 1.), (1, 1, 7.)]);
-    assert_eq!(counts.count(8), 9.);
-    let mut both = vec![
-        row_point(1, 1.),
-        row_point(8, 1.),
-        across_sequences(&row_point(8, 1.), 8),
-    ];
-    apply_invocation_counts(&mut both, &counts);
-    assert_eq!(
-        both.iter()
-            .map(|point| (point.label.as_str(), point.weight))
-            .collect::<Vec<_>>(),
-        // Two sequences' rows go to the most sequences declared at or
-        // below them: one.
-        [("m1", 7.), ("m8", 4.), ("m8s8", 5.)]
-    );
-    let mut one = vec![row_point(1, 1.), row_point(8, 1.)];
-    apply_invocation_counts(&mut one, &counts);
-    assert_eq!(
-        one.iter().map(|point| point.weight).collect::<Vec<_>>(),
-        [7., 9.]
-    );
-    // The workload's decode step of eight rows is eight requests' rows;
-    // its prefill launches are one sequence's.
-    let base = invocation_base(LIMITS);
-    let across = base.sequences(8).collect::<BTreeMap<_, _>>();
-    assert!((across[&8] - workload::decoded_tokens() / 9.).abs() < 1e-9);
-    assert!(
-        (across[&1] - workload::prefill_load(8, LIMITS).launches).abs() < 1e-9
-    );
-}
-
-/// The launches the objective weighs are the workload's at every row count:
-/// two thirds of a turn's decoded tokens in single-row steps and a ninth in
-/// steps of each of 2, 4 and 8 rows, whatever the method. A speculative
-/// method adds its rounds at the widths it verifies; it takes none of the
-/// workload's launches away.
-#[test]
-fn the_objective_weighs_the_workloads_decode_at_every_streaming_row_count() {
-    use crate::programs::invocation_demand::GraphInvocationDemand;
-    let weights = |method: crate::PlannedMethod| {
-        let demand = GraphInvocationDemand::new(
-            method,
-            invocation_base(LIMITS),
-            invocation_prefill_base(LIMITS),
-            invocation_rounds(),
-            &[1, 2, 4, 8],
-            None,
-            LIMITS.max_rows,
-        );
-        let mut points = row_points(LIMITS);
-        apply_invocation_counts(
-            &mut points,
-            &demand
-                .target
-                .represented(|rows| TUNING_ROWS.into_iter().find(|at| *at >= rows)),
-        );
-        points
-            .into_iter()
-            .map(|point| (point.rows, point.weight))
-            .collect::<BTreeMap<_, _>>()
-    };
-    let decoded = workload::decoded_tokens();
-    let prefill = |rows: u64| workload::prefill_load(rows, LIMITS).launches;
-    let plain = weights(crate::PlannedMethod::Plain);
-    assert!((plain[&1] - decoded * 2. / 3.).abs() < 1e-9, "{plain:?}");
-    for rows in [2, 4, 8] {
-        assert!(plain[&rows] > 47., "{plain:?}");
-        assert!(
-            (plain[&rows] - prefill(rows) - decoded / 9.).abs() < 1e-9,
-            "{plain:?}"
-        );
-    }
-    // Every decoded token is in one of those steps, and a prefill class
-    // holds its prefill launches alone.
-    let decode = [1, 2, 4, 8]
-        .into_iter()
-        .map(|rows| plain[&rows] - prefill(rows))
-        .sum::<f64>();
-    assert!((decode - decoded).abs() < 1e-9, "{plain:?}");
-    for rows in [16, 32, 64, 128, 256, 512] {
-        assert!((plain[&rows] - prefill(rows)).abs() < 1e-9, "{plain:?}");
-    }
-    // The points' own weights and the graph's counts are one model.
-    for rows in TUNING_ROWS {
-        assert_eq!(plain[&rows], workload::class_weight(rows, LIMITS));
-    }
-
-    // Up to three chained proposals at 1, 2, 4 and 8 slots verify 2 to 32
-    // rows: one round per decoded token at each class, over the workload's.
-    let chained = weights(crate::PlannedMethod::Mtp {
-        greedy_proposals: 3,
-        sampled_proposals: 1,
-    });
-    for rows in TUNING_ROWS {
-        let rounds = if (2..=32).contains(&rows) { decoded } else { 0. };
-        assert!(
-            (chained[&rows] - plain[&rows] - rounds).abs() < 1e-9,
-            "{chained:?}"
-        );
-    }
-}
-
-#[test]
-fn service_history_uses_positive_graph_point_demand() {
-    use crate::programs::invocation_demand::InvocationCounts;
-    let mut served = vec![row_point(1, 0.), row_point(1, 1.), row_point(1, 3.)];
-    for (point, history) in served.iter_mut().zip([0, 64, 128]) {
-        point.context = Some(history);
-    }
-    let projection = [row_point(1, 4.)];
-    let shares = step_shares(
-        &[
-            UnitTime {
-                invocations: InvocationCounts::new([(1, 4.)]),
-                served: &served,
-                shapes: &[served[0].clone(), served[2].clone()],
-                seconds: &[1., 129.],
-            },
-            UnitTime {
-                invocations: InvocationCounts::new([(1, 4.)]),
-                served: &projection,
-                shapes: &projection,
-                seconds: &[113.],
-            },
-        ],
-        LIMITS,
-    );
-    // Positive demand has mean history 112; the support-only zero contributes
-    // neither service frequency nor history. Linear timing gives 113 seconds.
-    assert!((shares[0] - 0.5).abs() < 1e-12, "{shares:?}");
-    assert!((shares[1] - 0.5).abs() < 1e-12, "{shares:?}");
-}
-
-const LIMITS: TuningLimits = TuningLimits {
-    max_rows: 512,
-    max_projected_rows: 8,
-    context_tokens: 16384,
-};
 
 #[test]
 fn draft_readout_tuning_preserves_the_complete_artifact_vocabulary() {
@@ -493,7 +427,7 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
         },
         LIMITS,
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
-        HashMap::new(),
+        Default::default(),
     );
     let tuner = tuner.census(untuned).unwrap();
     assert!(matches!(
@@ -501,47 +435,6 @@ fn the_mandatory_phase_forms_the_untuned_entries_the_count_met() {
         [TuningEvent::Untuned { programs: 2, .. }]
     ));
     assert!(tuner.search().unwrap().conclude().is_empty());
-}
-
-#[test]
-fn row_points_follow_the_shape_ladder_and_normalize_weights() {
-    let points = row_points(LIMITS);
-    assert_eq!(
-        points.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        TUNING_ROWS
-    );
-    let total = points.iter().map(|point| point.weight).sum::<f64>();
-    assert!((total - 1.0).abs() < 1e-12);
-    // Each served row class weighs its launches per turn of the served
-    // workload at the cost of one.
-    let weights = points.iter().map(|point| point.weight).collect::<Vec<_>>();
-    let raw = TUNING_ROWS.map(|rows| workload::class_weight(rows, LIMITS));
-    let sum = raw.iter().sum::<f64>();
-    for (weight, raw) in weights.iter().zip(raw) {
-        assert!((weight - raw / sum).abs() < 1e-12, "{weights:?}");
-    }
-    // One decode launch consumes one token while a large prefill launch
-    // consumes512. Demand counts invocations; latency supplies their service cost.
-    assert!(
-        weights[0] > weights[9] && weights[9] > weights[8],
-        "{weights:?}"
-    );
-    // The largest launch of an engine bounded below 512 rows takes the
-    // longer prompts: twice as many launches of 256 rows.
-    let narrow = row_points(TuningLimits {
-        max_rows: 256,
-        ..LIMITS
-    });
-    assert!(narrow[8].weight > weights[8] * 1.5, "{narrow:?}");
-    let bounded = row_points(TuningLimits {
-        max_rows: 32,
-        ..LIMITS
-    });
-    assert_eq!(
-        bounded.iter().map(|point| point.rows).collect::<Vec<_>>(),
-        [1, 2, 4, 8, 16, 32]
-    );
-    assert!((bounded.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
 }
 
 #[test]
@@ -597,82 +490,6 @@ fn the_tuning_cache_key_is_what_a_result_is_valid_for() {
 }
 
 #[test]
-fn the_census_discovers_bootstrap_and_workload_history_representatives() {
-    let labels = |shapes: &[PointShape]| {
-        shapes
-            .iter()
-            .zip(census_points(shapes))
-            .filter(|(_, census)| *census)
-            .map(|(shape, _)| shape.label.clone())
-            .collect::<Vec<_>>()
-    };
-    // Every streaming row count, then the most rows of the short chunks and
-    // of the prefill chunks.
-    assert_eq!(
-        labels(&row_points(LIMITS)),
-        ["m1", "m2", "m4", "m8", "m32", "m512"]
-    );
-    // An entry bounded below the largest chunk is timed at its own largest.
-    assert_eq!(
-        labels(&served_row_points(
-            TuningLimits {
-                max_rows: 256,
-                ..LIMITS
-            },
-            |rows| rows >= 32
-        )),
-        ["m32", "m256"]
-    );
-    // Attention starts at zero history and discovers the workload mean brackets.
-    let chunks = served_row_points(LIMITS, |rows| rows >= 16);
-    assert_eq!(
-        labels(&with_contexts(LIMITS, None, chunks.clone())),
-        [
-            "m32-c0",
-            "m32-c4096",
-            "m32-c16384",
-            "m512-c0",
-            "m512-c256",
-            "m512-c4096"
-        ]
-    );
-    // Streaming verification has the same discovery rule. The longest served
-    // history stays a numerical witness even when it has no workload demand;
-    // it must not inflate every contender's timing and confirmation cohort.
-    let long_limits = TuningLimits {
-        context_tokens: 65792,
-        ..LIMITS
-    };
-    let verification = with_contexts(
-        long_limits,
-        None,
-        served_row_points(long_limits, |rows| matches!(rows, 2 | 4 | 8)),
-    );
-    let selected = labels(&verification);
-    for rows in [2, 4, 8] {
-        let endpoint = format!("m{rows}-c65792");
-        let witness = verification
-            .iter()
-            .find(|point| point.label == endpoint)
-            .unwrap();
-        assert_eq!(witness.weight, 0.);
-        assert!(!selected.contains(&endpoint));
-        assert!(selected.contains(&format!("m{rows}-c0")));
-        assert!(
-            verification
-                .iter()
-                .filter(|point| point.rows == rows && point.weight > 0.)
-                .all(|point| selected.contains(&point.label))
-        );
-    }
-    // A saturated sliding window needs bootstrap plus its actual saturated history.
-    assert_eq!(
-        labels(&with_contexts(LIMITS, Some(1024), chunks)),
-        ["m32-c0", "m32-c1024", "m512-c0", "m512-c1024"]
-    );
-}
-
-#[test]
 fn a_units_window_is_the_longest_history_its_layers_keep() {
     use magnitude_family_contracts::{
         Attention, HistoryDomain, KeyValue, ModelDefinition, Operator, SublayerIndex, WeightScope,
@@ -719,10 +536,20 @@ fn a_units_window_is_the_longest_history_its_layers_keep() {
     assert_eq!(kept(&[0]), Ok(None));
     assert_eq!(kept(&[1, 0, 2]), Ok(None));
     assert!(kept(&[]).is_err());
+    // One request's listed history holds what the layers keep: the whole
+    // context, or the window, each in whole pages.
+    let codec = magnitude_state::KvCodec::AffineK8V4;
+    for window in [None, Some(1024), Some(2048)] {
+        let rows = request_history_rows(&inputs, codec, window).unwrap();
+        assert!(
+            rows >= window.unwrap_or(LIMITS.context_tokens),
+            "{window:?}: {rows}"
+        );
+    }
 }
 
 #[test]
-fn window_layers_are_timed_at_the_histories_their_window_keeps() {
+fn numerical_histories_include_witnesses_and_the_window_limit() {
     let decode = || served_row_points(LIMITS, |rows| rows == 1);
     let labels = |window: Option<u64>| {
         with_contexts(LIMITS, window, decode())
@@ -730,8 +557,7 @@ fn window_layers_are_timed_at_the_histories_their_window_keeps() {
             .map(|point| point.label)
             .collect::<Vec<_>>()
     };
-    // Layers keeping the whole context see every served length of the
-    // ladder: the points, and with them the key, of every stored result.
+    // Numerical witnesses remain present even when they carry no timing demand.
     let whole = ["m1-c0", "m1-c256", "m1-c4096", "m1-c16384"];
     assert_eq!(labels(None), whole);
     // A window shorter than the context is the longest history its layers
@@ -747,7 +573,7 @@ fn window_layers_are_timed_at_the_histories_their_window_keeps() {
     assert!((windowed.iter().map(|point| point.weight).sum::<f64>() - 1.0).abs() < 1e-12);
     // The window's lengths of one row point are its class, each row class
     // keeping the share it has at any history.
-    assert_eq!(windowed[2].class.as_deref(), Some("m1"));
+    assert_eq!(windowed[1].class.as_deref(), Some("m1"));
     let share = |points: &[PointShape], rows: u64| {
         points
             .iter()
@@ -762,118 +588,9 @@ fn window_layers_are_timed_at_the_histories_their_window_keeps() {
 }
 
 #[test]
-fn a_unit_serving_only_chunks_holds_its_part_of_the_prefill_classes() {
-    // One unit serves every row count, one only chunks. The census timed
-    // each at its census points: the first takes a second everywhere, the
-    // second three.
-    let every = row_points(LIMITS);
-    let chunks = served_row_points(LIMITS, |rows| rows >= 16);
-    let timed = |shapes: &[PointShape]| {
-        shapes
-            .iter()
-            .zip(census_points(shapes))
-            .filter(|(_, census)| *census)
-            .map(|(shape, _)| shape.clone())
-            .collect::<Vec<_>>()
-    };
-    let (every_timed, chunks_timed) = (timed(&every), timed(&chunks));
-    let shares = step_shares(
-        &[
-            UnitTime {
-                invocations: fixture_service_invocations(LIMITS, 1),
-                served: &every,
-                shapes: &every_timed,
-                seconds: &vec![1.; every_timed.len()],
-            },
-            UnitTime {
-                invocations: fixture_service_invocations(LIMITS, 1),
-                served: &chunks,
-                shapes: &chunks_timed,
-                seconds: &vec![3.; chunks_timed.len()],
-            },
-        ],
-        LIMITS,
-    );
-    assert!((shares.iter().sum::<f64>() - 1.).abs() < 1e-9, "{shares:?}");
-    // Every class takes its launches per turn at the time measured where
-    // it is timed, scaled by the classes' cost where not: the streaming
-    // classes are the first unit's alone, the chunk classes split one to
-    // three.
-    let time = |rows: u64, timed: u64| {
-        let cost = |rows: u64| (rows as f64).max(workload::STREAMING_EQUIVALENT_ROWS);
-        workload::class_load(rows, LIMITS).launches * cost(rows) / cost(timed)
-    };
-    // The census times the streaming rows, 32 rows and 512 rows.
-    let stands = |rows: u64| match rows {
-        0..=8 => rows,
-        16 | 32 => 32,
-        _ => 512,
-    };
-    let streaming = [1, 2, 4, 8]
-        .into_iter()
-        .map(|rows| time(rows, rows))
-        .sum::<f64>();
-    let chunks = [16, 32, 64, 128, 256, 512]
-        .into_iter()
-        .map(|rows| time(rows, stands(rows)))
-        .sum::<f64>();
-    let expected = 3. * chunks / (streaming + chunks + 3. * chunks);
-    assert!((shares[1] - expected).abs() < 1e-9, "{shares:?} {expected}");
-}
-
-/// Attention prefill time grows with history: a unit timed at a short and a
-/// long history is weighed at the workload's mean history between them,
-/// and outweighs a projection whose chunk time does not grow.
-#[test]
-fn attention_is_weighed_at_the_workloads_history() {
-    let limits = TuningLimits {
-        context_tokens: 65536,
-        ..LIMITS
-    };
-    let attention = with_contexts(limits, None, served_row_points(limits, |rows| rows == 512));
-    let short = attention
-        .iter()
-        .find(|shape| shape.context == Some(0))
-        .unwrap()
-        .clone();
-    let long = attention
-        .iter()
-        .find(|shape| shape.context == Some(65536))
-        .unwrap()
-        .clone();
-    let projection = served_row_points(limits, |rows| rows == 512);
-    // A chunk of the E2B full-attention layers on GB10: 62 ms at an empty
-    // history, 291 ms at 64K; the rest of the chunk about 58 ms.
-    let shares = step_shares(
-        &[
-            UnitTime {
-                invocations: fixture_service_invocations(limits, 1),
-                served: &attention,
-                shapes: &[short, long],
-                seconds: &[0.062, 0.291],
-            },
-            UnitTime {
-                invocations: fixture_service_invocations(limits, 1),
-                served: &projection,
-                shapes: &projection,
-                seconds: &[0.058],
-            },
-        ],
-        limits,
-    );
-    let history = workload::class_load(512, limits).history * 65536.;
-    let cost = |history: f64| 512. * (512. + history);
-    let expected = 0.062 + (0.291 - 0.062) * (cost(history) - cost(0.)) / (cost(65536.) - cost(0.));
-    assert!(
-        (shares[0] - expected / (expected + 0.058)).abs() < 1e-9,
-        "{shares:?}"
-    );
-    assert!(shares[0] > 0.6, "{shares:?}");
-}
-
-#[test]
 fn point_cost_grows_with_rows_and_history() {
     let point = |rows: u64, context: Option<u64>| PointShape {
+        terms: Vec::new(),
         label: String::new(),
         weight: 1.0,
         rows,
@@ -894,7 +611,7 @@ fn attention_points_cross_rows_with_served_contexts() {
     assert_eq!(
         points.len(),
         TUNING_ROWS.len() * 4,
-        "64k exceeds the served context"
+        "all numerical histories through the served context"
     );
     assert!(points.iter().all(|point| point.context.unwrap() <= 16384));
     assert_eq!(points[0].label, "m1-c0");
@@ -1252,7 +969,9 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
 
     fn terminal(&self) -> Result<TuningResult, TuneError> {
         if !self.formed {
-            return Err(TuneError::Declaration("the defaults were not formed".into()));
+            return Err(TuneError::Declaration(
+                "the defaults were not formed".into(),
+            ));
         }
         let mut configurations = Vec::new();
         // This deterministic fixture supplies explicit synthetic
@@ -1368,7 +1087,9 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
                     unpriced: 1,
                 },
                 forming: seismic::Quote::default(),
-                gain: 0.,
+                // As a real unit's discovery is worth: each point one
+                // operation of what remains.
+                opportunity: 0.,
                 footprint: seismic::Footprint::default(),
             })
         } else if !self.measured {
@@ -1376,7 +1097,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
                 stage: seismic::Stage::Measure,
                 quote: priced,
                 forming: seismic::Quote::default(),
-                gain: 0.5,
+                opportunity: 0.5,
                 footprint: seismic::Footprint::default(),
             })
         } else if !self.promoted && !self.case.unqualified {
@@ -1384,7 +1105,7 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
                 stage: seismic::Stage::Promote,
                 quote: priced,
                 forming: seismic::Quote::default(),
-                gain: 0.5,
+                opportunity: 0.5,
                 footprint: seismic::Footprint::default(),
             })
         } else {
@@ -1474,13 +1195,24 @@ impl EntrySearch<dense_output::Entry> for FakeSearch {
     }
 
     fn publish_artifact(&mut self) -> Result<Duration, TuneError> {
-        assert!(self.promoted, "only a promoted choice's artifact is published");
+        assert!(
+            self.promoted,
+            "only a promoted choice's artifact is published"
+        );
         self.case.artifacts.set(self.case.artifacts.get() + 1);
         Ok(Duration::ZERO)
     }
 
     fn service_measurements(&self) -> Vec<seismic::PointMeasurement> {
         self.measurements(self.discovered, self.case.defaults_seconds)
+    }
+
+    fn reweigh(&mut self, _: &[f64]) -> bool {
+        !self.measured
+    }
+
+    fn discovered(&self) -> bool {
+        self.discovered == self.specs.len()
     }
 
     fn standing(&self) -> Standing {
@@ -1704,7 +1436,11 @@ fn profile_what_compiles_on_workers_add_to_the_process_footprint() {
     let start = footprint();
     let half = specializations.len() / 2;
     for specialization in &specializations[..half] {
-        drop(dense_output::native_for_device_with(&device, elements(), specialization));
+        drop(dense_output::native_for_device_with(
+            &device,
+            elements(),
+            specialization,
+        ));
     }
     eprintln!(
         "{half} compiled and released one at a time: +{:.1} MiB stays",
@@ -1914,7 +1650,12 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
         fn cached(&self) -> Option<bool> {
             None
         }
-        fn set_invocations(&mut self, _: &crate::programs::invocation_demand::InvocationCounts) {}
+        fn set_invocations(
+            &mut self,
+            _: &crate::programs::invocation_demand::InvocationCounts,
+            _: &Objective,
+        ) {
+        }
         fn census(
             &mut self,
             _: &mut TuningInputs<'_, 'a>,
@@ -1970,10 +1711,13 @@ fn no_demand_composed_choices_are_published_in_the_mandatory_phase_and_time_fail
             },
             LIMITS,
             TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
-            HashMap::from([(
-                ("test_recipe", "unused".into(), BTreeMap::new()),
-                crate::programs::invocation_demand::InvocationCounts::new([(1, 0.)]),
-            )]),
+            super::super::specialization::InvocationDemand {
+                units: HashMap::from([(
+                    ("test_recipe", "unused".into(), BTreeMap::new()),
+                    crate::programs::invocation_demand::InvocationCounts::default(),
+                )]),
+                objective: Objective::new(workload::terms(LIMITS, &[])),
+            },
         );
         assert_eq!(tuner.register_composed(recipe()).unwrap(), None);
         assert!(
@@ -2032,7 +1776,12 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         fn cached(&self) -> Option<bool> {
             None
         }
-        fn set_invocations(&mut self, _: &crate::programs::invocation_demand::InvocationCounts) {}
+        fn set_invocations(
+            &mut self,
+            _: &crate::programs::invocation_demand::InvocationCounts,
+            _: &Objective,
+        ) {
+        }
         fn census(
             &mut self,
             _: &mut TuningInputs<'_, 'a>,
@@ -2083,9 +1832,21 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         statics.statics().clone(),
     );
     let mut invocations = fixture_invocations(&case, &statics, LIMITS);
-    invocations.insert(
+    invocations.units.insert(
         ("test_recipe", "pinned-prerequisite".into(), BTreeMap::new()),
-        crate::programs::invocation_demand::InvocationCounts::new([(1, 1.)]),
+        {
+            let mut counts = crate::programs::invocation_demand::InvocationCounts::default();
+            counts.launch(
+                crate::programs::invocation_demand::Launch {
+                    term: 0,
+                    rows: 1,
+                    sequences: 1,
+                    history: 0,
+                },
+                1.,
+            );
+            counts
+        },
     );
     let qualified = Rc::new(Cell::new(false));
     let recipe = || {
@@ -2124,7 +1885,10 @@ fn a_composed_recipe_finds_its_pinned_prerequisite_on_an_empty_cache() {
         qualified.get(),
         "the recipe was qualified against its prerequisite's pinned choice"
     );
-    assert_eq!(tuner.tune(&case, &implementation, &statics).unwrap(), defaults);
+    assert_eq!(
+        tuner.tune(&case, &implementation, &statics).unwrap(),
+        defaults
+    );
     assert_eq!(tuner.register_composed(recipe()).unwrap(), Some(false));
     assert!(case.seen.borrow().is_empty() && case.stages.borrow().is_empty());
 }
@@ -2329,7 +2093,11 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
         assert_eq!(stage.share, 1.);
     }
     assert_eq!(
-        stages.iter().map(|stage| stage.promoted).filter(|promoted| *promoted).count(),
+        stages
+            .iter()
+            .map(|stage| stage.promoted)
+            .filter(|promoted| *promoted)
+            .count(),
         1
     );
     // One complete record per unit, then what became of the budget.
@@ -2350,9 +2118,7 @@ fn the_tuner_drives_a_registered_case_and_reports_progress() {
     assert_eq!(budget.stages, expected.len());
     assert_eq!(budget.overrun_seconds, 0.);
     assert!(budget.unused_seconds > 0. && budget.refused.is_empty());
-    assert!(
-        (budget.used_seconds + budget.unused_seconds - budget.budget_seconds).abs() < 1e-9
-    );
+    assert!((budget.used_seconds + budget.unused_seconds - budget.budget_seconds).abs() < 1e-9);
     // A unit with no work left holds no inputs: the inputs its pieces
     // built were on the device while it worked, and none of them is when
     // the optional work ends, before the tuning does.
@@ -2571,7 +2337,11 @@ fn stored_results_are_offered_to_runtime_validation_and_changed_keys_miss() {
     assert_eq!(reused.origin, TuningOrigin::Stored);
     assert!(!started && !progressed);
     assert!(activated.seen.borrow().is_empty() && activated.stages.borrow().is_empty());
-    assert_eq!(activated.formations.get(), 0, "a later load is metadata only");
+    assert_eq!(
+        activated.formations.get(),
+        0,
+        "a later load is metadata only"
+    );
 
     assert_eq!(stored_results(), 5);
     // A fresh load searches a unit whose result is stored, and replaces it.
@@ -2675,7 +2445,9 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
         (tuned, case)
     };
     let untouched = |case: &FakeCase| {
-        case.formations.get() == 0 && case.seen.borrow().is_empty() && case.stages.borrow().is_empty()
+        case.formations.get() == 0
+            && case.seen.borrow().is_empty()
+            && case.stages.borrow().is_empty()
     };
     let stored_results = || std::fs::read_dir(root.join("tuning")).unwrap().count();
 
@@ -2686,7 +2458,10 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
     assert!(searched.qualified && first.formations.get() == 1);
     assert_eq!(searched.overall, first.chosen);
     let evidence = |tuned: &TunedEntry| tuned.receipt.read().unwrap();
-    assert_eq!((searched.rejections, evidence(&searched).reselection.clone()), (1, None));
+    assert_eq!(
+        (searched.rejections, evidence(&searched).reselection.clone()),
+        (1, None)
+    );
     assert_eq!(stored_results(), 1);
 
     // A stricter α than the challenger's ratio of 2: the same record, the
@@ -2705,7 +2480,10 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
     assert!(reselection.unserved.is_empty());
     // Both candidates are beyond this α; their measurements are unchanged.
     assert_eq!(strict.rejections, 2);
-    assert_eq!(strict_evidence.observations, evidence(&searched).observations);
+    assert_eq!(
+        strict_evidence.observations,
+        evidence(&searched).observations
+    );
     assert_eq!(stored_results(), 1);
 
     // A looser α than the rejected candidate's ratio of 12 admits its
@@ -2727,11 +2505,17 @@ fn a_stored_record_is_served_under_another_alpha_without_forming_or_measuring() 
     let (again, case) = load_under(8.);
     assert!(untouched(&case));
     assert_eq!(again.overall, searched.overall);
-    assert_eq!((again.rejections, again.measured), (searched.rejections, searched.measured));
+    assert_eq!(
+        (again.rejections, again.measured),
+        (searched.rejections, searched.measured)
+    );
     // Its evidence is named, not read: the load decoded the choice alone.
     // Whoever states it reads what the search stored.
     assert!(matches!(again.receipt, Receipt::Stored(_)));
-    assert_eq!(evidence(&again).observations, evidence(&searched).observations);
+    assert_eq!(
+        evidence(&again).observations,
+        evidence(&searched).observations
+    );
     assert_eq!(evidence(&again).reselection, None);
     assert_eq!(stored_results(), 1, "no α has a record of its own");
     std::fs::remove_dir_all(root).unwrap();
@@ -2864,7 +2648,7 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
     let mut last = FakeCase::new(&implementation, &statics, "prerequisite-last");
     last.bindings = "last".into();
     let mut invocations = fixture_invocations(&first, &statics, LIMITS);
-    invocations.extend(fixture_invocations(&last, &statics, LIMITS));
+    fixture_add(&mut invocations, &last, &statics, LIMITS);
     let context = |budget| TuningContext {
         definition: &definition,
         weights: &ZeroTuningWeights,
@@ -2937,7 +2721,10 @@ fn canonical_prerequisites_precede_every_census_and_a_spent_budget_starts_nothin
     };
     assert_eq!((budget.stages, budget.refused.len()), (0, 1));
     assert_eq!(budget.unused_seconds, 0.);
-    assert!(budget.overrun_seconds > 0., "the mandatory phase alone ran past it");
+    assert!(
+        budget.overrun_seconds > 0.,
+        "the mandatory phase alone ran past it"
+    );
 }
 
 #[test]
@@ -3013,7 +2800,7 @@ fn the_count_forms_nothing_and_a_weight_without_its_import_entry_is_a_typed_fail
     // cannot form that kernel before the clock, and its census needs no
     // weight imports or empirical self-comparison.
     let mut invocations = fixture_invocations(&case, &statics, LIMITS);
-    for demand in invocations.values_mut() {
+    for demand in invocations.units.values_mut() {
         *demand = demand.scaled(0);
     }
     let mut tuner = Tuner::count(
@@ -3119,10 +2906,7 @@ fn tuning_batches_are_packed_by_the_batch_builder() {
     let placed = inputs
         .batch(2, 600, &placement.sequences, placement.extent)
         .unwrap();
-    assert_eq!(
-        placed.class.segments(),
-        second.len().next_power_of_two()
-    );
+    assert_eq!(placed.class.segments(), second.len().next_power_of_two());
     let history = &placed.histories[0];
     assert_eq!(history.visible[0][0], [0, 600]);
     assert_eq!(history.visible[1][0], second[0]);
@@ -3214,10 +2998,10 @@ fn case_state_restores_its_written_rows() {
     assert!(initializer(Vec::new(), false).unwrap().is_none());
 }
 
-/// Physical launch demand determines startup order and the objective share;
-/// each operation receives the same session deadline rather than a share-sized admission allowance.
+/// Baselines precede candidate comparisons, without guessing a unit's cost;
+/// every operation receives the same session deadline.
 #[test]
-fn units_start_by_their_share_of_step_time() {
+fn units_measure_baselines_before_search() {
     let Some(device) = metal() else {
         return;
     };
@@ -3269,7 +3053,7 @@ fn units_start_by_their_share_of_step_time() {
         TuningWeights::new(&device, &load, &ZeroTuningWeights, &import),
         {
             let mut demand = fixture_invocations(&small, &statics, limits);
-            demand.extend(fixture_invocations(&large, &statics, limits));
+            fixture_add(&mut demand, &large, &statics, limits);
             demand
         },
     );
@@ -3290,19 +3074,24 @@ fn units_start_by_their_share_of_step_time() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    // Before anything is measured no unit has a share: each unit's first
-    // discovery comes in preparation order. From then the larger share
-    // goes first, though prepared second: its remaining discovery, then
-    // its challenger.
-    let points = row_points(limits).len();
-    let discovery = |bindings: &str| (bindings.to_owned(), seismic::Stage::Discovery);
-    assert_eq!(pieces[..2], [discovery("small"), discovery("large")]);
-    assert!(pieces[2..points + 1].iter().all(|piece| *piece == discovery("large")));
-    assert!(pieces[points + 1..2 * points].iter().all(|piece| *piece == discovery("small")));
-    assert_eq!(
-        pieces[2 * points],
-        ("large".to_owned(), seismic::Stage::Measure),
-        "{pieces:?}"
+    let first_candidate = pieces
+        .iter()
+        .position(|(_, stage)| *stage != seismic::Stage::Discovery)
+        .expect("a candidate is measured");
+    assert!(
+        pieces[first_candidate..]
+            .iter()
+            .all(|(_, stage)| *stage != seismic::Stage::Discovery)
+    );
+    assert!(
+        pieces[..first_candidate]
+            .iter()
+            .any(|(binding, _)| binding == "small")
+    );
+    assert!(
+        pieces[..first_candidate]
+            .iter()
+            .any(|(binding, _)| binding == "large")
     );
     let shares = tuner
         .conclude()
@@ -3322,7 +3111,7 @@ fn units_start_by_their_share_of_step_time() {
 /// keeps the key.
 #[test]
 fn stored_attention_choice_must_admit_every_served_span_class() {
-    use super::attention::{AttentionMix, AttentionPrefillK8V4Tuning};
+    use super::attention::{AttentionMix, AttentionPrefillK8V4Tuning, PrefillListing};
     let Some(device) = metal() else { return };
     let (definition, load) = fixture_load();
     let import = ImportKernels {
@@ -3331,7 +3120,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
     };
     let case = AttentionPrefillK8V4Tuning(AttentionMix {
         codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 128, 128),
-        listed: true,
+        listing: PrefillListing::Listed { capacity: 65536 },
         activation: Element::bf16(),
         shape: crate::AttentionShape {
             hidden: 2048,
@@ -3493,11 +3282,6 @@ fn full_context_demand_is_nonnegative_and_covers_the_actual_longest_history() {
     );
     assert!(points.iter().any(|point| point.context == Some(262144)));
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.).abs() < 1e-12);
-    let mean = points
-        .iter()
-        .map(|point| point.weight * point.context.unwrap() as f64)
-        .sum::<f64>();
-    assert!((mean - 72876.032).abs() < 1e-6, "{mean}");
 }
 #[test]
 fn sliding_demand_clamps_to_the_physical_history_window() {
@@ -3517,11 +3301,6 @@ fn sliding_demand_clamps_to_the_physical_history_window() {
     );
     assert!(points.iter().all(|point| point.context.unwrap() <= 1024));
     assert!((points.iter().map(|point| point.weight).sum::<f64>() - 1.).abs() < 1e-12);
-    let mean = points
-        .iter()
-        .map(|point| point.weight * point.context.unwrap() as f64)
-        .sum::<f64>();
-    assert!((mean - 1024.).abs() < 1e-9, "{mean}");
 }
 
 /// A load never searches. With every record stored it prepares from them,
@@ -3570,8 +3349,19 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     let invocations = |cases: &[&FakeCase]| {
         cases
             .iter()
-            .flat_map(|case| fixture_invocations(*case, &statics, limits))
-            .collect::<HashMap<_, _>>()
+            .fold(
+                None,
+                |demand: Option<super::super::specialization::InvocationDemand>, case| {
+                    Some(match demand {
+                        None => fixture_invocations(*case, &statics, limits),
+                        Some(mut demand) => {
+                            fixture_add(&mut demand, *case, &statics, limits);
+                            demand
+                        }
+                    })
+                },
+            )
+            .unwrap_or_default()
     };
     // One load of `cases`, in walk order: each unit's choice or the load's
     // stop, the units served unprepared, and the load's outcomes and events.
@@ -3641,7 +3431,9 @@ fn a_load_reads_records_and_reports_or_serves_defaults_without_searching() {
     let stored_results =
         || std::fs::read_dir(root.join("tuning")).map_or(0, |entries| entries.count());
     let untouched = |case: &FakeCase| {
-        case.formations.get() == 0 && case.seen.borrow().is_empty() && case.stages.borrow().is_empty()
+        case.formations.get() == 0
+            && case.seen.borrow().is_empty()
+            && case.stages.borrow().is_empty()
     };
     let unit = |digest: &str, bindings: &str| {
         let mut case = FakeCase::new(&implementation, &statics, digest);

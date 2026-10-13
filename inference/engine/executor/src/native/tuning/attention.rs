@@ -23,6 +23,7 @@ use crate::operators;
 use crate::operators::attention::graph::{
     DECODE_ROWS, rotary_amplitudes, rotary_components, rotary_frequencies,
 };
+use crate::programs::invocation_demand::Launch;
 use crate::{AttentionBinding, AttentionShape};
 use magnitude_family_contracts::{
     Attention, HeadHistory, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
@@ -520,13 +521,51 @@ pub(crate) struct AttentionMix {
     /// The row classes this variant serves. Distinct ranges have distinct
     /// tuning identities and are validated on their own rows.
     pub decode_rows: Option<Range<u64>>,
-    /// For the affine prefill: whether the launch lists the history row
-    /// tiles its rows see (the entry's `L`, static where the forms differ by
-    /// it: the two then have different admissible forms and tune apart).
-    pub listed: bool,
+    /// For the affine prefill: which of the layers' prefill launches the
+    /// kernel serves, and whether it lists the history row tiles their rows
+    /// see (the entry's `L`).
+    pub listing: PrefillListing,
     /// The most history rows the layers the case binds keep
     /// ([`history_window`]): its points see no longer history.
     pub window: Option<u64>,
+}
+
+/// Which prefill launches of its layers an affine prefill kernel serves.
+/// Where the layers' graphs list the history row tiles a launch's rows see
+/// (`StateResourcePlan::lists_history_tiles`), a launch whose rows see at
+/// most one request's history takes the listed kernel and any other the
+/// unlisted one (`listed_tiles` in the target's step): the two are
+/// alternatives for the same layers, each with its own admissible forms
+/// (`L` is static where the forms differ by it), and a launch is demand of
+/// the one that serves it alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillListing {
+    /// Every launch, listing none: the layers' graphs list no tiles.
+    Every,
+    /// The launches whose rows see at most `capacity` history rows, one
+    /// request's, listing the tiles they see.
+    Listed { capacity: u64 },
+    /// The launches whose rows see more than `capacity` history rows,
+    /// listing none.
+    Unlisted { capacity: u64 },
+}
+
+impl PrefillListing {
+    /// Whether the kernel lists its rows' history row tiles.
+    pub fn lists(self) -> bool {
+        matches!(self, Self::Listed { .. })
+    }
+
+    /// Whether the kernel serves `launch`: by the history rows its rows
+    /// see, each sequence's history and the rows it writes.
+    pub fn serves(self, launch: &Launch) -> bool {
+        let seen = launch.sequences * launch.history + launch.rows;
+        match self {
+            Self::Every => true,
+            Self::Listed { capacity } => seen <= capacity,
+            Self::Unlisted { capacity } => seen > capacity,
+        }
+    }
 }
 
 /// The most history rows the layers `scopes` name keep: the largest window
@@ -822,7 +861,7 @@ impl AttentionMix {
                     // A listed launch lists the tiles its rows see, one at
                     // least; an unlisted one passes an empty list of one
                     // column.
-                    let tiles = if self.listed {
+                    let tiles = if self.listing.lists() {
                         context.div_ceil(256).max(1)
                     } else {
                         1
@@ -831,7 +870,7 @@ impl AttentionMix {
                         self.shape
                             .mix_dimensions(point.rows, context + point.rows, segments)
                             .into_iter()
-                            .chain([("L", u64::from(self.listed)), ("HT", tiles)])
+                            .chain([("L", u64::from(self.listing.lists())), ("HT", tiles)])
                             .chain(
                                 if self.codec.encoding() == magnitude_state::HistoryEncoding::Affine
                                 {
@@ -859,7 +898,7 @@ impl AttentionMix {
                 rows.start,
                 rows.end
             ),
-            None if self.listed => format!("A={},L=1", self.activation.name()),
+            None if self.listing.lists() => format!("A={},L=1", self.activation.name()),
             None => format!("A={}", self.activation.name()),
         }
     }
@@ -868,7 +907,7 @@ impl AttentionMix {
         self.shape
             .mix_statics()
             .into_iter()
-            .chain([("L", u64::from(self.listed))])
+            .chain([("L", u64::from(self.listing.lists()))])
             .chain(
                 if self.codec.encoding() == magnitude_state::HistoryEncoding::Affine {
                     crate::operators::attention::graph::affine_dimensions(self.codec)
@@ -1013,7 +1052,7 @@ impl AttentionMix {
                             .ok_or("tuning history tiles exceed their bound")?;
                         tiles.truncate(tiles.iter().filter(|tile| **tile >= 0).count().max(1));
                         // An unlisted launch passes no list.
-                        if !self.listed {
+                        if !self.listing.lists() {
                             inputs.i32s(&[0, 1], &[])?
                         } else {
                             inputs.i32s(&[1, tiles.len() as u64], &tiles)?
@@ -1090,9 +1129,11 @@ macro_rules! mix_entry {
                 self.served(limits)
             }
 
-            fn invocation_rows(&self, rows: u64, representatives: &[u64]) -> Option<u64> {
+            fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
+                let rows = launch.rows;
                 if rows == 0 || !($serves)(rows)
                     || self.0.decode_rows.as_ref().is_some_and(|range| !range.contains(&rows))
+                    || !self.0.listing.serves(launch)
                 {
                     return None;
                 }
@@ -1223,6 +1264,37 @@ mix_entry!(
 mod tests {
     use super::*;
 
+    /// The listed and unlisted prefill kernels of the same layers each take
+    /// the launches the graph gives them, so no launch is demand of both:
+    /// one request's rows list the tiles they see however long its
+    /// history, several requests' whose histories together exceed one
+    /// request's take the kernel that lists none.
+    #[test]
+    fn a_prefill_launch_is_demand_of_the_kernel_that_serves_it() {
+        let capacity = 65536;
+        let (listed, unlisted) = (
+            PrefillListing::Listed { capacity },
+            PrefillListing::Unlisted { capacity },
+        );
+        let launch = |rows, sequences, history| Launch {
+            term: 0,
+            rows,
+            sequences,
+            history,
+        };
+        for launch in [
+            launch(512, 1, 0),
+            launch(512, 1, 65024),
+            launch(16, 16, 4096),
+            launch(64, 16, 4096),
+        ] {
+            assert!(PrefillListing::Every.serves(&launch));
+            assert_ne!(listed.serves(&launch), unlisted.serves(&launch));
+        }
+        assert!(listed.serves(&launch(512, 1, 65024)));
+        assert!(unlisted.serves(&launch(16, 16, 8192)));
+    }
+
     #[test]
     fn metal_verification_exposes_legal_scalar_group_split() {
         for implementation in [
@@ -1244,7 +1316,7 @@ mod tests {
                         256,
                         256,
                     ),
-                    listed: false,
+                    listing: PrefillListing::Every,
                     activation: Element::bf16(),
                     shape: AttentionShape {
                         hidden: 2560,
@@ -1341,7 +1413,7 @@ mod tests {
                     width as usize,
                     width as usize,
                 ),
-                listed: false,
+                listing: PrefillListing::Every,
                 activation: Element::bf16(),
                 shape: AttentionShape {
                     hidden: 1536,
@@ -1423,7 +1495,7 @@ mod tests {
                         width as usize,
                         width as usize,
                     ),
-                    listed: false,
+                    listing: PrefillListing::Every,
                     activation: Element::bf16(),
                     shape: AttentionShape {
                         hidden: 2048,
@@ -1536,7 +1608,7 @@ mod tests {
         }
         let mix = AttentionMix {
             codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 256, 256),
-            listed: false,
+            listing: PrefillListing::Every,
             activation: Element::bf16(),
             shape: AttentionShape {
                 hidden: 2560,
@@ -1630,7 +1702,13 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>();
             for logical in 1..=DECODE_ROWS {
-                let represented = tuned.invocation_rows(logical, &representatives);
+                let launch = Launch {
+                    term: 0,
+                    rows: logical,
+                    sequences: 1,
+                    history: 0,
+                };
+                let represented = tuned.invocation_rows(&launch, &representatives);
                 assert_eq!(represented.is_some(), range.contains(&logical));
                 assert!(represented.is_none_or(|row| range.contains(&row)));
             }
@@ -1651,7 +1729,7 @@ mod tests {
     fn served_dimensions_cover_every_span_class_of_every_point() {
         let mix = AttentionMix {
             codec: magnitude_state::KvCodec::AffineK8V4.spec(seismic::DType::BF16, 128, 128),
-            listed: true,
+            listing: PrefillListing::Listed { capacity: 65536 },
             activation: Element::bf16(),
             shape: AttentionShape {
                 hidden: 2048,

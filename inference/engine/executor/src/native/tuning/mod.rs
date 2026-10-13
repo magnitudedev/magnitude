@@ -75,14 +75,7 @@ macro_rules! generated_entry {
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
-            $module::native_tune_with(
-                device,
-                $elements,
-                statics,
-                points,
-                validation,
-                strategy,
-            )
+            $module::native_tune_with(device, $elements, statics, points, validation, strategy)
         }
 
         fn open(
@@ -93,10 +86,7 @@ macro_rules! generated_entry {
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             let $this = self;
             Ok(Box::new($module::native_search_with(
-                device,
-                $elements,
-                statics,
-                validation,
+                device, $elements, statics, validation,
             )?))
         }
 
@@ -124,13 +114,7 @@ macro_rules! generated_entry {
             validation: seismic::NumericalRequirement,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
-            $module::native_tune(
-                device,
-                statics,
-                points,
-                validation,
-                strategy,
-            )
+            $module::native_tune(device, statics, points, validation, strategy)
         }
 
         fn open(
@@ -140,9 +124,7 @@ macro_rules! generated_entry {
             validation: seismic::NumericalRequirement,
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             Ok(Box::new($module::native_search(
-                device,
-                statics,
-                validation,
+                device, statics, validation,
             )?))
         }
 
@@ -180,13 +162,13 @@ pub(crate) mod state_space;
 pub mod survey;
 mod trace;
 mod weights;
-mod workload;
+pub(crate) mod workload;
 
 pub use precision::{NumericalProfile, ResolvedNumericalProfile};
-pub use record::Receipt;
-use record::StoredChoice;
 #[cfg(test)]
 use record::ChosenEvidence;
+pub use record::Receipt;
+use record::StoredChoice;
 pub use trace::{TRACE_SCHEMA, TracedWork, TuningTrace};
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
 pub(crate) use weights::{TuningWeights, weight_plan};
@@ -195,14 +177,15 @@ use super::CatalogFailure;
 use super::specialization::{UntunedEntries, UntunedFormation};
 use crate::ModelLoadPlan;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use crate::programs::invocation_demand::Launch;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
 use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
 #[cfg(feature = "tuning-survey")]
 use seismic::Strategy;
 use seismic::{
     Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization,
-    ParameterValues, SearchSettings, SearchStop, Standing, Tensor, TensorError,
-    TuneError, TuningInitializer, TuningResult, TuningTime,
+    ParameterValues, SearchSettings, SearchStop, Standing, Tensor, TensorError, TuneError,
+    TuningInitializer, TuningResult, TuningTime,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -211,13 +194,12 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// The row classes units are tuned at. The served workload's launches per
-/// turn at each weigh the objective ([`invocation_base`]).
+/// The row classes units are tuned at; a load's launches are represented at
+/// them ([`EntryTuning::invocation_rows`]).
 pub const TUNING_ROWS: [u64; 10] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
-/// History lengths of attention tuning points (§5.3).
-// An empty history exercises the fresh-only path, where the Gemma G8
-// defect reproduces. Longer histories plus their appended rows already
-// cover partially occupied groups.
+/// Numerical history witnesses, supplemented by each layer's longest
+/// retained history ([`with_contexts`]). Performance demand selects its
+/// representatives independently in [`apply_invocation_counts`].
 pub const TUNING_CONTEXTS: [u64; 5] = [0, 256, 4096, 16384, 65536];
 /// Distinct layers a decode-row rotation cycles through where the model has
 /// them. Decode rows stream every weight once per call, so repeated calls
@@ -410,13 +392,18 @@ pub const MIN_SAMPLE_SECONDS: f64 = 0.0002;
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointShape {
     pub label: String,
-    /// Launches of this shape per turn of the served workload, once the
-    /// load's graph has supplied the unit's calls
-    /// ([`apply_invocation_counts`]); as a case declares its points, the
-    /// workload's launches relative to the unit's other points. The
-    /// objective is the sum over points of this times the time measured
-    /// there, so a point of no demand votes for nothing.
+    /// The point's weight in the unit's objective, once the load's graph
+    /// has supplied the unit's launches ([`apply_invocation_counts`]): for
+    /// each term of the load's objective, the term's weight times the
+    /// term's launches at the point over the term's time at the defaults
+    /// ([`Objective`]); as a case declares its points, their weights
+    /// relative to each other. The unit's objective is the sum over points
+    /// of this times the time measured there, so a point of no demand votes
+    /// for nothing.
     pub weight: f64,
+    /// The launches of each term of the load's objective at this point, by
+    /// the term's index: the point's part of the term's time.
+    pub terms: Vec<(usize, f64)>,
     pub rows: u64,
     /// The sequences the point's rows belong to, each with a history of its
     /// own: 1 for rows of one sequence (a prefill chunk, a drafter's
@@ -454,45 +441,6 @@ pub struct TuningLimits {
     pub context_tokens: u64,
 }
 
-/// The served workload's launches per turn at every row class the engine
-/// has ([`workload::class_load`]): prefill, single-row decode and the decode
-/// steps of 2, 4 and 8 rows. Supplied to the load's graph invocation model,
-/// which adds action multiplicities; the tuner does not infer them from
-/// weights.
-pub(crate) fn invocation_base(
-    limits: TuningLimits,
-) -> crate::programs::invocation_demand::InvocationCounts {
-    // A prefill launch's rows are one sequence's. A decode step of several
-    // rows is that many requests decoding together, one row each.
-    crate::programs::invocation_demand::InvocationCounts::across(
-        TUNING_ROWS
-            .into_iter()
-            .filter(|rows| *rows <= limits.max_rows)
-            .flat_map(|rows| {
-                let prefill = workload::prefill_load(rows, limits).launches;
-                let decode = (workload::class_load(rows, limits).launches - prefill).max(0.);
-                [(rows, 1, prefill), (rows, rows, decode)]
-            }),
-    )
-}
-
-/// The decode rounds of a turn that bound a speculative method's actions:
-/// a round emits at least one of the turn's decoded tokens.
-pub(crate) fn invocation_rounds() -> f64 {
-    workload::decoded_tokens()
-}
-
-pub(crate) fn invocation_prefill_base(
-    limits: TuningLimits,
-) -> crate::programs::invocation_demand::InvocationCounts {
-    crate::programs::invocation_demand::InvocationCounts::new(
-        TUNING_ROWS
-            .into_iter()
-            .filter(|rows| *rows <= limits.max_rows)
-            .map(|rows| (rows, workload::prefill_load(rows, limits).launches)),
-    )
-}
-
 impl TuningLimits {
     /// The bounds a load under `limits` tunes `definition`'s entries within.
     pub(crate) fn of(limits: crate::ResourceLimits, definition: &ModelDefinition) -> Self {
@@ -504,32 +452,21 @@ impl TuningLimits {
     }
 }
 
-/// The row classes one census point stands for. Each streaming row count is
-/// a class of its own. Numerical witnesses cover all histories; the census
-/// times bootstrap and workload representatives. Beyond them the short chunks and the prefill chunks are one group
-/// each: the census times a unit at the costliest point it serves in each
-/// group, and that point's time, scaled by cost, stands for the unit at
-/// every row count of the group it serves.
-fn census_group(rows: u64) -> u64 {
-    match rows {
-        0..=STREAMING_ROWS => rows,
-        16 | 32 => 32,
-        _ => u64::MAX,
-    }
-}
-
-/// Discover each served execution region at its widest rows, first without
-/// history, then at the points representing its workload demand. Complete
+/// Discover each unit at the points the load's objective weighs, and at an
+/// empty history beside each weighted history point, the cheapest point of
+/// its rows, which prices the longer ones before they are built. Complete
 /// numerical scope remains independent of these performance measurements.
 fn census_points(shapes: &[PointShape]) -> Vec<bool> {
     shapes
         .iter()
         .map(|shape| {
-            (shape.rows <= STREAMING_ROWS
-                || shapes.iter().all(|other| {
-                    census_group(other.rows) != census_group(shape.rows) || other.rows <= shape.rows
-                }))
-                && (shape.context.is_none_or(|history| history == 0) || shape.weight > 0.)
+            shape.weight > 0.
+                || (shape.context == Some(0)
+                    && shapes.iter().any(|other| {
+                        other.rows == shape.rows
+                            && other.sequences == shape.sequences
+                            && other.weight > 0.
+                    }))
         })
         .collect()
 }
@@ -542,47 +479,110 @@ fn normalized(mut points: Vec<PointShape>) -> Vec<PointShape> {
     points
 }
 
-/// Retain every numerical point while replacing only performance demand.
-/// History points preserve their conditional distribution within a row class.
-fn apply_invocation_counts(
-    points: &mut [PointShape],
-    counts: &crate::programs::invocation_demand::InvocationCounts,
-) {
-    // Launches of a row count go to the points of that row count whose
-    // sequences are the most declared that the launches have: a unit that
-    // declares only points of one sequence takes them all there.
-    let declared = points
-        .iter()
-        .fold(BTreeMap::<u64, Vec<u64>>::new(), |mut declared, point| {
-            declared.entry(point.rows).or_default().push(point.sequences);
-            declared
-        });
-    let mut supplied = BTreeMap::<(u64, u64), f64>::new();
-    for (rows, declared) in &declared {
-        for (sequences, count) in counts.sequences(*rows) {
-            let at = declared
-                .iter()
-                .copied()
-                .filter(|declared| *declared <= sequences)
-                .max()
-                .unwrap_or_else(|| *declared.iter().min().expect("a row count has a point"));
-            *supplied.entry((*rows, at)).or_default() += count;
+/// The declared workload and its measured baseline term times. Before
+/// discovery, unnormalized demand selects points only; no candidate is
+/// compared until the complete baseline supplies the normalization.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Objective {
+    pub terms: Vec<workload::Term>,
+    pub measured: Vec<f64>,
+}
+
+impl Objective {
+    pub fn new(terms: Vec<workload::Term>) -> Self {
+        let measured = vec![0.; terms.len()];
+        Self { terms, measured }
+    }
+
+    /// What `launches` launches of term `term` at a point weigh in a unit's
+    /// objective, per second they take: the term's weight over its time.
+    fn weight(&self, term: usize, launches: f64) -> f64 {
+        match self.measured.get(term) {
+            Some(time) if *time > 0. => self.terms[term].weight * launches / time,
+            _ => self.terms[term].weight * launches,
         }
     }
-    let totals = points
-        .iter()
-        .fold(BTreeMap::<(u64, u64), f64>::new(), |mut sum, point| {
-            *sum.entry((point.rows, point.sequences)).or_default() += point.weight;
-            sum
-        });
-    for point in points {
-        let shape = (point.rows, point.sequences);
-        let total = totals[&shape];
-        point.weight = if total > 0. {
-            point.weight / total * supplied.get(&shape).copied().unwrap_or(0.)
-        } else {
-            0.
+}
+
+/// Retain every numerical point while replacing its performance demand with
+/// the launches the load's graph supplied for the unit ([`Objective`]).
+/// Launches of a row count go to the points of that row count whose
+/// sequences are the most declared that the launches have; a unit that
+/// declares only points of one sequence takes them all there. A launch's
+/// history is divided between the two timing representatives around it in
+/// proportion to its distance from each, so its time is interpolated
+/// between the neighbouring measured points only, and is held to the
+/// longest declared (a windowed layer reads no more).
+pub(crate) fn apply_invocation_counts(
+    points: &mut [PointShape],
+    counts: &crate::programs::invocation_demand::InvocationCounts,
+    objective: &Objective,
+) {
+    for point in points.iter_mut() {
+        point.weight = 0.;
+        point.terms.clear();
+    }
+    for (launch, count) in counts.launches() {
+        let declared = points
+            .iter()
+            .filter(|point| point.rows == launch.rows)
+            .map(|point| point.sequences)
+            .collect::<Vec<_>>();
+        let Some(sequences) = declared
+            .iter()
+            .copied()
+            .filter(|declared| *declared <= launch.sequences)
+            .max()
+            .or_else(|| declared.iter().copied().min())
+        else {
+            continue;
         };
+        let at = points
+            .iter()
+            .enumerate()
+            .filter(|(_, point)| point.rows == launch.rows && point.sequences == sequences)
+            .map(|(index, point)| (index, point.context))
+            .collect::<Vec<_>>();
+        let mut contexts = at
+            .iter()
+            .filter_map(|(index, context)| context.map(|context| (context, *index)))
+            .collect::<Vec<_>>();
+        contexts.sort_unstable();
+        let parts = if contexts.is_empty() {
+            vec![(at[0].0, 1.)]
+        } else {
+            let longest = contexts.last().expect("a point").0;
+            // Keep all declared numerical witnesses, but time only the
+            // explicit empty, short and longest history representatives.
+            contexts.retain(|(context, _)| matches!(*context, 0 | 4096) || *context == longest);
+            let history = launch.history.min(longest);
+            let upper = contexts
+                .iter()
+                .position(|(context, _)| *context >= history)
+                .unwrap_or(contexts.len() - 1);
+            let lower = upper.saturating_sub(1);
+            let (low, high) = (contexts[lower].0 as f64, contexts[upper].0 as f64);
+            let high_share = if high > low {
+                ((history as f64 - low) / (high - low)).clamp(0., 1.)
+            } else {
+                1.
+            };
+            if lower == upper {
+                vec![(contexts[upper].1, 1.)]
+            } else {
+                vec![
+                    (contexts[lower].1, 1. - high_share),
+                    (contexts[upper].1, high_share),
+                ]
+            }
+        };
+        for (index, part) in parts {
+            if part > 0. {
+                let point = &mut points[index];
+                point.terms.push((launch.term, count * part));
+                point.weight += objective.weight(launch.term, count * part);
+            }
+        }
     }
 }
 
@@ -590,6 +590,7 @@ fn row_point(rows: u64, weight: f64) -> PointShape {
     PointShape {
         label: format!("m{rows}"),
         weight,
+        terms: Vec::new(),
         rows,
         sequences: 1,
         context: None,
@@ -631,7 +632,8 @@ pub(crate) fn history_placement(
             extent: context,
         });
     }
-    let layout = magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
+    let layout =
+        magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
     let geometry = layout
         .target_history
         .iter()
@@ -663,6 +665,43 @@ pub(crate) fn history_placement(
         .max()
         .unwrap_or(0);
     Ok(HistoryPlacement { sequences, extent })
+}
+
+/// The history rows the listing classes of a layer keeping at most
+/// `window` rows (the whole context without one) hold for one request: its
+/// history's most spans of whole pages, as the target's store of `codec`
+/// places them (`HistoryStorePlan::launch_tiles`). A launch whose rows see
+/// at most these lists the tiles they see.
+pub(crate) fn request_history_rows(
+    model: &ModelInputs<'_>,
+    codec: magnitude_state::KvCodec,
+    window: Option<u64>,
+) -> Result<u64, String> {
+    let layout =
+        magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
+    let domain = layout
+        .target_history
+        .iter()
+        .find(|domain| match (domain, window) {
+            (magnitude_state::HistoryDomainLayout::Token { .. }, None) => true,
+            (magnitude_state::HistoryDomainLayout::Window { rows, .. }, Some(window)) => {
+                *rows as u64 == window
+            }
+            _ => false,
+        })
+        .ok_or("the layers' history domain is not the target's")?;
+    let geometry = domain
+        .geometry(
+            &layout.target_history,
+            usize::try_from(model.limits.context_tokens).map_err(|_| "context exceeds usize")?,
+            usize::try_from(model.limits.max_rows).map_err(|_| "rows exceed usize")?,
+        )
+        .map_err(|error| error.to_string())?;
+    geometry
+        .span_limit
+        .checked_mul(geometry.page_rows)
+        .map(|rows| rows as u64)
+        .ok_or_else(|| "a request's history rows overflow".to_owned())
 }
 
 /// `point`, a row point of one sequence, as `sequences` sequences' rows.
@@ -700,12 +739,7 @@ pub fn served_row_points(limits: TuningLimits, serves: impl Fn(u64) -> bool) -> 
             .map(|rows| row_point(rows, 1.0))
             .collect();
     }
-    normalized(
-        within
-            .into_iter()
-            .map(|rows| row_point(rows, workload::class_weight(rows, limits)))
-            .collect(),
-    )
+    normalized(within.into_iter().map(|rows| row_point(rows, 1.)).collect())
 }
 
 /// The longest history the engine serves to layers keeping at most `window`
@@ -720,10 +754,10 @@ pub fn longest_history(limits: TuningLimits, window: Option<u64>) -> u64 {
 /// `rows` crossed with the history lengths the engine serves to layers
 /// keeping at most `window` history rows (the whole context without one).
 ///
-/// A layer whose window is shorter than the context never sees a longer
-/// history and sees exactly its window in every prompt longer than it, so
-/// its lengths are the ladder's below the window and the window itself. A
-/// window that holds the whole context bounds nothing.
+/// Those are [`TUNING_CONTEXTS`] below the longest and the longest itself:
+/// the context, or for a layer whose window is shorter than the context
+/// the window, which it sees in every prompt longer than it and never
+/// exceeds. A window that holds the whole context bounds nothing.
 pub fn with_contexts(
     limits: TuningLimits,
     window: Option<u64>,
@@ -740,41 +774,15 @@ pub fn with_contexts(
     normalized(
         rows.into_iter()
             .flat_map(|point| {
-                // Linear history interpolation represents the declared mean
-                // service history. Endpoints still belong to qualification.
-                let history = (workload::class_load(point.rows, limits).history
-                    * limits.context_tokens as f64)
-                    .min(longest as f64);
-                let upper = contexts
-                    .iter()
-                    .position(|&context| context as f64 >= history)
-                    .unwrap_or(contexts.len() - 1);
-                let lower = upper.saturating_sub(1);
-                let low = contexts[lower] as f64;
-                let high = contexts[upper] as f64;
-                let high_share = if high > low {
-                    ((history - low) / (high - low)).clamp(0., 1.)
-                } else {
-                    1.
-                };
-                contexts
-                    .iter()
-                    .enumerate()
-                    .map(move |(index, &context)| PointShape {
-                        label: format!("{}-c{context}", point.label),
-                        weight: point.weight
-                            * if index == upper {
-                                high_share
-                            } else if index == lower {
-                                1. - high_share
-                            } else {
-                                0.
-                            },
-                        rows: point.rows,
-                        sequences: point.sequences,
-                        context: Some(context),
-                        class: Some(point.label.clone()),
-                    })
+                contexts.iter().map(move |&context| PointShape {
+                    label: format!("{}-c{context}", point.label),
+                    weight: point.weight,
+                    terms: Vec::new(),
+                    rows: point.rows,
+                    sequences: point.sequences,
+                    context: Some(context),
+                    class: Some(point.label.clone()),
+                })
             })
             .collect(),
     )
@@ -932,6 +940,11 @@ pub(crate) trait EntrySearch<E: seismic::Entry> {
     /// programs exactly as a load requests them and release them.
     fn publish_artifact(&mut self) -> Result<Duration, TuneError>;
     fn service_measurements(&self) -> Vec<seismic::PointMeasurement>;
+    /// Weigh the points by `weights` before anything of the search is
+    /// measured against its first weights; false once it has.
+    fn reweigh(&mut self, weights: &[f64]) -> bool;
+    /// Whether the defaults are measured at every discovery point.
+    fn discovered(&self) -> bool;
     fn standing(&self) -> Standing;
 }
 
@@ -1014,6 +1027,12 @@ impl<E: seismic::Entry> EntrySearch<E> for seismic::NativeSearch<'static, E> {
     fn service_measurements(&self) -> Vec<seismic::PointMeasurement> {
         seismic::NativeSearch::service_measurements(self)
     }
+    fn reweigh(&mut self, weights: &[f64]) -> bool {
+        seismic::NativeSearch::reweigh(self, weights)
+    }
+    fn discovered(&self) -> bool {
+        seismic::NativeSearch::discovered(self)
+    }
     fn standing(&self) -> Standing {
         seismic::NativeSearch::standing(self)
     }
@@ -1038,9 +1057,12 @@ pub(crate) trait EntryTuning: Clone + 'static {
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String>;
     fn points(&self, limits: TuningLimits) -> Vec<PointShape>;
 
-    /// Project a logical graph invocation onto this entry's performance
-    /// representative. Numerical support remains `points`/served dimensions.
-    fn invocation_rows(&self, rows: u64, representatives: &[u64]) -> Option<u64> {
+    /// Project a logical graph launch onto this entry's performance
+    /// representative: the rows of the point that times it, none where the
+    /// unit's kernel does not serve it (another kernel for the same layers
+    /// does). Numerical support remains `points`/served dimensions.
+    fn invocation_rows(&self, launch: &Launch, representatives: &[u64]) -> Option<u64> {
+        let rows = launch.rows;
         (rows > 0)
             .then(|| {
                 representatives
@@ -1142,10 +1164,7 @@ pub enum TuningEvent {
     /// Milliseconds of tuning time spent so far, of the tuning budget.
     /// Reported when the search walk begins and after each unit it
     /// searches; nothing is reported when every unit is stored.
-    Progress {
-        completed: usize,
-        total: usize,
-    },
+    Progress { completed: usize, total: usize },
     /// A unit's optional work starts. How many configurations it can reach
     /// is reported with its result ([`SearchProgress`]): counting the
     /// declared domain here would enumerate it.
@@ -1520,7 +1539,10 @@ impl TuningMemory {
     /// What tuning holds now, as admission counts it: Seismic's charges on
     /// the device since tuning began.
     fn held(&self, device: &Device) -> u64 {
-        device.memory_usage().charged.saturating_sub(self.began_bytes)
+        device
+            .memory_usage()
+            .charged
+            .saturating_sub(self.began_bytes)
     }
 
     /// What tuning holds now in all: what the process's footprint has
@@ -1648,11 +1670,9 @@ impl TuningMemory {
         let held_within = within
             .saturating_sub(self.began_bytes)
             .max(self.held(device));
-        let grown = footprint
-            .zip(self.process_began_bytes)
-            .map(|(now, began)| {
-                now.saturating_sub(began) + if self.device_separate { held_within } else { 0 }
-            });
+        let grown = footprint.zip(self.process_began_bytes).map(|(now, began)| {
+            now.saturating_sub(began) + if self.device_separate { held_within } else { 0 }
+        });
         self.footprint_peak_bytes = self.footprint_peak_bytes.max(grown);
         self.footprint_margin_bytes = self
             .footprint_ceiling_bytes
@@ -1700,7 +1720,11 @@ impl TuningMemory {
 
     fn piece(&mut self, unit: String, stage: seismic::Stage, before: u64, after: u64) {
         let held = after as i64 - before as i64;
-        match self.held_by_class.iter_mut().find(|(class, _)| *class == stage) {
+        match self
+            .held_by_class
+            .iter_mut()
+            .find(|(class, _)| *class == stage)
+        {
             Some((_, sum)) => *sum += held,
             None => self.held_by_class.push((stage, held)),
         }
@@ -2386,9 +2410,12 @@ pub(super) trait ComposedContender<'a> {
     fn key(&self) -> String;
     fn label(&self) -> &'static str;
     fn cached(&self) -> Option<bool>;
+    /// Weigh the recipe's point by the launches the load's graph supplied
+    /// for it ([`apply_invocation_counts`]).
     fn set_invocations(
         &mut self,
         invocations: &crate::programs::invocation_demand::InvocationCounts,
+        objective: &Objective,
     );
     /// Form the contender and measure both recipes once: its discovery,
     /// run to its end. None when the contender cannot be formed or built.
@@ -2471,18 +2498,23 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
     fn key(&self) -> &TuningKey {
         &self.key
     }
-    fn time(&self) -> (usize, Vec<PointShape>, Vec<PointShape>, Vec<f64>) {
+    fn times(&self, terms: usize) -> Vec<f64> {
         self.census.as_ref().map_or_else(
-            || (1, Vec::new(), Vec::new(), Vec::new()),
+            || vec![0.; terms],
             |census| {
-                (
-                    1,
-                    census.served.clone(),
-                    census.measured.clone(),
-                    census.seconds.clone(),
-                )
+                term_times(&census.served, terms, |point| {
+                    census
+                        .measured
+                        .iter()
+                        .zip(&census.seconds)
+                        .find(|(measured, _)| measured.label == point.label)
+                        .map(|(_, seconds)| *seconds)
+                })
             },
         )
+    }
+    fn discovered(&self) -> bool {
+        true
     }
     fn share(&self) -> f64 {
         self.share
@@ -2503,7 +2535,7 @@ impl<'a> SearchedUnit<'a> for ComposedUnit<'a> {
                 unpriced: 0,
             },
             forming: seismic::Quote::default(),
-            gain: 1. / 2.,
+            opportunity: 1.,
             // What a recipe's qualification holds is its contender's own:
             // nothing of it was observed to price.
             footprint: seismic::Footprint::default(),
@@ -2599,10 +2631,16 @@ trait SearchedUnit<'a> {
         false
     }
     fn key(&self) -> &TuningKey;
-    /// The unit's step time as its census measured it: its launches per
-    /// step, the points it serves, its timed points and its defaults' time
-    /// at each.
-    fn time(&self) -> (usize, Vec<PointShape>, Vec<PointShape>, Vec<f64>);
+    /// The unit's time in each of the objective's `terms` at its defaults,
+    /// as its census measured it ([`term_times`]).
+    fn times(&self, terms: usize) -> Vec<f64>;
+    /// Weigh the unit's points again under `objective`, whose terms' times
+    /// now stand on measurements, once its discovery is complete and
+    /// before anything of its search is measured against those weights.
+    fn reweigh(&mut self, _objective: &Objective) {}
+    /// Whether the unit's defaults are measured at every discovery point,
+    /// so its times ([`SearchedUnit::times`]) are whole.
+    fn discovered(&self) -> bool;
     fn share(&self) -> f64;
     fn set_share(&mut self, share: f64);
     /// The unit's next piece of optional work, priced in full.
@@ -2676,24 +2714,33 @@ trait SearchedUnit<'a> {
 }
 
 impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
+    fn objective_ready(units: &[Self]) -> bool {
+        units.iter().all(|unit| unit.discovered())
+    }
+
+    /// Freeze the objective only after every ordinary unit has measured its
+    /// baseline. Missing measurements never become zero-cost service.
     fn refresh(units: &mut [Self], tuner: &mut Tuner<'a>) {
-        let times = units.iter().map(|unit| unit.time()).collect::<Vec<_>>();
-        let shares = step_shares(
-            &times
-                .iter()
-                .map(|(_, served, shapes, seconds)| UnitTime {
-                    invocations: crate::programs::invocation_demand::InvocationCounts::new(
-                        served.iter().map(|point| (point.rows, point.weight)),
-                    ),
-                    served,
-                    shapes,
-                    seconds,
-                })
-                .collect::<Vec<_>>(),
-            tuner.limits,
-        );
-        for (unit, share) in units.iter_mut().zip(shares) {
+        if units.iter().any(|unit| !unit.discovered()) {
+            return;
+        }
+        let objective = &mut tuner.invocations.objective;
+        let terms = objective.terms.len();
+        let times = units
+            .iter()
+            .map(|unit| unit.times(terms))
+            .collect::<Vec<_>>();
+        let weights = objective
+            .terms
+            .iter()
+            .map(|term| term.weight)
+            .collect::<Vec<_>>();
+        objective.measured = (0..terms)
+            .map(|term| times.iter().map(|unit| unit[term]).sum())
+            .collect();
+        for (unit, share) in units.iter_mut().zip(shares(&times, &weights)) {
             unit.set_share(share);
+            unit.reweigh(objective);
         }
     }
     fn prerequisites(&self) -> Vec<usize> {
@@ -2710,6 +2757,11 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
 
     fn next(&self) -> Option<seismic::Work> {
         (**self).next()
+    }
+
+    /// Units of one entry check the same untimed points.
+    fn kind(&self) -> &'static str {
+        self.key().0
     }
 
     fn forming(&self) -> Option<seismic::Forming> {
@@ -2749,9 +2801,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
                 .zip(seismic::ProcessMemory::footprint_peak())
                 .filter(|(before, peak)| peak > before)
                 .map_or(after, |(_, peak)| peak.max(after));
-            tuner
-                .memory
-                .host_piece(&unit, most.saturating_sub(before));
+            tuner.memory.host_piece(&unit, most.saturating_sub(before));
         }
         tuner.memory.piece(
             unit,
@@ -2956,7 +3006,9 @@ struct CaseUnit<'a, T: EntryTuning> {
     statics: NativeSpecialization,
     /// The unit's points, ascending in cost.
     shapes: Vec<PointShape>,
-    launches: usize,
+    /// Its points were weighed again once its discovery was complete
+    /// ([`SearchedUnit::reweigh`]).
+    reweighed: bool,
     /// The inputs built so far, kept for the unit's later work.
     cases: UnitCases<T::Case>,
     search: Box<dyn EntrySearch<T::Entry>>,
@@ -3036,19 +3088,38 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
         &self.key
     }
 
-    fn time(&self) -> (usize, Vec<PointShape>, Vec<PointShape>, Vec<f64>) {
+    fn times(&self, terms: usize) -> Vec<f64> {
         let measured = self.search.service_measurements();
-        let (shapes, seconds) = self
-            .shapes
-            .iter()
-            .filter_map(|shape| {
-                measured
-                    .iter()
-                    .find(|point| point.point == shape.label)
-                    .map(|point| (shape.clone(), point.median_seconds))
-            })
-            .unzip();
-        (self.launches, self.shapes.clone(), shapes, seconds)
+        term_times(&self.shapes, terms, |shape| {
+            measured
+                .iter()
+                .find(|point| point.point == shape.label)
+                .map(|point| point.median_seconds)
+        })
+    }
+
+    /// Freeze this unit's objective after the load's complete baseline
+    /// census and before measuring any challenger.
+    fn reweigh(&mut self, objective: &Objective) {
+        if self.reweighed || !self.search.discovered() {
+            return;
+        }
+        for point in &mut self.shapes {
+            point.weight = point
+                .terms
+                .iter()
+                .map(|(term, launches)| objective.weight(*term, *launches))
+                .sum();
+        }
+        let weights = point_specs(&self.shapes)
+            .into_iter()
+            .map(|spec| spec.weight)
+            .collect::<Vec<_>>();
+        self.reweighed = self.search.reweigh(&weights);
+    }
+
+    fn discovered(&self) -> bool {
+        self.search.discovered()
     }
 
     fn share(&self) -> f64 {
@@ -3068,7 +3139,10 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
     /// published the unit's canonical default.
     fn next(&self) -> Option<seismic::Work> {
         let mut work = self.search.next()?;
-        if matches!(work.stage, seismic::Stage::Promote | seismic::Stage::Confirm) {
+        if matches!(
+            work.stage,
+            seismic::Stage::Promote | seismic::Stage::Confirm
+        ) {
             let publication = self.search.artifact_publication(true);
             work.quote = match self.artifacts.get().price(publication) {
                 Some(seconds) => {
@@ -3126,7 +3200,8 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
 
     fn forming(&self) -> Option<seismic::Forming> {
         let forming = self.search.forming()?;
-        self.forming_quote.set(self.search.next().map(|work| work.forming));
+        self.forming_quote
+            .set(self.search.next().map(|work| work.forming));
         Some(forming)
     }
 
@@ -3308,131 +3383,42 @@ impl<'a, T: EntryTuning> SearchedUnit<'a> for CaseUnit<'a, T> {
     }
 }
 
-/// One tuning unit's step time as its census measured it: its launches per
-/// step, the points it serves, its timed points and its defaults' time at
-/// each.
-#[derive(Clone)]
-struct UnitTime<'u> {
-    invocations: crate::programs::invocation_demand::InvocationCounts,
-    served: &'u [PointShape],
-    shapes: &'u [PointShape],
-    seconds: &'u [f64],
+/// A unit's time in each of the objective's `terms` at its defaults: at
+/// every point whose time `seconds` gives, the point's launches of the term
+/// times that time. A point not yet timed counts for nothing.
+fn term_times(
+    points: &[PointShape],
+    terms: usize,
+    seconds: impl Fn(&PointShape) -> Option<f64>,
+) -> Vec<f64> {
+    let mut times = vec![0.; terms];
+    for point in points {
+        if let Some(seconds) = seconds(point) {
+            for (term, launches) in &point.terms {
+                times[*term] += launches * seconds;
+            }
+        }
+    }
+    times
 }
 
-/// Each unit's share of the served workload's time ([`workload`]): what the
-/// workload's launches of every row class the unit serves take at the
-/// defaults, at their mean history, against what every unit's take. A
-/// unit's time at a class is the defaults' time the census measured there,
-/// launches per step times it; for attention, at the class's mean history,
-/// interpolated linearly in a point's cost (rows times rows plus history)
-/// between the histories timed, or scaled from the one timed. A class the
-/// census did not time takes the costliest timed point of its group
-/// ([`census_group`]), scaled by the classes' cost. The defaults' time is
-/// also what tuning can recover: a unit far from its best spends more of
-/// the workload and gets more of the time.
-fn step_shares(units: &[UnitTime<'_>], _limits: TuningLimits) -> Vec<f64> {
-    let cost = |rows: u64| (rows as f64).max(workload::STREAMING_EQUIVALENT_ROWS);
-    let time = |unit: &UnitTime<'_>, rows: u64| {
-        if !unit.served.iter().any(|shape| shape.rows == rows) {
-            return 0.0;
-        }
-        // Use the same conditional history demand as the search objective.
-        // Zero-weight bootstrap witnesses establish numerical support only.
-        let (history_sum, history_weight) = unit
-            .served
-            .iter()
-            .filter(|shape| shape.rows == rows && shape.weight > 0.)
-            .filter_map(|shape| {
-                shape
-                    .context
-                    .map(|history| (history as f64 * shape.weight, shape.weight))
-            })
-            .fold((0., 0.), |(sum, weight), (next, demand)| {
-                (sum + next, weight + demand)
-            });
-        let history = if history_weight > 0. {
-            history_sum / history_weight
-        } else {
-            0.
-        };
-        let timed = |at: u64| {
-            unit.shapes
-                .iter()
-                .zip(unit.seconds)
-                .filter(|(shape, _)| shape.rows == at)
-                .map(|(shape, seconds)| (shape.clone(), *seconds))
-                .collect::<Vec<_>>()
-        };
-        let (at, class) = match timed(rows) {
-            class if !class.is_empty() => (rows, class),
-            _ => match unit
-                .shapes
-                .iter()
-                .filter(|shape| census_group(shape.rows) == census_group(rows))
-                .map(|shape| shape.rows)
-                .max()
-            {
-                Some(stands) => (stands, timed(stands)),
-                None => return 0.0,
-            },
-        };
-        let seconds = at_history(&class, history) * cost(rows) / cost(at);
-        unit.invocations.count(rows) * seconds
-    };
-    let totals = units
+/// Each unit's measured baseline contribution to the relative-time
+/// objective ([`workload`]): the weighted
+/// mean over terms of the unit's fraction of the term's time at the
+/// defaults, each unit's time in each term given (`times`).
+fn shares(times: &[Vec<f64>], weights: &[f64]) -> Vec<f64> {
+    let totals = (0..weights.len())
+        .map(|term| times.iter().map(|unit| unit[term]).sum::<f64>())
+        .collect::<Vec<_>>();
+    times
         .iter()
         .map(|unit| {
-            TUNING_ROWS
-                .iter()
-                .map(|rows| time(unit, *rows))
-                .sum::<f64>()
+            (0..weights.len())
+                .filter(|term| totals[*term] > 0.)
+                .map(|term| weights[term] * unit[term] / totals[term])
+                .sum()
         })
-        .collect::<Vec<_>>();
-    let total = totals.iter().sum::<f64>();
-    totals
-        .into_iter()
-        .map(|time| if total > 0.0 { time / total } else { 0.0 })
         .collect()
-}
-
-/// The defaults' time at `history` from the points of one row class timed:
-/// their mean for a class without history; for attention, linear in a
-/// point's cost between the two timed histories around it (or the two
-/// nearest), or scaled from the one timed.
-fn at_history(class: &[(PointShape, f64)], history: f64) -> f64 {
-    let costed = |shape: &PointShape, history: f64| {
-        let rows = shape.rows as f64;
-        rows * (rows + history)
-    };
-    let mut timed = class
-        .iter()
-        .filter_map(|(shape, seconds)| {
-            shape
-                .context
-                .map(|context| (context as f64, shape, *seconds))
-        })
-        .collect::<Vec<_>>();
-    if timed.is_empty() {
-        return class.iter().map(|(_, seconds)| seconds).sum::<f64>() / class.len() as f64;
-    }
-    timed.sort_by(|left, right| left.0.total_cmp(&right.0));
-    if timed.len() == 1 {
-        let (context, shape, seconds) = timed[0];
-        return seconds * costed(shape, history) / costed(shape, context);
-    }
-    let upper = timed
-        .iter()
-        .position(|(context, ..)| *context >= history)
-        .unwrap_or(timed.len() - 1)
-        .max(1);
-    let (low, shape, low_seconds) = timed[upper - 1];
-    let (high, _, high_seconds) = timed[upper];
-    let (from, to) = (costed(shape, low), costed(shape, high));
-    if to <= from {
-        return low_seconds;
-    }
-    let at = costed(shape, history);
-    (low_seconds + (high_seconds - low_seconds) * (at - from) / (to - from)).max(0.0)
 }
 
 /// One unit's built cases by point, kept from its census for its search,
@@ -3478,7 +3464,9 @@ impl<T: EntryTuning> CanonicalUnit for PreparedUnit<T> {
 
     fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<Duration, TuneError> {
         let began = Instant::now();
-        let formed = grounded.as_ref().map_or(Duration::ZERO, seismic::Grounded::elapsed);
+        let formed = grounded
+            .as_ref()
+            .map_or(Duration::ZERO, seismic::Grounded::elapsed);
         self.search.grounded(grounded)?;
         self.mandatory = formed + began.elapsed();
         Ok(self.search.longest_operation())
@@ -3495,11 +3483,19 @@ impl<T: EntryTuning> CanonicalUnit for PreparedUnit<T> {
 
 /// What one native implementation on a device is a function of: its entry,
 /// the entry's element bindings and its static values.
-type ImplementationKey = (&'static str, Vec<(&'static str, Element)>, NativeSpecialization);
+type ImplementationKey = (
+    &'static str,
+    Vec<(&'static str, Element)>,
+    NativeSpecialization,
+);
 
 /// A unit's slot in the kernel cache: the cache, the unit's key, and the
 /// valid choice stored under it with its evidence.
-type StoredSlot<'c> = (&'c KernelCache, TuningCacheKey, Option<(StoredChoice, Receipt)>);
+type StoredSlot<'c> = (
+    &'c KernelCache,
+    TuningCacheKey,
+    Option<(StoredChoice, Receipt)>,
+);
 
 /// Resolves every native entry's specialization for the opened device:
 /// static values, tuned parameters, and missing implementations. A first
@@ -3742,7 +3738,9 @@ impl<'a> Tuner<'a> {
                         .compile_host_bytes
                         .saturating_mul(seismic::Forming::threads(&forming) as u64)
                 });
-                unit.host_footprint(self).unwrap_or(0).saturating_add(compile)
+                unit.host_footprint(self)
+                    .unwrap_or(0)
+                    .saturating_add(compile)
             })
             .min();
         let domains = [
@@ -3988,28 +3986,25 @@ impl<'a> Tuner<'a> {
                     .map_err(|error| unit_failure(key, error))
             })
             .chain(
-                untuned
-                    .into_formations()
-                    .into_iter()
-                    .map(|formation| Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))),
+                untuned.into_formations().into_iter().map(|formation| {
+                    Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))
+                }),
             )
             .collect::<Result<Vec<_>, _>>()?;
         let workers = self.workers();
-        let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
-            match compile
-                .lock()
-                .expect("a mandatory compile is taken once")
-                .take()
-                .expect("a mandatory compile is formed once")
-            {
-                Mandatory::Canonical(grounding) => {
-                    MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
-                }
-                Mandatory::Untuned(formation) => {
-                    let began = Instant::now();
-                    let formed = formation();
-                    MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
-                }
+        let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| match compile
+            .lock()
+            .expect("a mandatory compile is taken once")
+            .take()
+            .expect("a mandatory compile is formed once")
+        {
+            Mandatory::Canonical(grounding) => {
+                MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
+            }
+            Mandatory::Untuned(formation) => {
+                let began = Instant::now();
+                let formed = formation();
+                MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
             }
         };
         // What the peak of the process's footprint rose by over compiles
@@ -4255,11 +4250,16 @@ impl<'a> Tuner<'a> {
             .max(allocation::Workers::compile_host(&threads));
         self.memory
             .mispriced
-            .extend(threads.mispriced().iter().map(|(priced, added)| Mispricing {
-                kind: "compile".into(),
-                priced_bytes: *priced,
-                added_bytes: *added,
-            }));
+            .extend(
+                threads
+                    .mispriced()
+                    .iter()
+                    .map(|(priced, added)| Mispricing {
+                        kind: "compile".into(),
+                        priced_bytes: *priced,
+                        added_bytes: *added,
+                    }),
+            );
         drop(threads);
         self.memory.no_room = self.no_room(&units, &report);
         self.memory.ended_bytes = self.device.memory_usage().charged;
@@ -4269,9 +4269,7 @@ impl<'a> Tuner<'a> {
         // Every unit reports its record as the allocator left it published,
         // whatever became of the work: each has served a published legal
         // choice throughout.
-        let reported = units
-            .iter_mut()
-            .try_for_each(|unit| unit.finish(&mut self));
+        let reported = units.iter_mut().try_for_each(|unit| unit.finish(&mut self));
         let refused = report
             .refused
             .iter()
@@ -4360,9 +4358,10 @@ impl<'a> Tuner<'a> {
         let demand_key = (contender.label(), key.clone(), BTreeMap::new());
         let demand = self
             .invocations
+            .units
             .get(&demand_key)
             .ok_or_else(|| unit_failure(&demand_key, "graph invocation demand is missing"))?;
-        contender.set_invocations(demand);
+        contender.set_invocations(demand, &self.invocations.objective);
         if let Some(selected) = self
             .composed_choices
             .get(&key)
@@ -4372,7 +4371,7 @@ impl<'a> Tuner<'a> {
             self.composed_choices.insert(key, selected);
             return Ok(Some(selected));
         }
-        let demanded = demand.iter().any(|(_, count)| count > 0.);
+        let demanded = demand.launches().any(|(_, count)| count > 0.);
         match &self.phase {
             Phase::Count { .. } => {
                 self.composed_counted.insert(key);
@@ -4459,9 +4458,10 @@ impl<'a> Tuner<'a> {
         let mut shapes = case.points(self.limits);
         let supplied = self
             .invocations
+            .units
             .get(key)
             .ok_or_else(|| unit_failure(key, "graph invocation demand is missing"))?;
-        apply_invocation_counts(&mut shapes, supplied);
+        apply_invocation_counts(&mut shapes, supplied, &self.invocations.objective);
         shapes.sort_by(|left, right| left.cost().total_cmp(&right.cost()));
         Ok(shapes)
     }
@@ -4633,9 +4633,9 @@ impl<'a> Tuner<'a> {
         let Phase::Census { launches, units } = &self.phase else {
             unreachable!("the phase is the census");
         };
-        let Some(&count) = launches.get(&key) else {
+        if !launches.contains_key(&key) {
             return Ok(None);
-        };
+        }
         if units.iter().any(|unit| *unit.key() == key) {
             return Ok(None);
         }
@@ -4658,7 +4658,7 @@ impl<'a> Tuner<'a> {
             implementation: implementation.clone(),
             statics: statics.clone(),
             shapes,
-            launches: count,
+            reweighed: false,
             cases,
             search,
             share: 0.,

@@ -97,6 +97,26 @@ def test_run_builds_one_flow_job(monkeypatch):
     assert command[command.index("--output") + 1] == "{run_dir}"
     assert "--fresh-tuning" in command and command[command.index("--tuning-seconds") + 1] == "60"
     assert command[command.index("--build-identity") + 1] == "{build_file}"
+    assert job.max_hold_seconds == flow.Job.max_hold_seconds
+
+
+def test_run_holds_the_host_no_longer_than_asked(monkeypatch):
+    from magnitude_remote import flow
+
+    jobs = []
+    monkeypatch.setattr(
+        flow,
+        "execute",
+        lambda job, host: jobs.append(job) or flow.Outcome("run-id", host, Path("/r"), 0),
+    )
+    code = cli.main([
+        "run", "--mode", "prose-repeat", "--model", "qwen3.5-4b:gguf:q4", "--context", "4k",
+        "--host", "gpu-pool", "--max-hold", "540",
+    ])
+    assert code == 0
+    assert jobs[0].max_hold_seconds == 540
+    # A flow-only option: the job is not handed it.
+    assert "--max-hold" not in jobs[0].command and "540" not in jobs[0].command
 
 
 def test_comparison_runs_build_only_what_they_use(monkeypatch):

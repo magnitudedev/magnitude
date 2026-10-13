@@ -1,121 +1,171 @@
-//! The served workload tuning weighs its units and points by: what one
-//! agent turn asks of the engine, per tuning row class.
+//! What tuning optimizes: the measurements the engine is held to, run the
+//! way the engine runs them for this load. Nothing here estimates how the
+//! engine is used; every launch follows from the load's own configuration
+//! (its context limit, launch rows, drafting method and its widths, and
+//! concurrency). Metric shares are explicit policy; normalization comes
+//! from measured baseline times.
 //!
-//! Derived from 137,170 turns of 1,631 Magnitude coding-agent sessions on
-//! the hosted provider (`~/.magnitude/sessions`, 2026-10-07; recorded with
-//! the derivation in `design/inference/engine/execution-plan.md`). Per turn
-//! the history at its start is the provider's cached prefix (median 46.6K
-//! tokens, 80% of turns hit), the new prompt tokens are the rest of its
-//! input (median 931, mean 13,579: a miss prefills the whole conversation)
-//! and its output is decoded (median 151, mean 426). New prompt tokens
-//! outnumber decoded ones 32 to 1. Histories are fractions of the context:
-//! the turns' inputs, against the 256K largest context their models serve,
-//! fall within an octave of it as 14% (128–256K), 31%, 30%, 15%, 7%, 2% and
-//! under 1% below.
+//! **Metrics.** One per phase, context point and concurrency
+//! ([`metrics`]):
 //!
-//! A prompt is prefilled in launches of the largest row class, the last
-//! launch of a turn in the smallest class that holds its remainder: per turn
-//! 26.5 launches of 512 rows at a mean history of 0.18 of the context, and
-//! the remainders' classes as listed. Decoding takes 426 tokens per turn at
-//! a mean history of 0.28: two thirds in single-row steps, a third in
-//! verification and concurrent steps of 2, 4 and 8 rows (a third of the
-//! steps each). The session data does not tell those apart; the split is
-//! the engine's earlier decode mix, kept until serving reports it.
+//! - `prefill(C)`: prefilling a prompt of C tokens as the engine schedules
+//!   it, in launches of the largest row class at histories 0, `max_rows`,
+//!   … and its remainder in one launch;
+//! - `decode(C)`: one decode step with C tokens of history, as the load
+//!   decodes: one target row per sequence without drafting; with drafting,
+//!   the drafter's launches for a width and the target's verification of
+//!   its drafts and their anchor.
+//!
+//! **Score.** Every metric counts by its relative change: the tuner
+//! minimizes the weighted mean over the objective's terms of
+//! `time / time at the defaults`. With drafting, the adaptive
+//! controller chooses a verification width at run time among those the
+//! load prepares, from their measured times, so each prepared width is a
+//! term of its own within its decode metric, the metric's weight divided
+//! among them: no width's share depends on a guess of the controller's
+//! choice, and no acceptance rate enters (a term's tokens per step divide
+//! its time and its time at the defaults alike).
+//!
+//! **Shares.** The baseline contribution: a unit's share is the weighted mean
+//! over terms of the unit's fraction of the term's time at the defaults,
+//! and a point's weight within a unit is the same quantity for the point
+//! ([`super::Objective`]).
+//!
+//! Three choices are the user's, each in one place: the context points
+//! ([`contexts`]), the concurrency ([`concurrency`]) and the metrics'
+//! weights ([`metric_weight`]).
 
-use super::{TUNING_ROWS, TuningLimits};
+use super::TuningLimits;
 
-/// One row class's load per turn.
+/// What a metric measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum Phase {
+    /// Prefilling a prompt of the metric's context.
+    Prefill,
+    /// One decode step at the metric's context of history.
+    Decode,
+}
+
+/// One measurement the engine is held to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct Metric {
+    pub phase: Phase,
+    /// The prompt's tokens (prefill) or the history decoded at (decode).
+    pub context: u64,
+    /// The sequences served together, each with a context of its own.
+    pub sequences: u64,
+}
+
+/// One term of the objective: a metric, or one prepared verification width
+/// of a drafted decode metric, with its weight in the score.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ClassLoad {
-    pub rows: u64,
-    /// Launches of this many rows per turn.
-    pub launches: f64,
-    /// Their mean visible history, as a fraction of the context.
-    pub history: f64,
+pub(crate) struct Term {
+    pub metric: Metric,
+    /// The drafter's width of a drafted decode term.
+    pub width: Option<u64>,
+    pub weight: f64,
 }
 
-/// Decoded tokens per turn.
-const DECODE_TOKENS: f64 = 426.1;
-pub(crate) fn decoded_tokens() -> f64 {
-    DECODE_TOKENS
+/// Explicit short- and long-context workload policy, capped at the load's limit.
+pub(crate) fn contexts(limits: TuningLimits) -> Vec<u64> {
+    let mut contexts = [4096, 65536]
+        .map(|context: u64| context.min(limits.context_tokens))
+        .to_vec();
+    contexts.dedup();
+    contexts
 }
-/// The mean history a decoded token sees, as a fraction of the context.
-const DECODE_HISTORY: f64 = 0.278;
 
-/// Prefill launches per turn by row class (rows, launches, history).
-const PREFILL: [(u64, f64, f64); 7] = [
-    (16, 0.012, 0.250),
-    (32, 0.023, 0.253),
-    (64, 0.058, 0.252),
-    (128, 0.178, 0.315),
-    (256, 0.289, 0.271),
-    (512, 26.488, 0.184),
-    // Remainders of fewer rows than 16 are a few thousandths of a launch.
-    (8, 0.006, 0.265),
-];
+/// The sequences the load's metrics serve together. A load declares no
+/// concurrency it serves, only the most sequences one launch admits, which
+/// bounds what it can serve rather than stating what it does: its metrics
+/// are of one sequence.
+pub(crate) fn concurrency(_limits: TuningLimits) -> Vec<u64> {
+    vec![1]
+}
 
-/// A row class of at most this many rows streams its weights: a launch
-/// costs about as much as one of this many rows of a compute-bound class
-/// (27B dense expansion on an M4 Pro: 0.50 ms at one row, 24.8 ms at 512).
-pub(crate) const STREAMING_EQUIVALENT_ROWS: f64 = 10.;
+/// A metric's weight in the score: every metric counts alike.
+pub(crate) fn metric_weight(_metric: &Metric) -> f64 {
+    1.
+}
 
-/// The served workload's launches of row class `rows` per turn and their
-/// mean history, for an engine whose largest launch has `limits.max_rows`
-/// rows: a prompt longer than that is prefilled in launches of the largest
-/// class it has, which takes the launches of every larger class.
-pub(crate) fn prefill_load(rows: u64, limits: TuningLimits) -> ClassLoad {
-    let largest = TUNING_ROWS
+/// The load's metrics.
+pub(crate) fn metrics(limits: TuningLimits) -> Vec<Metric> {
+    let mut metrics = Vec::new();
+    for phase in [Phase::Prefill, Phase::Decode] {
+        for &sequences in &concurrency(limits) {
+            for &context in &contexts(limits) {
+                metrics.push(Metric {
+                    phase,
+                    context,
+                    sequences,
+                });
+            }
+        }
+    }
+    metrics
+}
+
+/// The objective's terms for a load whose drafter prepares `widths` (none
+/// without drafting): every metric, a drafted decode metric once for each
+/// width, the weights summing to one.
+pub(crate) fn terms(limits: TuningLimits, widths: &[u64]) -> Vec<Term> {
+    let metrics = metrics(limits);
+    let total = metrics.iter().map(metric_weight).sum::<f64>();
+    metrics
         .into_iter()
-        .filter(|rows| *rows <= limits.max_rows)
-        .max()
-        .unwrap_or(1);
-    let prefill = PREFILL
-        .iter()
-        .filter(|(class, ..)| *class == rows || (rows == largest && *class > largest))
-        .map(|(class, launches, history)| {
-            // A launch of the larger class is `class / largest` of these.
-            let scale = (*class).max(rows) as f64 / rows as f64;
-            (launches * scale, *history)
+        .flat_map(|metric| {
+            let weight = metric_weight(&metric) / total;
+            let widths = match metric.phase {
+                Phase::Decode if !widths.is_empty() => {
+                    widths.iter().map(|width| Some(*width)).collect::<Vec<_>>()
+                }
+                _ => vec![None],
+            };
+            let each = weight / widths.len() as f64;
+            widths.into_iter().map(move |width| Term {
+                metric,
+                width,
+                weight: each,
+            })
         })
-        .collect::<Vec<_>>();
-    let prefill_launches = prefill.iter().map(|(launches, _)| launches).sum::<f64>();
-    let prefill_history = if prefill_launches > 0. {
-        prefill
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIMITS: TuningLimits = TuningLimits {
+        max_rows: 512,
+        max_projected_rows: 8,
+        context_tokens: 64256,
+    };
+
+    /// Prefill and decode at every context point to the limit; a drafted
+    /// decode metric divides its weight among the prepared widths.
+    #[test]
+    fn every_metric_counts_alike_and_widths_share_theirs() {
+        assert_eq!(contexts(LIMITS), [4096, 64256]);
+        let short = TuningLimits {
+            context_tokens: 2048,
+            ..LIMITS
+        };
+        assert_eq!(contexts(short), [2048]);
+        let plain = terms(LIMITS, &[]);
+        assert_eq!(plain.len(), 4);
+        assert!(
+            plain
+                .iter()
+                .all(|term| (term.weight - 1. / 4.).abs() < 1e-12)
+        );
+        let drafted = terms(LIMITS, &[1, 2, 3]);
+        assert_eq!(drafted.len(), 2 + 2 * 3);
+        assert!((drafted.iter().map(|term| term.weight).sum::<f64>() - 1.).abs() < 1e-12);
+        let decode_64k = drafted
             .iter()
-            .map(|(launches, history)| launches * history)
-            .sum::<f64>()
-            / prefill_launches
-    } else {
-        0.
-    };
-    ClassLoad {
-        rows,
-        launches: prefill_launches,
-        history: prefill_history,
+            .filter(|term| term.metric.phase == Phase::Decode && term.metric.context == 64256)
+            .map(|term| term.weight)
+            .sum::<f64>();
+        assert!((decode_64k - 1. / 4.).abs() < 1e-12);
     }
-}
-
-pub(crate) fn class_load(rows: u64, limits: TuningLimits) -> ClassLoad {
-    let prefill = prefill_load(rows, limits);
-    let decode = match rows {
-        1 => DECODE_TOKENS * 2. / 3.,
-        2 | 4 | 8 => DECODE_TOKENS / 9.,
-        _ => 0.,
-    };
-    let launches = prefill.launches + decode;
-    ClassLoad {
-        rows,
-        launches,
-        history: if launches > 0. {
-            (prefill.launches * prefill.history + decode * DECODE_HISTORY) / launches
-        } else {
-            0.
-        },
-    }
-}
-
-/// A row class's invocation demand among a unit's points. Device latency,
-/// rather than a rows-based cost surrogate, determines its elapsed-service vote.
-pub(crate) fn class_weight(rows: u64, limits: TuningLimits) -> f64 {
-    class_load(rows, limits).launches
 }

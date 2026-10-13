@@ -36,14 +36,10 @@ use magnitude_kernels::{
     readout_project_rows, readout_refine_rows, readout_top_rows,
 };
 use seismic::{
-    Element, NativeKernel, NativeSpecialization, NativeTensorBatch, Shuffle, SustainedClock,
-    Tally, Tensor, Verdict,
+    Element, NativeKernel, NativeSpecialization, NativeTensorBatch, Shuffle, SustainedClock, Tally,
+    Tensor, Verdict,
 };
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::Instant,
-};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadoutRecipe {
@@ -365,8 +361,8 @@ impl RecipeCase {
             .map_err(|_| "progressive code depth exceeds u8")?;
         let mut values = Vec::new();
         for row in 0..rows {
-            let token =
-                u64::from(((seed * rows + row) as u32).wrapping_mul(0x9e37_79b9)) % recipe.vocabulary;
+            let token = u64::from(((seed * rows + row) as u32).wrapping_mul(0x9e37_79b9))
+                % recipe.vocabulary;
             values.extend(crate::progressive::row_values(
                 &stored(top, token)?,
                 &stored(next, token)?,
@@ -630,8 +626,13 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
     fn set_invocations(
         &mut self,
         invocations: &crate::programs::invocation_demand::InvocationCounts,
+        objective: &super::Objective,
     ) {
-        self.point.weight = invocations.count(self.point.rows);
+        super::apply_invocation_counts(
+            std::slice::from_mut(&mut self.point),
+            invocations,
+            objective,
+        );
     }
     fn key(&self) -> String {
         self.key.as_str().to_owned()

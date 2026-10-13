@@ -496,11 +496,7 @@ impl AttestedPrograms {
             )?;
             self.drafter_graphs = Some(crate::PreparedDrafterGraphs::Draft(Rc::new(
                 crate::programs::native_draft::PreparedDraftGraphs::prepare(
-                    device,
-                    handles,
-                    load,
-                    &geometry,
-                    classes,
+                    device, handles, load, &geometry, classes,
                 )
                 .map_err(|error| error.to_string())?,
             )));
@@ -976,17 +972,7 @@ impl AttestedPrograms {
             selection_limits,
             graph_demand: crate::programs::invocation_demand::GraphInvocationDemand::new(
                 method,
-                super::tuning::invocation_base(limits),
-                super::tuning::invocation_prefill_base(limits),
-                super::tuning::invocation_rounds(),
-                &magnitude_batching::row_classes(
-                    (selection_limits.max_drafting_slots as usize)
-                        .min(selection_limits.max_launch_slots)
-                        .min(selection_limits.max_launch_rows),
-                )
-                .into_iter()
-                .map(|rows| rows as u64)
-                .collect::<Vec<_>>(),
+                super::tuning::workload::terms(limits, &method.draft_widths()),
                 tuning.definition.draft.as_ref(),
                 selection_limits.max_launch_rows as u64,
             ),
