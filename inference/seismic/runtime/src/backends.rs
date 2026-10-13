@@ -382,7 +382,8 @@ pub(crate) fn discover() -> BackendDiscovery {
                     }
                 } else {
                     let granted = granted_bytes(BackendName::Cuda, descriptor.uuid, || {
-                        seismic_cuda::usable_memory_bytes(ordinal).map_err(|error| error.to_string())
+                        seismic_cuda::usable_memory_bytes(ordinal, descriptor.uuid)
+                            .map_err(|error| error.to_string())
                     });
                     DiscoveredMemory::Dedicated {
                         capacity_bytes: match granted {

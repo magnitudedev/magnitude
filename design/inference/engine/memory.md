@@ -13,6 +13,7 @@ applies_to:
   - inference/seismic/backends/cuda/src/direct.rs
   - inference/seismic/backends/cuda/src/driver.rs
   - inference/seismic/backends/cuda/src/executor.rs
+  - inference/seismic/backends/cuda/src/nvml.rs
   - inference/seismic/backends/cuda/src/open.rs
   - inference/seismic/backends/vulkan/src/device.rs
   - inference/seismic/backends/vulkan/src/direct.rs
@@ -39,7 +40,8 @@ recommendations and the engine's claim ceiling all read that one figure:
 
 | Device | Usable capacity |
 |---|---|
-| A GPU with a CUDA view | `cuMemGetInfo` free bytes once the process's context exists: the device total less the reserve, the WDDM share and the context, which the driver reports as one figure. Under WDDM it is per process and does not change with other programs; outside WDDM (Linux, TCC) it is the whole device's, so memory other programs hold at discovery is not yet separated there |
+| A GPU with a CUDA view, on Windows (WDDM) | `cuMemGetInfo` free bytes once the process's context exists and before it allocates: the device total less the reserve, the WDDM share and the context, which the driver reports as one figure, per process and independent of other programs |
+| A GPU with a CUDA view, elsewhere (Linux) | NVML's total less its reserve (`nvmlDeviceGetMemoryInfo_v2`) less the process's context, measured as the fall in NVML's device-wide free bytes across creating it, and never less than `cuMemGetInfo` free once the context exists. `cuMemGetInfo` free there is the whole device's, lowered by what other programs hold, so it alone is not the capacity. NVML is found by the device's CUDA UUID. Without NVML, its v2 memory query or a matching device, or when the process already has the device's context, the capacity is `cuMemGetInfo` free: exact when no other program holds memory at discovery, lower by what they hold otherwise |
 | A GPU with only a Vulkan view, under WDDM | The device-local heap's `VK_EXT_memory_budget` budget, WDDM's per-process budget |
 | A GPU with only a Vulkan view, elsewhere | The device-local heap, which excludes the driver's reserve |
 

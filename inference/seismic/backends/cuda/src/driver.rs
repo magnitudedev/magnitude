@@ -82,6 +82,7 @@ driver! {
     driver_version: unsafe extern "system" fn(*mut c_int) -> ResultCode => "cuDriverGetVersion",
     primary_context_retain: unsafe extern "system" fn(*mut Handle, c_int) -> ResultCode => "cuDevicePrimaryCtxRetain",
     primary_context_release: unsafe extern "system" fn(c_int) -> ResultCode => "cuDevicePrimaryCtxRelease_v2",
+    primary_context_state: unsafe extern "system" fn(c_int, *mut c_uint, *mut c_int) -> ResultCode => "cuDevicePrimaryCtxGetState",
     context_get: unsafe extern "system" fn(*mut Handle) -> ResultCode => "cuCtxGetCurrent",
     context_set: unsafe extern "system" fn(Handle) -> ResultCode => "cuCtxSetCurrent",
     stream_create: unsafe extern "system" fn(*mut Handle, c_uint) -> ResultCode => "cuStreamCreate",
@@ -178,6 +179,19 @@ impl Driver {
             code: result,
             description,
         })
+    }
+
+    /// Whether the device's primary context exists in this process.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    pub fn primary_context_active(&self, ordinal: c_int) -> Result<bool, DriverError> {
+        let (mut flags, mut active) = (0, 0);
+        unsafe {
+            self.check(
+                (self.primary_context_state)(ordinal, &mut flags, &mut active),
+                "primary context state",
+            )?;
+        }
+        Ok(active != 0)
     }
 
     /// One `cuDeviceGetAttribute` query.
