@@ -608,6 +608,7 @@ pub fn inventory_model_failure(error: InventoryError) -> ModelFailure {
         InventoryError::Loaded(_) => ("already_loaded".to_owned(), false),
         InventoryError::DeletionUnsafe(_) => ("deletion_unsafe".to_owned(), false),
         InventoryError::Unsupported(_) => ("unsupported".to_owned(), false),
+        InventoryError::DoesNotFit(_) => ("model_does_not_fit".to_owned(), false),
         InventoryError::Io(_) => ("io_failed".to_owned(), true),
         InventoryError::Upstream(_) => ("upstream_failed".to_owned(), true),
         InventoryError::Integrity(_) => ("integrity_failed".to_owned(), false),

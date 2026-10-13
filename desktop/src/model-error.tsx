@@ -53,6 +53,9 @@ export const modelCommandNotice = (failure: LocalModelCommandFailure): NoticeCon
   if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_instance_stopped") return {
     severity: "info", title: "Loading was stopped", description: "Load the model again when you’re ready.",
   }
+  if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_does_not_fit") return {
+    title: "This model doesn’t fit this computer", description: "It needs more memory than this computer can provide. Choose a smaller model.",
+  }
   if (Option.isSome(failure.rejection) && failure.rejection.value.code === "memory_shortage") return {
     title: MEMORY_SHORTAGE_TITLE, description: "Quit apps you aren’t using, or choose a smaller model.",
   }

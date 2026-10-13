@@ -30,6 +30,12 @@ describe("desktop failure presentation", () => {
     expect(html).toContain("text-amber-500")
     expect(html).not.toMatch(/role="alert"|PRIVATE|bytes|32358673408/)
   })
+  it("explains a load refused because the model does not fit, without retry advice", () => {
+    const rejection = new LocalModelMutationFailed({ code: "model_does_not_fit", message: "PRIVATE", retryable: false })
+    const notice = modelCommandNotice({ operation: "load", rejection: Option.some(rejection) })
+    expect(notice.title).toBe("This model doesn’t fit this computer")
+    expect(JSON.stringify(notice)).not.toMatch(/PRIVATE|Try loading/)
+  })
   it("does not expose diagnostics from unknown load, download, or command failures", () => {
     const html = renderToStaticMarkup(<ModelLoadNotice failure={{ code: "worker_lost", message: "PRIVATE stack trace", retryable: true }} />)
     expect(html).toContain("This model couldn’t start")

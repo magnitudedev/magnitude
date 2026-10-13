@@ -479,6 +479,12 @@ impl ApiError {
                 "integrity_failed",
                 false,
             ),
+            InventoryError::DoesNotFit(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_request_error",
+                "model_does_not_fit",
+                false,
+            ),
             InventoryError::ModelOperation {
                 code, retryable, ..
             } => (
