@@ -6,7 +6,7 @@ import { isDeepStrictEqual } from "node:util"
 import type { HarnessConnector, HarnessModel } from "./contract"
 import type { HarnessConnectionPaths } from "./paths"
 import { harnessEndpoints, jsonObject, readOr, valueAt } from "./shared"
-import { CLAUDE_GATEWAY_DISCOVERY } from "./connectors/claude-code"
+import { CLAUDE_AUTH_TOKEN_PLACEHOLDER, CLAUDE_GATEWAY_DISCOVERY, claudeCodeHasLogin } from "./connectors/claude-code"
 import { clineModelCatalog, clineProviderSettings } from "./connectors/cline"
 import { hermesProviderConfig } from "./connectors/hermes"
 import { ohMyPiProviderConfig } from "./connectors/oh-my-pi"
@@ -61,9 +61,14 @@ export const inspectHarnessConnection = (
     case "hermes": valid = yield* provider(paths.hermes, ["providers", "magnitude"], hermesProviderConfig(endpoints.openai), "yaml"); break
     case "openclaw": valid = yield* provider(paths.openclaw, ["models", "providers", "magnitude"], openClawProviderConfig(models, endpoints.openai), "json5"); break
     case "oh-my-pi": valid = yield* provider(paths.ompModels, ["providers", "magnitude"], ohMyPiProviderConfig(models, endpoints.openai), "yaml"); break
-    case "claude-code": valid = yield* provider(paths.claude, ["env"], {
-      ANTHROPIC_BASE_URL: endpoints.anthropic, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
-    }); break
+    case "claude-code": {
+      const settings = yield* read(paths.claude)
+      valid = includesFields(valueAt(settings, ["env"]), {
+        ANTHROPIC_BASE_URL: endpoints.anthropic, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+      }) && (valueAt(settings, ["env", "ANTHROPIC_AUTH_TOKEN"]) === CLAUDE_AUTH_TOKEN_PLACEHOLDER
+        || (yield* claudeCodeHasLogin(paths, settings)))
+      break
+    }
     case "cline":
       valid = (yield* provider(paths.clineProviders, ["providers", "openai-compatible", "settings"], clineProviderSettings(Option.none(), endpoints.openai)))
         && (yield* provider(paths.clineModels, ["providers", "openai-compatible", "models"], clineModelCatalog(models)))

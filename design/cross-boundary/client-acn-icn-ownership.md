@@ -179,6 +179,13 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
 - Generic `/inference/v1/**` and `/inference/anthropic/**` traffic remains a transparent local ICN
   proxy. Harness-only alias discovery and upstream multiplexing exist only below the explicit
   Codex and Claude Code proxy subroutes.
+- Below the Claude Code subroute, a request carrying Magnitude's placeholder credential
+  (`MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL`, as bearer or API key) never goes upstream. It
+  comes only from a Claude Code without an Anthropic login, so any non-local model it names (the
+  opus, sonnet, haiku, and fable tiers its subagents and background work use) is served by the
+  model ICN reports Ready, else Loading, with the request otherwise unchanged. With nothing loaded
+  the gateway answers `invalid_request_error` naming the requested model. Any other credential
+  still forwards non-local models upstream byte for byte.
 - Codex WebSocket model routing and socket replacement belong to ACN; native local Responses
   WebSocket events and connection-scoped replay belong to ICN.
 - Every client-visible model query and mutation belongs to the ACN `Models` group.
