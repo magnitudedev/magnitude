@@ -55,7 +55,7 @@ it("checks a signed hosted offer and verifies the selected release asset before 
     return new Response(payload, { headers: { "content-length": String(payload.length) } })
   }, { preconnect: () => {} })
   try {
-    const offer = Option.getOrThrow(await Effect.runPromise(checkHostedUpdate(connection, { reason: "manual", outcome: Option.none() }).pipe(
+    const offer = Option.getOrThrow(await Effect.runPromise(checkHostedUpdate(connection, { reason: "manual", outcome: Option.none(), hardware: Option.none() }).pipe(
       Effect.provide([NodeContext.layer, FetchHttpClient.layer]), Effect.provideService(FetchHttpClient.Fetch, localFetch))))
     expect(offer).toEqual(publication.release)
     const selected = await Effect.runPromise(resolveHostedDownload({ ...connection, release: offer }).pipe(

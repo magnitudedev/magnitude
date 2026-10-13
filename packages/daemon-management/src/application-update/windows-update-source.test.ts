@@ -12,13 +12,15 @@ import { WindowsInstallerSignatureFailed } from "../desktop-native/windows-updat
 import { UpdateClientMetadata, UpdateManifest } from "@magnitudedev/release/hosted-update"
 import { PublisherKeyId, signUpdateManifest } from "../../../release/src/hosted-update/manifest"
 import { makeWindowsUpdateSource } from "./windows-update-source"
+import { UpdateHardwareSource, unavailableUpdateHardware } from "./update-hardware"
+const runWithHardware = <A, E>(effect: Effect.Effect<A, E, UpdateHardwareSource>) => Effect.runPromise(Effect.provideService(effect, UpdateHardwareSource, unavailableUpdateHardware))
 
 // Exercise the real private-file adapter; native publisher verification has separate executable tests.
 describe.skipIf(process.platform !== "win32")("Windows installer staging", () => {
   it("creates an absent profile before preparing its private update directory", async () => {
     const root = await mkdtemp(join(tmpdir(), "windows-update-fresh-"))
     try {
-      await Effect.runPromise(Effect.gen(function* () {
+      await runWithHardware(Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
         const addon = fileURLToPath(new URL("../../dist/native/win32-x64/desktop-host.node", import.meta.url))
         const profile = join(root, "profile")
@@ -41,10 +43,10 @@ describe.skipIf(process.platform !== "win32")("Windows installer staging", () =>
       bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex"),
     } })
     const publisher = generateKeyPairSync("ed25519")
-    const envelope = await Effect.runPromise(signUpdateManifest(manifest, publisher.privateKey))
+    const envelope = await runWithHardware(signUpdateManifest(manifest, publisher.privateKey))
     let signatures = 0
     try {
-      await Effect.runPromise(Effect.gen(function* () {
+      await runWithHardware(Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem
         const addon = fileURLToPath(new URL("../../dist/native/win32-x64/desktop-host.node", import.meta.url))
         const permissions = windowsPrivateFilePermissions(addon)

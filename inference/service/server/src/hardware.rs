@@ -11,7 +11,7 @@ use magnitude_engine::census::MemoryDomain;
 use magnitude_engine::worker::protocol::MemoryObservation;
 use magnitude_executor::platform::{MemoryReserves, unusable_reason};
 use magnitude_service_contracts::{
-    ExecutionBackend, HardwareDevice, HardwareDeviceId, HardwareDeviceKind,
+    ExecutionBackend, HardwareBackendDiagnostic, HardwareDevice, HardwareDeviceId, HardwareDeviceKind,
     HardwareDeviceMemoryLimit, HardwareDeviceMemoryLimitKind, HardwareMemoryDomain,
     HardwareMemoryDomainKind, HardwareProvider, HardwareSnapshot, HardwareSystemMemory,
     InventoryError,
@@ -288,6 +288,14 @@ fn snapshot(
         },
         native_build: build_identity::native_build(),
         enabled_backends: build_identity::compiled_backends(),
+        backend_diagnostics: topology
+            .diagnostics()
+            .iter()
+            .map(|diagnostic| HardwareBackendDiagnostic {
+                backend: execution_backend(diagnostic.backend),
+                message: diagnostic.message.clone(),
+            })
+            .collect(),
         topology_fingerprint: topology_fingerprint(&memory_domains),
         memory_domains,
     }

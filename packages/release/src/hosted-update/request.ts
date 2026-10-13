@@ -14,6 +14,22 @@ export const UpdateOutcome = Schema.Struct({
   reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
 }).pipe(Schema.filter(outcome => (outcome.outcome === "failed") === Option.isSome(outcome.reason)))
 export type UpdateOutcome = typeof UpdateOutcome.Type
+const Label = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(96), Schema.pattern(/^[\x20-\x7E]+$/))
+const Reason = Schema.String.pipe(Schema.minLength(1), Schema.maxLength(200), Schema.pattern(/^[\x20-\x7E]+$/))
+const Count = Schema.NumberFromString.pipe(Schema.int(), Schema.nonNegative())
+export const UpdateHardwareFields = Schema.Struct({
+  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+  gpu_name: Schema.optionalWith(Label, { as: "Option", exact: true }),
+  gpu_kind: Schema.optionalWith(Schema.Literal("discrete", "integrated"), { as: "Option", exact: true }),
+  gpu_memory_gb: Schema.optionalWith(Count, { as: "Option", exact: true }),
+  gpu_count: Schema.optionalWith(Count, { as: "Option", exact: true }),
+  gpu_unused_reason: Schema.optionalWith(Reason, { as: "Option", exact: true }),
+  cpu_model: Schema.optionalWith(Label, { as: "Option", exact: true }),
+  cpu_cores: Schema.optionalWith(Count, { as: "Option", exact: true }),
+  memory_gb: Schema.optionalWith(Count, { as: "Option", exact: true }),
+})
+export const UpdateHardware = UpdateHardwareFields.pipe(Schema.filter(hardware => Option.isSome(hardware.gpu_name) || (Option.isNone(hardware.gpu_kind) && Option.isNone(hardware.gpu_memory_gb))))
+export type UpdateHardware = typeof UpdateHardware.Type
 export const UpdateRequestFields = Schema.Struct({
   protocol: Schema.Literal("1"),
   product: Schema.Literal("desktop"),
@@ -31,10 +47,20 @@ export const UpdateRequestFields = Schema.Struct({
   outcome: Schema.optionalWith(Schema.Literal("applied", "failed"), { as: "Option", exact: true }),
   outcome_version: Schema.optionalWith(Version, { as: "Option", exact: true }),
   outcome_reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
+  backend: Schema.optionalWith(UpdateHardwareFields.fields.backend, { as: "Option", exact: true }),
+  gpu_name: UpdateHardwareFields.fields.gpu_name,
+  gpu_kind: UpdateHardwareFields.fields.gpu_kind,
+  gpu_memory_gb: UpdateHardwareFields.fields.gpu_memory_gb,
+  gpu_count: UpdateHardwareFields.fields.gpu_count,
+  gpu_unused_reason: UpdateHardwareFields.fields.gpu_unused_reason,
+  cpu_model: UpdateHardwareFields.fields.cpu_model,
+  cpu_cores: UpdateHardwareFields.fields.cpu_cores,
+  memory_gb: UpdateHardwareFields.fields.memory_gb,
 })
-export const UpdateRequest = UpdateRequestFields.pipe(Schema.filter(request => Option.isNone(request.outcome)
+export const UpdateRequest = UpdateRequestFields.pipe(Schema.filter(request => (Option.isNone(request.outcome)
   ? Option.isNone(request.outcome_version) && Option.isNone(request.outcome_reason)
-  : Option.isSome(request.outcome_version) && (request.outcome.value === "failed") === Option.isSome(request.outcome_reason)))
+  : Option.isSome(request.outcome_version) && (request.outcome.value === "failed") === Option.isSome(request.outcome_reason))
+  && (Option.isSome(request.gpu_name) || (Option.isNone(request.gpu_kind) && Option.isNone(request.gpu_memory_gb)))))
 export type UpdateRequest = typeof UpdateRequest.Type
 export class InvalidUpdateRequest extends Schema.TaggedError<InvalidUpdateRequest>()("InvalidUpdateRequest", {}) {}
 export class ExpiredUpdateRequest extends Schema.TaggedError<ExpiredUpdateRequest>()("ExpiredUpdateRequest", {}) {}

@@ -119,7 +119,7 @@ describe("ACN public HTTP listener", () => {
         Effect.provideService(RpcServer.Protocol, protocol),
         Effect.forkScoped,
       )
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie), Option.none())
 
       expect((yield* http.get(`${origin}/health`)).status).toBe(200)
       expect((yield* rpc(origin, undefined)).status).toBe(409)
@@ -166,7 +166,7 @@ describe("ACN network access", () => {
       yield* installAcnPublicRoutes(publicRouter, lifecycle, { origin: new URL(icnOrigin), clientOptions: { headers: {} } }, network)
       const port = yield* listen(publicRouter, 0, "0.0.0.0")
       const rpcRouter = yield* HttpLayerRouter.make
-      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie))
+      yield* lifecycle.becomeReady(rpcRouter.asHttpEffect().pipe(Effect.orDie), Option.none())
       const local = loopbackOrigin(port)
       const remote = `http://${external}:${port}`
       const get = (url: string, headers: Record<string, string> = {}) => http.execute(HttpClientRequest.get(url, { headers }))

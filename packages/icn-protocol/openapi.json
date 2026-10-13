@@ -3897,6 +3897,22 @@
         ],
         "description": "Lazy grammar triggers. The engine's grammars are never lazy, so responses\ncarry none; the shape remains part of the published contract."
       },
+      "HardwareBackendDiagnostic": {
+        "type": "object",
+        "required": [
+          "backend",
+          "message"
+        ],
+        "properties": {
+          "backend": {
+            "$ref": "#/components/schemas/ExecutionBackend"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "HardwareDevice": {
         "type": "object",
         "required": [
@@ -4108,6 +4124,13 @@
               "$ref": "#/components/schemas/ExecutionBackend"
             },
             "description": "Backends compiled into the engine build."
+          },
+          "backend_diagnostics": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HardwareBackendDiagnostic"
+            },
+            "description": "Backends that discovery could not enumerate on this machine, with the engine's own reason,\nfor example an absent driver. Empty when every compiled backend enumerated."
           },
           "topology_fingerprint": {
             "type": "string"

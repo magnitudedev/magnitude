@@ -549,8 +549,20 @@ pub struct HardwareSnapshot {
     pub native_build: String,
     /// Backends compiled into the engine build.
     pub enabled_backends: Vec<ExecutionBackend>,
+    /// Backends that discovery could not enumerate on this machine, with the engine's own reason,
+    /// for example an absent driver. Empty when every compiled backend enumerated.
+    #[serde(default)]
+    pub backend_diagnostics: Vec<HardwareBackendDiagnostic>,
     pub topology_fingerprint: String,
     pub memory_domains: Vec<HardwareMemoryDomain>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HardwareBackendDiagnostic {
+    pub backend: ExecutionBackend,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1033,6 +1033,13 @@ export const GrammarTriggerResponse = S.Union(
 export type GrammarTriggerResponse = S.Schema.Type<typeof GrammarTriggerResponse>
 export type GrammarTriggerResponseEncoded = S.Schema.Encoded<typeof GrammarTriggerResponse>
 
+export const HardwareBackendDiagnostic = S.Struct({
+  backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
+  message: S.String,
+})
+export type HardwareBackendDiagnostic = S.Schema.Type<typeof HardwareBackendDiagnostic>
+export type HardwareBackendDiagnosticEncoded = S.Schema.Encoded<typeof HardwareBackendDiagnostic>
+
 export const HardwareDevice = S.Struct({
   backend: S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend),
   description: S.String,
@@ -1108,6 +1115,12 @@ export type HardwareMemoryDomainKindEncoded = S.Schema.Encoded<typeof HardwareMe
 
 export const HardwareSnapshot = S.Struct({
   architecture: S.String,
+  backend_diagnostics: S.optionalWith(
+    S.Array(
+      S.suspend((): S.Schema<HardwareBackendDiagnostic, HardwareBackendDiagnosticEncoded> => HardwareBackendDiagnostic),
+    ),
+    { exact: true, as: "Option" },
+  ),
   captured_at: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   cpu_model: S.optionalWith(S.Union(S.String, S.Null), { exact: true, as: "Option" }),
   enabled_backends: S.Array(S.suspend((): S.Schema<ExecutionBackend, ExecutionBackendEncoded> => ExecutionBackend)),
