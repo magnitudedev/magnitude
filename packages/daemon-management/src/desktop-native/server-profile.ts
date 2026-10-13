@@ -5,6 +5,8 @@ import { dirname } from "node:path"
 /** Data directory and home of the `magnitude` system user that runs the Linux server service. */
 export const SERVER_DATA_DIRECTORY = "/var/lib/magnitude"
 export const SERVER_USER = "magnitude"
+/** The server profile's fixed service port, which other computers reach once network access is on. */
+export const SERVER_PORT = 10100
 /** Written by the root step of `magnitude server setup`; its presence selects the server profile. */
 export const SERVER_MARKER_PATH = "/etc/magnitude/server"
 export const SERVER_MARKER_CONTENT = "Magnitude runs as the system service on this machine. Remove it with `magnitude server remove`.\n"
