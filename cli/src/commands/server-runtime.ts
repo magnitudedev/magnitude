@@ -8,7 +8,8 @@ import { serverRemove, serverSetup } from "../server/server-setup"
 const report = <E extends { readonly message: string }>(effect: Effect.Effect<void, E>) => Effect.runPromise(effect.pipe(
   Effect.catchAll(error => Effect.sync(() => { process.stderr.write(`${error.message}\n`); process.exitCode = 1 }))))
 
-export const runServerSetup = () => report(serverSetup.pipe(Effect.provide(ServerSetupHostLive)))
+// A request to a service that never answered may still be pending after setup gave up on it.
+export const runServerSetup = () => report(serverSetup.pipe(Effect.provide(ServerSetupHostLive))).then(() => process.exit())
 export const runServerRemove = () => report(serverRemove.pipe(Effect.provide(ServerSetupHostLive)))
 
 /** The hidden root command. It accepts no input beyond the user name and runs only from the installed CLI as root. */

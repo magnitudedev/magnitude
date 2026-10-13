@@ -44,6 +44,8 @@ Save the key; `magnitude status` never shows it. Afterwards it is in **Settings 
 <Tab title="Linux">
 Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Setup adds you to the `magnitude` group; log out and back in before running `magnitude status` or `magnitude update`.
 
+Setup creates the `magnitude` account as a system account with no login. If the machine already has an account or group named `magnitude` that isn't one, such as a person's account, setup leaves it alone and stops without changing anything.
+
 Logs: `journalctl -u magnitude`
 </Tab>
 <Tab title="macOS">
@@ -56,6 +58,8 @@ Magnitude runs as a LaunchDaemon, `dev.magnitude.server`, as you. It uses your o
 Logs: `~/.magnitude/logs/server.log`
 </Tab>
 </Tabs>
+
+If setup stops partway, for example because the server didn't start within two minutes, it says where to look; run `magnitude server setup` again to finish once that's fixed.
 
 Check on the server at any time with:
 
@@ -118,7 +122,7 @@ The app and the server can't run at the same time. Opening the app while the ser
 magnitude server remove
 ```
 
-It stops the service and removes it, and asks for your password once. Its data stays: in `/var/lib/magnitude` on Linux, or in `~/.magnitude` on macOS. Run `magnitude server setup` again to bring the server back with the same models.
+It stops the service and removes it, and asks for your password once. Its data stays: in `/var/lib/magnitude` on Linux, now owned by root, or in `~/.magnitude` on macOS. Run `magnitude server setup` again to bring the server back with the same models. If removal stops partway, run it again to finish.
 
 ## Without the service
 

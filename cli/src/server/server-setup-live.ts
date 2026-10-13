@@ -5,7 +5,7 @@ import { open } from "node:fs/promises"
 import { join } from "node:path"
 import { userInfo } from "node:os"
 import { MagnitudeClient } from "@magnitudedev/sdk"
-import { applicationStateDirectory, installedServerCli, requestApplication, TerminalCommand, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
+import { applicationStateDirectory, hasLinuxServerRemnants, installedServerCli, requestApplication, TerminalCommand, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { isServerSetUp } from "./serve-owner"
 import { desktopDataDirectory, desktopServiceOrigin } from "./application"
 import { ServerSetupFailed, ServerSetupHost, type ServerAccess } from "./server-setup"
@@ -27,11 +27,11 @@ const askTerminal = (question: string) => Effect.acquireUseRelease(
 
 const withService = <A, E>(use: (client: MagnitudeClient) => Effect.Effect<A, E>) => withLocalService(desktopServiceOrigin, use)
 
-/** The service may still be starting, or restarting after a settings change. */
+/** The service may still be starting, or restarting after a settings change; `serverSetup` bounds the whole wait. */
 const readNetworkAccess = (settled: boolean) => withService(client => client.configuration.getNetworkAccess({})).pipe(
   Effect.filterOrFail(settings => !settled || !settings.pending, () => failed("The server is still restarting.")),
-  Effect.retry(Schedule.spaced(Duration.seconds(1)).pipe(Schedule.upTo(Duration.minutes(3)))),
-  Effect.mapError(() => failed("The Magnitude server did not start. See `journalctl -u magnitude` for details.")))
+  Effect.retry(Schedule.spaced(Duration.seconds(1))),
+  Effect.mapError(() => failed("The Magnitude server did not start.")))
 
 const enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed> = Effect.gen(function* () {
   const current = yield* readNetworkAccess(false)
@@ -66,6 +66,10 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
       Effect.flatMap(directory => requestApplication(join(directory, "application.sock"), "Observe")),
       Effect.map(snapshot => Option.some(snapshot.owner._tag)), Effect.orElseSucceed(() => Option.none())),
     isSetUp: isServerSetUp,
+    hasRemnants: platform === "linux"
+      ? Effect.all([isServerSetUp, hasLinuxServerRemnants.pipe(
+        Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(CommandExecutor.CommandExecutor, executor), Effect.orElseSucceed(() => false))]).pipe(Effect.map(found => found.some(Boolean)))
+      : isServerSetUp,
     hasTerminal: Effect.tryPromise(() => open("/dev/tty", "r+").then(tty => tty.close())).pipe(Effect.as(true), Effect.orElseSucceed(() => false)),
     sudoWithoutPrompt: executor.exitCode(Command.make("/usr/bin/sudo", "-n", "true")).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false)),
     confirm: question => askTerminal(question).pipe(Effect.map(answer => /^y(es)?$/i.test(answer))),
@@ -78,7 +82,10 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
       // In this terminal's session, so sudo reuses its ticket (the installer's Yes) or asks here once.
       const code = yield* terminal.run(root ? cli.value : "/usr/bin/sudo", root ? args : ["--", cli.value, ...args], { stdin: "inherit" }).pipe(
         Effect.orElseSucceed(() => -1))
-      if (code !== 0) return yield* failed("The root step did not finish; nothing else was changed.")
+      // The root step has printed what went wrong, and what it undid.
+      if (code !== 0) return yield* failed(args[0] === "_server-remove"
+        ? "Server removal did not finish. Run `magnitude server remove` again once the problem above is fixed."
+        : "Server setup did not finish.")
     }),
     enableNetworkAccess,
     write: text => Effect.sync(() => { process.stdout.write(text) }),

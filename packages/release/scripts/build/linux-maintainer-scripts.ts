@@ -1,3 +1,11 @@
+import { linuxSudoersPath } from "./linux-system-files"
+
+/**
+ * Removing the package removes the update helper the server's sudoers rule names, so removal (not
+ * upgrade) deletes the rule too; `magnitude server remove` still cleans up the rest.
+ */
+export const removeServerGrant = `rm -f ${linuxSudoersPath}\n`
+
 /**
  * Dpkg calls the installed postinst after restoring an aborted upgrade or removal. Removal keeps
  * the installation gate so a reinstall reuses its lock inode; purge deletes it with the package.
@@ -6,7 +14,7 @@ export const renderLinuxMaintainerScripts = (begin: string, end: string): Readon
   preinst: `case "$1" in install|upgrade) ;; *) exit 0 ;; esac\n${begin}`,
   postinst: `case "$1" in configure|abort-upgrade|abort-remove) ;; *) exit 0 ;; esac\n[ -f /var/lib/magnitude-desktop/installing ] || exit 0\n${end}`,
   prerm: `case "$1" in remove) ;; *) exit 0 ;; esac\n${begin}`,
-  postrm: `case "$1" in remove|purge) ;; *) exit 0 ;; esac\n[ -f /var/lib/magnitude-desktop/installation.lock ] || exit 0\n${end}\nif [ "$1" = purge ]; then rm -rf /var/lib/magnitude-desktop; fi\n`,
+  postrm: `case "$1" in remove|purge) ;; *) exit 0 ;; esac\n${removeServerGrant}[ -f /var/lib/magnitude-desktop/installation.lock ] || exit 0\n${end}\nif [ "$1" = purge ]; then rm -rf /var/lib/magnitude-desktop; fi\n`,
 })
 
 /**
@@ -20,6 +28,6 @@ export const renderPacmanInstallScript = (begin: string, end: string): string =>
   return [
     scriptlet("post_install", `${begin}\n${end}`),
     scriptlet("post_upgrade", completion),
-    scriptlet("post_remove", completion),
+    scriptlet("post_remove", `${removeServerGrant}${completion}`),
   ].join("\n")
 }

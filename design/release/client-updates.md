@@ -41,7 +41,7 @@ No owner installs at startup: Desktop launch and `serve` start normally with a p
 retained, and Desktop offers Restart. Only the system service (`magnitude server setup`: the Linux
 `magnitude` user under the server profile, or the macOS LaunchDaemon) installs unattended, at an
 idle point, when the service reports no working session and no inference request in flight, and
-only when it may do so without asking anyone (the Linux sudoers rule, or a writable macOS
+only when it may do so without asking anyone (the Linux sudoers rule that setup writes, or a writable macOS
 application folder). Any other `serve`, including one run by hand with password-free sudo and every
 Windows `serve`, keeps serving and prints one line per downloaded version naming `magnitude update
 install`, recording no outcome. To install the service ends its owner scope, which releases its

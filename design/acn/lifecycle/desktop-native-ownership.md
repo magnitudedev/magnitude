@@ -307,8 +307,13 @@ neither.
 
 On Linux the service is the package's inert `magnitude.service` unit, running as the `magnitude`
 system account. Setup creates that account and group with home and data directory
-`/var/lib/magnitude`, adds the person to the group, writes a root-owned marker, and enables the
-unit. The marker selects the server profile for the service and for every CLI command: a marker
+`/var/lib/magnitude`, adds the person to the group, writes the service's sudoers rule, enables the
+unit, and writes a root-owned marker last. An existing `magnitude` account is reused only when it is
+recognizably Magnitude's own: a uid and primary group in the system ranges of `/etc/login.defs`, home
+`/var/lib/magnitude` and no login shell. Any other account or group with that name, such as a
+person's, makes setup refuse before changing anything, and removal never deletes it. A failed root
+step undoes what that run created, so no marker points the CLI at a server that was never enabled;
+re-running setup over a complete or partial setup finishes the remaining steps. The marker selects the server profile for the service and for every CLI command: a marker
 that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
 The desktop app always uses the person's own profile. The server profile's ownership directory is
 group-traversable (0710) and its control socket is group-accessible (0660), so group members reach
@@ -322,8 +327,14 @@ no server profile exists, and it replaces the app bundle through the person's ow
 transaction. Its label is distinct from the retired `dev.magnitude.acn` agent, and the Linux system
 unit is distinct from the per-user unit that previous-installation retirement inspects.
 
-`server remove` stops and unregisters the service and removes the Linux account and marker; the
-data directory is kept. Desktop launch first checks for a running server (the active Linux unit
+`server remove` stops and unregisters the service and removes the Linux sudoers rule, account,
+group and marker, the marker last, so a removal that fails part way is still visible and can be run
+again; it cleans up whatever of these exists, with or without the marker. The data directory is
+kept, handed to root (mode 0700) since no account owns it any more, until setup gives it back to a
+new service account. Setup waits a bounded two minutes for the service to answer, then fails naming
+its log (the journal on Linux, `~/.magnitude/logs/server.log`, private to the person, on macOS);
+on macOS, where the service serves in the person's own profile, a re-run treats the Headless owner
+of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
 it runs, the whole window is one screen offering to keep the server, which opens it in the browser
 and quits, or to stop it with administrator authorization (on Linux, pkexec of the CLI's removal
