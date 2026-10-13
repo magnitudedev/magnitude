@@ -38,11 +38,13 @@ Open it in a browser on another computer:
 Network access key: mag_…
 ```
 
-Save the key; `magnitude status` never shows it. Afterwards it is in **Settings → Network access** in the browser app on this machine, and setting the server up again keeps it.
+Save the key; `magnitude status` never shows it. Afterwards it is in **Settings → Network access** in the browser app, and setting the server up again keeps it.
+
+A browser on the server itself signs in with the same key, like a browser on another device. Other accounts on the server can use `/inference/v1` without a key, but can't control the server: only the account running it and, on Linux, members of the `magnitude` group can.
 
 <Tabs>
 <Tab title="Linux">
-Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Setup adds you to the `magnitude` group; log out and back in before running `magnitude status` or `magnitude update`.
+Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Setup adds you to the `magnitude` group; log out and back in before running `magnitude status` or `magnitude update`. To let another account control the server from the CLI, add it to the group: `sudo usermod -aG magnitude ACCOUNT`. Removing an account from the group takes effect when the server next restarts.
 
 Setup creates the `magnitude` account as a system account with no login. If the machine already has an account or group named `magnitude` that isn't one, such as a person's account, setup leaves it alone and stops without changing anything.
 
@@ -114,7 +116,7 @@ The server checks for updates about once an hour, downloads them, and installs t
 
 ## The desktop app on the same machine
 
-The app and the server can't run at the same time. Opening the app while the server runs shows a screen that offers to keep the server, which opens it in your browser instead, or to stop it and use the app. Stopping asks for administrator authorization.
+The app and the server can't run at the same time. Opening the app while the server runs shows a screen that offers to keep the server, which opens it in your browser instead (sign in with the network access key), or to stop it and use the app. Stopping asks for administrator authorization.
 
 ## Stop and remove the server
 

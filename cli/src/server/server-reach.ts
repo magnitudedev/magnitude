@@ -1,8 +1,8 @@
-import { FetchHttpClient } from "@effect/platform"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Option } from "effect"
 import { join } from "node:path"
-import { MagnitudeClient, type NetworkAccessSettings } from "@magnitudedev/sdk"
+import type { MagnitudeClient, NetworkAccessSettings } from "@magnitudedev/sdk"
 import { makeFirstPartyConnection } from "@magnitudedev/client-common"
+import { localServiceClient } from "./application"
 
 /**
  * One request to the service on this machine's loopback port, without starting or observing an owner.
@@ -10,7 +10,7 @@ import { makeFirstPartyConnection } from "@magnitudedev/client-common"
  * the connection and never answers cannot hold the caller.
  */
 export const withLocalService = <A, E>(origin: string, use: (client: MagnitudeClient) => Effect.Effect<A, E>) => Effect.scoped(
-  makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(
+  makeFirstPartyConnection(localServiceClient(origin)).pipe(
     Effect.flatMap(connection => use(connection.client)))).pipe(Effect.disconnect, Effect.timeout("5 seconds"))
 
 export interface ServerReach {
@@ -28,7 +28,8 @@ const host = (address: string) => address.includes(":") ? `[${address}]` : addre
  * access key: service output goes to logs other accounts can read.
  */
 export const renderServerReach = (reach: ServerReach): readonly string[] => {
-  const lines = [`On this computer:   ${reach.endpoint}`]
+  // The system service admits a browser on this computer, like any other, with the network access key.
+  const lines = [`On this computer:   ${reach.endpoint}${reach.service ? "  (the browser app asks for the network access key)" : ""}`]
   const network = Option.getOrUndefined(reach.network)
   const addresses = network?.enabled ? network.interfaces.filter(entry => entry.kind !== "virtual") : []
   if (network?.enabled && addresses.length > 0) {

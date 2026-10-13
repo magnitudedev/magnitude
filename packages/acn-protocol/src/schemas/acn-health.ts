@@ -118,3 +118,11 @@ export const MagnitudeHealthResponseSchema = Schema.Struct({
   rpcVersion: PositiveSafeInteger,
 });
 export type MagnitudeHealthResponse = typeof MagnitudeHealthResponseSchema.Type;
+
+/** What `/health` tells a caller not admitted to application control: readiness, never the instance identity. */
+export const MagnitudeReadinessResponseSchema = Schema.Struct({
+  service: Schema.Literal("magnitude-acn"),
+  version: AcnIdentitySchema,
+  state: Schema.Struct({ _tag: Schema.Literal("Starting", "Ready", "Stopping") }),
+});
+export type MagnitudeReadinessResponse = typeof MagnitudeReadinessResponseSchema.Type;

@@ -46,6 +46,9 @@ plugins call the SDK over RPC instead.
 - `serve` owns the foreground application and service tree until shutdown or cooperative Desktop handoff.
 - `server setup` and `server remove` register and remove the system service on Linux (systemd) and
   macOS (launchd), running as the person and asking for authorization only for their one root step.
+  Setup turns network access on as a local controller of the new service, presenting its local
+  control token; if this account cannot read it yet, setup stops and asks the person to log in
+  again and rerun it, without retrying.
   On Windows they explain that server mode isn't available and change nothing.
 - `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance and exits successfully without starting anything.
 - `hardware` reports the local inference topology, current memory use, and current allocation.

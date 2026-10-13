@@ -5,7 +5,7 @@ import { Duplex } from "node:stream"
 import { Socket } from "node:net"
 import { DesktopChildEvent, DesktopOwnerCommand } from "@magnitudedev/acn-protocol/desktop-control"
 import { receiveJsonLines, sendJsonLine, JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channel"
-import { Deferred, Effect, Option, Ref, Schema, Stream, SubscriptionRef, type Scope } from "effect"
+import { Deferred, Effect, Option, Ref, Schema, Stream, SubscriptionRef, type Redacted, type Scope } from "effect"
 import type { ApplicationOwnerState, MagnitudeHealthResponse, OwnerReply, OwnerRequest } from "@magnitudedev/acn-protocol"
 
 export class AcnOwnerUnavailable extends Schema.TaggedError<AcnOwnerUnavailable>()("AcnOwnerUnavailable", {
@@ -13,7 +13,8 @@ export class AcnOwnerUnavailable extends Schema.TaggedError<AcnOwnerUnavailable>
 }) {}
 
 export interface AcnOwnerControl {
-  readonly awaitStart: Effect.Effect<void, JsonLineChannelFailed>
+  /** Resolves with the local control token loopback callers must present, when the owner requires one. */
+  readonly awaitStart: Effect.Effect<Option.Option<Redacted.Redacted<string>>, JsonLineChannelFailed>
   readonly awaitShutdown: Effect.Effect<void, JsonLineChannelFailed>
   readonly reportHealth: (health: MagnitudeHealthResponse) => Effect.Effect<void, JsonLineChannelFailed>
   /** The owner's latest self-report, once it has sent one. */
@@ -56,7 +57,7 @@ const openOwnerChannel = process.platform === "win32" ? Effect.gen(function* () 
 
 export const makeAcnOwnerControl: Effect.Effect<AcnOwnerControl, AcnOwnerUnavailable | JsonLineChannelFailed, Scope.Scope> = Effect.gen(function* () {
   const socket = yield* openOwnerChannel
-  const started = yield* Deferred.make<void, JsonLineChannelFailed>()
+  const started = yield* Deferred.make<Option.Option<Redacted.Redacted<string>>, JsonLineChannelFailed>()
   const shutdown = yield* Deferred.make<void, JsonLineChannelFailed>()
   const stoppingObserved = yield* Deferred.make<void, JsonLineChannelFailed>()
   const ownerState = yield* SubscriptionRef.make(Option.none<ApplicationOwnerState>())
@@ -80,7 +81,7 @@ export const makeAcnOwnerControl: Effect.Effect<AcnOwnerControl, AcnOwnerUnavail
       ? Effect.all([Deferred.succeed(shutdown, undefined), Deferred.fail(started, new JsonLineChannelFailed({ message: "Desktop stopped before startup authorization" }))]).pipe(Effect.asVoid)
       : Effect.gen(function* () {
           if (yield* Deferred.isDone(started)) return yield* new JsonLineChannelFailed({ message: "Duplicate owner Start" })
-          yield* Deferred.succeed(started, undefined)
+          yield* Deferred.succeed(started, command.controlToken)
         })),
     Effect.zipRight(Effect.fail(new JsonLineChannelFailed({ message: "Desktop control channel closed" }))),
     Effect.catchAll(error => Effect.all([Deferred.fail(started, error), Deferred.fail(shutdown, error), Deferred.fail(stoppingObserved, error), failPending(error)])),

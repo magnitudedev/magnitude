@@ -1,8 +1,8 @@
 import { Starting, Ready, Failed, CleanupFailed, Stopping, Stopped, OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
 import { type ApplicationOwnerState, type MagnitudeHealthResponse, type OwnerReply, type OwnerRequest } from "@magnitudedev/acn-protocol"
 import { FSM } from "@magnitudedev/utils"
-import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Queue, Ref, Schema, Stream, SubscriptionRef } from "effect"
-import { OwnedChildSpawner, type OwnedChild, type OwnedChildCommand } from "./owned-child"
+import { Cause, Clock, Deferred, Effect, Exit, Fiber, Option, Queue, Redacted, Ref, Schema, Stream, SubscriptionRef } from "effect"
+import { OwnedChildSpawner, OwnedChildSpawnFailed, type OwnedChild, type OwnedChildCommand } from "./owned-child"
 
 const states = { Starting, Ready, Failed, CleanupFailed, Stopping, Stopped }
 const machine = FSM.defineFSM(states, {
@@ -35,8 +35,12 @@ export interface OwnerAgent {
   readonly handle: (request: OwnerRequest) => Effect.Effect<{ readonly reply: OwnerReply; readonly afterReply: Effect.Effect<void> }>
 }
 
-/** One application-scoped supervisor; observers and renderer lifetimes do not own it. */
-export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number, owner: OwnerAgent) => Effect.gen(function* () {
+/**
+ * One application-scoped supervisor; observers and renderer lifetimes do not own it. Each start
+ * issues its own local control token (none for open loopback control) and hands it over in `Start`.
+ */
+export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number, owner: OwnerAgent,
+  issueControlToken: Effect.Effect<Option.Option<Redacted.Redacted<string>>, OwnedChildSpawnFailed> = Effect.succeed(Option.none())) => Effect.gen(function* () {
   const spawner = yield* OwnedChildSpawner
   const status = yield* SubscriptionRef.make<OwnedServiceState>(new Starting({ attempt: 0, health: Option.none() }))
   const active = yield* Ref.make(Option.none<OwnedChild>())
@@ -52,6 +56,7 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
     Effect.catchAll(error => Ref.set(cleanupFailure, Option.some(error.message))),
   )
   const attempt = (number: number, readyAt: Ref.Ref<Option.Option<number>>) => Effect.scoped(Effect.gen(function* () {
+    const controlToken = yield* issueControlToken
     const child = yield* spawner.spawn(command)
     yield* Ref.set(active, Option.some(child))
     yield* Effect.addFinalizer(() => retire(child))
@@ -65,7 +70,7 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
           return yield* new ServiceChildProtocolFailed({ message: "Unexpected service bootstrap identity" })
         }
         yield* Ref.set(admitted, true)
-        yield* child.send({ _tag: "Start" })
+        yield* child.send({ _tag: "Start", controlToken })
         yield* owner.state.pipe(Stream.runForEach(state => child.send({ _tag: "OwnerState", state })), Effect.ignore, Effect.forkScoped)
         return
       }

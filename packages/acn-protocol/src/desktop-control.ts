@@ -2,9 +2,14 @@ import { Schema } from "effect"
 import { MagnitudeHealthResponseSchema } from "./schemas/acn-health"
 import { ApplicationOwnerState, OwnerReply, OwnerRequest } from "./schemas/application-owner"
 
-/** Private inherited channel; never a client model API or a discoverable listener. */
+/**
+ * Private inherited channel; never a client model API or a discoverable listener. `Start` carries the
+ * local control token when loopback callers must present one (see `LOCAL_CONTROL_HEADER`).
+ */
 export const DesktopOwnerCommand = Schema.Union(
-  Schema.TaggedStruct("Start", {}),
+  Schema.TaggedStruct("Start", {
+    controlToken: Schema.optionalWith(Schema.Redacted(Schema.String), { as: "Option", exact: true }),
+  }),
   Schema.TaggedStruct("Shutdown", {}),
   Schema.TaggedStruct("StoppingObserved", {}),
   Schema.TaggedStruct("OwnerState", { state: ApplicationOwnerState }),
