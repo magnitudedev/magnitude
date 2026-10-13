@@ -1,11 +1,11 @@
 //! Qwen 3.5 (dense and routed) as a registered model family.
 
-use crate::inputs::{QwenImageTokens, QwenInputAdapter};
-use crate::{inspect_components, recognize};
-use magnitude_artifacts::{gguf::Directory, PackageIdentity};
+use crate::{FAMILY_IDS, inspect_components, recognize};
+use magnitude_artifacts::{PackageIdentity, gguf::Directory};
 use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, MarkerTokens, ModelDefinition, ModelFamily,
 };
+use magnitude_family_qwen::inputs::{QwenImageTokens, QwenInputAdapter};
 
 /// The text one image renders as in the Qwen chat template: the image pad
 /// between the vision delimiters, which input preparation expands to the
@@ -29,7 +29,8 @@ impl ModelFamily for Qwen35Family {
         projector: Option<&Directory>,
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
-        inspect_components(target, projector, identity).map_err(|error| FamilyError(error.to_string()))
+        inspect_components(target, projector, identity)
+            .map_err(|error| FamilyError(error.to_string()))
     }
 
     fn input_adapter(
@@ -49,7 +50,7 @@ impl ModelFamily for Qwen35Family {
                 .map_err(|error| FamilyError(error.to_string()))
             })
             .transpose()?;
-        Ok(Box::new(QwenInputAdapter::new(image_tokens)))
+        Ok(Box::new(QwenInputAdapter::new(FAMILY_IDS, image_tokens)))
     }
 
     fn media_placeholder(&self, definition: &ModelDefinition) -> Option<&'static str> {

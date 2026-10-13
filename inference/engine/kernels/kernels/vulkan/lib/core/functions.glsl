@@ -32,6 +32,16 @@ float functions_activate(const int function, float x) {
     return seismic_div_rn(x, 1.0 + exp(-x));
 }
 
+// A gated delta net's output gate on z, by the code the entries take
+// (`gate_function: i32`): 0 SiLU, 1 sigmoid.
+#define FUNCTIONS_GATE_SIGMOID 1
+
+float functions_output_gate(const int function, float z) {
+    if (function == FUNCTIONS_GATE_SIGMOID)
+        return seismic_div_rn(1.0, 1.0 + exp(-z));
+    return seismic_div_rn(z, 1.0 + exp(-z));
+}
+
 float functions_softcap(float cap, float z) {
     return cap * (seismic_div_rn(2.0, 1.0 + precise_exp(seismic_div_rn(-2.0 * z, cap))) - 1.0);
 }

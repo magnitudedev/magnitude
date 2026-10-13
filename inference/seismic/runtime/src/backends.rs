@@ -108,6 +108,9 @@ pub(crate) enum DiscoveredMemory {
         basis: CapacityBasis,
         ledger: LedgerKey,
         max_allocation_bytes: u64,
+        /// Whether host-shared storage (upload allocations) is the device's
+        /// own memory; else it is host RAM.
+        shared_device_local: bool,
     },
     Unsupported {
         reason: String,
@@ -398,6 +401,8 @@ pub(crate) fn discover() -> BackendDiscovery {
                         basis: CapacityBasis::CudaUsable,
                         ledger: LedgerKey::PhysicalGpu(descriptor.uuid),
                         max_allocation_bytes,
+                        // Upload allocations are mapped pinned host memory.
+                        shared_device_local: false,
                     }
                 };
                 devices.push(DiscoveredDevice {

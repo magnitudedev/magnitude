@@ -126,7 +126,7 @@ void ss_step_of(int row, uint head, out float delta, out float log_decay) {
 // of `parts` cooperating workgroups copies an even share.
 void ss_publish_window(versions_slot slot, uint head, uint part, uint parts) {
     const int taps = SS_TAPS - 1;
-    const uint rows = uint(taps + versions_tape_rows(slot));
+    const uint rows = uint(taps + versions_tape_rows(slot, int(SEISMIC_DIM_T)));
     const uint group = ss_group_of(head);
     const uint per_tap = SS_P + (ss_leads_group(head) ? 2u * SS_N : 0u);
     const uint total = rows * per_tap;
@@ -190,7 +190,7 @@ void ss_advance_rows(versions_slot slot, int begin, uint head, uint block_row0, 
     const uint lane = SEISMIC_LANE, thread = gl_LocalInvocationIndex, threads = gl_WorkGroupSize.x;
     const uint group = ss_group_of(head);
     const int publish = slot.lo + slot.stop;
-    const int recorded = versions_tape_rows(slot);
+    const int recorded = versions_tape_rows(slot, int(SEISMIC_DIM_T));
     const float skip = element_f32_at(SEISMIC_PTR(SEISMIC_BUFFER_SKIP) + uint64_t(head) * SEISMIC_SKIP_STRIDE_0 * 4ul);
     const uint64_t mixed = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     // The subgroup that owns state row 0 records the decay, and B when the

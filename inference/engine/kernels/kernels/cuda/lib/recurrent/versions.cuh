@@ -76,9 +76,9 @@ __device__ __forceinline__ int covered_end(const Slots &slots, const seismic_wor
 }
 
 // Rows the slot records in its successor's tape: those after the stop row, at
-// most T.
-__device__ __forceinline__ int tape_rows(const Slot &slot, const seismic_words_t &seismic_words_value) {
-    return min(static_cast<int>(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
+// most the tape's `capacity` (T).
+__device__ __forceinline__ int tape_rows(const Slot &slot, int capacity) {
+    return min(capacity, slot.hi - slot.lo - slot.stop);
 }
 
 // Bank `index` of a slab-stored arena whose banks are `bytes` long.

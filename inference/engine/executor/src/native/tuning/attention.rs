@@ -21,9 +21,10 @@ use super::{
 };
 use crate::operators;
 use crate::operators::attention::graph::{
-    DECODE_ROWS, rotary_amplitudes, rotary_components, rotary_frequencies,
+    DECODE_ROWS, indexer_project_dimensions, rotary_amplitudes, rotary_components,
+    rotary_frequencies, selected_segments,
 };
-use crate::{AttentionBinding, AttentionShape};
+use crate::{AttentionBinding, AttentionShape, SelectionBinding};
 use magnitude_family_contracts::{
     Attention, HeadHistory, HistoryDomain, KeyValue, Operator, WeightKind, WeightScope,
 };
@@ -345,7 +346,8 @@ impl EntryTuning for AttentionProjectTuning {
         } else {
             shape.project_dimensions(0)
         };
-        Ok(statics.to_vec())
+        let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
+        Ok([statics.as_slice(), &[("PT", parts), ("NM", norm)]].concat())
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -359,6 +361,7 @@ impl EntryTuning for AttentionProjectTuning {
     ) -> Result<Vec<Self::Case>, String> {
         let shape = self.binding.shape;
         let query_kind = operators::attention::query_kind(operator(inputs, &self.scopes)?);
+        let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -386,10 +389,15 @@ impl EntryTuning for AttentionProjectTuning {
                     value: segment(shape.value_rows(), WeightKind::Value)?,
                     hidden: inputs.activation(
                         Element::f32(),
-                        &[point.rows, shape.hidden],
+                        &[point.rows, parts * shape.hidden],
                         index as u64 + 1,
                     )?,
-                    input_norm: inputs.weight(scope, WeightKind::InputNorm)?,
+                    input_norm: inputs.input_norm(
+                        scope,
+                        WeightKind::InputNorm,
+                        self.binding.norm,
+                        norm,
+                    )?,
                     query: if self.binding.key_value_only {
                         query
                             .slice_leading(0, 0)
@@ -419,6 +427,107 @@ impl EntryTuning for AttentionProjectTuning {
     generated_entry!(attention_project, this => this.elements());
 }
 
+/// `attention_project` as a selected read's indexer projection: the normed
+/// input's query heads (`heads · width` rows) and raw key (`width` rows),
+/// with no gate or value rows.
+#[derive(Clone)]
+pub(crate) struct IndexerProjectTuning {
+    pub binding: AttentionBinding,
+    pub selection: SelectionBinding,
+    pub scopes: Vec<WeightScope>,
+    pub epsilon: f32,
+}
+
+impl IndexerProjectTuning {
+    fn elements(&self) -> attention_project::Elements {
+        let selection = self.selection;
+        attention_project::Elements {
+            NW: self.binding.norm,
+            QW: selection.query,
+            GW: selection.query,
+            KW: selection.key,
+            VW: selection.query,
+            A: self.binding.activation,
+        }
+    }
+}
+
+impl EntryTuning for IndexerProjectTuning {
+    type Entry = attention_project::Entry;
+    type Case = AttentionProjectCase;
+
+    fn launches(&self) -> usize {
+        self.scopes.len()
+    }
+
+    fn bindings(&self) -> String {
+        format!(
+            "NW={},QW={},KW={},A={};indexer",
+            self.binding.norm.name(),
+            self.selection.query.name(),
+            self.selection.key.name(),
+            self.binding.activation.name()
+        )
+    }
+
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+        let hidden = self.binding.shape.hidden;
+        let [_, statics @ ..] = indexer_project_dimensions(hidden, self.selection.shape, 0);
+        if projection_shape(inputs, &self.scopes, WeightKind::IndexerQuery)?
+            != (statics[1].1, hidden)
+        {
+            return Err("the indexer query projection disagrees with the binding".into());
+        }
+        let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
+        Ok([statics.as_slice(), &[("PT", parts), ("NM", norm)]].concat())
+    }
+
+    fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
+        row_points(limits)
+    }
+
+    fn rotation(
+        &self,
+        inputs: &mut TuningInputs<'_, '_>,
+        point: &PointShape,
+    ) -> Result<Vec<Self::Case>, String> {
+        let hidden = self.binding.shape.hidden;
+        let (parts, norm) = inputs.input_form(&self.scopes, hidden)?;
+        TuningInputs::rotation_scopes(&self.scopes, point)
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| {
+                let query = inputs.weight(scope, WeightKind::IndexerQuery)?;
+                let empty = query.slice_leading(0, 0).map_err(|error| error.to_string())?;
+                Ok(AttentionProjectCase {
+                    gate: empty.clone(),
+                    key: inputs.weight(scope, WeightKind::IndexerKey)?,
+                    value: empty,
+                    hidden: inputs.activation(
+                        Element::f32(),
+                        &[point.rows, parts * hidden],
+                        index as u64 + 1,
+                    )?,
+                    input_norm: inputs.input_norm(
+                        scope,
+                        WeightKind::InputNorm,
+                        self.binding.norm,
+                        norm,
+                    )?,
+                    query,
+                    epsilon: self.epsilon,
+                })
+            })
+            .collect()
+    }
+
+    fn args<'a>(case: &'a mut Self::Case) -> attention_project::Args<'a> {
+        AttentionProjectTuning::args(case)
+    }
+
+    generated_entry!(attention_project, this => this.elements());
+}
+
 /// `attention_output`: output projection plus residual.
 #[derive(Clone)]
 pub(crate) struct AttentionOutputTuning {
@@ -430,6 +539,7 @@ pub(crate) struct AttentionOutputTuning {
 
 pub(crate) struct AttentionOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
 }
@@ -463,7 +573,14 @@ impl EntryTuning for AttentionOutputTuning {
         {
             return Err("the attention output projection disagrees with the binding".into());
         }
-        Ok(vec![("D", shape.hidden), ("Q", heads), ("W", shape.width)])
+        let (streams, inject) = inputs.join(&self.scopes)?;
+        Ok(vec![
+            ("D", shape.hidden),
+            ("SN", streams),
+            ("IN", inject),
+            ("Q", heads),
+            ("W", shape.width),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -476,6 +593,7 @@ impl EntryTuning for AttentionOutputTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String> {
         let shape = self.shape;
+        let (streams, inject) = inputs.join(&self.scopes)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -484,9 +602,10 @@ impl EntryTuning for AttentionOutputTuning {
                 Ok(AttentionOutputCase {
                     hidden: inputs.activation(
                         Element::f32(),
-                        &[point.rows, shape.hidden],
+                        &[point.rows, streams * shape.hidden],
                         seed + 1,
                     )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, inject], seed + 3)?,
                     gated: inputs.activation(
                         self.activation,
                         &[point.rows, shape.kv_heads * shape.group, shape.width],
@@ -501,6 +620,7 @@ impl EntryTuning for AttentionOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
         }
@@ -527,6 +647,23 @@ pub(crate) struct AttentionMix {
     /// The most history rows the layers the case binds keep
     /// ([`history_window`]): its points see no longer history.
     pub window: Option<u64>,
+    /// A selected read's indexer: the prefill then reads through its
+    /// WorkList bitmap (`B` words, static), tuned with every block read.
+    pub selection: Option<SelectionBinding>,
+}
+
+impl AttentionMix {
+    /// The prefill's WorkList bitmap words `B`: 0 for a read of every
+    /// visible row.
+    fn words(&self) -> u64 {
+        self.selection.map_or(0, |selection| selection.shape.words)
+    }
+
+    /// The keys `BR` of a WorkList bitmap's block: 1 for a read of every
+    /// visible row.
+    fn block_keys(&self) -> u64 {
+        self.selection.map_or(1, |selection| selection.shape.block)
+    }
 }
 
 /// The most history rows the layers `scopes` name keep: the largest window
@@ -619,6 +756,11 @@ pub(crate) struct AttentionMixCase<H> {
     /// The history row tiles the case's rows see (the affine prefill's
     /// `history_tiles`).
     history_tiles: Tensor,
+    /// The prefill's WorkList bitmap (`[rows, B]`, every block read; none in
+    /// the Visible form) and its blocks' keys (`[0, BR]`, BR 1 in the
+    /// Visible form).
+    selection: Tensor,
+    block_slots: Tensor,
     history: H,
     slab_rows: u32,
     epsilon: f32,
@@ -811,13 +953,22 @@ impl AttentionMix {
     /// [`magnitude_state::MAX_HISTORY_SPANS`], and the attend launches'
     /// threadgroup memory grows with the spans they schedule.
     fn served_dimensions(&self, shapes: &[PointShape]) -> Vec<BTreeMap<String, u64>> {
+        // A selected read's decode rows also read the indexer's segments.
         let classes = std::iter::successors(Some(1u64), |segments| segments.checked_mul(2))
             .take_while(|segments| {
                 *segments <= magnitude_state::MAX_HISTORY_SPANS.next_power_of_two() as u64
-            });
+            })
+            .map(|segments| (segments, false))
+            .chain(
+                self.selection
+                    .map(|selection| (selected_segments(selection.shape.blocks), true)),
+            );
         classes
-            .flat_map(|segments| {
+            .flat_map(|(segments, selected)| {
                 shapes.iter().filter_map(move |point| {
+                    if selected && point.rows > DECODE_ROWS {
+                        return None;
+                    }
                     let context = point.context?;
                     // A listed launch lists the tiles its rows see, one at
                     // least; an unlisted one passes an empty list of one
@@ -860,6 +1011,14 @@ impl AttentionMix {
                 rows.end
             ),
             None if self.listed => format!("A={},L=1", self.activation.name()),
+            None if self.selection.is_some() => {
+                format!(
+                    "A={},B={},BR={}",
+                    self.activation.name(),
+                    self.words(),
+                    self.block_keys()
+                )
+            }
             None => format!("A={}", self.activation.name()),
         }
     }
@@ -1019,6 +1178,11 @@ impl AttentionMix {
                             inputs.i32s(&[1, tiles.len() as u64], &tiles)?
                         }
                     },
+                    selection: inputs.u32s(
+                        &[rows, self.words()],
+                        &vec![u32::MAX; (rows * self.words()) as usize],
+                    )?,
+                    block_slots: inputs.i32s(&[0, self.block_keys()], &[])?,
                     history: history.share(),
                     slab_rows: u32::try_from(view).map_err(|_| "tuning history rows exceed u32")?,
                     epsilon: self.epsilon,
@@ -1033,7 +1197,7 @@ impl AttentionMix {
 /// The fused entries differ in the rows they serve and in their history
 /// planes; they share every other argument.
 macro_rules! mix_entry {
-    ($tuning:ident, $module:ident, $history:ty, $serves:expr,
+    ($tuning:ident, $module:ident, $history:ty, $serves:expr, statics |$mix:ident| $statics:expr,
      |$case:ident| { $($plane:ident: $state:expr),* $(,)? }
      $(, search_starts $starts:path)?) => {
         impl $tuning {
@@ -1083,7 +1247,9 @@ macro_rules! mix_entry {
                 &self,
                 _inputs: &ModelInputs<'_>,
             ) -> Result<Vec<(&'static str, u64)>, String> {
-                Ok(self.0.statics())
+                let $mix = &self.0;
+                let extra: Vec<(&'static str, u64)> = $statics.into_iter().collect();
+                Ok(self.0.statics().into_iter().chain(extra).collect())
             }
 
             fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -1110,7 +1276,13 @@ macro_rules! mix_entry {
             }
 
             fn served_dimensions(&self, shapes: &[PointShape]) -> Vec<BTreeMap<String, u64>> {
-                self.0.served_dimensions(shapes)
+                let mut served = self.0.served_dimensions(shapes);
+                let $mix = &self.0;
+                let extra: Vec<(&'static str, u64)> = $statics.into_iter().collect();
+                for dimensions in &mut served {
+                    dimensions.extend(extra.iter().map(|(name, value)| (name.to_string(), *value)));
+                }
+                served
             }
 
             $(fn search_starts(
@@ -1171,11 +1343,14 @@ macro_rules! mix_entry {
     };
 }
 
+// The prefills tune the form their binding reads: Visible (`B = 0`) or
+// WorkList (`B` words).
 mix_entry!(
     AttentionDecodeTuning,
     attention_decode,
     DenseMixHistory,
     |rows| rows <= DECODE_ROWS,
+    statics |_mix| [],
     |case| {
         history_key: case.history.key.tensor_mut(),
         history_value: case.history.value.tensor_mut(),
@@ -1187,7 +1362,10 @@ mix_entry!(
     attention_prefill,
     DenseMixHistory,
     |rows| rows > DECODE_ROWS,
+    statics |mix| [("B", mix.words()), ("BR", mix.block_keys())],
     |case| {
+        selection: &case.selection,
+        block_slots: &case.block_slots,
         history_key: case.history.key.tensor_mut(),
         history_value: case.history.value.tensor_mut(),
     }
@@ -1197,6 +1375,7 @@ mix_entry!(
     attention_decode_k8v4,
     AffineMixHistory,
     |rows| rows <= DECODE_ROWS,
+    statics |_mix| [],
     |case| {
         history_key_codes: case.history.key_codes.tensor_mut(),
         history_key_coefficients: case.history.key_coefficients.tensor_mut(),
@@ -1210,7 +1389,10 @@ mix_entry!(
     attention_prefill_k8v4,
     AffineMixHistory,
     |rows| rows > DECODE_ROWS,
+    statics |mix| [("B", mix.words()), ("BR", mix.block_keys())],
     |case| {
+        selection: &case.selection,
+        block_slots: &case.block_slots,
         history_tiles: &case.history_tiles,
         history_key_codes: case.history.key_codes.tensor_mut(),
         history_key_coefficients: case.history.key_coefficients.tensor_mut(),
@@ -1263,6 +1445,7 @@ mod tests {
                     epsilon: 1.0e-5,
                     decode_rows: Some(2..DECODE_ROWS + 1),
                     window: None,
+                    selection: None,
                 };
                 let limits = TuningLimits {
                     max_rows: 8,
@@ -1360,6 +1543,7 @@ mod tests {
                 epsilon: 1.0e-6,
                 decode_rows: Some(rows),
                 window: None,
+                selection: None,
             };
             let statics = mix
                 .statics()
@@ -1442,6 +1626,7 @@ mod tests {
                     epsilon: 1.0e-5,
                     decode_rows: Some(2..DECODE_ROWS + 1),
                     window: None,
+                    selection: None,
                 };
                 let limits = TuningLimits {
                     max_rows,
@@ -1555,6 +1740,7 @@ mod tests {
             epsilon: 1.0e-5,
             decode_rows: Some(1..2),
             window: None,
+            selection: None,
         };
         let single = AttentionDecodeK8V4Tuning(mix);
         let limits = TuningLimits {
@@ -1670,6 +1856,7 @@ mod tests {
             epsilon: 1.0e-5,
             decode_rows: None,
             window: None,
+            selection: None,
         };
         let tuning = AttentionPrefillK8V4Tuning(mix);
         let limits = TuningLimits {

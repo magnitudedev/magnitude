@@ -76,8 +76,11 @@ pub struct FileSource {
 }
 
 impl FileSource {
+    /// The source keeps the name `path` gives it, made absolute but not
+    /// resolved through links: a content-addressed store names its files by
+    /// links, and a split GGUF finds its shards by that name.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
-        let path = path.as_ref().canonicalize()?;
+        let path = std::path::absolute(path.as_ref())?;
         let file = File::open(&path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() {

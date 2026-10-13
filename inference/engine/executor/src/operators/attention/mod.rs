@@ -5,7 +5,7 @@
 pub(crate) mod graph;
 
 use super::{PlanError, WeightPush, tail};
-use crate::{AttentionBinding, AttentionShape};
+use crate::{AttentionBinding, AttentionShape, SelectionBinding, SelectionShape};
 use magnitude_family_contracts::{
     Attention, AttentionGate, Decoder, GateFunction, GateGranularity, HeadNorm, HistoryDomain,
     HistoryReads, KeyValue, MediaRowAttention, Operator, OutputForm, Rotary, RotaryPair, ValueNorm,
@@ -20,7 +20,8 @@ use seismic::Element;
 /// epsilon, owned histories in a token or window domain or a Shared layer's
 /// source history, and any rotary table whose stored divisors (checked at
 /// load, `check_rotary_divisors`) cover its pairs. Media rows attend
-/// causally or bidirectionally (`operators::media_rows_bidirectional`).
+/// causally or bidirectionally (`operators::media_rows_bidirectional`). A
+/// history is read whole or selected by an indexer (`HistoryReads`).
 pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), PlanError> {
     // A Shared layer reads its source's history (`StateStore::history_read`)
     // and projects no keys or values; its source's domain is admitted with
@@ -39,6 +40,16 @@ pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), Pla
         }
     }
     head_norm_epsilon(attention, input_epsilon)?;
+    if let AttentionGate::Interleaved {
+        function: GateFunction::Silu,
+    }
+    | AttentionGate::Separate {
+        function: GateFunction::Silu,
+        ..
+    } = &attention.gate
+    {
+        return Err(PlanError::Unsupported("SiLU attention gate"));
+    }
     if let Rotary::Table {
         pairs,
         divisors: Some(divisors),
@@ -50,8 +61,19 @@ pub(crate) fn admit(attention: &Attention, input_epsilon: f64) -> Result<(), Pla
             ));
         }
     }
-    if attention.reads != HistoryReads::Visible {
-        return Err(PlanError::Unsupported("attention history reads"));
+    // A selected read's indexer orders keys by position (`indexer_select`):
+    // its rows attend causally, and its norms share one epsilon.
+    if let HistoryReads::Selected { indexer, .. } = &attention.reads {
+        if attention.media_rows != MediaRowAttention::Causal {
+            return Err(PlanError::Unsupported(
+                "selected attention attending media rows bidirectionally",
+            ));
+        }
+        if indexer.query_norm.epsilon != indexer.key_norm.epsilon {
+            return Err(PlanError::Unsupported(
+                "indexer norms with differing epsilons",
+            ));
+        }
     }
     let shape = shape(0, attention)?;
     if shape.width < 2 * shape.rotary_pairs {
@@ -187,7 +209,8 @@ pub(crate) fn shape(hidden: u64, attention: &Attention) -> Result<AttentionShape
 }
 
 /// The attention entries' `gate_function` code: 0 sigmoid, 1 softplus (and
-/// 0 for an ungated operator, whose gate is never read).
+/// 0 for an ungated operator, whose gate is never read). [`admit`] rejects
+/// every other gate.
 pub(crate) fn gate_function(attention: &Attention) -> i32 {
     let function = match &attention.gate {
         AttentionGate::None => return 0,
@@ -198,6 +221,7 @@ pub(crate) fn gate_function(attention: &Attention) -> i32 {
     match function {
         GateFunction::Sigmoid => 0,
         GateFunction::Softplus => 1,
+        GateFunction::Silu => unreachable!("admission rejects SiLU attention gates"),
     }
 }
 
@@ -272,29 +296,78 @@ pub(super) fn weights<'a>(attention: &'a Attention, push: &mut WeightPush<'_, 'a
     {
         push(WeightKind::KeyNorm, &norm.weight);
     }
+    if let HistoryReads::Selected { indexer, .. } = &attention.reads {
+        push(WeightKind::IndexerQuery, &indexer.query);
+        push(WeightKind::IndexerKey, &indexer.key);
+        push(WeightKind::IndexerQueryNorm, &indexer.query_norm.weight);
+        push(WeightKind::IndexerKeyNorm, &indexer.key_norm.weight);
+    }
     push(WeightKind::AttentionOutput, &attention.output);
+}
+
+/// The static axes of a selected read in a decoder serving `context`
+/// tokens; none for a read of every visible row.
+pub(crate) fn selection_shape(reads: &HistoryReads, context: u64) -> Option<SelectionShape> {
+    match reads {
+        HistoryReads::Visible => None,
+        HistoryReads::Selected {
+            block,
+            blocks,
+            indexer,
+        } => Some(SelectionShape {
+            heads: indexer.heads,
+            width: indexer.width,
+            block: *block,
+            blocks: *blocks,
+            // A row at position t < context reads blocks up to its tail's,
+            // t / block: the bitmap covers them all.
+            words: context / block / 32 + 1,
+        }),
+    }
+}
+
+/// A selected read's numerical parameters apart from its weights: block,
+/// blocks, indexer heads, width and norm epsilon.
+fn selection_key(reads: &HistoryReads) -> Option<(u64, u64, u64, u64, f64)> {
+    match reads {
+        HistoryReads::Visible => None,
+        HistoryReads::Selected {
+            block,
+            blocks,
+            indexer,
+        } => Some((
+            *block,
+            *blocks,
+            indexer.heads,
+            indexer.width,
+            indexer.query_norm.epsilon,
+        )),
+    }
 }
 
 /// Every numerical parameter of the operator a sealed graph holds apart from
 /// its weights.
 pub(super) fn shape_key(attention: &Attention, epsilon: f64) -> Result<String, PlanError> {
     Ok(format!(
-        "attention {:?} {:?} {:?} {:?} {}",
+        "attention {:?} {:?} {:?} {:?} {} {:?}",
         shape(0, attention)?,
         gate_function(attention),
         head_norm_epsilon(attention, epsilon)?,
         attention.rotary,
-        attention.scale
+        attention.scale,
+        selection_key(&attention.reads)
     ))
 }
 
-/// The program binding of an attention sublayer with `output`; `lookup`
-/// resolves the planned element of a role in its scope. An absent
-/// projection segment binds a zero-row view of the query weight.
+/// The program binding of an attention sublayer with `output` in a decoder
+/// serving `context` tokens; `lookup` resolves the planned element of a role
+/// in its scope. An absent projection segment binds a zero-row view of the
+/// query weight.
 pub(super) fn binding(
     attention: &Attention,
     output: &OutputForm,
     hidden: u64,
+    context: u64,
     lookup: impl Fn(WeightKind) -> Result<Element, PlanError>,
     activation: Element,
     history: KvCodec,
@@ -302,7 +375,17 @@ pub(super) fn binding(
     let shape = shape(hidden, attention)?;
     let query = lookup(query_kind(attention))?;
     let segment = |present: bool, kind| if present { lookup(kind) } else { Ok(query) };
+    let selection = selection_shape(&attention.reads, context)
+        .map(|shape| {
+            Ok::<_, PlanError>(SelectionBinding {
+                shape,
+                query: lookup(WeightKind::IndexerQuery)?,
+                key: lookup(WeightKind::IndexerKey)?,
+            })
+        })
+        .transpose()?;
     Ok(AttentionBinding {
+        selection,
         key_value_only: false,
         shape,
         norm: lookup(WeightKind::InputNorm)?,
@@ -334,6 +417,282 @@ mod tests {
         RotaryPair {
             frequency,
             amplitude: 1.0,
+        }
+    }
+
+    mod selected {
+        use crate::programs::native_target_graph::checked_target_family_storage;
+        use crate::{
+            ComponentSelection, ExecutionPath, MixerProgramSlot, ModelLoadPlan, PlannedMethod,
+            ResourceCapacity, ResourceLimits, ResourcePlanner, SelectionShape, resident_layout,
+            source_element,
+        };
+        use magnitude_artifacts::{
+            ArtifactIdentity, ComponentFile, ComponentManifest, PackageIdentity, PackageManifest,
+            gguf::{Encoding, TensorDescriptor},
+        };
+        use magnitude_family_contracts::{
+            ActivationDType, ActivationFunction, Attention, AttentionGate, Block, Decoder,
+            DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, FamilyId, FeedForwardUp,
+            HeadNorm, HistoryDomain, HistoryReads, Indexer, InputNorm, InputSemantics, KeyValue,
+            MediaRowAttention, ModelDefinition, Operator, OutputForm, ResidualForm, RmsNorm,
+            Rotary, RotaryPair, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+        };
+        use magnitude_state::{HistoryDomainKind, KvCodec, LayerRef};
+        use seismic::BackendName;
+
+        const HIDDEN: u64 = 256;
+        const CONTEXT: u64 = 4096;
+
+        /// A decoder of two blocks, each a selected attention (64-wide heads,
+        /// fully rotated; an indexer of two 64-wide heads over blocks of four
+        /// rows, two selected) and a dense feed-forward.
+        fn selected() -> (ModelDefinition, PackageManifest) {
+            let mut tensors = Vec::new();
+            let mut offset = 0;
+            let mut tensor = |name: String, shape: Vec<u64>| {
+                let encoding = if shape.len() > 1 {
+                    Encoding::BF16
+                } else {
+                    Encoding::F32
+                };
+                let nbytes = source_element(encoding, *shape.last().unwrap())
+                    .unwrap()
+                    .canonical_byte_len(&shape)
+                    .unwrap();
+                tensors.push(TensorDescriptor {
+                    name: name.clone(),
+                    shape: shape.clone(),
+                    encoding,
+                    offset,
+                    nbytes,
+                });
+                offset += nbytes;
+                WeightDescriptor::stored(name, shape)
+            };
+            let rms = |weight| RmsNorm {
+                weight,
+                epsilon: 1e-6,
+            };
+            let mut block = |layer: usize| {
+                let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+                let attention = Sublayer {
+                    input: InputNorm::Rms(rms(tensor(name("attn_norm"), vec![HIDDEN]))),
+                    op: Operator::Attention(Box::new(Attention {
+                        heads: 4,
+                        kv_heads: 2,
+                        width: 64,
+                        query: tensor(name("attn_q"), vec![HIDDEN, HIDDEN]),
+                        gate: AttentionGate::None,
+                        query_norm: HeadNorm::Rms(rms(tensor(name("attn_q_norm"), vec![64]))),
+                        key_value: KeyValue::Owned {
+                            key: tensor(name("attn_k"), vec![128, HIDDEN]),
+                            value: ValueSource::Projected(tensor(
+                                name("attn_v"),
+                                vec![128, HIDDEN],
+                            )),
+                            key_norm: HeadNorm::Rms(rms(tensor(name("attn_k_norm"), vec![64]))),
+                            value_norm: ValueNorm::None,
+                            domain: HistoryDomain::Token,
+                        },
+                        rotary: Rotary::Table {
+                            pairs: (0..32)
+                                .map(|pair| RotaryPair {
+                                    frequency: 1.0e4f64.powf(-(2 * pair) as f64 / 64.0),
+                                    amplitude: 1.0,
+                                })
+                                .collect(),
+                            divisors: None,
+                        },
+                        scale: 1.0 / 8.0,
+                        reads: HistoryReads::Selected {
+                            block: 4,
+                            blocks: 2,
+                            indexer: Indexer {
+                                heads: 2,
+                                width: 64,
+                                query: tensor(name("indexer.q_proj"), vec![128, HIDDEN]),
+                                key: tensor(name("indexer.k_proj"), vec![64, HIDDEN]),
+                                query_norm: rms(tensor(name("indexer.q_norm"), vec![64])),
+                                key_norm: rms(tensor(name("indexer.k_norm"), vec![64])),
+                            },
+                        },
+                        media_rows: MediaRowAttention::Causal,
+                        output: tensor(name("attn_output"), vec![HIDDEN, HIDDEN]),
+                    })),
+                    output: OutputForm::Residual,
+                };
+                let dense = Sublayer {
+                    input: InputNorm::Rms(rms(tensor(name("ffn_norm"), vec![HIDDEN]))),
+                    op: Operator::DenseFfn(Box::new(DenseFfn {
+                        intermediate: 512,
+                        up: FeedForwardUp::Gated {
+                            activation: ActivationFunction::Silu,
+                            gate: tensor(name("ffn_gate"), vec![512, HIDDEN]),
+                            up: tensor(name("ffn_up"), vec![512, HIDDEN]),
+                        },
+                        down: tensor(name("ffn_down"), vec![HIDDEN, 512]),
+                    })),
+                    output: OutputForm::Residual,
+                };
+                Block {
+                    sublayers: vec![attention, dense],
+                }
+            };
+            let blocks = vec![block(0), block(1)];
+            let embedding = tensor("token_embd".into(), vec![512, HIDDEN]);
+            let output_norm = tensor("output_norm".into(), vec![HIDDEN]);
+            let identity = PackageIdentity {
+                target: ArtifactIdentity([7; 32]),
+                projector: None,
+            };
+            let definition = ModelDefinition {
+                family: FamilyId("selected-attention".into()),
+                artifact_identity: identity,
+                inputs: InputSemantics { coordinate_axes: 1 },
+                decoder: Decoder {
+                    activation_dtype: ActivationDType::BF16,
+                    hidden: HIDDEN,
+                    vocabulary: 512,
+                    context_limit: CONTEXT,
+                    residual: ResidualForm::Single,
+                    entry: EntryForm {
+                        embedding: embedding.clone(),
+                        scale: EmbeddingScale::Unit,
+                        norm: None,
+                        per_layer: None,
+                        hash_routing: None,
+                    },
+                    blocks,
+                    exit: ExitForm {
+                        norm: ExitNorm::Rms(rms(output_norm)),
+                        output: embedding,
+                        softcap: None,
+                    },
+                },
+                head: None,
+                vision: None,
+                draft: None,
+            };
+            let manifest = PackageManifest {
+                identity,
+                target: ComponentManifest {
+                    files: vec![ComponentFile {
+                        path: "selected.gguf".into(),
+                        size: offset,
+                    }],
+                    identity: identity.target,
+                    tensors,
+                },
+                projector: None,
+                draft: None,
+            };
+            (definition, manifest)
+        }
+
+        /// A selected read binds its indexer at the served context, keeps
+        /// its raw keys and block keys in their own domains, and its graphs
+        /// (the checked metadata route of the production fragment: the
+        /// indexer, the Segments decode and the WorkList prefill) certify on
+        /// every backend at every row class.
+        #[test]
+        fn selected_attention_plans_its_indexer_and_certifies_on_every_backend() {
+            let (definition, manifest) = selected();
+            definition.validate().unwrap();
+            assert_eq!(definition.deferred_forms(), []);
+            let limits = ResourceLimits {
+                max_launch_rows: 64,
+                max_launch_slots: 8,
+                max_selected_rows: 64,
+                max_drafting_slots: 8,
+                exported_logits_rows: 0,
+                max_images_per_request: 1,
+                max_image_cells: 0,
+                lookahead: false,
+            };
+            for backend in [
+                BackendName::Cpu,
+                BackendName::Metal,
+                BackendName::Cuda,
+                BackendName::Vulkan,
+            ] {
+                for codec in [KvCodec::Dense, KvCodec::AffineK8V4] {
+                    let load = ModelLoadPlan::derive(
+                        &manifest,
+                        &definition,
+                        ComponentSelection {
+                            head: false,
+                            vision: false,
+                        },
+                        resident_layout(ExecutionPath::Native, backend),
+                    )
+                    .unwrap();
+                    let plan = load.program_plan(&definition, codec).unwrap();
+                    let MixerProgramSlot::Attention(binding) = plan.target().blocks()[0].mixer()
+                    else {
+                        panic!("an attention block");
+                    };
+                    assert_eq!(
+                        binding.selection.map(|selection| selection.shape),
+                        Some(SelectionShape {
+                            heads: 2,
+                            width: 64,
+                            block: 4,
+                            blocks: 2,
+                            // Blocks [0, 1024] of a 4096-token context.
+                            words: 33,
+                        })
+                    );
+                    let state = ResourcePlanner::state_plan(
+                        &definition,
+                        &load,
+                        PlannedMethod::Plain,
+                        codec,
+                        limits,
+                        ResourceCapacity {
+                            domain_bytes: 16 * 1024 * 1024 * 1024,
+                            tensor_operations: crate::TensorOperations::Absent,
+                        },
+                    )
+                    .unwrap();
+                    // The Token domain, then each indexer's raw keys and
+                    // block keys.
+                    let kinds = state
+                        .target_state()
+                        .domains
+                        .iter()
+                        .map(|domain| domain.kind)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        kinds,
+                        [
+                            HistoryDomainKind::Token,
+                            HistoryDomainKind::Window { rows: 3 },
+                            HistoryDomainKind::Block { rate: 4 },
+                        ]
+                    );
+                    for block in 0..2 {
+                        let (window, blocks) =
+                            state.target_state().indexer_history(block).unwrap();
+                        assert!(
+                            window
+                                .components
+                                .iter()
+                                .any(|component| component.layer == LayerRef::Indexer(block))
+                        );
+                        assert!(blocks.rows as u64 >= CONTEXT / 4);
+                    }
+                    checked_target_family_storage(
+                        backend,
+                        &load,
+                        &definition.decoder,
+                        &state,
+                        plan.target(),
+                        limits,
+                    )
+                    .unwrap_or_else(|error| panic!("{backend:?} {codec:?}: {error}"));
+                }
+            }
         }
     }
 

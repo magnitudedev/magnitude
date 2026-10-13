@@ -1,3 +1,4 @@
+use crate::operators::streams::StreamsBinding;
 use crate::{
     AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, GeneralRoutedBinding,
     ReadoutBinding, RecurrentBinding, RoutedBinding, ShortConvBinding, StateSpaceBinding,
@@ -6,7 +7,7 @@ use magnitude_kernels::{
     attention_append_dense, attention_append_k8v4, attention_decode, attention_decode_k8v4,
     attention_output, attention_prefill, attention_prefill_k8v4, attention_project, dense_expand,
     dense_output, embedding_rows, gated_delta_chunk, gated_delta_project,
-    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved,
+    gated_delta_project_convolved, gated_delta_step, gated_delta_step_convolved, indexer_select,
     post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
     readout_planes_rows, readout_refine_rows, readout_selected_rows, readout_top_rows,
     routed_combine, routed_expand, routed_experts, routed_group, routed_output, routed_route,
@@ -23,6 +24,7 @@ use std::collections::HashMap;
 /// Immutable decoder-stage specializations keyed by semantic bindings.
 #[derive(Debug, Default)]
 pub struct TargetKernels {
+    pub(super) residual_features: Option<NativeKernel<feature_rows::Entry>>,
     pub(super) embedding: HashMap<EmbeddingBinding, NativeKernel<embedding_rows::Entry>>,
     pub(super) attention: HashMap<AttentionBinding, AttentionKernels>,
     pub(super) recurrent: HashMap<RecurrentBinding, RecurrentKernels>,
@@ -37,6 +39,38 @@ pub struct TargetKernels {
     pub(super) per_layer_entry: HashMap<crate::PerLayerEntryBinding, PerLayerEntryKernels>,
     pub(super) per_layer: HashMap<crate::PerLayerBinding, PerLayerKernels>,
     pub(super) parallel: HashMap<crate::ParallelBinding, ParallelKernels>,
+    pub(super) streams: HashMap<StreamsBinding, StreamsKernels>,
+    pub(super) ngram: HashMap<crate::NGramBinding, NGramKernels>,
+}
+
+/// An n-gram input sublayer (`operators::ngram`): the table rows of each
+/// position (`rows`), read from the streamed table and decoded to
+/// activations (`stored`), their key and value projections into F32, the
+/// gate and the row op.
+#[derive(Clone, Debug)]
+pub struct NGramKernels {
+    pub rows: NativeKernel<magnitude_kernels::ngram_rows::Entry>,
+    pub stored: NativeKernel<magnitude_kernels::stored_rows::Entry>,
+    pub key: NativeKernel<project_rows::Entry>,
+    pub value: NativeKernel<project_rows::Entry>,
+    pub gate: NativeKernel<magnitude_kernels::ngram_gate::Entry>,
+    pub inject: NativeKernel<magnitude_kernels::ngram_inject::Entry>,
+    /// The copy of a step's selected tokens where the host reads them
+    /// early, in the entry graph of a step that reads selected tokens: the
+    /// table's filler learns the rows it names from them.
+    pub notice: NativeKernel<magnitude_kernels::selection_notice::Entry>,
+}
+
+/// A decoder's hyper-connection streams (`operators::streams`): the
+/// sublayers' mix sites (`down`, with inject values) and the exit site
+/// (`exit`, without), their second stage (`up`), and the widening of the
+/// embedded rows (`repeat`). Every site of a decoder shares one binding.
+#[derive(Clone, Debug)]
+pub struct StreamsKernels {
+    pub down: NativeKernel<magnitude_kernels::stream_mix_down::Entry>,
+    pub exit: NativeKernel<magnitude_kernels::stream_mix_down::Entry>,
+    pub up: NativeKernel<magnitude_kernels::stream_mix_up::Entry>,
+    pub repeat: NativeKernel<magnitude_kernels::repeat_rows::Entry>,
 }
 
 /// A dense branch beside a general routed branch: the dense branch's
@@ -184,6 +218,38 @@ pub struct AttentionKernels {
     pub project: NativeKernel<attention_project::Entry>,
     pub history: AttentionHistoryKernels,
     pub output: SublayerOutput<NativeKernel<attention_output::Entry>>,
+    /// A selected read's indexer and selected prefill
+    /// (`AttentionBinding::selection`).
+    pub selection: Option<SelectionKernels>,
+}
+
+/// A selected read's entries: the indexer's normed query and raw-key
+/// projection (`attention_project`: query rows `heads · width`, key rows
+/// `width`), `indexer_select`, and the codec's prefill in its WorkList form
+/// (`B` words) for the classes that score.
+#[derive(Clone, Debug)]
+pub struct SelectionKernels {
+    pub project: NativeKernel<attention_project::Entry>,
+    pub select: NativeKernel<indexer_select::Entry>,
+    pub prefill: SelectedPrefillKernel,
+}
+
+/// The WorkList prefill of a selected read's history codec.
+#[derive(Clone, Debug)]
+pub enum SelectedPrefillKernel {
+    Dense(NativeKernel<attention_prefill::Entry>),
+    AffineK8V4(NativeKernel<attention_prefill_k8v4::Entry>),
+}
+
+impl SelectionKernels {
+    pub fn invocation_workspace_bytes(&self) -> u64 {
+        self.project.invocation_workspace_bytes()
+            + self.select.invocation_workspace_bytes()
+            + match &self.prefill {
+                SelectedPrefillKernel::Dense(kernel) => kernel.invocation_workspace_bytes(),
+                SelectedPrefillKernel::AffineK8V4(kernel) => kernel.invocation_workspace_bytes(),
+            }
+    }
 }
 
 /// A sublayer's output entries by its `SublayerTail`: the operator's own

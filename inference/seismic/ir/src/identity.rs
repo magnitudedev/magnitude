@@ -455,6 +455,7 @@ impl CanonicalIdentity for crate::schedule::FillValue {
             Self::U8(_) => b"u8",
             Self::U16(_) => b"u16",
             Self::U32(_) => b"u32",
+            Self::U64(_) => b"u64",
         });
         out.bytes(self.pattern());
     }

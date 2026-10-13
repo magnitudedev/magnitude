@@ -3846,6 +3846,7 @@ fn zero_of<B: seismic_native_target::TargetFamily>(
         ValueType::Scalar(DType::F32) => kernel.constant(ConstantValue::F32(0.0), ty),
         ValueType::Scalar(DType::I32) => kernel.constant(ConstantValue::I32(0), ty),
         ValueType::Scalar(DType::U32) => kernel.constant(ConstantValue::U32(0), ty),
+        ValueType::Scalar(DType::U64) => kernel.constant(ConstantValue::U64(0), ty),
         ValueType::Scalar(DType::Bool) => kernel.constant(ConstantValue::Bool(false), ty),
         ValueType::Bool => kernel.constant(ConstantValue::Bool(false), ty),
         ValueType::Index => kernel.index_constant(0),
@@ -3869,6 +3870,7 @@ fn one_of<B: seismic_native_target::TargetFamily>(
         }
         ValueType::Scalar(DType::I32) => kernel.constant(ConstantValue::I32(1), ty),
         ValueType::Scalar(DType::U32) => kernel.constant(ConstantValue::U32(1), ty),
+        ValueType::Scalar(DType::U64) => kernel.constant(ConstantValue::U64(1), ty),
         ValueType::Scalar(DType::Bool) => kernel.constant(ConstantValue::Bool(true), ty),
         ValueType::Index => kernel.index_constant(1),
         ValueType::Bool | ValueType::Vector { .. } | ValueType::Opaque { .. } => {
@@ -3891,17 +3893,10 @@ fn portable_index<B: seismic_native_target::TargetFamily>(
 fn scalar_bits<B: seismic_native_target::TargetFamily>(
     kernel: &mut PortableBuilder<'_, B>,
     dtype: DType,
-    bits: u32,
+    bits: u64,
 ) -> PortableValue {
     let ty = value_type(dtype);
-    let value = match dtype {
-        DType::F32 => ConstantValue::F32(f32::from_bits(bits)),
-        DType::F16 => ConstantValue::F16(bits as u16),
-        DType::BF16 => ConstantValue::BF16(bits as u16),
-        DType::I32 => ConstantValue::I32(bits as i32),
-        DType::U32 => ConstantValue::U32(bits),
-        DType::Bool => ConstantValue::Bool(bits != 0),
-    };
+    let value = ConstantValue::from_scalar(ReferenceScalar::from_bits(dtype, bits));
     kernel.constant(value, ty)
 }
 
@@ -4016,7 +4011,7 @@ enum CapturedExpr {
     Nat(u64),
     Int(i64),
     Bool(bool),
-    Scalar(DType, u32),
+    Scalar(DType, u64),
     NatArgument(NatExpr),
     ScalarArgument(seismic_lang::expr::SymbolId, DType),
     Value(PortableValue),

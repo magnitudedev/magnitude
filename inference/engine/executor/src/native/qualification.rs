@@ -1,6 +1,7 @@
 mod glue;
 mod head;
 mod helpers;
+mod streams;
 mod target;
 mod vision;
 
@@ -147,6 +148,8 @@ impl<'a> QualificationView<'a> {
         self.qualify_conditioning_overlay(device)?;
         self.qualify_feature_copy(device)?;
         self.qualify_target(device)?;
+        self.qualify_streams(device)?;
+        self.qualify_ngram(device)?;
         self.qualify_head(device)?;
         self.qualify_vision(device)?;
         for (element, binding) in [

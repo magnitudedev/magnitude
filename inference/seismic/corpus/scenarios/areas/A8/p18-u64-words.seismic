@@ -1,0 +1,42 @@
+# origin: A8:u64-words
+# invoke mix: i32[6]=0,1,7,-1,49,2147483647 ; u64[3]=0x10000000003,0x20000000011,0xf423f00007 ; u64[6]=zero
+# expect: returned
+# pin: o = u64[6]=0x0,0x23942ffffd,0x6abc900023,0x20000023942ffffc,0x7c9700177,0x14ec10000a
+# invoke to_u64: f32[7]=nan,1.5,-2.5,5e9,1e20,inf,-inf ; u64[7]=zero
+# expect: returned
+# pin: o = u64[7]=0x0,0x1,0x0,0x12a05f200,0xffffffffffffffff,0xffffffffffffffff,0x0
+# invoke narrow: u64[6]=0x0,0x1,0xffffffff,0x100000000,0xfedcba9876543210,0xffffffffffffffff ; u32[6]=zero ; i32[6]=zero ; f32[6]=zero
+# expect: returned
+# pin: a = u32[6]=0,1,4294967295,0,1985229328,4294967295
+# pin: b = i32[6]=0,1,-1,0,1985229328,-1
+# pin: c = f32[6]=0x0,0x3f800000,0x4f800000,0x4f800000,0x5f7edcbb,0x5f800000
+# invoke unsigned_signs: u64[4]=0x0,0x1,0x8000000000000000,0xffffffffffffffff ; u32[4]=0x0,0x1,0x80000001,0xffffffff ; u64[4]=zero ; u64[4]=zero ; u32[4]=zero
+# expect: returned
+# pin: n = u64[4]=0x0,0xffffffffffffffff,0x8000000000000000,0x1
+# pin: a = u64[4]=0x0,0x1,0x8000000000000000,0xffffffffffffffff
+# pin: aw = u32[4]=0x0,0x1,0x80000001,0xffffffff
+fn mix[N](t: &tensor[N] i32, m: &tensor[3] u64, o: &mut tensor[N] u64):
+    # 64-bit words wrap; an I32 widens by its value modulo 2^64. The divisor
+    # is odd, so no input divides by zero.
+    parallel for i in 0..N:
+        let w = u64(t[i])
+        o[i] = ((w * m[0]) ^ (w * m[1])) % (m[2] | u64(1)) + (w >> u32(3))
+
+fn to_u64[N](x: &tensor[N] f32, o: &mut tensor[N] u64):
+    # NaN converts to 0 and out-of-range values saturate, on every backend.
+    parallel for i in 0..N:
+        o[i] = u64(x[i])
+
+fn narrow[N](x: &tensor[N] u64, a: &mut tensor[N] u32, b: &mut tensor[N] i32, c: &mut tensor[N] f32):
+    # The low word, and one rounding to F32.
+    parallel for i in 0..N:
+        a[i] = u32(x[i])
+        b[i] = i32(x[i])
+        c[i] = f32(x[i])
+
+fn unsigned_signs[N](x: &tensor[N] u64, w: &tensor[N] u32, n: &mut tensor[N] u64, a: &mut tensor[N] u64, aw: &mut tensor[N] u32):
+    # Negation wraps; an unsigned word is its own magnitude.
+    parallel for i in 0..N:
+        n[i] = -x[i]
+        a[i] = abs(x[i])
+        aw[i] = abs(w[i])

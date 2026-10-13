@@ -152,6 +152,67 @@ template <class Rows> struct Residual {
     }
 };
 
+// `scatter`: each of the STREAMS hyper-connection streams of the residual
+// plus the projection times the stream's inject value,
+//   out[m, s * width + n] = residual[rows(m), s * width + n] + round_A(projection) * inject[m, s],
+// or with INJECTED false (one stream) `Residual`'s sum.
+template <class Rows, u32 STREAMS, bool INJECTED> struct Scatter {
+    const float *residual;
+    u64 residual_stride;
+    Rows rows;
+    float *out;
+    u64 stride;
+    const float *inject;
+    u64 inject_stride;
+    u64 width;
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float value, float) const {
+        const float y = Act::round(value);
+#pragma unroll
+        for (u32 s = 0; s < STREAMS; ++s) {
+            const float base = residual[rows(m) * residual_stride + s * width + n];
+            out[m * stride + s * width + n] = INJECTED ? base + y * inject[m * inject_stride + s] : base + y;
+        }
+    }
+    __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
+        (*this)(m, n, first, 0.0f);
+        (*this)(m, n + 1, second, 0.0f);
+    }
+};
+
+// A routed sublayer's column n joining its row's residual (`routed_output`,
+// `routed_combine`): residual + selected + shared, in that order, or (INJECTED)
+// for each of the STREAMS streams residual[s] + (selected + shared) * inject[s].
+// `out` and `residual` point at the row, `inject` at its inject values.
+template <u32 STREAMS, bool INJECTED>
+__device__ __forceinline__ void routed_join(float *out, const float *residual, const float *inject, u64 width, u64 n,
+                                            float selected, float shared) {
+    if constexpr (!INJECTED) {
+        out[n] = residual[n] + selected + shared;
+    } else {
+#pragma unroll
+        for (u32 s = 0; s < STREAMS; ++s)
+            out[s * width + n] = residual[s * width + n] + (selected + shared) * inject[s];
+    }
+}
+
+// An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
+// when the entry takes inject values. `make` forms either from every field
+// (`Residual` reads the leading ones).
+template <class Rows, u32 STREAMS, bool INJECTED> struct OutputOf {
+    using type = Scatter<Rows, STREAMS, INJECTED>;
+    __device__ static __forceinline__ type make(const float *residual, u64 residual_stride, Rows rows, float *out,
+                                                u64 stride, const float *inject, u64 inject_stride, u64 width) {
+        return type{residual, residual_stride, rows, out, stride, inject, inject_stride, width};
+    }
+};
+template <class Rows> struct OutputOf<Rows, 1, false> {
+    using type = Residual<Rows>;
+    __device__ static __forceinline__ type make(const float *residual, u64 residual_stride, Rows rows, float *out,
+                                                u64 stride, const float *, u64, u64) {
+        return type{residual, residual_stride, rows, out, stride};
+    }
+};
+
 // out[m, n] = round(round_A(silu(round_A(gate))) * round_A(up)).
 template <class E> struct SiluMul {
     u8 *out;
@@ -207,6 +268,53 @@ template <class E, class Publication = E> struct Activated {
     }
     __device__ __forceinline__ void pair(u32 m, u64 n, float first, float second, float, float) const {
         element::put2<E>(out, m * stride + n, value(first), value(second));
+    }
+};
+
+// A mix site's low-rank rows (`stream_mix_down`) over S streams:
+// out[m, n] = round_E(silu(projection / S)).
+template <class E> struct MixLow {
+    u8 *out;
+    u64 stride;
+    float streams;
+    __device__ __forceinline__ float value(float projected) const {
+        const float v = projected / streams;
+        return v / (1.0f + expf(-v));
+    }
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
+        element::put<E>(out, m * stride + n, value(projected));
+    }
+};
+
+// A mix site's inject values (`stream_mix_down`) over S streams:
+// out[m, n] = 2 sigmoid(projection / S) (F32).
+struct MixInject {
+    float *out;
+    u64 stride;
+    float streams;
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
+        out[m * stride + n] = 2.0f / (1.0f + expf(-projected / streams));
+    }
+};
+
+// A mix site's per-stream partials (`stream_mix_up`): column n of stream
+// n / width gated by its projection,
+// out[m, n] = sigmoid(projection) * x[m, n] * inverse[m, n / width] * w[n] / S (F32).
+template <class NORM> struct Mix {
+    float *out;
+    u64 stride;
+    const float *x;
+    u64 x_stride;
+    const float *inverse;
+    u64 inverse_stride;
+    const u8 *norm;
+    u64 width;
+    float streams;
+    __device__ __forceinline__ void operator()(u32 m, u64 n, float projected, float) const {
+        const float normalized = x[m * x_stride + n] * inverse[m * inverse_stride + n / width]
+            * element::at<NORM>(norm, n);
+        const float gate = 1.0f / (1.0f + expf(-projected));
+        out[m * stride + n] = gate * normalized / streams;
     }
 };
 

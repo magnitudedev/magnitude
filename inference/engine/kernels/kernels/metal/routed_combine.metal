@@ -60,6 +60,7 @@ kernel void routed_combine_down(
 
 kernel void routed_combine(
     device const float *residual [[buffer(SEISMIC_BUFFER_RESIDUAL)]],
+    device const float *inject [[buffer(SEISMIC_BUFFER_INJECT)]],
     device const uchar *expert_output [[buffer(SEISMIC_BUFFER_EXPERT_OUTPUT)]],
     device const int *inverse [[buffer(SEISMIC_BUFFER_INVERSE)]],
     device const float *scores [[buffer(SEISMIC_BUFFER_SCORES)]],
@@ -98,10 +99,8 @@ kernel void routed_combine(
         selected_even.z, selected_odd.z, selected_even.w, selected_odd.w};
     const float projected[8] = {shared_even.x, shared_odd.x, shared_even.y, shared_odd.y, shared_even.z,
         shared_odd.z, shared_even.w, shared_odd.w};
-    for (uint i = 0; i < 8u && n + i < columns; ++i) {
-        const ulong column = n + i;
-        value[m * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1] =
-            residual[m * SEISMIC_RESIDUAL_STRIDE_0 + column * SEISMIC_RESIDUAL_STRIDE_1] + selected[i]
-            + projected[i] * c;
-    }
+    for (uint i = 0; i < 8u && n + i < columns; ++i)
+        projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(value + m * SEISMIC_RESULT_0_STRIDE_0,
+            SEISMIC_RESULT_0_STRIDE_1, residual + m * SEISMIC_RESIDUAL_STRIDE_0, SEISMIC_RESIDUAL_STRIDE_1,
+            inject + m * SEISMIC_INJECT_STRIDE_0, columns, n + i, selected[i], projected[i] * c);
 }

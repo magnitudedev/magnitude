@@ -517,6 +517,8 @@ __device__ __forceinline__ void named_arrive(u32 id, u32 threads) {
 struct Tile {
     int span;
     int first;
+    // Its place in a WorkList's list (unused otherwise).
+    int index;
 };
 
 // A block of `attend`: query tile `tile` (tokens [tile * QT, (tile + 1) *
@@ -555,6 +557,31 @@ struct Split {
     float *partials;    // [parts][M][KV * G][W]
     float *statistics;  // [parts][M][KV * G][2]
     u32 *counts;        // [query tiles]
+};
+
+// A prefill launch's WorkList selection (`indexer_select`'s per-row block
+// bitmap, `words` words a row, `block_rows` keys a block; none when `words`
+// is 0), with what its list launch (`list`) leaves: each row's key ordinal at
+// the start of each of its spans (`bases`, [M][R + 1]) and each query tile's
+// listed key tiles (`lists`, [tiles][capacity] (span, first) pairs; `listed`
+// counts them).
+struct Selection {
+    const u32 *bitmap;
+    const int *bases;
+    const int *lists;
+    const u32 *listed;
+    u32 words;
+    int block_rows;
+    u32 capacity;
+
+    // Whether row `token` reads key `key` of span `index` (whose bounds
+    // begin at `lo`): the bit of the key's block (a block past the bitmap is
+    // not read).
+    __device__ __forceinline__ bool reads(long long token, int index, int spans, int key, int lo) const {
+        const int ordinal = bases[token * (spans + 1) + index] + key - lo;
+        const u32 block = static_cast<u32>(ordinal) / static_cast<u32>(block_rows);
+        return block / 32 < words && ((bitmap[token * words + block / 32] >> (block % 32)) & 1u) != 0u;
+    }
 };
 
 // Prefill rows: L1 put the queries and the batch's keys and values in scratch
@@ -825,9 +852,107 @@ __device__ __forceinline__ void stage_history(const ListedF16History &history, u
 }
 #endif
 
+// The list launch of a WorkList prefill: block per query tile of QT rows,
+// 256 threads. It writes each tile row's key ordinal at the start of each of
+// its spans (`bases`), then lists, in `attend`'s tile order (each span's
+// union interval in KEYS-key tiles, spans then fresh), the key tiles some row
+// of the tile reads (a row reads a key of its span interval when the bit of
+// the key's block is set). `attend` walks exactly these.
+__device__ __forceinline__ void list(const Inputs &in, int *bases, int *lists, u32 *listed, const u32 *bitmap,
+                                     u32 words, int block_rows, u32 capacity, int tile) {
+    [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
+    const int spans = static_cast<int>(SEISMIC_DIM_R);
+    const long long first_token = static_cast<long long>(tile) * QT;
+    const long long rows_total = static_cast<long long>(SEISMIC_DIM_M);
+    extern __shared__ __align__(16) u8 shared[];
+    int *table = reinterpret_cast<int *>(shared);  // [R + 1][2] union intervals
+    u32 *sums = reinterpret_cast<u32 *>(table + (spans + 1) * 2);  // [8], then the count
+    const int thread = threadIdx.x;
+    const int warp = thread / 32;
+    const int lane = thread % 32;
+    if (thread < QT && first_token + thread < rows_total) {
+        int base = 0;
+        for (int index = 0; index <= spans; ++index) {
+            const Span s = span(in, first_token + thread, index, spans);
+            bases[(first_token + thread) * (spans + 1) + index] = base;
+            base += max(s.hi - s.lo, 0);
+        }
+    }
+    for (int index = thread; index <= spans; index += 256) {
+        int union_lo = 0x7fffffff, union_hi = -0x7fffffff;
+        for (long long token = first_token; token < min(first_token + QT, rows_total); ++token) {
+            const Span s = span(in, token, index, spans);
+            if (s.hi > s.lo) {
+                union_lo = min(union_lo, s.lo);
+                union_hi = max(union_hi, s.hi);
+            }
+        }
+        if (union_hi <= union_lo) union_lo = union_hi = 0;
+        table[index * 2] = union_lo;
+        table[index * 2 + 1] = union_hi;
+    }
+    if (thread == 0) sums[8] = 0;
+    __syncthreads();
+    int total = 0;
+    for (int index = 0; index <= spans; ++index)
+        if (table[index * 2 + 1] > table[index * 2]) total += (table[index * 2 + 1] - table[index * 2] + KEYS - 1) / KEYS;
+    for (int round = 0; round < total; round += 256) {
+        const int candidate = round + thread;
+        bool read = false;
+        int entry_span = 0, entry_first = 0;
+        if (candidate < total) {
+            int before = 0;
+            for (int index = 0; index <= spans; ++index) {
+                const int lo = table[index * 2], hi = table[index * 2 + 1];
+                if (hi <= lo) continue;
+                const int n = (hi - lo + KEYS - 1) / KEYS;
+                if (candidate < before + n) {
+                    entry_span = index;
+                    entry_first = lo + (candidate - before) * KEYS;
+                    break;
+                }
+                before += n;
+            }
+            const int end = min(entry_first + KEYS, table[entry_span * 2 + 1]);
+            for (long long token = first_token; token < min(first_token + QT, rows_total) && !read; ++token) {
+                const Span s = span(in, token, entry_span, spans);
+                const int first_key = max(entry_first, s.lo);
+                const int last_key = min(end, s.hi);
+                if (first_key >= last_key) continue;
+                const int base = bases[token * (spans + 1) + entry_span];
+                const u32 first_block = static_cast<u32>(base + first_key - s.lo) / static_cast<u32>(block_rows);
+                const u32 last_block = static_cast<u32>(base + last_key - 1 - s.lo) / static_cast<u32>(block_rows);
+                for (u32 b = first_block; b <= last_block && !read; ++b)
+                    read = b / 32 < words && ((bitmap[token * words + b / 32] >> (b % 32)) & 1u) != 0u;
+            }
+        }
+        // Compact this round's listed tiles in tile order.
+        const u32 votes = __ballot_sync(0xffffffffu, read);
+        const u32 before_lane = __popc(votes & ((1u << lane) - 1u));
+        __syncthreads();
+        if (lane == 0) sums[warp] = __popc(votes);
+        __syncthreads();
+        u32 offset = sums[8];
+        for (int other = 0; other < warp; ++other) offset += sums[other];
+        if (read && offset + before_lane < capacity) {
+            int *slot = lists + (static_cast<long long>(tile) * capacity + offset + before_lane) * 2;
+            slot[0] = entry_span;
+            slot[1] = entry_first;
+        }
+        __syncthreads();
+        if (thread == 0) {
+            u32 added = 0;
+            for (int other = 0; other < 8; ++other) added += sums[other];
+            sums[8] += added;
+        }
+        __syncthreads();
+    }
+    if (thread == 0) listed[tile] = min(sums[8], capacity);
+}
+
 template <class History, class Rows>
 __device__ __forceinline__ void attend(const Inputs &in, const History &history, const Rows &rows,
-                                       Block block) {
+                                       Block block, const Selection &selection = Selection{}) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     typedef Operands<History> Ops;
     constexpr bool CODED = History::CODED;
@@ -938,8 +1063,11 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
         const int lo = table[index * 4 + 0], hi = table[index * 4 + 1];
         return hi > lo ? (hi - lo + KEYS - 1) / KEYS : 0;
     };
+    // A WorkList's key tiles are its query tile's listed ones.
+    const bool listing = selection.words > 0;
     int total_tiles = 0;
     for (int index = 0; index <= spans; ++index) total_tiles += span_tiles(index);
+    if (listing) total_tiles = static_cast<int>(selection.listed[block.tile]);
     const int parts = block.parts;
     const int per = max(Rows::MIN_TILES, (total_tiles + parts - 1) / parts);
     const int active = max(1, (total_tiles + per - 1) / per);
@@ -954,6 +1082,11 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     const int count = max(0, min(per, total_tiles - tiles_lo));
     // Tile `index` of the query tile's sequence.
     auto nth = [&](int index) {
+        if (listing) {
+            if (index >= total_tiles) return Tile{spans + 1, 0, index};
+            const int *entry = selection.lists + (static_cast<long long>(block.tile) * selection.capacity + index) * 2;
+            return Tile{entry[0], entry[1], index};
+        }
         for (int span = 0; span <= spans; ++span) {
             const int n = span_tiles(span);
             if (index < n) return Tile{span, table[span * 4 + 0] + index * KEYS};
@@ -974,7 +1107,7 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     auto advance = [&](Tile &tile, int &piece) {
         if (++piece == PIECES) {
             piece = 0;
-            tile = settle(Tile{tile.span, tile.first + KEYS});
+            tile = listing ? nth(tile.index + 1) : settle(Tile{tile.span, tile.first + KEYS});
         }
     };
     // Staged units per output window.
@@ -1057,6 +1190,8 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
     float denominator[2];
     int cached_span = -1;
     Span interval_a{0, 0}, interval_b{0, 0};
+    // The rows' raw span bounds and key ordinals, for a WorkList mask.
+    Span raw_a{0, 0}, raw_b{0, 0};
     // A key tile's scores, accumulated over its pieces.
     float s[KEYS / 8][4];
     // Split scores: this warp's column, the key piece and first 16-column step
@@ -1132,8 +1267,10 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
             cached_span = current.span;
             interval_a = valid_a ? span(in, token_a, current.span, spans) : Span{0, 0};
             interval_b = valid_b ? span(in, token_b, current.span, spans) : Span{0, 0};
+            raw_a = interval_a;
+            raw_b = interval_b;
         }
-        const bool full = current.first >= table[current.span * 4 + 2] &&
+        const bool full = !listing && current.first >= table[current.span * 4 + 2] &&
                           current.first + KEYS <= table[current.span * 4 + 3];
 
         // Scale into the exp2 domain, mask, then the online softmax of both rows.
@@ -1148,7 +1285,13 @@ __device__ __forceinline__ void attend(const Inputs &in, const History &history,
                 for (int e = 0; e < 4; ++e) {
                     const int key = current.first + 8 * n + 2 * t + (e & 1);
                     const Span &interval = e < 2 ? interval_a : interval_b;
-                    if (key < interval.lo || key >= interval.hi) s[n][e] = NEG_INF;
+                    if (key < interval.lo || key >= interval.hi) {
+                        s[n][e] = NEG_INF;
+                    } else if (listing &&
+                               !selection.reads(e < 2 ? token_a : token_b, current.span, spans, key,
+                                                (e < 2 ? raw_a : raw_b).lo)) {
+                        s[n][e] = NEG_INF;
+                    }
                 }
             }
         }

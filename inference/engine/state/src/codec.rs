@@ -28,6 +28,9 @@ impl fmt::Display for CodecIdentity {
 pub enum LayerRef {
     Target(u32),
     Head(u32),
+    /// The selected-attention indexer of target block `n`: its keys, which
+    /// no attention reads as history.
+    Indexer(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -299,6 +302,49 @@ impl ComponentDescriptor {
             heads,
             planes,
         })
+    }
+
+    /// A selected-attention indexer's component: one dense key vector of
+    /// `width` `dtype` values per row and, with `coordinates`, the row's four
+    /// rotary coordinates (`i32`) in the value plane: a raw key's, whose
+    /// block is rotated at its first row's coordinates.
+    pub fn indexer(
+        layer: LayerRef,
+        dtype: DType,
+        width: usize,
+        coordinates: bool,
+    ) -> Result<Self, LayoutError> {
+        if !matches!(layer, LayerRef::Indexer(_)) {
+            return Err(LayoutError::WrongRepresentation(
+                "indexer history of an attention layer",
+            ));
+        }
+        let mut planes = planes_for(VectorKind::Key, Codec::Dense { dtype }, width)?;
+        let value_width = if coordinates { 4 } else { 0 };
+        // Its planes are `[rows, elements]`: one vector per row, no heads.
+        if coordinates {
+            planes.push(plane(VectorKind::Value, PlaneName::Dense, DType::I32, value_width)?);
+        }
+        Ok(Self {
+            layer,
+            codec: CodecSpec {
+                key: Codec::Dense { dtype },
+                value: Codec::Dense {
+                    dtype: if coordinates { DType::I32 } else { dtype },
+                },
+                key_width: width,
+                value_width,
+                packing: 1,
+            },
+            heads: 1,
+            planes,
+        })
+    }
+
+    /// Whether attention reads this component as history (an indexer's
+    /// keys are not).
+    pub fn attended(&self) -> bool {
+        !matches!(self.layer, LayerRef::Indexer(_))
     }
 
     pub fn planes(&self) -> &[PlaneDescriptor] {

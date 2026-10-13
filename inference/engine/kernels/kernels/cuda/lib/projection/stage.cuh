@@ -80,6 +80,78 @@ template <class NORM, class Rows> struct Rms {
     }
 };
 
+// The sum in part order of the PARTS width-wide parts of an F32 row, a
+// hyper-connection mix site's per-stream partials (`form_input` without a
+// norm): x = round_A(sum_p t[p * width + k]). Its fields are `Rms`'s, so an
+// entry selects either by its norm's extent (`Input`); `norm` and `eps` are
+// not read.
+template <class NORM, class Rows, u64 PARTS> struct Summed {
+    const float *x;
+    u64 stride;
+    const u8 *norm;
+    float eps;
+    u64 width;
+    Rows rows;
+    static constexpr bool STAGED = true;
+    static constexpr int FACTORS = 0;
+    __device__ __forceinline__ void prepare_row(float *, u32, float *) const {}
+    __device__ __forceinline__ float value(const float *, u32 m, u64 k) const {
+        const float *row = x + rows(m) * stride;
+        float sum = 0.0f;
+#pragma unroll
+        for (u64 part = 0; part < PARTS; ++part)
+            sum = seismic_add_rn(sum, row[part * width + k]);
+        return Act::round(sum);
+    }
+};
+
+// The per-stream RMS normalization of STREAMS hyper-connection streams of
+// `width` columns each (`group_rms`, `stream_mix_down`), one factor (the
+// stream's inverse) per stream:
+// x = round_A(t[k] * inverse[k / width] * w[k]).
+template <class NORM, class Rows, u32 STREAMS> struct GroupRms {
+    const float *x;
+    u64 stride;
+    const u8 *norm;
+    float eps;
+    u64 width;
+    Rows rows;
+    static constexpr bool STAGED = true;
+    static constexpr int FACTORS = STREAMS;
+    __device__ __forceinline__ float squares(u32 m, u32 stream, u32 first, u32 step) const {
+        const float *row = x + rows(m) * stride + stream * width;
+        float total = 0.0f;
+        for (u64 k = first; k < width; k += step)
+            total = seismic_fma_rn(row[k], row[k], total);
+        return total;
+    }
+    __device__ __forceinline__ void prepare_row(float *shared, u32 m, float *scratch) const {
+#pragma unroll 1
+        for (u32 stream = 0; stream < STREAMS; ++stream) {
+            const float total = reduce::group_sum(squares(m, stream, threadIdx.x, blockDim.x), scratch);
+            if (threadIdx.x == 0)
+                shared[stream] = rsqrtf(total / (float)width + eps);
+        }
+    }
+    __device__ __forceinline__ float formed(const float *factors, u32 m, u64 k) const {
+        return x[rows(m) * stride + k] * factors[k / width] * element::at<NORM>(norm, k);
+    }
+    __device__ __forceinline__ float value(const float *factors, u32 m, u64 k) const {
+        return Act::round(formed(factors, m, k));
+    }
+};
+
+// An entry's input prologue (`form_input`): RMS normalization with a norm
+// of NORM_EXTENT values, or the sum of PARTS partials without one.
+template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS> struct InputOf {
+    using type = Rms<NORM, Rows>;
+};
+template <class NORM, class Rows, u64 PARTS> struct InputOf<NORM, Rows, 0, PARTS> {
+    using type = Summed<NORM, Rows, PARTS>;
+};
+template <class NORM, class Rows, u64 NORM_EXTENT, u64 PARTS>
+using Input = typename InputOf<NORM, Rows, NORM_EXTENT, PARTS>::type;
+
 // The prologue's row m as A into out[m * K .. m * K + K), formed by the whole
 // block: the staging launch (one block per row, global scratch) and a GEMV
 // block at M = 1 (its shared memory) both form rows with it.
@@ -91,6 +163,21 @@ template <class Storage = Act, class Pro> __device__ __forceinline__ void form_r
     __syncthreads();
     for (u64 k = threadIdx.x; k < K; k += blockDim.x)
         element::put<Storage>(out, m * K + k, pro.value(factors, m, k));
+}
+
+// `form_row`, also publishing the row's FACTORS factors (a group prologue's
+// per-stream inverses) to published[f * step] when `published` is given.
+template <class Pro>
+__device__ __forceinline__ void form_row_publishing(const Pro &pro, u32 m, u64 K, u8 *out, float *published,
+                                                    u64 step) {
+    __shared__ float factors[Pro::FACTORS > 0 ? Pro::FACTORS : 1];
+    __shared__ float scratch[32];
+    pro.prepare_row(factors, m, scratch);
+    __syncthreads();
+    if (published != nullptr && threadIdx.x < (unsigned)Pro::FACTORS)
+        published[threadIdx.x * step] = factors[threadIdx.x];
+    for (u64 k = threadIdx.x; k < K; k += blockDim.x)
+        element::put<Act>(out, m * K + k, pro.value(factors, m, k));
 }
 
 // int8 activations (the GEMM's INT8 candidate): rows quantized per 32-code

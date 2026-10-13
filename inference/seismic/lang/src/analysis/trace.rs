@@ -176,6 +176,7 @@ fn word_range(dtype: DType) -> Option<(f64, f64)> {
     match dtype {
         DType::I32 => Some((f64::from(i32::MIN), f64::from(i32::MAX))),
         DType::U32 => Some((0.0, f64::from(u32::MAX))),
+        DType::U64 => Some((0.0, u64::MAX as f64)),
         DType::Bool => Some((0.0, 1.0)),
         DType::F32 | DType::BF16 | DType::F16 => None,
     }

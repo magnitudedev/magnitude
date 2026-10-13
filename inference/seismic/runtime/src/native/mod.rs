@@ -33,6 +33,7 @@ pub mod plan;
 pub mod replay;
 pub mod sampling;
 pub mod search;
+pub mod timeline;
 mod timing;
 pub mod trace;
 pub mod tune;
@@ -2206,6 +2207,15 @@ pub(crate) trait DispatchList {
     /// argument, so CUDA replays the list as one graph. `None` for lists
     /// launched call by call.
     fn plans(&self) -> Option<Vec<u64>>;
+    /// The timeline operations at `boundary`, before call `boundary`
+    /// (`count()` after the last), in order.
+    fn timelines(&self, _boundary: usize) -> &[timeline::TimelineOperation] {
+        &[]
+    }
+    /// Whether any boundary has timeline operations.
+    fn has_timelines(&self) -> bool {
+        false
+    }
 }
 
 /// One entry per access group with merged write access, in group order:
@@ -2416,8 +2426,22 @@ fn encode(
             }
             .map_err(CallError::Execution)?;
             let mut typed = Vec::new();
+            let timelines = |batch: &mut seismic_metal::DirectBatch, boundary: usize| {
+                for operation in list.timelines(boundary) {
+                    let timeline::TimelineKind::Metal(event) = operation.timeline.kind() else {
+                        unreachable!("a run binds timelines of its own device");
+                    };
+                    match operation.node {
+                        timeline::TimelineNode::Wait => batch.wait_event(event, operation.value),
+                        timeline::TimelineNode::Signal => {
+                            batch.signal_event(event, operation.value)
+                        }
+                    }
+                }
+            };
             for _ in 0..repetitions {
                 for index in 0..list.count() {
+                    timelines(&mut batch, index);
                     buffers.clear();
                     let dispatch = list.dispatch(index, &mut buffers);
                     let NativeRoute::Metal {
@@ -2455,6 +2479,7 @@ fn encode(
                             .map_err(CallError::Execution)?;
                     }
                 }
+                timelines(&mut batch, list.count());
             }
             Ok(RouteSubmission::Metal(batch.commit()))
         }
@@ -2620,6 +2645,7 @@ fn scalar_value(dtype: seismic_lang::types::DType, value: u64) -> ArgumentValue 
         seismic_lang::types::DType::BF16 => ArgumentValue::BF16(value as u16),
         seismic_lang::types::DType::I32 => ArgumentValue::I32(value as u32 as i32),
         seismic_lang::types::DType::U32 => ArgumentValue::U32(value as u32),
+        seismic_lang::types::DType::U64 => ArgumentValue::U64(value),
         seismic_lang::types::DType::Bool => ArgumentValue::Bool(value != 0),
     }
 }

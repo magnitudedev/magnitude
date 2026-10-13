@@ -49,7 +49,6 @@ pub enum Error {
         capacity: usize,
     },
     Placement(PlacementError),
-    UnsupportedHistoryDomain(HistoryDomainKind),
     UnsupportedBankComponent(BankComponent),
     /// A caller whose launch format carries one history domain met a store
     /// with another number of them.
@@ -75,9 +74,6 @@ impl std::fmt::Display for Error {
                 write!(f, "all {capacity} recurrent banks have live claims")
             }
             Self::Placement(error) => write!(f, "recurrent bank placement: {error:?}"),
-            Self::UnsupportedHistoryDomain(kind) => {
-                write!(f, "history domain {kind:?} is not supported")
-            }
             Self::UnsupportedBankComponent(component) => {
                 write!(f, "recurrent bank component {component:?} is not supported")
             }
@@ -123,27 +119,18 @@ impl From<PlacementError> for Error {
     }
 }
 
-fn element(dtype: DType) -> Element {
-    match dtype {
-        DType::F32 => Element::f32(),
-        DType::F16 => Element::f16(),
-        DType::BF16 => Element::bf16(),
-        DType::I32 => Element::i32(),
-        DType::U32 => Element::u32(),
-        DType::Bool => Element::bool(),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComponentSpec {
     pub shape: Vec<usize>,
     pub dtype: DType,
 }
 impl ComponentSpec {
-    /// Physical bytes in one component of a recurrent state bank.
+    /// Physical bytes in one component of a recurrent state bank: a
+    /// nonempty numeric tensor (floating state, or integer words such as the
+    /// n-gram token window), whose zero bits are its zero seed.
     pub fn bytes(&self) -> Result<usize, String> {
-        if self.shape.is_empty() || self.shape.contains(&0) || !self.dtype.is_float() {
-            return Err("state components require nonempty floating tensors".into());
+        if self.shape.is_empty() || self.shape.contains(&0) || !self.dtype.is_numeric() {
+            return Err("state components require nonempty numeric tensors".into());
         }
         self.shape
             .iter()
@@ -1260,10 +1247,14 @@ impl HistoryDomain {
             .unwrap_or(0)
     }
 
-    /// The first position a history at `position`, trimmed at `floor`,
-    /// references.
+    /// The first row a history at `position`, trimmed at `floor`,
+    /// references, in the domain's rows: a position, or for Block the first
+    /// block with no trimmed position.
     fn history_start(&self, position: usize, floor: usize) -> usize {
-        self.kind.retained_from(position).max(floor)
+        match self.kind {
+            HistoryDomainKind::Block { rate } => floor.div_ceil(rate),
+            kind => kind.retained_from(position).max(floor),
+        }
     }
 
     /// Plan one shrink of this domain against its published arena: the
@@ -1521,7 +1512,7 @@ impl StateStore {
                 component_specs
                     .iter()
                     .map(|spec| SlabRegion {
-                        element: element(spec.dtype),
+                        element: Element::dense(spec.dtype),
                         row_shape: spec.shape.iter().map(|&size| size as u64).collect(),
                     })
                     .collect(),
@@ -1543,7 +1534,7 @@ impl StateStore {
                     .iter()
                     .flat_map(ComponentDescriptor::planes)
                     .map(|plane| SlabRegion {
-                        element: element(plane.dtype),
+                        element: Element::dense(plane.dtype),
                         row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
                     })
                     .collect(),
@@ -1866,6 +1857,22 @@ impl StateStore {
         domains.sort_unstable_by_key(|domain| domain.0);
         domains.dedup();
         domains
+    }
+    /// The stored domains of block `block`'s indexer (`LayerRef::Indexer`):
+    /// its raw keys' Window domain and its block keys' Block domain, each
+    /// one history read of a launch row (`history_reads`).
+    pub fn indexer_domains(&self, block: u32) -> Option<(HistoryDomainId, HistoryDomainId)> {
+        let layer = LayerRef::Indexer(block);
+        let find = |block: bool| {
+            self.domains
+                .iter()
+                .position(|domain| {
+                    matches!(domain.kind, HistoryDomainKind::Block { .. }) == block
+                        && domain.components.iter().any(|component| component.layer == layer)
+                })
+                .map(HistoryDomainId)
+        };
+        Some((find(false)?, find(true)?))
     }
     /// The history reads of a launch row, in order: every stored domain,
     /// then every Shared source domain (`shared_source_domains`).
@@ -2622,12 +2629,24 @@ impl StateStore {
             tape: 0,
         })
     }
-    /// Reserve `count` rows in every stored domain, in logical order, each
-    /// following that domain's `histories` claim (none for rows of a new
-    /// history; see [`Arena`] for placement). One domain's refusal releases
-    /// the rows already reserved in the others. Reserving never adds slabs.
-    fn reserve(&self, histories: Option<&[Claims]>, count: usize) -> Result<Vec<Claims>, Error> {
-        self.reserve_rows(histories, &vec![count; self.domains.len()])
+    /// Reserve the rows an advance of `count` rows from `position` adds to
+    /// every stored domain (`HistoryDomainKind::advance_rows`), in logical
+    /// order, each following that domain's `histories` claim (none for rows
+    /// of a new history; see [`Arena`] for placement). One domain's refusal
+    /// releases the rows already reserved in the others. Reserving never
+    /// adds slabs.
+    fn reserve(
+        &self,
+        histories: Option<&[Claims]>,
+        position: usize,
+        count: usize,
+    ) -> Result<Vec<Claims>, Error> {
+        let counts = self
+            .domains
+            .iter()
+            .map(|domain| domain.kind.advance_rows(position, count))
+            .collect::<Vec<_>>();
+        self.reserve_rows(histories, &counts)
     }
 
     /// The free-page rows a history of `domain` ending at `end` needs to take
@@ -2797,21 +2816,27 @@ impl SequenceState {
         Ok(())
     }
     /// This sequence's demand for appending `rows`: in every stored domain,
-    /// the whole free pages beyond what its last page holds in place, for
-    /// provisioning a launch's backing before its advances begin.
+    /// the whole free pages beyond what its last page holds in place of the
+    /// domain's rows of that advance, for provisioning a launch's backing
+    /// before its advances begin.
     pub fn demands(&self, rows: usize) -> Vec<RowDemand> {
         self.store
             .history_domains()
             .map(|domain| RowDemand {
                 domain,
-                rows: self
-                    .store
-                    .page_demand(domain, self.claims[domain.0].end(), rows),
+                rows: self.store.page_demand(
+                    domain,
+                    self.claims[domain.0].end(),
+                    self.store.domains[domain.0]
+                        .kind
+                        .advance_rows(self.position, rows),
+                ),
             })
             .collect()
     }
     /// The rows this history references in one domain, in logical order:
-    /// positions `[history_start(domain), position)`.
+    /// positions `[history_start(domain), position)` (for Block, blocks
+    /// `[history_start(domain), position / rate)`).
     pub fn history_ranges(&self, domain: HistoryDomainId) -> Vec<(usize, usize)> {
         self.claims[domain.0].ranges()
     }
@@ -2820,7 +2845,7 @@ impl SequenceState {
         self.claims.iter().map(Claims::ranges).collect()
     }
     /// The logical position of the first row this history references in a
-    /// domain.
+    /// domain (for Block, the first block).
     pub fn history_start(&self, domain: HistoryDomainId) -> usize {
         self.starts[domain.0]
     }
@@ -3179,7 +3204,7 @@ mod tests {
     }
 
     #[test]
-    fn component_specs_reject_non_float_empty_and_zero_shapes() {
+    fn component_specs_reject_non_numeric_empty_and_zero_shapes() {
         for spec in [
             ComponentSpec {
                 shape: vec![],
@@ -3191,14 +3216,19 @@ mod tests {
             },
             ComponentSpec {
                 shape: vec![4],
-                dtype: DType::I32,
+                dtype: DType::Bool,
             },
         ] {
             assert_eq!(
                 spec.bytes().unwrap_err(),
-                "state components require nonempty floating tensors"
+                "state components require nonempty numeric tensors"
             );
         }
+        let words = ComponentSpec {
+            shape: vec![4, 1],
+            dtype: DType::U32,
+        };
+        assert_eq!(words.bytes().unwrap(), 16);
     }
 
     /// Claim exactly `[start, start + count)`, which must lie in one hole.
@@ -3876,9 +3906,7 @@ mod tests {
                 },
                 logical_rows: 2,
             }]),
-            Err(Error::UnsupportedHistoryDomain(HistoryDomainKind::Block {
-                rate: 4
-            }))
+            Err(Error::Layout(LayoutError::WrongRepresentation(_)))
         ));
     }
 

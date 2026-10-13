@@ -10,11 +10,12 @@ uint projection_row(uint64_t table, uint m) {
 #define PROJECTION_PLAIN 0
 #define PROJECTION_RMS 1
 #define PROJECTION_GROUPED 2
+#define PROJECTION_SUMMED 3
 
 struct projection_prologue {
     int kind;
     int act;            // ELEMENT_* of the activation A (bf16 or f16)
-    uint64_t x;         // Plain/Grouped: A rows; Rms: F32 rows
+    uint64_t x;         // Plain/Grouped: A rows; Rms/Summed: F32 rows
     uint64_t x0;        // element strides of x
     uint64_t x1;
     uint columns;       // K
@@ -24,25 +25,55 @@ struct projection_prologue {
     uint64_t norm_stride;
     int norm_kind;      // ELEMENT_* of the norm
     float eps;
+    uint parts;         // Summed: the parts of a row, `columns` wide each
 };
 
 projection_prologue projection_plain(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t rows) {
     return projection_prologue(PROJECTION_PLAIN, act, x, stride0, stride1, columns, rows, 1ul, 0ul, 0ul,
-        ELEMENT_F32, 0.0);
+        ELEMENT_F32, 0.0, 1u);
 }
 
 projection_prologue projection_rms(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint64_t norm,
     uint64_t norm_stride, const int norm_kind, float eps, uint columns, uint64_t rows) {
     return projection_prologue(PROJECTION_RMS, act, x, stride0, stride1, columns, rows, 1ul, norm, norm_stride,
-        norm_kind, eps);
+        norm_kind, eps, 1u);
+}
+
+// The sum in part order of the `parts` parts of an F32 row, a hyper-connection
+// mix site's per-stream partials (`form_input` without a norm). Its square
+// sums are zero and it ignores the inverse it is given.
+projection_prologue projection_summed(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
+    uint64_t rows, uint parts) {
+    return projection_prologue(PROJECTION_SUMMED, act, x, stride0, stride1, columns, rows, 1ul, 0ul, 0ul,
+        ELEMENT_F32, 0.0, parts);
+}
+
+// An entry's input prologue (`form_input`) by its norm's extent `norm_extent`:
+// `projection_rms`, or without a norm `projection_summed` over `parts` parts.
+projection_prologue projection_input(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint64_t norm,
+    uint64_t norm_stride, const int norm_kind, float eps, uint columns, uint64_t rows, const uint norm_extent,
+    const uint parts) {
+    return norm_extent == 0u
+        ? projection_summed(act, x, stride0, stride1, columns, rows, parts)
+        : projection_rms(act, x, stride0, stride1, norm, norm_stride, norm_kind, eps, columns, rows);
 }
 
 // Tile row m reads activation row order[m * order_stride]; -1 is padding.
 projection_prologue projection_grouped(const int act, uint64_t x, uint64_t stride0, uint64_t stride1, uint columns,
     uint64_t order, uint64_t order_stride) {
     return projection_prologue(PROJECTION_GROUPED, act, x, stride0, stride1, columns, order, order_stride, 0ul,
-        0ul, ELEMENT_F32, 0.0);
+        0ul, ELEMENT_F32, 0.0, 1u);
+}
+
+// Element k of a Summed row m: the sum in part order of its parts.
+float projection_summed_at(projection_prologue in_, uint m, uint k) {
+    const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
+    float sum = 0.0;
+    for (uint part = 0u; part < in_.parts; ++part)
+        sum = seismic_add_rn(sum,
+            element_f32_at(in_.x + (row + uint64_t(part * in_.columns + k) * in_.x1) * 4ul));
+    return sum;
 }
 
 // Eight consecutive elements of `kind` from element `index` of the tensor at
@@ -87,6 +118,12 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
         }
         projection_load8_strided(in_.act, in_.x, uint64_t(row) * in_.x0 + uint64_t(k) * in_.x1, in_.x1, valid,
             in_.x1 == 1ul && (in_.x0 & 7ul) == 0ul, even, odd);
+    } else if (in_.kind == PROJECTION_SUMMED) {
+        float v[8];
+        [[unroll]] for (uint i = 0u; i < 8u; ++i)
+            v[i] = i < valid ? element_round(in_.act, projection_summed_at(in_, m, k + i)) : 0.0;
+        even = vec4(v[0], v[2], v[4], v[6]);
+        odd = vec4(v[1], v[3], v[5], v[7]);
     } else {
         const uint64_t row = uint64_t(projection_row(in_.rows, m)) * in_.x0;
         vec4 xe, xo;
@@ -121,6 +158,8 @@ void projection_load8(projection_prologue in_, uint m, uint k, float inverse, ou
 #define PROJECTION_RMS_PARTS 8u
 
 float projection_rms_squares(projection_prologue in_, uint m, uint part, uint lane) {
+    if (in_.kind == PROJECTION_SUMMED)
+        return 0.0;
     const uint64_t row = in_.x + uint64_t(projection_row(in_.rows, m)) * in_.x0 * 4ul;
     const bool vector = in_.x1 == 1ul && (in_.x0 & 3ul) == 0ul && (in_.columns & 3u) == 0u;
     float sum = 0.0;

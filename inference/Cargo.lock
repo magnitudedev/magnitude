@@ -2237,6 +2237,7 @@ dependencies = [
  "magnitude-family-muse-glimmer",
  "magnitude-family-nemotron-h",
  "magnitude-family-qwen35",
+ "magnitude-family-qwen4exp",
  "magnitude-generation",
  "magnitude-grammar",
  "magnitude-scheduler",
@@ -2284,6 +2285,7 @@ dependencies = [
  "magnitude-family-muse-glimmer",
  "magnitude-family-nemotron-h",
  "magnitude-family-qwen35",
+ "magnitude-family-qwen4exp",
  "magnitude-kernels",
  "magnitude-state",
  "seismic",
@@ -2306,6 +2308,7 @@ dependencies = [
  "magnitude-family-muse-glimmer",
  "magnitude-family-nemotron-h",
  "magnitude-family-qwen35",
+ "magnitude-family-qwen4exp",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2380,13 +2383,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "magnitude-family-qwen35"
+name = "magnitude-family-qwen"
 version = "0.1.0"
 dependencies = [
  "magnitude-artifacts",
  "magnitude-family-common",
  "magnitude-family-contracts",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "magnitude-family-qwen35"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+ "magnitude-family-qwen",
+]
+
+[[package]]
+name = "magnitude-family-qwen4exp"
+version = "0.1.0"
+dependencies = [
+ "magnitude-artifacts",
+ "magnitude-family-common",
+ "magnitude-family-contracts",
+ "magnitude-family-qwen",
 ]
 
 [[package]]

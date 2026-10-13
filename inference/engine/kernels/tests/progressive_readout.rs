@@ -49,7 +49,7 @@ fn scan_spec(
     rows: u64,
 ) -> NativeSpecialization {
     let launch = scan_launch(device, planes);
-    let spec = statics(head)
+    let spec = formed_statics(head)
         .with_launch_param(launch, width_param(device), scan)
         .with_launch_param(launch, "ROWS", rows);
     if device.backend() != BackendName::Metal {
@@ -379,7 +379,8 @@ impl Case {
         let groups = d / 32;
         let selection = &self.selection;
         Tensors {
-            hidden: tensor(device, Element::f32(), &[self.m, d], f32s(&self.hidden)),
+            // The levels read the rows as `[M, PT, D]` parts (one part).
+            hidden: tensor(device, Element::f32(), &[self.m, 1, d], f32s(&self.hidden)),
             norm: tensor(device, Element::bf16(), &[d], bf16_bytes(&self.norm)),
             top: tensor(
                 device,
@@ -448,6 +449,14 @@ fn statics(head: &Head) -> NativeSpecialization {
         .with_static("V", head.v as u64)
         .with_static("D", head.d as u64)
         .with_static("P", (head.bits / 2 - 1) as u64)
+}
+
+/// The statics of the entries that form their input (top, planes): one
+/// part normalized at the row width.
+fn formed_statics(head: &Head) -> NativeSpecialization {
+    statics(head)
+        .with_static("PT", 1)
+        .with_static("NM", head.d as u64)
 }
 
 /// Every level natively, each from the previous native level.
@@ -961,7 +970,7 @@ fn progressive_portable_bodies_match_the_natives() {
             (
                 dense(
                     DType::F32,
-                    &[m, d],
+                    &[m, 1, d],
                     case.hidden.iter().map(|x| f64::from(*x)),
                 ),
                 dense(

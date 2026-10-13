@@ -21,7 +21,7 @@ impl<'a> QualificationView<'a> {
             );
             // One (token, status) selection row.
             let tokens = semantic_zeros(device, Element::i32(), &[1, 2], "head", &label)?;
-            let direct = semantic_zeros(device, Element::i32(), &[0], "head", &label)?;
+            let direct = semantic_zeros(device, Element::i32(), &[0, 1], "head", &label)?;
             let table = semantic_pattern(
                 device,
                 binding.embedding_table,
@@ -29,13 +29,15 @@ impl<'a> QualificationView<'a> {
                 "head",
                 &label,
             )?;
-            let pattern = (0..hidden)
+            let streams = binding.streams.map_or(1, |s| s.geometry.streams);
+            let form = SublayerRows { form: crate::operators::InputForm { parts: streams, normalized: binding.streams.is_none() }, streams, injected: binding.streams.is_some() };
+            let pattern = (0..hidden * streams)
                 .map(|column| [1.0_f32, -2.0, 3.0, -4.0][column as usize % 4])
                 .collect::<Vec<_>>();
             let conditioning = semantic_dense_values(
                 device,
-                binding.activation,
-                &[1, hidden],
+                binding.conditioning,
+                &[1, hidden * streams],
                 &pattern,
                 "head",
                 &label,
@@ -43,7 +45,7 @@ impl<'a> QualificationView<'a> {
             let embedding_norm =
                 semantic_ones(device, binding.embedding_norm, &[hidden], "head", &label)?;
             let hidden_norm =
-                semantic_ones(device, binding.hidden_norm, &[hidden], "head", &label)?;
+                semantic_ones(device, binding.hidden_norm, &[hidden * streams], "head", &label)?;
             let combine = semantic_pattern(
                 device,
                 binding.combine,
@@ -65,7 +67,13 @@ impl<'a> QualificationView<'a> {
                 })
                 .map_err(|error| qualification_dynamic("draft_rows", &label, error))?
                 .value;
-            qualify_attention(device, &block.attention, binding.attention, &label)?;
+            qualify_attention(
+                device,
+                &block.attention,
+                binding.attention,
+                form,
+                &label,
+            )?;
             // The attention block keeps its residual (zero weights), so the
             // feed-forward stage continues from the head input.
             let attended = features;
@@ -133,7 +141,7 @@ impl<'a> QualificationView<'a> {
                         .value
                 }
                 (FeedForwardProgramSlot::Routed(binding), AttestedFeedForward::Routed(kernels)) => {
-                    super::target::qualify_routed(device, binding, kernels)?;
+                    super::target::qualify_routed(device, binding, kernels, form)?;
                     attended
                 }
                 _ => {
@@ -146,11 +154,17 @@ impl<'a> QualificationView<'a> {
             };
             require_finite_nonzero_f32(&advanced, "head_feed_forward", &label)?;
             let output_norm =
-                semantic_ones(device, binding.output_norm, &[hidden], "head", &label)?;
+                semantic_ones(device, binding.output_norm, &[if binding.streams.is_some() { 0 } else { hidden }], "head", &label)?;
+            let parts = readout_parts(
+                &advanced,
+                block.features.specialization().statics(),
+                "readout_features_rows",
+                &label,
+            )?;
             let projected_features = block
                 .features
                 .call(readout_features_rows::Args {
-                    hidden: &advanced,
+                    hidden: &parts,
                     norm: &output_norm,
                     out_rows: &out_rows,
                     epsilon: 1.0e-5,

@@ -2,15 +2,15 @@
 //! processor supplies pixels and grids; this adapter assigns numerical meaning.
 
 use magnitude_artifacts::{
-    media::{DType, PreparedMedia, PreparedTensor, MAX_PREPARED_BYTES},
     BoundaryRule, ImageProcessor, InputLayout, InputSpan, TokenId,
+    media::{DType, MAX_PREPARED_BYTES, PreparedMedia, PreparedTensor},
 };
 use magnitude_family_contracts::{
     InputPreparationError, ModelDefinition, ModelInputAdapter, PositionSampling,
     PreparedModelInput, PreparedVisionInput, TokenPlan, VisionSpatialControls,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{BTreeMap, btree_map::Entry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QwenImageTokens {
@@ -40,12 +40,17 @@ impl QwenImageTokens {
 
 #[derive(Clone, Debug)]
 pub struct QwenInputAdapter {
+    /// The family ids whose definitions this adapter prepares input for.
+    families: &'static [&'static str],
     image_tokens: Option<QwenImageTokens>,
 }
 
 impl QwenInputAdapter {
-    pub fn new(image_tokens: Option<QwenImageTokens>) -> Self {
-        Self { image_tokens }
+    pub fn new(families: &'static [&'static str], image_tokens: Option<QwenImageTokens>) -> Self {
+        Self {
+            families,
+            image_tokens,
+        }
     }
 }
 
@@ -56,7 +61,7 @@ impl ModelInputAdapter for QwenInputAdapter {
         token_plan: TokenPlan,
         media: &[PreparedMedia],
     ) -> Result<PreparedModelInput, InputPreparationError> {
-        if !matches!(definition.family.0.as_str(), "qwen35" | "qwen35moe") {
+        if !self.families.contains(&definition.family.0.as_str()) {
             return Err(InputPreparationError::InputAlignment);
         }
         if !token_plan.layout().spans().is_empty() {

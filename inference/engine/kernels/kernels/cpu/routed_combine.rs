@@ -107,6 +107,7 @@ fn routed_combine<L: Isa, E: Elements>(
         cx.dim_k() as usize,
     );
     let (s, t) = (cx.dim_s() as usize, cx.dim_t() as usize);
+    let (inject, streams, injected) = (cx.arg_inject(), cx.dim_sn() as usize, cx.dim_in() != 0);
     let columns = projection::item_rows(group[0], cx.param_rows(), h);
     let (down, residual, expert_output) = (
         cx.arg_shared_down(),
@@ -150,16 +151,24 @@ fn routed_combine<L: Isa, E: Elements>(
             }
         }
         let coefficient = coefficient.get([row]);
-        let source = residual.span([row, columns.start], columns.len());
-        // SAFETY: each work item writes its own channels of every row.
-        let out = unsafe { result.span_mut([row, columns.start], columns.len()) };
-        for (((target, residual), selected), projected) in out
-            .iter_mut()
-            .zip(source)
-            .zip(selected.iter())
-            .zip(projected.iter())
-        {
-            *target = residual + selected + activation::publish::<E::A>(*projected) * coefficient;
+        for stream in 0..streams {
+            let first = stream * h + columns.start;
+            let factor = injected.then(|| inject.get([row, stream]));
+            let source = residual.span([row, first], columns.len());
+            // SAFETY: each work item writes its own channels of every row.
+            let out = unsafe { result.span_mut([row, first], columns.len()) };
+            for (((target, residual), selected), projected) in out
+                .iter_mut()
+                .zip(source)
+                .zip(selected.iter())
+                .zip(projected.iter())
+            {
+                let shared = activation::publish::<E::A>(*projected) * coefficient;
+                *target = match factor {
+                    None => residual + selected + shared,
+                    Some(factor) => residual + (selected + shared) * factor,
+                };
+            }
         }
     }
 }

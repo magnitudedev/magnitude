@@ -11,6 +11,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         mut pending: PendingOperationOutcome,
         decision: PhysicalDecision,
     ) -> Result<(), DomainError> {
+        // A poisoned sequence's outputs are discarded like an orphan's: its
+        // accepted state returns, and its sequence fails.
+        if let Outcome::TableReadFailed(error) = &pending.outcome {
+            let error = error.clone();
+            self.abort(pending)?;
+            return Err(DomainError::TableRead(error));
+        }
         if matches!(pending.outcome, Outcome::Head { .. }) {
             // A head commits exactly its entry rows; its chained proposal
             // rows never become visible.
@@ -138,7 +145,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     pub fn abort(&mut self, pending: PendingOperationOutcome) -> Result<(), DomainError> {
         let conflicting_owner = match &pending.outcome {
             Outcome::Head { .. } => self.head.contains_key(&pending.request),
-            Outcome::Forward { .. } => {
+            Outcome::Forward { .. } | Outcome::TableReadFailed(_) => {
                 self.target.contains_key(&pending.request)
                     || (pending.primed.is_some() && self.head.contains_key(&pending.request))
             }
@@ -157,7 +164,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 Outcome::Head { .. } => {
                     self.head.insert(pending.request, advance.abort());
                 }
-                Outcome::Forward { .. } => {
+                Outcome::Forward { .. } | Outcome::TableReadFailed(_) => {
                     self.target.insert(pending.request, advance.abort());
                 }
                 Outcome::Encode { .. } => {

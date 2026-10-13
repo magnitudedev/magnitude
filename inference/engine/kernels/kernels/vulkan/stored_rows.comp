@@ -1,0 +1,40 @@
+// stored_rows: rows of a streamed table whose slots hold them as stored
+// (gguf_iq4_nl_block), found through the directory and decoded into A. A
+// workgroup per (row, 256 columns), an invocation per value: the slot's
+// block of the value (an f16 scale, then sixteen bytes whose low nibbles are
+// values 0..16 and high nibbles 16..32) indexes the iq4 table, times the
+// scale. Rows past the 65535-group grid are visited by a grid-stride loop.
+// The Vulkan form of `metal/stored_rows.metal`.
+#include "lib/core/activation.glsl"
+#include "lib/core/gathered.glsl"
+
+#if !defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_NL_BLOCK)
+#error "stored_rows decodes gguf_iq4_nl_block slots"
+#endif
+
+float stored_iq4(uint code) {
+    const int values[16] = int[16](-127, -104, -83, -65, -49, -35, -22, -10,
+        1, 13, 25, 38, 53, 69, 89, 113);
+    return float(values[code]);
+}
+
+void stored_rows() {
+    const uint64_t slots = SEISMIC_PTR(SEISMIC_BUFFER_SLOTS);
+    const uint64_t tokens = SEISMIC_PTR(SEISMIC_BUFFER_TOKENS);
+    const uint64_t rows = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t column = uint64_t(gl_WorkGroupID.y) * 256ul + gl_LocalInvocationID.x;
+    if (column >= SEISMIC_DIM_W)
+        return;
+    for (uint64_t row = gl_WorkGroupID.x; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.x) {
+        const uint64_t slot = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
+            SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
+        // Strides of external storage count packets.
+        const uint64_t block = slots + slot * SEISMIC_SLOTS_STRIDE_0 * uint64_t(SEISMIC_ELEMENT_E_PACKET_SIZE)
+            + (column / 32ul) * 18ul;
+        const float scale = seismic_f16_to_f32(uint16_t(element_u16_at(block)));
+        const uint within = uint(column % 32ul);
+        const uint code = (element_u8_at(block + 2ul + uint64_t(within % 16u)) >> (4u * (within / 16u))) & 15u;
+        element_put(ELEMENT_ACT, rows, row * SEISMIC_RESULT_0_STRIDE_0 + column * SEISMIC_RESULT_0_STRIDE_1,
+            stored_iq4(code) * scale);
+    }
+}

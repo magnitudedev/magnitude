@@ -34,7 +34,7 @@ kernel void short_conv_rows(
         const versions::Slot slot = versions::slot_of(slots, group.y - rows, seismic_words);
         device const float *source = versions::bank<float>(window, slot.source, SEISMIC_WINDOW_STRIDE_0, seismic_words);
         device float *target = versions::bank<float>(window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
-        const long published = taps + versions::tape_rows(slot, seismic_words);
+        const long published = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
         for (long tap = 0; tap < published; ++tap) {
             const long position = slot.stop + tap - taps;
             target[ulong(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2] = position < 0

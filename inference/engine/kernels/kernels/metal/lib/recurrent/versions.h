@@ -62,9 +62,9 @@ inline ulong slot_index_of_row(Slots slots, long row, constant ulong *seismic_wo
 }
 
 // Rows the slot records in its successor's tape: those after the stop row, at
-// most T.
-inline long tape_rows(Slot slot, constant ulong *seismic_words) {
-    return metal::min(long(SEISMIC_DIM_T), slot.hi - slot.lo - slot.stop);
+// most the tape's `capacity` (T).
+inline long tape_rows(Slot slot, long capacity) {
+    return metal::min(capacity, slot.hi - slot.lo - slot.stop);
 }
 
 // Bank `index` of a slab-stored arena whose banks are `stride` elements.

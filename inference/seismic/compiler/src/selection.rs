@@ -50,7 +50,9 @@ impl SelectionAxes {
                         DType::I32 => axes.push((*symbol, AxisSort::Signed)),
                         DType::U32 => axes.push((*symbol, AxisSort::Natural)),
                         DType::Bool => axes.push((*symbol, AxisSort::Boolean)),
-                        DType::F32 | DType::BF16 | DType::F16 => {}
+                        // A U64 word exceeds the natural axis; it has no
+                        // navigated axis, like a floating scalar.
+                        DType::U64 | DType::F32 | DType::BF16 | DType::F16 => {}
                     }
                 }
                 ParameterKind::Index { symbol, .. } => {

@@ -28,7 +28,7 @@ pub use preparation::{
     WorkerReport,
 };
 
-use crate::census::{AllocationCensus, MemoryDomain};
+use crate::census::{AllocationCensus, HostModelBytes, MemoryDomain};
 use crate::execution::LoadAttempt;
 use magnitude_executor::UnpreparedUnits;
 use crate::error::{ArtifactError, LoadError, UnloadCause};
@@ -289,7 +289,7 @@ fn load(
     let host_package = package.clone();
     let progress_outbound = outbound.clone();
     // Readiness, the host-table bytes and the allocation domain.
-    type Built = (ExecutionReady, u64, MemoryDomain);
+    type Built = (ExecutionReady, HostModelBytes, MemoryDomain);
     let factory = move |wakes: WorkerWakeHandle<UnloadCause>| -> Result<
         (Box<dyn Driven<Stopped = UnloadCause>>, Built),
         Stopped,
@@ -321,7 +321,10 @@ fn load(
             );
         }
         let backend = built.domain.execution_backend();
-        let host_table_bytes = built.domain.host_table_bytes();
+        let host_model = HostModelBytes {
+            tables: built.domain.host_table_bytes(),
+            stored_tables: built.domain.host_stored_table_bytes().map_err(internal)?,
+        };
         let domain = MemoryDomain::of(built.device, built.pool);
         let resources = ResourcePlanSummary::from_plan(&built.plan).map_err(internal)?;
         let owner = Owner::with_resource_plan(
@@ -334,7 +337,7 @@ fn load(
         .map_err(internal)?;
         let census = owner
             .reconcile_memory_charge()
-            .and_then(|charge| AllocationCensus::classify(&charge, host_table_bytes, domain))
+            .and_then(|charge| AllocationCensus::classify(&charge, host_model, domain))
             .map_err(internal)?;
         let ready = ExecutionReady {
             resources,
@@ -344,7 +347,7 @@ fn load(
         };
         Ok((
             Box::new(ExecutionOwner::new(owner, method)) as Box<dyn Driven<Stopped = UnloadCause>>,
-            (ready, host_table_bytes, domain),
+            (ready, host_model, domain),
         ))
     };
     let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
@@ -378,7 +381,7 @@ fn load(
     };
     let (
         execution,
-        (execution_ready, host_table_bytes, domain),
+        (execution_ready, host_model, domain),
         (binding, chat),
     ) = match Worker::spawn_ready_with(factory, usize::MAX, host) {
         Ok(spawned) => spawned,
@@ -409,7 +412,7 @@ fn load(
             execution,
             binding,
             definition: session_definition,
-            host_table_bytes,
+            host_model,
             domain,
         },
         ready,

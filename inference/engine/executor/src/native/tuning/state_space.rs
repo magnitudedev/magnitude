@@ -16,6 +16,7 @@ use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
 };
+use crate::operators::InputForm;
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use crate::{StateSpaceBinding, StateSpaceShape};
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -91,7 +92,11 @@ impl EntryTuning for StateSpaceProjectTuning {
             return Err("the state-space projection disagrees with the binding".into());
         }
         let [_, statics @ ..] = shape.project_dimensions(0);
-        Ok(statics.to_vec())
+        Ok([
+            statics.as_slice(),
+            &InputForm::SINGLE.dimensions(shape.hidden),
+        ]
+        .concat())
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {
@@ -151,6 +156,7 @@ pub(crate) struct StateSpaceOutputTuning {
 
 pub(crate) struct StateSpaceOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
 }
@@ -203,6 +209,7 @@ impl EntryTuning for StateSpaceOutputTuning {
                         &[point.rows, shape.hidden],
                         seed + 1,
                     )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, 0], seed + 3)?,
                     gated: inputs.activation(
                         self.binding.activation,
                         &[point.rows, shape.heads, shape.head_width],
@@ -217,6 +224,7 @@ impl EntryTuning for StateSpaceOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
         }

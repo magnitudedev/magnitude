@@ -213,6 +213,7 @@ pub fn inspect_assistant(draft: &Directory, target: &ModelDefinition) -> Result<
     b.finish()?;
     let head = Head {
         blocks: vec![HeadBlock {
+            residual: magnitude_family_contracts::ResidualForm::Single,
             input: HeadInput::Projected {
                 pre,
                 embedding_scale: decoder.entry.scale,

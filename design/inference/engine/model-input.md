@@ -35,6 +35,14 @@ Every prompt token is one input row, in order, except each image's placeholder t
 adapter expands to its span's rows; the input's layout alone therefore maps a prompt position to its
 row.
 
+An input row's token also names the rows it reads of a gathered table, by the table's row rule. A
+token table's row is the token. An n-gram table's rows hash the token with its predecessors: order
+`n` mixes the last `n` tokens (exact 64-bit products, XOR-combined) into each of its heads' row
+ranges, a predecessor at or before the latest reset token preceding the row, or before the
+sequence, reading as the reset token. A media row hashes the token that stands in its place. The
+rule is one definition: the device evaluates it from a step's token rows and the token window its
+state carries, the host over the tokens it fed, and both name the same rows at every position.
+
 The tokenizer is adapted from the container's tokenizer facts, never from the model family: the
 declared scheme selects one implemented profile, and an unimplemented scheme or uninterpreted
 tokenizer metadata is an unsupported representation. Implicit sequence-start insertion is such a
@@ -72,6 +80,23 @@ architecture alone does not establish a drafter transform. An optional `output.w
 vocabulary and hidden width. Absence shares the target projection; equal dimensions
 do not establish training compatibility between those projections.
 
+Prediction heads declare their residual form and the conditioning they chain: either
+normalized readout features or raw residual streams before the final readout mix.
+Every block in a chain preserves that conditioning representation. A residual chain
+has the target's width and residual form. Packaging is independent of these semantics:
+a head may live beside the target or in a separately pinned draft component while
+sharing the target's embedding and vocabulary projection.
+
+The Flash Next shared prediction package (`qwen4exp`) contains one causal head with
+its own attention history. It consumes the target's four F32 residual streams before
+its exit mix. For each stream it RMS-normalizes that stream with its own coefficients,
+concatenates the normalized successor embedding, and applies the shared combining
+projection. Its attention and routed feed-forward use the declared hyper-connection
+mix/scatter sites. Its exit mix feeds the shared target vocabulary projection; its
+unmixed residual streams condition the next draft step. Compression ratio zero means
+ordinary causal attention; published dormant indexer weights are validated but never
+executed. Header geometry must match the target; the catalog pins the trained pair.
+
 A Gemma 4 assistant (`gemma4-assistant`) is interpreted against its Gemma 4 target as
 that target's draft head, stored in the draft component and keeping no history of its
 own. Every assistant layer is a prediction layer whose attention reads target history
@@ -103,3 +128,5 @@ only over the rows a step reads (`execution-plan.md`, the stateless tail).
 - A prepared prompt holds the tokenizer's implicit BOS exactly once, and no BOS otherwise beyond
   what the template renders.
 - Execution performs no model-family coordinate or interpolation calculation.
+- The device's and the host's n-gram rows equal the reference rule at every position: after
+  reset tokens, after a previous context, and across chunk and tape-version boundaries.

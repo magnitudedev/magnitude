@@ -78,7 +78,12 @@ impl ConstantStorage {
 }
 
 impl GraphConstant {
-    fn of(port: Option<NativePort>, element: Element, extents: Vec<u64>, value: ConstantValue) -> Self {
+    fn of(
+        port: Option<NativePort>,
+        element: Element,
+        extents: Vec<u64>,
+        value: ConstantValue,
+    ) -> Self {
         Self {
             port,
             value: Arc::new(ConstantStorage {
@@ -113,6 +118,19 @@ impl GraphConstant {
         )
     }
 
+    /// A rank-1 `u64` constant.
+    pub(crate) fn u64<G: GraphDraft>(graph: &mut G, values: &[u64]) -> Result<Self, GraphError> {
+        Self::rank1(
+            graph,
+            Element::u64(),
+            values.len(),
+            values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect(),
+        )
+    }
+
     /// A rank-1 `f32` constant.
     pub(crate) fn f32<G: GraphDraft>(graph: &mut G, values: &[f32]) -> Result<Self, GraphError> {
         Self::rank1(
@@ -126,6 +144,18 @@ impl GraphConstant {
         )
     }
 
+    /// A typed empty vector, bound like every other graph constant.
+    pub(crate) fn empty<G: GraphDraft>(
+        graph: &mut G,
+        element: Element,
+        constants: &mut Vec<Self>,
+    ) -> Result<seismic::WorkflowTensor, GraphError> {
+        let constant = Self::rank1(graph, element, 0, Arc::from([]))?;
+        let tensor = constant.port().tensor().clone();
+        constants.push(constant);
+        Ok(tensor)
+    }
+
     /// A zero-extent scale port for a weight without a second-level scale.
     pub(crate) fn absent_scale<G: GraphDraft>(
         graph: &mut G,
@@ -134,6 +164,28 @@ impl GraphConstant {
         let scale = Self::f32(graph, &[])?;
         let tensor = scale.port().tensor().clone();
         constants.push(scale);
+        Ok(tensor)
+    }
+
+    /// A zero-extent inject port `[rows, 0]` for an output that joins a
+    /// single residual stream, its rows following the class dimension
+    /// `class`, or fixed without one.
+    pub(crate) fn absent_inject<G: GraphDraft>(
+        graph: &mut G,
+        rows: u64,
+        class: Option<&'static str>,
+        constants: &mut Vec<Self>,
+    ) -> Result<seismic::WorkflowTensor, GraphError> {
+        let inject = match class {
+            Some(class) => Self::zeros_for_class(graph, rows, 0, class)?,
+            None => {
+                let mut inject = Self::zeros_value(rows, 0)?;
+                inject.port = Some(graph.port(Element::f32(), &[rows, 0])?);
+                inject
+            }
+        };
+        let tensor = inject.port().tensor().clone();
+        constants.push(inject);
         Ok(tensor)
     }
 
@@ -158,6 +210,72 @@ impl GraphConstant {
                     .collect(),
             ),
         ))
+    }
+
+    /// An `i32` constant of the given extents, possibly empty.
+    pub(crate) fn i32_shaped<G: GraphDraft>(
+        graph: &mut G,
+        extents: &[u64],
+        values: &[i32],
+    ) -> Result<Self, GraphError> {
+        if extents.iter().product::<u64>() != values.len() as u64 {
+            return Err("constant values disagree with its extents".into());
+        }
+        let port = graph.port(Element::i32(), extents)?;
+        Ok(Self::of(
+            Some(port),
+            Element::i32(),
+            extents.to_vec(),
+            ConstantValue::Bytes(
+                values
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect(),
+            ),
+        ))
+    }
+
+    /// The `u32` zero matrix `[count, width]`, for resource accounting
+    /// without a graph port.
+    pub(crate) fn u32_zeros_value(count: u64, width: u64) -> Result<Self, String> {
+        Element::u32()
+            .canonical_byte_len(&[count, width])
+            .map_err(|error| error.to_string())?;
+        Ok(Self::of(
+            None,
+            Element::u32(),
+            vec![count, width],
+            ConstantValue::Zero,
+        ))
+    }
+
+    /// The `u32` zero matrix `[count, width]` of fixed extents.
+    pub(crate) fn u32_zeros<G: GraphDraft>(
+        graph: &mut G,
+        count: u64,
+        width: u64,
+    ) -> Result<Self, GraphError> {
+        let mut constant = Self::u32_zeros_value(count, width)?;
+        constant.port = Some(graph.port(Element::u32(), &constant.value.extents)?);
+        Ok(constant)
+    }
+
+    /// The `u32` zero matrix `[count, width]` whose rows follow the class
+    /// dimension `class_dimension`.
+    pub(crate) fn u32_zeros_for_class<G: GraphDraft>(
+        graph: &mut G,
+        count: u64,
+        width: u64,
+        class_dimension: &'static str,
+    ) -> Result<Self, GraphError> {
+        let mut constant = Self::u32_zeros_value(count, width)?;
+        constant.port = Some(graph.port_with_class_extent(
+            Element::u32(),
+            &constant.value.extents,
+            0,
+            class_dimension,
+        )?);
+        Ok(constant)
     }
 
     /// An `f32` constant value of the given extents, for resource accounting

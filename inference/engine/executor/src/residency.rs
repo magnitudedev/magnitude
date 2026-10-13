@@ -8,6 +8,7 @@ use crate::device_table::{
     DeviceTable, KeptRows, ResidentTable, TileRun, TileSource, TilesBrought,
 };
 use crate::domain::ClaimRefusal;
+use crate::stored_table::StoredTable;
 use crate::programs::ProgramSubmission;
 use crate::programs::native_import::NativeImportProgram;
 use crate::resources::ImportWindow;
@@ -183,7 +184,9 @@ impl Stored {
     pub fn source_element(&self) -> Option<Element> {
         match self {
             Self::Dense(tensor) => Some(Element::dense(tensor.dtype)),
-            Self::GgmlBlocks { encoding, .. } => source_element(*encoding),
+            Self::GgmlBlocks {
+                encoding, shape, ..
+            } => source_element(*encoding, shape.last().copied().unwrap_or(1)),
         }
     }
 
@@ -262,6 +265,17 @@ impl ResidentWeight {
             tensor: table.slots_tensor().clone(),
             scale: None,
             table: ResidentTable::streamed(table),
+        }
+    }
+
+    /// The weight of a stored table: the slots that hold some of its rows as
+    /// stored, and the stored table they are.
+    fn stored(descriptor: WeightDescriptor, table: Arc<StoredTable>) -> Self {
+        Self {
+            descriptor,
+            tensor: table.slots_tensor().clone(),
+            scale: None,
+            table: ResidentTable::Stored(table),
         }
     }
 
@@ -516,8 +530,10 @@ impl ResidencyStore {
         if let Some(weight) = self.resident.get(&key) {
             return Ok(Some(weight.clone()));
         }
-        let table = self.stream_table(artifact, &plan)?;
-        let weight = ResidentWeight::streamed(descriptor.clone(), table);
+        let weight = match plan.stored_in_slots() {
+            false => ResidentWeight::streamed(descriptor.clone(), self.stream_table(artifact, &plan)?),
+            true => ResidentWeight::stored(descriptor.clone(), self.store_table(artifact, &plan)?),
+        };
         // The plan charged the slots, the directory and the staging.
         let planned = plan.storage_bytes().map_err(invalid)?;
         if weight.storage_bytes() != planned {
@@ -567,6 +583,7 @@ impl ResidencyStore {
             &plan.shape[1..],
             plan.shape[0],
             streamed.staging_rows,
+            streamed.directory,
             Box::new(TileImport {
                 import: self
                     .programs
@@ -580,6 +597,58 @@ impl ResidencyStore {
         .map_err(invalid)?;
         table.seed().map_err(invalid)?;
         Ok(Rc::new(table))
+    }
+
+    /// The stored table of the streamed gathered table `plan`
+    /// (`TableFill::Stored`), its slots holding the rows steps named when it
+    /// was last served. Its rows are read from the artifact without the
+    /// file cache.
+    fn store_table(
+        &self,
+        artifact: &GgufArtifact,
+        plan: &WeightPlan,
+    ) -> Result<Arc<StoredTable>, WeightImportError> {
+        let streamed = plan
+            .streamed
+            .ok_or_else(|| invalid("a weight held whole has no stored table"))?;
+        let stored = Stored::from_gguf(artifact, &plan.descriptor)
+            .map_err(|error| invalid(error.to_string()))?;
+        let (source, offset, length) = stored.file_range();
+        let row_bytes = plan
+            .resident
+            .canonical_byte_len(&[1, plan.shape[1]])
+            .map_err(|error| invalid(error.to_string()))?;
+        if streamed.table_rows.checked_mul(row_bytes) != Some(length) {
+            return Err(invalid(format!(
+                "stored table {:?}: {length} bytes are not {} rows of {row_bytes}",
+                plan.descriptor.name, streamed.table_rows
+            )));
+        }
+        let kept = self.kept_table_rows.as_ref().map(|directory| {
+            KeptRows::of(
+                directory,
+                &format!(
+                    "{}\n{offset}\n{length}\n{:?}\n{:?}",
+                    source.path().display(),
+                    plan.resident,
+                    plan.shape
+                ),
+            )
+        });
+        let table = StoredTable::new(
+            &self.device,
+            plan.resident,
+            streamed.table_rows,
+            plan.shape[1],
+            plan.shape[0],
+            streamed.directory,
+            magnitude_artifacts::UncachedSource::open(source.path())?,
+            offset,
+            kept,
+        )
+        .map_err(invalid)?;
+        table.seed().map_err(invalid)?;
+        Ok(Arc::new(table))
     }
 
     /// The imported physical view selected for an explicit semantic weight role.
@@ -754,9 +823,16 @@ impl ResidencyStore {
         let (upload, actual_resident) = match stored {
             Stored::Dense(_) => (actual_source, Element::dense(target)),
             Stored::GgmlBlocks { .. } if dequantized => (Element::f32(), Element::dense(target)),
-            Stored::GgmlBlocks { encoding, .. } => (
+            Stored::GgmlBlocks {
+                encoding, shape, ..
+            } => (
                 actual_source,
-                resident_element(*encoding, target, layout)
+                resident_element(
+                    *encoding,
+                    shape.last().copied().unwrap_or(1),
+                    target,
+                    layout,
+                )
                     .ok_or_else(|| invalid("unsupported packed resident representation"))?,
             ),
         };
@@ -1378,7 +1454,7 @@ fn validate_request(
             if *nbytes != expected {
                 return Err(invalid("packed weight byte count mismatch"));
             }
-            if source_element(*encoding).is_none() {
+            if source_element(*encoding, shape.last().copied().unwrap_or(1)).is_none() {
                 return Err(invalid(format!(
                     "GGUF encoding {encoding:?} has no qualified native import"
                 )));
@@ -1428,6 +1504,8 @@ mod tests {
             Encoding::Q4K,
             Encoding::Q5K,
             Encoding::Q6K,
+            Encoding::Iq2Xs,
+            Encoding::Iq3Xxs,
             Encoding::Iq3S,
             Encoding::Iq4Nl,
             Encoding::Iq4Xs,
@@ -1437,14 +1515,16 @@ mod tests {
             Encoding::Mxfp4,
             Encoding::Nvfp4,
         ] {
-            assert!(source_element(encoding).is_some());
+            assert!(source_element(encoding, 2560).is_some());
             for layout in seismic::Layout::ALL {
-                assert!(resident_element(encoding, DType::BF16, layout).is_some());
+                assert!(resident_element(encoding, 2560, DType::BF16, layout).is_some());
             }
         }
         for encoding in [Encoding::Q1_0, Encoding::I32] {
-            assert!(source_element(encoding).is_none());
-            assert!(resident_element(encoding, DType::BF16, seismic::Layout::Rows16).is_none());
+            assert!(source_element(encoding, 2560).is_none());
+            assert!(
+                resident_element(encoding, 2560, DType::BF16, seismic::Layout::Rows16).is_none()
+            );
         }
     }
 

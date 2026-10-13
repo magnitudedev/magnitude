@@ -646,6 +646,7 @@ fn head_block(
         epsilon: layer_norm_epsilon,
     });
     Ok(HeadBlock {
+        residual: magnitude_family_contracts::ResidualForm::Single,
         input: HeadInput::Combine {
             embedding_norm,
             hidden_norm,

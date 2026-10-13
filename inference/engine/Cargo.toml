@@ -15,6 +15,7 @@ magnitude-batching = { path = "batching" }
 magnitude-family-contracts = { path = "families/contracts" }
 magnitude-executor = { path = "executor" }
 magnitude-family-qwen35 = { path = "families/qwen35" }
+magnitude-family-qwen4exp = { path = "families/qwen4exp" }
 magnitude-family-llama = { path = "families/llama" }
 magnitude-family-lfm2 = { path = "families/lfm2" }
 magnitude-family-nemotron-h = { path = "families/nemotron_h" }

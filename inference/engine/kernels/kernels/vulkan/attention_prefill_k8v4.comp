@@ -19,6 +19,20 @@
 #define ATTENTION_AMPLITUDE_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_ROTARY_AMPLITUDES)
 #define ATTENTION_VALUE_NORM_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_VALUE_NORM)
 #define PREFILL_ROWS uint(SEISMIC_TUNE_ROWS)
+// The WorkList selection (B > 0) and the list launch's scratch.
+#define PREFILL_SELECTED (SEISMIC_DIM_B != 0)
+#define PREFILL_SELECTION_WORDS uint(SEISMIC_DIM_B)
+#define PREFILL_BLOCK_ROWS int(SEISMIC_DIM_BR)
+#define PREFILL_SELECTION_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SELECTION)
+// A query tile's rows each read at most the bitmap's 32 * B * BR keys, in at
+// most R + 1 runs.
+#define PREFILL_LIST_CAPACITY uint(uint64_t(PREFILL_QT) * ((32ul * SEISMIC_DIM_B * SEISMIC_DIM_BR + FLASH_KEYS - 1ul) / FLASH_KEYS + SEISMIC_DIM_R + 1ul))
+// The worklist scratch: the query tiles' (span, first) lists, their counts,
+// then the rows' span ordinals.
+#define PREFILL_LIST_TILES ((SEISMIC_DIM_M + uint64_t(PREFILL_QT) - 1ul) / uint64_t(PREFILL_QT))
+#define PREFILL_LISTS_BUFFER SEISMIC_PTR(SEISMIC_BUFFER_SCRATCH_WORKLIST)
+#define PREFILL_LISTED_BUFFER (PREFILL_LISTS_BUFFER + PREFILL_LIST_TILES * uint64_t(PREFILL_LIST_CAPACITY) * 8ul)
+#define PREFILL_BASES_BUFFER (PREFILL_LISTED_BUFFER + PREFILL_LIST_TILES * 4ul)
 #include "lib/attention/prefill.glsl"
 
 attention_history prefill_history() {
@@ -35,3 +49,4 @@ prefill_scratch prefill_scratch_planes() {
 void attention_prefill_k8v4_prepare() { prefill_prepare(prefill_history(), prefill_scratch_planes()); }
 void attention_prefill_k8v4_attend() { prefill_attend(prefill_history(), prefill_scratch_planes()); }
 void attention_prefill_k8v4_merge() { prefill_merge(prefill_scratch_planes()); }
+void attention_prefill_k8v4_list() { prefill_list(); }

@@ -3,10 +3,10 @@
 pub mod assessment;
 mod completion;
 mod device_resources;
+mod device_table;
 mod domain;
 mod error;
 mod execution_path;
-mod device_table;
 mod host_tables;
 mod import_transforms;
 mod inventory;
@@ -14,21 +14,22 @@ mod kernel_cache;
 mod lanes;
 pub mod memory;
 mod native;
+#[cfg(test)]
+mod ngram_steps_tests;
 mod operation;
 mod operators;
 mod planning;
 pub mod programs;
 mod progressive;
 mod slot_directory;
+mod stored_table;
 mod streamed_table;
 pub use programs::{
     CommitSpan, CompletedHeadWork, CompletedImportWork, CompletedStateWork, CompletedTargetWork,
     CompletedVisionWork, GraphError, HeadProgram, ImportProgram, PlannedSealedGraphs,
-    PreparedDraftGraphs,
-    PreparedDrafterGraphs, PreparedHeadGraphs, PreparedStateCopyGraphs, PreparedTargetGraphs,
-    PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport, SealedGraphsHeap, StateProgram,
-    TargetOutput,
-    TargetProgram, VisionProgram,
+    PreparedDraftGraphs, PreparedDrafterGraphs, PreparedHeadGraphs, PreparedStateCopyGraphs,
+    PreparedTargetGraphs, PreparedTargetReadoutGraphs, PreparedVisionGraphs, SealReport,
+    SealedGraphsHeap, StateProgram, TargetOutput, TargetProgram, VisionProgram,
 };
 pub mod platform;
 mod residency;
@@ -47,7 +48,10 @@ pub use domain::{
     ReservedResources, ResumeState, StateBindings, SubmitFailure, TargetContinuation, TargetFlight,
     TargetHostTiming, VisionFlight, require_normal,
 };
-pub use error::{CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError};
+pub use error::{
+    CapacityError, DeviceError, InvariantError, PlanError, ResourceKind, SubmitError,
+    TableReadError,
+};
 pub use execution_path::ExecutionPath;
 pub use inventory::kernel_inventory;
 pub use kernel_cache::{
@@ -71,13 +75,11 @@ pub use native::pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use native::tuning_survey;
 pub use native::{
-    AttestedPrograms, CatalogError, CatalogFailure, PointShape, QualificationCase,
-    QualificationReport, NumericalProfile, Receipt,
-    ResolvedNumericalProfile, ROTATION_LAYERS, PinnedChoice, SEARCH_VERSION, STANDARD_TUNING_BUDGET,
-    SearchProgress,
-    TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent,
-    TuningLimits, UnpreparedUnits,
-    TuningObserver, TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource,
+    AttestedPrograms, CatalogError, CatalogFailure, NumericalProfile, PinnedChoice, PointShape,
+    QualificationCase, QualificationReport, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
+    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
+    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
+    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
     UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
 };
 pub use operation::{
@@ -100,15 +102,15 @@ pub use planning::{
     ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FeedForwardProgramSlot,
     GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan, ImportProgramSlot,
     MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding, MixerProgramSlot, ModelLoadPlan,
-    NativeGraphCharge, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, PlannedDevice,
-    PlannedMethod, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding,
-    ResolvedPolicy, ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner,
-    RoutedBinding, ScalableWeight, SealedGraphHostBytes, SelectorBinding, SharedHeadProgramPlan,
-    StartupSlots,
-    StateCapacityPlan, StateProgramPlan, StateResourcePlan, StateStorePlan, SublayerTail,
-    TapProgramPlan, TargetBlockProgramSlot, TargetProgramPlan, TensorOperations, VisionProgramPlan,
-    WeightPlan, WeightScalePlan, WeightStorageIdentity, draft_ladder, image_cell_limit,
-    resident_element, resident_layout, source_element,
+    NGramBinding, NativeGraphCharge, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
+    PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead,
+    RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity, ResourceLimits,
+    ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SealedGraphHostBytes,
+    SelectionBinding, SelectionShape, SelectorBinding, SharedHeadProgramPlan, StartupSlots, StateCapacityPlan, StateProgramPlan,
+    StateResourcePlan, StateStorePlan, SublayerTail, TapProgramPlan, TargetBlockProgramSlot,
+    TargetProgramPlan, TensorOperations, VisionProgramPlan, WeightPlan, WeightScalePlan,
+    WeightStorageIdentity, draft_ladder, image_cell_limit, resident_element, resident_layout,
+    source_element,
 };
 
 /// Whether this executor runs `definition` with its draft head selected.

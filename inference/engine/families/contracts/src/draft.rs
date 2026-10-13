@@ -12,8 +12,8 @@
 
 use crate::decoder::{self, Context};
 use crate::{
-    checked_product, expect_shape, Block, Decoder, DefinitionError, KeyValue, Operator, RmsNorm,
-    SublayerIndex, TokenId, WeightDescriptor,
+    Block, Decoder, DefinitionError, KeyValue, Operator, ResidualForm, RmsNorm, SublayerIndex,
+    TokenId, WeightDescriptor, checked_product, expect_shape,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -283,13 +283,19 @@ impl DraftDefinition {
             )?;
         }
         if let Some(output) = &self.output {
-            expect_shape(output, &[decoder.vocabulary, hidden], "draft output projection")?;
+            expect_shape(
+                output,
+                &[decoder.vocabulary, hidden],
+                "draft output projection",
+            )?;
         }
         decoder::validate_blocks(
             &self.blocks,
             &Context {
                 hidden,
+                vocabulary: decoder.vocabulary,
                 coordinate_axes,
+                residual: &ResidualForm::Single,
                 per_layer: None,
                 shared_sources: None,
             },

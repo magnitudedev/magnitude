@@ -368,8 +368,106 @@ pub struct DirectBatch {
     /// Graphs replayed by this batch; the submission keeps them alive and
     /// records itself as their last use.
     replayed: Vec<std::sync::Arc<GraphInner>>,
+    /// Host timelines the batch's queue submission waits on before it runs,
+    /// and the ones it signals once it completes, with their values.
+    waits: Vec<(vk::Semaphore, u64)>,
+    signals: Vec<(vk::Semaphore, u64)>,
     /// Set by `commit`; an uncommitted batch returns its resources on drop.
     committed: bool,
+}
+
+/// A timeline semaphore the host and the device's queue submissions both
+/// advance and wait on.
+pub struct HostTimeline {
+    device: Device,
+    semaphore: vk::Semaphore,
+}
+
+impl HostTimeline {
+    /// A timeline at 0.
+    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+        let mut timeline = vk::SemaphoreTypeCreateInfo::default()
+            .semaphore_type(vk::SemaphoreType::TIMELINE)
+            .initial_value(0);
+        let semaphore = call(
+            unsafe {
+                device.inner.device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline),
+                    None,
+                )
+            },
+            "vkCreateSemaphore",
+        )?;
+        Ok(Self {
+            device: device.clone(),
+            semaphore,
+        })
+    }
+
+    /// Raise the timeline to `value` from the host; a value it has reached
+    /// already changes nothing.
+    ///
+    /// Host writes made before the signal are visible to the device work
+    /// that waits on `value` (`DirectBatch::wait_timeline`):
+    /// - the writes are to `HOST_COHERENT` memory (every upload allocation,
+    ///   `Memory::new`, which host-shared tensors are), so they are
+    ///   available in the host domain without `vkFlushMappedMemoryRanges`
+    ///   (spec, "Host Access to Device Memory Objects": a flush is required
+    ///   only of memory without `VK_MEMORY_PROPERTY_HOST_COHERENT_BIT`);
+    /// - `vkSignalSemaphore`'s first synchronization scope includes every
+    ///   host operation that happened-before it (spec, "Semaphore Signaling",
+    ///   `vkSignalSemaphore`), and the waiting batch's semaphore wait
+    ///   operation's second synchronization and access scopes include every
+    ///   command of the batch and all its device memory accesses, at the
+    ///   stages of its wait mask (spec, "Semaphore Waiting"), which is
+    ///   `COMPUTE_SHADER | ALL_COMMANDS` (`Device::submit_with`).
+    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+        if self.value() >= value {
+            return Ok(());
+        }
+        let info = vk::SemaphoreSignalInfo::default()
+            .semaphore(self.semaphore)
+            .value(value);
+        call(
+            unsafe { self.device.inner.device.signal_semaphore(&info) },
+            "vkSignalSemaphore",
+        )
+    }
+
+    /// The value reached. A failed query reads as reached everything: the
+    /// device cannot make progress.
+    pub fn value(&self) -> u64 {
+        unsafe {
+            self.device
+                .inner
+                .device
+                .get_semaphore_counter_value(self.semaphore)
+        }
+        .unwrap_or(u64::MAX)
+    }
+
+    /// Wait at most `timeout` for the timeline to reach `value`; whether it
+    /// did.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        let semaphores = [self.semaphore];
+        let values = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let nanoseconds = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        unsafe { self.device.inner.device.wait_semaphores(&info, nanoseconds) }.is_ok()
+            && self.value() >= value
+    }
+}
+
+impl Drop for HostTimeline {
+    /// A submission may still wait on or signal the semaphore: every one
+    /// submitted so far completes first. Precondition: every value a
+    /// submission waits on was signaled, or is signaled by one before it.
+    fn drop(&mut self) {
+        let _ = self.device.wait(self.device.submitted());
+        unsafe { self.device.inner.device.destroy_semaphore(self.semaphore, None) };
+    }
 }
 
 impl DirectBatch {
@@ -410,6 +508,8 @@ impl DirectBatch {
             arguments: Arguments::new(),
             launched: false,
             replayed: Vec::new(),
+            waits: Vec::new(),
+            signals: Vec::new(),
             committed: false,
         };
         let begun = begin(
@@ -451,6 +551,23 @@ impl DirectBatch {
         };
         self.written += 1;
         query
+    }
+
+    /// The batch's queue submission waits, before any of its work, until
+    /// `timeline` reaches `value`: the host gate. Precondition: nothing is
+    /// recorded in the batch yet.
+    pub fn wait_timeline(&mut self, timeline: &HostTimeline, value: u64) {
+        assert!(
+            !self.launched,
+            "DirectBatch::wait_timeline precondition: the batch records nothing yet"
+        );
+        self.waits.push((timeline.semaphore, value));
+    }
+
+    /// `timeline` reaches `value` once the batch's queue submission
+    /// completes. Precondition: the batch records nothing after this.
+    pub fn signal_timeline(&mut self, timeline: &HostTimeline, value: u64) {
+        self.signals.push((timeline.semaphore, value));
     }
 
     /// Record a launch that does no device work (inactive, or an empty
@@ -562,7 +679,9 @@ impl DirectBatch {
         );
         drop(recording);
         ended?;
-        let value = self.device.submit(self.command)?;
+        let value = self
+            .device
+            .submit_with(self.command, &self.waits, &self.signals)?;
         for graph in &self.replayed {
             graph.last_use.fetch_max(value, Ordering::AcqRel);
         }

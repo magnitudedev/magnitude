@@ -3350,6 +3350,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         epsilon: 1.0e-5,
         decode_rows: None,
         window: None,
+        selection: None,
     });
     let implementation = seismic::generated::native_implementation::<
         magnitude_kernels::attention_prefill_k8v4::Entry,
@@ -3361,7 +3362,7 @@ fn stored_attention_choice_must_admit_every_served_span_class() {
         .shape
         .mix_dimensions(64, 4352, 1)
         .into_iter()
-        .chain([("L", 1), ("HT", 16)])
+        .chain([("L", 1), ("HT", 16), ("B", 0)])
         .chain(crate::operators::attention::graph::affine_dimensions(case.0.codec).unwrap())
         .map(|(name, value)| (name.to_owned(), value))
         .collect();

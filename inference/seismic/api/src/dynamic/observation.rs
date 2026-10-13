@@ -256,12 +256,13 @@ fn snapshot(
             oracle.push(match s.clone() {
                 Scalar::Index(v) => Arg::Index(v),
                 Scalar::Range(a, b) => Arg::Range(a, b),
-                Scalar::F32(v) => Arg::Scalar(R::from_bits(DType::F32, v)),
-                Scalar::F16(v) => Arg::Scalar(R::from_bits(DType::F16, v as u32)),
-                Scalar::BF16(v) => Arg::Scalar(R::from_bits(DType::BF16, v as u32)),
-                Scalar::I32(v) => Arg::Scalar(R::from_bits(DType::I32, v as u32)),
-                Scalar::U32(v) => Arg::Scalar(R::from_bits(DType::U32, v)),
-                Scalar::Bool(v) => Arg::Scalar(R::from_bits(DType::Bool, u32::from(v))),
+                Scalar::F32(v) => Arg::Scalar(R::F32(v)),
+                Scalar::F16(v) => Arg::Scalar(R::F16(v)),
+                Scalar::BF16(v) => Arg::Scalar(R::BF16(v)),
+                Scalar::I32(v) => Arg::Scalar(R::I32(v)),
+                Scalar::U32(v) => Arg::Scalar(R::U32(v)),
+                Scalar::U64(v) => Arg::Scalar(R::U64(v)),
+                Scalar::Bool(v) => Arg::Scalar(R::Bool(v)),
             });
             *ordinal += 1;
             Value::Scalar(s.clone())

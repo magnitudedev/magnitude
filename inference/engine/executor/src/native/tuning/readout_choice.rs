@@ -36,14 +36,10 @@ use magnitude_kernels::{
     readout_project_rows, readout_refine_rows, readout_top_rows,
 };
 use seismic::{
-    Element, NativeKernel, NativeSpecialization, NativeTensorBatch, Shuffle, SustainedClock,
-    Tally, Tensor, Verdict,
+    Element, NativeKernel, NativeSpecialization, NativeTensorBatch, Shuffle, SustainedClock, Tally,
+    Tensor, Verdict,
 };
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    time::Instant,
-};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadoutRecipe {
@@ -57,6 +53,10 @@ pub(crate) struct ReadoutRecipe {
     pub prepared: bool,
     pub vocabulary: u64,
     pub hidden: u64,
+    /// The readout's input form (`PT`, `NM`): partial rows summed, and the
+    /// norm's extent (0 for the hyper-connection exit site's partials).
+    pub parts: u64,
+    pub norm_extent: u64,
     pub low_planes: u64,
     pub scale_extent: u64,
 }
@@ -154,7 +154,17 @@ impl ReadoutRecipe {
         NativeSpecialization::new()
             .with_static("V", self.vocabulary)
             .with_static("D", self.hidden)
+            .with_static("PT", self.parts)
+            .with_static("NM", self.norm_extent)
             .with_static("P", self.low_planes)
+    }
+
+    /// `readout_features_rows`' statics over this recipe's input form.
+    fn feature_statics(self) -> NativeSpecialization {
+        NativeSpecialization::new()
+            .with_static("D", self.hidden)
+            .with_static("PT", self.parts)
+            .with_static("NM", self.norm_extent)
     }
 
     /// Row-independent fixed programs are formed once per exact physical
@@ -287,8 +297,13 @@ impl RecipeCase {
         rows: u64,
         seed: u64,
     ) -> Result<Self, String> {
-        let hidden = inputs.activation(Element::f32(), &[rows, recipe.hidden], seed)?;
-        let norm = inputs.shared_weight(recipe.norm_scope, WeightKind::OutputNorm)?;
+        let hidden =
+            inputs.activation(Element::f32(), &[rows, recipe.parts * recipe.hidden], seed)?;
+        let norm = if recipe.norm_extent == 0 {
+            inputs.scratch(recipe.norm, &[0])?
+        } else {
+            inputs.shared_weight(recipe.norm_scope, WeightKind::OutputNorm)?
+        };
         let weight = inputs
             .shared_weight(recipe.scope, WeightKind::Output)?
             .slice_leading(0, recipe.vocabulary)
@@ -363,10 +378,12 @@ impl RecipeCase {
         let columns = usize::try_from(recipe.hidden).map_err(|_| "hidden width exceeds usize")?;
         let bits = u8::try_from(2 * (recipe.low_planes + 1))
             .map_err(|_| "progressive code depth exceeds u8")?;
+        // The row is the first of its partial rows; the others are zero.
+        let partials = (recipe.parts - 1) * recipe.hidden;
         let mut values = Vec::new();
         for row in 0..rows {
-            let token =
-                u64::from(((seed * rows + row) as u32).wrapping_mul(0x9e37_79b9)) % recipe.vocabulary;
+            let token = u64::from(((seed * rows + row) as u32).wrapping_mul(0x9e37_79b9))
+                % recipe.vocabulary;
             values.extend(crate::progressive::row_values(
                 &stored(top, token)?,
                 &stored(next, token)?,
@@ -375,8 +392,9 @@ impl RecipeCase {
                 columns,
                 bits,
             ));
+            values.extend(std::iter::repeat_n(0.0, partials as usize));
         }
-        inputs.f32s(&[rows, recipe.hidden], &values)
+        inputs.f32s(&[rows, recipe.parts * recipe.hidden], &values)
     }
 
     /// Replace the case's hidden rows, and the features prepared from them.
@@ -400,12 +418,18 @@ impl RecipeCase {
         recipe: ReadoutRecipe,
         feature_kernel: &NativeKernel<readout_features_rows::Entry>,
     ) -> Result<(), CatalogFailure> {
+        // The entry reads the rows as their `[M, PT, D]` parts.
+        let rows = self.hidden.extents()[0];
+        let partials = self
+            .hidden
+            .reshape(&[rows, recipe.parts, recipe.hidden])
+            .map_err(fail)?;
         let mut batch = NativeTensorBatch::new(device);
         batch
             .push(
                 feature_kernel,
                 readout_features_rows::Args {
-                    hidden: &self.hidden,
+                    hidden: &partials,
                     norm: &self.norm,
                     out_rows: &self.out_rows,
                     epsilon: recipe.epsilon,
@@ -474,12 +498,18 @@ impl RecipeCase {
         kernels: &ProgressiveReadoutKernels,
     ) -> Result<f64, CatalogFailure> {
         let [top, bit3, rest, scales, radius] = &self.planes;
+        // The entry reads the rows as their `[M, PT, D]` parts.
+        let rows = self.hidden.extents()[0];
+        let partials = self
+            .hidden
+            .reshape(&[rows, recipe.parts, recipe.hidden])
+            .map_err(fail)?;
         let mut batch = NativeTensorBatch::new(device);
         batch
             .push(
                 &kernels.top,
                 readout_top_rows::Args {
-                    hidden: &self.hidden,
+                    hidden: &partials,
                     norm: &self.norm,
                     top,
                     bit3,
@@ -685,7 +715,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 NW: self.recipe.norm,
                 A: self.recipe.activation,
             },
-            &NativeSpecialization::new().with_static("D", self.recipe.hidden),
+            &self.recipe.feature_statics(),
         )
         .map_err(fail)?;
         if self.recipe.prepared {
@@ -764,7 +794,7 @@ impl<'a> ComposedContender<'a> for ReadoutContender<'a> {
                 NW: self.recipe.norm,
                 A: self.recipe.activation,
             },
-            &NativeSpecialization::new().with_static("D", self.recipe.hidden),
+            &self.recipe.feature_statics(),
         )
         .map_err(fail)?;
         let mut cases = Vec::new();

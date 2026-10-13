@@ -48,7 +48,8 @@ fn attention_output_rows<L: Isa, E: Elements>(
         (cx.dim_q() * cx.dim_w()) as usize,
     );
     let rows = projection::item_rows(group[0], cx.param_rows(), d);
-    let (hidden, result) = (cx.arg_hidden(), cx.result_0());
+    let (hidden, result, inject) = (cx.arg_hidden(), cx.result_0(), cx.arg_inject());
+    let (streams, injected) = (cx.dim_sn() as usize, cx.dim_in() != 0);
     // SAFETY: the stage launch wrote every row before this launch.
     let staged = unsafe { cx.scratch_staged().slice::<f32>(0, m * k) };
     let blocks = seismic::cpu::quant::blocks(k);
@@ -62,11 +63,21 @@ fn attention_output_rows<L: Isa, E: Elements>(
         staged,
         quantized,
         |row, projected| {
-            let source = hidden.span([row, rows.start], rows.len());
-            // SAFETY: each work item writes its own columns of every row.
-            let out = unsafe { result.span_mut([row, rows.start], rows.len()) };
-            for ((target, hidden), projected) in out.iter_mut().zip(source).zip(projected) {
-                *target = hidden + activation::publish::<E::A>(*projected);
+            // `scatter`: the residual plus the projection, or each stream's
+            // residual plus the projection times its inject value.
+            for stream in 0..streams {
+                let first = stream * d + rows.start;
+                let factor = injected.then(|| inject.get([row, stream]));
+                let source = hidden.span([row, first], rows.len());
+                // SAFETY: each work item writes its own columns of every row.
+                let out = unsafe { result.span_mut([row, first], rows.len()) };
+                for ((target, hidden), projected) in out.iter_mut().zip(source).zip(projected) {
+                    let y = activation::publish::<E::A>(*projected);
+                    *target = match factor {
+                        None => hidden + y,
+                        Some(factor) => hidden + y * factor,
+                    };
+                }
             }
         },
     );

@@ -56,6 +56,8 @@ elements! {
     I32: i32, "i32";
     /// The `u32` element.
     U32: u32, "u32";
+    /// The `u64` element.
+    U64: u64, "u64";
 }
 
 impl Dense for F32 {

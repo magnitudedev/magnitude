@@ -113,6 +113,59 @@ struct Plain {
     }
 };
 
+// The sum in part order of the PARTS `columns`-wide parts of an F32 row, a
+// hyper-connection mix site's per-stream partials (`form_input` without a
+// norm). It has `Rms`'s fields and interface, so an entry selects either by
+// its norm's extent (`InputOf`): `norm`, `norm_stride` and `eps` are not
+// read, and its square sums are zero (the inverse it is given is ignored).
+template <typename A, typename N, typename Rows, uint PARTS>
+struct Summed {
+    static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
+    typedef A activation;
+    device const float *x;
+    ulong stride0, stride1;
+    device const uchar *norm;
+    ulong norm_stride;
+    float eps;
+    uint columns;
+    Rows rows;
+    uint groups() const { return 1; }
+    uint width() const { return columns; }
+    float norm_input(uint, uint, uint) const { return 0.0f; }
+    float epsilon() const { return eps; }
+    static constant constexpr uint parts = 8;
+    float squares(uint, uint, uint, uint) const { return 0.0f; }
+    float sum(uint m, uint column) const {
+        device const float *row = x + ulong(rows.at(m)) * stride0;
+        float total = 0.0f;
+        for (uint part = 0; part < PARTS; ++part)
+            total += row[ulong(part * columns + column) * stride1];
+        return total;
+    }
+    float value(uint m, uint column, float) const { return A::round(sum(m, column)); }
+    void load8(uint m, uint k, float, thread float4 &even, thread float4 &odd) const {
+        float v[8];
+        for (uint i = 0; i < 8; ++i)
+            v[i] = k + i < columns ? A::round(sum(m, k + i)) : 0.0f;
+        even = float4(v[0], v[2], v[4], v[6]);
+        odd = float4(v[1], v[3], v[5], v[7]);
+    }
+};
+
+template <typename A, typename N, typename Rows>
+struct Rms;
+
+// An entry's input prologue (`form_input`): RMS normalization with a norm
+// of NORM_EXTENT values, or the sum of PARTS partials without one.
+template <typename A, typename N, typename Rows, uint NORM_EXTENT, uint PARTS>
+struct InputOf {
+    typedef Rms<A, N, Rows> type;
+};
+template <typename A, typename N, typename Rows, uint PARTS>
+struct InputOf<A, N, Rows, 0, PARTS> {
+    typedef Summed<A, N, Rows, PARTS> type;
+};
+
 template <typename A, typename N, typename Rows>
 struct Rms {
     static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
@@ -182,3 +235,56 @@ struct Rms {
     }
 };
 
+
+// The per-stream RMS normalization of a row of hyper-connection streams
+// (`group_rms`, `stream_mix_down`): `groups()` streams of `width()` columns,
+// each normalized by its own inverse,
+//   x = round_A(r[row(m), k] * inverse(m, k / width) * norm[k]),
+// with `Rms`'s interface over the stream that holds column k (every stream's
+// first column a multiple of 8, so no eight-column load straddles two).
+template <typename A, typename N, typename Rows>
+struct GroupRms {
+    static_assert(A::bytes == 2, "the Metal projection family requires a bf16 or f16 activation element");
+    typedef A activation;
+    device const float *x;
+    ulong stride0, stride1;
+    device const uchar *norm;
+    ulong norm_stride;
+    float eps;
+    uint columns;
+    Rows rows;
+    uint stream_width;
+    uint groups() const { return columns / stream_width; }
+    uint width() const { return stream_width; }
+    float norm_input(uint m, uint group, uint i) const {
+        return x[ulong(rows.at(m)) * stride0 + ulong(group * stream_width + i) * stride1];
+    }
+    float epsilon() const { return eps; }
+    static constant constexpr uint parts = 8;
+    // `Rms::squares` over stream `group`'s columns.
+    float squares(uint m, uint group, uint part, uint lane) const {
+        device const float *row = x + ulong(rows.at(m)) * stride0 + ulong(group * stream_width) * stride1;
+        bool vector = stride1 == 1 && (stride0 & 3u) == 0 && (stream_width & 3u) == 0;
+        float sum = 0.0f;
+        for (uint c = 4u * (32u * part + lane); c < stream_width; c += 128u * parts) {
+            float4 v;
+            if (vector) {
+                v = *reinterpret_cast<device const float4 *>(row + c);
+            } else {
+                for (uint i = 0; i < 4; ++i)
+                    v[i] = c + i < stream_width ? row[ulong(c + i) * stride1] : 0.0f;
+            }
+            sum = metal::fma(v.x, v.x, sum);
+            sum = metal::fma(v.y, v.y, sum);
+            sum = metal::fma(v.z, v.z, sum);
+            sum = metal::fma(v.w, v.w, sum);
+        }
+        return sum;
+    }
+    float value(uint m, uint column, float inverse) const {
+        return Rms<A, N, Rows>{x, stride0, stride1, norm, norm_stride, eps, columns, rows}.value(m, column, inverse);
+    }
+    void load8(uint m, uint k, float inverse, thread float4 &even, thread float4 &odd) const {
+        Rms<A, N, Rows>{x, stride0, stride1, norm, norm_stride, eps, columns, rows}.load8(m, k, inverse, even, odd);
+    }
+};

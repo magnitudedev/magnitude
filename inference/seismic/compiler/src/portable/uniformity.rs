@@ -28,7 +28,10 @@ fn scalar_failure_scope(recipe: &seismic_lang::reference_math::ReferenceRecipe, 
             N::Word { a, b, .. } | N::Compare { a, b, .. } | N::And { a, b } => {
                 join(get(a), get(b))
             }
-            N::Not { value } | N::Bits { value } | N::FromBits { value, .. } => get(value),
+            N::Not { value }
+            | N::Bits { value }
+            | N::FromBits { value, .. }
+            | N::Resize { value, .. } => get(value),
             N::Select { condition, yes, no } => all([get(condition), get(yes), get(no)]),
         });
     }

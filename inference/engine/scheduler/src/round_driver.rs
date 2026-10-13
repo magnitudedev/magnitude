@@ -47,6 +47,16 @@ pub fn reconcile_forward<F: ProgramFamily>(
     request: RequestId,
     pending: PendingOperationOutcome,
 ) -> Result<(Generation, MethodEffects), (Generation, RoundError)> {
+    // The sequence's table rows could not be read: its outputs are
+    // discarded and the round fails with the typed cause.
+    if let Outcome::TableReadFailed(error) = pending.outcome() {
+        let error = error.clone();
+        let error = match domain.abort(pending) {
+            Ok(()) => RoundError::Physical(DomainError::TableRead(error)),
+            Err(physical) => RoundError::Physical(physical),
+        };
+        return Err((round.fail(), error));
+    }
     let transition = match stage_forward(&round, domain, request, &pending) {
         Ok(transition) => transition,
         Err(error) => {

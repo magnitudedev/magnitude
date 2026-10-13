@@ -110,9 +110,9 @@ fn arithmetic_class(ty: ValueType) -> MetalService {
         | ValueType::Vector {
             dtype: DType::BF16, ..
         } => BF16_STRICT,
-        ValueType::Scalar(DType::I32 | DType::U32 | DType::Bool)
+        ValueType::Scalar(DType::I32 | DType::U32 | DType::U64 | DType::Bool)
         | ValueType::Vector {
-            dtype: DType::I32 | DType::U32 | DType::Bool,
+            dtype: DType::I32 | DType::U32 | DType::U64 | DType::Bool,
             ..
         }
         | ValueType::Index
@@ -343,6 +343,8 @@ pub fn operation_cost<
             }
             OperationCost::Demands(demands)
         }
+        // The position arithmetic of the element's index alone.
+        ClosedOpView::ReadPlaneLane { .. } => cost![one(arena, INTEGER, Latency)],
         ClosedOpView::ReadPlane { place, .. } => cost![
             one(arena, memory_class(place.kind), Capacity),
             one(arena, REPRESENTATION, Latency),
@@ -623,12 +625,16 @@ mod tests {
                 }
             }
             assert!(demands.iter().any(|d| d.class == MetalService::Integer));
-            assert!(demands
-                .iter()
-                .all(|d| matches!(d.class, MetalService::Integer | MetalService::Control)));
-            assert!(demands
-                .iter()
-                .all(|d| service_available(false, &BTreeSet::new(), d.class)));
+            assert!(
+                demands
+                    .iter()
+                    .all(|d| matches!(d.class, MetalService::Integer | MetalService::Control))
+            );
+            assert!(
+                demands
+                    .iter()
+                    .all(|d| service_available(false, &BTreeSet::new(), d.class))
+            );
         }
     }
 }

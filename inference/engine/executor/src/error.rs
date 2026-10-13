@@ -22,6 +22,23 @@ impl fmt::Display for DeviceError {
 
 impl error::Error for DeviceError {}
 
+/// A table's rows a sequence's step named could not be read from the
+/// model's artifact (a stored table, `StoredTable`): the step read other
+/// rows in their place, so the sequence fails. Other sequences of the step
+/// are unaffected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableReadError {
+    pub detail: String,
+}
+
+impl fmt::Display for TableReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "model weights could not be read: {}", self.detail)
+    }
+}
+
+impl error::Error for TableReadError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanError {
     InvalidDefinition(String),

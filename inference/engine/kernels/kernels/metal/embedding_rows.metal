@@ -29,7 +29,7 @@ kernel void embedding_rows(
     const float scale = as_type<float>(uint(SEISMIC_PARAM_SCALE));
     projection::Weights<packets::W0> rows{table, KERNEL_W0_LAYOUT(width), width, nullptr};
     const uint token = uint(gathered::row(directory, SEISMIC_DIRECTORY_STRIDE_0, SEISMIC_DIM_R,
-        tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]));
+        SEISMIC_DIM_F, tokens[ulong(row) * SEISMIC_TOKENS_STRIDE_0]));
     float inverse = 1.0f;
     if (SEISMIC_PARAM_NORMALIZE != 0) {
         float squares = 0.0f;

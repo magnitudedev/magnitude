@@ -698,10 +698,14 @@ fn render_representation(out: &mut String, prefix: &str, representation: Represe
                     "#define {plane_prefix} 1\n#define {plane_prefix}_BYTES_PER_GROUP {}\n",
                     plane.bytes_per_group
                 ));
-                if let registry::RowPlaneContent::Codes { shift, bits } = plane.content {
-                    out.push_str(&format!(
+                match plane.content {
+                    registry::RowPlaneContent::Codes { shift, bits } => out.push_str(&format!(
                         "#define {plane_prefix}_CODE_SHIFT {shift}\n#define {plane_prefix}_CODE_BITS {bits}\n"
-                    ));
+                    )),
+                    registry::RowPlaneContent::Grids { bits } => {
+                        out.push_str(&format!("#define {plane_prefix}_CODE_BITS {bits}\n"))
+                    }
+                    registry::RowPlaneContent::Groups { .. } => {}
                 }
             }
         }
@@ -799,6 +803,13 @@ fn render_code_interpretation(
             for (ordinal, value) in values.iter().enumerate() {
                 out.push_str(&format!("#define {prefix}_CODE_TABLE_{ordinal} {value}\n"));
             }
+        }
+        // The grid's points live in the native packet libraries.
+        registry::CodeInterpretation::Grid(grid) => {
+            out.push_str(&format!(
+                "#define {prefix}_CODE_GRID 1\n#define {prefix}_CODE_GRID_LANES {}\n#define {prefix}_CODE_GRID_INDEX_BITS {}\n",
+                grid.lanes, grid.index_bits
+            ));
         }
     }
 }

@@ -4,7 +4,7 @@
 // 4-bit view and publishes each row's threshold (`lib/readout/progressive.cuh`).
 #include "lib/readout/progressive.cuh"
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 
 #define F32_AT(buffer) reinterpret_cast<float *>(SEISMIC_PTR(buffer))
 #define F32_IN(buffer) reinterpret_cast<const float *>(SEISMIC_PTR(buffer))

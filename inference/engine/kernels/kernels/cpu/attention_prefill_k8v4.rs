@@ -121,6 +121,10 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
         SlabTensor::from_scalars(cx.arg_history_value_codes(), slab_rows),
         SlabTensor::from_bound(cx.arg_history_value_coefficients(), slab_rows),
     );
+    // The WorkList bitmap of the row (none in the Visible form).
+    let selection = cx.arg_selection();
+    let bitmap: &[u32] = if cx.dim_b() == 0 { &[] } else { selection.row([row, 0]) };
+    let block_rows = cx.dim_br() as i32;
     attention::attend_rows(
         &mut state,
         queries,
@@ -130,6 +134,7 @@ fn attention_prefill_k8v4_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>
         spans,
         fresh,
         range,
+        |ordinal| attention::selected(bitmap, block_rows, ordinal),
         |token, out| {
             attention::affine_decode(
                 key_codes.row([token, kv_head, 0]),

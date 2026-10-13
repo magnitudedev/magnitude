@@ -38,6 +38,9 @@ pub struct AssessmentMemoryTerms {
     /// Host-resident gathered tables (model-family plan §3.7): claims in the
     /// system-RAM domain, never device weights.
     pub host_table_bytes: u64,
+    /// The target's stored tables' host-shared slots and directories
+    /// (`ModelLoadPlan::shared_table_bytes`), part of `target_weights`.
+    pub shared_table_bytes: u64,
 }
 
 /// Upper bounds for every nonresident charge of a clean load. The prepared
@@ -104,6 +107,11 @@ pub struct AssessmentMemoryCharge {
     /// Host-resident tables: system RAM, which is the allocation domain of a
     /// unified-memory device and the staging domain of a dedicated one.
     pub host_table_bytes: u64,
+    /// The stored tables' host-shared bytes, part of `allocation_bytes` and
+    /// `serving_bytes`: held in the domain the device's host-shared storage
+    /// consumes (`platform::shared_role`), host RAM on a dedicated device
+    /// whose shared storage is not its own memory.
+    pub shared_table_bytes: u64,
 }
 
 /// A complete fit result: every domain the load touches, and whether the
@@ -261,7 +269,7 @@ impl AssessmentGraphResourceBounds {
                     .head
                     .as_ref()
                     .ok_or("head graph requires a draft head")?;
-                let head_block = crate::operators::EmbeddedHeadBlock::of(
+                let head_block = crate::operators::CausalHeadBlock::of(
                     head,
                     head.blocks
                         .first()
@@ -483,6 +491,7 @@ impl AssessmentMemoryTerms {
                 .map_err(|_| "assessment bank count exceeds u64")?,
             fit_depth: definition.decoder.context_limit.min(100_000),
             host_table_bytes: load.host_table_bytes()?,
+            shared_table_bytes: load.shared_table_bytes()?,
         })
     }
 
@@ -548,6 +557,7 @@ impl AssessmentMemoryTerms {
             allocation_bytes,
             staging_bytes: bounds.staging_upload_bytes,
             host_table_bytes: self.host_table_bytes,
+            shared_table_bytes: self.shared_table_bytes,
         })
     }
 }
@@ -557,9 +567,14 @@ impl AssessmentMemoryCharge {
     /// (`platform::fit_capacities`). A domain's remaining bytes are
     /// `capacity − reserve − required`; the workload fits when none is
     /// negative, and otherwise the domain with the largest deficit limits it.
+    /// `shared` is the role of the domain the device's host-shared storage
+    /// consumes (`platform::shared_role`): the stored tables' bytes are
+    /// charged there, so a dedicated device whose shared storage is host
+    /// RAM holds them in its staging domain, not its own memory.
     pub fn assess_fit(
         self,
         capacities: &[(DomainRole, FitCapacity)],
+        shared: DomainRole,
     ) -> Result<AssessmentFit, String> {
         if !capacities
             .iter()
@@ -573,19 +588,35 @@ impl AssessmentMemoryCharge {
         let dedicated = capacities
             .iter()
             .any(|(role, _)| *role == DomainRole::Staging);
+        if shared == DomainRole::Staging && !dedicated {
+            return Err(
+                "host-shared storage outside the allocation domain of a unified device".into(),
+            );
+        }
         let with_tables = |bytes: u64| {
             bytes
                 .checked_add(self.host_table_bytes)
                 .and_then(|bytes| bytes.checked_add(self.bounds.sealed_graph_host_bytes.at_most))
                 .ok_or_else(|| "domain charge with host tables overflows".to_owned())
         };
+        // The stored tables' bytes, charged with the weights, move to host
+        // RAM where the device's shared storage is host RAM.
+        let shared_in_host = match shared {
+            DomainRole::Allocation => 0,
+            DomainRole::Staging => self.shared_table_bytes,
+        };
         let domains = capacities
             .iter()
             .map(|&(role, capacity)| {
                 let required_bytes = match role {
-                    DomainRole::Allocation if dedicated => self.allocation_bytes,
+                    DomainRole::Allocation if dedicated => self
+                        .allocation_bytes
+                        .checked_sub(shared_in_host)
+                        .ok_or("stored tables exceed the allocation charge")?,
                     DomainRole::Allocation => with_tables(self.allocation_bytes)?,
-                    DomainRole::Staging => with_tables(self.staging_bytes)?,
+                    DomainRole::Staging => with_tables(self.staging_bytes)?
+                        .checked_add(shared_in_host)
+                        .ok_or("domain charge with stored tables overflows")?,
                 };
                 let signed = |bytes: u64| {
                     i64::try_from(bytes).map_err(|_| "domain byte count exceeds i64".to_owned())
@@ -742,13 +773,14 @@ mod tests {
             ("V", definition.decoder.vocabulary),
             ("D", definition.decoder.hidden),
             ("R", 0),
+            ("F", 1),
         ];
         let mut invalid = NativeGraphMetadata::new(BackendName::Cpu);
         let wrong_table = invalid.port(Element::f32(), &[1, 1]).unwrap();
         let tokens = invalid
             .input_for::<magnitude_kernels::embedding_rows::Entry>(&elements, "tokens", &dimensions)
             .unwrap();
-        let direct = invalid.port(Element::i32(), &[0]).unwrap();
+        let direct = invalid.port(Element::i32(), &[0, 1]).unwrap();
         let mismatch = invalid.enqueue::<magnitude_kernels::embedding_rows::Entry>(
             &elements,
             &dimensions,
@@ -828,6 +860,7 @@ mod tests {
             4,
             2,
             0,
+            false,
         )
         .unwrap();
         assert!(family.storage.workspace >= block.workspace);
@@ -915,6 +948,7 @@ mod tests {
         }
         definition.head = Some(Head {
             blocks: vec![HeadBlock {
+                residual: magnitude_family_contracts::ResidualForm::Single,
                 input: HeadInput::Combine {
                     embedding_norm: rms("embedding_norm"),
                     hidden_norm: rms("hidden_norm"),
@@ -945,10 +979,10 @@ mod tests {
             sampled_proposals: 1,
         };
         let limits = crate::ResourceLimits {
-            max_launch_rows: 16,
-            max_launch_slots: 2,
-            max_selected_rows: 2,
-            max_drafting_slots: 2,
+            max_launch_rows: 256,
+            max_launch_slots: 16,
+            max_selected_rows: 16,
+            max_drafting_slots: 16,
             exported_logits_rows: 0,
             max_images_per_request: 1,
             max_image_cells: 0,
@@ -968,7 +1002,7 @@ mod tests {
         .unwrap();
         let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
         let head = definition.head.clone().unwrap();
-        let head_block = crate::operators::EmbeddedHeadBlock::of(&head, &head.blocks[0]).unwrap();
+        let head_block = crate::operators::CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
         let head_state = state.head_state().unwrap();
         let head_history = head_state.sole_history().unwrap();
         let classes = crate::programs::native_head::head_graph_classes(
@@ -1176,7 +1210,7 @@ mod tests {
         definition.head.as_mut().unwrap().blocks[0].blocks[0].sublayers[1].op =
             Operator::RoutedFfn(Box::new(routed));
         let head = definition.head.clone().unwrap();
-        let head_block = crate::operators::EmbeddedHeadBlock::of(&head, &head.blocks[0]).unwrap();
+        let head_block = crate::operators::CausalHeadBlock::of(&head, &head.blocks[0]).unwrap();
         let load = ModelLoadPlan::derive(
             &manifest,
             &definition,
@@ -1223,6 +1257,112 @@ mod tests {
             routed_pools.head.unwrap().workspace_bytes,
             routed_family.storage.workspace
         );
+        // Raw stream conditioning has independent target and head readout
+        // features. Certify priming, prefix, chained and shaped classes with
+        // the same topology that execution uses.
+        definition.decoder = crate::planning::tests::hyper_connection_fixture_definition().decoder;
+        let mut site = match &definition.decoder.exit.norm {
+            ExitNorm::HyperConnectionHead(site) => site.clone(),
+            _ => unreachable!(),
+        };
+        let head = &mut definition.head.as_mut().unwrap().blocks[0];
+        head.residual = definition.decoder.residual.clone();
+        head.chain = HeadChain::Residual;
+        let HeadInput::Combine { hidden_norm, .. } = &mut head.input else {
+            unreachable!()
+        };
+        hidden_norm.weight.shape = vec![512];
+        for (index, sublayer) in head.blocks[0].sublayers.iter_mut().enumerate() {
+            site.norm.weight.name = format!("head_mix_{index}_norm");
+            site.down.name = format!("head_mix_{index}_down");
+            site.up.name = format!("head_mix_{index}_up");
+            site.inject = Some(descriptor(&format!("mix_{index}_inject"), &[4, 512]));
+            sublayer.input = InputNorm::HyperConnectionMix(site.clone());
+            sublayer.output = magnitude_family_contracts::OutputForm::Scatter;
+        }
+        site.norm.weight.name = "head_exit_norm".into();
+        site.down.name = "head_exit_down".into();
+        site.up.name = "head_exit_up".into();
+        site.inject = None;
+        head.output_norm = ExitNorm::HyperConnectionHead(site);
+        let Operator::RoutedFfn(routed) = &mut head.blocks[0].sublayers[1].op else {
+            unreachable!()
+        };
+        // CUDA routes whole groups of 32 experts.
+        routed.experts = 32;
+        routed.router.weight.shape[0] = 32;
+        if let FeedForwardUp::Gated { gate, up, .. } = &mut routed.expert_up {
+            gate.shape[0] = 32;
+            up.shape[0] = 32;
+        }
+        routed.expert_down.shape[0] = 32;
+        definition.validate().unwrap();
+        let manifest = crate::planning::tests::fixture_manifest(&definition);
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: true,
+                vision: false,
+            },
+            Layout::Rows16,
+        )
+        .unwrap();
+        assert_eq!(load.residual_conditioning(), Some(512));
+        let method = PlannedMethod::Mtp {
+            greedy_proposals: 3,
+            sampled_proposals: 3,
+        };
+        let state = crate::ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            method,
+            KvCodec::Dense,
+            limits,
+            crate::ResourceCapacity {
+                domain_bytes: 512 * 1024 * 1024,
+                tensor_operations: crate::TensorOperations::Absent,
+            },
+        )
+        .unwrap();
+        let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+        let binding = plan.head().unwrap().blocks()[0];
+        assert_eq!(binding.conditioning, Element::f32());
+        assert_eq!(binding.streams.unwrap().geometry.streams, 4);
+        let head = definition.head.as_ref().unwrap();
+        let block = crate::operators::CausalHeadBlock::of(head, &head.blocks[0]).unwrap();
+        let head_state = state.head_state().unwrap();
+        let history = head_state.sole_history().unwrap();
+        let classes = crate::programs::native_head::head_graph_classes(
+            limits,
+            history.rows as u64,
+            history.slab_rows,
+            head_state.span_limit(),
+            method.draft_rows(),
+        )
+        .unwrap();
+        for backend in [BackendName::Cpu, BackendName::Cuda] {
+            crate::programs::native_head::verify_head_family_certificates(
+                backend,
+                &load,
+                &definition.decoder,
+                block,
+                binding,
+                &classes,
+            )
+            .unwrap();
+            let pools = AssessmentGraphResourceBounds::derive(
+                &definition,
+                &load,
+                &state,
+                method,
+                KvCodec::Dense,
+                limits,
+                backend,
+            )
+            .unwrap();
+            assert!(pools.head.unwrap().workspace_bytes > 0);
+        }
     }
 
     /// A draft head of its own width that reads the target's history and is
@@ -1283,6 +1423,7 @@ mod tests {
         }
         definition.head = Some(Head {
             blocks: vec![HeadBlock {
+                residual: magnitude_family_contracts::ResidualForm::Single,
                 input: HeadInput::Projected {
                     pre: descriptor("pre_projection", &[WIDTH, 2 * hidden]),
                     embedding_scale: definition.decoder.entry.scale,
@@ -1653,7 +1794,7 @@ mod tests {
         let storage = crate::programs::graph::readout::checked_features_graph_storage(
             BackendName::Cpu,
             &definition.decoder,
-            norm,
+            Some(norm),
             2,
             1,
         )
@@ -1693,7 +1834,7 @@ mod tests {
         let features = crate::programs::graph::readout::checked_features_graph_storage(
             BackendName::Cpu,
             &definition.decoder,
-            weight(WeightKind::OutputNorm),
+            Some(weight(WeightKind::OutputNorm)),
             2,
             1,
         )
@@ -1701,7 +1842,7 @@ mod tests {
         let projected = crate::programs::graph::readout::checked_projected_graph_storage(
             BackendName::Cpu,
             &definition.decoder,
-            weight(WeightKind::OutputNorm),
+            Some(weight(WeightKind::OutputNorm)),
             weight(WeightKind::Output),
             2,
             1,
@@ -1744,7 +1885,7 @@ mod tests {
             crate::programs::graph::readout::checked_selection_graph_storage(
                 BackendName::Cpu,
                 &definition.decoder,
-                weight(WeightKind::OutputNorm),
+                Some(weight(WeightKind::OutputNorm)),
                 weight(WeightKind::Output),
                 2,
                 1,
@@ -1919,6 +2060,7 @@ mod tests {
             })
             .collect();
         let load = ModelLoadPlan {
+            residual_conditioning: None,
             target: Vec::new(),
             head: None,
             vision: Some(weights),
@@ -2136,6 +2278,7 @@ mod tests {
             allocation_bytes,
             staging_bytes,
             host_table_bytes: 0,
+            shared_table_bytes: 0,
         }
     }
 
@@ -2150,6 +2293,7 @@ mod tests {
             recurrent_banks: 3,
             fit_depth: 10,
             host_table_bytes: 30,
+            shared_table_bytes: 0,
         };
         assert_eq!(terms.exact_resident_bytes(50).unwrap(), 100 + 20 + 5 + 50);
         let bounds = AssessmentMemoryBounds {
@@ -2201,7 +2345,9 @@ mod tests {
         };
         // Unified memory: one allocation domain.
         let unified = [(DomainRole::Allocation, domain(1_000, 100))];
-        let fits = fixture_charge(900, 0).assess_fit(&unified).unwrap();
+        let fits = fixture_charge(900, 0)
+            .assess_fit(&unified, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(fits.verdict, AssessmentFitVerdict::Fits);
         assert_eq!(
             fits.domains,
@@ -2214,7 +2360,9 @@ mod tests {
                 remaining_bytes: 0,
             }]
         );
-        let short = fixture_charge(901, 0).assess_fit(&unified).unwrap();
+        let short = fixture_charge(901, 0)
+            .assess_fit(&unified, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(
             short.verdict,
             AssessmentFitVerdict::DoesNotFit {
@@ -2229,11 +2377,15 @@ mod tests {
             (DomainRole::Allocation, domain(1_000, 100)),
             (DomainRole::Staging, domain(500, 200)),
         ];
-        let both = fixture_charge(800, 300).assess_fit(&dedicated).unwrap();
+        let both = fixture_charge(800, 300)
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(both.verdict, AssessmentFitVerdict::Fits);
         assert_eq!(both.domains[1].required_bytes, 300);
         assert_eq!(both.domains[1].remaining_bytes, 0);
-        let staging = fixture_charge(800, 350).assess_fit(&dedicated).unwrap();
+        let staging = fixture_charge(800, 350)
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(
             staging.verdict,
             AssessmentFitVerdict::DoesNotFit {
@@ -2244,7 +2396,9 @@ mod tests {
         assert_eq!(staging.domains[0].remaining_bytes, 100);
         assert_eq!(staging.domains[1].remaining_bytes, -50);
         // The largest deficit limits the load.
-        let worst = fixture_charge(1_000, 310).assess_fit(&dedicated).unwrap();
+        let worst = fixture_charge(1_000, 310)
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(
             worst.verdict,
             AssessmentFitVerdict::DoesNotFit {
@@ -2255,7 +2409,10 @@ mod tests {
         // A reserve above capacity leaves a negative remainder, not an error.
         let tiny = [(DomainRole::Allocation, domain(100, 200))];
         assert_eq!(
-            fixture_charge(1, 0).assess_fit(&tiny).unwrap().verdict,
+            fixture_charge(1, 0)
+                .assess_fit(&tiny, DomainRole::Allocation)
+                .unwrap()
+                .verdict,
             AssessmentFitVerdict::DoesNotFit {
                 limiting: host,
                 deficit_bytes: 101,
@@ -2263,7 +2420,10 @@ mod tests {
         );
         assert!(
             fixture_charge(1, 0)
-                .assess_fit(&[(DomainRole::Staging, domain(100, 0))])
+                .assess_fit(
+                    &[(DomainRole::Staging, domain(100, 0))],
+                    DomainRole::Allocation
+                )
                 .is_err()
         );
 
@@ -2273,9 +2433,11 @@ mod tests {
             host_table_bytes: 50,
             ..fixture_charge(800, 300)
         };
-        let unified_tables = tables.assess_fit(&unified).unwrap();
+        let unified_tables = tables.assess_fit(&unified, DomainRole::Allocation).unwrap();
         assert_eq!(unified_tables.domains[0].required_bytes, 850);
-        let dedicated_tables = tables.assess_fit(&dedicated).unwrap();
+        let dedicated_tables = tables
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(dedicated_tables.domains[0].required_bytes, 800);
         assert_eq!(dedicated_tables.domains[1].required_bytes, 350);
 
@@ -2286,10 +2448,87 @@ mod tests {
             at_most: 20,
             at_least: 15,
         };
-        let unified_sealed = sealed.assess_fit(&unified).unwrap();
+        let unified_sealed = sealed.assess_fit(&unified, DomainRole::Allocation).unwrap();
         assert_eq!(unified_sealed.domains[0].required_bytes, 870);
-        let dedicated_sealed = sealed.assess_fit(&dedicated).unwrap();
+        let dedicated_sealed = sealed
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
         assert_eq!(dedicated_sealed.domains[0].required_bytes, 800);
         assert_eq!(dedicated_sealed.domains[1].required_bytes, 370);
+    }
+
+    /// A stored table's slots and directory are charged where the device's
+    /// host-shared storage lives: unified memory and a device whose shared
+    /// storage is its own memory hold them in the allocation domain, and a
+    /// discrete GPU whose shared storage is host RAM (CUDA's pinned memory)
+    /// in host RAM, where a load that does not fit is refused although the
+    /// device's own memory holds everything else.
+    #[test]
+    fn stored_tables_are_charged_in_the_domain_of_shared_storage() {
+        // Pool identities are the catalog's; the domains are told apart by
+        // role.
+        let host = seismic::DeviceCatalog::discover()
+            .unwrap()
+            .topology()
+            .host_pool()
+            .id;
+        let gpu = host;
+        let domain = |id, kind, capacity_bytes, reserve_bytes| FitCapacity {
+            domain: id,
+            kind,
+            capacity_bytes,
+            reserve_bytes,
+        };
+        let device = domain(gpu, seismic::MemoryPoolKind::DeviceLocal, 1_000, 100);
+        let ram = domain(host, seismic::MemoryPoolKind::HostRam, 500, 200);
+        let dedicated = [(DomainRole::Allocation, device), (DomainRole::Staging, ram)];
+        // 900 device bytes, 250 of them stored tables; 100 staged.
+        let charge = AssessmentMemoryCharge {
+            shared_table_bytes: 250,
+            ..fixture_charge(900, 100)
+        };
+        // Device-local shared storage: everything on the device.
+        let local = charge
+            .assess_fit(&dedicated, DomainRole::Allocation)
+            .unwrap();
+        assert_eq!(local.verdict, AssessmentFitVerdict::Fits);
+        assert_eq!(local.domains[0].required_bytes, 900);
+        assert_eq!(local.domains[1].required_bytes, 100);
+        // Host shared storage: the tables move to host RAM, beside the
+        // staged upload, and overflow it.
+        let pinned = charge.assess_fit(&dedicated, DomainRole::Staging).unwrap();
+        assert_eq!(pinned.domains[0].required_bytes, 650);
+        assert_eq!(pinned.domains[1].required_bytes, 350);
+        assert_eq!(pinned.domains[0].remaining_bytes, 250);
+        assert_eq!(pinned.domains[1].remaining_bytes, -50);
+        assert_eq!(
+            pinned.verdict,
+            AssessmentFitVerdict::DoesNotFit {
+                limiting: host,
+                deficit_bytes: 50,
+            }
+        );
+        // With room in host RAM it fits, and the device keeps 350 free.
+        let roomy = [
+            (DomainRole::Allocation, device),
+            (
+                DomainRole::Staging,
+                domain(host, seismic::MemoryPoolKind::HostRam, 600, 200),
+            ),
+        ];
+        let fits = charge.assess_fit(&roomy, DomainRole::Staging).unwrap();
+        assert_eq!(fits.verdict, AssessmentFitVerdict::Fits);
+        assert_eq!(fits.domains[0].remaining_bytes, 250);
+        // Unified memory has no other domain to hold them in.
+        let unified = [(DomainRole::Allocation, ram)];
+        assert!(charge.assess_fit(&unified, DomainRole::Staging).is_err());
+        assert_eq!(
+            charge
+                .assess_fit(&unified, DomainRole::Allocation)
+                .unwrap()
+                .domains[0]
+                .required_bytes,
+            900
+        );
     }
 }

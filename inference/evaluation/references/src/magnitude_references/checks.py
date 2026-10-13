@@ -4,7 +4,9 @@
 reference's own float32 weights into it (every parameter must be supplied, none left over) and
 compares logits on seeded random prompts: it checks the forward pass against the released modeling
 code. The prompts are arbitrary because both sides compute the same function of them; this is a
-numerical equivalence check of two implementations, never a quality measurement. `check_weights`
+numerical equivalence check of two implementations, never a quality measurement. A family transformers
+lacks (`qwen4exp`) is checked the same way against mlx_vlm, run by an interpreter that has it
+(`mlx_released.py`). `check_weights`
 compares the reference's weights, after undoing the converter's transforms, with the original
 checkpoint tensors: it checks the GGUF mapping (the differences are the file's quantization error; a
 mapping error shows as a relative error near 1).
@@ -59,11 +61,37 @@ def hf_model(reference):
     return model.eval()
 
 
-def check_hf(reference, count: int, length: int, seed: int) -> dict:
+def mlx_logits(reference, tokens: torch.Tensor, mlx_python: Path) -> torch.Tensor:
+    """The released mlx_vlm model's logits over the reference's weights (`mlx_released.py`, run by an
+    interpreter that has mlx_vlm)."""
+    import json
+    import subprocess
+    import tempfile
+    runner = Path(__file__).with_name("mlx_released.py")  # imports mlx: run, never imported here
+    with tempfile.TemporaryDirectory(prefix="magnitude-mlx-") as temporary:
+        directory = Path(temporary)
+        (directory / "config.json").write_text(json.dumps({
+            "module": "qwen4_exp", "text_config": reference.mlx_config(), "constants": reference.mlx_constants()}))
+        np.savez(directory / "parameters.npz",
+                 **{name: value.detach().to("cpu", F32).numpy() for name, value in reference.mlx_parameters().items()})
+        np.save(directory / "tokens.npy", tokens.cpu().numpy())
+        subprocess.run([str(mlx_python), "-I", str(runner), str(directory)], check=True)
+        return torch.from_numpy(np.load(directory / "logits.npy")).to(tokens.device)
+
+
+def check_hf(reference, count: int, length: int, seed: int, mlx_python: Path | None = None) -> dict:
+    """The reference's logits against its family's released modeling code: transformers, or mlx_vlm
+    for a family transformers lacks (`reference.released`)."""
     tokens = prompts(count, length, reference.vocab_size, seed).to(reference.weights.device)
+    released = getattr(reference, "released", "transformers")
+    if released == "mlx_vlm":
+        if mlx_python is None:
+            raise ValueError(f"{reference.architecture} is checked against mlx_vlm: pass an mlx_vlm interpreter")
+        tokens = reference.check_prompts(tokens)
     with torch.no_grad():
         ours = reference.forward(tokens)
-        theirs = hf_model(reference)(input_ids=tokens, use_cache=False).logits.to(F32)
+        theirs = (mlx_logits(reference, tokens, mlx_python) if released == "mlx_vlm"
+                  else hf_model(reference)(input_ids=tokens, use_cache=False).logits.to(F32))
     difference = (ours - theirs).abs()
     scale = float(theirs.abs().max())
     report = {

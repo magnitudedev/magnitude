@@ -442,6 +442,7 @@ impl<'a> Checker<'a> {
         let fits = match dtype {
             DType::I32 => i128::from(i32::MIN) <= value && value <= i128::from(i32::MAX),
             DType::U32 => 0 <= value && value <= i128::from(u32::MAX),
+            DType::U64 => 0 <= value && value <= i128::from(u64::MAX),
             _ => true,
         };
         if !fits {
@@ -452,10 +453,9 @@ impl<'a> Checker<'a> {
             );
             return None;
         }
-        let symbolic = dtype.is_int().then(|| {
-            self.arena
-                .int(i64::try_from(value).expect("word literal fits i64"))
-        });
+        let symbolic = dtype
+            .is_int()
+            .then(|| self.arena.int_exact(crate::expr::BigInt::from(value)));
         Some(self.scalar_expr(
             CheckedExprKind::Literal(reference_math::integer_literal(dtype, value)),
             dtype,
@@ -1255,9 +1255,10 @@ impl<'a> Checker<'a> {
             BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
         );
         if quantity(&l.ty) || quantity(&r.ty) {
-            if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = l.ty {
+            if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) = l.ty {
                 r = self.quantity_to_word(r, dtype);
-            } else if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = r.ty {
+            } else if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) = r.ty
+            {
                 l = self.quantity_to_word(l, dtype);
             } else {
                 let (Some(a), Some(b)) = (l.integer(), r.integer()) else {
@@ -1448,7 +1449,7 @@ impl<'a> Checker<'a> {
             ),
             ValueType::Integer
             | ValueType::Index { .. }
-            | ValueType::Scalar(DType::I32 | DType::U32) => {
+            | ValueType::Scalar(DType::I32 | DType::U32 | DType::U64) => {
                 let binding = self.arena.checker_variable(crate::expr::SymbolSort::Int);
                 if runtime {
                     self.data_symbols.insert(binding);

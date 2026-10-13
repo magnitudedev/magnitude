@@ -64,9 +64,11 @@ pub fn generate<E>(
 pub fn literal_bits(dtype: DType, literal: Literal) -> Result<u64, String> {
     let width = dtype.bytes() * 8;
     let bits = match (dtype, literal) {
-        (DType::Bool, Literal::Bool(value)) => u32::from(value),
-        (DType::Bool, Literal::Bits(bits @ (0 | 1))) => bits as u32,
-        (_, Literal::Bits(bits)) if dtype != DType::Bool && bits >> width == 0 => bits as u32,
+        (DType::Bool, Literal::Bool(value)) => u64::from(value),
+        (DType::Bool, Literal::Bits(bits @ (0 | 1))) => bits,
+        (_, Literal::Bits(bits)) if dtype != DType::Bool && (width == 64 || bits >> width == 0) => {
+            bits
+        }
         (dtype, Literal::Decimal(value)) if dtype.is_float() => float_literal(dtype, value).bits(),
         (dtype, Literal::Integer(value)) if dtype.is_float() => {
             integer_literal(dtype, value).bits()
@@ -77,9 +79,12 @@ pub fn literal_bits(dtype: DType, literal: Literal) -> Result<u64, String> {
         (DType::U32, Literal::Integer(value)) if u32::try_from(value).is_ok() => {
             integer_literal(DType::U32, value).bits()
         }
+        (DType::U64, Literal::Integer(value)) if u64::try_from(value).is_ok() => {
+            integer_literal(DType::U64, value).bits()
+        }
         _ => return Err(format!("{literal:?} is not a {} element", dtype.name())),
     };
-    Ok(u64::from(bits))
+    Ok(bits)
 }
 
 fn tensor_bytes(element: &str, shape: &[u64], fill: &Fill, storage: usize) -> Vec<u8> {
@@ -181,7 +186,7 @@ impl SplitMix64 {
                 u64::from(float_literal(dtype, self.grid()).bits())
             }
             DType::I32 => u64::from((((self.next() % 32) as i32) - 16) as u32),
-            DType::U32 => self.next() % 32,
+            DType::U32 | DType::U64 => self.next() % 32,
             DType::Bool => self.next() >> 63,
         }
     }

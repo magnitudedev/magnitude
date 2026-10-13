@@ -87,6 +87,7 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
     const float *residual =
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL)) + m * SEISMIC_RESIDUAL_STRIDE_0;
     float *out = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER)) + m * SEISMIC_RESULT_0_STRIDE_0;
+    const float *inject = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT)) + m * SEISMIC_INJECT_STRIDE_0;
     const float coefficient =
         reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT))[m * SEISMIC_COEFFICIENT_STRIDE_0];
     const projection::u64 first = blockIdx.x * CHANNELS;
@@ -95,7 +96,8 @@ __global__ void routed_output(SEISMIC_KERNEL_PARAMS) {
         for (projection::u64 k = 0; k < K; ++k)
             selected = __fmaf_rn(scores[m * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1],
                                  __ldcg(published + k * H + n), selected);
-        out[n] = residual[n] + selected + __ldcg(published + K * H + n) * coefficient;
+        projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
+            out, residual, inject, H, n, selected, __ldcg(published + K * H + n) * coefficient);
     }
 }
 #endif
@@ -192,6 +194,7 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
     const float *coefficients = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_COEFFICIENT));
     const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
     float *out = reinterpret_cast<float *>(SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER));
+    const float *inject = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_INJECT));
     const projection::u64 first = blockIdx.x * CHANNELS;
     for (projection::u64 item = threadIdx.x; item < M * CHANNELS; item += blockDim.x) {
         const projection::u64 row = item / CHANNELS, n = first + item % CHANNELS;
@@ -202,9 +205,10 @@ __global__ void routed_output_gathered(SEISMIC_KERNEL_PARAMS) {
         for (projection::u64 k = 0; k < K; ++k)
             selected = __fmaf_rn(scores[row * SEISMIC_SCORES_STRIDE_0 + k * SEISMIC_SCORES_STRIDE_1],
                                  __ldcg(row_published + k * H + n), selected);
-        out[row * SEISMIC_RESULT_0_STRIDE_0 + n] =
-            residual[row * SEISMIC_RESIDUAL_STRIDE_0 + n] + selected
-            + __ldcg(row_published + K * H + n) * coefficients[row * SEISMIC_COEFFICIENT_STRIDE_0];
+        projection::routed_join<SEISMIC_DIM_SN, (SEISMIC_DIM_IN != 0)>(
+            out + row * SEISMIC_RESULT_0_STRIDE_0, residual + row * SEISMIC_RESIDUAL_STRIDE_0,
+            inject + row * SEISMIC_INJECT_STRIDE_0, H, n, selected,
+            __ldcg(row_published + K * H + n) * coefficients[row * SEISMIC_COEFFICIENT_STRIDE_0]);
     }
 }
 #endif

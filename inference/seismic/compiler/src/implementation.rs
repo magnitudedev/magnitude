@@ -2865,6 +2865,9 @@ mod internals {
                         SymbolSort::Scalar(DType::U32) => AnyExpr::from(
                             self.arena.scalar_symbol::<seismic_lang::expr::U32>(*symbol),
                         ),
+                        SymbolSort::Scalar(DType::U64) => AnyExpr::from(
+                            self.arena.scalar_symbol::<seismic_lang::expr::U64>(*symbol),
+                        ),
                         SymbolSort::Scalar(DType::Bool) => AnyExpr::from(
                             self.arena
                                 .scalar_symbol::<seismic_lang::expr::BoolScalar>(*symbol),
@@ -2978,6 +2981,9 @@ mod internals {
                                     .into(),
                                 DType::U32 => arena
                                     .scalar_symbol::<seismic_lang::expr::U32>(symbol)
+                                    .into(),
+                                DType::U64 => arena
+                                    .scalar_symbol::<seismic_lang::expr::U64>(symbol)
                                     .into(),
                                 DType::Bool => arena
                                     .scalar_symbol::<seismic_lang::expr::BoolScalar>(symbol)
@@ -3457,6 +3463,10 @@ mod internals {
                                 digest.bytes(b"u32");
                                 digest.hashed(value)
                             }
+                            seismic_ir::kernel::ops::ConstantValue::U64(value) => {
+                                digest.bytes(b"u64");
+                                digest.hashed(value)
+                            }
                             seismic_ir::kernel::ops::ConstantValue::Bool(value) => {
                                 digest.bytes(b"bool");
                                 digest.hashed(value)
@@ -3657,6 +3667,18 @@ mod internals {
                         place(digest, *source);
                         digest.hashed(plane);
                         digest.hashed(field);
+                        values(digest, index);
+                    }
+                    Op::ReadPlaneLane {
+                        out,
+                        place: source,
+                        plane,
+                        index,
+                    } => {
+                        digest.bytes(b"read-plane-lane");
+                        value(digest, *out);
+                        place(digest, *source);
+                        digest.hashed(plane);
                         values(digest, index);
                     }
                     Op::ReadPlane {

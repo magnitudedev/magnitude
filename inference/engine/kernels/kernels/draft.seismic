@@ -7,31 +7,36 @@
 # draft step embeds the previous step's selection directly; `directory`
 # addresses the table's rows (`gathered_row`). A failed selection (token -1)
 # embeds row 0; its proposal is discarded by the host.
-fn draft_rows[M, V, D, R](tokens: &tensor[M, 2] i32, directory: &tensor[R] i32,
-    table: &tensor[V, D] EW, conditioning: &tensor[M, D] A, embedding_norm: &tensor[D] EN,
-    hidden_norm: &tensor[D] HN, combine: &tensor[D, 2 * D] CW,
-    epsilon: f32) -> tensor[M, D] f32 where R >= 0:
+fn draft_rows[M, V, D, S, R, F](tokens: &tensor[M, 2] i32, directory: &tensor[R, F] i32,
+    table: &tensor[V, D] EW, conditioning: &tensor[M, S * D] C, embedding_norm: &tensor[D] EN,
+    hidden_norm: &tensor[S * D] HN, combine: &tensor[D, 2 * D] CW,
+    epsilon: f32) -> tensor[M, S * D] f32 where R >= 0 and F >= 1 and S >= 1:
     let mut embedded = tensor[M, D] A
     let mut normalized_embedding = tensor[M, D] A
-    let mut normalized_hidden = tensor[M, D] A
-    let mut joined = tensor[M, 2 * D] A
-    let mut result = tensor[M, D] f32
-    for row in 0..M:
-        for column in 0..2 * D:
-            joined[row, column] = 0.0
-        for column in 0..D:
-            result[row, column] = 0.0
+    let mut joined = tensor[M * S, 2 * D] A
+    let mut projected = tensor[M * S, D] f32
+    let mut result = tensor[M, S * D] f32
     parallel for row in 0..M:
         let token = gathered_row(directory, tokens[row, 0])
         parallel for column in 0..D:
             embedded[row, column] = f32(table[token, column])
     rms_norm(embedded, embedding_norm, normalized_embedding, epsilon)
-    rms_norm(conditioning, hidden_norm, normalized_hidden, epsilon)
     parallel for row in 0..M:
-        parallel for column in 0..D:
-            joined[row, column] = normalized_embedding[row, column]
-            joined[row, D + column] = normalized_hidden[row, column]
-    linear(joined, combine, result)
+        parallel for stream in 0..S:
+            let mut squares = 0.0
+            for column in 0..D:
+                let value = f32(conditioning[row, stream * D + column])
+                squares += value * value
+            let inverse = rsqrt(squares / f32(D) + epsilon)
+            parallel for column in 0..D:
+                joined[row * S + stream, column] = normalized_embedding[row, column]
+                joined[row * S + stream, D + column] = f32(conditioning[row, stream * D + column]) * inverse * f32(hidden_norm[stream * D + column])
+                projected[row * S + stream, column] = 0.0
+    linear(joined, combine, projected)
+    parallel for row in 0..M:
+        parallel for stream in 0..S:
+            parallel for column in 0..D:
+                result[row, stream * D + column] = projected[row * S + stream, column]
     return result
 
 # Metal decode uses one threadgroup per (32 outputs, row). Prefill joins
@@ -42,34 +47,44 @@ fn draft_rows[M, V, D, R](tokens: &tensor[M, 2] i32, directory: &tensor[R] i32,
 # reduces four combine rows over it. (CUDA holds the joined row in F32 and
 # decodes mma16 lane chunks, hence its larger shared memory.)
 native draft_rows for metal from "metal/draft_rows.metal":
-    scratch joined bytes (M * D * 2 * 2 * min(M / 17, 1))
-    launch draft_rows when M <= 16:
-        threadgroups (ceil_div(D, 32), M, 1)
+    scratch joined bytes (M * S * D * 2 * 2 * min(M * S / 17, 1))
+    launch draft_rows when M * S <= 16:
+        threadgroups (ceil_div(D, 32), M * S, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * D + 64)
-    launch draft_rows_join when M > 16:
-        threadgroups (1, M, 1)
+    launch draft_rows_join when M * S > 16:
+        threadgroups (1, M * S, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * D + 64)
-    launch draft_rows_gemm when M > 16:
-        threadgroups (ceil_div(D, 64), ceil_div(M, 64), 1)
+    launch draft_rows_gemm when M * S > 16:
+        threadgroups (ceil_div(D, 64), ceil_div(M * S, 64), 1)
         threads_per_threadgroup (128, 1, 1)
 
-# Packed tables and combine weights decode whole 64-column k-blocks (every
-# k-quant row is a multiple of 256 columns); the joined row is F32 in shared
-# memory. (Metal holds it in A.)
+# CUDA shares the standard projection row bands. Large classes stage each
+# normalized row/stream once and share combine weight tiles across rows.
 native draft_rows for cuda from "cuda/draft_rows.cu":
-    launch draft_rows:
-        threadgroups (ceil_div(D, 32), M, 1)
+    scratch joined bytes (M * S * D * 4) when M * S > 16
+    launch draft_rows when M * S <= 16:
+        threadgroups (ceil_div(D, 32), M * S, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (8 * D)
+    launch draft_rows_join when M * S > 16:
+        threadgroups (1, M * S, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (8 * D)
+    launch draft_rows_gemm_small when M * S > 16 and M * S <= 64:
+        threadgroups (ceil_div(D, 128), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (3 * (64 * 144 + 10240) + 2048)
+    launch draft_rows_gemm when M * S > 64:
+        threadgroups (ceil_div(D, 128), ceil_div(M * S, 128), 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (2 * (128 * 144 + 10240) + 2048)
 
-# Vulkan: one workgroup per (32 outputs, row); D is static because it sizes
-# the shared joined row (Vulkan spec §6.2).
 native draft_rows for vulkan from "vulkan/draft_rows.comp":
     static (D)
     launch draft_rows:
-        threadgroups (ceil_div(D, 32), M, 1)
+        threadgroups (ceil_div(D, 32), M * S, 1)
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (4 * D + 64)
 
@@ -79,12 +94,12 @@ native draft_rows for vulkan from "vulkan/draft_rows.comp":
 # library, `cpu/lib/projection/projection.rs`).
 native draft_rows for cpu from "cpu/draft_rows.rs":
     params (ROWS in [8, 4, 2, 1], arithmetic INT8 in [0, 1])
-    scratch quantized bytes (M * ceil_div(2 * D, 256) * 292)
-    scratch joined bytes (M * D * 8)
+    scratch quantized bytes (M * S * ceil_div(2 * D, 256) * 292)
+    scratch joined bytes (M * S * D * 8)
     launch draft_rows_join:
-        threadgroups (M, 1, 1)
+        threadgroups (M * S, 1, 1)
         threads_per_threadgroup (1, 1, 1)
-        shared_bytes (D * 8)
+        shared_bytes (D * 8 * (S + 1))
     launch draft_rows_rows:
         threadgroups (ceil_div(D, ROWS), 1, 1)
         threads_per_threadgroup (1, 1, 1)

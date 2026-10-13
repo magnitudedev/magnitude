@@ -185,6 +185,7 @@ fn round_import(dtype: DType) -> HostImport {
         DType::I32 => RoundImport::I32,
         DType::U32 => RoundImport::U32,
         DType::Bool => RoundImport::Bool,
+        DType::U64 => unreachable!("only narrow floating values are rounded by import"),
     })
 }
 
@@ -206,7 +207,9 @@ fn atomic_import(dtype: DType, op: seismic_lang::intrinsics::AtomicOp) -> HostIm
         (DType::U32, AtomicOp::Add) => AtomicImport::AddU32,
         (DType::U32, AtomicOp::Max) => AtomicImport::MaxU32,
         (DType::U32, AtomicOp::Min) => AtomicImport::MinU32,
-        (DType::Bool, _) => panic!("typed CPU kernel admitted an atomic boolean"),
+        (DType::Bool | DType::U64, _) => {
+            panic!("typed CPU kernel admitted an atomic {dtype}")
+        }
     })
 }
 
@@ -419,6 +422,8 @@ impl Emitter<'_, '_> {
                             UnaryOp::Neg => self.builder.ins().fneg(a),
                             UnaryOp::Abs => self.builder.ins().fabs(a),
                         },
+                        // An unsigned word is its own magnitude.
+                        ValueType::Scalar(DType::U32 | DType::U64) if op == UnaryOp::Abs => a,
                         _ => match op {
                             UnaryOp::Neg => self.builder.ins().ineg(a),
                             UnaryOp::Abs => {
@@ -667,6 +672,27 @@ impl Emitter<'_, '_> {
                     );
                     self.define(out.value, value);
                 }
+                ClosedOpView::ReadPlaneLane {
+                    out,
+                    plane_info,
+                    indices,
+                    ..
+                } => {
+                    // The packing axis's coordinate (a plane group divides
+                    // the packet group).
+                    let logical = self.value(
+                        indices
+                            .last()
+                            .expect("a packed place has a packing axis")
+                            .value(),
+                    );
+                    let lane = self
+                        .builder
+                        .ins()
+                        .urem_imm(logical, i64::from(plane_info.group));
+                    let lane = self.builder.ins().ireduce(types::I32, lane);
+                    self.define(out.value, lane);
+                }
                 ClosedOpView::ReadPlane {
                     out,
                     place,
@@ -860,6 +886,7 @@ impl Emitter<'_, '_> {
             }
             ConstantValue::I32(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
             ConstantValue::U32(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
+            ConstantValue::U64(value) => self.builder.ins().iconst(types::I64, value as i64),
             ConstantValue::Bool(value) => self.builder.ins().iconst(types::I32, i64::from(value)),
             ConstantValue::Index(value) => self.builder.ins().iconst(types::I64, value as i64),
         }
@@ -1152,7 +1179,7 @@ impl Emitter<'_, '_> {
         } else if from_bool {
             if to_float {
                 self.builder.ins().fcvt_from_uint(types::F32, value)
-            } else if to == ValueType::Index {
+            } else if native_type(to).bits() > 32 {
                 self.builder.ins().uextend(types::I64, value)
             } else {
                 value
@@ -1160,10 +1187,14 @@ impl Emitter<'_, '_> {
         } else if from_float && to_float {
             value
         } else if from_float {
-            let word = if to == ValueType::Scalar(DType::I32) {
-                self.builder.ins().fcvt_to_sint_sat(types::I32, value)
-            } else {
-                self.builder.ins().fcvt_to_uint_sat(types::I32, value)
+            let word = match to {
+                ValueType::Scalar(DType::I32) => {
+                    self.builder.ins().fcvt_to_sint_sat(types::I32, value)
+                }
+                ValueType::Scalar(DType::U64) => {
+                    self.builder.ins().fcvt_to_uint_sat(types::I64, value)
+                }
+                _ => self.builder.ins().fcvt_to_uint_sat(types::I32, value),
             };
             if to == ValueType::Index {
                 self.builder.ins().uextend(types::I64, word)
@@ -1175,23 +1206,28 @@ impl Emitter<'_, '_> {
                 ValueType::Scalar(DType::I32) => {
                     self.builder.ins().fcvt_from_sint(types::F32, value)
                 }
-                ValueType::Scalar(DType::U32) | ValueType::Index => {
+                ValueType::Scalar(DType::U32 | DType::U64) | ValueType::Index => {
                     self.builder.ins().fcvt_from_uint(types::F32, value)
                 }
                 _ => panic!("typed scalar cast contains a non-scalar source"),
             }
         } else {
-            // Source integer conversions preserve the low 32 bits;
-            // an internal natural destination zero-extends that word.
-            let word = if from == ValueType::Index {
+            // Integer conversions keep the low word of a wider source. Into a
+            // wider destination (Index and U64 are 64-bit) a U64 takes an
+            // I32's value modulo 2^64 (sign extension); every other word
+            // zero-extends.
+            let (from_bits, to_bits) = (native_type(from).bits(), native_type(to).bits());
+            if from_bits > to_bits {
                 self.builder.ins().ireduce(types::I32, value)
+            } else if from_bits < to_bits {
+                match (from, to) {
+                    (ValueType::Scalar(DType::I32), ValueType::Scalar(DType::U64)) => {
+                        self.builder.ins().sextend(types::I64, value)
+                    }
+                    _ => self.builder.ins().uextend(types::I64, value),
+                }
             } else {
                 value
-            };
-            if to == ValueType::Index {
-                self.builder.ins().uextend(types::I64, word)
-            } else {
-                word
             }
         };
         self.round_value(result, to)
@@ -1538,7 +1574,9 @@ impl Emitter<'_, '_> {
                     .bitcast(types::F32, MemFlags::new(), shifted)
             }
             DType::I32 => self.builder.ins().fcvt_from_sint(types::F32, value),
-            DType::U32 | DType::Bool => self.builder.ins().fcvt_from_uint(types::F32, value),
+            DType::U32 | DType::U64 | DType::Bool => {
+                self.builder.ins().fcvt_from_uint(types::F32, value)
+            }
         }
     }
 
@@ -1731,6 +1769,11 @@ impl Emitter<'_, '_> {
                 let right = self.repack_expression(source_packet, right);
                 self.builder.ins().fmul(left, right)
             }
+            RepackExpr::ScaleF32 { value, exponent } => {
+                let value = self.repack_expression(source_packet, value);
+                let factor = self.builder.ins().f32const(2f32.powi(i32::from(*exponent)));
+                self.builder.ins().fmul(value, factor)
+            }
             RepackExpr::Lookup { index, table } => {
                 // Registered tables are process-lifetime statics and the JIT
                 // runs in this process, so the table is addressed directly.
@@ -1757,6 +1800,10 @@ impl Emitter<'_, '_> {
                     .ins()
                     .load(types::I32, MemFlags::trusted(), address, 0)
             }
+            DType::U64 => self
+                .builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), address, 0),
             DType::Bool => {
                 let value = self
                     .builder
@@ -1776,7 +1823,7 @@ impl Emitter<'_, '_> {
 
     fn store_element(&mut self, address: Value, dtype: DType, value: Value) {
         let stored = match dtype {
-            DType::F32 | DType::I32 | DType::U32 => value,
+            DType::F32 | DType::I32 | DType::U32 | DType::U64 => value,
             DType::Bool => self.builder.ins().ireduce(types::I8, value),
             DType::F16 | DType::BF16 => self.builder.ins().ireduce(types::I16, value),
         };
@@ -1794,6 +1841,7 @@ impl Emitter<'_, '_> {
                     .bitcast(types::F32, MemFlags::new(), bits)
             }
             DType::I32 | DType::U32 | DType::Bool => self.builder.ins().ireduce(types::I32, word),
+            DType::U64 => word,
             DType::F16 | DType::BF16 => {
                 let bits = self.builder.ins().ireduce(types::I32, word);
                 self.builder.ins().band_imm(bits, 0xffff)
@@ -1802,6 +1850,9 @@ impl Emitter<'_, '_> {
     }
 
     fn encode_word(&mut self, value: Value, dtype: DType) -> Value {
+        if dtype == DType::U64 {
+            return value;
+        }
         let raw = match dtype {
             DType::F32 => self
                 .builder
@@ -1809,6 +1860,7 @@ impl Emitter<'_, '_> {
                 .bitcast(types::I32, MemFlags::new(), value),
             DType::I32 | DType::U32 | DType::Bool => value,
             DType::F16 | DType::BF16 => self.builder.ins().band_imm(value, 0xffff),
+            DType::U64 => unreachable!("a U64 word is its own encoding"),
         };
         self.builder.ins().uextend(types::I64, raw)
     }
@@ -1997,6 +2049,8 @@ fn native_type(ty: ValueType) -> ir::Type {
 fn native_scalar_type(dtype: DType) -> ir::Type {
     if dtype == DType::F32 {
         types::F32
+    } else if dtype == DType::U64 {
+        types::I64
     } else {
         types::I32
     }

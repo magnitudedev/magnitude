@@ -263,8 +263,10 @@ pub(crate) fn dequantize(
     shape: &[u64],
     bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let packet = crate::resident_element(encoding, seismic::DType::F32, seismic::Layout::Packet)
-        .ok_or_else(|| format!("{encoding:?} has no packet representation"))?;
+    let width = shape.last().copied().unwrap_or(1);
+    let packet =
+        crate::resident_element(encoding, width, seismic::DType::F32, seismic::Layout::Packet)
+            .ok_or_else(|| format!("{encoding:?} has no packet representation"))?;
     let canonical = packet
         .repack_host(source, shape, bytes)
         .ok_or_else(|| format!("{encoding:?} has no conversion into {}", packet.name()))?;

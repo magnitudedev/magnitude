@@ -506,6 +506,11 @@ impl Element {
             seismic_lang::types::DType::U32,
         ))
     }
+    pub fn u64() -> Element {
+        Element(seismic_lang::registry::dense(
+            seismic_lang::types::DType::U64,
+        ))
+    }
     pub fn bool() -> Element {
         Element(seismic_lang::registry::dense(
             seismic_lang::types::DType::Bool,
@@ -544,6 +549,46 @@ impl BF16 {
     }
     pub const fn to_bits(self) -> u16 {
         self.0
+    }
+}
+
+pub use seismic_runtime::native::graph::NativeTimelinePort;
+pub use seismic_runtime::native::timeline::TimelineNode;
+
+/// A monotonic value one device's native work and the host both advance
+/// and wait on (`seismic_runtime::native::timeline`). A sealed graph's
+/// timeline node binds it per run: at a wait node (the host gate) the device
+/// runs nothing after it until the host has raised the timeline to the run's
+/// value; at a signal node the device raises it to the run's value once the
+/// work before has completed, its writes visible to the host.
+#[derive(Clone)]
+pub struct Timeline {
+    inner: Arc<seismic_runtime::native::timeline::TimelineInner>,
+}
+
+impl Timeline {
+    /// A timeline at 0 on `device`.
+    pub fn new(device: &Device) -> Result<Self, TensorError> {
+        seismic_runtime::native::timeline::TimelineInner::new(device.inner()).map(|inner| Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Raise the timeline to `value` from the host, after every host write
+    /// before it; a value it has reached already changes nothing.
+    pub fn signal(&self, value: u64) -> Result<(), ExecutionError> {
+        self.inner.signal(value)
+    }
+
+    /// Whether the timeline has reached `value`.
+    pub fn reached(&self, value: u64) -> bool {
+        self.inner.reached(value)
+    }
+
+    /// Wait at most `timeout` for the timeline to reach `value`, after which
+    /// the host sees every device write before the signal; whether it did.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        self.inner.wait(value, timeout)
     }
 }
 
@@ -679,6 +724,46 @@ impl Tensor {
         .map(|inner| Tensor {
             inner: Arc::new(inner),
         })
+    }
+
+    /// A zero-filled tensor in storage the host writes and reads in place
+    /// while device work that uses it is queued or running (host-visible on
+    /// every backend, mapped pinned host memory on CUDA): the slots and the
+    /// directory of a table the host fills while steps that read it wait at
+    /// a gate (`Timeline`), or a notice the device writes for the host.
+    pub fn shared(
+        device: &Device,
+        element: Element,
+        extents: &[u64],
+    ) -> Result<Tensor, TensorError> {
+        seismic_runtime::api::tensor::TensorInner::shared(device.inner(), element.id(), extents)
+            .map(|inner| Tensor {
+                inner: Arc::new(inner),
+            })
+    }
+
+    /// Write `bytes` at `offset` bytes into this view without waiting for
+    /// device work that uses its storage.
+    ///
+    /// # Safety
+    /// The tensor was made by [`Tensor::shared`] (or is a view of one), and
+    /// no device work in flight reads or writes these bytes: what the device
+    /// reads after it, it reads after a gate the host opens once written.
+    pub unsafe fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<(), TensorError> {
+        // SAFETY: the caller upholds the contract.
+        unsafe { self.inner.write_shared(offset, bytes) }
+    }
+
+    /// Read `into.len()` bytes at `offset` bytes into this view without
+    /// waiting for device work that uses its storage.
+    ///
+    /// # Safety
+    /// The tensor was made by [`Tensor::shared`] (or is a view of one), and
+    /// no device work in flight writes these bytes: the device wrote them
+    /// before a signal the host waited for.
+    pub unsafe fn read_shared(&self, offset: u64, into: &mut [u8]) -> Result<(), TensorError> {
+        // SAFETY: the caller upholds the contract.
+        unsafe { self.inner.read_shared(offset, into) }
     }
 
     /// A zero-filled owned tensor.
@@ -2248,6 +2333,12 @@ impl NativeGraphMetadata {
         self.backend
     }
 
+    /// A timeline node after every node enqueued so far
+    /// (`NativeGraph::timeline`).
+    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        self.inner.timeline(node)
+    }
+
     /// Tag following checked ports and nodes with a semantic class extent
     /// scope. A scoped override distinguishes repeated calls to one entry.
     pub fn set_class_scope(&mut self, scope: Option<&'static str>) {
@@ -2513,6 +2604,13 @@ impl NativePort {
 }
 
 impl NativeGraph {
+    /// A timeline node after every node enqueued so far: a host gate the
+    /// device waits at, or a signal the host waits for (`Timeline`). Each
+    /// run binds it (`NativeGraphBindings::set_timeline`).
+    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        self.inner.timeline(node)
+    }
+
     /// Declare an external tensor descriptor from model metadata. Sealing
     /// checks each use against its generated Seismic entry contract.
     pub fn port(&mut self, element: Element, extents: &[u64]) -> Result<NativePort, TensorError> {
@@ -2784,6 +2882,19 @@ pub struct NativeGraphBindings {
 impl NativeGraphBindings {
     pub fn set(&mut self, port: &NativePort, tensor: &Tensor) -> Result<(), WorkflowError> {
         self.inner.set(port.inner, tensor.inner.clone())
+    }
+
+    /// Bind timeline node `port` to `timeline` at `value` for this run: a
+    /// gate waits until the timeline reaches the value, a signal raises it
+    /// to the value.
+    pub fn set_timeline(
+        &mut self,
+        port: NativeTimelinePort,
+        timeline: &Timeline,
+        value: u64,
+    ) -> Result<(), WorkflowError> {
+        self.inner
+            .set_timeline(port, timeline.inner.clone(), value)
     }
 
     /// Bind an unsubmitted exported output lease as a graph destination.

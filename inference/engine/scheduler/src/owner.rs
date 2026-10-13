@@ -413,6 +413,7 @@ fn classify_domain_error(error: DomainError) -> RequestError {
         DomainError::Invariant(error) | DomainError::Submit(SubmitError::Invariant(error)) => {
             RequestError::Invariant(error)
         }
+        DomainError::TableRead(error) => RequestError::TableRead(error),
     }
 }
 

@@ -7,6 +7,7 @@
 // Activation tensors are canonical in their last axis.
 
 #include "../core/activation.cuh"
+#include "../core/functions.cuh"
 #include <seismic/slab.cuh>
 
 namespace recurrent {
@@ -398,7 +399,8 @@ __device__ __forceinline__ void advance_rows(const Inputs &in, const Slot &slot,
 // from its raw outputs `mixed`. Per value head (one warp each, lanes striding
 // the head's columns, then a warp sum),
 //   gated = round_A(round_A(raw * rsqrt(sum_head raw^2 / W + eps) * norm[i])
-//                   * round_A(silu(z)))
+//                   * round_A(gate(z)))
+// with gate the output gate of `gate_function` (`functions::output_gate`)
 // with z column CH + head * W + i of the projection row.
 template <class NORM>
 __device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, const u8 *norm, float eps,
@@ -422,7 +424,7 @@ __device__ __forceinline__ void gate_row(const Inputs &in, const u8 *mixed, cons
         const float v = element::at<Act>(mixed, raw_index(row, head, i));
         const float normalized = Act::round(v * inverses[head] * element::at<NORM>(norm, i));
         const float z = projection(in, row, CH + k);
-        const float activated = Act::round(z / (1.0f + expf(-z)));
+        const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
         element::put<Act>(gated,
                           static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
                               static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +
@@ -453,7 +455,7 @@ __device__ __forceinline__ void gate_head(const Inputs &in, const u8 *mixed, con
             const float v = Act::load(__ldcg(raw + raw_index(row, head, i)));
             const float normalized = Act::round(v * inverse * element::at<NORM>(norm, i));
             const float z = projection(in, row, CH + head * W + i);
-            const float activated = Act::round(z / (1.0f + expf(-z)));
+            const float activated = Act::round(functions::output_gate((int)SEISMIC_PARAM_GATE_FUNCTION, z));
             element::put<Act>(gated,
                               static_cast<u64>(row) * SEISMIC_RESULT_0_STRIDE_0 +
                                   static_cast<u64>(head) * SEISMIC_RESULT_0_STRIDE_1 +

@@ -30,10 +30,11 @@ pub(super) fn exact(
         return match value {
             ReferenceScalar::I32(value) => Some(arena.int(i64::from(*value))),
             ReferenceScalar::U32(value) => Some(arena.int(i64::from(*value))),
+            ReferenceScalar::U64(value) => Some(arena.int_exact((*value).into())),
             _ => None,
         };
     }
-    if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = result {
+    if let ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) = result {
         if matches!(id, PrimitiveId::Copy) && operands.len() == 1 && operands[0].ty == result {
             return operands[0].value;
         }
@@ -46,7 +47,7 @@ pub(super) fn exact(
         let inputs = operands
             .iter()
             .map(|operand| match operand.ty {
-                ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) => Some(ScalarOperand::Word {
+                ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) => Some(ScalarOperand::Word {
                     dtype: *dtype,
                     value: operand.value?,
                 }),

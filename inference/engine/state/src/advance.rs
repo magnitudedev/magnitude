@@ -15,7 +15,8 @@ use std::rc::Rc;
 /// rows and records the tape of the rows after it. `history` holds the
 /// planes of every stored domain ([`StateStore::history_planes`]);
 /// `destinations[domain]` holds the advance's fresh rows in that domain, one
-/// per advance row.
+/// per advance row (for Block, one per block the advance completes, in
+/// order).
 #[derive(Clone, Copy)]
 pub struct OwnedAdvanceBindings<'a> {
     pub recurrent: &'a [Tensor],
@@ -318,7 +319,8 @@ impl OwnedCodecAdvance {
 
 fn identify_codec(components: &[ComponentDescriptor]) -> Result<KvCodec, Error> {
     for candidate in [KvCodec::Dense, KvCodec::AffineK8V4, KvCodec::RotatedK4V4] {
-        if components.iter().all(|component| {
+        // An indexer's keys are dense whatever the attention codec.
+        if components.iter().filter(|component| component.attended()).all(|component| {
             let dense_dtype = match component.codec.key {
                 Codec::Dense { dtype } => dtype,
                 _ => seismic::DType::F16,
@@ -525,7 +527,7 @@ impl OwnedStateAdvance {
                 Error::from("committed rows must be a nonempty prefix of the advance"),
             ));
         }
-        let claims = match state.store.reserve(Some(&state.claims), count) {
+        let claims = match state.store.reserve(Some(&state.claims), state.position, count) {
             Ok(claims) => claims,
             Err(error) => return Err((state, error)),
         };
@@ -645,9 +647,11 @@ impl OwnedStateAdvance {
         } else {
             0
         };
+        // Each domain keeps the rows of the accepted prefix: a Block domain
+        // the blocks it completes.
         let mut kept = claims;
-        for claims in &mut kept {
-            drop(claims.split_off(accepted));
+        for (claims, domain) in kept.iter_mut().zip(&state.store.domains) {
+            drop(claims.split_off(domain.kind.advance_rows(state.position, accepted)));
         }
         install_commit(&mut state, kept, &mut following, tape, accepted);
         Ok(OwnedAdvanceResolution::Committed(state))
@@ -771,7 +775,7 @@ impl OwnedSuccessorAdvance {
         if count == 0 || count > store.context_capacity.saturating_sub(predecessor.end) {
             return Err(Error::from("successor advance exceeds context capacity"));
         }
-        let claims = store.reserve(Some(predecessor.claims), count)?;
+        let claims = store.reserve(Some(predecessor.claims), predecessor.end, count)?;
         let following = store.successor_bank()?;
         let destinations = destinations(&claims);
         let mut transaction = store.begin_transaction();

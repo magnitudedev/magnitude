@@ -140,9 +140,32 @@ fn plane_value(encoding: &PlaneEncoding, raw: u32) -> f64 {
             }
             CodeInterpretation::Offset(offset) => f64::from(raw) - f64::from(*offset),
             CodeInterpretation::Table(table) => f64::from(table[raw as usize]),
+            // An entry of vector codes is no one value: it is its raw bits.
+            CodeInterpretation::Grid(_) => f64::from(raw),
         },
         PlaneEncoding::FloatCode { format } => f64::from(format.decode(raw)),
     }
+}
+
+/// Whether a plane holds vector codes, whose entries never move.
+fn vector_codes(encoding: &PlaneEncoding) -> bool {
+    matches!(
+        encoding,
+        PlaneEncoding::Packed {
+            interpretation: CodeInterpretation::Grid(_),
+            ..
+        }
+    )
+}
+
+/// The first plane whose entries step by decoded value: the code plane, or
+/// for vector codes the plane of their scale codes.
+fn stepping_code_plane(packet: &PackedPacketLayout) -> usize {
+    packet
+        .planes
+        .iter()
+        .position(|plane| !vector_codes(&plane.encoding))
+        .expect("a packed representation has a stepping plane")
 }
 
 fn step_of(steps: &Steps, raw: u32, up: bool) -> Step {
@@ -606,11 +629,13 @@ fn level_tables_order_codes_by_decoded_value() {
         assert_eq!(step_of(&table, raw, true), up, "raw {raw} up");
     }
 
-    assert!(Steps::of(&PlaneEncoding::Packed {
-        bits: ENUMERABLE_CODE_BITS + 1,
-        interpretation: CodeInterpretation::Unsigned,
-    })
-    .is_none());
+    assert!(
+        Steps::of(&PlaneEncoding::Packed {
+            bits: ENUMERABLE_CODE_BITS + 1,
+            interpretation: CodeInterpretation::Unsigned,
+        })
+        .is_none()
+    );
     assert!(Steps::of(&PlaneEncoding::Dense(DType::U32)).is_none());
 }
 
@@ -620,7 +645,11 @@ fn every_registry_level_table_matches_the_plane_encoding() {
     for info in packed_storages() {
         for plane in &packet_form(info).planes {
             let Some(Steps::Levels(steps)) = Steps::of(&plane.encoding) else {
-                assert!(matches!(plane.encoding, PlaneEncoding::Dense(_)));
+                assert!(
+                    matches!(plane.encoding, PlaneEncoding::Dense(_))
+                        || (vector_codes(&plane.encoding)
+                            && matches!(Steps::of(&plane.encoding), Some(Steps::Fixed)))
+                );
                 continue;
             };
             tables += 1;
@@ -786,10 +815,12 @@ fn entry_roles(recipe: &DecodeRecipe) -> Vec<Vec<QuantizedComponent>> {
                             _ => None,
                         })
                         .expect("the recipe reads every plane field");
+                    // The step whose first operand is the read (a vector
+                    // code's also takes its lane).
                     let decoded = recipe
                         .steps()
                         .iter()
-                        .find(|step| step.uses() == [read])
+                        .find(|step| step.uses().first() == Some(&read))
                         .expect("the recipe decodes every plane read")
                         .defines();
                     QuantizedComponent::ALL
@@ -837,6 +868,8 @@ struct Observed {
     /// Unchanged finite entries with adjacent levels on both sides.
     interior: u64,
     non_finite: u64,
+    /// Entries of vector codes, which never move.
+    fixed: u64,
 }
 
 /// Perturb the canonical bytes of `packets`, whose reference decode is
@@ -884,6 +917,13 @@ fn perturb_and_examine(
             decoded_after[plane][field][flat],
         );
         let context = format!("`{name}` plane `{}` cell {cell} entry {entry}", schema.name);
+        if vector_codes(&schema.encoding) {
+            assert_eq!(raw_after, raw_before, "{context}: a vector code moved");
+            write_bits(&mut expected_packets, bit, schema.entry_bits, raw_after);
+            observed[plane].values += 1;
+            observed[plane].fixed += 1;
+            continue;
+        }
         // The entry addressed here is the one the reference decoder reads.
         let direct = plane_value(&schema.encoding, raw_before);
         assert!(
@@ -947,10 +987,10 @@ const DECODED_EXTENTS: [u64; 2] = [2, 270];
 fn assert_mixed_moves_are_adjacent(stored: &Stored, packets: &[u8], decoded: &[Vec<Vec<f64>>]) {
     let (tallies, observed) = perturb_and_examine(stored, packets, decoded, &dither(41, 0.3, 0.3));
     let name = stored.info.name;
+    let code = &observed[stepping_code_plane(stored.packet())];
     assert!(
-        observed[0].up > 0 && observed[0].down > 0 && observed[0].interior > 0,
-        "`{name}`: {:?}",
-        observed[0]
+        code.up > 0 && code.down > 0 && code.interior > 0,
+        "`{name}`: {code:?}"
     );
     for tally in tallies {
         assert!(
@@ -979,11 +1019,8 @@ fn every_packed_representation_steps_each_plane_to_its_adjacent_decoded_level() 
         // adjacent level on that side, or has none, or is not finite.
         for up in [true, false] {
             let (tallies, observed) = perturb_and_examine(&stored, &packets, &decoded, &all(up));
-            assert!(
-                observed[0].up + observed[0].down > 0,
-                "`{}` up={up}",
-                info.name
-            );
+            let code = &observed[stepping_code_plane(stored.packet())];
+            assert!(code.up + code.down > 0, "`{}` up={up}", info.name);
             for (plane, (tally, seen)) in tallies.iter().zip(&observed).enumerate() {
                 let context = format!("`{}` plane {plane} up={up}", info.name);
                 assert_eq!(seen.interior, 0, "{context}: an interior entry stayed");
@@ -999,7 +1036,7 @@ fn every_packed_representation_steps_each_plane_to_its_adjacent_decoded_level() 
                         values: seen.values,
                         up: if up { moved } else { 0 },
                         down: if up { 0 } else { moved },
-                        blocked: ended,
+                        blocked: ended + seen.fixed,
                         off_lattice: seen.non_finite,
                     },
                     "{context}"

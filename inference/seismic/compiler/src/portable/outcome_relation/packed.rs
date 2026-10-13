@@ -54,6 +54,14 @@ impl Analysis<'_> {
                 } => {
                     self.total_recipe(&reference::code_recipe(interpretation, *bits), &[get(*raw)])?
                 }
+                DecodeStep::ReadPlaneLane { plane, .. } => {
+                    self.plane_lane(view, indices, *plane, state)?
+                }
+                DecodeStep::InterpretGridCode {
+                    raw, lane, grid, ..
+                } => {
+                    self.total_recipe(&reference::grid_code_recipe(grid), &[get(*raw), get(*lane)])?
+                }
                 DecodeStep::DecodeFloatCode { raw, format, .. } => {
                     self.total_recipe(&reference::float_code_recipe(*format), &[get(*raw)])?
                 }

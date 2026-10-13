@@ -23,8 +23,14 @@
 //!
 //! Standalone calls, and every launch of a launch-detail trace (timed one by
 //! one), are recorded launch by launch into one queue submission.
+//!
+//! A timeline boundary (`timeline`) ends a queue submission: the one before
+//! it signals its signals' timeline semaphores, and the one after it waits
+//! on its gates'. The calls between boundaries are recorded and divided as
+//! a submission of their own.
 
 use super::graph_replays::Replays;
+use super::timeline::{TimelineKind, TimelineNode, TimelineOperation};
 use super::{DispatchList, NativeRoute, RouteSubmission};
 use crate::api::CallError;
 use crate::backends::vulkan_buffer;
@@ -102,59 +108,96 @@ fn encode_measured(
     timed: Option<usize>,
     retained: &Arc<dyn Any + Send + Sync>,
 ) -> Result<RouteSubmission, CallError> {
-    let Some(mut key) = list.plans().filter(|_| timed.is_none()) else {
-        let mut batch = match timed {
-            Some(launches) => DirectBatch::timed(device, launches),
-            None => DirectBatch::new(device),
-        }
-        .map_err(CallError::Execution)?;
+    // The calls between timeline boundaries form one segment. A boundary
+    // ends a queue submission: the next one waits on its gates' timelines,
+    // and the one it ends signals its signals'.
+    let segments = segments(list);
+    let Some(plans) = list.plans().filter(|_| timed.is_none()) else {
+        let new_batch = || {
+            match timed {
+                Some(launches) => DirectBatch::timed(device, launches),
+                None => DirectBatch::new(device),
+            }
+            .map_err(CallError::Execution)
+        };
+        let mut batch = new_batch()?;
+        let mut submissions = Vec::new();
         for _ in 0..repetitions {
-            each_launch(list, |launch| match launch {
-                Some(launch) => batch.launch(launch),
-                None => {
-                    batch.skip();
-                    Ok(())
+            for (calls, boundary) in &segments {
+                each_launch(list, calls.clone(), |launch| match launch {
+                    Some(launch) => batch.launch(launch),
+                    None => {
+                        batch.skip();
+                        Ok(())
+                    }
+                })?;
+                let operations = list.timelines(*boundary);
+                if operations.is_empty() {
+                    continue;
                 }
-            })?;
+                for operation in operations {
+                    if operation.node == TimelineNode::Signal {
+                        batch.signal_timeline(host_timeline(operation), operation.value);
+                    }
+                }
+                submissions.push(
+                    std::mem::replace(&mut batch, new_batch()?)
+                        .commit()
+                        .map_err(CallError::Execution)?,
+                );
+                for operation in operations {
+                    if operation.node == TimelineNode::Wait {
+                        batch.wait_timeline(host_timeline(operation), operation.value);
+                    }
+                }
+            }
         }
-        let submission = batch.commit().map_err(CallError::Execution)?;
+        submissions.push(batch.commit().map_err(CallError::Execution)?);
         return Ok(RouteSubmission::Vulkan(VulkanSubmission::new(
-            vec![submission],
+            submissions,
             None,
         )));
     };
-    key.extend(addresses(list));
+    let addresses = addresses(list);
     let mut queued = Queued::new(device);
-    replays.graphs.replay(
-        key,
-        retained,
-        || {
-            let mut launches = Vec::new();
-            each_launch(list, |launch| {
-                launches.extend(launch.map(DirectLaunch::kind));
-                Ok(())
-            })?;
-            Ok(Divided {
-                launches,
-                parts: Vec::new(),
-                graph: None,
-                measured: false,
-            })
-        },
-        |divided| {
-            divided.refresh(device, list, &replays.costs)?;
-            let graph = divided
-                .graph
-                .as_ref()
-                .expect("a refreshed division is recorded");
-            for _ in 0..repetitions {
-                for (segment, part) in divided.parts.iter().enumerate() {
-                    queued.add(graph, segment, part, replays.costs.estimate(&part.kinds))?;
-                }
+    for _ in 0..repetitions {
+        for (calls, boundary) in &segments {
+            if !calls.is_empty() {
+                let mut key = plans.clone();
+                key.extend(&addresses);
+                key.extend([calls.start as u64, calls.end as u64]);
+                replays.graphs.replay(
+                    key,
+                    retained,
+                    || {
+                        let mut launches = Vec::new();
+                        each_launch(list, calls.clone(), |launch| {
+                            launches.extend(launch.map(DirectLaunch::kind));
+                            Ok(())
+                        })?;
+                        Ok(Divided {
+                            launches,
+                            parts: Vec::new(),
+                            graph: None,
+                            measured: false,
+                        })
+                    },
+                    |divided| {
+                        divided.refresh(device, list, calls.clone(), &replays.costs)?;
+                        let graph = divided
+                            .graph
+                            .as_ref()
+                            .expect("a refreshed division is recorded");
+                        for (segment, part) in divided.parts.iter().enumerate() {
+                            queued.add(graph, segment, part, replays.costs.estimate(&part.kinds))?;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
-            Ok(())
-        },
-    )?;
+            queued.timelines(list.timelines(*boundary))?;
+        }
+    }
     let submissions = queued.finish()?;
     Ok(RouteSubmission::Vulkan(VulkanSubmission::new(
         submissions.submissions,
@@ -173,6 +216,7 @@ impl Divided {
         &mut self,
         device: &seismic_vulkan::Device,
         list: &impl DispatchList,
+        calls: Range<usize>,
         costs: &LaunchCosts<LaunchKind>,
     ) -> Result<(), CallError> {
         let current = self.measured
@@ -206,7 +250,7 @@ impl Divided {
         let mut builder = DirectGraphBuilder::new(device).map_err(CallError::Execution)?;
         let mut index = 0usize;
         let mut part = 0usize;
-        each_launch(list, |launch| {
+        each_launch(list, calls, |launch| {
             let Some(launch) = launch else {
                 return Ok(());
             };
@@ -361,6 +405,8 @@ fn sum<K: Eq + Hash>(seconds: &HashMap<K, f64>, kinds: &[(K, u32)]) -> Option<f6
 struct Queued<'a> {
     device: &'a seismic_vulkan::Device,
     open: Option<(DirectBatch, Option<f64>, Vec<(LaunchKind, u32)>)>,
+    /// Gates the next batch opened waits on.
+    gates: Vec<TimelineOperation>,
     submissions: Vec<DirectSubmission>,
     kinds: Vec<Vec<(LaunchKind, u32)>>,
 }
@@ -375,9 +421,51 @@ impl<'a> Queued<'a> {
         Self {
             device,
             open: None,
+            gates: Vec::new(),
             submissions: Vec::new(),
             kinds: Vec::new(),
         }
+    }
+
+    /// Open a batch, which waits on the gates of the boundary before it.
+    fn open(&mut self) -> Result<(), CallError> {
+        let mut batch = DirectBatch::new(self.device).map_err(CallError::Execution)?;
+        for gate in self.gates.drain(..) {
+            batch.wait_timeline(host_timeline(&gate), gate.value);
+        }
+        self.open = Some((batch, Some(0.0), Vec::new()));
+        Ok(())
+    }
+
+    /// A boundary's timeline operations: its signals end the open batch
+    /// (an empty one when none is open), and its gates make the next batch
+    /// wait.
+    fn timelines(&mut self, operations: &[TimelineOperation]) -> Result<(), CallError> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        if operations
+            .iter()
+            .any(|operation| operation.node == TimelineNode::Signal)
+        {
+            if self.open.is_none() {
+                self.open()?;
+            }
+            let (batch, ..) = self.open.as_mut().expect("a batch is open");
+            for operation in operations {
+                if operation.node == TimelineNode::Signal {
+                    batch.signal_timeline(host_timeline(operation), operation.value);
+                }
+            }
+        }
+        self.commit()?;
+        self.gates.extend(
+            operations
+                .iter()
+                .filter(|operation| operation.node == TimelineNode::Wait)
+                .cloned(),
+        );
+        Ok(())
     }
 
     fn add(
@@ -393,8 +481,7 @@ impl<'a> Queued<'a> {
         );
         if !joins {
             self.commit()?;
-            let batch = DirectBatch::new(self.device).map_err(CallError::Execution)?;
-            self.open = Some((batch, Some(0.0), Vec::new()));
+            self.open()?;
         }
         let (batch, queued, kinds) = self.open.as_mut().expect("a batch is open");
         batch
@@ -422,11 +509,11 @@ impl<'a> Queued<'a> {
     }
 
     fn finish(mut self) -> Result<QueuedSubmissions, CallError> {
-        if self.open.is_none() && self.submissions.is_empty() {
-            // Nothing was queued (no repetition): an empty batch still
-            // orders the submission and reports its completion.
-            let batch = DirectBatch::new(self.device).map_err(CallError::Execution)?;
-            self.open = Some((batch, Some(0.0), Vec::new()));
+        if self.open.is_none() && (self.submissions.is_empty() || !self.gates.is_empty()) {
+            // Nothing was queued (no repetition), or gates end the list: an
+            // empty batch still orders the submission, waits on them and
+            // reports its completion.
+            self.open()?;
         }
         self.commit()?;
         Ok(QueuedSubmissions {
@@ -532,28 +619,56 @@ impl VulkanSubmission {
         Ok((start, end))
     }
 
-    /// Per-launch intervals of a timed submission, which is always one
-    /// queue submission.
+    /// Per-launch intervals of a timed submission: one queue submission,
+    /// or one per timeline segment, each timing its own launches in order.
     pub(crate) fn launch_intervals(
         &self,
         anchor: &TimelineAnchor,
     ) -> Result<Option<Vec<Option<(f64, f64)>>>, ExecutionError> {
-        match self.submissions.as_slice() {
-            [submission] => submission.launch_intervals(anchor),
-            _ => Ok(None),
+        let mut intervals = Vec::new();
+        for submission in &self.submissions {
+            let Some(own) = submission.launch_intervals(anchor)? else {
+                return Ok(None);
+            };
+            intervals.extend(own);
         }
+        Ok(Some(intervals))
     }
 }
 
-/// Visit every launch of one pass over `list` in order; `None` for an
-/// inactive launch.
+/// The calls of `list` between timeline boundaries, each range with the
+/// boundary that ends it, from a leading empty range for the operations
+/// before the first call to the range ending at the list's end.
+fn segments(list: &impl DispatchList) -> Vec<(Range<usize>, usize)> {
+    let mut segments = Vec::new();
+    let mut first = 0;
+    for boundary in 0..=list.count() {
+        if boundary == list.count() || !list.timelines(boundary).is_empty() {
+            segments.push((first..boundary, boundary));
+            first = boundary;
+        }
+    }
+    segments
+}
+
+/// The Vulkan timeline of an operation bound on this device.
+fn host_timeline(operation: &TimelineOperation) -> &seismic_vulkan::direct::HostTimeline {
+    let TimelineKind::Vulkan(timeline) = operation.timeline.kind() else {
+        unreachable!("a run binds timelines of its own device");
+    };
+    timeline
+}
+
+/// Visit every launch of the calls `calls` of one pass over `list` in
+/// order; `None` for an inactive launch.
 fn each_launch(
     list: &impl DispatchList,
+    calls: Range<usize>,
     mut visit: impl FnMut(Option<&DirectLaunch<'_>>) -> Result<(), ExecutionError>,
 ) -> Result<(), CallError> {
     let mut buffers = Vec::new();
     let mut typed = Vec::new();
-    for index in 0..list.count() {
+    for index in calls {
         buffers.clear();
         let dispatch = list.dispatch(index, &mut buffers);
         let NativeRoute::Vulkan { launches, .. } = &dispatch.kernel.route else {

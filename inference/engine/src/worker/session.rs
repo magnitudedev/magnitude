@@ -125,8 +125,8 @@ pub(crate) struct Loaded {
     pub execution: Worker<UnloadCause>,
     pub binding: GenerationBinding,
     pub definition: ModelDefinition,
-    /// Bytes of the model's host-resident tables held in host RAM.
-    pub host_table_bytes: u64,
+    /// The model's bytes in host RAM beside the device's allocation domain.
+    pub host_model: crate::census::HostModelBytes,
     pub domain: MemoryDomain,
 }
 
@@ -431,7 +431,7 @@ impl Session {
                     readings,
                 }) => match AllocationCensus::classify(
                     &reconciliation,
-                    self.loaded.host_table_bytes,
+                    self.loaded.host_model,
                     self.loaded.domain,
                 ) {
                     Ok(census) => {

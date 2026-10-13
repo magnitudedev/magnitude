@@ -2,20 +2,25 @@
 //! topology and external state; checked entry contracts derive every stage
 //! edge and intermediate allocation.
 
-use crate::operators::{self, MixerKind, PairedBlock, paired_block};
 use crate::device_table::ResidentTable;
+use crate::stored_table::{SelectionNotice, StoredTable};
+use crate::operators::{self, MixerKind, PairedBlock, paired_block};
 use crate::streamed_table::StreamedTable;
 use crate::{
     ModelLoadPlan, ResidentTarget, ResourceLimits, StateResourcePlan, TargetBlockProgramSlot,
     TargetProgramPlan,
     native::{AttestedTarget, AttestedTargetBlock, OutputScales},
     operators::block::{
-        self, BlockControlPorts, BlockStatePorts, FeedForwardEntries, MixerEntries, PerLayerParts,
+        self, BlockControlPorts, BlockStatePorts, FeedForwardEntries, MixerEntries, NGramParts,
+        PerLayerParts,
     },
+    operators::ngram::graph::{CheckedNGramEntries, NGramStepPorts},
     operators::per_layer::graph::{
         CheckedPerLayerEntryEntries, PerLayerEntryEntries, PerLayerEntryPorts, per_layer_entry,
         per_layer_entry_class_slice,
     },
+    operators::streams::StreamsGeometry,
+    operators::streams::graph::{CheckedStreamsEntries, StreamsEntries, mix_site, widen},
     programs::graph::GraphError,
     programs::graph::RowForm,
     programs::graph::draft::GraphDraft,
@@ -26,27 +31,52 @@ use crate::{
     },
 };
 use magnitude_family_contracts::{
-    Decoder, EmbeddingScale, SublayerIndex, TapPoint, WeightKind, WeightRole, WeightScope,
+    Decoder, EmbeddingScale, ExitNorm, SublayerIndex, TapPoint, WeightKind, WeightRole, WeightScope,
 };
-use magnitude_kernels::embedding_rows;
+use magnitude_kernels::{embedding_rows, selection_notice, stored_rows};
 use magnitude_state::LayerRef;
 use seismic::{
     BackendName, BoundNativeGraphPlan, Device, Element, HostHeap, NativeGraphClassSlice,
     NativeGraphFamily, NativeGraphLayout, NativeGraphMetadata, NativeGraphPlan,
-    NativeGraphStorageBytes, NativePort, WorkflowTensor,
+    NativeGraphStorageBytes, NativePort, NativeTimelinePort, TimelineNode, WorkflowTensor,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 /// A block graph's class: (rows, history segments, request slots, the
-/// history row tiles of its launch's rows it lists; 0 for a class that lists
-/// none).
-type BlockClass = (u64, u64, u64, u64);
+/// history row tiles of its launch's rows it lists, 0 for a class that lists
+/// none; whether a selected read scores, 1, or every row of the launch reads
+/// its whole history, 0 and every other block's).
+type BlockClass = (u64, u64, u64, u64, u64);
+
+/// The topology a block class's graph certifies in: its row form, whether
+/// it lists history row tiles and whether it scores.
+fn class_topology(class: BlockClass) -> (RowForm, bool, bool) {
+    let (rows, _, _, listed, scored) = class;
+    (RowForm::of(rows), listed > 0, scored > 0)
+}
+
+/// The shape of `slot`'s selected read, when its block reads one
+/// (`AttentionBinding::selection`).
+fn slot_selection(slot: TargetBlockProgramSlot) -> Option<crate::SelectionShape> {
+    match slot.mixer() {
+        crate::MixerProgramSlot::Attention(binding) => {
+            binding.selection.map(|selection| selection.shape)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `slot`'s block has classes that score a selected read.
+fn slot_scores(slot: TargetBlockProgramSlot) -> bool {
+    slot_selection(slot).is_some()
+}
 
 /// Whether the prefill graphs of `slot`'s block come in classes that list
-/// their launch's history row tiles: an attention block's, where the plan's
-/// device of `backend` reads its heads' history decoded.
+/// their launch's history row tiles: an attention block's that may
+/// (`attention::graph::lists_history_tiles`), where the plan's device of
+/// `backend` reads its heads' history decoded.
 fn slot_lists(
     state: &StateResourcePlan,
     backend: BackendName,
@@ -54,7 +84,8 @@ fn slot_lists(
 ) -> bool {
     match slot.mixer() {
         crate::MixerProgramSlot::Attention(binding) => {
-            state.lists_history_tiles(backend, binding.shape.width)
+            crate::operators::attention::graph::lists_history_tiles(binding)
+                && state.lists_history_tiles(backend, binding.shape.width)
         }
         _ => false,
     }
@@ -96,7 +127,9 @@ fn block_listings(
     rows: u64,
 ) -> Result<BlockListings, String> {
     let form = match slot.mixer() {
-        crate::MixerProgramSlot::Attention(binding) => {
+        crate::MixerProgramSlot::Attention(binding)
+            if crate::operators::attention::graph::lists_history_tiles(binding) =>
+        {
             state.decoded_history_form(backend, binding.shape.width)
         }
         _ => None,
@@ -121,13 +154,15 @@ fn block_listings(
 /// that lists none. A recurrent block
 /// binds exact per-slot bank tables (every slot count a launch of `rows`
 /// rows can serve, up to the launch slot bound) and is independent of
-/// segments. Everything else is per row.
+/// segments. Everything else is per row. A block that `scores` a selected
+/// read has, per segment count, a class that scores (and lists none).
 fn block_classes(
     mixer: MixerKind,
     rows: u64,
     max_slots: u64,
     max_segments: u64,
     listings: &BlockListings,
+    scores: bool,
 ) -> Vec<BlockClass> {
     match mixer {
         MixerKind::Attention => std::iter::successors(Some(1u64), |segments| {
@@ -143,22 +178,30 @@ fn block_classes(
                 .filter(move |_| listings.segments(segments, max_segments) == segments);
             std::iter::once(0)
                 .chain(listed)
-                .map(move |listed| (rows, segments, 1, listed))
+                .map(move |listed| (rows, segments, 1, listed, 0))
+                .chain(scores.then_some((rows, segments, 1, 0, 1)))
         })
         .collect(),
         MixerKind::Recurrent => (1..=rows.min(max_slots))
-            .map(|slots| (rows, 1, slots, 0))
+            .map(|slots| (rows, 1, slots, 0, 0))
             .collect(),
     }
 }
 
 /// The class of a block's graph serving a launch of `rows` rows over
 /// `segments` history segments and `slots` requests, listing `listed` of the
-/// launch's history row tiles.
-fn block_class(mixer: MixerKind, rows: u64, segments: u64, slots: u64, listed: u64) -> BlockClass {
+/// launch's history row tiles, scoring a selected read when `scored`.
+fn block_class(
+    mixer: MixerKind,
+    rows: u64,
+    segments: u64,
+    slots: u64,
+    listed: u64,
+    scored: bool,
+) -> BlockClass {
     match mixer {
-        MixerKind::Attention => (rows, segments, 1, listed),
-        MixerKind::Recurrent => (rows, 1, slots, 0),
+        MixerKind::Attention => (rows, segments, 1, listed, u64::from(scored)),
+        MixerKind::Recurrent => (rows, 1, slots, 0, 0),
     }
 }
 
@@ -172,10 +215,18 @@ fn block_class_slice(
     max_slots: u64,
     max_segments: u64,
     listed: &[u64],
+    scored: bool,
 ) -> Result<NativeGraphClassSlice, String> {
     let mixer = block.mixer.kind();
     // The segment and slot counts are those of every listing class.
-    let classes = block_classes(mixer, rows, max_slots, max_segments, &BlockListings::default());
+    let classes = block_classes(
+        mixer,
+        rows,
+        max_slots,
+        max_segments,
+        &BlockListings::default(),
+        false,
+    );
     let slice = NativeGraphClassSlice::new()
         .dimension("M", [rows])
         .dimension("O", [rows]);
@@ -186,7 +237,27 @@ fn block_class_slice(
         MixerKind::Attention => {
             slice.dimension("R", classes.iter().map(|&(_, segments, ..)| segments))
         }
-        MixerKind::Recurrent => slice.dimension("B", classes.iter().map(|&(_, _, slots, _)| slots)),
+        MixerKind::Recurrent => slice.dimension("B", classes.iter().map(|&(_, _, slots, ..)| slots)),
+    };
+    let slice = match block.mixer {
+        crate::operators::Mixer::Attention(operator) if scored => {
+            crate::operators::attention::graph::decode_class_segments(slice, &operator.reads)
+        }
+        _ => slice,
+    };
+    // An n-gram input reads its table's rows for each batch row's heads.
+    let slice = match block.ngram {
+        Some(ngram) => slice.scoped(
+            "stored_rows",
+            "M",
+            [rows
+                * ngram
+                    .op
+                    .hash
+                    .heads()
+                    .map_err(|error| error.to_string())?],
+        ),
+        None => slice,
     };
     block::feed_forward_class_slice(block, rows, slice)
 }
@@ -269,15 +340,13 @@ fn enumerate_block_graphs(
     };
     let shared = (0..blocks.len())
         .map(|index| {
-            (0..index)
-                .find(|&first| shapes[first] == shapes[index] && equal_scales(first, index))
+            (0..index).find(|&first| shapes[first] == shapes[index] && equal_scales(first, index))
         })
         .collect::<Vec<_>>();
     let exact = match scales {
         BlockOutputScales::Read(_) => true,
         BlockOutputScales::Planned(_) => (0..blocks.len()).all(|index| {
-            (0..index)
-                .all(|first| shapes[first] != shapes[index] || (unit(first) && unit(index)))
+            (0..index).all(|first| shapes[first] != shapes[index] || (unit(first) && unit(index)))
         }),
     };
     let mut enumeration = BlockGraphEnumeration {
@@ -293,7 +362,14 @@ fn enumerate_block_graphs(
             if !listings.tiles.is_empty() {
                 enumeration.listings[index] = listings.clone();
             }
-            for class in block_classes(mixers[index], rows, max_slots, max_segments, &listings) {
+            for class in block_classes(
+                mixers[index],
+                rows,
+                max_slots,
+                max_segments,
+                &listings,
+                slot_scores(slot),
+            ) {
                 enumeration.launch_classes.insert(class);
                 match shared[index] {
                     Some(first) => enumeration.sharing.push((index, class, first)),
@@ -447,9 +523,7 @@ fn block_binding_storage(bindings: &[usize]) -> Result<HostHeap, String> {
     use std::mem::size_of;
     bindings
         .iter()
-        .map(|count| {
-            HostHeap::allocation(*count, size_of::<(BlockClass, BoundNativeGraphPlan)>())
-        })
+        .map(|count| HostHeap::allocation(*count, size_of::<(BlockClass, BoundNativeGraphPlan)>()))
         .try_fold(
             HostHeap::allocation(
                 bindings.len(),
@@ -540,10 +614,7 @@ impl SealedHeap {
         graph: impl Fn() -> String,
     ) -> Result<(), String> {
         let (held, planned) = (plan.host_heap(), layout.plan_heap());
-        self.heap = self
-            .heap
-            .plus(held)
-            .ok_or("sealed graph heap overflows")?;
+        self.heap = self.heap.plus(held).ok_or("sealed graph heap overflows")?;
         if held != planned {
             self.mismatched += 1;
             if cfg!(debug_assertions) {
@@ -573,6 +644,9 @@ pub struct PreparedTargetGraphs {
     max_segments: u64,
     /// Block mixers, which decide the class a launch selects per block.
     mixers: Vec<MixerKind>,
+    /// Per block, its selected read's shape, which decides whether a launch
+    /// takes its scoring class.
+    selections: Vec<Option<crate::SelectionShape>>,
     classes: usize,
     family: NativeGraphFamily,
     max_output_bytes: u64,
@@ -590,6 +664,9 @@ pub struct PreparedTargetGraphs {
     /// The `[rows, L·P]` F32 extents of the per-layer rows every per-layer
     /// input sublayer reads, over the largest row class.
     per_layer_rows: Option<[u64; 2]>,
+    /// The `[rows, 2]` I32 extents of the token rows a model whose blocks
+    /// read them keeps, over the largest row class (`keeps_token_rows`).
+    token_rows: Option<[u64; 2]>,
     seal: SealReport,
 }
 
@@ -653,6 +730,10 @@ struct BlockGraphShape {
     /// accumulator-scale port extent.
     weights: Vec<((u32, Option<u32>), WeightKind, Element, Vec<u64>, u64)>,
     state: String,
+    /// Decoder-boundary work belongs to the graph as well as its sublayers.
+    /// Interior blocks cannot stand in for the stream widening or exit mix.
+    widens_streams: bool,
+    mixes_exit: bool,
     /// Where a separate draft taps the block.
     tapped: TapPositions,
 }
@@ -747,10 +828,12 @@ pub(crate) fn block_scopes(block: usize) -> Result<[WeightScope; 2], String> {
 }
 
 /// A target sublayer (or branch) role moved to the same sublayer (or
-/// branch) of `block`.
+/// branch) of `block`. A decoder-wide role (the exit site the last block
+/// ends with) is every block's own.
 fn block_role(role: WeightRole, block: usize) -> Result<WeightRole, String> {
     let block = u32::try_from(block).map_err(|_| "target block index exceeds u32")?;
     let scope = match role.scope {
+        WeightScope::Target => WeightScope::Target,
         WeightScope::TargetSublayer(SublayerIndex { sublayer, .. }) => {
             WeightScope::TargetSublayer(SublayerIndex { block, sublayer })
         }
@@ -817,7 +900,7 @@ fn block_graph_shapes(
                 MixerKind::Recurrent => {
                     let first = operators::bank_component_index(&geometry.blocks, index)
                         .map_err(|error| error.to_string())?;
-                    let count = paired.mixer.bank_components();
+                    let count = paired.bank_components();
                     format!("{:?}", components.get(first..first + count))
                 }
                 // Blocks share a plan only within one history domain's rows
@@ -836,6 +919,12 @@ fn block_graph_shapes(
                 geometry: paired.shape_key().map_err(|error| error.to_string())?,
                 weights,
                 state,
+                widens_streams: index == 0
+                    && StreamsGeometry::of(geometry)
+                        .map_err(|error| error.to_string())?
+                        .is_some(),
+                mixes_exit: index + 1 == geometry.blocks.len()
+                    && matches!(geometry.exit.norm, ExitNorm::HyperConnectionHead(_)),
                 tapped: tapped[index].positions(),
             })
         })
@@ -853,6 +942,7 @@ impl PreparedTargetGraphs {
             })
             .map_err(|error| error.to_string())?;
         let per_layer_rows = per_layer_rows_bytes(self.per_layer_rows)?;
+        let token_rows = token_rows_bytes(self.token_rows)?;
         distinct_storage_bytes(
             self.blocks_by_class
                 .iter()
@@ -860,6 +950,7 @@ impl PreparedTargetGraphs {
         )?
         .checked_add(taps)
         .and_then(|bytes| bytes.checked_add(per_layer_rows))
+        .and_then(|bytes| bytes.checked_add(token_rows))
         .ok_or_else(|| "target binding charge overflows".into())
     }
 
@@ -963,12 +1054,24 @@ impl PreparedTargetGraphs {
         let trace = std::env::var_os("MAGNITUDE_V4_TRACE_GRAPH_SEAL").is_some();
         let began_all = Instant::now();
         let mut sealed_graphs = 0usize;
+        let notice = match notifies_selection(load) {
+            true => Some(
+                handles
+                    .blocks
+                    .iter()
+                    .find_map(|block| block.ngram.as_ref())
+                    .map(|ngram| &ngram.notice)
+                    .ok_or("a stored table without an n-gram input's kernels")?,
+            ),
+            false => None,
+        };
         for &rows in &row_classes {
             for source in [EntryTokens::Uploaded, EntryTokens::Selected] {
                 let layout = &certificate.entries[&source];
                 let entry = PreparedTargetEntryGraph::prepare(
                     device,
                     &handles.embedding,
+                    notice,
                     load,
                     geometry,
                     rows,
@@ -1002,7 +1105,7 @@ impl PreparedTargetGraphs {
         // it.
         let constants = FamilyConstants::default();
         let seal_block = |&(index, class): &(usize, BlockClass)| {
-            let (rows, segments, slots, listed) = class;
+            let (rows, segments, slots, listed, scored) = class;
             let began = Instant::now();
             let positions = tapped[index].positions();
             let tap = match (positions.any(), tap_width, &handles.taps) {
@@ -1019,6 +1122,7 @@ impl PreparedTargetGraphs {
                 &handles.blocks[index],
                 tap,
                 plan.blocks()[index].per_layer(),
+                plan.blocks()[index].ngram(),
                 load,
                 geometry,
                 state,
@@ -1027,12 +1131,13 @@ impl PreparedTargetGraphs {
                 segments,
                 slots,
                 listed,
-                &certificate.blocks[index][&(RowForm::of(rows), listed > 0)].layout,
+                scored > 0,
+                &certificate.blocks[index][&class_topology(class)].layout,
                 &constants,
             )
             .map_err(|error| {
                 format!(
-                    "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, block {index}: {error}"
+                    "target graph row class {rows}, history segments {segments}, request slots {slots}, listed {listed}, scored {scored}, block {index}: {error}"
                 )
             })?;
             if trace {
@@ -1061,8 +1166,7 @@ impl PreparedTargetGraphs {
         for (&(index, class), block) in sealing.iter().zip(sealed) {
             let block = block?;
             sealed_graphs += 1;
-            let (rows, _, _, listed) = class;
-            let certified = &certificate.blocks[index][&(RowForm::of(rows), listed > 0)];
+            let certified = &certificate.blocks[index][&class_topology(class)];
             let graph = || format!("target graph class {class:?} of block {index}");
             held.seal(&block.plan, &certified.layout, graph)?;
             held.own(&block, certified, graph)?;
@@ -1103,8 +1207,7 @@ impl PreparedTargetGraphs {
             )
             .and_then(|heap| {
                 heap.plus(
-                    HostHeap::allocation(1, SHARED_BLOCK_GRAPH_BYTES)
-                        .times(sealing.len() as u64)?,
+                    HostHeap::allocation(1, SHARED_BLOCK_GRAPH_BYTES).times(sealing.len() as u64)?,
                 )
             })
             .ok_or("prepared block graph storage overflows")?;
@@ -1127,7 +1230,10 @@ impl PreparedTargetGraphs {
                 term(&held_graphs),
                 term(&planned.at_most),
             );
-            least_bytes <= bytes && bytes <= most_bytes && least <= allocations && allocations <= most
+            least_bytes <= bytes
+                && bytes <= most_bytes
+                && least <= allocations
+                && allocations <= most
         };
         fn heap(heap: HostHeap) -> (u64, u64) {
             (heap.bytes, heap.allocations)
@@ -1163,6 +1269,7 @@ impl PreparedTargetGraphs {
             listings,
             max_segments,
             mixers,
+            selections: plan.blocks().iter().copied().map(slot_selection).collect(),
             classes: launch_classes.len(),
             family,
             max_output_bytes,
@@ -1172,6 +1279,7 @@ impl PreparedTargetGraphs {
             stateless_tail,
             per_layer_entries,
             per_layer_rows: per_layer_rows(plan, largest_rows),
+            token_rows: token_rows_extents(load, largest_rows),
             seal,
         })
     }
@@ -1180,9 +1288,7 @@ impl PreparedTargetGraphs {
     /// `rows` rows, ascending; empty when that row class has none.
     pub(crate) fn listed_tiles(&self, index: usize, rows: u64) -> &[u64] {
         match self.listings.get(index) {
-            Some(listings) if !crate::operators::attention::graph::decodes(rows) => {
-                &listings.tiles
-            }
+            Some(listings) if !crate::operators::attention::graph::decodes(rows) => &listings.tiles,
             _ => &[],
         }
     }
@@ -1192,6 +1298,11 @@ impl PreparedTargetGraphs {
     /// block's listing classes are sealed for that alone.
     pub(crate) fn listed_segments(&self, index: usize, segments: u64) -> u64 {
         self.listings[index].segments(segments, self.max_segments)
+    }
+
+    /// Block `index`'s selected read's shape, when it reads one.
+    pub(crate) fn selection(&self, index: usize) -> Option<crate::SelectionShape> {
+        self.selections.get(index).copied().flatten()
     }
 
     /// The tap indices block `index` writes.
@@ -1254,9 +1365,13 @@ impl PreparedTargetGraphs {
         resident: &ResidentTarget,
     ) -> Result<BoundTargetGraphs, String> {
         let embedding = resident.embedding.table().clone();
-        let direct =
-            seismic::Tensor::from_host(&resident.embedding.tensor().device(), Element::i32(), &[0], &[])
-                .map_err(|error| error.to_string())?;
+        let direct = seismic::Tensor::from_host(
+            &resident.embedding.tensor().device(),
+            Element::i32(),
+            &[0, 1],
+            &[],
+        )
+        .map_err(|error| error.to_string())?;
         let mut entry_bound = BTreeMap::new();
         for (key, entry) in &self.entries {
             let directory = match (key.1, embedding.directory()) {
@@ -1323,6 +1438,17 @@ impl PreparedTargetGraphs {
                     .map_err(|error| format!("draft input rows allocation failed: {error}"))
             })
             .transpose()?;
+        let token_rows = self
+            .token_rows
+            .map(|extents| {
+                seismic::Tensor::zeros(
+                    &resident.embedding.tensor().device(),
+                    Element::i32(),
+                    &extents,
+                )
+                .map_err(|error| format!("token rows allocation failed: {error}"))
+            })
+            .transpose()?;
         let per_layer = match (&resident.per_layer, self.per_layer_rows) {
             (None, None) => None,
             (Some(weights), Some(extents)) => Some(BoundPerLayerEntry {
@@ -1362,6 +1488,21 @@ impl PreparedTargetGraphs {
             }),
             _ => return Err("resident per-layer weights disagree with the prepared graphs".into()),
         };
+        let stored = resident
+            .sublayers
+            .stored_tables()
+            .map(|(role, table)| match role.scope {
+                WeightScope::TargetSublayer(index) => Ok((index.block as usize, table.clone())),
+                scope => Err(format!("a stored table of scope {scope:?}")),
+            })
+            .collect::<Result<BTreeMap<_, _>, String>>()?;
+        let notice = match stored.is_empty() {
+            true => None,
+            false => Some(SelectionNotice::new(
+                &resident.embedding.tensor().device(),
+                self.entries.keys().map(|(rows, _)| *rows).max().unwrap_or(1),
+            )?),
+        };
         let graphs = BoundTargetGraphs {
             prepared: self.clone(),
             entry_bound,
@@ -1369,7 +1510,10 @@ impl PreparedTargetGraphs {
             constants: constants.into_tensors(),
             taps,
             per_layer,
+            token_rows,
             embedding,
+            stored,
+            notice,
         };
         // A binding that holds another heap than the plan counted is a
         // defect of the plan's accounting: an error in a debug build.
@@ -1474,8 +1618,17 @@ pub(crate) struct BoundTargetGraphs {
     /// column blocks of a step's leading rows, and the readout fuses them.
     pub taps: Option<seismic::Tensor>,
     pub per_layer: Option<BoundPerLayerEntry>,
+    /// The step's token rows of a model whose blocks read them: a step of
+    /// host tokens copies them here in its entry (`kept_tokens`), and its
+    /// blocks read them; a step of selected tokens reads its selection.
+    pub token_rows: Option<seismic::Tensor>,
     /// The token embedding as the entries gather it.
     pub embedding: ResidentTable,
+    /// The stored tables the blocks read (`stored_table_rows`), by block.
+    pub stored: BTreeMap<usize, Arc<StoredTable>>,
+    /// Where steps reading selected tokens copy them for the host: present
+    /// with a stored table (`EntryNotice`).
+    pub notice: Option<SelectionNotice>,
 }
 
 impl BoundTargetGraphs {
@@ -1546,7 +1699,12 @@ impl TokenRows {
     /// Rows of `tokens` tokens, in `slots` slots.
     fn new(tokens: u64, slots: usize) -> Self {
         Self(std::sync::Mutex::new(
-            crate::slot_directory::SlotDirectory::new(tokens, slots as u64, 1),
+            crate::slot_directory::SlotDirectory::new(
+                tokens,
+                slots as u64,
+                1,
+                crate::planning::DirectoryForm::Dense,
+            ),
         ))
     }
 
@@ -1567,7 +1725,10 @@ impl TokenRows {
     /// The step that writes `token`'s row into the free slot `slot` is
     /// queued: steps after it find the row there.
     pub(crate) fn hold(&self, token: u64, slot: usize) {
-        self.0.lock().expect("token rows lock").hold(token, slot, true);
+        self.0
+            .lock()
+            .expect("token rows lock")
+            .hold(token, slot, true);
     }
 
     /// A step writes other rows over the slots `slots`.
@@ -1585,7 +1746,10 @@ mod token_rows_tests {
 
     #[test]
     fn a_token_row_is_held_from_the_step_that_writes_it_until_overwritten() {
-        assert!(matches!(TokenRows::new(8, 0).find(3).unwrap(), TokenRow::None));
+        assert!(matches!(
+            TokenRows::new(8, 0).find(3).unwrap(),
+            TokenRow::None
+        ));
         assert!(TokenRows::new(8, 2).find(8).is_err());
 
         let rows = TokenRows::new(8, 2);
@@ -1619,6 +1783,7 @@ impl BoundTargetGraphs {
             .iter()
             .chain(&self.taps)
             .chain(self.per_layer.as_ref().map(|per_layer| &per_layer.rows))
+            .chain(&self.token_rows)
             .try_fold(0u64, |bytes, tensor| {
                 bytes
                     .checked_add(tensor.storage_bytes())
@@ -1676,6 +1841,7 @@ impl BoundTargetGraphs {
         segments: u64,
         slots: u64,
         listed: u64,
+        scored: bool,
         index: usize,
     ) -> Result<(&PreparedTargetBlockGraph, &BoundNativeGraphPlan), String> {
         let mixer = *self
@@ -1683,7 +1849,7 @@ impl BoundTargetGraphs {
             .mixers
             .get(index)
             .ok_or_else(|| format!("target block {index} does not exist"))?;
-        let key = block_class(mixer, rows, segments, slots, listed);
+        let key = block_class(mixer, rows, segments, slots, listed, scored);
         let graphs = &self.prepared.blocks_by_class[index];
         let graph = graphs
             .binary_search_by(|(class, _)| class.cmp(&key))
@@ -1716,12 +1882,39 @@ pub(crate) struct PreparedTargetEntryGraph {
     pub directory: NativePort,
     pub tokens: NativePort,
     pub hidden: WorkflowTensor,
+    /// Of a step reading selected tokens in a model with a stored table:
+    /// where the step copies its tokens for the host, and the signal after.
+    pub notice: Option<EntryNotice>,
+    /// Of a step uploading the host's tokens in a model whose blocks read
+    /// the step's token rows: where it keeps them.
+    pub kept_tokens: Option<KeptTokens>,
+}
+
+/// An entry graph's kept token rows (`keeps_token_rows`): the host's token
+/// rows uploaded in the `sample_rows` layout, and the bound token rows
+/// (`BoundTargetGraphs::token_rows`) the entry copies them to for the blocks.
+#[derive(Clone)]
+pub(crate) struct KeptTokens {
+    pub uploaded: NativePort,
+    pub rows: NativePort,
+}
+
+/// An entry graph's selection notice (`selection_notice`): the step's
+/// `[rows, 2]` selected tokens copied into a host-shared tensor the run
+/// binds, then a signal the run binds, which the stored table's filler
+/// waits for to learn the rows the step names.
+#[derive(Clone)]
+pub(crate) struct EntryNotice {
+    pub tokens: NativePort,
+    pub signal: NativeTimelinePort,
 }
 
 impl PreparedTargetEntryGraph {
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         device: &Device,
         embedding: &seismic::NativeKernel<embedding_rows::Entry>,
+        notice: Option<&seismic::NativeKernel<selection_notice::Entry>>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         rows: u64,
@@ -1731,6 +1924,8 @@ impl PreparedTargetEntryGraph {
         let draft = entry_graph_topology(
             device.native_graph_with_layout(layout),
             embedding,
+            notice,
+            keeps_token_rows(load),
             embedding_weight(load)?,
             geometry,
             rows,
@@ -1743,8 +1938,38 @@ impl PreparedTargetEntryGraph {
             directory: draft.directory,
             tokens: draft.tokens,
             hidden: draft.hidden,
+            notice: draft.notice,
+            kept_tokens: draft.kept_tokens,
         })
     }
+}
+
+/// Whether the steps of `load` that read selected tokens notify the host of
+/// them (`EntryNotice`): its target has a stored table.
+fn notifies_selection(load: &ModelLoadPlan) -> bool {
+    load.weights().any(crate::WeightPlan::stored_in_slots)
+}
+
+/// Whether blocks of `load` read the step's token rows past the entry: its
+/// target has an n-gram input. Its steps of host tokens then keep them in
+/// the bound token rows.
+fn keeps_token_rows(load: &ModelLoadPlan) -> bool {
+    load.weights()
+        .any(|weight| weight.role.kind == WeightKind::NGramTable)
+}
+
+/// The `[rows, 2]` I32 extents of the token rows a model that keeps them
+/// binds, over its largest row class.
+fn token_rows_extents(load: &ModelLoadPlan, rows: u64) -> Option<[u64; 2]> {
+    keeps_token_rows(load).then_some([rows, 2])
+}
+
+fn token_rows_bytes(extents: Option<[u64; 2]>) -> Result<u64, String> {
+    extents.map_or(Ok(0), |extents| {
+        Element::i32()
+            .canonical_byte_len(&extents)
+            .map_err(|error| error.to_string())
+    })
 }
 
 fn embedding_weight(load: &ModelLoadPlan) -> Result<&crate::WeightPlan, String> {
@@ -1768,11 +1993,22 @@ struct EntryGraphDraft<G> {
     directory: NativePort,
     tokens: NativePort,
     hidden: WorkflowTensor,
+    notice: Option<EntryNotice>,
+    kept_tokens: Option<KeptTokens>,
 }
 
+/// The entry graph: the step's token rows embedded. `notice` (of a model
+/// with a stored table) copies selected tokens for the host first. With
+/// `keeps_tokens` (a model whose blocks read the step's token rows) the
+/// host's uploaded tokens are copied into the bound token rows
+/// (`kept_tokens`), so later graphs read a device tensor of the step's token
+/// rows whatever their source, as they read a selection.
+#[allow(clippy::too_many_arguments)]
 fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     mut graph: G,
     embedding: G::Binding<'a, embedding_rows::Entry>,
+    notice: Option<G::Binding<'a, selection_notice::Entry>>,
+    keeps_tokens: bool,
     weight: &crate::WeightPlan,
     geometry: &Decoder,
     rows: u64,
@@ -1782,15 +2018,16 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
     // Uploaded tokens are the host's: of a streamed table it writes their
     // slots. Selected tokens are the device's, which finds their slots in
     // the directory.
-    let entries = match source {
-        EntryTokens::Uploaded => 0,
-        EntryTokens::Selected => weight.directory_entries(),
+    let [entries, fields] = match source {
+        EntryTokens::Uploaded => [0, 1],
+        EntryTokens::Selected => weight.directory_shape(),
     };
     let dimensions = [
         ("M", rows),
         ("V", weight.shape[0]),
         ("D", geometry.hidden),
         ("R", entries),
+        ("F", fields),
     ];
     let tokens = match source {
         EntryTokens::Uploaded => graph.input_for(embedding, "tokens", &dimensions)?,
@@ -1798,7 +2035,55 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
             graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?
         }
     };
-    let directory = graph.port(Element::i32(), &[entries])?;
+    // Selected tokens reach the host first, as early in the step as they
+    // can: the filler of a stored table learns from them the rows the step
+    // names while the device runs the blocks before the table's gate.
+    // The token row copy entry (`selection_notice`), which the kept token
+    // rows use too.
+    let copy_entry = notice;
+    let notice = match (notice, source) {
+        (Some(entry), EntryTokens::Selected) => {
+            let mut copied = graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?;
+            graph.enqueue::<selection_notice::Entry>(
+                entry,
+                &[("M", rows)],
+                selection_notice::WorkflowArgs {
+                    selection: tokens.tensor().into(),
+                    notice: copied.tensor_mut().into(),
+                },
+            )?;
+            Some(EntryNotice {
+                tokens: copied,
+                signal: graph.timeline(TimelineNode::Signal),
+            })
+        }
+        _ => None,
+    };
+    // The host's tokens themselves (the embedding's uploaded rows are its
+    // table's indices, a streamed table's slots), copied into the bound
+    // token rows.
+    let kept_tokens = match (keeps_tokens, source) {
+        (true, EntryTokens::Uploaded) => {
+            let copy = copy_entry.ok_or("kept token rows need the token row copy entry")?;
+            let uploaded = graph.input_for(copy, "selection", &[("M", rows)])?;
+            let mut rows_port =
+                graph.port_with_class_extent(Element::i32(), &[rows, 2], 0, "M")?;
+            graph.enqueue::<selection_notice::Entry>(
+                copy,
+                &[("M", rows)],
+                selection_notice::WorkflowArgs {
+                    selection: uploaded.tensor().into(),
+                    notice: rows_port.tensor_mut().into(),
+                },
+            )?;
+            Some(KeptTokens {
+                uploaded,
+                rows: rows_port,
+            })
+        }
+        _ => None,
+    };
+    let directory = graph.port(Element::i32(), &[entries, fields])?;
     let (scale, normalize, epsilon) = embedding_transform(geometry);
     let result = graph.enqueue::<embedding_rows::Entry>(
         embedding,
@@ -1819,6 +2104,8 @@ fn entry_graph_topology<'a, G: GraphDraft + 'a>(
         directory,
         tokens,
         hidden: result.r1,
+        notice,
+        kept_tokens,
     })
 }
 
@@ -1849,6 +2136,8 @@ pub(crate) fn checked_entry_graph_storage(
     let draft = entry_graph_topology(
         NativeGraphMetadata::new(backend),
         &elements,
+        notifies_selection(load).then_some(&[][..]),
+        keeps_token_rows(load),
         weight,
         geometry,
         rows,
@@ -1863,6 +2152,7 @@ pub(crate) fn checked_entry_graph_storage(
 
 #[derive(Clone)]
 pub(crate) struct PreparedTargetBlockGraph {
+    pub residual: Option<WorkflowTensor>,
     pub plan: NativeGraphPlan,
     pub hidden: NativePort,
     pub weights: Vec<(WeightPort, NativePort)>,
@@ -1874,6 +2164,8 @@ pub(crate) struct PreparedTargetBlockGraph {
     pub taps: Option<TapPorts>,
     /// The per-layer rows port of a block with a per-layer input sublayer.
     pub per_layer: Option<NativePort>,
+    /// What each step binds of a block with an n-gram input.
+    pub ngram: Option<NGramStepPorts>,
     pub output: WorkflowTensor,
 }
 
@@ -1936,7 +2228,7 @@ fn weight_port<G: GraphDraft>(
             return Err(format!("planned weight {role:?} has no second-level scale").into());
         }
         (WeightPart::Directory, _) => match plan.streamed {
-            Some(streamed) => graph.port(Element::i32(), &[streamed.table_rows]),
+            Some(_) => graph.port(Element::i32(), &plan.directory_shape()),
             None => {
                 return Err(
                     format!("planned weight {role:?} is held whole and has no directory").into(),
@@ -1954,8 +2246,8 @@ fn weight_port<G: GraphDraft>(
 #[derive(Clone)]
 pub(crate) struct RowDirectory {
     pub tensor: WorkflowTensor,
-    /// Its entries: the readers' `R`.
-    pub entries: u64,
+    /// Its entries and their fields: the readers' `R` and `F`.
+    pub shape: [u64; 2],
 }
 
 impl RowDirectory {
@@ -1964,10 +2256,13 @@ impl RowDirectory {
         graph: &mut G,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<Self, GraphError> {
-        let directory = GraphConstant::i32(graph, &[])?;
+        let directory = GraphConstant::i32_shaped(graph, &[0, 1], &[])?;
         let tensor = directory.port().tensor().clone();
         constants.push(directory);
-        Ok(Self { tensor, entries: 0 })
+        Ok(Self {
+            tensor,
+            shape: [0, 1],
+        })
     }
 }
 
@@ -1981,8 +2276,9 @@ pub(crate) struct GatheredTable {
     /// The rows of `table`: the readers' `V`.
     pub rows: u64,
     role: WeightRole,
-    /// The entries of a streamed table's directory; 0 of a table held whole.
-    entries: u64,
+    /// The shape of a streamed table's directory; `[0, 1]` of a table held
+    /// whole.
+    directory_shape: [u64; 2],
     /// The empty directory, declared by the graph's first read by rows.
     direct: Option<RowDirectory>,
     /// The directory's port, declared by the graph's first read of selected
@@ -2012,7 +2308,7 @@ impl GatheredTable {
             table,
             rows,
             role,
-            entries: plan.directory_entries(),
+            directory_shape: plan.directory_shape(),
             direct: None,
             directory: None,
         })
@@ -2043,7 +2339,7 @@ impl GatheredTable {
         ports: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
     ) -> Result<RowDirectory, GraphError> {
-        if self.entries == 0 {
+        if self.directory_shape[0] == 0 {
             return self.by_rows(graph, constants);
         }
         if let Some(directory) = &self.directory {
@@ -2056,10 +2352,65 @@ impl GatheredTable {
             .directory
             .insert(RowDirectory {
                 tensor,
-                entries: self.entries,
+                shape: self.directory_shape,
             })
             .clone())
     }
+}
+
+/// The ports a read of a stored table binds each run (`stored_table_rows`):
+/// the gate it waits at until the host has written every row it names, and
+/// the signal after it, which says the read is done with the rows.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StoredReadPorts {
+    pub gate: NativeTimelinePort,
+    pub read: NativeTimelinePort,
+}
+
+/// The rows `rows` (`[count, 2]`, (row, status) pairs) of the stored table
+/// `table` (`TableFill::Stored`), decoded to activations `[count, width]`:
+/// behind a gate the step's rows open (`StoredTable`), read through the
+/// table's directory (`stored_rows`), then a signal that the read is done.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stored_table_rows<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entry: G::Binding<'a, stored_rows::Entry>,
+    table: &mut GatheredTable,
+    load: &ModelLoadPlan,
+    ports: &mut Vec<(WeightPort, NativePort)>,
+    constants: &mut Vec<GraphConstant>,
+    rows: &WorkflowTensor,
+    count: u64,
+) -> Result<(WorkflowTensor, StoredReadPorts), GraphError> {
+    let plan = load
+        .weights()
+        .find(|plan| plan.role == table.role)
+        .ok_or_else(|| format!("missing planned weight {:?}", table.role))?;
+    if !plan.stored_in_slots() {
+        return Err(format!("planned weight {:?} is not a stored table", table.role).into());
+    }
+    let width = plan.shape[1];
+    let directory = table.selected(graph, load, ports, constants)?;
+    let gate = graph.timeline(TimelineNode::Wait);
+    let decoded = graph
+        .enqueue(
+            entry,
+            &[
+                ("M", count),
+                ("S", table.rows),
+                ("W", width),
+                ("R", directory.shape[0]),
+                ("F", directory.shape[1]),
+            ],
+            stored_rows::WorkflowArgs {
+                slots: (&table.table).into(),
+                tokens: rows.into(),
+                directory: (&directory.tensor).into(),
+            },
+        )?
+        .value;
+    let read = graph.timeline(TimelineNode::Signal);
+    Ok((decoded, StoredReadPorts { gate, read }))
 }
 
 /// The port of a weight an entry binds without an accumulator-scale port
@@ -2244,6 +2595,7 @@ impl PreparedTargetBlockGraph {
         handle: &'a AttestedTargetBlock,
         tap: Option<TapEntry<'a, seismic::NativeGraph>>,
         per_layer: Option<crate::PerLayerBinding>,
+        ngram: Option<crate::NGramBinding>,
         load: &ModelLoadPlan,
         geometry: &Decoder,
         state: &StateResourcePlan,
@@ -2252,6 +2604,7 @@ impl PreparedTargetBlockGraph {
         segments: u64,
         slots: u64,
         listed: u64,
+        scored: bool,
         layout: &NativeGraphLayout,
         family: &FamilyConstants,
     ) -> Result<Self, String> {
@@ -2259,14 +2612,23 @@ impl PreparedTargetBlockGraph {
         let mut weights = Vec::new();
         let mut constants = Vec::new();
         let hidden = graph
-            .port(Element::f32(), &[rows, geometry.hidden])
+            .port(
+                Element::f32(),
+                &[rows, block_input_width(geometry, block_index)?],
+            )
             .map_err(|error| error.to_string())?;
         let mixer = (&handle.mixer).into();
         let feed_forward = handle.feed_forward.as_ref().map(Into::into);
+        let streams = handle.streams.as_ref().map(Into::into);
         let per_layer = match (&handle.per_layer, per_layer) {
             (None, None) => None,
             (Some(kernels), Some(binding)) => Some((kernels.into(), binding)),
             _ => return Err("the block's per-layer kernels disagree with its binding".into()),
+        };
+        let ngram = match (&handle.ngram, ngram) {
+            (None, None) => None,
+            (Some(kernels), Some(binding)) => Some((kernels.into(), binding)),
+            _ => return Err("the block's n-gram kernels disagree with its binding".into()),
         };
         let parts = block_graph(
             &mut graph,
@@ -2274,6 +2636,8 @@ impl PreparedTargetBlockGraph {
             mixer,
             feed_forward,
             per_layer,
+            ngram,
+            streams,
             hidden.tensor(),
             BlockGraphInputs {
                 load,
@@ -2284,6 +2648,7 @@ impl PreparedTargetBlockGraph {
                 segments,
                 slots,
                 listed,
+                scored,
                 output_scales: handle.output_scales,
             },
             &mut weights,
@@ -2293,6 +2658,7 @@ impl PreparedTargetBlockGraph {
         graph
             .export(&parts.output)
             .map_err(|error| error.to_string())?;
+        if let Some(residual) = &parts.residual { graph.export(residual).map_err(|error| error.to_string())?; }
         let plan = graph.seal().map_err(|error| error.to_string())?;
         // The graph's constants are the family's values, and its vectors
         // hold exactly their elements: what it owns then follows from its
@@ -2313,6 +2679,8 @@ impl PreparedTargetBlockGraph {
             controls: parts.controls,
             taps: parts.taps,
             per_layer: parts.per_layer,
+            ngram: parts.ngram,
+            residual: parts.residual,
             output: parts.output,
         })
     }
@@ -2339,19 +2707,35 @@ struct BlockGraphInputs<'a> {
     segments: u64,
     slots: u64,
     listed: u64,
+    scored: bool,
     output_scales: OutputScales,
 }
 
 struct BlockGraphParts {
+    residual: Option<WorkflowTensor>,
     output: WorkflowTensor,
     state: BlockStatePorts,
     controls: BlockControlPorts,
     taps: Option<TapPorts>,
     /// The per-layer rows a block with a per-layer input sublayer reads.
     per_layer: Option<NativePort>,
+    /// What each step binds of a block with an n-gram input.
+    ngram: Option<NGramStepPorts>,
 }
 
-/// One decoder block's graph fragment: its draft tap when tapped, then its
+/// The width of block `block_index`'s input rows: the embedded rows into
+/// block 0, the streams (`S * H`) into every later block of a decoder with
+/// residual streams.
+fn block_input_width(geometry: &Decoder, block_index: usize) -> Result<u64, String> {
+    Ok(
+        match StreamsGeometry::of(geometry).map_err(|error| error.to_string())? {
+            Some(streams) if block_index > 0 => streams.width(),
+            _ => geometry.hidden,
+        },
+    )
+}
+
+/// One decoder block's graph fragment:its draft tap when tapped, then its
 /// mixer then its feed-forward over `hidden`. The production graph and the
 /// checked metadata route both build blocks through this one function.
 #[allow(clippy::too_many_arguments)]
@@ -2361,6 +2745,8 @@ fn block_graph<'a, G: GraphDraft + 'a>(
     mixer_entries: MixerEntries<'a, G>,
     feed_forward_entries: Option<FeedForwardEntries<'a, G>>,
     per_layer_entries: Option<PerLayerParts<'a, G>>,
+    ngram_entries: Option<NGramParts<'a, G>>,
+    streams_entries: Option<StreamsEntries<'a, G>>,
     hidden: &WorkflowTensor,
     inputs: BlockGraphInputs<'_>,
     weights: &mut Vec<(WeightPort, NativePort)>,
@@ -2375,6 +2761,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         segments,
         slots,
         listed,
+        scored,
         output_scales,
     } = inputs;
     let block = geometry
@@ -2393,34 +2780,102 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         segments,
         slots,
         listed,
+        scored,
         output_scales,
     };
+    let streams = StreamsGeometry::of(geometry).map_err(|error| error.to_string())?;
+    if streams.is_some() != streams_entries.is_some() {
+        return Err("the block's streams entries disagree with its residual form".into());
+    }
+    if streams.is_some() && tap_entry.is_some() {
+        return Err("a draft taps residual streams".into());
+    }
     let mut taps = tap_entry
         .map(|entry| Taps::new(graph, entry, rows, geometry.hidden, activation(geometry)))
         .transpose()?;
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.entry) {
         taps.ports.entry = Some(taps.tap(graph, hidden)?);
     }
-    let (mixed, state_ports, controls) =
-        sublayers.mixer(graph, mixer_entries, hidden, weights, constants)?;
+    // Block 0 widens the embedded rows into the streams.
+    let hidden = match (streams, streams_entries) {
+        (Some(streams), Some(entries)) if block_index == 0 => {
+            widen(graph, entries.repeat, streams, hidden, rows, constants)?
+        }
+        _ => hidden.clone(),
+    };
+    let (mixed, mut state_ports, controls) = sublayers.mixer(
+        graph,
+        mixer_entries,
+        streams_entries,
+        &hidden,
+        weights,
+        constants,
+    )?;
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.middle) {
         if paired.feed_forward.is_none() {
             return Err("a draft taps the feed-forward of a lone mixer block".into());
         }
         taps.ports.middle = Some(taps.tap(graph, &mixed)?);
     }
-    let output = sublayers.feed_forward(graph, feed_forward_entries, mixed, weights, constants)?;
+    let output = sublayers.feed_forward(
+        graph,
+        feed_forward_entries,
+        streams_entries,
+        mixed,
+        weights,
+        constants,
+    )?;
     let (output, per_layer) =
         sublayers.per_layer(graph, per_layer_entries, output, weights, constants)?;
+    // The n-gram input's windows follow the mixer's bank components.
+    let (output, ngram) =
+        sublayers.ngram(graph, ngram_entries, &controls, output, weights, constants)?;
+    let ngram = match (ngram, &mut state_ports) {
+        (None, _) => None,
+        (Some(ports), BlockStatePorts::Recurrent(bank)) => {
+            bank.push(ports.window);
+            bank.push(ports.token_window);
+            Some(ports.step)
+        }
+        (Some(_), BlockStatePorts::Attention(..)) => {
+            return Err("an n-gram input in an attention block".into());
+        }
+    };
+    let residual = (block_index + 1 == geometry.blocks.len() && load.residual_conditioning().is_some()).then(|| output.clone());
+    // The last block ends with the decoder's exit site, whose partials the
+    // readout sums.
+    let output = match (streams, streams_entries, &geometry.exit.norm) {
+        (Some(streams), Some(entries), ExitNorm::HyperConnectionHead(site))
+            if block_index + 1 == geometry.blocks.len() =>
+        {
+            mix_site(
+                graph,
+                entries,
+                load,
+                WeightScope::Target,
+                streams,
+                &output,
+                rows,
+                site.norm.epsilon as f32,
+                false,
+                weights,
+            )?
+            .partials
+        }
+        (Some(_), _, ExitNorm::HyperConnectionHead(_)) | (None, _, _) => output,
+        (Some(_), _, _) => return Err("residual streams without their exit site".into()),
+    };
     if let Some(taps) = taps.as_mut().filter(|taps| taps.positions.output) {
         taps.ports.output = Some(taps.tap(graph, &output)?);
     }
     Ok(BlockGraphParts {
+        residual,
         output,
         state: state_ports,
         controls,
         taps: taps.map(|taps| taps.ports),
         per_layer,
+        ngram,
     })
 }
 
@@ -2441,6 +2896,7 @@ fn checked_block_graph_draft(
     segments: u64,
     slots: u64,
     listed: u64,
+    scored: bool,
 ) -> Result<(NativeGraphMetadata, Vec<GraphConstant>, HostHeap), GraphError> {
     let mut weights = Vec::new();
     let mut constants = Vec::new();
@@ -2453,10 +2909,12 @@ fn checked_block_graph_draft(
     let hidden = GraphDraft::port_with_class_extent(
         &mut graph,
         Element::f32(),
-        &[rows, geometry.hidden],
+        &[rows, block_input_width(geometry, block_index)?],
         0,
         "M",
     )?;
+    let checked_streams = slot.streams().map(CheckedStreamsEntries::new);
+    let streams = checked_streams.as_ref().map(CheckedStreamsEntries::entries);
     let checked_mixer = block::CheckedMixerEntries::new(
         slot.mixer(),
         graph.backend(),
@@ -2474,12 +2932,20 @@ fn checked_block_graph_draft(
     let per_layer = checked_per_layer
         .as_ref()
         .map(|(checked, binding)| (checked.entries(), *binding));
+    let checked_ngram = slot
+        .ngram()
+        .map(|binding| (CheckedNGramEntries::new(binding), binding));
+    let ngram = checked_ngram
+        .as_ref()
+        .map(|(checked, binding)| (checked.entries(), *binding));
     let parts = block_graph(
         &mut graph,
         tap_entry,
         mixer,
         feed_forward,
         per_layer,
+        ngram,
+        streams,
         hidden.tensor(),
         BlockGraphInputs {
             load,
@@ -2490,6 +2956,7 @@ fn checked_block_graph_draft(
             segments,
             slots,
             listed,
+            scored,
             // Scalar arguments leave the checked shapes and storage alone.
             output_scales: OutputScales {
                 mixer: 1.0,
@@ -2501,6 +2968,7 @@ fn checked_block_graph_draft(
         &mut constants,
     )?;
     GraphDraft::export(&mut graph, &parts.output)?;
+    if let Some(residual) = &parts.residual { GraphDraft::export(&mut graph, residual)?; }
     let owned = owned_vectors_heap(weights.len(), constants.len(), parts.state.ports().len());
     Ok((graph, constants, owned))
 }
@@ -2518,6 +2986,7 @@ pub(crate) fn checked_block_graph_resources(
     segments: u64,
     slots: u64,
     listed: u64,
+    scored: bool,
 ) -> Result<(NativeGraphStorageBytes, Vec<GraphConstant>), GraphError> {
     let (graph, constants, _) = checked_block_graph_draft(
         NativeGraphMetadata::new(backend),
@@ -2531,6 +3000,7 @@ pub(crate) fn checked_block_graph_resources(
         segments,
         slots,
         listed,
+        scored,
     )?;
     Ok((GraphDraft::seal(graph)?, constants))
 }
@@ -2575,7 +3045,8 @@ struct TargetFamilyCertificate {
     per_layer: Option<NativeGraphLayout>,
     /// Per block, what each row regime's classes seal into, those that
     /// list their launch's history row tiles apart.
-    blocks: Vec<BTreeMap<(RowForm, bool), CertifiedBlockGraph>>,
+    /// Per block, its certified graphs by topology (`class_topology`).
+    blocks: Vec<BTreeMap<(RowForm, bool, bool), CertifiedBlockGraph>>,
 }
 
 /// What every class of one block's row regime prepares to: one topology.
@@ -2632,6 +3103,8 @@ fn certify_target_family(
         let graph = entry_graph_topology(
             NativeGraphMetadata::new_template(backend),
             &elements,
+            notifies_selection(load).then_some(&[][..]),
+            keeps_token_rows(load),
             weight,
             geometry,
             largest_rows,
@@ -2686,8 +3159,12 @@ fn certify_target_family(
             let largest = *rows.last().expect("a regime holds a row class");
             // A regime's listing classes are their own topology (another
             // kernel of the entry, and the list's input), over every listed
-            // tile count.
-            for listed in [false, true] {
+            // tile count; so are a selected read's classes that score (the
+            // indexer's selection and the selected attention forms).
+            let topologies = [(false, false), (true, false)]
+                .into_iter()
+                .chain(slot_scores(slot).then_some((false, true)));
+            for (listed, scored) in topologies {
                 let listings = match listed {
                     false => Vec::new(),
                     true => block_listings(state, backend, slot, index, largest)?.tiles,
@@ -2720,11 +3197,12 @@ fn certify_target_family(
                     1,
                     1,
                     listings.last().copied().unwrap_or(0),
+                    scored,
                 )?;
                 let slices = rows
                     .iter()
                     .map(|&rows| {
-                        block_class_slice(&paired, rows, max_slots, max_segments, &listings)
+                        block_class_slice(&paired, rows, max_slots, max_segments, &listings, scored)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let layout = graph
@@ -2732,7 +3210,7 @@ fn certify_target_family(
                     .and_then(|template| template.certify(&slices))
                     .map_err(|error| format!("target block {index}: {error}"))?;
                 family.include(layout.storage_bytes(), constants);
-                blocks[index].insert((form, listed), CertifiedBlockGraph { layout, owned });
+                blocks[index].insert((form, listed, scored), CertifiedBlockGraph { layout, owned });
             }
         }
         // Row-class constants (`block::class_constants_of`).
@@ -2795,10 +3273,10 @@ fn certify_target_family(
                 planned.seal(layout)?;
             }
         }
-        for &(index, (rows, _, _, listed)) in sealing {
+        for &(index, class) in sealing {
             planned.seal_block(
                 blocks[index]
-                    .get(&(RowForm::of(rows), listed > 0))
+                    .get(&class_topology(class))
                     .ok_or("a block class has no certified layout")?,
             )?;
         }
@@ -2826,10 +3304,10 @@ fn certify_target_family(
             .iter()
             .map(|&(index, class, _)| (index, class)),
     );
-    for (index, (rows, _, _, listed)) in bound_classes {
+    for (index, class) in bound_classes {
         binding(
             &blocks[index]
-                .get(&(RowForm::of(rows), listed > 0))
+                .get(&class_topology(class))
                 .ok_or("a block class has no certified layout")?
                 .layout,
         )?;
@@ -2860,14 +3338,16 @@ fn certify_target_family(
         bound,
         constants: family.constant_heap()?,
     };
-    // The draft input rows and the per-layer rows the family binds with its
-    // constants.
+    // The draft input rows, the per-layer rows and the kept token rows the
+    // family binds with its constants.
     let mut resources = family.finish()?;
     let per_layer_rows = per_layer_rows_bytes(per_layer_rows(plan, largest_rows))?;
+    let token_rows = token_rows_bytes(token_rows_extents(load, largest_rows))?;
     resources.binding_constant_bytes = resources
         .binding_constant_bytes
         .checked_add(tap_buffer_bytes(tap_width, largest_rows, geometry)?)
         .and_then(|bytes| bytes.checked_add(per_layer_rows))
+        .and_then(|bytes| bytes.checked_add(token_rows))
         .ok_or("target binding charge overflows")?;
     Ok(TargetFamilyCertificate {
         resources,
@@ -2915,6 +3395,85 @@ mod resource_template_tests {
         resident_layout,
     };
     use magnitude_state::KvCodec;
+
+    /// Identical sublayers may share an interior graph, but neither the
+    /// widening entry nor the exit mix may disappear through that sharing.
+    #[test]
+    fn stream_boundaries_keep_their_own_block_graphs() {
+        use crate::planning::tests::{fixture_manifest, hyper_connection_fixture_definition};
+        let mut definition = hyper_connection_fixture_definition();
+        let manifest = fixture_manifest(&definition);
+        // Tied weights make the four sublayers identical in every respect.
+        definition.decoder.blocks = vec![definition.decoder.blocks[0].clone(); 4];
+        let backend = BackendName::Cuda;
+        let codec = KvCodec::Dense;
+        let limits = ResourceLimits {
+            max_launch_rows: 64,
+            max_launch_slots: 64,
+            max_selected_rows: 64,
+            max_drafting_slots: 64,
+            exported_logits_rows: 0,
+            max_images_per_request: 1,
+            max_image_cells: 0,
+            lookahead: false,
+        };
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            resident_layout(ExecutionPath::Native, backend),
+        )
+        .unwrap();
+        let state = ResourcePlanner::state_plan(
+            &definition,
+            &load,
+            PlannedMethod::Plain,
+            codec,
+            limits,
+            ResourceCapacity {
+                domain_bytes: 1 << 30,
+                tensor_operations: crate::TensorOperations::Absent,
+            },
+        )
+        .unwrap();
+        let geometry = &definition.decoder;
+        let plan = load.program_plan(&definition, codec).unwrap();
+        let (_, tapped) = block_taps(plan.target(), geometry).unwrap();
+        let shapes = block_graph_shapes(&load, geometry, &state, &tapped).unwrap();
+        assert_ne!(shapes[0], shapes[1], "stream widening cannot be shared");
+        assert_eq!(shapes[1], shapes[2], "interior graphs still share");
+        assert_ne!(shapes[2], shapes[3], "the exit mix cannot be omitted");
+        let enumeration = enumerate_block_graphs(
+            backend,
+            &state,
+            plan.target(),
+            &block_mixers(geometry).unwrap(),
+            &shapes,
+            BlockOutputScales::Planned(UnreadScales::Equal),
+            &[1, 64],
+            limits.max_launch_slots as u64,
+            state.target_state().span_limit().next_power_of_two() as u64,
+        )
+        .unwrap();
+        assert!(!enumeration.sharing.is_empty());
+        assert!(
+            enumeration
+                .sharing
+                .iter()
+                .all(|&(index, _, first)| index == 2 && first == 1)
+        );
+        for boundary in [0, 3] {
+            assert!(
+                enumeration
+                    .sealing
+                    .iter()
+                    .any(|&(index, _)| index == boundary)
+            );
+        }
+    }
 
     /// The 512-row attention class workspaces of one model on Metal over
     /// K8/V4 history: the family's, each listing class's and that of the class
@@ -3012,9 +3571,9 @@ mod resource_template_tests {
             listings.tiles.is_empty(),
             !(tensor_operations || matches!(head_width, 128 | 256 | 512))
         );
-        for (rows, segments, slots, listed) in
-            block_classes(MixerKind::Attention, 512, 512, max_segments, &listings)
+        for class in block_classes(MixerKind::Attention, 512, 512, max_segments, &listings, false)
         {
+            let (rows, segments, slots, listed, _) = class;
             let (graph, _, _) = checked_block_graph_draft(
                 NativeGraphMetadata::new(backend),
                 &load,
@@ -3027,9 +3586,10 @@ mod resource_template_tests {
                 segments,
                 slots,
                 listed,
+                false,
             )
             .unwrap();
-            let layout = &certificate.blocks[index][&(RowForm::of(rows), listed > 0)].layout;
+            let layout = &certificate.blocks[index][&class_topology(class)].layout;
             assert_eq!(
                 graph.seal_with_layout(layout).unwrap(),
                 layout.storage_bytes()
@@ -3048,6 +3608,7 @@ mod resource_template_tests {
                 1,
                 1,
                 listed,
+                false,
             )
             .unwrap()
             .0
@@ -3229,6 +3790,8 @@ mod resource_template_tests {
                         let graph = entry_graph_topology(
                             NativeGraphMetadata::new(backend),
                             &elements,
+                            notifies_selection(&load).then_some(&[][..]),
+                            keeps_token_rows(&load),
                             weight,
                             geometry,
                             rows,
@@ -3244,7 +3807,7 @@ mod resource_template_tests {
                         );
                     }
                     for (index, block) in geometry.blocks.iter().enumerate() {
-                        for (rows, segments, slots, listed) in block_classes(
+                        for class in block_classes(
                             paired_block(block).unwrap().mixer.kind(),
                             rows,
                             limits.max_launch_slots as u64,
@@ -3257,7 +3820,9 @@ mod resource_template_tests {
                                 rows,
                             )
                             .unwrap(),
+                            slot_scores(plan.target().blocks()[index]),
                         ) {
+                            let (rows, segments, slots, listed, scored) = class;
                             let (graph, mut block_constants, block_owned) =
                                 checked_block_graph_draft(
                                     NativeGraphMetadata::new(backend),
@@ -3271,10 +3836,10 @@ mod resource_template_tests {
                                     segments,
                                     slots,
                                     listed,
+                                    scored > 0,
                                 )
                                 .unwrap();
-                            let certified =
-                                &certificate.blocks[index][&(RowForm::of(rows), listed > 0)];
+                            let certified = &certificate.blocks[index][&class_topology(class)];
                             // Every class of a regime prepares a graph that
                             // owns the vectors its template plans.
                             assert_eq!(

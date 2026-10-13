@@ -2,6 +2,47 @@
 
 use super::*;
 
+/// The tokens of a request's sequence, as its target forwards fed them. A
+/// forward at `position` feeds its tokens there and drops every token at or
+/// after it, so the tokens before any forward's position are the accepted
+/// ones, whatever was fed and not accepted (a verification's rejected rows,
+/// a discarded lookahead, a rollback). A sequence resumed from another's
+/// state starts with that state's tokens (`ResumeState`). It follows the
+/// sequence's state as the n-gram token window does on the device.
+#[derive(Clone, Debug, Default)]
+pub(super) struct TokenHistory(Vec<crate::TokenId>);
+
+impl TokenHistory {
+    /// A sequence whose first tokens are `tokens`.
+    pub(super) fn starting(tokens: &[crate::TokenId]) -> Self {
+        Self(tokens.to_vec())
+    }
+
+    /// Feed `tokens` at `position`: the tokens before it are kept, every
+    /// one at or after it replaced.
+    pub(super) fn feed(&mut self, position: usize, tokens: &[crate::TokenId]) -> Result<(), String> {
+        if position > self.0.len() {
+            return Err(format!(
+                "a forward at {position} follows {} fed tokens",
+                self.0.len()
+            ));
+        }
+        self.0.truncate(position);
+        self.0.extend_from_slice(tokens);
+        Ok(())
+    }
+
+    /// The tokens before `position`.
+    pub(super) fn before(&self, position: usize) -> Result<&[crate::TokenId], String> {
+        self.0.get(..position).ok_or_else(|| {
+            format!(
+                "the sequence holds {} tokens, not every one before {position}",
+                self.0.len()
+            )
+        })
+    }
+}
+
 impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Install a request's prepared input for its lifetime. It is not
     /// resident until [`Self::open_state`]; its images are encoded then.
@@ -46,8 +87,44 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 input,
                 images,
                 resident: false,
+                tokens: TokenHistory::default(),
             },
         );
+        Ok(())
+    }
+
+    /// The tokens of `request`'s sequence before `position`, at most
+    /// `count`, oldest first: the accepted tokens a forward at `position`
+    /// follows. The host's form of the n-gram token window: the host
+    /// evaluates the n-gram row rule (`NGramHash::rows`) over them.
+    pub(crate) fn preceding_tokens(
+        &self,
+        request: RequestId,
+        position: usize,
+        count: usize,
+    ) -> Result<&[crate::TokenId], String> {
+        let before = self.installed_input(request)?.tokens.before(position)?;
+        Ok(&before[before.len().saturating_sub(count)..])
+    }
+
+    /// Record that the target group `operations` feeds its tokens.
+    pub(super) fn feed_tokens(&mut self, operations: &[Operation]) -> Result<(), String> {
+        for operation in operations {
+            let Operation::Forward {
+                request,
+                tokens,
+                position,
+                ..
+            } = operation
+            else {
+                return Err("non-forward target operation".into());
+            };
+            self.input
+                .get_mut(request)
+                .ok_or_else(|| format!("request {} feeds rows without installed input", request.0))?
+                .tokens
+                .feed(*position, tokens)?;
+        }
         Ok(())
     }
 

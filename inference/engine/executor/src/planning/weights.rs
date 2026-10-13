@@ -46,11 +46,71 @@ pub struct WeightPlan {
 /// The rows of a streamed gathered table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamedRows {
-    /// The rows of the stored table: the entries of its device directory.
+    /// The rows of the stored table.
     pub table_rows: u64,
     /// The rows one step may bring: the rows of the device staging its
-    /// tiles pass through, as stored.
+    /// tiles pass through, as stored. 0 of a table whose rows the host
+    /// writes into their slots (`TableFill::Stored`).
     pub staging_rows: u64,
+    /// How readers find a row's slot.
+    pub directory: DirectoryForm,
+    pub fill: TableFill,
+}
+
+/// How the readers of a streamed table find a row's slot (`gathered_row`):
+/// a device directory of `[entries, fields]` I32.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryForm {
+    /// Every table row's slot, or -1: 4 bytes per table row.
+    Dense,
+    /// (row, slot) buckets, linearly probed, a power of two at least twice
+    /// the slots: 8 bytes per bucket, whatever the table's rows.
+    Hashed,
+}
+
+impl DirectoryForm {
+    /// The form of a table of `table_rows` rows in `slots` slots: dense
+    /// while the table has no more than 16 times its slots of rows (where a
+    /// dense directory costs at most what a hashed one of its slots does,
+    /// and is read in one access), else hashed.
+    pub fn of(table_rows: u64, slots: u64) -> Self {
+        match table_rows <= slots.saturating_mul(16) {
+            true => Self::Dense,
+            false => Self::Hashed,
+        }
+    }
+
+    /// Entries (`R`) of the directory of a table of `table_rows` rows in
+    /// `slots` slots.
+    pub fn entries(self, table_rows: u64, slots: u64) -> u64 {
+        match self {
+            Self::Dense => table_rows,
+            Self::Hashed => slots.saturating_mul(2).max(1).next_power_of_two(),
+        }
+    }
+
+    /// I32 fields (`F`) of an entry: a dense one's slot, a hashed one's row
+    /// and slot.
+    pub fn fields(self) -> u64 {
+        match self {
+            Self::Dense => 1,
+            Self::Hashed => 2,
+        }
+    }
+}
+
+/// How a streamed table's rows reach their slots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableFill {
+    /// In the table's resident representation, converted by the weight's
+    /// import entry from staging, queued ahead of the step that names them.
+    Imported,
+    /// As stored, written by the host into slots the device reads in place;
+    /// a reader decodes them (`stored_rows`) to the values of their
+    /// conversion into `decoded`, the representation the table would be
+    /// resident in. A step reading them waits at a gate until the host has
+    /// written them.
+    Stored { decoded: Element },
 }
 
 impl WeightPlan {
@@ -70,6 +130,18 @@ impl WeightPlan {
     /// entry.
     pub fn placed_on_host(&self) -> bool {
         self.progressive_depth().is_some()
+    }
+
+    /// Whether the weight is a table whose slots the host writes as stored
+    /// (`TableFill::Stored`): it takes no import entry.
+    pub fn stored_in_slots(&self) -> bool {
+        matches!(
+            self.streamed,
+            Some(StreamedRows {
+                fill: TableFill::Stored { .. },
+                ..
+            })
+        )
     }
 
     /// The source code depth retained by a progressive placement.
@@ -92,23 +164,41 @@ impl WeightPlan {
 
     /// The bytes of the stored tensor in the upload representation:
     /// `source_bytes`, or a streamed table's whole rows, of which a load
-    /// uploads only its slots'.
+    /// uploads only its slots' (an imported table) or none (a stored one,
+    /// whose slots hold rows as stored).
     pub fn stored_bytes(&self) -> u64 {
         match self.streamed {
-            Some(streamed) => self.source_bytes / self.shape[0] * streamed.table_rows,
+            Some(StreamedRows {
+                table_rows,
+                fill: TableFill::Imported,
+                ..
+            }) => self.source_bytes / self.shape[0] * table_rows,
+            Some(StreamedRows {
+                table_rows,
+                fill: TableFill::Stored { .. },
+                ..
+            }) => self.resident_bytes / self.shape[0] * table_rows,
             None => self.source_bytes,
         }
     }
 
-    /// The entries of a streamed table's device directory: one per row of
-    /// the stored table. 0 for a weight held whole.
-    pub fn directory_entries(&self) -> u64 {
-        self.streamed.map_or(0, |streamed| streamed.table_rows)
+    /// The shape `[R, F]` of a streamed table's device directory
+    /// (`DirectoryForm`); `[0, 1]`, the empty directory, of a weight held
+    /// whole.
+    pub fn directory_shape(&self) -> [u64; 2] {
+        self.streamed.map_or([0, 1], |streamed| {
+            [
+                streamed
+                    .directory
+                    .entries(streamed.table_rows, self.shape[0]),
+                streamed.directory.fields(),
+            ]
+        })
     }
 
     /// The device allocations a streamed table holds beside its slots: the
-    /// directory (one I32 slot per table row) and the staging its tiles
-    /// pass through, as stored. `[0, 0]` for a weight held whole.
+    /// directory and the staging its tiles pass through, as stored. `[0, 0]`
+    /// for a weight held whole.
     pub fn streamed_bytes(&self) -> Result<[u64; 2], String> {
         let Some(streamed) = self.streamed else {
             return Ok([0, 0]);
@@ -116,7 +206,7 @@ impl WeightPlan {
         let mut staging = self.shape.clone();
         staging[0] = streamed.staging_rows;
         Ok([
-            representation_bytes(Element::i32(), &[streamed.table_rows])?,
+            representation_bytes(Element::i32(), &self.directory_shape())?,
             representation_bytes(self.upload, &staging)?,
         ])
     }
@@ -344,6 +434,32 @@ pub struct AttentionBinding {
     /// How the block's history planes encode keys and values.
     pub history: magnitude_state::CodecSpec,
     pub tail: SublayerTail,
+    /// A selected read's indexer (`HistoryReads::Selected`); none for a
+    /// read of every visible row.
+    pub selection: Option<SelectionBinding>,
+}
+
+/// The indexer of a selected attention read (`indexer_select`): its shape
+/// and the elements of its query and key projections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectionBinding {
+    pub shape: SelectionShape,
+    pub query: Element,
+    pub key: Element,
+}
+
+/// A selected read's static axes: `heads` indexer query heads of `width`
+/// columns score blocks of `block` keys, of which a row past `blocks`
+/// complete ones reads the `blocks` best and its tail. Prefill rows read
+/// their blocks through a bitmap of `words` 32-block words (`B`), enough for
+/// every block of the served context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectionShape {
+    pub heads: u64,
+    pub width: u64,
+    pub block: u64,
+    pub blocks: u64,
+    pub words: u64,
 }
 
 /// How a sublayer's output projection joins the residual stream (the
@@ -493,6 +609,8 @@ pub struct FeaturesBinding {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HeadBinding {
+    pub streams: Option<crate::operators::streams::StreamsBinding>,
+    pub conditioning: Element,
     pub embedding_table: Element,
     pub embedding_norm: Element,
     pub hidden_norm: Element,
@@ -575,6 +693,8 @@ impl HostPeak {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelLoadPlan {
+    /// Width of raw F32 residual conditioning requested by the selected head.
+    pub(super) residual_conditioning: Option<u64>,
     pub(super) target: Vec<WeightPlan>,
     pub(super) head: Option<Vec<WeightPlan>>,
     pub(super) vision: Option<Vec<WeightPlan>>,
@@ -601,6 +721,8 @@ fn head_component_scope(scope: WeightScope) -> Result<bool, String> {
 }
 
 impl ModelLoadPlan {
+    pub(crate) fn residual_conditioning(&self) -> Option<u64> { self.residual_conditioning }
+
     pub fn host_tables(&self) -> &[HostTablePlan] {
         &self.host_tables
     }
@@ -615,6 +737,21 @@ impl ModelLoadPlan {
                 .checked_add(bytes)
                 .ok_or_else(|| "host table bytes overflow".to_owned())
         })
+    }
+
+    /// The host-shared bytes of the target's stored tables
+    /// (`TableFill::Stored`): their slots and directories, part of the
+    /// target's weights, in the domain the device's host-shared storage
+    /// consumes (`platform::shared_role`).
+    pub fn shared_table_bytes(&self) -> Result<u64, String> {
+        self.target
+            .iter()
+            .filter(|weight| weight.stored_in_slots())
+            .try_fold(0u64, |total, weight| {
+                total
+                    .checked_add(weight.storage_bytes()?)
+                    .ok_or_else(|| "stored table bytes overflow".to_owned())
+            })
     }
 
     /// The most of one target weight's import the host holds at once. A
@@ -885,16 +1022,18 @@ impl ModelLoadPlan {
                 ),
             ]
         });
+        // The per-layer entry's table is a host table.
         let host_tables = decoder
             .entry
             .per_layer
             .iter()
-            .map(|entry| {
+            .map(|entry| (target_role(WeightKind::PerLayerTable), &entry.table))
+            .map(|(role, descriptor)| {
                 host_table(
                     target_tensors,
                     target_component,
-                    target_role(WeightKind::PerLayerTable),
-                    &entry.table,
+                    role,
+                    descriptor,
                     target_form,
                 )
             })
@@ -906,13 +1045,8 @@ impl ModelLoadPlan {
             std::iter::once((target_role(WeightKind::Embedding), &decoder.entry.embedding))
                 .chain(per_layer_weights)
                 .chain(operators::decoder_weights(decoder))
-                .chain([
-                    (
-                        target_role(WeightKind::OutputNorm),
-                        decoder.exit.norm.weight(),
-                    ),
-                    (target_role(WeightKind::Output), &decoder.exit.output),
-                ])
+                .chain(operators::exit_weights(decoder))
+                .chain([(target_role(WeightKind::Output), &decoder.exit.output)])
                 .collect(),
             target_form,
         )?;
@@ -1018,6 +1152,7 @@ impl ModelLoadPlan {
         )?;
 
         Ok(Self {
+            residual_conditioning: definition.head.as_ref().filter(|head| selection.head && head.residual_conditioning()).map(|head| head.conditioning_width(&definition.decoder)),
             target,
             head,
             vision,
@@ -1065,15 +1200,12 @@ impl ModelLoadPlan {
                 // do not. It is measured against the packed projection's
                 // only for Q8_0 projections without a soft cap, so only
                 // those are offered.
-                let depth = (Some(weight.source) == source_element(Encoding::Q8_0))
+                let width = weight.shape.last().copied().unwrap_or(1);
+                let depth = (Some(weight.source) == source_element(Encoding::Q8_0, width))
                     .then_some(ProgressiveCodeDepth::Eight);
                 let admitted = weight.role.kind == WeightKind::Output
                     && weight.role.scope == WeightScope::Target
-                    && definition
-                        .decoder
-                        .exit
-                        .softcap
-                        .is_none_or(|cap| cap == 0.0)
+                    && definition.decoder.exit.softcap.is_none_or(|cap| cap == 0.0)
                     && !indexed.contains(&weight.role.scope)
                     && weight.scale.is_none()
                     && weight.descriptor.transforms.is_empty()
@@ -1271,6 +1403,48 @@ pub struct PerLayerEntryBinding {
     pub activation: Element,
 }
 
+/// An n-gram input sublayer (`operators::ngram`): its rows per position
+/// (`ngram_rows`), read from its streamed table as stored (`table_source`)
+/// and decoded as if repacked to `table` (`stored_rows`), projected to the
+/// key and value rows, gated into the streams (`ngram_gate`) and convolved
+/// over its window (`ngram_inject`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NGramBinding {
+    pub hidden: u64,
+    pub streams: u64,
+    /// Predecessors the row rule reads (C): its orders are 2..=C + 1.
+    pub context: u64,
+    /// Rows gathered per order (P), each `width` wide.
+    pub heads_per_order: u64,
+    pub width: u64,
+    pub kernel: u64,
+    pub dilation: u64,
+    pub table_source: Element,
+    pub table: Element,
+    pub key: Element,
+    pub value: Element,
+    /// The key, query and convolution norms'.
+    pub norm: Element,
+    pub activation: Element,
+}
+
+impl NGramBinding {
+    /// Rows gathered per position.
+    pub fn heads(&self) -> u64 {
+        self.context * self.heads_per_order
+    }
+
+    /// The width of a position's gathered rows.
+    pub fn embedding(&self) -> u64 {
+        self.heads() * self.width
+    }
+
+    /// The streams' channels, `S * H`.
+    pub fn channels(&self) -> u64 {
+        self.streams * self.hidden
+    }
+}
+
 /// A block's per-layer input sublayer: `per_layer_gate` over its layer's
 /// slice, `project_rows` back to the hidden width, and its post-norm tail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1332,13 +1506,13 @@ fn host_table(
             descriptor.name
         ));
     }
-    let [_, _] = stored.shape[..] else {
+    let [_, width] = stored.shape[..] else {
         return Err(format!("host table {:?} is not a matrix", descriptor.name));
     };
-    let source = source_element(stored.encoding)
+    let source = source_element(stored.encoding, width)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
-    let resident =
-        resident_element(stored.encoding, form.activation, form.layout).ok_or_else(|| {
+    let resident = resident_element(stored.encoding, width, form.activation, form.layout)
+        .ok_or_else(|| {
             format!(
                 "{:?} has no resident form in the `{}` layout",
                 stored.encoding,
@@ -1366,7 +1540,7 @@ fn host_table(
 /// Whether every reader of a weight of `kind` gathers it by row index: a
 /// gathered table, which is streamed where it can be.
 fn gathered_table(kind: WeightKind) -> bool {
-    matches!(kind, WeightKind::Embedding)
+    matches!(kind, WeightKind::Embedding | WeightKind::NGramTable)
 }
 
 /// Plan the weights of one component's roles. A gathered table whose stored
@@ -1384,16 +1558,12 @@ fn push_weights(
             let read_whole = weights
                 .iter()
                 .any(|(other, stored)| other != role && stored.name == descriptor.name);
-            push_gathered_table(out, inventory, component, *role, descriptor, form, read_whole)?;
+            push_gathered_table(
+                out, inventory, component, *role, descriptor, form, read_whole,
+            )?;
         } else {
             push_weight(
-                out,
-                inventory,
-                component,
-                role.scope,
-                role.kind,
-                descriptor,
-                form,
+                out, inventory, component, role.scope, role.kind, descriptor, form,
             )?;
         }
     }
@@ -1409,7 +1579,8 @@ fn push_weights(
 /// - its rows do not reach the device as stored (the host prepares them, or
 ///   a second-level scale accompanies them).
 ///
-/// Then it is planned as any weight is.
+/// Then it is planned as any weight is. An n-gram table is a stored table
+/// instead (`push_stored_table`).
 fn push_gathered_table(
     out: &mut Vec<WeightPlan>,
     inventory: &[TensorDescriptor],
@@ -1419,6 +1590,9 @@ fn push_gathered_table(
     form: ResidentForm,
     read_whole: bool,
 ) -> Result<(), String> {
+    if role.kind == WeightKind::NGramTable {
+        return push_stored_table(out, inventory, component, role, descriptor);
+    }
     let plan = |form| {
         let mut planned = Vec::with_capacity(1);
         push_weight(
@@ -1460,9 +1634,91 @@ fn push_gathered_table(
         // The largest step any backend admits, each row of which may bring
         // its tile.
         staging_rows: slots.min(magnitude_batching::MAX_CLASS_ROWS as u64 * tile),
+        directory: DirectoryForm::of(table_rows, slots),
+        fill: TableFill::Imported,
     });
     out.push(streamed);
     Ok(())
+}
+
+/// The slots of an n-gram table: the rows its hit rate plateaus at (2.9 M,
+/// 256 MiB of IQ4_NL rows), a multiple of every row tile.
+pub const NGRAM_TABLE_SLOTS: u64 = 180 * 16_384;
+
+/// Plan an n-gram table (`TableFill::Stored`): slots for
+/// `NGRAM_TABLE_SLOTS` of its rows (all of them, of a table of no more) as
+/// stored, in the encoding of its 32-value blocks (`stored_block_element`),
+/// which the host writes and its reader (`stored_rows`) decodes as their
+/// registered conversion does, and a directory of the form the plan picks
+/// (`DirectoryForm::of`). A table with import transforms, a second-level
+/// scale, rows past I32 or an encoding without a stored block form is
+/// refused. The slots are the weight's shape and resident bytes; the load
+/// uploads nothing.
+fn push_stored_table(
+    out: &mut Vec<WeightPlan>,
+    inventory: &[TensorDescriptor],
+    component: ArtifactComponent,
+    role: WeightRole,
+    descriptor: &WeightDescriptor,
+) -> Result<(), String> {
+    let refused = |reason: &str| {
+        format!(
+            "n-gram table {:?} cannot be streamed as stored: {reason}",
+            descriptor.name
+        )
+    };
+    let stored = inventory
+        .iter()
+        .find(|tensor| tensor.name == descriptor.name)
+        .ok_or_else(|| format!("n-gram table {:?} is absent from its component", descriptor.name))?;
+    let [table_rows, width] = stored.shape[..] else {
+        return Err(refused("it is not a matrix"));
+    };
+    if !descriptor.transforms.is_empty() || stored.shape != descriptor.shape {
+        return Err(refused("it is not the stored matrix itself"));
+    }
+    if table_rows > i32::MAX as u64 {
+        return Err(refused("its rows exceed I32"));
+    }
+    let (block, decoded) = stored_block_element(stored.encoding)
+        .ok_or_else(|| refused(&format!("{:?} has no stored block form", stored.encoding)))?;
+    if representation_bytes(block, &stored.shape)? != stored.nbytes {
+        return Err(refused("its rows are not whole blocks"));
+    }
+    let slots = NGRAM_TABLE_SLOTS.min(table_rows);
+    let shape = vec![slots, width];
+    out.push(WeightPlan {
+        role,
+        component,
+        source: block,
+        upload: block,
+        resident: block,
+        resident_bytes: representation_bytes(block, &shape)?,
+        shape,
+        descriptor: descriptor.clone(),
+        source_bytes: 0,
+        scale: None,
+        streamed: Some(StreamedRows {
+            table_rows,
+            staging_rows: 0,
+            directory: DirectoryForm::of(table_rows, slots),
+            fill: TableFill::Stored { decoded },
+        }),
+    });
+    Ok(())
+}
+
+/// The encoding of `encoding`'s 32-value blocks as stored, and the packed
+/// representation its registered conversion decodes them as: what a stored
+/// table's slots hold and its reader decodes.
+pub fn stored_block_element(encoding: Encoding) -> Option<(Element, Element)> {
+    match encoding {
+        Encoding::Iq4Nl => Some((
+            Element::named("gguf_iq4_nl_block")?,
+            Element::named("iq4g32s")?,
+        )),
+        _ => None,
+    }
 }
 
 fn push_weight(
@@ -1490,7 +1746,8 @@ fn push_weight(
     // Projector weights keep their stored dense element: the vision kernels
     // read f32, f16 and bf16 matrices and vectors directly, and converting
     // f16 matrices or f32 biases to the activation dtype only loses bits.
-    let stored_dense = source_element(stored.encoding).and_then(Element::dtype);
+    let width = stored.shape.last().copied().unwrap_or(1);
+    let stored_dense = source_element(stored.encoding, width).and_then(Element::dtype);
     let dense_resident = match (role.kind, stored_dense) {
         (WeightKind::Vision(_), Some(dtype)) => dtype,
         _ => resident_dtype(role, form.activation),
@@ -1506,7 +1763,7 @@ fn push_weight(
             stored.encoding
         ));
     }
-    let source = source_element(stored.encoding)
+    let source = source_element(stored.encoding, width)
         .ok_or_else(|| format!("unsupported source encoding {:?}", stored.encoding))?;
     // Packed projector weights become dense in the activation dtype: the GPU
     // vision kernels read dense weights only. The host dequantizes them
@@ -1515,7 +1772,7 @@ fn push_weight(
         (WeightKind::Vision(_), None) => (Element::f32(), Element::dense(form.activation)),
         _ => (
             source,
-            resident_element(stored.encoding, dense_resident, form.layout).ok_or_else(|| {
+            resident_element(stored.encoding, width, dense_resident, form.layout).ok_or_else(|| {
                 format!(
                     "{:?} has no resident form in the `{}` layout",
                     stored.encoding,
@@ -1750,9 +2007,20 @@ pub fn resident_layout(path: ExecutionPath, backend: BackendName) -> Layout {
     }
 }
 
-/// The external storage of an artifact encoding.
-pub fn source_element(encoding: Encoding) -> Option<Element> {
+/// The external storage of an artifact encoding whose rows hold `width`
+/// values (the stored last axis).
+///
+/// IQ4_NL is stored as 32-value blocks, but the registry converts a source
+/// packet into one resident packet: eight blocks reach iq4g32 (256-value
+/// groups, f32 scales; its kernels are the qualified ones for IQ4) only as
+/// one 256-value `gguf_iq4_nl` packet. So rows whose width is a multiple of
+/// 256 read that packet, and every other width reads single blocks
+/// (`gguf_iq4_nl_block`, into iq4g32s). This is the one place the width
+/// chooses an IQ4_NL tensor's forms: `resident_element` follows the source
+/// chosen here.
+pub fn source_element(encoding: Encoding, width: u64) -> Option<Element> {
     match encoding {
+        Encoding::Iq4Nl if !width.is_multiple_of(256) => Element::named("gguf_iq4_nl_block"),
         Encoding::F32 => Some(Element::dense(DType::F32)),
         Encoding::F16 => Some(Element::dense(DType::F16)),
         Encoding::BF16 => Some(Element::dense(DType::BF16)),
@@ -1761,6 +2029,8 @@ pub fn source_element(encoding: Encoding) -> Option<Element> {
         Encoding::Q4K => Element::named("gguf_q4_k"),
         Encoding::Q5K => Element::named("gguf_q5_k"),
         Encoding::Q6K => Element::named("gguf_q6_k"),
+        Encoding::Iq2Xs => Element::named("gguf_iq2_xs"),
+        Encoding::Iq3Xxs => Element::named("gguf_iq3_xxs"),
         Encoding::Iq3S => Element::named("gguf_iq3_s"),
         Encoding::Iq4Nl => Element::named("gguf_iq4_nl"),
         Encoding::Iq4Xs => Element::named("gguf_iq4_xs"),
@@ -1779,15 +2049,27 @@ pub fn source_element(encoding: Encoding) -> Option<Element> {
 /// format without its own representation imports exactly into one that
 /// holds every value it encodes: Q3_K and IQ3_S into q6k (an f16
 /// super-scale times an int8 sixteen-value sub-block scale times a code in
-/// [-32, 31]), IQ4_NL into iq4g32 (same table). NVFP4's per-tensor F32
-/// `.scale` is a separate tensor; its representation holds the block values.
-pub fn resident_element(encoding: Encoding, dense: DType, layout: Layout) -> Option<Element> {
+/// [-32, 31]), IQ4_NL into iq4g32 (same table) or, read as single blocks
+/// (`source_element`), into iq4g32s. NVFP4's per-tensor F32 `.scale` is a
+/// separate tensor; its representation holds the block values. `width` is
+/// the stored rows' width, as `source_element` takes it.
+pub fn resident_element(
+    encoding: Encoding,
+    width: u64,
+    dense: DType,
+    layout: Layout,
+) -> Option<Element> {
     let representation = match encoding {
         Encoding::F32 | Encoding::F16 | Encoding::BF16 => return Some(Element::dense(dense)),
+        Encoding::Iq4Nl if source_element(encoding, width)?.name() == "gguf_iq4_nl_block" => {
+            "iq4g32s"
+        }
         Encoding::Q8_0 => "q8g32s",
         Encoding::Q3K | Encoding::Iq3S | Encoding::Q6K => "q6k",
         Encoding::Q4K => "q4k",
         Encoding::Q5K => "q5k",
+        Encoding::Iq2Xs => "iq2xs",
+        Encoding::Iq3Xxs => "iq3xxs",
         Encoding::Iq4Nl | Encoding::Iq4Xs => "iq4g32",
         Encoding::Q4_0 => "q4g32s",
         Encoding::Q5_0 => "q5g32s",
@@ -1887,6 +2169,8 @@ mod representation_byte_tests {
             (Encoding::Q5K, "q5k"),
             (Encoding::Q6K, "q6k"),
             (Encoding::Iq3S, "q6k"),
+            (Encoding::Iq2Xs, "iq2xs"),
+            (Encoding::Iq3Xxs, "iq3xxs"),
             (Encoding::Iq4Nl, "iq4g32"),
             (Encoding::Iq4Xs, "iq4g32"),
             (Encoding::Q4_0, "q4g32s"),
@@ -1896,7 +2180,7 @@ mod representation_byte_tests {
             (Encoding::Nvfp4, "nvfp4g16"),
         ] {
             for layout in Layout::ALL {
-                let element = resident_element(encoding, DType::BF16, layout).unwrap();
+                let element = resident_element(encoding, 2560, DType::BF16, layout).unwrap();
                 assert_eq!(
                     (element.representation(), element.layout()),
                     (representation, layout)
@@ -1904,14 +2188,41 @@ mod representation_byte_tests {
             }
         }
         assert_eq!(
-            resident_element(Encoding::F16, DType::BF16, Layout::Rows16),
+            resident_element(Encoding::F16, 2560, DType::BF16, Layout::Rows16),
             Some(Element::bf16())
         );
         for encoding in [Encoding::Q1_0, Encoding::I32] {
             assert_eq!(
-                resident_element(encoding, DType::BF16, Layout::Rows16),
+                resident_element(encoding, 2560, DType::BF16, Layout::Rows16),
                 None
             );
+        }
+    }
+
+    /// IQ4_NL rows whose width is a multiple of 256 read eight-block packets
+    /// into iq4g32; other widths (a 640-wide expert down) read single blocks
+    /// into iq4g32s, whose bytes are the stored blocks'.
+    #[test]
+    fn iq4_nl_forms_follow_the_row_width() {
+        for (width, source, representation) in [
+            (2560, "gguf_iq4_nl", "iq4g32"),
+            (640, "gguf_iq4_nl_block", "iq4g32s"),
+            (160, "gguf_iq4_nl_block", "iq4g32s"),
+        ] {
+            let stored = source_element(Encoding::Iq4Nl, width).unwrap();
+            assert_eq!(stored.name(), source);
+            // 18 bytes per 32 stored values, whatever the packet.
+            assert_eq!(
+                stored.canonical_byte_len(&[2, width]).unwrap(),
+                2 * width / 32 * 18
+            );
+            for layout in Layout::ALL {
+                let element = resident_element(Encoding::Iq4Nl, width, DType::BF16, layout).unwrap();
+                assert_eq!(
+                    (element.representation(), element.layout()),
+                    (representation, layout)
+                );
+            }
         }
     }
 }

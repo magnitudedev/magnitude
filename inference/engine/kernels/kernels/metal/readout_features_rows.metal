@@ -18,8 +18,9 @@ kernel void readout_features_rows(
     uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float partials[8];
     const uint width = uint(SEISMIC_DIM_D);
-    projection::Rms<activation, norm_element, projection::SelectedRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0,
-        SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,
+    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type
+        in{hidden, SEISMIC_HIDDEN_STRIDE_0,
+        SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), width, {out_rows}};
     const float inverse = projection::normalization_inverse<256>(in, row, 0, partials, thread_index);
     device typename activation::storage *out = reinterpret_cast<device typename activation::storage *>(features);

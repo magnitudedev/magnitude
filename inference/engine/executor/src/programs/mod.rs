@@ -20,7 +20,7 @@ pub use native_draft::PreparedDraftGraphs;
 pub use native_drafter::PreparedDrafterGraphs;
 pub use native_head::PreparedHeadGraphs;
 pub use native_state::PreparedStateCopyGraphs;
-pub use native_target::{CommitSpan, TargetOutput, TargetReadoutGraphResult};
+pub use native_target::{CommitSpan, StoredRead, TargetOutput, TargetReadoutGraphResult};
 pub use native_target_graph::{
     PlannedSealedGraphs, PreparedTargetGraphs, SealReport, SealedGraphsHeap,
 };

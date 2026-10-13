@@ -1,5 +1,5 @@
 use magnitude_artifacts::TokenId;
-use magnitude_family_qwen35::inputs::{spatial_controls, QwenImageTokens};
+use magnitude_family_qwen::inputs::{QwenImageTokens, spatial_controls};
 
 #[test]
 fn image_markers_require_distinct_addressable_tokens() {
@@ -33,9 +33,11 @@ fn spatial_controls_follow_merge_group_order_and_normalized_bilinear_weights() {
             .map(|plane| plane[row])
             .sum::<f32>();
         assert!((sum - 1.0).abs() <= f32::EPSILON * 4.0);
-        assert!(controls
-            .interpolation_indices()
-            .iter()
-            .all(|plane| (0..16).contains(&plane[row])));
+        assert!(
+            controls
+                .interpolation_indices()
+                .iter()
+                .all(|plane| (0..16).contains(&plane[row]))
+        );
     }
 }

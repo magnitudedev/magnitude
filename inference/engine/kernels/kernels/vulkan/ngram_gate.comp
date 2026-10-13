@@ -1,0 +1,73 @@
+// ngram_gate (contract and portable body in ngram.seismic): each row's
+// per-stream gate sigmoid(g) and the inverse RMS of the gated value. The
+// Vulkan form of `cuda/ngram_gate.cu`: a workgroup per (stream, row), the y
+// grid visiting the rows with a stride.
+#include <seismic/element.glsl>
+#include "lib/core/reduce.glsl"
+
+#if defined(SEISMIC_KEY_NORM_REPRESENTATION_F32)
+#define KEY_NORM ELEMENT_F32
+#elif defined(SEISMIC_KEY_NORM_REPRESENTATION_F16)
+#define KEY_NORM ELEMENT_F16
+#elif defined(SEISMIC_KEY_NORM_REPRESENTATION_BF16)
+#define KEY_NORM ELEMENT_BF16
+#else
+#error "ngram_gate requires a dense key norm"
+#endif
+#if defined(SEISMIC_QUERY_NORM_REPRESENTATION_F32)
+#define QUERY_NORM ELEMENT_F32
+#elif defined(SEISMIC_QUERY_NORM_REPRESENTATION_F16)
+#define QUERY_NORM ELEMENT_F16
+#elif defined(SEISMIC_QUERY_NORM_REPRESENTATION_BF16)
+#define QUERY_NORM ELEMENT_BF16
+#else
+#error "ngram_gate requires a dense query norm"
+#endif
+
+// Shared: one partial per subgroup (reduce_group_sum at float 0).
+void ngram_gate() {
+    const uint64_t width = SEISMIC_DIM_H;
+    const uint64_t stream = gl_WorkGroupID.x;
+    const uint thread = gl_LocalInvocationIndex;
+    const float epsilon = element_word_f32(SEISMIC_PARAM_EPSILON);
+    const uint64_t key_norm = SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM);
+    const uint64_t query_norm = SEISMIC_PTR(SEISMIC_BUFFER_QUERY_NORM);
+    for (uint64_t row = gl_WorkGroupID.y; row < SEISMIC_DIM_M; row += gl_NumWorkGroups.y) {
+        const uint64_t k = SEISMIC_PTR(SEISMIC_BUFFER_KEY)
+            + (row * SEISMIC_KEY_STRIDE_0 + stream * SEISMIC_KEY_STRIDE_1) * 4ul;
+        const uint64_t x = SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN)
+            + (row * SEISMIC_HIDDEN_STRIDE_0 + stream * SEISMIC_HIDDEN_STRIDE_1) * 4ul;
+        const uint64_t v = SEISMIC_PTR(SEISMIC_BUFFER_VALUE) + row * SEISMIC_VALUE_STRIDE_0 * 4ul;
+        float keys = 0.0;
+        float queries = 0.0;
+        float dot = 0.0;
+        float values = 0.0;
+        for (uint64_t i = thread; i < width; i += gl_WorkGroupSize.x) {
+            const float kv = element_f32_at(k + i * SEISMIC_KEY_STRIDE_2 * 4ul);
+            const float xv = element_f32_at(x + i * SEISMIC_HIDDEN_STRIDE_2 * 4ul);
+            const float vv = element_f32_at(v + i * SEISMIC_VALUE_STRIDE_1 * 4ul);
+            keys = seismic_fma_rn(kv, kv, keys);
+            queries = seismic_fma_rn(xv, xv, queries);
+            dot += seismic_mul_rn(seismic_mul_rn(seismic_mul_rn(kv,
+                       element_at(KEY_NORM, key_norm, stream * SEISMIC_KEY_NORM_STRIDE_0 + i * SEISMIC_KEY_NORM_STRIDE_1)),
+                       xv),
+                   element_at(QUERY_NORM, query_norm, stream * SEISMIC_QUERY_NORM_STRIDE_0 + i * SEISMIC_QUERY_NORM_STRIDE_1));
+            values = seismic_fma_rn(vv, vv, values);
+        }
+        keys = reduce_group_sum(keys, 0u);
+        queries = reduce_group_sum(queries, 0u);
+        dot = reduce_group_sum(dot, 0u);
+        values = reduce_group_sum(values, 0u);
+        if (thread == 0u) {
+            const float g = seismic_div_rn(dot * inversesqrt(seismic_div_rn(keys, float(width)) + epsilon)
+                * inversesqrt(seismic_div_rn(queries, float(width)) + epsilon), sqrt(float(width)));
+            const float root = sqrt(max(abs(g), 1e-6));
+            const float signed_root = g > 0.0 ? root : (g < 0.0 ? -root : 0.0);
+            const float gate = seismic_div_rn(1.0, 1.0 + exp(-signed_root));
+            const uint64_t target = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER) + row * SEISMIC_RESULT_0_STRIDE_0 * 4ul;
+            element_f32_put(target + stream * SEISMIC_RESULT_0_STRIDE_1 * 4ul, gate);
+            element_f32_put(target + (SEISMIC_DIM_S + stream) * SEISMIC_RESULT_0_STRIDE_1 * 4ul,
+                inversesqrt(gate * gate * seismic_div_rn(values, float(width)) + epsilon));
+        }
+    }
+}

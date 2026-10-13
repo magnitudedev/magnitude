@@ -649,6 +649,37 @@ impl Submission {
                     ),
                     "device fill",
                 ),
+                // Each 32-bit half of every element: one strided pass per half,
+                // or a single pass when the halves agree.
+                FillValue::U64(pattern) => {
+                    let low = u32::from_le_bytes([pattern[0], pattern[1], pattern[2], pattern[3]]);
+                    let high = u32::from_le_bytes([pattern[4], pattern[5], pattern[6], pattern[7]]);
+                    if low == high {
+                        driver.check(
+                            (driver.memset_d32_async)(
+                                pointer,
+                                low,
+                                count * 2,
+                                self.device.stream.raw(),
+                            ),
+                            "device fill",
+                        )
+                    } else {
+                        [(0, low), (4, high)].into_iter().try_for_each(|(offset, half)| {
+                            driver.check(
+                                (driver.memset_d2d32_async)(
+                                    pointer + offset,
+                                    8,
+                                    half,
+                                    1,
+                                    count,
+                                    self.device.stream.raw(),
+                                ),
+                                "device fill",
+                            )
+                        })
+                    }
+                }
             }
             .map_err(submission_error)
         }

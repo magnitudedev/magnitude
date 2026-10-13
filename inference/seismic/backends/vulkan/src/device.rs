@@ -532,16 +532,48 @@ impl Device {
 
     /// Submit `command`, signalling the timeline with the next value.
     pub(crate) fn submit(&self, command: vk::CommandBuffer) -> Result<u64, ExecutionError> {
+        self.submit_with(command, &[], &[])
+    }
+
+    /// Submit `command` once every timeline semaphore of `waits` reaches its
+    /// value, signalling the device timeline with the next value and each
+    /// of `signals` with its own once the command completes.
+    pub(crate) fn submit_with(
+        &self,
+        command: vk::CommandBuffer,
+        waits: &[(vk::Semaphore, u64)],
+        signals: &[(vk::Semaphore, u64)],
+    ) -> Result<u64, ExecutionError> {
         let inner = &self.inner;
         let mut queue = inner.queue.lock().expect("queue lock is never poisoned");
         let value = queue.next;
-        let signal = [vk::SemaphoreSubmitInfo::default()
-            .semaphore(inner.timeline)
-            .value(value)
-            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+        let semaphore = |stages: vk::PipelineStageFlags2| {
+            move |(semaphore, value): (vk::Semaphore, u64)| {
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(semaphore)
+                    .value(value)
+                    .stage_mask(stages)
+            }
+        };
+        let signal = std::iter::once((inner.timeline, value))
+            .chain(signals.iter().copied())
+            .map(semaphore(vk::PipelineStageFlags2::ALL_COMMANDS))
+            .collect::<Vec<_>>();
+        // A host gate's wait: no stage of the batch, the compute shaders
+        // that read what the host wrote before signaling it included,
+        // starts before it (spec, "Semaphore Waiting": the wait's second
+        // synchronization scope is limited to the stages of its mask).
+        let wait = waits
+            .iter()
+            .copied()
+            .map(semaphore(
+                vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::ALL_COMMANDS,
+            ))
+            .collect::<Vec<_>>();
         let commands = [vk::CommandBufferSubmitInfo::default().command_buffer(command)];
         let submit = vk::SubmitInfo2::default()
             .command_buffer_infos(&commands)
+            .wait_semaphore_infos(&wait)
             .signal_semaphore_infos(&signal);
         inner.measured(|| {
             call(
@@ -555,6 +587,16 @@ impl Device {
         })?;
         queue.next += 1;
         Ok(value)
+    }
+
+    /// The device timeline value of the latest submission.
+    pub(crate) fn submitted(&self) -> u64 {
+        self.inner
+            .queue
+            .lock()
+            .expect("queue lock is never poisoned")
+            .next
+            - 1
     }
 
     /// The timeline value every completed submission has reached. A failed

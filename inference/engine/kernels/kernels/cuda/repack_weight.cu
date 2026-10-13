@@ -37,8 +37,9 @@
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32)
 #define REPACK_IQ4 1
 #define REPACK_CODE_BITS 4u
-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)
-// block_q4_0: d (f16) | qs[16].
+#elif (defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)) || \
+    (defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_NL_BLOCK) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32S))
+// block_q4_0 and one block_iq4_nl: d (f16) | qs[16].
 #define REPACK_BLOCK32 1
 #define REPACK_SCALE_BYTES 2u
 #define REPACK_QS 2u
@@ -70,6 +71,16 @@
 #define REPACK_E2M1 1
 #define REPACK_SCALE_BYTES 4u
 #define REPACK_CODE_BITS 4u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XS)
+// See `metal/repack_weight.metal`.
+#define REPACK_GRID 1
+#define REPACK_GRID_FACTOR 0.125f
+#define REPACK_CODE_BITS 2u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ3_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ3XXS)
+#define REPACK_GRID 1
+#define REPACK_IQ3XXS 1
+#define REPACK_GRID_FACTOR 0.25f
+#define REPACK_CODE_BITS 3u
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -154,8 +165,25 @@ __constant__ u32 iq3s_grid[512] = {
 };
 #endif
 
+#if defined(REPACK_GRID)
+// Resident vector-code entry `e` of a source block (`metal/repack_weight.metal`).
+__device__ __forceinline__ u32 grid_entry(const u8 *in, u32 e) {
+#if defined(REPACK_IQ3XXS)
+    const u32 block = e / 4, group = e % 4;
+    const u32 signs = (u32)in[66 + 4 * block] | ((u32)in[67 + 4 * block] << 8) | ((u32)in[68 + 4 * block] << 16) |
+                      ((u32)in[69 + 4 * block] << 24);
+    return (u32)in[2 + 8 * block + 2 * group] | ((u32)in[3 + 8 * block + 2 * group] << 8) |
+           (((signs >> (7 * group)) & 127u) << 16);
+#else
+    return (u32)in[2 + 2 * e] | ((u32)in[3 + 2 * e] << 8);
+#endif
+}
+#endif
+
 __device__ __forceinline__ u32 source_code(const u8 *in, u32 p) {
-#if defined(REPACK_KQUANT) && REPACK_CODE_BITS == 4u
+#if defined(REPACK_GRID)
+    return (grid_entry(in, p / 8) >> (REPACK_CODE_BITS * (p % 8))) & ((1u << REPACK_CODE_BITS) - 1u);
+#elif defined(REPACK_KQUANT) && REPACK_CODE_BITS == 4u
     return (in[16 + (p / 64) * 32 + p % 32] >> ((p % 64 / 32) * 4)) & 15u;
 #elif defined(REPACK_KQUANT)
     u32 low = (in[48 + (p / 64) * 32 + p % 32] >> ((p % 64 / 32) * 4)) & 15u;
@@ -249,6 +277,11 @@ __device__ __forceinline__ void write_scales(const u8 *in, u8 *out) {
 #elif defined(REPACK_IQ3S)
     // Both halves of 32-value sub-block b take 1 + 2 s, s its four-bit scale.
     for (u32 j = 0; j < 16; ++j) out[j] = (u8)(1u + 2u * ((in[106 + j / 4] >> (4 * (j / 2 % 2))) & 15u));
+#elif defined(REPACK_IQ3XXS)
+    // Sub-block b's scale is the top nibble of its u32, nibble b of the plane.
+    for (u32 j = 0; j < 4; ++j) out[j] = (u8)((in[69 + 8 * j] >> 4) | (in[73 + 8 * j] & 0xf0u));
+#elif defined(REPACK_GRID)
+    for (u32 j = 0; j < 8; ++j) out[j] = in[66 + j];
 #endif
 }
 
@@ -263,6 +296,9 @@ __device__ __forceinline__ void write_supers(const u8 *in, u8 *out) {
     reinterpret_cast<unsigned short *>(out)[0] = (unsigned short)(in[0] | (in[1] << 8));
 #elif defined(REPACK_Q8)
     reinterpret_cast<unsigned short *>(out)[0] = (unsigned short)(in[0] | (in[1] << 8));
+#elif defined(REPACK_GRID)
+    // d widened and scaled by a power of two, exactly.
+    reinterpret_cast<float *>(out)[0] = seismic_f16_to_f32((unsigned short)(in[0] | (in[1] << 8))) * REPACK_GRID_FACTOR;
 #elif defined(REPACK_IQ4NL)
     // Each block's f16 scale, widened exactly.
     for (u32 j = 0; j < 8; ++j)
@@ -279,6 +315,18 @@ __device__ __forceinline__ void write_supers(const u8 *in, u8 *out) {
 __device__ __forceinline__ u32 pack_eight(const u8 *in, u32 first, u32 shift, u32 bits) {
     u32 value = 0;
     for (u32 i = 0; i < 8; ++i) value |= ((source_code(in, first + i) >> shift) & ((1u << bits) - 1u)) << (i * bits);
+    return value;
+}
+
+// Word `word` of the codes of positions `first ..`, REPACK_CODE_BITS each,
+// packed little-endian (a code may straddle two words).
+__device__ __forceinline__ u32 code_word(const u8 *in, u32 first, u32 word) {
+    u32 value = 0;
+    for (u32 code = (word * 32) / REPACK_CODE_BITS; code <= (word * 32 + 31) / REPACK_CODE_BITS; ++code) {
+        const int shift = (int)(code * REPACK_CODE_BITS) - (int)(word * 32);
+        const u32 raw = source_code(in, first + code);
+        value |= shift >= 0 ? raw << shift : raw >> (-shift);
+    }
     return value;
 }
 
@@ -339,14 +387,7 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
         if (n >= SEISMIC_DIM_N) continue;
         const u8 *in = source_packet(source, seismic_words_value, b, n, packet);
         u32 word = within / 32 * code_words + item % code_words;
-        u32 first = (word * 32) / REPACK_CODE_BITS;
-        u32 last = (word * 32 + 31) / REPACK_CODE_BITS;
-        u32 value = 0;
-        for (u32 code = first; code <= last; ++code) {
-            int shift = (int)(code * REPACK_CODE_BITS) - (int)(word * 32);
-            u32 raw = source_code(in, code);
-            value |= shift >= 0 ? raw << shift : raw >> (-shift);
-        }
+        u32 value = code_word(in, 0, word);
         u8 *out = destination_packet(destination, seismic_words_value, b, n, packet);
 #if SEISMIC_ELEMENT_U_PACKET_SIZE % 4 == 0
         reinterpret_cast<u32 *>(out + SEISMIC_ELEMENT_U_PLANE_0_OFFSET)[word] = value;
@@ -360,7 +401,8 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     const u64 n = row0 + lane;
     const u8 *in = source_packet(source, seismic_words_value, b, n, packet);
     u8 *out = destination_packet(destination, seismic_words_value, b, n, packet);
-#if defined(REPACK_KQUANT) || defined(REPACK_Q6K) || defined(REPACK_Q3K) || defined(REPACK_IQ3S)
+#if defined(REPACK_KQUANT) || defined(REPACK_Q6K) || defined(REPACK_Q3K) || defined(REPACK_IQ3S) || \
+    defined(REPACK_GRID)
     write_scales(in, out + SEISMIC_ELEMENT_U_PLANE_1_OFFSET);
     write_supers(in, out + SEISMIC_ELEMENT_U_PLANE_2_OFFSET);
 #else
@@ -426,7 +468,12 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
         const u64 n = row0 + lane;
         const u8 *in = source_packet(source, seismic_words_value, b, n, column0 / GROUP);
         u8 *row = row_base(destination, seismic_words_value, b, n);
-#if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+        // The tile's four grid entries, REPACK_CODE_BITS words.
+        u32 *grids = reinterpret_cast<u32 *>(row + SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET +
+                                             column0 / 32 * 4 * REPACK_CODE_BITS);
+        for (u32 word = 0; word < REPACK_CODE_BITS; ++word) grids[word] = code_word(in, within, word);
+#elif defined(SEISMIC_ELEMENT_U_PLANE_CODES)
         uint4 *codes = reinterpret_cast<uint4 *>(row + SEISMIC_RESULT_0_PLANE_CODES_ROW_OFFSET + column0);
         codes[0] = make_uint4(pack_four_bytes(in, within), pack_four_bytes(in, within + 4),
                               pack_four_bytes(in, within + 8), pack_four_bytes(in, within + 12));
@@ -451,7 +498,23 @@ extern "C" __global__ void repack_weight(SEISMIC_KERNEL_PARAMS) {
     {
         const u32 block = column0 / 64;
         const u32 step0 = (column0 % 64) / 16;
-#if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+        // Grid entries stay whole: the tile sequence is [k-block][row][k-block
+        // bytes]; row `lane`'s 32 columns (steps `step0`, `step0 + 1`) are
+        // half of its k-block bytes.
+        if (lane < TILE_ROWS) {
+            const u64 n = row0 + lane;
+            const bool stored = n < SEISMIC_DIM_N;
+            const u8 *in = source_packet(source, seismic_words_value, b, stored ? n : 0, column0 / GROUP);
+            const u64 position =
+                ((u64)block * TILE_ROWS + lane) * 8 * REPACK_CODE_BITS + step0 / 2 * 4 * REPACK_CODE_BITS;
+            for (u32 word = 0; word < REPACK_CODE_BITS; ++word)
+                *reinterpret_cast<u32 *>(tile_plane_byte(destination, seismic_words_value, b, row0, position + 4 * word,
+                                                         SEISMIC_RESULT_0_PLANE_GRIDS_BYTES_PER_ROW,
+                                                         SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET)) =
+                    stored ? code_word(in, within, word) : 0u;
+        }
+#elif defined(SEISMIC_ELEMENT_U_PLANE_CODES)
         {
             u32 words[4];
             for (u32 half_step = 0; half_step < 2; ++half_step) {

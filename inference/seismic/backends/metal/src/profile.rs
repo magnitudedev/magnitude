@@ -231,7 +231,7 @@ fn limits_of(facts: &MetalFacts) -> TargetLimits {
 
 fn dtype_support_of(facts: &MetalFacts) -> DataTypeSupport {
     let mut scalars: BTreeSet<DType> =
-        [DType::F32, DType::F16, DType::I32, DType::U32, DType::Bool]
+        [DType::F32, DType::F16, DType::I32, DType::U32, DType::U64, DType::Bool]
             .into_iter()
             .collect();
     if facts.bfloat_arithmetic {
@@ -412,6 +412,7 @@ fn dtype_tag(dtype: DType) -> u8 {
         DType::I32 => 3,
         DType::U32 => 4,
         DType::Bool => 5,
+        DType::U64 => 6,
     }
 }
 

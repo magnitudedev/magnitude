@@ -8,13 +8,13 @@ use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel};
 use crate::families;
 use crate::options::InputModalities;
 use magnitude_artifacts::{
-    gguf::{Directory, Value},
     ImageProcessor, InputLayout, Package, TokenId,
+    gguf::{Directory, Value},
 };
 use magnitude_chat::{
+    ByteBpeTokenizer, SpecialTokens, TemplateBundle, TemplateInspection,
     artifacts::{gguf_byte_bpe, gguf_templates},
     request::ImageInput,
-    ByteBpeTokenizer, SpecialTokens, TemplateBundle, TemplateInspection,
 };
 use magnitude_executor::image_cell_limit;
 use magnitude_family_contracts::{
@@ -94,6 +94,7 @@ pub enum DraftUnavailable {
     /// A Gemma 4 assistant (`gemma4-assistant`) that is not a draft head of
     /// this target.
     Assistant(magnitude_family_gemma4::Error),
+    PredictionHead(magnitude_family_qwen4exp::Error),
     /// An architecture no drafter family interprets.
     Architecture(Option<String>),
 }
@@ -103,6 +104,7 @@ impl fmt::Display for DraftUnavailable {
         match self {
             Self::Block(error) => write!(formatter, "DFlash draft: {error}"),
             Self::Assistant(error) => write!(formatter, "Gemma assistant draft: {error}"),
+            Self::PredictionHead(error) => write!(formatter, "prediction head: {error}"),
             Self::Architecture(Some(architecture)) => write!(
                 formatter,
                 "draft GGUF architecture {architecture:?} names no drafter family"
@@ -152,6 +154,12 @@ pub fn bind_draft(
         return AdmittedDefinition::bound(declared);
     };
     match draft.value("general.architecture").and_then(Value::string) {
+        Some(magnitude_family_qwen4exp::FAMILY_ID) => {
+            match magnitude_family_qwen4exp::inspect_head(draft, &declared) {
+                Ok(head) => AdmittedDefinition::bound(ModelDefinition { head: Some(head), ..declared }),
+                Err(error) => AdmittedDefinition::without(declared, DraftUnavailable::PredictionHead(error)),
+            }
+        }
         Some(magnitude_family_dflash::ARCHITECTURE) => {
             match magnitude_family_dflash::inspect(draft, &declared, &|layer| {
                 family.layer_entry(&declared, layer)
@@ -397,8 +405,8 @@ mod tests {
     #[test]
     fn draft_admission_retains_target_and_distinguishes_missing_from_invalid() {
         use magnitude_artifacts::{
-            gguf::{Metadata, Scalar, Value},
             ArtifactIdentity, PackageIdentity,
+            gguf::{Metadata, Scalar, Value},
         };
         use magnitude_family_common::headers;
         let family = magnitude_family_qwen35::Qwen35Family;
@@ -451,8 +459,8 @@ mod tests {
     #[test]
     fn a_draft_is_interpreted_by_the_family_its_architecture_names() {
         use magnitude_artifacts::{
-            gguf::{Scalar, Value},
             ArtifactIdentity, PackageIdentity,
+            gguf::{Scalar, Value},
         };
         use magnitude_family_common::headers;
         let identity = PackageIdentity {
@@ -480,7 +488,10 @@ mod tests {
         let admitted = bind_draft(&qwen, target.clone(), Some(&assistant));
         assert_eq!(admitted.definition, target);
         let Some(DraftUnavailable::Assistant(error)) = &admitted.draft_unavailable else {
-            panic!("an assistant is interpreted as one: {:?}", admitted.draft_unavailable);
+            panic!(
+                "an assistant is interpreted as one: {:?}",
+                admitted.draft_unavailable
+            );
         };
         assert!(error.to_string().contains("drafts for a Gemma 4 target"));
         // A Gemma target's assistant failure is the assistant's, not DFlash's.

@@ -11,7 +11,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of one head conditioning row: the target's normalized output
     /// feature in the activation representation.
     pub(super) fn head_conditioning_bytes(&self) -> usize {
-        self.definition.decoder.hidden as usize * self.definition.decoder.activation_dtype.bytes()
+        let decoder = &self.definition.decoder;
+        self.definition.head.as_ref().map_or(
+            decoder.hidden as usize * decoder.activation_dtype.bytes(),
+            |head| head.conditioning_width(decoder) as usize * if head.residual_conditioning() { 4 } else { decoder.activation_dtype.bytes() },
+        )
     }
 
     /// Submit one batch of head transactions. Each commits its entry rows to
@@ -838,8 +842,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
 /// domain equally wide, skipping leaves nothing to inject).
 pub(super) fn skippable_window(store: &StateStore) -> Option<usize> {
     // A domain's reach: its window, or `None` for a history of every row.
+    // An indexer's domains are no attention's.
     let reaches = store
         .history_domains()
+        .filter(|&domain| !super::target::indexer_domain(store, domain))
         .map(|domain| match store.history_domain_kind(domain) {
             magnitude_state::HistoryDomainKind::Window { rows } => Some(rows),
             _ => None,

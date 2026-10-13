@@ -34,21 +34,22 @@ use shared_head::SharedHeadKernels;
 use target::TargetKernels;
 pub(crate) use target::{
     AttentionHistoryKernels, AttentionKernels, DenseExpansionKernel, DenseKernels, ExpertKernels,
-    GeneralRoutedKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels, PostNormKernels,
-    ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels, RecurrentKernels,
-    RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels, ShortConvKernels, StateSpaceKernels,
-    SublayerOutput, TableConversion, TapKernels,
+    GeneralRoutedKernels, NGramKernels, ParallelKernels, PerLayerEntryKernels, PerLayerKernels,
+    PostNormKernels, ProgressiveReadoutKernels, ReadoutHeadKernels, ReadoutKernels,
+    RecurrentKernels, RecurrentStepKernels, RoutedDecodeKernels, RoutedKernels,
+    SelectedPrefillKernel, SelectionKernels,
+    ShortConvKernels, StateSpaceKernels, StreamsKernels, SublayerOutput, TableConversion,
+    TapKernels,
 };
 #[cfg(feature = "pinned-tuning")]
 pub use tuning::pinned as pinned_tuning;
 #[cfg(feature = "tuning-survey")]
 pub use tuning::survey as tuning_survey;
 pub use tuning::{
-    NumericalProfile, PointShape, ROTATION_LAYERS, Receipt,
-    PinnedChoice, ResolvedNumericalProfile, SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress,
-    TRACE_SCHEMA, TUNING_CONTEXTS, TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent,
-    TuningLimits, UnpreparedUnits,
-    TuningObserver, TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource,
+    NumericalProfile, PinnedChoice, PointShape, ROTATION_LAYERS, Receipt, ResolvedNumericalProfile,
+    SEARCH_VERSION, STANDARD_TUNING_BUDGET, SearchProgress, TRACE_SCHEMA, TUNING_CONTEXTS,
+    TUNING_ROWS, TracedWork, TunedEntry, TuningContext, TuningEvent, TuningLimits, TuningObserver,
+    TuningOrigin, TuningRoom, TuningSettings, TuningTrace, TuningWeightSource, UnpreparedUnits,
     UnreportedTuning, ZeroTuningWeights, attention_points, row_points,
 };
 pub(crate) use vision::VisionKernels;
@@ -62,7 +63,8 @@ use magnitude_kernels::{
     attention_prefill, attention_prefill_k8v4, attention_project, conditioning_overlay, copy_rows,
     dense_expand, dense_output, dense_up, draft_rows, embedding_rows, feature_copy,
     gated_delta_chunk, gated_delta_project, gated_delta_project_convolved, gated_delta_step,
-    gated_delta_step_convolved, import_dense, moe_tail, per_layer_gate, per_layer_inputs,
+    gated_delta_step_convolved, import_dense, indexer_select, moe_tail, per_layer_gate,
+    per_layer_inputs,
     post_norm_residual, project_rows, readout_exact_rows, readout_features_rows, readout_head_rows,
     readout_planes_rows, readout_project_rows, readout_refine_rows, readout_selected_rows,
     readout_top_rows, repack_weight, routed_combine, routed_down, routed_expand, routed_experts,
@@ -249,7 +251,11 @@ mod qualification_tests {
             .with_static("NK", binding.key_heads)
             .with_static("NV", binding.value_heads)
             .with_static("W", binding.width);
-        let projections = heads.clone().with_static("H", 2560);
+        let projections = heads
+            .clone()
+            .with_static("H", 2560)
+            .with_static("PT", 1)
+            .with_static("NM", 2560);
         let statics = heads.with_static("C", binding.convolution_width);
         /// The declared defaults of `E` at `statics`.
         fn defaults<E: seismic::Entry>(
@@ -330,6 +336,8 @@ mod qualification_tests {
         .unwrap();
         let output = seismic::NativeSpecialization::new()
             .with_static("D", 2560)
+            .with_static("SN", 1)
+            .with_static("IN", 0)
             .with_static("Q", binding.value_heads)
             .with_static("W", binding.width);
         attention_output::native_for_device_with(

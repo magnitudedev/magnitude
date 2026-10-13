@@ -437,6 +437,7 @@ pub enum Scalar {
     BF16(u16),
     I32(i32),
     U32(u32),
+    U64(u64),
     Bool(bool),
     Index(seismic_lang::expr::BigUint),
     Range(seismic_lang::expr::BigUint, seismic_lang::expr::BigUint),
@@ -450,6 +451,7 @@ impl Scalar {
             Self::BF16(v) => E::BF16(v),
             Self::I32(v) => E::I32(v),
             Self::U32(v) => E::U32(v),
+            Self::U64(v) => E::U64(v),
             Self::Bool(v) => E::Bool(v),
             Self::Index(v) => E::Index(v),
             Self::Range(start, end) => E::Range { start, end },
@@ -463,6 +465,7 @@ impl Scalar {
                 | (Self::BF16(_), SignatureType::Scalar(DType::BF16))
                 | (Self::I32(_), SignatureType::Scalar(DType::I32))
                 | (Self::U32(_), SignatureType::Scalar(DType::U32))
+                | (Self::U64(_), SignatureType::Scalar(DType::U64))
                 | (Self::Bool(_), SignatureType::Scalar(DType::Bool))
                 | (Self::Index(_), SignatureType::Index)
                 | (Self::Range(..), SignatureType::Range)
@@ -706,6 +709,7 @@ fn decode(
                 ArgumentValue::BF16(v) => Scalar::BF16(v),
                 ArgumentValue::I32(v) => Scalar::I32(v),
                 ArgumentValue::U32(v) => Scalar::U32(v),
+                ArgumentValue::U64(v) => Scalar::U64(v),
                 ArgumentValue::Bool(v) => Scalar::Bool(v),
                 ArgumentValue::Index(v) => Scalar::Index(v),
                 ArgumentValue::Range { start, end } => Scalar::Range(start, end),
@@ -941,6 +945,7 @@ impl Scalar {
             Self::BF16(v) => f32::from_bits((v as u32) << 16) as f64,
             Self::I32(v) => v as f64,
             Self::U32(v) => v as f64,
+            Self::U64(v) => v as f64,
             Self::Bool(v) => u8::from(v) as f64,
             Self::Index(_) | Self::Range(..) => f64::NAN,
         }
@@ -953,6 +958,7 @@ impl Scalar {
             Self::BF16(v) => S::BF16(v),
             Self::I32(v) => S::I32(v),
             Self::U32(v) => S::U32(v),
+            Self::U64(v) => S::U64(v),
             Self::Bool(v) => S::Bool(v),
             Self::Index(v) => S::Nat(v),
             Self::Range(..) => unreachable!(),

@@ -317,3 +317,14 @@ def test_acquisition_reads_the_contract_object(tmp_path):
     assert acquisition.embedded_drafter
     with pytest.raises(ValueError):
         Acquisition.model_validate({**value, "extra": 1})
+
+
+def test_explicit_mtp_keeps_its_separate_catalog_head(artifact_path, tmp_path, acquisition):
+    mtp = acquisition.model_copy(update={"drafter": acquisition.drafter.model_copy(update={"method": "mtp"})})
+    options = EngineOptions(magnitude=MagnitudeOptions(method="mtp"))
+    argv = make("magnitude", artifact_path, tmp_path, mtp, options).argv(1234, 8192, 1, tmp_path)
+    assert flag(argv, "--method") == "mtp"
+    assert flag(argv, "--draft") == str(mtp.drafter.path)
+    # An override away from a DFlash catalog entry uses the embedded MTP head.
+    argv = make("magnitude", artifact_path, tmp_path, acquisition, options).argv(1234, 8192, 1, tmp_path)
+    assert "--draft" not in argv

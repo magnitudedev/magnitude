@@ -142,6 +142,16 @@ charge is never subtracted again. Released storage returns to its domain: a back
 sub-allocates device memory frees each underlying allocation once it holds no storage, so a
 released charge reappears in observed headroom and the release order can satisfy a deficit. A load onto a
 dedicated device also claims its staged uploads against host RAM under the host's reserve.
+A stored table's slots and directory ([residency](residency.md)) are host-shared storage (Seismic's
+upload allocation), charged to the domain it is physically allocated in, which the device reports
+(`DeviceMemoryInfo::shared_pool`): the allocation domain of a unified-memory device (Apple, DGX
+Spark, the CPU) and of a Vulkan device whose upload memory is a large host-visible device-local
+heap (ReBAR/SAM); host RAM, the staging domain, of a dedicated CUDA device (mapped pinned memory)
+and of a Vulkan device without one. Assessment charges them there
+(`AssessmentMemoryCharge::assess_fit`), so a load that does not fit host RAM is refused although
+the device holds the rest; the target import's claim stages them through host RAM; and the census
+reports them in host RAM. Seismic charges every allocation of a device, these included, to its
+ledger, so its enforced limit, charges plus the device's ceiling, is unchanged by them.
 
 State is stored in fixed-size history and bank slabs on every backend: one history slab tensor per
 history domain of a store, and one bank slab tensor. The 64 MiB slab target is fixed for an engine

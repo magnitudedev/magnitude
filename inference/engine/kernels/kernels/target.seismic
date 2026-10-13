@@ -1,17 +1,49 @@
 # Target input rows: the token embedding and the conditioning overlay.
 
+# The bucket a hashed directory probes first for `row`: murmur3's 32-bit
+# finalizer of the row, masked to the R (a power of two) buckets.
+fn gathered_bucket(row: i32, buckets: u32) -> u32:
+    let mut h = u32(row)
+    h = h ^ (h >> 16)
+    h = h * u32(2246822507)
+    h = h ^ (h >> 13)
+    h = h * u32(3266489909)
+    h = h ^ (h >> 16)
+    return h & (buckets - u32(1))
+
 # The row a reader of a gathered table reads for `selected`, a row of a
-# (row, status) selection: `selected` itself through an empty directory
-# (R = 0: the table is held whole, or the host gave its slots), else its slot
-# in `directory`, every row's slot (or -1) of a streamed table that holds only
-# some of its rows. A failed selection (-1) and a row without a slot read row
-# 0; the step that reads it is never used. Every reader of a gathered table
-# addresses its rows through this (`<backend>/lib/core/gathered.*`).
-fn gathered_row[R](directory: &tensor[R] i32, selected: i32) -> i32 where R >= 0:
+# (row, status) selection. Through an empty directory (R = 0: the table is
+# held whole, or the host gave its slots) it is `selected` itself. A streamed
+# table, which holds only some of its rows in slots, has one of two
+# directories:
+# - dense (F = 1): `directory[row, 0]` is every table row's slot, or -1;
+# - hashed (F = 2): R (a power of two) buckets of (row, slot), open-addressed
+#   by linear probing from `gathered_bucket(row)`, ascending and wrapping. A
+#   bucket's row is -1 when it is empty, which ends a probe, and -2 when its
+#   row left (a tombstone), which a probe passes. No empty bucket lies
+#   between a row's first bucket and its own, and at least one is empty.
+# A failed selection (-1) and a row without a slot read row 0; the step that
+# reads it is never used. Every reader of a gathered table addresses its rows
+# through this (`<backend>/lib/core/gathered.*`).
+fn gathered_row[R, F](directory: &tensor[R, F] i32, selected: i32) -> i32 where R >= 0 and F >= 1:
     let mut row = max(selected, 0)
     if R > 0:
         if selected >= 0:
-            row = max(directory[selected], 0)
+            if F == 1:
+                row = max(directory[selected, 0], 0)
+            else:
+                row = 0
+                let mut bucket = gathered_bucket(selected, u32(R))
+                let mut searching = 1
+                for probe in 0..R:
+                    if searching == 1:
+                        let key = directory[i32(bucket), 0]
+                        if key == selected:
+                            row = max(directory[i32(bucket), 1], 0)
+                            searching = 0
+                        if key == -1:
+                            searching = 0
+                        bucket = (bucket + u32(1)) & (u32(R) - u32(1))
     return row
 
 # Token embedding (K2): gather one table row per token and decode it with the
@@ -23,9 +55,9 @@ fn gathered_row[R](directory: &tensor[R] i32, selected: i32) -> i32 where R >= 0
 # elsewhere) and, with `normalize` nonzero, RMS-normalized without a weight
 # (`epsilon`; Muse) before its one rounding to A. Both results hold that
 # rounded row.
-fn embedding_rows[M, V, D, R](table: &tensor[V, D] EW, tokens: &tensor[M, 2] i32,
-    directory: &tensor[R] i32, scale: f32, normalize: i32, epsilon: f32)
-    -> (tensor[M, D] A, tensor[M, D] f32) where R >= 0:
+fn embedding_rows[M, V, D, R, F](table: &tensor[V, D] EW, tokens: &tensor[M, 2] i32,
+    directory: &tensor[R, F] i32, scale: f32, normalize: i32, epsilon: f32)
+    -> (tensor[M, D] A, tensor[M, D] f32) where R >= 0 and F >= 1:
     let mut embedded = tensor[M, D] A
     parallel for row in 0..M:
         let token = gathered_row(directory, tokens[row, 0])
@@ -99,6 +131,79 @@ native conditioning_overlay for vulkan from "vulkan/conditioning_overlay.comp":
 native conditioning_overlay for cpu from "cpu/conditioning_overlay.rs":
     launch conditioning_overlay:
         threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+
+# Rows of a streamed table whose slots hold its rows as stored (an n-gram
+# table, `TableFill::Stored`): `slots[s]` is a stored row of W values in its
+# 32-value block encoding E (`gguf_iq4_nl_block`: an f16 scale, then sixteen
+# bytes whose low nibbles are values 0..16 and high nibbles 16..32, indexing
+# the iq4 codebook). Row m of the result is the slot `gathered_row` names for
+# `tokens[m, 0]` (a (row, status) selection), decoded exactly as its
+# registered conversion (`iq4g32s`) decodes and rounded once to A. A failed
+# selection and a row without a slot read slot 0.
+fn stored_rows[M, S, W, R, F](slots: &tensor[S, W] E, tokens: &tensor[M, 2] i32,
+    directory: &tensor[R, F] i32) -> tensor[M, W] A where R >= 0 and F >= 1:
+    let blocks = repack[U = iq4g32s](slots)
+    let mut rows = tensor[M, W] A
+    parallel for row in 0..M:
+        let slot = gathered_row(directory, tokens[row, 0])
+        rows[row] = f32(blocks[slot])
+    return rows
+
+# Each native decodes the stored blocks itself. Metal, CUDA and Vulkan: one
+# threadgroup per row and 256 columns, a thread per value.
+native stored_rows for metal from "metal/stored_rows.metal":
+    static (W)
+    launch stored_rows:
+        threadgroups (M, ceil_div(W, 256), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stored_rows for cuda from "cuda/stored_rows.cu":
+    static (W)
+    launch stored_rows:
+        threadgroups (min(M, 65535), ceil_div(W, 256), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native stored_rows for vulkan from "vulkan/stored_rows.comp":
+    static (W)
+    launch stored_rows:
+        threadgroups (min(M, 65535), ceil_div(W, 256), 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# CPU: one work item per row, its decoded values in its shared bytes.
+native stored_rows for cpu from "cpu/stored_rows.rs":
+    static (W)
+    launch stored_rows:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes (W * 4)
+
+# The (token, status) rows a step reads, copied where the host reads them
+# without waiting for the step (`notice`, host-visible storage): the host
+# learns a device selection as early as the step that consumes it begins.
+fn selection_notice[M](selection: &tensor[M, 2] i32, notice: &mut tensor[M, 2] i32):
+    parallel for row in 0..M:
+        notice[row, 0] = selection[row, 0]
+        notice[row, 1] = selection[row, 1]
+
+native selection_notice for metal from "metal/selection_notice.metal":
+    launch selection_notice:
+        threadgroups (ceil_div(M, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native selection_notice for cuda from "cuda/selection_notice.cu":
+    launch selection_notice:
+        threadgroups (ceil_div(M, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native selection_notice for vulkan from "vulkan/selection_notice.comp":
+    launch selection_notice:
+        threadgroups (ceil_div(M, 256), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+native selection_notice for cpu from "cpu/selection_notice.rs":
+    launch selection_notice:
+        threadgroups (1, 1, 1)
         threads_per_threadgroup (1, 1, 1)
 
 # Preserve activation storage across independently owned feature lifetimes.

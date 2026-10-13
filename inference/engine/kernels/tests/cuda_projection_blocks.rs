@@ -130,6 +130,8 @@ fn recurrent_project_cases(mixes: &[[Option<Format>; 4]], seed: u64) {
                     },
                     &mapping.projection_params(statics_specialization(&[
                         ("H", h),
+                        ("PT", 1),
+                        ("NM", h),
                         ("NK", nk),
                         ("NV", nv),
                         ("W", w),
@@ -212,6 +214,8 @@ fn attention_project_cases(sets: &[[Format; 3]], seed: u64) {
                     },
                     &mapping.projection_params(statics_specialization(&[
                         ("D", d),
+                        ("PT", 1),
+                        ("NM", d),
                         ("Q", query),
                         ("GR", 0),
                         ("K", keys),
@@ -280,6 +284,8 @@ fn cuda_attention_output_matches_host_model() {
                     },
                     &mapping.projection_params(statics_specialization(&[
                         ("D", d),
+                        ("SN", 1),
+                        ("IN", 0),
                         ("Q", q),
                         ("W", w),
                     ])),
@@ -287,6 +293,7 @@ fn cuda_attention_output_matches_host_model() {
                 .unwrap()
                 .call(attention_output::Args {
                     hidden: &hidden,
+                    inject: &no_inject(&device, hidden.extents()[0]),
                     gated: &gated_tensor,
                     output_weight: &output.tensor,
                 })
@@ -352,6 +359,8 @@ fn cuda_projection_block_timings() {
                 },
                 &mapping.projection_params(statics_specialization(&[
                     ("H", h),
+                    ("PT", 1),
+                    ("NM", h),
                     ("NK", nk),
                     ("NV", nv),
                     ("W", w),
@@ -386,15 +395,19 @@ fn cuda_projection_block_timings() {
                 },
                 &mapping.projection_params(statics_specialization(&[
                     ("D", h),
+                    ("SN", 1),
+                    ("IN", 0),
                     ("Q", nv),
                     ("W", w),
                 ])),
             )
             .unwrap();
+            let inject = no_inject(&device, hidden.extents()[0]);
             let args = output_weights
                 .iter()
                 .map(|weight| attention_output::Args {
                     hidden: &hidden,
+                    inject: &inject,
                     gated: &gated,
                     output_weight: weight,
                 })
@@ -408,4 +421,9 @@ fn cuda_projection_block_timings() {
             );
         }
     }
+}
+
+/// The inject port of a single residual stream: no columns.
+fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
+    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
 }

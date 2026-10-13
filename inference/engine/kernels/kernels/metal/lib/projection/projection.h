@@ -241,6 +241,151 @@ struct Residual {
     }
 };
 
+// `scatter`: each of the STREAMS hyper-connection streams of the residual
+// plus the output times the stream's inject value,
+//   y[m, s * width + n] = residual[row(m), s * width + n] + round_A(acc) * inject[m, s]   (F32),
+// with `Residual`'s interface (column strides are the streams' too).
+template <typename A, typename Rows, uint STREAMS>
+struct Scatter {
+    device float *y;
+    ulong stride0, stride1;
+    device const float *residual;
+    ulong residual0, residual1;
+    Rows rows;
+    device const float *inject;
+    ulong inject0;
+    uint width;
+    struct Row {
+        device float *y;
+        device const float *residual;
+        ulong stride1, residual1;
+        device const float *inject;
+        uint width;
+        void store(uint n, float value) const {
+            const float rounded = A::round(value);
+            PROJECTION_UNROLL
+            for (uint s = 0; s < STREAMS; ++s) {
+                const ulong column = ulong(s * width + n);
+                y[column * stride1] = residual[column * residual1] + rounded * inject[s];
+            }
+        }
+        void store8(uint n, float4 even, float4 odd) const {
+            PROJECTION_UNROLL
+            for (uint i = 0; i < 4; ++i) {
+                store(n + 2u * i, even[i]);
+                store(n + 2u * i + 1u, odd[i]);
+            }
+        }
+    };
+    Row row(uint m) const {
+        return Row{y + ulong(m) * stride0, residual + ulong(rows.at(m)) * residual0, stride1, residual1,
+            inject + ulong(m) * inject0, width};
+    }
+    void store(uint m, uint n, float value) const { row(m).store(n, value); }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// An output entry's epilogue: `Residual`, or `Scatter` over STREAMS streams
+// when the entry takes inject values. `make` forms either from every field
+// (`Residual` reads the leading ones).
+template <typename A, typename Rows, uint STREAMS, bool INJECTED>
+struct OutputOf {
+    typedef Scatter<A, Rows, STREAMS> type;
+    static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
+        ulong residual1, Rows rows, device const float *inject, ulong inject0, uint width) {
+        return type{y, stride0, stride1, residual, residual0, residual1, rows, inject, inject0, width};
+    }
+};
+template <typename A, typename Rows>
+struct OutputOf<A, Rows, 1, false> {
+    typedef Residual<A, Rows> type;
+    static type make(device float *y, ulong stride0, ulong stride1, device const float *residual, ulong residual0,
+        ulong residual1, Rows rows, device const float *, ulong, uint) {
+        return type{y, stride0, stride1, residual, residual0, residual1, rows};
+    }
+};
+
+// A routed sublayer's column n joining its row's residual (`routed_output`,
+// `routed_combine`): residual + selected + shared, in that order, or (INJECTED)
+// for each of the STREAMS streams residual[s] + (selected + shared) * inject[s].
+// `out`, `residual` and `inject` point at the row; strides are column strides.
+template <uint STREAMS, bool INJECTED>
+inline void routed_join(device float *out, ulong out1, device const float *residual, ulong residual1,
+    device const float *inject, ulong width, ulong n, float selected, float shared) {
+    if (!INJECTED) {
+        out[n * out1] = residual[n * residual1] + selected + shared;
+        return;
+    }
+    PROJECTION_UNROLL
+    for (uint s = 0; s < STREAMS; ++s) {
+        const ulong column = ulong(s) * width + n;
+        out[column * out1] = residual[column * residual1] + (selected + shared) * inject[s];
+    }
+}
+
+// A mix site's low-rank rows (`stream_mix_down`), over S streams:
+//   y = round_A(silu(acc / S))
+template <typename A>
+struct MixLow {
+    device uchar *y;
+    ulong stride0, stride1;
+    float streams;
+    void store(uint m, uint n, float value) const {
+        const float v = value / streams;
+        reinterpret_cast<device typename A::storage *>(y)[ulong(m) * stride0 + ulong(n) * stride1] =
+            A::store(v / (1.0f + metal::exp(-v)));
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// A mix site's inject values (`stream_mix_down`), over S streams:
+//   y = 2 sigmoid(acc / S)                                              (F32)
+struct MixInject {
+    device float *y;
+    ulong stride0, stride1;
+    float streams;
+    void store(uint m, uint n, float value) const {
+        y[ulong(m) * stride0 + ulong(n) * stride1] = 2.0f / (1.0f + metal::exp(-value / streams));
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
+// A mix site's per-stream partials (`stream_mix_up`): column n of stream
+// s = n / width, gated by its sum,
+//   y = sigmoid(acc) * x[m, n] * inverse[m, s] * norm[n] / S             (F32)
+template <typename N>
+struct Mix {
+    device float *y;
+    ulong stride0, stride1;
+    device const float *x;
+    ulong x0, x1;
+    device const float *inverse;
+    ulong inverse0, inverse1;
+    device const uchar *norm;
+    ulong norm_stride;
+    uint width;
+    float streams;
+    void store(uint m, uint n, float value) const {
+        const float normalized = x[ulong(m) * x0 + ulong(n) * x1] * inverse[ulong(m) * inverse0
+            + ulong(n / width) * inverse1] * element::at<N>(norm, ulong(n) * norm_stride);
+        const float gate = 1.0f / (1.0f + metal::exp(-value));
+        y[ulong(m) * stride0 + ulong(n) * stride1] = gate * normalized / streams;
+    }
+    void store2(uint m, uint n, float first, float second) const {
+        store(m, n, first);
+        store(m, n + 1u, second);
+    }
+};
+
 template <typename A>
 struct SiluMul {
     device uchar *y;
@@ -434,12 +579,9 @@ inline float normalization_inverse(thread const In &in, uint m, uint group,
 // `TallOrder` when whole 8-column words are written (columns and every
 // group's first column multiples of 8).
 template <uint THREADS, typename Order, typename In>
-inline void device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
-    threadgroup float *partials, uint thread_index) {
-    static_assert(THREADS % 32 == 0 && THREADS <= 1024, "a normalizing threadgroup is whole simdgroups");
+inline void device_normalize_with(thread const In &in, uint m, uint group, float inverse, device uchar *x,
+    uint columns, uint thread_index) {
     typedef typename In::activation A;
-    uint m = item / in.groups(), group = item % in.groups();
-    const float inverse = normalization_inverse<THREADS>(in, m, group, partials, thread_index);
     device typename A::storage *row = reinterpret_cast<device typename A::storage *>(x) + ulong(m) * columns;
     uint first = group * in.width();
     bool vector = (columns & 7u) == 0 && (first & 7u) == 0;
@@ -455,10 +597,23 @@ inline void device_normalize(thread const In &in, uint item, device uchar *x, ui
     }
 }
 
-template <uint THREADS, typename In>
-inline void device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
+// Row m's norm group `group` (item m * groups + group) normalized by its
+// reduced inverse, which the threadgroup returns.
+template <uint THREADS, typename Order, typename In>
+inline float device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
     threadgroup float *partials, uint thread_index) {
-    device_normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials, thread_index);
+    static_assert(THREADS % 32 == 0 && THREADS <= 1024, "a normalizing threadgroup is whole simdgroups");
+    uint m = item / in.groups(), group = item % in.groups();
+    const float inverse = normalization_inverse<THREADS>(in, m, group, partials, thread_index);
+    device_normalize_with<THREADS, Order>(in, m, group, inverse, x, columns, thread_index);
+    return inverse;
+}
+
+template <uint THREADS, typename In>
+inline float device_normalize(thread const In &in, uint item, device uchar *x, uint columns,
+    threadgroup float *partials, uint thread_index) {
+    return device_normalize<THREADS, RowOrder<typename In::activation>>(in, item, x, columns, partials,
+        thread_index);
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +664,20 @@ struct SharedNorm {
         in.load8(m, k, metal::rsqrt(sum / float(in.width()) + in.epsilon()), even, odd);
     }
 };
+
+// Every norm group's inverse of the `m_rows` rows, from the square sums of
+// `threadgroup_squares` (after a barrier publishes them), exactly as
+// SharedNorm applies it: inverses[m * stride0 + group * stride1].
+template <typename In>
+inline void publish_inverses(thread const In &in, uint m_rows, threadgroup const float *squares,
+    device float *inverses, ulong stride0, ulong stride1, uint thread_index, uint threads) {
+    for (uint item = thread_index; item < m_rows * in.groups(); item += threads) {
+        uint m = item / in.groups(), group = item % in.groups();
+        float sum = sum_parts<In::parts>(squares + item * In::parts);
+        inverses[ulong(m) * stride0 + ulong(group) * stride1] =
+            metal::rsqrt(sum / float(in.width()) + in.epsilon());
+    }
+}
 
 // `in` as a SharedNorm over `squares`. The operand's type is deduced from a
 // value: `decltype` of a local carries its address space under Metal 4.1,

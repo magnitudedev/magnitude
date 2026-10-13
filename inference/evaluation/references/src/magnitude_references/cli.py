@@ -75,6 +75,8 @@ def parser() -> argparse.ArgumentParser:
     families.add_argument("--cases", help="comma-separated case names (default: all)")
     families.add_argument("--zlab-source", type=Path,
                           help="Z-Lab dflash/model.py at z-lab/dflash@07ebd93d (families.dflash.ZLAB_CODE) for DFlash2")
+    families.add_argument("--mlx-python", type=Path,
+                          help="a Python interpreter with mlx_vlm, for the families transformers lacks (qwen4exp)")
     families.add_argument("--list", action="store_true")
 
     for command in commands.choices.values():
@@ -146,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         for case in [*targets, *drafts]:
             print(f"{case.name}: {'; '.join(case.covers)}")
         return 0
-    reports = check_families(names, device, options.zlab_source)
+    reports = check_families(names, device, options.zlab_source, options.mlx_python)
     emit({"cases": reports, "pass": all(report["pass"] for report in reports)}, options.json)
     return 0 if all(report["pass"] for report in reports) else 1
 

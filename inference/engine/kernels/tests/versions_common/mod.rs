@@ -115,7 +115,8 @@ pub fn bytes(element: Element, values: &[f32]) -> Vec<u8> {
             .flat_map(|value| ((bf16_round(*value).to_bits() >> 16) as u16).to_le_bytes())
             .collect()
     } else {
-        assert_eq!(element, Element::f32());
+        // 32-bit words (`u32`, `i32`) travel as the bits of their f32 values.
+        assert!([Element::f32(), Element::u32(), Element::i32()].contains(&element));
         values.iter().flat_map(|value| value.to_le_bytes()).collect()
     }
 }

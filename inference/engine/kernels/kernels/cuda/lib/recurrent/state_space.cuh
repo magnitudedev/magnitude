@@ -160,7 +160,7 @@ __device__ __forceinline__ void publish_window(const Operands &in, const version
                                                u64 parts) {
     [[maybe_unused]] const seismic_words_t &seismic_words_value = *in.words;
     const int taps = TAPS - 1;
-    const int rows = taps + versions::tape_rows(slot, seismic_words_value);
+    const int rows = taps + versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T));
     const int group = group_of(head);
     const u64 per_tap = P + (leads_group(head) ? 2 * N : 0);
     const u64 total = static_cast<u64>(rows) * per_tap;
@@ -251,7 +251,7 @@ __device__ __forceinline__ void advance_rows(const Operands &in, const versions:
     const int lane = threadIdx.x % 32;
     const int group = group_of(head);
     const int publish = slot.lo + slot.stop;
-    const int recorded = versions::tape_rows(slot, seismic_words_value);
+    const int recorded = versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T));
     const float skip = in.skip[head * SEISMIC_SKIP_STRIDE_0];
     // The warp that owns state row 0 records the decay, and B when the head
     // leads its group.

@@ -138,8 +138,9 @@ impl Memory {
         }
         .ok_or("no device-local memory type")?;
         // A small BAR window (typically 256 MiB) is not spent on upload
-        // regions; ReBAR/SAM and unified memory are.
-        let upload = if facts.host_visible_device_local_bytes > 256 << 20 {
+        // regions; ReBAR/SAM and unified memory are. Every upload type is
+        // HOST_COHERENT (`visible`): host writes need no flush.
+        let upload = if facts.uploads_device_local() {
             find(local | visible, local | visible)
         } else {
             find(visible, visible)

@@ -127,8 +127,9 @@ inline void top_publish(threadgroup atomic_uint *lowest, threadgroup const float
 #define TOP_ROWS_OPERANDS                                                               \
     const uint d = uint(SEISMIC_DIM_D);                                                 \
     const uint rows = uint(SEISMIC_DIM_O);                                              \
-    projection::Rms<progressive::activation, norm_element, projection::SelectedRows> in{hidden, \
-        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,  \
+    projection::InputOf<progressive::activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, \
+        SEISMIC_DIM_PT>::type in{hidden, \
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, norm, SEISMIC_NORM_STRIDE_0,  \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), d, {out_rows}};                    \
     const projection::Weights<packets::ProgressiveTop> w{top, SEISMIC_TOP_STRIDE_0, scales, \
         SEISMIC_SCALES_STRIDE_0};                                                       \

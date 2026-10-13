@@ -9,7 +9,7 @@ use crate::operators;
 use crate::{ResidencyStore, ResidentWeight, WeightImportError};
 use magnitude_artifacts::{Package, gguf::GgufArtifact};
 use magnitude_family_contracts::{
-    ActivationDType, HeadComponent, ModelDefinition, ProgressivePlane, VisionDescription,
+    ActivationDType, ExitNorm, HeadComponent, ModelDefinition, ProgressivePlane, VisionDescription,
     WeightKind, WeightRole, WeightScope,
 };
 use seismic::DType;
@@ -64,6 +64,16 @@ impl ResidentRoles {
 
     fn values(&self) -> impl Iterator<Item = &ResidentWeight> {
         self.0.values()
+    }
+
+    /// The stored tables (`TableFill::Stored`) among the weights, by their
+    /// roles.
+    pub(crate) fn stored_tables(
+        &self,
+    ) -> impl Iterator<Item = (WeightRole, &std::sync::Arc<crate::stored_table::StoredTable>)> {
+        self.0
+            .iter()
+            .filter_map(|(role, weight)| weight.table().stored().map(|table| (*role, table)))
     }
 
     fn import(
@@ -136,7 +146,9 @@ pub struct ResidentTarget {
     /// Decoder blocks, whose weights are in `sublayers`.
     pub blocks: usize,
     pub sublayers: ResidentRoles,
-    pub output_norm: ResidentWeight,
+    /// The readout's exit norm; absent for a hyper-connection exit site,
+    /// whose roles are in `sublayers`.
+    pub output_norm: Option<ResidentWeight>,
     pub output: ResidentOutput,
     /// A separate draft's fusion of the target taps, which the target
     /// readout applies; imported from the draft component.
@@ -199,7 +211,7 @@ impl ResidentTarget {
     pub(crate) fn visit_weights<'a>(&'a self, mut visit: impl FnMut(&'a ResidentWeight)) {
         visit(&self.embedding);
         self.sublayers.values().for_each(&mut visit);
-        visit(&self.output_norm);
+        self.output_norm.iter().for_each(&mut visit);
         match &self.output {
             ResidentOutput::Packed(output) => visit(output),
             ResidentOutput::Progressive(progressive) => ProgressivePlane::ALL
@@ -241,13 +253,25 @@ pub(crate) fn import_target(
     let activation = activation_dtype(decoder.activation_dtype);
     let target = package.target();
     let embedding = residency.import_gguf(target, &decoder.entry.embedding, activation)?;
+    // A hyper-connection exit site is the last block's mix site: its roles
+    // are resident beside the sublayers'. Any other exit norm is the
+    // readout's.
+    let (exit_roles, output_norm) = match &decoder.exit.norm {
+        ExitNorm::HyperConnectionHead(_) => (operators::exit_weights(decoder), None),
+        norm => (
+            Vec::new(),
+            Some(residency.import_gguf(target, norm.weight(), activation)?),
+        ),
+    };
     let sublayers = ResidentRoles::import(
-        operators::decoder_weights(decoder),
+        operators::decoder_weights(decoder)
+            .into_iter()
+            .chain(exit_roles)
+            .collect(),
         residency,
         target,
         activation,
     )?;
-    let output_norm = residency.import_gguf(target, decoder.exit.norm.weight(), activation)?;
     let output = import_output(
         &decoder.exit.output,
         WeightScope::Target,

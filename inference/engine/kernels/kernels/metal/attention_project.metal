@@ -36,7 +36,8 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     const uint gate_rows = uint(SEISMIC_DIM_GR);                                        \
     const uint key_rows = uint(SEISMIC_DIM_K);                                          \
     const uint value_rows = uint(SEISMIC_DIM_V);                                        \
-    projection::Rms<activation, norm_element, projection::AllRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
+    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+        in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_1, input_norm, SEISMIC_INPUT_NORM_STRIDE_0,               \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}};                            \
     projection::Weights<packets::W0> query_w{query_weight, KERNEL_W0_LAYOUT(k), k};     \

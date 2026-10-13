@@ -195,12 +195,15 @@ impl EntryTuning for RoutedRouteTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
+        let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
         Ok(vec![
             ("H", shape.hidden),
             ("E", shape.experts),
             ("K", shape.selected),
+            ("PT", parts),
+            ("NM", norm),
         ])
     }
 
@@ -219,6 +222,7 @@ impl EntryTuning for RoutedRouteTuning {
     ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
         let normalize = i32::from(self.normalize(inputs)?);
+        let (parts, norm) = inputs.input_form(&self.scopes, shape.hidden)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
@@ -228,10 +232,10 @@ impl EntryTuning for RoutedRouteTuning {
                 Ok(RoutedRouteCase {
                     residual: inputs.activation(
                         Element::f32(),
-                        &[rows, shape.hidden],
+                        &[rows, parts * shape.hidden],
                         index as u64 + 1,
                     )?,
-                    norm: inputs.weight(scope, WeightKind::InputNorm)?,
+                    norm: inputs.input_norm(scope, WeightKind::InputNorm, self.norm, norm)?,
                     router: inputs.weight(scope, WeightKind::Router)?,
                     shared_router: inputs.weight(scope, WeightKind::SharedRouter)?,
                     routes: inputs.state(routes, 0..rows)?,
@@ -299,13 +303,16 @@ impl EntryTuning for RoutedRouteSharedTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.route.shape;
+        let (parts, norm) = inputs.input_form(&self.route.scopes, shape.hidden)?;
         Ok(vec![
             ("H", shape.hidden),
             ("E", shape.experts),
             ("K", shape.selected),
             ("S", shape.shared),
+            ("PT", parts),
+            ("NM", norm),
         ])
     }
 
@@ -655,6 +662,7 @@ pub(crate) struct RoutedOutputTuning {
 
 pub(crate) struct RoutedOutputCase {
     residual: Tensor,
+    inject: Tensor,
     expert_product: Tensor,
     shared_product: Tensor,
     routes: Tensor,
@@ -691,13 +699,16 @@ impl EntryTuning for RoutedOutputTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
+        let (streams, inject) = inputs.join(&self.scopes)?;
         Ok(vec![
             ("H", shape.hidden),
             ("K", shape.selected),
             ("F", shape.features),
             ("S", shape.shared),
+            ("SN", streams),
+            ("IN", inject),
         ])
     }
 
@@ -711,13 +722,19 @@ impl EntryTuning for RoutedOutputTuning {
         point: &PointShape,
     ) -> Result<Vec<Self::Case>, String> {
         let (shape, rows) = (self.shape, point.rows);
+        let (streams, inject) = inputs.join(&self.scopes)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
                 let seed = 8 * index as u64;
                 Ok(RoutedOutputCase {
-                    residual: inputs.activation(Element::f32(), &[rows, shape.hidden], seed + 1)?,
+                    residual: inputs.activation(
+                        Element::f32(),
+                        &[rows, streams * shape.hidden],
+                        seed + 1,
+                    )?,
+                    inject: inputs.activation(Element::f32(), &[rows, inject], seed + 6)?,
                     expert_product: inputs.activation(
                         self.activation,
                         &[rows, shape.selected, shape.features],
@@ -741,6 +758,7 @@ impl EntryTuning for RoutedOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> routed_output::Args<'a> {
         routed_output::Args {
             residual: &case.residual,
+            inject: &case.inject,
             expert_product: &case.expert_product,
             shared_product: &case.shared_product,
             routes: &case.routes,
@@ -868,6 +886,7 @@ pub(crate) struct RoutedCombineTuning {
 
 pub(crate) struct RoutedCombineCase {
     residual: Tensor,
+    inject: Tensor,
     expert_output: Tensor,
     inverse: Tensor,
     scores: Tensor,
@@ -907,12 +926,15 @@ impl EntryTuning for RoutedCombineTuning {
         )
     }
 
-    fn statics(&self, _: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
+    fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let shape = self.shape;
+        let (streams, inject) = inputs.join(&self.scopes)?;
         Ok(vec![
             ("H", shape.hidden),
             ("K", shape.selected),
             ("S", shape.shared),
+            ("SN", streams),
+            ("IN", inject),
         ])
     }
 
@@ -928,13 +950,19 @@ impl EntryTuning for RoutedCombineTuning {
         let (shape, rows) = (self.shape, point.rows);
         let (_, inverse, table) = group(&routes(rows, shape), rows, shape)?;
         let blocks = table.len() as u64;
+        let (streams, inject) = inputs.join(&self.scopes)?;
         TuningInputs::rotation_scopes(&self.scopes, point)
             .into_iter()
             .enumerate()
             .map(|(index, scope)| {
                 let seed = 8 * index as u64;
                 Ok(RoutedCombineCase {
-                    residual: inputs.activation(Element::f32(), &[rows, shape.hidden], seed + 1)?,
+                    residual: inputs.activation(
+                        Element::f32(),
+                        &[rows, streams * shape.hidden],
+                        seed + 1,
+                    )?,
+                    inject: inputs.activation(Element::f32(), &[rows, inject], seed + 6)?,
                     expert_output: inputs.activation(
                         self.activation,
                         &[blocks, TILE_ROWS, shape.hidden],
@@ -959,6 +987,7 @@ impl EntryTuning for RoutedCombineTuning {
     fn args<'a>(case: &'a mut Self::Case) -> routed_combine::Args<'a> {
         routed_combine::Args {
             residual: &case.residual,
+            inject: &case.inject,
             expert_output: &case.expert_output,
             inverse: &case.inverse,
             scores: &case.scores,

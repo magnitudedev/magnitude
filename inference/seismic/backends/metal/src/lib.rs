@@ -50,7 +50,7 @@ pub use compile::NativeCandidate;
 pub use device::{DeviceHandle, MetalBuffer, MetalDevice};
 pub use direct::{
     host_seconds, DirectBatch, DirectLaunch, DirectPipeline, DirectSubmission, LaunchTimestamps,
-    DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,
+    SharedEvent, DIRECT_BUFFER_SLOTS, DIRECT_WORD_BYTES_LIMIT,
 };
 pub use executor::MetalExecutor;
 pub use facts::MetalFacts;

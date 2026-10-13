@@ -36,8 +36,16 @@ impl Recipe {
     fn lt(&self, a: V, b: V) -> V {
         self.word_cmp(CmpOp::Lt, a, b)
     }
+    /// A word constant of the width `ty`.
+    fn k(&self, ty: DType, x: u64) -> V {
+        if ty == DType::U64 {
+            self.u64(x)
+        } else {
+            self.u(u32::try_from(x).expect("word constant width"))
+        }
+    }
     fn nonzero(&self, a: V) -> V {
-        self.word_cmp(CmpOp::Ne, a, self.u(0))
+        self.word_cmp(CmpOp::Ne, a, self.k(a.ty, 0))
     }
     fn unsigned(&self, a: V) -> V {
         self.select(a, self.u(1), self.u(0))
@@ -55,7 +63,7 @@ impl Recipe {
         self.nonzero(self.mask(x, 1 << bit))
     }
     fn negate_word(&self, x: V) -> V {
-        self.sub(self.u(0), x)
+        self.sub(self.k(x.ty, 0), x)
     }
     fn signed_magnitude(&self, x: V) -> (V, V) {
         let sign = self.sign(x, 31);
@@ -63,6 +71,9 @@ impl Recipe {
     }
 }
 
+fn bits_of(word: DType) -> u32 {
+    if word == DType::U64 { 64 } else { 32 }
+}
 fn wide(b: &Recipe, x: V, n: usize) -> Wide {
     assert!(n > 0);
     let mut v = vec![b.u(0); n];
@@ -864,7 +875,7 @@ pub(super) fn absolute(b: &Recipe, a: V) -> V {
     } else if dtype == DType::I32 {
         b.signed_magnitude(bits).1
     } else {
-        assert_eq!(dtype, DType::U32);
+        assert!(matches!(dtype, DType::U32 | DType::U64));
         bits
     };
     b.typed(result, dtype)
@@ -903,11 +914,18 @@ fn round_integral(b: &Recipe, a: V) -> V {
 fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
     let dtype = a.ty;
     let x = b.bits(a);
-    let y = b.bits(c);
+    let word = x.ty;
+    let width = if word == DType::U64 { 64 } else { 32 };
+    // A shift count of another integer dtype keeps its value; a negative I32
+    // count is a huge word and fails like any other count out of range.
+    let y = b.resize(b.bits(c), word);
+    // Products and quotients run on 32-bit limbs; a U64 word has two.
+    let limbs = |v: V| if word == DType::U64 { b.limbs(v).to_vec() } else { vec![v] };
+    let joined = |v: &[V]| if word == DType::U64 { b.joined([v[0], v[1]]) } else { v[0] };
     let result = match op {
         SourceBinary::Add => b.add(x, y),
         SourceBinary::Sub => b.sub(x, y),
-        SourceBinary::Mul => multiply_words(b, x, y, 32)[0],
+        SourceBinary::Mul => joined(&wide_multiply(b, &limbs(x), &limbs(y), width)),
         SourceBinary::BitAnd => b.word(WordOp::And, x, y),
         SourceBinary::BitOr => b.union(x, y),
         SourceBinary::BitXor => b.xor(x, y),
@@ -917,7 +935,7 @@ fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
             } else {
                 b.boolean(false)
             };
-            let zero = b.eq(y, b.u(0));
+            let zero = b.eq(y, b.k(word, 0));
             let fail = b.or(zero, overflow);
             b.fail_if(zero, ScalarFailure::IntegerDivisionByZero);
             if dtype == DType::I32 {
@@ -933,22 +951,24 @@ fn integer_binary(b: &Recipe, op: SourceBinary, a: V, c: V) -> V {
             } else {
                 (b.boolean(false), y)
             };
-            let my = b.select(fail, b.u(1), my);
-            let (quotient, rem) = wide_divide(b, &[mx], &[my]);
+            let my = b.select(fail, b.k(word, 1), my);
+            let (quotient, rem) = wide_divide(b, &limbs(mx), &limbs(my));
+            let (quotient, rem) = (joined(&quotient), joined(&rem));
             let opposite = b.not(b.eq(b.unsigned(sx), b.unsigned(sy)));
-            let quotient = b.select(opposite, b.negate_word(quotient[0]), quotient[0]);
-            let adjust = b.and(sx, b.nonzero(rem[0]));
+            let quotient = b.select(opposite, b.negate_word(quotient), quotient);
+            let adjust = b.and(sx, b.nonzero(rem));
             if op == SourceBinary::Rem {
-                b.select(adjust, b.sub(my, rem[0]), rem[0])
+                b.select(adjust, b.sub(my, rem), rem)
             } else {
-                let adjusted = b.select(sy, b.add(quotient, b.u(1)), b.sub(quotient, b.u(1)));
+                let one = b.k(word, 1);
+                let adjusted = b.select(sy, b.add(quotient, one), b.sub(quotient, one));
                 b.select(adjust, adjusted, quotient)
             }
         }
         SourceBinary::Shl | SourceBinary::Shr => {
-            let valid = b.lt(y, b.u(32));
+            let valid = b.lt(y, b.k(word, width as u64));
             b.fail_if(b.not(valid), ScalarFailure::ShiftCount);
-            let count = b.select(valid, y, b.u(0));
+            let count = b.select(valid, y, b.k(word, 0));
             if op == SourceBinary::Shl {
                 b.word(WordOp::Shl, x, count)
             } else {
@@ -1030,19 +1050,30 @@ pub(super) fn cast(b: &Recipe, a: V, to: DType) -> V {
                 to,
             )
         } else {
-            b.typed(word, to)
+            b.typed(b.resize(word, super::word_type(to)), to)
         };
     }
+    // Integer conversion is modular: a wider result sign-extends an I32 and
+    // zero-extends a U32, and a narrower one keeps the low word.
     if from.is_int() && to.is_int() {
-        return b.typed(bits, to);
+        let word = if from == DType::I32 && to == DType::U64 {
+            let high = b.select(b.sign(bits, 31), b.u(u32::MAX), b.u(0));
+            b.joined([bits, high])
+        } else {
+            b.resize(bits, super::word_type(to))
+        };
+        return b.typed(word, to);
     }
     if from.is_int() {
         let (sign, magnitude) = if from == DType::I32 {
-            b.signed_magnitude(bits)
+            let (sign, magnitude) = b.signed_magnitude(bits);
+            (sign, vec![magnitude])
+        } else if from == DType::U64 {
+            (b.boolean(false), b.limbs(bits).to_vec())
         } else {
-            (b.boolean(false), bits)
+            (b.boolean(false), vec![bits])
         };
-        return b.typed(pack(b, &[magnitude], b.u(0), sign, Format::of(to)), to);
+        return b.typed(pack(b, &magnitude, b.u(0), sign, Format::of(to)), to);
     }
     let a = decode(b, a);
     if to.is_float() {
@@ -1052,38 +1083,48 @@ pub(super) fn cast(b: &Recipe, a: V, to: DType) -> V {
         return b.typed(canonical(b, a.nan, result, f), to);
     }
     assert!(to.is_int());
+    // Saturating conversion over the 32-bit limbs of the integer dtype.
+    let n = if to == DType::U64 { 2 } else { 1 };
     let negative_exponent = b.signed_lt(a.exponent, b.u(0));
+    let magnitude = wide(b, a.magnitude, n);
     let shifted_left = wide_shift(
         b,
-        &[a.magnitude],
+        &magnitude,
         b.select(negative_exponent, b.u(0), a.exponent),
         true,
-    )[0];
+    );
     let shifted_right = wide_shift(
         b,
-        &[a.magnitude],
+        &magnitude,
         b.select(negative_exponent, b.negate_word(a.exponent), b.u(0)),
         false,
-    )[0];
-    let magnitude = b.select(negative_exponent, shifted_right, shifted_left);
-    let bit_length = b.add(word_bit_length(b, a.magnitude), a.exponent);
-    let exceeds_word = b.signed_lt(b.u(32), bit_length);
-    let limit = if to == DType::I32 {
-        b.select(a.sign, b.u(0x8000_0000), b.u(0x7fff_ffff))
-    } else {
-        b.u(u32::MAX)
-    };
-    let magnitude = b.select(
-        b.or(b.or(exceeds_word, a.infinity), b.lt(limit, magnitude)),
-        limit,
-        magnitude,
     );
-    let result = if to == DType::I32 {
-        b.select(a.sign, b.negate_word(magnitude), magnitude)
+    let magnitude = wide_select(b, negative_exponent, &shifted_right, &shifted_left);
+    let bit_length = b.add(word_bit_length(b, a.magnitude), a.exponent);
+    let exceeds_width = b.signed_lt(b.u(32 * n as u32), bit_length);
+    let limit = if to == DType::I32 {
+        vec![b.select(a.sign, b.u(0x8000_0000), b.u(0x7fff_ffff))]
     } else {
-        b.select(a.sign, b.u(0), magnitude)
+        vec![b.u(u32::MAX); n]
     };
-    b.typed(b.select(a.nan, b.u(0), result), to)
+    let saturated = b.or(
+        b.or(exceeds_width, a.infinity),
+        wide_lt(b, &limit, &magnitude),
+    );
+    let magnitude = wide_select(b, saturated, &limit, &magnitude);
+    let zeros = vec![b.u(0); n];
+    let result = if to == DType::I32 {
+        vec![b.select(a.sign, b.negate_word(magnitude[0]), magnitude[0])]
+    } else {
+        wide_select(b, a.sign, &zeros, &magnitude)
+    };
+    let result = wide_select(b, a.nan, &zeros, &result);
+    let word = if n == 2 {
+        b.joined([result[0], result[1]])
+    } else {
+        result[0]
+    };
+    b.typed(word, to)
 }
 
 /// The word realization of `integer_to_float`: the two's-complement value
@@ -1147,7 +1188,10 @@ pub(super) fn operation(b: &Recipe, op: ScalarOp, args: &[V]) -> V {
             match op {
                 SourceUnary::Neg => negate(b, args[0]),
                 SourceUnary::Not => b.not(args[0]),
-                SourceUnary::BitNot => b.typed(b.xor(b.bits(args[0]), b.u(u32::MAX)), args[0].ty),
+                SourceUnary::BitNot => {
+                    let bits = b.bits(args[0]);
+                    b.typed(b.xor(bits, b.k(bits.ty, u64::MAX >> (64 - bits_of(bits.ty)))), args[0].ty)
+                }
             }
         }
         ScalarOp::Cast(to) => {
@@ -1182,9 +1226,9 @@ pub(super) fn literal(dtype: DType, bits: u64) -> ReferenceScalar {
         return ReferenceScalar::from_bits(
             dtype,
             if fraction != 0 {
-                f.nan()
+                f.nan().into()
             } else {
-                f.exponent_mask() | if sign { f.sign_mask() } else { 0 }
+                (f.exponent_mask() | if sign { f.sign_mask() } else { 0 }).into()
             },
         );
     }
@@ -1206,7 +1250,7 @@ pub(super) fn literal(dtype: DType, bits: u64) -> ReferenceScalar {
 }
 pub(super) fn integer_literal(dtype: DType, value: i128) -> ReferenceScalar {
     if !dtype.is_float() {
-        return ReferenceScalar::from_bits(dtype, value as u32);
+        return ReferenceScalar::from_bits(dtype, value as u64);
     }
     integer_to_float(dtype, &BigInt::from(value))
 }

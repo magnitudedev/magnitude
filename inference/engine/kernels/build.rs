@@ -32,7 +32,8 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "gated_delta_step_convolved",
         &[BackendName::Metal],
         "the convolved recurrent decode form's step over the projection's convolved channels; the other backends convolve in `gated_delta_step`",
-    ),    (
+    ),
+    (
         "readout_top_rows",
         &[BackendName::Metal, BackendName::Cuda],
         "level one of the progressive head's certified selection (decode rows)",
@@ -132,6 +133,21 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "representation ladder of `expert_down` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
     ),
     (
+        "lib/streams/down_weight",
+        &[BackendName::Vulkan],
+        "representation ladder of a mix site's `down_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
+        "lib/streams/inject_weight",
+        &[BackendName::Vulkan],
+        "representation ladder of a mix site's `inject_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
+        "lib/streams/up_weight",
+        &[BackendName::Vulkan],
+        "representation ladder of a mix site's `up_weight` (GLSL has no templates); Metal and CUDA bind it through `packets` slots",
+    ),
+    (
         "lib/recurrent/convolution",
         &[BackendName::Metal],
         "the gated-delta convolution and window publication, apart from `recurrent.h` because the Metal-only `gated_delta_step_convolved` binds no window; the other backends keep them in their recurrent library",
@@ -161,6 +177,9 @@ fn main() {
         .source("kernels/short_conv.seismic")
         .source("kernels/state_space.seismic")
         .source("kernels/residual.seismic")
+        .source("kernels/streams.seismic")
+        .source("kernels/ngram.seismic")
+        .source("kernels/indexer.seismic")
         .source("kernels/functions.seismic")
         .run()
         .unwrap_or_else(|error| {

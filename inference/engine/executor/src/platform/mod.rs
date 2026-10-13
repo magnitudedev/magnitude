@@ -12,7 +12,7 @@ mod selection;
 pub use policy::{
     DomainReading, DomainRole, DomainThresholds, FitCapacity, HostDistress, MemoryBand,
     MemoryConstraint, MemoryPolicyError, MemoryReserves, band_of, fit_capacities, host_distress,
-    observe_domains, refresh_device_ceiling,
+    observe_domains, refresh_device_ceiling, shared_role,
 };
 pub use qualification::{
     OpenedPlatform, PlatformConfig, PlatformError, SelectedDevice, open_selected, select_device,

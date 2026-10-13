@@ -144,7 +144,12 @@ enum Repr {
     Q5g32,
     Mxfp4,
     Nvfp4,
+    Iq2xs,
+    Iq3xxs,
 }
+
+/// The vector-coded formats (256-value GGUF blocks).
+const GRID_REPRS: [Repr; 2] = [Repr::Iq2xs, Repr::Iq3xxs];
 
 /// The formats with a representation of their own, imported from GGUF.
 const GGUF_REPRS: [Repr; 5] = [
@@ -174,6 +179,8 @@ impl Repr {
             Repr::Q5g32 => "q5g32",
             Repr::Mxfp4 => "mxfp4g32",
             Repr::Nvfp4 => "nvfp4g16",
+            Repr::Iq2xs => "iq2xs",
+            Repr::Iq3xxs => "iq3xxs",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -185,6 +192,8 @@ impl Repr {
             Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
             Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
             Repr::Nvfp4 => Some(("gguf_nvfp4", 36, 64)),
+            Repr::Iq2xs => Some(("gguf_iq2_xs", 74, 256)),
+            Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
             _ => None,
         }
     }
@@ -265,7 +274,13 @@ fn planes(repr: Repr, k: usize) -> Planes {
             planes.supers = place(4 * (k / 32));
         }
         Repr::Bf16 => at = 2 * k,
-        Repr::Q4g32s | Repr::Q5g32s | Repr::Q5g32 | Repr::Mxfp4 | Repr::Nvfp4 => {
+        Repr::Q4g32s
+        | Repr::Q5g32s
+        | Repr::Q5g32
+        | Repr::Mxfp4
+        | Repr::Nvfp4
+        | Repr::Iq2xs
+        | Repr::Iq3xxs => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -439,7 +454,13 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                     out[column] = value;
                 }
             }
-            Repr::Q4g32s | Repr::Q5g32s | Repr::Q5g32 | Repr::Mxfp4 | Repr::Nvfp4 => {
+            Repr::Q4g32s
+            | Repr::Q5g32s
+            | Repr::Q5g32
+            | Repr::Mxfp4
+            | Repr::Nvfp4
+            | Repr::Iq2xs
+            | Repr::Iq3xxs => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -482,6 +503,9 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
                     *field = (exponent << 3) | rng.below(8) as u8;
                 }
             }
+            // d: values reach d (2 s + 1) 43 / 8 and d (2 s + 1) 62 / 4.
+            Repr::Iq2xs => block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes()),
+            Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
             _ => unreachable!("{repr:?} is not imported from GGUF"),
         }
         external.extend(block);
@@ -807,6 +831,40 @@ fn statics_on(device: &Device, statics: &[(&str, usize)]) -> NativeSpecializatio
         })
 }
 
+/// An output entry's statics over the single residual stream: one stream
+/// (`SN` 1) joined without inject (`IN` 0). The CPU form has no statics.
+fn joined(device: &Device, spec: NativeSpecialization) -> NativeSpecialization {
+    if is_cpu(device) {
+        return spec;
+    }
+    spec.with_static("SN", 1).with_static("IN", 0)
+}
+
+/// Rows `[M, D]` as the `[M, 1, D]` parts the features entry reads.
+fn one_part(rows: &Tensor) -> Tensor {
+    let extents = rows.extents();
+    rows.reshape(&[extents[0], 1, extents[1]]).unwrap()
+}
+
+/// The row width a consumer entry's statics name: `D`, else `H`.
+fn row_width(statics: &[(&str, usize)]) -> usize {
+    ["D", "H"]
+        .iter()
+        .find_map(|name| statics.iter().find(|(static_name, _)| static_name == name))
+        .map(|(_, value)| *value)
+        .expect("a consumer entry's statics name its row width")
+}
+
+/// A consumer entry's statics over the single residual stream: its input
+/// read as one part (`PT` 1) normalized at the row width `width` (`NM`). The
+/// CPU form has no statics.
+fn formed(device: &Device, spec: NativeSpecialization, width: usize) -> NativeSpecialization {
+    if is_cpu(device) {
+        return spec;
+    }
+    spec.with_static("PT", 1).with_static("NM", width as u64)
+}
+
 /// The specialization of a projection entry on `device` under `mapping`. CPU
 /// implementations have no static dimensions and one mapping parameter, the
 /// weight rows per work item.
@@ -1002,6 +1060,15 @@ fn attention_output_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
+    // The CPU form's statics: the gated heads and width.
+    if is_cpu(device) {
+        return statics
+            .iter()
+            .filter(|(name, _)| matches!(*name, "Q" | "W"))
+            .fold(specialization_on(device, statics, mapping), |spec, (name, value)| {
+                spec.with_static(*name, *value as u64)
+            });
+    }
     let specialization = scoped_projection_specialization_on(
         device,
         statics,
@@ -1020,6 +1087,7 @@ fn attention_output_specialization_on(
         ATTENTION_OUTPUT_GEMV_ROWS_LAUNCH,
         mapping,
     );
+    let specialization = joined(device, specialization);
     if device.backend() == BackendName::Metal {
         with_pack(specialization, ATTENTION_OUTPUT_PACKED_LAUNCH, PACK_DEFAULT)
             .with_param("PACK", 0)
@@ -1056,6 +1124,7 @@ fn segmented_projection_specialization_on(
         false,
     );
     let specialization = with_tall(device, specialization, 6, mapping.tall);
+    let specialization = formed(device, specialization, row_width(statics));
     if device.backend() == BackendName::Metal {
         with_pack(specialization, packed, PACK_DEFAULT).with_param("PACK", 0)
     } else {
@@ -1070,6 +1139,12 @@ fn attention_project_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
+    // The CPU form's one static: the row width its `[M, PT * D]` input
+    // does not name alone.
+    if is_cpu(device) {
+        return specialization_on(device, statics, mapping)
+            .with_static("D", row_width(statics) as u64);
+    }
     with_gemv_rows(
         device,
         segmented_projection_specialization_on(
@@ -1176,7 +1251,7 @@ fn readout_projection_specialization_on(
     statics: &[(&str, usize)],
     mapping: Mapping,
 ) -> NativeSpecialization {
-    scoped_projection_specialization_on(
+    let specialization = scoped_projection_specialization_on(
         device,
         statics,
         mapping,
@@ -1186,7 +1261,8 @@ fn readout_projection_specialization_on(
             gemm: 3,
         },
         false,
-    )
+    );
+    formed(device, specialization, row_width(statics))
 }
 
 /// The specialization of `readout_head_rows` on `device`: the readout
@@ -2010,6 +2086,7 @@ fn metal_tall_segmented_projections_are_bit_identical_to_the_staged_tiles() {
             .unwrap()
             .call(attention_output::Args {
                 hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
+                inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
                 output_weight: &out_weight.tensor(&device),
             })
@@ -2784,6 +2861,7 @@ fn metal_packed_recurrent_and_attention_projections_agree_with_the_staged_tiles(
             .unwrap()
             .call(attention_output::Args {
                 hidden: &f32_tensor(&device, &[rows, outputs], &narrow),
+                inject: &no_inject(&device, rows as u64),
                 gated: &act_tensor(&device, act, &[rows, heads, width], &gated),
                 output_weight: &weight.tensor(&device),
             })
@@ -3252,10 +3330,12 @@ fn packed_timing() {
                 specialization,
             )
             .unwrap();
+            let inject = no_inject(&device, hidden.extents()[0]);
             let rotation = weights
                 .iter()
                 .map(|weight| attention_output::Args {
                     hidden: &hidden,
+                    inject: &inject,
                     gated: &gated,
                     output_weight: weight,
                 })
@@ -3374,6 +3454,22 @@ fn dense_output_iq4_matches_its_portable_body_and_the_host_reference() {
 fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() {
     for device in devices() {
         dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &GGUF_REPRS);
+    }
+}
+
+/// IQ2_XS and IQ3_XXS weights, imported into their vector-coded
+/// representations.
+#[test]
+fn dense_output_grid_formats_match_their_portable_body_and_the_host_reference() {
+    for device in devices() {
+        dense_output_matches_its_portable_body_and_the_host_reference_on(&device, &GRID_REPRS);
+    }
+}
+
+#[test]
+fn dense_expand_grid_formats_match_their_portable_body() {
+    for device in devices() {
+        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq2xs, Repr::Iq3xxs)]);
     }
 }
 
@@ -4007,6 +4103,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                 let out = kernel
                     .call(attention_output::Args {
                         hidden: &f32_tensor(&device, &[rows, h], hidden),
+                        inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, nv, w], gated),
                         output_weight: &out_weight.tensor(&device),
                     })
@@ -4023,6 +4120,7 @@ fn recurrent_output_cases_on(device: &Device, scoped: bool) {
                     &[("OW", repr.storage()), ("A", registry::dense(DType::BF16))],
                     vec![
                         floats(&[rows, h], &hidden),
+                        floats(&[rows, 0], &[]),
                         activations(act, &[rows, nv, w], &gated),
                         Input::Data(out_weight.oracle()),
                     ],
@@ -4295,6 +4393,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                 let out = kernel
                     .call(attention_output::Args {
                         hidden: &f32_tensor(&device, &[rows, d_out], hidden),
+                        inject: &no_inject(&device, rows as u64),
                         gated: &act_tensor(&device, act, &[rows, q, w], gated),
                         output_weight: &out_weight.tensor(&device),
                     })
@@ -4330,6 +4429,7 @@ fn attention_projections_match_their_portable_bodies_and_the_host_reference_on(
                         &[("A", registry::dense(DType::BF16)), ("OW", repr.storage())],
                         vec![
                             floats(&[rows, d_out], &hidden),
+                            floats(&[rows, 0], &[]),
                             activations(act, &[rows, q, w], &gated),
                             Input::Data(out_weight.oracle()),
                         ],
@@ -4499,7 +4599,8 @@ fn head_logits_scoped_launches_match_the_host(device: &Device) {
                 .call(readout_project_rows::Args {
                     features: &act_tensor(device, act, &[rows, d], &features),
                     weight: &head.tensor(device),
-                    token_rows: &Tensor::zeros(device, Element::i32(), &[rows as u64, 0, v as u64]).unwrap(),
+                    token_rows: &Tensor::zeros(device, Element::i32(), &[rows as u64, 0, v as u64])
+                        .unwrap(),
                     weight_scale: &Tensor::zeros(device, Element::f32(), &[0]).unwrap(),
                     softcap: 0.0,
                 })
@@ -4567,11 +4668,11 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                     NW: Element::bf16(),
                     A: act.element(),
                 },
-                &statics_on(device, &[("D", d)]),
+                &formed(device, statics_on(device, &[("D", d)]), d),
             )
             .unwrap()
             .call(readout_features_rows::Args {
-                hidden: &hidden_tensor,
+                hidden: &one_part(&hidden_tensor),
                 norm: &bf16_norm(&device, &norm),
                 out_rows: &rows_tensor,
                 epsilon: 1e-6,
@@ -4741,7 +4842,7 @@ fn readout_entries_match_their_portable_bodies_and_the_host_reference_on(
                             ("A", registry::dense(DType::BF16)),
                         ],
                         vec![
-                            floats(&[rows, d], &hidden),
+                            floats(&[rows, 1, d], &hidden),
                             activations(Act::Bf16, &[d], &norm),
                             ints(&[outputs], &out_rows),
                             Input::F32(1e-6),
@@ -5295,10 +5396,12 @@ fn timing_on(device: &Device) {
                     ),
                 )
                 .unwrap();
+                let inject = no_inject(&device, hidden.extents()[0]);
                 let rotation = weights
                     .iter()
                     .map(|weight| attention_output::Args {
                         hidden: &hidden,
+                        inject: &inject,
                         gated: &gated,
                         output_weight: weight,
                     })
@@ -5434,10 +5537,12 @@ fn timing_on(device: &Device) {
                     ),
                 )
                 .unwrap();
+                let inject = no_inject(&device, hidden.extents()[0]);
                 let rotation = weights
                     .iter()
                     .map(|weight| attention_output::Args {
                         hidden: &hidden,
+                        inject: &inject,
                         gated: &gated,
                         output_weight: weight,
                     })
@@ -5461,9 +5566,10 @@ fn timing_on(device: &Device) {
                 NW: Element::bf16(),
                 A: a,
             },
-            &statics_on(device, &[("D", d)]),
+            &formed(device, statics_on(device, &[("D", d)]), d),
         )
         .unwrap();
+        let hidden = one_part(&hidden);
         let rotation = vec![readout_features_rows::Args {
             hidden: &hidden,
             norm: &norm,
@@ -5883,9 +5989,13 @@ fn metal_convolved_matrix_columns_match_host() {
                         .unwrap();
                 }
                 let mut window = slabs.logical_region(0).unwrap();
-                let mut spec = statics_on(
+                let mut spec = formed(
                     &device,
-                    &[("H", h), ("NK", nk), ("NV", nv), ("W", w), ("C", c)],
+                    statics_on(
+                        &device,
+                        &[("H", h), ("NK", nk), ("NV", nv), ("W", w), ("C", c)],
+                    ),
+                    h,
                 )
                 .with_param("BATCH_FROM", 3)
                 .with_launch_param(2, "BATCH_SIMDGROUPS", 8)
@@ -6109,6 +6219,7 @@ fn metal_attention_output_matrix_matches_host() {
                     let output = kernel
                         .call(attention_output::Args {
                             hidden: &f32_tensor(&device, &[rows, d], &hidden),
+                            inject: &no_inject(&device, rows as u64),
                             gated: &act_tensor(&device, act, &[rows, q, w], &gated),
                             output_weight: &weights.tensor(&device),
                         })
@@ -6375,11 +6486,15 @@ fn metal_normalize_prepass_matches_small_row_tree() {
                 NW: Element::bf16(),
                 A: Element::bf16(),
             },
-            &NativeSpecialization::new().with_static("D", h as u64),
+            &formed(
+                &device,
+                NativeSpecialization::new().with_static("D", h as u64),
+                h,
+            ),
         )
         .unwrap()
         .call(readout_features_rows::Args {
-            hidden: &hidden,
+            hidden: &one_part(&hidden),
             norm: &nt,
             out_rows: &selected,
             epsilon: 1e-6,
@@ -6459,4 +6574,9 @@ fn metal_normalize_prepass_matches_small_row_tree() {
         differences, 0,
         "identity projection must preserve each rounded RMS activation across the staging boundary"
     );
+}
+
+/// The inject port of a single residual stream: no columns.
+fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
+    seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
 }

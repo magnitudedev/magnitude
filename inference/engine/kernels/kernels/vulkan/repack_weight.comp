@@ -32,8 +32,8 @@
 #define REPACK_IQ4NL 1
 #elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32)
 #define REPACK_IQ4 1
-#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)
-// block_q4_0: d (f16) | qs[16].
+#elif (defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_Q4_0) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_Q4G32S)) || (defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ4_NL_BLOCK) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ4G32S))
+// block_q4_0 and one block_iq4_nl: d (f16) | qs[16].
 #define REPACK_BLOCK32 1
 #define REPACK_SCALE_BYTES 2u
 #define REPACK_QS 2u
@@ -60,6 +60,21 @@
 #define REPACK_NVFP4 1
 #define REPACK_E2M1 1
 #define REPACK_SCALE_BYTES 4u
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ2_XS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ2XS)
+// block_iq2_xs: d (f16) | qs[32] (u16: 9-bit grid index, 7 signs) |
+// scales[8] (two 4-bit sub-block scales each, low first). The resident
+// entries are two bytes, the factor d / 8.
+#define REPACK_GRID 1
+#define REPACK_GRID_BYTES 2u
+#define REPACK_GRID_FACTOR 0.125
+#elif defined(SEISMIC_ELEMENT_E_REPRESENTATION_GGUF_IQ3_XXS) && defined(SEISMIC_ELEMENT_U_REPRESENTATION_IQ3XXS)
+// block_iq3_xxs: d (f16) | qs[64] (8-bit grid indices of four values) |
+// eight u32, one per 32 values: four 7-bit sign groups, then the 4-bit
+// scale. The resident entries are three bytes, the factor d / 4.
+#define REPACK_GRID 1
+#define REPACK_IQ3XXS 1
+#define REPACK_GRID_BYTES 3u
+#define REPACK_GRID_FACTOR 0.25
 #else
 #error "repack_weight binding is not a registered GGUF-to-resident conversion"
 #endif
@@ -198,6 +213,34 @@ uint repack_word(uint64_t gp, uint offset) {
         | (repack_byte(gp, offset + 3u) << 24);
 }
 
+#if defined(REPACK_GRID)
+// Resident vector-code entry `e` (values 8e .. 8e + 7) of the source block:
+// the grid indices, then the seven signs (registry `gguf_iq2_xs`,
+// `gguf_iq3_xxs`).
+uint repack_grid_entry(uint64_t gp, uint e) {
+#if defined(REPACK_IQ3XXS)
+    const uint block = e / 4u, group = e % 4u;
+    return repack_byte(gp, 2u + 8u * block + 2u * group) | (repack_byte(gp, 3u + 8u * block + 2u * group) << 8)
+        | (((repack_word(gp, 66u + 4u * block) >> (7u * group)) & 127u) << 16);
+#else
+    return repack_byte(gp, 2u + 2u * e) | (repack_byte(gp, 3u + 2u * e) << 8);
+#endif
+}
+
+// Word `w` of entries `first .. first + 3`, packed little-endian
+// (an entry may straddle two words).
+uint repack_grid_word(uint64_t gp, uint first, uint w) {
+    const uint bits = 8u * REPACK_GRID_BYTES;
+    uint value = 0u;
+    for (uint e = (32u * w) / bits; e < 4u && e * bits < 32u * w + 32u; ++e) {
+        const int shift = int(e * bits) - int(32u * w);
+        const uint entry = repack_grid_entry(gp, first + e);
+        value |= shift >= 0 ? entry << uint(shift) : entry >> uint(-shift);
+    }
+    return value;
+}
+#endif
+
 #if defined(REPACK_KQUANT)
 // Six-bit local coefficient `field` (0 scale, 1 minimum) of sub-block `j`.
 uint repack_kquant_local(uint64_t gp, uint j, uint field) {
@@ -263,6 +306,15 @@ void repack_write_scales(uint64_t gp, uint64_t to) {
         }
         element_u32_put(to + 4ul * w, value);
     }
+#elif defined(REPACK_IQ3XXS)
+    // Sub-block b's scale is the top nibble of its u32, nibble b of the plane.
+    uint value = 0u;
+    for (uint b = 0u; b < 8u; ++b)
+        value |= (repack_byte(gp, 69u + 4u * b) >> 4) << (4u * b);
+    element_u32_put(to, value);
+#elif defined(REPACK_GRID)
+    element_u32_put(to, repack_word(gp, 66u));
+    element_u32_put(to + 4ul, repack_word(gp, 70u));
 #endif
 }
 
@@ -277,6 +329,10 @@ void repack_write_supers(uint64_t gp, uint64_t to) {
     element_u16_put(to, repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8));
 #elif defined(REPACK_Q8)
     element_u16_put(to, repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8));
+#elif defined(REPACK_GRID)
+    // d widened and scaled by a power of two, exactly.
+    element_f32_put(to,
+        seismic_f16_to_f32(uint16_t(repack_byte(gp, 0u) | (repack_byte(gp, 1u) << 8))) * REPACK_GRID_FACTOR);
 #elif defined(REPACK_IQ4NL)
     // Each block's f16 scale, widened exactly.
     for (uint j = 0u; j < 8u; ++j)
@@ -348,7 +404,12 @@ void repack_weight() {
         const uint64_t n = row0 + lane;
         const uint64_t gp = repack_source_packet(source, b, n, column0 / REPACK_GROUP);
         const uint64_t row = repack_row_base(destination, b, n);
-#if defined(SEISMIC_ELEMENT_U_PLANE_CODES)
+#if defined(SEISMIC_ELEMENT_U_PLANE_GRIDS)
+        // The tile's four grid entries.
+        const uint64_t grids = row + SEISMIC_RESULT_0_PLANE_GRIDS_ROW_OFFSET + uint64_t(column0 / 8u * REPACK_GRID_BYTES);
+        for (uint w = 0u; w < REPACK_GRID_BYTES; ++w)
+            element_u32_put(grids + 4ul * w, repack_grid_word(gp, within / 8u, w));
+#elif defined(SEISMIC_ELEMENT_U_PLANE_CODES)
         const uint64_t codes = row + SEISMIC_RESULT_0_PLANE_CODES_ROW_OFFSET + column0;
         element_uvec4_put(codes, uvec4(repack_pack_four_bytes(gp, within), repack_pack_four_bytes(gp, within + 4u),
             repack_pack_four_bytes(gp, within + 8u), repack_pack_four_bytes(gp, within + 12u)));

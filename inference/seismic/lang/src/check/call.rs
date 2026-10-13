@@ -970,7 +970,7 @@ impl<'a> Checker<'a> {
         // Keep the conversion as an evaluated operand, including wrapping.
         if matches!(op, MathOp::Min | MathOp::Max) {
             let word = out.iter().find_map(|value| match value.ty {
-                ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) => Some(dtype),
+                ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) => Some(dtype),
                 _ => None,
             });
             if let Some(dtype) = word {

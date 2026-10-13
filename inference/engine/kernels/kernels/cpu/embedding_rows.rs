@@ -7,8 +7,8 @@ use lib::core::{activation, gathered, reduce};
 
 fn embedding_rows<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, group: [u64; 3], _shared: &mut [u8]) {
     let row = group[0] as usize;
-    let token = gathered::row(cx.arg_tokens().get([row, 0]), cx.dim_r(), |selected| {
-        cx.arg_directory().get([selected])
+    let token = gathered::row(cx.arg_tokens().get([row, 0]), cx.dim_r(), cx.dim_f(), |entry, field| {
+        cx.arg_directory().get([entry, field])
     });
     // SAFETY: each work item writes its own row of both results.
     let (embedded, widened) = unsafe { (cx.result_0().row_mut([row, 0]), cx.result_1().row_mut([row, 0])) };

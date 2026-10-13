@@ -5,7 +5,7 @@
 use super::GraphError;
 use seismic::{
     Element, Entry, NativeGraph, NativeGraphMetadata, NativeGraphPlan, NativeGraphStorageBytes,
-    NativeKernel, NativePort, WorkflowTensor,
+    NativeKernel, NativePort, NativeTimelinePort, TimelineNode, WorkflowTensor,
 };
 
 pub(crate) trait GraphDraft: Sized {
@@ -44,6 +44,9 @@ pub(crate) trait GraphDraft: Sized {
         args: E::WorkflowArgs<'_>,
     ) -> Result<E::WorkflowResults, GraphError>;
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError>;
+    /// A timeline node after every node enqueued so far: a host gate or a
+    /// signal to the host (`seismic::Timeline`).
+    fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort;
     fn seal(self) -> Result<Self::Plan, GraphError>;
 }
 
@@ -88,6 +91,9 @@ impl GraphDraft for NativeGraph {
     }
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
         self.export(result).map_err(invalid)
+    }
+    fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        self.timeline(node)
     }
     fn seal(self) -> Result<Self::Plan, GraphError> {
         self.seal().map_err(invalid)
@@ -139,6 +145,9 @@ impl GraphDraft for NativeGraphMetadata {
     }
     fn export(&mut self, result: &WorkflowTensor) -> Result<(), GraphError> {
         Ok(self.export(result)?)
+    }
+    fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        self.timeline(node)
     }
     fn seal(self) -> Result<Self::Plan, GraphError> {
         Ok(self.seal()?)

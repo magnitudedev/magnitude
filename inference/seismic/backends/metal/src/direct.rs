@@ -11,7 +11,8 @@ use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
     MTLComputePipelineState, MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor,
-    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLSize, MTLStorageMode,
+    MTLCounterSamplingPoint, MTLCounterSet, MTLDevice, MTLDispatchType, MTLEvent, MTLSharedEvent,
+    MTLSize, MTLStorageMode,
 };
 use seismic_compiler::errors::ExecutionError;
 
@@ -179,8 +180,10 @@ impl LaunchTimestamps {
 
 /// How a batch places its launches in compute encoders.
 enum Encoding {
-    /// Every launch in one serial encoder: the production form.
-    Serial(Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>),
+    /// Every launch between two event commands in one serial encoder: the
+    /// production form. `None` after an event command, until the next
+    /// launch opens the next encoder.
+    Serial(Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>),
     /// Every launch in its own encoder, with the encoder's start and end
     /// timestamps sampled at stage boundaries into its range of
     /// `timestamps`. Encoders of one command buffer run in order over
@@ -215,19 +218,99 @@ fn command_buffer(
     })
 }
 
+fn serial_encoder(
+    command: &ProtocolObject<dyn MTLCommandBuffer>,
+) -> Result<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>, ExecutionError> {
+    crate::pooled(|| command.computeCommandEncoder()).ok_or_else(|| {
+        ExecutionError::SubmissionFailed("Metal could not create a native compute encoder".into())
+    })
+}
+
+/// A 64-bit value the host and the device's command buffers both advance
+/// and wait on (`MTLSharedEvent`).
+pub struct SharedEvent {
+    event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
+}
+
+// A shared event is a thread-safe Metal object.
+unsafe impl Send for SharedEvent {}
+unsafe impl Sync for SharedEvent {}
+
+impl SharedEvent {
+    /// An event at 0.
+    pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
+        crate::pooled(|| device.handle().raw().newSharedEvent())
+            .map(|event| Self { event })
+            .ok_or_else(|| {
+                ExecutionError::AllocationFailed("Metal could not create a shared event".into())
+            })
+    }
+
+    fn as_event(&self) -> &ProtocolObject<dyn MTLEvent> {
+        ProtocolObject::from_ref(&*self.event)
+    }
+
+    /// Set the event to `value` from the host.
+    pub fn signal(&self, value: u64) {
+        crate::pooled(|| self.event.setSignaledValue(value));
+    }
+
+    pub fn value(&self) -> u64 {
+        crate::pooled(|| self.event.signaledValue())
+    }
+
+    /// Wait at most `timeout` for the event to reach `value`; whether it
+    /// did.
+    pub fn wait(&self, value: u64, timeout: std::time::Duration) -> bool {
+        let milliseconds = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        crate::pooled(|| {
+            self.event.signaledValue() >= value
+                || self
+                    .event
+                    .waitUntilSignaledValue_timeoutMS(value, milliseconds)
+        })
+    }
+}
+
 impl DirectBatch {
     pub fn new(device: &MetalDevice) -> Result<Self, ExecutionError> {
         let command = command_buffer(device)?;
-        let encoder = crate::pooled(|| command.computeCommandEncoder()).ok_or_else(|| {
-            ExecutionError::SubmissionFailed(
-                "Metal could not create a native compute encoder".into(),
-            )
-        })?;
+        let encoder = serial_encoder(&command)?;
         Ok(Self {
             device: device.clone(),
             command,
-            encoding: Encoding::Serial(encoder),
+            encoding: Encoding::Serial(Some(encoder)),
         })
+    }
+
+    /// The command buffer's following work waits until `event` reaches
+    /// `value` (`encodeWaitForEvent`): the host gate.
+    pub fn wait_event(&mut self, event: &SharedEvent, value: u64) {
+        self.end_serial();
+        crate::pooled(|| {
+            self.command
+                .encodeWaitForEvent_value(event.as_event(), value)
+        });
+    }
+
+    /// `event` reaches `value` once the work encoded before it completes
+    /// (`encodeSignalEvent`).
+    pub fn signal_event(&mut self, event: &SharedEvent, value: u64) {
+        self.end_serial();
+        crate::pooled(|| {
+            self.command
+                .encodeSignalEvent_value(event.as_event(), value)
+        });
+    }
+
+    /// End the open serial encoder: an event command is encoded between
+    /// encoders.
+    fn end_serial(&mut self) {
+        if let Encoding::Serial(encoder) = &mut self.encoding {
+            if let Some(encoder) = encoder.take() {
+                crate::pooled(|| encoder.endEncoding());
+            }
+        }
     }
 
     /// A measurement batch of at most `launches` launches: each launch gets
@@ -288,7 +371,13 @@ impl DirectBatch {
         }
         let command = &self.command;
         match &mut self.encoding {
-            Encoding::Serial(encoder) => crate::pooled(|| encode_launch(encoder, launch)),
+            Encoding::Serial(encoder) => {
+                let encoder = match encoder {
+                    Some(encoder) => encoder,
+                    None => encoder.insert(serial_encoder(command)?),
+                };
+                crate::pooled(|| encode_launch(encoder, launch))
+            }
             Encoding::Timed {
                 timestamps,
                 first,
@@ -337,7 +426,9 @@ impl DirectBatch {
     pub fn commit(self) -> DirectSubmission {
         let timing = match self.encoding {
             Encoding::Serial(encoder) => {
-                crate::pooled(|| encoder.endEncoding());
+                if let Some(encoder) = encoder {
+                    crate::pooled(|| encoder.endEncoding());
+                }
                 None
             }
             Encoding::Timed {

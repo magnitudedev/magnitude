@@ -39,6 +39,7 @@ magnitude-family-llama = { path = "../families/llama" }
 magnitude-family-muse-glimmer = { path = "../families/muse_glimmer" }
 magnitude-family-nemotron-h = { path = "../families/nemotron_h" }
 magnitude-family-qwen35 = { path = "../families/qwen35" }
+magnitude-family-qwen4exp = { path = "../families/qwen4exp" }
 
 # Development-only: replays the tuning search against survey records.
 [[example]]

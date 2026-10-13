@@ -15,7 +15,7 @@
 //! because Seismic owns representation and storage binding semantics. Library
 //! files are embedded in this crate, inlined
 //! once like any include, and may include only other library files.
-use crate::checked::{check_source, CheckedModule, SourceError, SourceFile, SourceSet};
+use crate::checked::{CheckedModule, SourceError, SourceFile, SourceSet, check_source};
 use crate::ids::EntryId;
 use crate::registry::BackendName;
 use std::path::{Path, PathBuf};
@@ -33,6 +33,7 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         include_str!("../native-library/metal/packets.h"),
     ),
     ("slab.h", include_str!("../native-library/metal/slab.h")),
+    ("grids.h", include_str!("../native-library/metal/grids.h")),
     (
         "element.cuh",
         include_str!("../native-library/cuda/element.cuh"),
@@ -43,6 +44,10 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
     ),
     ("slab.cuh", include_str!("../native-library/cuda/slab.cuh")),
     (
+        "grids.cuh",
+        include_str!("../native-library/cuda/grids.cuh"),
+    ),
+    (
         "element.glsl",
         include_str!("../native-library/vulkan/element.glsl"),
     ),
@@ -50,7 +55,14 @@ pub const NATIVE_LIBRARY: &[(&str, &str)] = &[
         "packets.glsl",
         include_str!("../native-library/vulkan/packets.glsl"),
     ),
-    ("slab.glsl", include_str!("../native-library/vulkan/slab.glsl")),
+    (
+        "slab.glsl",
+        include_str!("../native-library/vulkan/slab.glsl"),
+    ),
+    (
+        "grids.glsl",
+        include_str!("../native-library/vulkan/grids.glsl"),
+    ),
 ];
 
 #[derive(Debug)]
@@ -118,7 +130,9 @@ impl std::fmt::Display for NativeIncludeError {
             NativeIncludeReason::LibraryRelative => {
                 "a Seismic library file may include only `<seismic/…>` files"
             }
-            NativeIncludeReason::Malformed => "only `#include \"<relative path>\"` directives are admitted",
+            NativeIncludeReason::Malformed => {
+                "only `#include \"<relative path>\"` directives are admitted"
+            }
             NativeIncludeReason::Absolute => "include paths are relative to the including file",
             NativeIncludeReason::Extension => {
                 "only `.h` (Metal), `.cuh` (CUDA) or `.glsl` (Vulkan) files of the asset's backend may be included"
@@ -126,7 +140,9 @@ impl std::fmt::Display for NativeIncludeError {
             NativeIncludeReason::OutsideSourceRoots => {
                 "the included file lies outside the build's source roots"
             }
-            NativeIncludeReason::Missing => "the included file does not exist (in the source roots or Seismic's native library)",
+            NativeIncludeReason::Missing => {
+                "the included file does not exist (in the source roots or Seismic's native library)"
+            }
         };
         write!(
             f,
@@ -299,7 +315,7 @@ pub fn capture_assets(
             None => {
                 return Err(LoadError::Invalid(
                     "inline native assets require base_dir".into(),
-                ))
+                ));
             }
         };
         let path = root.join(source_path).canonicalize()?;
@@ -457,7 +473,7 @@ impl Expansion<'_> {
                     continue;
                 }
                 Include::Relative(_) if in_library => {
-                    return Err(failure(NativeIncludeReason::LibraryRelative))
+                    return Err(failure(NativeIncludeReason::LibraryRelative));
                 }
                 Include::Relative(target) => target,
             };
@@ -577,6 +593,29 @@ mod tests {
         root.canonicalize().expect("canonical fixture")
     }
 
+    /// Every backend's grid tables are the registry's points: an IQ2_XS
+    /// point as its (low, high) words, an IQ3_XXS point as one word.
+    #[test]
+    fn native_grids_are_the_registrys() {
+        let expected = crate::grids::IQ2XS_GRID
+            .iter()
+            .flat_map(|point| [*point & 0xffff_ffff, *point >> 32])
+            .chain(crate::grids::IQ3XXS_GRID.iter().copied())
+            .collect::<Vec<_>>();
+        for name in ["grids.h", "grids.cuh", "grids.glsl"] {
+            let (_, text) = NATIVE_LIBRARY
+                .iter()
+                .find(|(library, _)| *library == name)
+                .expect("a grids header per backend");
+            let words = text
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter_map(|token| token.strip_prefix("0x"))
+                .map(|digits| u64::from_str_radix(digits.trim_end_matches('u'), 16).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(words, expected, "{name}");
+        }
+    }
+
     fn asset(root: &Path, text: &str) -> NativeAssetFile {
         let path = root.join("metal/kernel.metal");
         std::fs::write(&path, text).expect("asset");
@@ -688,7 +727,8 @@ mod tests {
             "#include <seismic/element.h>\nLIB\n",
         )
         .unwrap();
-        // packets.h includes element.h itself; each library file is inlined once.
+        // packets.h includes element.h and grids.h itself; each library file
+        // is inlined once.
         let asset = asset(
             &root,
             "#include <seismic/packets.h>\n#include \"common/lib.h\"\n#include <seismic/element.h>\nBODY\n",
@@ -698,7 +738,7 @@ mod tests {
             includes,
             library,
         } = expand_includes(&asset, "h", &[root.clone()]).unwrap();
-        assert_eq!(library, ["packets.h", "element.h"]);
+        assert_eq!(library, ["packets.h", "element.h", "grids.h"]);
         assert_eq!(
             includes.len(),
             1,
@@ -706,9 +746,11 @@ mod tests {
         );
         assert!(source.starts_with("#line 1 \"seismic/packets.h\"\n"));
         assert!(source.contains("#line 1 \"seismic/element.h\"\n"));
-        assert!(!source
-            .lines()
-            .any(|line| line.trim_start().starts_with("#include")));
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim_start().starts_with("#include"))
+        );
         assert_eq!(source.matches("struct Rows16 {").count(), 1);
         assert_eq!(source.matches("#define ELEMENT_OF(prefix)").count(), 1);
         assert!(source.ends_with("\nBODY\n"));

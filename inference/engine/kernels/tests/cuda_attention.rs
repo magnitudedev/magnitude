@@ -40,7 +40,7 @@ fn cuda_prefill(
     attention_prefill::native_for_device_with(
         device,
         attention_prefill::Elements { A: Element::bf16() },
-        &qwen_form(statics(geometry), geometry)
+        &visible_prefill(device, qwen_form(statics(geometry), geometry))
             .with_param("WARPS", warps)
             .with_param("SPLIT_GROUPS", split_groups)
             .with_param("STAGES", 2)

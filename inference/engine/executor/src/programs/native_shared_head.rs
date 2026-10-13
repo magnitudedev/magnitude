@@ -20,7 +20,7 @@ use crate::operators::block::{
     BlockControlPorts, BlockLane, BlockStatePorts, BlockSublayers, CheckedFeedForwardEntries,
     CheckedMixerEntries, FeedForwardEntries, MixerEntries,
 };
-use crate::operators::{SharedHead, paired_block};
+use crate::operators::{InputForm, SharedHead, paired_block};
 use crate::{
     DeviceError, GraphOutputTensor, HeadLaunchCore, InvariantError, ModelLoadPlan,
     NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentWeight,
@@ -334,7 +334,13 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         })
         .transpose()?;
 
-    let embedding_dims = [("M", slots), ("V", table.rows), ("D", hidden), ("R", 0)];
+    let embedding_dims = [
+        ("M", slots),
+        ("V", table.rows),
+        ("D", hidden),
+        ("R", 0),
+        ("F", 1),
+    ];
     let join_dims = [("M", slots), ("D", hidden), ("T", 2)];
     let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
     let conditioning = graph.input_for(entries.join, "residual", &join_dims)?;
@@ -379,7 +385,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     ("M", slots),
                     ("V", table.rows),
                     ("D", hidden),
-                    ("R", directory.entries),
+                    ("R", directory.shape[0]),
+                    ("F", directory.shape[1]),
                 ],
                 embedding_rows::WorkflowArgs {
                     table: (&table.table).into(),
@@ -399,7 +406,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 residual: (&embedded).into(),
                 index: halves[0].port().tensor().into(),
                 taps: joined.tensor_mut().into(),
-            },        )?;
+            },
+        )?;
         graph.enqueue(
             entries.join,
             &join_dims,
@@ -410,7 +418,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 },
                 index: halves[1].port().tensor().into(),
                 taps: joined.tensor_mut().into(),
-            },        )?;
+            },
+        )?;
         let mut residual = graph
             .enqueue(
                 entries.input,
@@ -424,7 +433,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     source: joined.tensor().into(),
                     weight: (&input.weight).into(),
                     weight_scale: (&input.scale).into(),
-                },            )?
+                },
+            )?
             .value;
         let mut blocks = Vec::with_capacity(geometry.sources.len());
         for (index, &source) in geometry.sources.iter().enumerate() {
@@ -444,25 +454,29 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 rows: slots,
                 segments: geometry.segments,
                 slots,
-                // The head's classes list no history row tiles.
+                // The head's classes list no history row tiles and score
+                // no selected read.
                 listed: 0,
+                scored: false,
                 output_scales: (entries.scales)(index)?,
             };
             let (mixed, state, controls) = sublayers.mixer(
                 &mut graph,
                 (entries.mixer)(index)?,
+                None,
                 &residual,
                 &mut weights,
                 &mut constants,
             )?;
             let (
-                BlockStatePorts::Attention(planes),
+                BlockStatePorts::Attention(planes, None),
                 BlockControlPorts::Attention {
                     coordinates,
                     visible,
                     fresh,
                     destinations,
                     history_tiles: None,
+                    indexer: None,
                 },
             ) = (state, controls)
             else {
@@ -471,6 +485,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             residual = sublayers.feed_forward(
                 &mut graph,
                 (entries.feed_forward)(index)?,
+                None,
                 mixed,
                 &mut weights,
                 &mut constants,
@@ -486,13 +501,20 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
         let features = graph
             .enqueue(
                 entries.features,
-                &[("M", slots), ("O", slots), ("D", width)],
+                &[
+                    ("M", slots),
+                    ("O", slots),
+                    ("D", width),
+                    ("PT", 1),
+                    ("NM", width),
+                ],
                 readout_features_rows::WorkflowArgs {
-                    hidden: (&residual).into(),
+                    hidden: (&residual.reshape(&[slots, 1, width])).into(),
                     norm: (&output_norm).into(),
                     out_rows: out_rows.port().tensor().into(),
                     epsilon,
-                },            )?
+                },
+            )?
             .value;
         let mut projection_selection = None;
         let mut logits = if let Some(policy) = &geometry.plan.clustered {
@@ -542,7 +564,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     logits: (&cluster_scores).into(),
                     candidates: (&mut candidates).into(),
                     unary: (&mut unary).into(),
-                },            )?;
+                },
+            )?;
             let per_cluster = vocabulary / policy.clusters;
             let columns = policy.selected_clusters * per_cluster;
             let token_rows = graph
@@ -562,7 +585,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                             .tensor()
                             .reshape(&[policy.clusters, per_cluster]))
                             .into(),
-                    },                )?
+                    },
+                )?
                 .value;
             let (compact, _) = readout::project_readout(
                 &mut graph,
@@ -594,7 +618,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     scores: (&compact).into(),
                     token_rows: (&token_rows).into(),
                     logits: (&mut logits).into(),
-                },            )?;
+                },
+            )?;
             logits
         } else {
             let (logits, inputs) = readout::project_readout(
@@ -611,6 +636,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                     readout::ProjectionPorts::Progressive { .. } => readout::ReadoutInput::RawRms {
                         hidden: &residual,
                         norm: &output_norm,
+                        form: InputForm::SINGLE,
                         out_rows: out_rows.port().tensor(),
                         epsilon,
                     },
@@ -667,7 +693,8 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                             source: (&features).into(),
                             weight: (&chain.weight).into(),
                             weight_scale: (&chain.scale).into(),
-                        },                    )?
+                        },
+                    )?
                     .value,
             )
         } else {

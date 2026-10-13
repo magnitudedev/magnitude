@@ -287,7 +287,19 @@ pub struct Facts {
     pub host_visible_device_local_bytes: u64,
 }
 
+/// The largest host-visible device-local heap that is a small BAR window,
+/// which upload storage is not spent on.
+const SMALL_BAR_BYTES: u64 = 256 << 20;
+
 impl Facts {
+    /// Whether upload storage (host-written storage the device reads:
+    /// upload regions, host-shared tensors) is device-local memory: a
+    /// host-visible device-local heap larger than a small BAR window
+    /// (ReBAR/SAM, or unified memory). Else it is host RAM.
+    pub fn uploads_device_local(&self) -> bool {
+        self.host_visible_device_local_bytes > SMALL_BAR_BYTES
+    }
+
     pub fn is_gpu(&self) -> bool {
         matches!(
             self.device_type,

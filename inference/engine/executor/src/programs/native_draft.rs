@@ -22,7 +22,7 @@
 //! `k · slots + s`.
 
 use super::{DeviceSubmission, HeadProgram};
-use crate::operators::{self, Mixer};
+use crate::operators::{self, InputForm, Join, Mixer, SublayerInput};
 use crate::{
     DeviceError, DraftProgramPlan, GraphOutputTensor, HeadLaunchCore, InvariantError,
     ModelLoadPlan, NativeGraphOutputLease, NativeGraphWorkspaceLease, ResidentHead, ResidentOutput,
@@ -52,7 +52,8 @@ use magnitude_family_contracts::{
 };
 use magnitude_kernels::{
     dense_output, draft_convolve_input, draft_convolve_residual, draft_gated_rows, draft_path_step,
-    draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows, shape_rows, widen_rows,
+    draft_top_k, embedding_rows, project_rows, readout_features_rows, sample_rows, shape_rows,
+    widen_rows,
 };
 use magnitude_state::LayerRef;
 use seismic::{
@@ -712,17 +713,17 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         let shape =
             operators::attention::shape(hidden, attention).map_err(|error| error.to_string())?;
         let scope = draft_sublayer(index, 0)?;
-        let injection =
-            attention_weights(
-                &shape,
-                attention,
-                class.slots > 0,
-                false,
-                |kind| match kind {
-                    WeightKind::InputNorm => Ok(fusion_norm.clone()),
-                    kind => weight(&mut graph, load, scope, kind, &mut weights),
-                },
-            )?;
+        let injection = attention_weights(
+            &shape,
+            attention,
+            InputForm::SINGLE,
+            class.slots > 0,
+            false,
+            |kind| match kind {
+                WeightKind::InputNorm => Ok(fusion_norm.clone()),
+                kind => weight(&mut graph, load, scope, kind, &mut weights),
+            },
+        )?;
         layer_weights.push(Some((attention, shape, injection)));
     }
     fn attention_block<'o>(
@@ -751,6 +752,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             activation,
             inject_only,
             causal_cache: false,
+            selection: None,
         }
     }
 
@@ -772,14 +774,19 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 &[("M", class.entry_rows), ("D", hidden)],
                 widen_rows::WorkflowArgs {
                     rows: features.tensor().into(),
-                },            )?
+                },
+            )?
             .value;
         (DraftConditioning::Features(features), widened)
     } else {
         let rows = graph.input_for(
             entries.layers[first].injection.project,
             "hidden",
-            &first_shape.key_value_dimensions(class.entry_rows),
+            &[
+                first_shape.key_value_dimensions(class.entry_rows).as_slice(),
+                &InputForm::SINGLE.dimensions(first_shape.hidden),
+            ]
+            .concat(),
         )?;
         let tensor = rows.tensor().clone();
         (DraftConditioning::Rows(rows), tensor)
@@ -791,12 +798,15 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             injection.push(None);
             continue;
         };
+        let join = Join::single(Some("M"));
         let (mixed, state, controls) = attention_graph::attention(
             &mut graph,
             layer.injection,
             weights_of,
             &mut constants,
+            SublayerInput::single(&conditioning_rows),
             &conditioning_rows,
+            &join,
             attention_block(
                 operator,
                 *shape,
@@ -856,7 +866,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         ("M", rows),
         ("V", table.rows),
         ("D", hidden),
-        ("R", direct.entries),
+        ("R", direct.shape[0]),
+        ("F", direct.shape[1]),
     ];
     let tokens = graph.input_for(entries.embedding, "tokens", &embedding_dims)?;
     let mut residual = graph
@@ -870,7 +881,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 scale: draft.embedding_scale as f32,
                 normalize: 0,
                 epsilon,
-            },        )?
+            },
+        )?
         .r1;
     let mut layers = Vec::with_capacity(draft.blocks.len());
     // DFlash2's unfused layers read their normed rows through the identity
@@ -936,7 +948,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             &mut weights,
         )?;
         let block_weights = AttentionWeights {
-            input_norm,
+            input_norm: Some(input_norm),
             query: injection_weights.query.clone(),
             gate: injection_weights.gate.clone(),
             key: injection_weights.key.clone(),
@@ -945,13 +957,17 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
             key_norm: injection_weights.key_norm.clone(),
             output: injection_weights.output.clone(),
             post_norm: None,
+            indexer: None,
         };
+        let join = Join::single(Some("M"));
         let (mixed, state, controls) = attention_graph::attention(
             &mut graph,
             layer.attention,
             &block_weights,
             &mut constants,
+            SublayerInput::single(&residual),
             &residual,
+            &join,
             attention_block(
                 operator,
                 *shape,
@@ -1038,6 +1054,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                     ("V", readout_vocabulary),
                     ("D", hidden),
                     ("WS", extent),
+                    ("PT", 1),
+                    ("NM", hidden),
                 ],
             )?;
             (
@@ -1060,6 +1078,7 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
         readout::ReadoutInput::RawRms {
             hidden: &residual,
             norm: &output_norm,
+            form: InputForm::SINGLE,
             out_rows: head_rows.tensor(),
             epsilon,
         },
@@ -1125,7 +1144,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                 ("M", slots),
                 ("V", vocabulary),
                 ("D", rank),
-                ("R", direct.entries),
+                ("R", direct.shape[0]),
+                ("F", direct.shape[1]),
             ];
             let anchors = graph.input_for(chain.embedding, "tokens", &memory_dims)?;
             for step in 0..proposals {
@@ -1152,7 +1172,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             scale: 1.0,
                             normalize: 0,
                             epsilon,
-                        },                    )?
+                        },
+                    )?
                     .r0;
                 let absent_scale = absent(&mut graph, &mut constants, &mut absent_scale)?;
                 let mut biased = graph
@@ -1171,7 +1192,8 @@ fn draft_graph<'a, G: GraphDraft + 'a>(
                             down_weight: (&markov_projection).into(),
                             out_rows: rows_of_step.port().tensor().into(),
                             down_scale: (&absent_scale).into(),
-                        },                    )?
+                        },
+                    )?
                     .value;
                 let mut step_result = result
                     .tensor()
@@ -1338,7 +1360,8 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                     source,
                     weight: weight.into(),
                     weight_scale: absent_scale.into(),
-                },            )
+                },
+            )
             .map(|projected| projected.value)
     };
     // One sublayer's prologue: its normed rows, their coefficients and the
@@ -1362,13 +1385,20 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
         let normed = graph
             .enqueue(
                 norm_entry,
-                &[("M", rows), ("O", rows), ("D", hidden)],
+                &[
+                    ("M", rows),
+                    ("O", rows),
+                    ("D", hidden),
+                    ("PT", 1),
+                    ("NM", hidden),
+                ],
                 readout_features_rows::WorkflowArgs {
-                    hidden: residual.into(),
+                    hidden: (&residual.reshape(&[rows, 1, hidden])).into(),
                     norm: (&norm).into(),
                     out_rows: layer.rows_map.into(),
                     epsilon,
-                },            )?
+                },
+            )?
             .value;
         let dynamic = project(
             graph,
@@ -1387,7 +1417,8 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                     dynamic: (&dynamic).into(),
                     base: (&base).into(),
                     block,
-                },            )?
+                },
+            )?
             .value;
         Ok::<_, GraphError>((convolved, dynamic, base))
     };
@@ -1406,7 +1437,8 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
                         dynamic: dynamic.into(),
                         base: base.into(),
                         block,
-                    },                )
+                    },
+                )
                 .map(|finished| finished.value)
         };
 
@@ -1475,7 +1507,10 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             activation: layer.activation,
             inject_only: false,
             causal_cache: false,
+            selection: None,
         },
+        None,
+        Some("M"),
     )?;
     let attended = attended.ok_or("draft block attention result is absent")?;
     let output = project(
@@ -1526,7 +1561,8 @@ fn dflash2_layer<'a, G: GraphDraft + 'a>(
             draft_gated_rows::WorkflowArgs {
                 gate: (&gate).into(),
                 up: (&up).into(),
-            },        )?
+            },
+        )?
         .value;
     let down = project(
         graph,
@@ -1624,19 +1660,27 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
             logits: path.logits.into(),
             candidates: candidates.tensor_mut().into(),
             unary: unary.tensor_mut().into(),
-        },    )?;
+        },
+    )?;
     let candidates = candidates.tensor().clone();
     let unary = unary.tensor().clone();
     let features = graph
         .enqueue(
             entries.features,
-            &[("M", path.rows), ("O", outputs), ("D", hidden)],
+            &[
+                ("M", path.rows),
+                ("O", outputs),
+                ("D", hidden),
+                ("PT", 1),
+                ("NM", hidden),
+            ],
             readout_features_rows::WorkflowArgs {
-                hidden: path.residual.into(),
+                hidden: (&path.residual.reshape(&[path.rows, 1, hidden])).into(),
                 norm: path.output_norm.into(),
                 out_rows: path.head_rows.into(),
                 epsilon: path.epsilon,
-            },        )?
+            },
+        )?
         .value;
     let projected = graph
         .enqueue(
@@ -1646,7 +1690,8 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                 source: (&features).into(),
                 weight: (&selector_hidden).into(),
                 weight_scale: absent_scale.into(),
-            },        )?
+            },
+        )?
         .value;
     let successors = graph
         .enqueue(
@@ -1655,7 +1700,8 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                 ("M", outputs * top_k),
                 ("V", vocabulary),
                 ("D", rank),
-                ("R", path.direct.entries),
+                ("R", path.direct.shape[0]),
+                ("F", path.direct.shape[1]),
             ],
             embedding_rows::WorkflowArgs {
                 table: (&successor_codes).into(),
@@ -1664,13 +1710,15 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                 scale: 1.0,
                 normalize: 0,
                 epsilon: path.epsilon,
-            },        )?
+            },
+        )?
         .r0;
     let code_dims = [
         ("M", slots),
         ("V", vocabulary),
         ("D", rank),
-        ("R", path.direct.entries),
+        ("R", path.direct.shape[0]),
+        ("F", path.direct.shape[1]),
     ];
     let anchors = graph.input_for(entries.predecessor, "tokens", &code_dims)?;
     for step in 0..path.proposals {
@@ -1690,7 +1738,8 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                     scale: 1.0,
                     normalize: 0,
                     epsilon: path.epsilon,
-                },            )?
+                },
+            )?
             .r0;
         let mut selection = path.result.slice_leading(first, last);
         graph.enqueue(
@@ -1703,7 +1752,8 @@ fn dflash2_path<'a, G: GraphDraft + 'a>(
                 predecessor: (&predecessors).into(),
                 successor: (&successors.slice_leading(first * top_k, last * top_k)).into(),
                 selection: (&mut selection).into(),
-            },        )?;
+            },
+        )?;
     }
     Ok(anchors)
 }

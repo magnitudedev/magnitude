@@ -75,14 +75,7 @@ macro_rules! generated_entry {
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
             let $this = self;
-            $module::native_tune_with(
-                device,
-                $elements,
-                statics,
-                points,
-                validation,
-                strategy,
-            )
+            $module::native_tune_with(device, $elements, statics, points, validation, strategy)
         }
 
         fn open(
@@ -93,10 +86,7 @@ macro_rules! generated_entry {
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             let $this = self;
             Ok(Box::new($module::native_search_with(
-                device,
-                $elements,
-                statics,
-                validation,
+                device, $elements, statics, validation,
             )?))
         }
 
@@ -124,13 +114,7 @@ macro_rules! generated_entry {
             validation: seismic::NumericalRequirement,
             strategy: seismic::Strategy,
         ) -> Result<seismic::TuningResult, seismic::TuneError> {
-            $module::native_tune(
-                device,
-                statics,
-                points,
-                validation,
-                strategy,
-            )
+            $module::native_tune(device, statics, points, validation, strategy)
         }
 
         fn open(
@@ -140,9 +124,7 @@ macro_rules! generated_entry {
             validation: seismic::NumericalRequirement,
         ) -> Result<Box<dyn super::EntrySearch<Self::Entry>>, seismic::TuneError> {
             Ok(Box::new($module::native_search(
-                device,
-                statics,
-                validation,
+                device, statics, validation,
             )?))
         }
 
@@ -176,6 +158,7 @@ pub(crate) mod recurrent;
 pub(crate) mod routed;
 pub(crate) mod short_conv;
 pub(crate) mod state_space;
+pub(crate) mod streams;
 #[cfg(feature = "tuning-survey")]
 pub mod survey;
 mod trace;
@@ -183,10 +166,10 @@ mod weights;
 mod workload;
 
 pub use precision::{NumericalProfile, ResolvedNumericalProfile};
-pub use record::Receipt;
-use record::StoredChoice;
 #[cfg(test)]
 use record::ChosenEvidence;
+pub use record::Receipt;
+use record::StoredChoice;
 pub use trace::{TRACE_SCHEMA, TracedWork, TuningTrace};
 pub use weights::{TuningWeightSource, ZeroTuningWeights};
 pub(crate) use weights::{TuningWeights, weight_plan};
@@ -195,14 +178,18 @@ use super::CatalogFailure;
 use super::specialization::{UntunedEntries, UntunedFormation};
 use crate::ModelLoadPlan;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use crate::operators::InputForm;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
-use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    InputNorm, ModelDefinition, Operator, OutputForm, ResidualForm, Sublayer, WeightKind,
+    WeightScope,
+};
 #[cfg(feature = "tuning-survey")]
 use seismic::Strategy;
 use seismic::{
     Configuration, DType, Device, Element, NativeImplementation, NativeSpecialization,
-    ParameterValues, SearchSettings, SearchStop, Standing, Tensor, TensorError,
-    TuneError, TuningInitializer, TuningResult, TuningTime,
+    ParameterValues, SearchSettings, SearchStop, Standing, Tensor, TensorError, TuneError,
+    TuningInitializer, TuningResult, TuningTime,
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
@@ -554,7 +541,10 @@ fn apply_invocation_counts(
     let declared = points
         .iter()
         .fold(BTreeMap::<u64, Vec<u64>>::new(), |mut declared, point| {
-            declared.entry(point.rows).or_default().push(point.sequences);
+            declared
+                .entry(point.rows)
+                .or_default()
+                .push(point.sequences);
             declared
         });
     let mut supplied = BTreeMap::<(u64, u64), f64>::new();
@@ -631,7 +621,8 @@ pub(crate) fn history_placement(
             extent: context,
         });
     }
-    let layout = magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
+    let layout =
+        magnitude_state::ModelStateLayout::derive(&model.definition.decoder, &[], codec, 0)?;
     let geometry = layout
         .target_history
         .iter()
@@ -1142,10 +1133,7 @@ pub enum TuningEvent {
     /// Milliseconds of tuning time spent so far, of the tuning budget.
     /// Reported when the search walk begins and after each unit it
     /// searches; nothing is reported when every unit is stored.
-    Progress {
-        completed: usize,
-        total: usize,
-    },
+    Progress { completed: usize, total: usize },
     /// A unit's optional work starts. How many configurations it can reach
     /// is reported with its result ([`SearchProgress`]): counting the
     /// declared domain here would enumerate it.
@@ -1520,7 +1508,10 @@ impl TuningMemory {
     /// What tuning holds now, as admission counts it: Seismic's charges on
     /// the device since tuning began.
     fn held(&self, device: &Device) -> u64 {
-        device.memory_usage().charged.saturating_sub(self.began_bytes)
+        device
+            .memory_usage()
+            .charged
+            .saturating_sub(self.began_bytes)
     }
 
     /// What tuning holds now in all: what the process's footprint has
@@ -1648,11 +1639,9 @@ impl TuningMemory {
         let held_within = within
             .saturating_sub(self.began_bytes)
             .max(self.held(device));
-        let grown = footprint
-            .zip(self.process_began_bytes)
-            .map(|(now, began)| {
-                now.saturating_sub(began) + if self.device_separate { held_within } else { 0 }
-            });
+        let grown = footprint.zip(self.process_began_bytes).map(|(now, began)| {
+            now.saturating_sub(began) + if self.device_separate { held_within } else { 0 }
+        });
         self.footprint_peak_bytes = self.footprint_peak_bytes.max(grown);
         self.footprint_margin_bytes = self
             .footprint_ceiling_bytes
@@ -1700,7 +1689,11 @@ impl TuningMemory {
 
     fn piece(&mut self, unit: String, stage: seismic::Stage, before: u64, after: u64) {
         let held = after as i64 - before as i64;
-        match self.held_by_class.iter_mut().find(|(class, _)| *class == stage) {
+        match self
+            .held_by_class
+            .iter_mut()
+            .find(|(class, _)| *class == stage)
+        {
             Some((_, sum)) => *sum += held,
             None => self.held_by_class.push((stage, held)),
         }
@@ -2005,6 +1998,75 @@ impl ModelInputs<'_> {
             .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
     }
 
+    /// The sublayer and residual form named by the first tuning scope.
+    fn sublayer(&self, scopes: &[WeightScope]) -> Result<Option<(&Sublayer, &ResidualForm)>, String> {
+        let scope = *scopes.first().ok_or("a tuning case needs at least one layer")?;
+        let (block, index, residual) = match scope {
+            WeightScope::TargetSublayer(index) => (self.definition.decoder.blocks.get(index.block as usize), index, &self.definition.decoder.residual),
+            WeightScope::HeadSublayer(index) => {
+                let (head, block) = self.definition.head.as_ref().and_then(|head| head.blocks.iter().flat_map(|head| head.blocks.iter().map(move |block| (head, block))).nth(index.block as usize)).ok_or("head tuning scope has no block")?;
+                (Some(block), index, &head.residual)
+            }
+            _ => return Ok(None),
+        };
+        block.and_then(|block| block.sublayers.get(index.sublayer as usize)).map(|sublayer| Some((sublayer, residual))).ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
+    }
+
+    fn streams(residual: &ResidualForm) -> Result<u64, String> {
+        match residual {
+            ResidualForm::HyperConnections(form) => Ok(form.streams),
+            ResidualForm::Single => Err("the sublayer has a single residual stream".into()),
+        }
+    }
+
+    /// The residual join of the sublayers `scopes` name (`scatter`): its
+    /// streams `SN` and inject extent `IN`, (S, S) for a scatter into the
+    /// hyper-connection streams, else (1, 0).
+    pub fn join(&self, scopes: &[WeightScope]) -> Result<(u64, u64), String> {
+        match self.sublayer(scopes)? {
+            Some((Sublayer {
+                output: OutputForm::Scatter,
+                ..
+            }, residual)) => {
+                let streams = Self::streams(residual)?;
+                Ok((streams, streams))
+            }
+            _ => Ok((1, 0)),
+        }
+    }
+
+    /// The input form of the sublayers `scopes` name (`form_input`): its
+    /// parts `PT` and norm extent `NM`, a mix site's S partials without a
+    /// norm, else one row normalized by a norm of `width`.
+    pub fn input_form(&self, scopes: &[WeightScope], width: u64) -> Result<(u64, u64), String> {
+        match self.sublayer(scopes)? {
+            Some((Sublayer {
+                input: InputNorm::HyperConnectionMix(_),
+                ..
+            }, residual)) => Ok((Self::streams(residual)?, 0)),
+            _ => Ok((1, width)),
+        }
+    }
+
+    /// The input form of a readout normalized by the norm of `scope`: the
+    /// decoder exit site's S partials without a norm, or the final row
+    /// normalized by a norm of `width`.
+    pub fn readout_form(&self, scope: WeightScope, width: u64) -> Result<(u64, u64), String> {
+        let form = match scope {
+            WeightScope::Target => InputForm::exit(&self.definition.decoder),
+            WeightScope::HeadBlock(index) => {
+                let block = self.definition.head.as_ref().and_then(|head| head.blocks.get(index as usize)).ok_or("head readout scope is absent")?;
+                match &block.residual {
+                    magnitude_family_contracts::ResidualForm::HyperConnections(form) => InputForm { parts: form.streams, normalized: false },
+                    _ => InputForm::SINGLE,
+                }
+            }
+            _ => InputForm::SINGLE,
+        };
+        let [(_, parts), (_, norm)] = form.dimensions(width);
+        Ok((parts, norm))
+    }
+
     /// The planned shape of one weight role.
     pub fn weight_shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
         Ok(weights::weight_plan(self.load, scope, kind)?.shape.clone())
@@ -2071,6 +2133,23 @@ impl TuningInputs<'_, '_> {
     /// resident representation and layout.
     pub fn weight(&mut self, scope: WeightScope, kind: WeightKind) -> Result<Tensor, String> {
         self.weights.weight(scope, kind)
+    }
+
+    /// A consumer entry's norm port of `extent` (`NM`): the resident norm
+    /// `kind`, or an empty `element` port when the input is a mix site's
+    /// partials.
+    pub fn input_norm(
+        &mut self,
+        scope: WeightScope,
+        kind: WeightKind,
+        element: Element,
+        extent: u64,
+    ) -> Result<Tensor, String> {
+        if extent == 0 {
+            self.scratch(element, &[0])
+        } else {
+            self.weight(scope, kind)
+        }
     }
 
     /// Retain a requested shared readout operand by physical storage identity.
@@ -2749,9 +2828,7 @@ impl<'a> allocation::Unit for Box<dyn SearchedUnit<'a> + 'a> {
                 .zip(seismic::ProcessMemory::footprint_peak())
                 .filter(|(before, peak)| peak > before)
                 .map_or(after, |(_, peak)| peak.max(after));
-            tuner
-                .memory
-                .host_piece(&unit, most.saturating_sub(before));
+            tuner.memory.host_piece(&unit, most.saturating_sub(before));
         }
         tuner.memory.piece(
             unit,
@@ -3478,7 +3555,9 @@ impl<T: EntryTuning> CanonicalUnit for PreparedUnit<T> {
 
     fn grounded(&mut self, grounded: Option<seismic::Grounded>) -> Result<Duration, TuneError> {
         let began = Instant::now();
-        let formed = grounded.as_ref().map_or(Duration::ZERO, seismic::Grounded::elapsed);
+        let formed = grounded
+            .as_ref()
+            .map_or(Duration::ZERO, seismic::Grounded::elapsed);
         self.search.grounded(grounded)?;
         self.mandatory = formed + began.elapsed();
         Ok(self.search.longest_operation())
@@ -3495,11 +3574,19 @@ impl<T: EntryTuning> CanonicalUnit for PreparedUnit<T> {
 
 /// What one native implementation on a device is a function of: its entry,
 /// the entry's element bindings and its static values.
-type ImplementationKey = (&'static str, Vec<(&'static str, Element)>, NativeSpecialization);
+type ImplementationKey = (
+    &'static str,
+    Vec<(&'static str, Element)>,
+    NativeSpecialization,
+);
 
 /// A unit's slot in the kernel cache: the cache, the unit's key, and the
 /// valid choice stored under it with its evidence.
-type StoredSlot<'c> = (&'c KernelCache, TuningCacheKey, Option<(StoredChoice, Receipt)>);
+type StoredSlot<'c> = (
+    &'c KernelCache,
+    TuningCacheKey,
+    Option<(StoredChoice, Receipt)>,
+);
 
 /// Resolves every native entry's specialization for the opened device:
 /// static values, tuned parameters, and missing implementations. A first
@@ -3742,7 +3829,9 @@ impl<'a> Tuner<'a> {
                         .compile_host_bytes
                         .saturating_mul(seismic::Forming::threads(&forming) as u64)
                 });
-                unit.host_footprint(self).unwrap_or(0).saturating_add(compile)
+                unit.host_footprint(self)
+                    .unwrap_or(0)
+                    .saturating_add(compile)
             })
             .min();
         let domains = [
@@ -3988,28 +4077,25 @@ impl<'a> Tuner<'a> {
                     .map_err(|error| unit_failure(key, error))
             })
             .chain(
-                untuned
-                    .into_formations()
-                    .into_iter()
-                    .map(|formation| Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))),
+                untuned.into_formations().into_iter().map(|formation| {
+                    Ok(std::sync::Mutex::new(Some(Mandatory::Untuned(formation))))
+                }),
             )
             .collect::<Result<Vec<_>, _>>()?;
         let workers = self.workers();
-        let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| {
-            match compile
-                .lock()
-                .expect("a mandatory compile is taken once")
-                .take()
-                .expect("a mandatory compile is formed once")
-            {
-                Mandatory::Canonical(grounding) => {
-                    MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
-                }
-                Mandatory::Untuned(formation) => {
-                    let began = Instant::now();
-                    let formed = formation();
-                    MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
-                }
+        let ground = |compile: &std::sync::Mutex<Option<Mandatory<'a>>>| match compile
+            .lock()
+            .expect("a mandatory compile is taken once")
+            .take()
+            .expect("a mandatory compile is formed once")
+        {
+            Mandatory::Canonical(grounding) => {
+                MandatoryFormed::Canonical(grounding.map(seismic::Grounding::run))
+            }
+            Mandatory::Untuned(formation) => {
+                let began = Instant::now();
+                let formed = formation();
+                MandatoryFormed::Untuned(formed.map(|()| began.elapsed()))
             }
         };
         // What the peak of the process's footprint rose by over compiles
@@ -4255,11 +4341,16 @@ impl<'a> Tuner<'a> {
             .max(allocation::Workers::compile_host(&threads));
         self.memory
             .mispriced
-            .extend(threads.mispriced().iter().map(|(priced, added)| Mispricing {
-                kind: "compile".into(),
-                priced_bytes: *priced,
-                added_bytes: *added,
-            }));
+            .extend(
+                threads
+                    .mispriced()
+                    .iter()
+                    .map(|(priced, added)| Mispricing {
+                        kind: "compile".into(),
+                        priced_bytes: *priced,
+                        added_bytes: *added,
+                    }),
+            );
         drop(threads);
         self.memory.no_room = self.no_room(&units, &report);
         self.memory.ended_bytes = self.device.memory_usage().charged;
@@ -4269,9 +4360,7 @@ impl<'a> Tuner<'a> {
         // Every unit reports its record as the allocator left it published,
         // whatever became of the work: each has served a published legal
         // choice throughout.
-        let reported = units
-            .iter_mut()
-            .try_for_each(|unit| unit.finish(&mut self));
+        let reported = units.iter_mut().try_for_each(|unit| unit.finish(&mut self));
         let refused = report
             .refused
             .iter()

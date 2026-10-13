@@ -697,3 +697,168 @@ fn a_single_token_domain_is_the_one_domain_store() {
     assert_eq!(first.history_start(TOKEN), 0);
     assert_eq!(store.committed_bytes(), device.memory_usage().charged);
 }
+
+/// A Token domain and one selected-attention indexer of blocks of four: its
+/// raw keys in a Window(3) domain and its block keys in a Block(4) domain.
+const RAW: HistoryDomainId = HistoryDomainId(1);
+const BLOCKS: HistoryDomainId = HistoryDomainId(2);
+
+fn indexed_store(device: Rc<Device>, context: usize, max_advance: usize) -> StoreBindings {
+    let keys = |coordinates| {
+        ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 4, coordinates).unwrap()
+    };
+    StateStore::new(
+        device,
+        context,
+        max_advance,
+        vec![
+            HistoryDomainPlan {
+                layout: HistoryDomainLayout::Token {
+                    components: vec![component(0, 1)],
+                },
+                logical_rows: context,
+            },
+            HistoryDomainPlan {
+                layout: HistoryDomainLayout::Window {
+                    rows: 3,
+                    components: vec![keys(true)],
+                },
+                logical_rows: context,
+            },
+            HistoryDomainPlan {
+                layout: HistoryDomainLayout::Block {
+                    rate: 4,
+                    components: vec![keys(false)],
+                },
+                logical_rows: context / 4,
+            },
+        ],
+        vec![],
+        banks(),
+    )
+    .unwrap()
+    .1
+}
+
+#[test]
+fn block_histories_hold_the_complete_blocks() {
+    let Some(device) = cpu_device() else { return };
+    let store = indexed_store(device, 64, 16);
+    // The indexer's domains follow the one attention reads; a launch row
+    // reads each.
+    assert_eq!(store.history_reads(), 3);
+    assert_eq!(store.indexer_domains(0), Some((RAW, BLOCKS)));
+    // Raw keys carry their coordinates; block keys do not.
+    assert_eq!(store.history_components(RAW)[0].planes().len(), 2);
+    assert_eq!(store.history_components(BLOCKS)[0].planes().len(), 1);
+    assert_eq!(store.indexer_domains(1), None);
+    // Ten rows from 0 complete blocks 0 and 1: two block rows, the
+    // advance's destinations in block order.
+    let advance = OwnedStateAdvance::begin(store.create().unwrap(), 10).ok().unwrap();
+    assert_eq!(advance.bindings().destinations[BLOCKS.0].len(), 2);
+    assert_eq!(advance.bindings().destinations[RAW.0].len(), 10);
+    let OwnedAdvanceResolution::Committed(state) = advance.commit_all().ok().unwrap() else {
+        panic!("an advance commits");
+    };
+    assert_eq!(rows_of(&state.history_ranges(BLOCKS)).len(), 2);
+    assert_eq!(state.history_start(BLOCKS), 0);
+    // The raw keys of the incomplete block are among the last three rows.
+    assert_eq!(state.history_start(RAW), 7);
+    assert_eq!(store.occupied_rows(BLOCKS), 2);
+    // Six more rows from 10 complete blocks 2 and 3 (positions 11 and 15).
+    let state = commit(state, 6);
+    assert_eq!(rows_of(&state.history_ranges(BLOCKS)).len(), 4);
+    assert_eq!(store.occupied_rows(BLOCKS), 4);
+    assert_eq!(store.occupied_rows(RAW), 3);
+}
+
+#[test]
+fn rollback_keeps_the_blocks_of_the_accepted_prefix() {
+    let Some(device) = cpu_device() else { return };
+    let store = indexed_store(device, 64, 16);
+    let state = commit(store.create().unwrap(), 6);
+    let before = state.history_ranges(BLOCKS);
+    assert_eq!(rows_of(&before).len(), 1);
+    // A verification of eight rows from 6 would complete blocks 1 and 2
+    // (positions 7 and 11); accepting three rows (positions 6..9) keeps
+    // block 1 only.
+    let advance = OwnedStateAdvance::begin(state, 8).ok().unwrap();
+    let completed = advance.bindings().destinations[BLOCKS.0].clone();
+    assert_eq!(completed.len(), 2);
+    let OwnedAdvanceResolution::Committed(state) = advance.commit(3).ok().unwrap() else {
+        panic!("a prefix commits");
+    };
+    assert_eq!(
+        rows_of(&state.history_ranges(BLOCKS)),
+        rows_of(&before).into_iter().chain([completed[0]]).collect::<Vec<_>>()
+    );
+    assert_eq!(store.occupied_rows(BLOCKS), 2);
+    // Accepting one row (position 6) completes no block.
+    let advance = OwnedStateAdvance::begin(state, 4).ok().unwrap();
+    assert_eq!(advance.bindings().destinations[BLOCKS.0].len(), 1);
+    let OwnedAdvanceResolution::Committed(state) = advance.commit(1).ok().unwrap() else {
+        panic!("a prefix commits");
+    };
+    assert_eq!(state.position(), 10);
+    assert_eq!(rows_of(&state.history_ranges(BLOCKS)).len(), 2);
+    assert_eq!(store.occupied_rows(BLOCKS), 2);
+}
+
+#[test]
+fn checkpoints_and_successors_share_the_block_rows() {
+    let Some(device) = cpu_device() else { return };
+    let store = indexed_store(device, 64, 16);
+    let state = commit(store.create().unwrap(), 9);
+    // A checkpoint at 9 references blocks [0, 2).
+    let checkpoint = state.checkpoint();
+    assert_eq!(checkpoint.history_ranges(BLOCKS), state.history_ranges(BLOCKS));
+    drop(state);
+    assert_eq!(store.occupied_rows(BLOCKS), 2);
+    // A fork resumed from it continues the same blocks: three rows from 9
+    // complete block 2 (position 11).
+    let fork = commit(checkpoint.fork(), 3);
+    assert_eq!(rows_of(&fork.history_ranges(BLOCKS))[..2], rows_of(&checkpoint.history_ranges(BLOCKS))[..]);
+    assert_eq!(store.occupied_rows(BLOCKS), 3);
+    // A successor of an in-flight advance reads the blocks its predecessor
+    // completes: one row from 12 after four from 12..
+    let first = OwnedStateAdvance::begin(fork, 4).ok().unwrap();
+    let completed = first.bindings().destinations[BLOCKS.0].clone();
+    assert_eq!(completed.len(), 1);
+    let second = first.successor(4).unwrap();
+    assert_eq!(rows_of(&second.history_ranges(BLOCKS)).last(), completed.last());
+    assert_eq!(second.bindings().destinations[BLOCKS.0].len(), 1);
+    let OwnedAdvanceResolution::Committed(state) = first.commit_all().ok().unwrap() else {
+        panic!("an advance commits");
+    };
+    let second = second.attach(state).ok().unwrap();
+    let OwnedAdvanceResolution::Committed(state) = second.commit_all().ok().unwrap() else {
+        panic!("an advance commits");
+    };
+    assert_eq!(state.position(), 20);
+    assert_eq!(rows_of(&state.history_ranges(BLOCKS)).len(), 5);
+    drop(checkpoint);
+    assert_eq!(store.occupied_rows(BLOCKS), 5);
+}
+
+#[test]
+fn indexer_domains_follow_the_attended_ones() {
+    let Some(device) = cpu_device() else { return };
+    let keys = ComponentDescriptor::indexer(LayerRef::Indexer(0), DType::F32, 4, false).unwrap();
+    let plans = vec![
+        HistoryDomainPlan {
+            layout: HistoryDomainLayout::Block {
+                rate: 4,
+                components: vec![keys],
+            },
+            logical_rows: 16,
+        },
+        HistoryDomainPlan {
+            layout: HistoryDomainLayout::Token {
+                components: vec![component(0, 1)],
+            },
+            logical_rows: 64,
+        },
+    ];
+    assert!(StateStore::new(device, 64, 16, plans, vec![], banks()).is_err());
+    assert!(ComponentDescriptor::indexer(LayerRef::Target(0), DType::F32, 4, true).is_err());
+}

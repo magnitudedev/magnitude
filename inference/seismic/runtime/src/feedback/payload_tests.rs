@@ -480,9 +480,9 @@ fn source_cast_payloads(backend: registry::BackendName, store: bool) {
             .unwrap(),
         );
         for bits in samples {
-            let expected = evaluate(&recipe, &[ReferenceScalar::from_bits(from, bits)])
+            let expected = evaluate(&recipe, &[ReferenceScalar::from_bits(from, bits.into())])
                 .unwrap()
-                .bits();
+                .bits() as u32;
             let mut args = EncodedArgs::new();
             args.push_scalar(scalar_argument(from, bits));
             if store {

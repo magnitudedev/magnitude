@@ -106,6 +106,7 @@ driver! {
     memset_d8_async: unsafe extern "system" fn(u64, c_uchar, usize, Handle) -> ResultCode => "cuMemsetD8Async",
     memset_d16_async: unsafe extern "system" fn(u64, u16, usize, Handle) -> ResultCode => "cuMemsetD16Async",
     memset_d32_async: unsafe extern "system" fn(u64, c_uint, usize, Handle) -> ResultCode => "cuMemsetD32Async",
+    memset_d2d32_async: unsafe extern "system" fn(u64, usize, c_uint, usize, usize, Handle) -> ResultCode => "cuMemsetD2D32Async",
     module_load: unsafe extern "system" fn(*mut Handle, *const c_void, c_uint, *mut c_int, *mut *mut c_void) -> ResultCode => "cuModuleLoadDataEx",
     module_unload: unsafe extern "system" fn(Handle) -> ResultCode => "cuModuleUnload",
     module_function: unsafe extern "system" fn(*mut Handle, Handle, *const c_char) -> ResultCode => "cuModuleGetFunction",
@@ -121,6 +122,10 @@ driver! {
     launch_cooperative: unsafe extern "system" fn(Handle, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, Handle, *mut *mut c_void, *mut *mut c_void) -> ResultCode => "cuLaunchCooperativeKernel",
     error_string: unsafe extern "system" fn(ResultCode, *mut *const c_char) -> ResultCode => "cuGetErrorString";
     optional {
+        // Driver API 11.7+: stream memory operations on a 32-bit word (a
+        // host gate's wait, a device signal to the host).
+        stream_wait_value_32: unsafe extern "system" fn(Handle, u64, u32, c_uint) -> ResultCode => "cuStreamWaitValue32_v2",
+        stream_write_value_32: unsafe extern "system" fn(Handle, u64, u32, c_uint) -> ResultCode => "cuStreamWriteValue32_v2",
         // Driver API 11.4+: identifies the exposed device, including a MIG
         // partition, rather than its parent GPU.
         device_uuid_v2: unsafe extern "system" fn(*mut [u8; 16], c_int) -> ResultCode => "cuDeviceGetUuid_v2",
@@ -1111,6 +1116,11 @@ impl HostMapped {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.host.add(offset), bytes.len());
         }
+    }
+
+    /// The allocation's first byte on the host.
+    pub fn host(&self) -> *mut u8 {
+        self.host
     }
 
     /// Precondition (this module's own): `offset + bytes.len() <= self.bytes`.

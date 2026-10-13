@@ -41,6 +41,8 @@ TEMPLATES = {  # locked catalog (or plan-candidate) GGUFs whose headers the synt
     "qwen35": ("unsloth/Qwen3.5-4B-MTP-GGUF", "86835bf9949e4d14d6860f7910b1340ad4f271a9", "Qwen3.5-4B-UD-Q4_K_XL.gguf"),
     "qwen35moe": ("unsloth/Qwen3.6-35B-A3B-MTP-GGUF", "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
                   "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"),
+    "qwen4exp": ("unsloth/Qwen3.8-Flash-Next-GGUF", "83cadfda58d30be06c110518208d1bb918b33f10",
+                 "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"),
     "nemotron-super": ("unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF", "036038fb30334a2d56a146c6f0d4871ab5edccbb",
                        "MXFP4_MOE/NVIDIA-Nemotron-3-Super-120B-A12B-MXFP4_MOE-00001-of-00003.gguf"),
 }
@@ -488,6 +490,124 @@ def qwen35(case: "Case") -> Synthetic:
     return s
 
 
+def ngram_constants(vocab: int, ngram_size: int, heads: int, base: int, seed: int, layer: int = 0):
+    """The n-gram hash constants the released qwen4_exp code derives from its config (mlx_vlm
+    `_build_layer_multipliers`, `_find_nth_prime_after`): per-distance odd multipliers, and per head a
+    prime row count and its first row."""
+    mask = (1 << 64) - 1
+
+    def splitmix(value: int) -> int:
+        value = (value + 0x9E3779B97F4A7C15) & mask
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+        return (value ^ (value >> 31)) & mask
+
+    half = max(1, ((1 << 63) - 1) // max(vocab, 1) // 2)
+    first = seed + 10007 * layer
+    multipliers = [2 * (splitmix((first + 0x9E3779B97F4A7C15 * (i + 1)) & mask) % half) + 1 for i in range(ngram_size)]
+
+    def prime(value: int) -> bool:
+        return value >= 2 and all(value % d for d in range(2, math.isqrt(value) + 1))
+
+    sizes, offsets, size = [], [], base - 1
+    for _ in range(layer * heads, (layer + 1) * heads):
+        size += 1
+        while not prime(size):
+            size += 1
+        offsets.append(sum(sizes))
+        sizes.append(size)
+    return multipliers, sizes, offsets
+
+
+def qwen4exp(case: "Case") -> Synthetic:
+    a = case.axes
+    s = Synthetic(template("qwen4exp"), case.name, case.vocab, case.seed)
+    hidden, heads, kv, dim, layers = a["hidden"], a["heads"], a["kv_heads"], a["head_dim"], a["layers"]
+    k_heads, v_heads, k_width, v_width, conv = a["k_heads"], a["v_heads"], a["k_width"], a["v_width"], a["conv"]
+    streams, rank, interval, block = a["streams"], a["rank"], a["interval"], a["block"]
+    wide = streams * hidden
+    ngram_size, per_order, width = a["ngram_size"], a["heads_per_ngram"], a["ngram_width"]
+    ngram_heads = (ngram_size - 1) * per_order
+    multipliers, sizes, offsets = ngram_constants(case.vocab, ngram_size, ngram_heads, a["ngram_base"], 1234)
+    rows = sizes[-1] + offsets[-1] + a["ngram_padding"]
+    attention_layers = [(layer + 1) % interval == 0 for layer in range(layers)]
+    keys = [("block_count", layers), ("context_length", 4096), ("embedding_length", hidden),
+            ("attention.head_count", heads), ("attention.head_count_kv", kv), ("rope.dimension_sections", [2, 1, 1, 0]),
+            ("rope.freq_base", 1e7), ("attention.layer_norm_rms_epsilon", 1e-6), ("attention.key_length", dim),
+            ("attention.value_length", dim), ("ssm.conv_kernel", conv), ("ssm.state_size", k_width),
+            ("ssm.group_count", k_heads), ("ssm.time_step_rank", v_heads), ("ssm.inner_size", v_heads * v_width),
+            ("full_attention_interval", interval), ("rope.dimension_count", dim // 4),
+            ("expert_count", a["experts"]), ("expert_used_count", a["experts_used"]),
+            ("expert_feed_forward_length", a["expert_ffn"]), ("expert_shared_feed_forward_length", a["shared_ffn"]),
+            ("hyper_connection.count", streams), ("hyper_connection.low_rank", rank),
+            ("attention.indexer.head_count", a["indexer_heads"]), ("attention.indexer.key_length", a["indexer_width"]),
+            ("attention.indexer.top_k", a["selected_tokens"]),
+            ("attention.compress_ratios", [block if attention else 0 for attention in attention_layers]),
+            ("ple.layers", [a["ngram_layer"]]), ("ple.ngram_size", ngram_size), ("ple.heads_per_ngram", per_order),
+            ("ple.conv_kernel", a["ngram_kernel"]), ("ple.eos_token_id", a["reset"]),
+            ("embedding_length_per_layer_input", width), ("ple.layer_multipliers", multipliers),
+            ("ple.head_offsets", offsets), ("ple.head_vocab_sizes", sizes), ("ple.image_token_id", case.vocab - 1)]
+    for key, value in keys:
+        s.key(key, value)
+    s.tensor("token_embd.weight", s.normal(case.vocab, hidden))
+    s.matrix("output.weight", case.vocab, hidden, gain=3.0)
+
+    def site(prefix: str, inject: bool) -> None:
+        s.norm(prefix + "_norm.weight", wide)
+        s.matrix(prefix + "_down.weight", rank, wide, gain=2.0)
+        s.matrix(prefix + "_up.weight", wide, rank, gain=2.0)
+        if inject:
+            s.matrix(prefix + "_inject.weight", streams, wide, gain=2.0, kind=Q.F32)
+
+    site("output_hc", False)
+    channels = 2 * k_heads * k_width + v_heads * v_width
+    e, f, shared = a["experts"], a["expert_ffn"], a["shared_ffn"]
+    iw, ih = a["indexer_width"], a["indexer_heads"]
+    for layer in range(layers):
+        p = f"blk.{layer}."
+        site(p + "hc_attn", True)
+        site(p + "hc_ffn", True)
+        if layer == a["ngram_layer"]:
+            s.tensor("per_layer_token_embd.weight", s.normal(rows, width))
+            s.matrix(p + "ple_key.weight", wide, ngram_heads * width)
+            s.matrix(p + "ple_value.weight", hidden, ngram_heads * width)
+            for name in ("ple_norm_key", "ple_norm_query", "ple_norm_conv"):
+                s.norm(p + name + ".weight", wide)
+            s.tensor(p + "ple_conv1d.weight", s.normal(wide, a["ngram_kernel"], scale=0.5), Q.F32)
+        if attention_layers[layer]:
+            s.matrix(p + "attn_q.weight", heads * dim * 2, hidden)
+            s.matrix(p + "attn_k.weight", kv * dim, hidden)
+            s.matrix(p + "attn_v.weight", kv * dim, hidden)
+            s.matrix(p + "attn_output.weight", hidden, heads * dim)
+            s.norm(p + "attn_q_norm.weight", dim)
+            s.norm(p + "attn_k_norm.weight", dim)
+            # mlx breaks selection ties arbitrarily. A block scores exactly 0 when every head's
+            # product is negative (relu), so the case has 8 indexer heads, and large weights spread
+            # the scores: the seeded prompts have no tie at a selection boundary.
+            s.matrix(p + "indexer.q_proj.weight", ih * iw, hidden, gain=4.0)
+            s.matrix(p + "indexer.k_proj.weight", iw, hidden, gain=4.0)
+            s.norm(p + "indexer.q_norm.weight", iw)
+            s.norm(p + "indexer.k_norm.weight", iw)
+        else:
+            s.matrix(p + "attn_qkv.weight", channels, hidden)
+            s.matrix(p + "attn_gate.weight", v_heads * v_width, hidden)
+            s.matrix(p + "ssm_beta.weight", v_heads, hidden)
+            s.matrix(p + "ssm_alpha.weight", v_heads, hidden)
+            s.tensor(p + "ssm_conv1d.weight", s.normal(channels, conv, scale=0.5), Q.F32)
+            s.tensor(p + "ssm_a", -s.rng.uniform(0.5, 4.0, v_heads).astype(np.float32), Q.F32)
+            s.tensor(p + "ssm_dt.bias", s.normal(v_heads, scale=0.5), Q.F32)
+            s.norm(p + "ssm_norm.weight", v_width)
+            s.matrix(p + "ssm_out.weight", hidden, v_heads * v_width)
+        s.tensor(p + "ffn_gate_inp.weight", s.normal(e, hidden, scale=1 / math.sqrt(hidden)), Q.F32)
+        s.experts(p + "ffn_gate_exps.weight", e, f, hidden)
+        s.experts(p + "ffn_up_exps.weight", e, f, hidden)
+        s.experts(p + "ffn_down_exps.weight", e, hidden, f)
+        swiglu(s, p, hidden, shared, "_shexp")
+        s.tensor(p + "ffn_gate_inp_shexp.weight", s.normal(hidden, scale=1 / math.sqrt(hidden)), Q.F32)
+    s.check_keys()
+    return s
+
+
 # ---------------------------------------------------------------------------------------------
 # Cases
 
@@ -558,6 +678,17 @@ CASES = [
                                       "interval": 4, "k_heads": 2, "v_heads": 4, "k_width": 16, "v_width": 16, "conv": 4,
                                       "experts": 16, "experts_used": 4, "expert_ffn": 32, "shared_ffn": 48},
          ("softmax-routed SwiGLU experts, renormalized top-k", "sigmoid-gated shared expert", "untied head")),
+    Case("qwen4exp-streams", qwen4exp, {"hidden": 64, "heads": 4, "kv_heads": 1, "head_dim": 32, "layers": 4,
+                                        "interval": 4, "k_heads": 2, "v_heads": 4, "k_width": 16, "v_width": 16,
+                                        "conv": 4, "experts": 8, "experts_used": 2, "expert_ffn": 16, "shared_ffn": 24,
+                                        "streams": 4, "rank": 8, "indexer_heads": 8, "indexer_width": 16,
+                                        "selected_tokens": 8, "block": 4, "ngram_layer": 1, "ngram_size": 3,
+                                        "heads_per_ngram": 2, "ngram_width": 16, "ngram_kernel": 4, "ngram_base": 100,
+                                        "ngram_padding": 4, "reset": 7, "check_length": 48},
+         ("four hyper-connection streams (rank-8 mix, inject, exit head)", "sigmoid gated delta output gate",
+          "selected attention past 2 blocks of 4 (rows 11 on), ties to the lower block",
+          "n-gram input at block 1 (orders 2 and 3, two heads each, resets mid-sequence, dilated conv)",
+          "checked against mlx_vlm (no transformers model)")),
 ]
 
 
@@ -682,9 +813,11 @@ def selected(names: set[str] | None) -> tuple[list[Case], list[DraftCase]]:
     return targets, drafts
 
 
-def check_families(names: set[str] | None, device: torch.device, zlab_source: Path | None) -> list[dict]:
-    """Every selected case's reference against transformers and every draft case against the released
-    draft code, over synthetic GGUFs written to a temporary directory. Each report carries `pass`."""
+def check_families(names: set[str] | None, device: torch.device, zlab_source: Path | None,
+                   mlx_python: Path | None = None) -> list[dict]:
+    """Every selected case's reference against its released code (transformers, or mlx_vlm under
+    `mlx_python`) and every draft case against the released draft code, over synthetic GGUFs written
+    to a temporary directory. Each report carries `pass`."""
     targets, drafts = selected(names)
     if any(case.axes.get("conv_kernel_size") for case in drafts) and zlab_source is None:
         raise ValueError("DFlash2 released-code checks require a pinned Z-Lab model.py (zlab_source)")
@@ -697,7 +830,7 @@ def check_families(names: set[str] | None, device: torch.device, zlab_source: Pa
             case.build(case).write(model)
             reference = open_reference(model, device, cache=True)
             references[case.name] = reference
-            report = check_hf(reference, 2, 32, 7)
+            report = check_hf(reference, 2, case.axes.get("check_length", 32), 7, mlx_python)
             reports.append({"case": case.name, "architecture": reference.architecture, "covers": list(case.covers),
                             "tensors_not_in_forward": reference.weights.unread(), **report})
         for case in drafts:

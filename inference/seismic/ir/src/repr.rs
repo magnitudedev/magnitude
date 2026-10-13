@@ -48,6 +48,7 @@ impl ScalarKind {
             Self::Scalar(DType::BF16) => SymbolValue::BF16(word as u16),
             Self::Scalar(DType::I32) => SymbolValue::I32(word as u32 as i32),
             Self::Scalar(DType::U32) => SymbolValue::U32(word as u32),
+            Self::Scalar(DType::U64) => SymbolValue::U64(word),
             Self::Scalar(DType::Bool) => SymbolValue::Bool(word as u8 != 0),
         }
     }
@@ -164,12 +165,14 @@ scalar!(
     IntegerType,
     AtomicType
 );
+scalar!(U64, DType::U64, u64, ConstantValue::U64, IntegerType);
 scalar!(Bool, DType::Bool, bool, ConstantValue::Bool);
 impl NumericType for F32 {}
 impl NumericType for F16 {}
 impl NumericType for BF16 {}
 impl NumericType for I32 {}
 impl NumericType for U32 {}
+impl NumericType for U64 {}
 impl SignedType for F32 {}
 impl SignedType for F16 {}
 impl SignedType for BF16 {}
@@ -195,18 +198,20 @@ pub(crate) fn constant_of<T: ScalarType>(value: T::Value) -> ConstantValue {
 
 pub(crate) fn fill_value_of<T: VectorElement>(value: T::Value) -> crate::schedule::FillValue {
     let (encoded, width) = match constant_of::<T>(value) {
-        ConstantValue::F32(value) => (value.to_bits(), 4),
-        ConstantValue::F16(value) | ConstantValue::BF16(value) => (u32::from(value), 2),
-        ConstantValue::I32(value) => (value as u32, 4),
-        ConstantValue::U32(value) => (value, 4),
-        ConstantValue::Bool(value) => (u32::from(value), 1),
+        ConstantValue::F32(value) => (u64::from(value.to_bits()), 4),
+        ConstantValue::F16(value) | ConstantValue::BF16(value) => (u64::from(value), 2),
+        ConstantValue::I32(value) => (u64::from(value as u32), 4),
+        ConstantValue::U32(value) => (u64::from(value), 4),
+        ConstantValue::U64(value) => (value, 8),
+        ConstantValue::Bool(value) => (u64::from(value), 1),
         ConstantValue::Index(_) => panic!("an index scalar is not a storage element type"),
     };
     let bytes = encoded.to_le_bytes();
     match width {
         1 => crate::schedule::FillValue::U8([bytes[0]]),
         2 => crate::schedule::FillValue::U16([bytes[0], bytes[1]]),
-        4 => crate::schedule::FillValue::U32(bytes),
+        4 => crate::schedule::FillValue::U32([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        8 => crate::schedule::FillValue::U64(bytes),
         _ => panic!("registered scalar dtype has unsupported fill width"),
     }
 }
@@ -231,6 +236,7 @@ pub(crate) fn fill_constant_for(
         DType::BF16 => fill_value_of::<BF16>(if one { 1.0 } else { 0.0 }),
         DType::I32 => fill_value_of::<I32>(i32::from(one)),
         DType::U32 => fill_value_of::<U32>(u32::from(one)),
+        DType::U64 => fill_value_of::<U64>(u64::from(one)),
         DType::Bool => fill_value_of::<Bool>(one),
     }
 }
@@ -285,18 +291,21 @@ representation!(DenseF16, "f16", F16, 1);
 representation!(DenseBF16, "bf16", BF16, 1);
 representation!(DenseI32, "i32", I32, 1);
 representation!(DenseU32, "u32", U32, 1);
+representation!(DenseU64, "u64", U64, 1);
 representation!(DenseBool, "bool", Bool, 1);
 impl WritableRepresentation for DenseF32 {}
 impl WritableRepresentation for DenseF16 {}
 impl WritableRepresentation for DenseBF16 {}
 impl WritableRepresentation for DenseI32 {}
 impl WritableRepresentation for DenseU32 {}
+impl WritableRepresentation for DenseU64 {}
 impl WritableRepresentation for DenseBool {}
 impl DenseRepresentation for DenseF32 {}
 impl DenseRepresentation for DenseF16 {}
 impl DenseRepresentation for DenseBF16 {}
 impl DenseRepresentation for DenseI32 {}
 impl DenseRepresentation for DenseU32 {}
+impl DenseRepresentation for DenseU64 {}
 impl DenseRepresentation for DenseBool {}
 representation!(Q4G64, "q4g64", F32, 2);
 representation!(Q4G32, "q4g32", F32, 2);
@@ -307,6 +316,7 @@ representation!(Q8G32S, "q8g32s", F32, 2);
 representation!(IQ4G32, "iq4g32", F32, 2);
 representation!(Q8G32, "q8g32", F32, 2);
 representation!(Q4G32S, "q4g32s", F32, 2);
+representation!(IQ4G32S, "iq4g32s", F32, 2);
 representation!(Q5G32S, "q5g32s", F32, 2);
 representation!(Q5G32, "q5g32", F32, 3);
 // Row layouts split 5-bit codes into `codes_lo` and `codes_hi`, and carry
@@ -314,16 +324,19 @@ representation!(Q5G32, "q5g32", F32, 3);
 representation!(MXFP4G32, "mxfp4g32", F32, 2);
 representation!(NVFP4G16, "nvfp4g16", F32, 2);
 representation!(Q4G32SRows16, "q4g32s", Rows16, F32, 2);
+representation!(IQ4G32SRows16, "iq4g32s", Rows16, F32, 2);
 representation!(Q5G32SRows16, "q5g32s", Rows16, F32, 3);
 representation!(Q5G32Rows16, "q5g32", Rows16, F32, 3);
 representation!(MXFP4G32Rows16, "mxfp4g32", Rows16, F32, 2);
 representation!(NVFP4G16Rows16, "nvfp4g16", Rows16, F32, 2);
 representation!(Q4G32SRows8, "q4g32s", Rows8, F32, 2);
+representation!(IQ4G32SRows8, "iq4g32s", Rows8, F32, 2);
 representation!(Q5G32SRows8, "q5g32s", Rows8, F32, 3);
 representation!(Q5G32Rows8, "q5g32", Rows8, F32, 3);
 representation!(MXFP4G32Rows8, "mxfp4g32", Rows8, F32, 2);
 representation!(NVFP4G16Rows8, "nvfp4g16", Rows8, F32, 2);
 representation!(Q4G32SMma16, "q4g32s", Mma16, F32, 2);
+representation!(IQ4G32SMma16, "iq4g32s", Mma16, F32, 2);
 representation!(Q5G32SMma16, "q5g32s", Mma16, F32, 3);
 representation!(Q5G32Mma16, "q5g32", Mma16, F32, 3);
 representation!(MXFP4G32Mma16, "mxfp4g32", Mma16, F32, 2);
@@ -339,6 +352,7 @@ representation!(Q6KRows8, "q6k", Rows8, F32, 4);
 representation!(Q8G32SRows8, "q8g32s", Rows8, F32, 2);
 representation!(IQ4G32Rows8, "iq4g32", Rows8, F32, 2);
 representation!(Q4G32SRows32, "q4g32s", Rows32, F32, 2);
+representation!(IQ4G32SRows32, "iq4g32s", Rows32, F32, 2);
 representation!(Q5G32SRows32, "q5g32s", Rows32, F32, 3);
 representation!(Q5G32Rows32, "q5g32", Rows32, F32, 3);
 representation!(MXFP4G32Rows32, "mxfp4g32", Rows32, F32, 2);
@@ -353,6 +367,17 @@ representation!(Q5KMma16, "q5k", Mma16, F32, 4);
 representation!(Q6KMma16, "q6k", Mma16, F32, 4);
 representation!(Q8G32SMma16, "q8g32s", Mma16, F32, 2);
 representation!(IQ4G32Mma16, "iq4g32", Mma16, F32, 2);
+// Vector codes: row layouts keep whole entries in `grids`.
+representation!(IQ2XS, "iq2xs", F32, 3);
+representation!(IQ3XXS, "iq3xxs", F32, 3);
+representation!(IQ2XSRows16, "iq2xs", Rows16, F32, 3);
+representation!(IQ3XXSRows16, "iq3xxs", Rows16, F32, 3);
+representation!(IQ2XSRows8, "iq2xs", Rows8, F32, 3);
+representation!(IQ3XXSRows8, "iq3xxs", Rows8, F32, 3);
+representation!(IQ2XSRows32, "iq2xs", Rows32, F32, 3);
+representation!(IQ3XXSRows32, "iq3xxs", Rows32, F32, 3);
+representation!(IQ2XSMma16, "iq2xs", Mma16, F32, 3);
+representation!(IQ3XXSMma16, "iq3xxs", Mma16, F32, 3);
 
 /// Dispatches a runtime representation id into the typed world.
 pub trait RepresentationVisitor {
@@ -385,6 +410,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q8g32s", registry::Layout::Rows32) => return visitor.visit::<Q8G32SRows32>(),
         ("iq4g32", registry::Layout::Rows32) => return visitor.visit::<IQ4G32Rows32>(),
         ("q4g32s", registry::Layout::Rows32) => return visitor.visit::<Q4G32SRows32>(),
+        ("iq4g32s", registry::Layout::Rows32) => return visitor.visit::<IQ4G32SRows32>(),
         ("q5g32s", registry::Layout::Rows32) => return visitor.visit::<Q5G32SRows32>(),
         ("q5g32", registry::Layout::Rows32) => return visitor.visit::<Q5G32Rows32>(),
         ("mxfp4g32", registry::Layout::Rows32) => return visitor.visit::<MXFP4G32Rows32>(),
@@ -395,20 +421,31 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("q8g32s", registry::Layout::Mma16) => return visitor.visit::<Q8G32SMma16>(),
         ("iq4g32", registry::Layout::Mma16) => return visitor.visit::<IQ4G32Mma16>(),
         ("q4g32s", registry::Layout::Rows16) => return visitor.visit::<Q4G32SRows16>(),
+        ("iq4g32s", registry::Layout::Rows16) => return visitor.visit::<IQ4G32SRows16>(),
         ("q5g32s", registry::Layout::Rows16) => return visitor.visit::<Q5G32SRows16>(),
         ("q5g32", registry::Layout::Rows16) => return visitor.visit::<Q5G32Rows16>(),
         ("mxfp4g32", registry::Layout::Rows16) => return visitor.visit::<MXFP4G32Rows16>(),
         ("nvfp4g16", registry::Layout::Rows16) => return visitor.visit::<NVFP4G16Rows16>(),
         ("q4g32s", registry::Layout::Rows8) => return visitor.visit::<Q4G32SRows8>(),
+        ("iq4g32s", registry::Layout::Rows8) => return visitor.visit::<IQ4G32SRows8>(),
         ("q5g32s", registry::Layout::Rows8) => return visitor.visit::<Q5G32SRows8>(),
         ("q5g32", registry::Layout::Rows8) => return visitor.visit::<Q5G32Rows8>(),
         ("mxfp4g32", registry::Layout::Rows8) => return visitor.visit::<MXFP4G32Rows8>(),
         ("nvfp4g16", registry::Layout::Rows8) => return visitor.visit::<NVFP4G16Rows8>(),
         ("q4g32s", registry::Layout::Mma16) => return visitor.visit::<Q4G32SMma16>(),
+        ("iq4g32s", registry::Layout::Mma16) => return visitor.visit::<IQ4G32SMma16>(),
         ("q5g32s", registry::Layout::Mma16) => return visitor.visit::<Q5G32SMma16>(),
         ("q5g32", registry::Layout::Mma16) => return visitor.visit::<Q5G32Mma16>(),
         ("mxfp4g32", registry::Layout::Mma16) => return visitor.visit::<MXFP4G32Mma16>(),
         ("nvfp4g16", registry::Layout::Mma16) => return visitor.visit::<NVFP4G16Mma16>(),
+        ("iq2xs", registry::Layout::Rows16) => return visitor.visit::<IQ2XSRows16>(),
+        ("iq3xxs", registry::Layout::Rows16) => return visitor.visit::<IQ3XXSRows16>(),
+        ("iq2xs", registry::Layout::Rows8) => return visitor.visit::<IQ2XSRows8>(),
+        ("iq3xxs", registry::Layout::Rows8) => return visitor.visit::<IQ3XXSRows8>(),
+        ("iq2xs", registry::Layout::Rows32) => return visitor.visit::<IQ2XSRows32>(),
+        ("iq3xxs", registry::Layout::Rows32) => return visitor.visit::<IQ3XXSRows32>(),
+        ("iq2xs", registry::Layout::Mma16) => return visitor.visit::<IQ2XSMma16>(),
+        ("iq3xxs", registry::Layout::Mma16) => return visitor.visit::<IQ3XXSMma16>(),
         (_, registry::Layout::Packet) => {}
         (other, layout) => panic!(
             "registry storage `{other}` in layout `{}` has no type-level marker",
@@ -421,6 +458,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         "bf16" => visitor.visit::<DenseBF16>(),
         "i32" => visitor.visit::<DenseI32>(),
         "u32" => visitor.visit::<DenseU32>(),
+        "u64" => visitor.visit::<DenseU64>(),
         "bool" => visitor.visit::<DenseBool>(),
         "q4g64" => visitor.visit::<Q4G64>(),
         "q4g32" => visitor.visit::<Q4G32>(),
@@ -431,10 +469,13 @@ pub fn with_representation<V: RepresentationVisitor>(
         "iq4g32" => visitor.visit::<IQ4G32>(),
         "q8g32" => visitor.visit::<Q8G32>(),
         "q4g32s" => visitor.visit::<Q4G32S>(),
+        "iq4g32s" => visitor.visit::<IQ4G32S>(),
         "q5g32s" => visitor.visit::<Q5G32S>(),
         "q5g32" => visitor.visit::<Q5G32>(),
         "mxfp4g32" => visitor.visit::<MXFP4G32>(),
         "nvfp4g16" => visitor.visit::<NVFP4G16>(),
+        "iq2xs" => visitor.visit::<IQ2XS>(),
+        "iq3xxs" => visitor.visit::<IQ3XXS>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }
 }
@@ -452,6 +493,7 @@ pub fn with_scalar<V: ScalarVisitor>(dtype: DType, visitor: V) -> V::Output {
         DType::BF16 => visitor.visit::<BF16>(),
         DType::I32 => visitor.visit::<I32>(),
         DType::U32 => visitor.visit::<U32>(),
+        DType::U64 => visitor.visit::<U64>(),
         DType::Bool => visitor.visit::<Bool>(),
     }
 }

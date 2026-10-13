@@ -24,26 +24,138 @@ pub(super) fn qualification_dynamic(
     }
 }
 
+/// A sublayer's rows as its block graph forms and joins them
+/// (`operators::block`): its consumer entry forms its input from `form`'s
+/// parts (`PT`, `NM`), and its output entry joins `streams` residual streams
+/// (`SN`), scattering with one inject value per stream when `injected`
+/// (`IN`). One residual stream is one normalized row, joined by a plain add.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct SublayerRows {
+    pub form: crate::operators::InputForm,
+    pub streams: u64,
+    pub injected: bool,
+}
+
+impl SublayerRows {
+    pub(super) const SINGLE: Self = Self {
+        form: crate::operators::InputForm::SINGLE,
+        streams: 1,
+        injected: false,
+    };
+
+    /// The rows of a target sublayer of `decoder` reading `source`: a mix
+    /// site's sublayer reads its site's partials and scatters into the
+    /// streams.
+    pub(super) fn of(
+        decoder: &magnitude_family_contracts::Decoder,
+        source: Option<crate::operators::SublayerSource<'_>>,
+        label: &str,
+    ) -> Result<Self, CatalogFailure> {
+        match source {
+            Some(source @ crate::operators::SublayerSource::Mix(_)) => {
+                let streams = crate::operators::streams::StreamsGeometry::of(decoder)
+                    .map_err(|error| qualification_dynamic("target", label, error))?
+                    .ok_or_else(|| {
+                        qualification_dynamic("target", label, "a mix site without streams")
+                    })?
+                    .streams;
+                Ok(Self {
+                    form: source.form(streams),
+                    streams,
+                    injected: true,
+                })
+            }
+            _ => Ok(Self::SINGLE),
+        }
+    }
+
+    /// The width of a residual row of `hidden` streams.
+    pub(super) fn residual_width(&self, hidden: u64) -> u64 {
+        self.streams * hidden
+    }
+
+    /// `rows` input rows the consumer entry forms its input from: `PT`
+    /// parts of `hidden`, each of ones.
+    pub(super) fn input(
+        &self,
+        device: &Device,
+        rows: u64,
+        hidden: u64,
+        entry: &'static str,
+        label: &str,
+    ) -> Result<Tensor, CatalogFailure> {
+        semantic_ones(
+            device,
+            Element::f32(),
+            &[rows, self.form.parts * hidden],
+            entry,
+            label,
+        )
+    }
+
+    /// The consumer's zero input norm of `element`, empty when the form
+    /// normalizes nothing.
+    pub(super) fn norm(
+        &self,
+        device: &Device,
+        element: Element,
+        hidden: u64,
+        entry: &'static str,
+        label: &str,
+    ) -> Result<Tensor, CatalogFailure> {
+        semantic_zeros(
+            device,
+            element,
+            &[self.form.norm_extent(hidden)],
+            entry,
+            label,
+        )
+    }
+
+    /// The output entry's inject values of `rows` rows: one per stream (of
+    /// ones), or none.
+    pub(super) fn inject(
+        &self,
+        device: &Device,
+        rows: u64,
+        entry: &'static str,
+        label: &str,
+    ) -> Result<Tensor, CatalogFailure> {
+        let values = if self.injected { self.streams } else { 0 };
+        semantic_ones(device, Element::f32(), &[rows, values], entry, label)
+    }
+}
+
 /// One attention block in its binding's form (the kernels fix it
-/// statically) on one row: zero weights, a zero history row and the row's own
-/// fresh key, through both the decode and the prefill entry. Zero weights
-/// make each attention output zero, so the block returns the residual.
+/// statically) on one row, reading and joining `rows`: zero weights, a zero
+/// history row and the row's own fresh key, through both the decode and the
+/// prefill entry. Zero weights make each attention output zero, so the block
+/// returns the residual.
 pub(super) fn qualify_attention(
     device: &Device,
     kernels: &AttentionKernels,
     binding: AttentionBinding,
+    rows: SublayerRows,
     label: &str,
 ) -> Result<(), CatalogFailure> {
     const ENTRY: &str = "attention";
     let shape = binding.shape;
     let (hidden, kv_heads, width, heads) =
         (shape.hidden, shape.kv_heads, shape.width, shape.heads());
-    let residual_values = (0..hidden)
+    let residual_values = (0..rows.residual_width(hidden))
         .map(|index| (index % 7) as f32 - 3.0)
         .collect::<Vec<_>>();
-    let residual = semantic_f32(device, &[1, hidden], &residual_values, ENTRY, label)?;
+    let residual = semantic_f32(
+        device,
+        &[1, rows.residual_width(hidden)],
+        &residual_values,
+        ENTRY,
+        label,
+    )?;
+    let input = rows.input(device, 1, hidden, ENTRY, label)?;
+    let inject = rows.inject(device, 1, "attention_output", label)?;
     let zeros = |element, extents: &[u64]| semantic_zeros(device, element, extents, ENTRY, label);
-    let input_norm = zeros(binding.norm, &[hidden])?;
+    let input_norm = rows.norm(device, binding.norm, hidden, ENTRY, label)?;
     let query = zeros(binding.query, &[shape.query_rows(), hidden])?;
     let gate = zeros(binding.gate, &[shape.gate_rows(), hidden])?;
     let key = zeros(binding.key, &[shape.key_rows(), hidden])?;
@@ -62,10 +174,15 @@ pub(super) fn qualify_attention(
     let destinations = semantic_i32(device, &[1], &[1], ENTRY, label)?;
     // The affine prefill kernel of a launch that lists no history row tiles.
     let history_tiles = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
+    // The history's prefill reads every visible row: no WorkList bitmap, its
+    // blocks of one key.
+    let block_slots = semantic_i32(device, &[0, 1], &[], ENTRY, label)?;
+    let selection = Tensor::from_host(device, Element::u32(), &[1, 0], &[])
+        .map_err(|error| qualification_dynamic(ENTRY, label, error))?;
     let projected = kernels
         .project
         .call(attention_project::Args {
-            hidden: &residual,
+            hidden: &input,
             input_norm: &input_norm,
             query_weight: &query,
             gate_weight: &gate,
@@ -154,7 +271,7 @@ pub(super) fn qualify_attention(
             ),
             (
                 "attention_prefill",
-                mix!(prefill, attention_prefill,
+                mix!(@call prefill, attention_prefill, {selection: &selection, block_slots: &block_slots},
                     history_key: activation, width, history_value: activation, width),
             ),
         ],
@@ -176,7 +293,8 @@ pub(super) fn qualify_attention(
                 ),
                 (
                     "attention_prefill_k8v4",
-                    mix!(@call prefill, attention_prefill_k8v4, {history_tiles: &history_tiles},
+                    mix!(@call prefill, attention_prefill_k8v4,
+                        {selection: &selection, block_slots: &block_slots, history_tiles: &history_tiles},
                         history_key_codes: Element::u32(), geometry.key_codes as u64,
                         history_key_coefficients: Element::f16(), geometry.key_coefficients as u64,
                         history_value_codes: Element::u32(), geometry.value_codes as u64,
@@ -191,6 +309,7 @@ pub(super) fn qualify_attention(
                 output_kernel
                     .call(attention_output::Args {
                         hidden: &residual,
+                        inject: &inject,
                         gated,
                         output_weight: &output,
                     })
@@ -284,6 +403,26 @@ pub(super) fn tensor_f32(
         .collect::<Vec<_>>();
     Tensor::from_host(device, Element::f32(), extents, &bytes)
         .map_err(|error| qualification(entry, bindings, error))
+}
+
+/// `rows` (`[M, PT * D]`) as the `[M, PT, D]` parts a readout entry reads,
+/// PT the entry's static (1 when it declares none).
+pub(super) fn readout_parts(
+    rows: &Tensor,
+    statics: &std::collections::BTreeMap<String, u64>,
+    entry: &'static str,
+    bindings: &str,
+) -> Result<Tensor, CatalogFailure> {
+    let parts = statics.get("PT").copied().unwrap_or(1);
+    let [m, width] = rows.extents()[..] else {
+        return Err(qualification_dynamic(
+            entry,
+            bindings,
+            "readout rows are not a matrix",
+        ));
+    };
+    rows.reshape(&[m, parts, width / parts])
+        .map_err(|error| qualification_dynamic(entry, bindings, error))
 }
 
 pub(super) fn semantic_zeros(
@@ -504,6 +643,12 @@ fn pattern_source(representation: &str) -> Option<(Element, Vec<u8>)> {
             "gguf_nvfp4",
             unit_packet(36, &[(0, &[0x38; 4]), (4, &[0x22; 32])]),
         ),
+        // Grid point 0 (every magnitude 8), no signs, scale codes 0 (odd
+        // scale 1) and d = 1: d / 8 * 1 * 8.
+        "iq2xs" => ("gguf_iq2_xs", unit_packet(74, &[(0, &[0x00, 0x3c])])),
+        // Grid points 0 (every magnitude 4), no signs, scale codes 0 and
+        // d = 1: d / 4 * 1 * 4.
+        "iq3xxs" => ("gguf_iq3_xxs", unit_packet(98, &[(0, &[0x00, 0x3c])])),
         // Table code 8 (value 1) at sub-scale 33 - 32 = 1 and d = 1.
         "iq4g32" => (
             "gguf_iq4_xs",
@@ -725,7 +870,7 @@ mod tests {
         let mut compared = Vec::new();
         for representation in [
             "q8g32s", "q5g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16",
+            "nvfp4g16", "iq2xs", "iq3xxs",
         ] {
             let (source, packet) = pattern_source(representation).unwrap();
             for layout in [Layout::Packet, Layout::Rows16, Layout::Rows8, Layout::Mma16] {
@@ -759,14 +904,13 @@ mod tests {
     fn every_packed_representation_has_a_unit_fixture() {
         let representations = [
             "q8g32s", "q4k", "q5k", "q6k", "iq4g32", "q4g32s", "q5g32s", "q5g32", "mxfp4g32",
-            "nvfp4g16",
+            "nvfp4g16", "iq2xs", "iq3xxs",
         ];
         for representation in representations {
             let (source, packet) = pattern_source(representation)
                 .unwrap_or_else(|| panic!("{representation} has no fixture"));
-            let columns = if representation.starts_with('q') && representation.ends_with('k')
-                || representation == "iq4g32"
-            {
+            // Whole 256-value GGUF blocks where the source has them.
+            let columns = if source.logical_group() == Some(256) {
                 512
             } else {
                 704

@@ -9,7 +9,7 @@ use magnitude_state::{
     HistoryDomainLayout, HistoryDomainPlan, HistoryDomainTrace, KvCodec, LayerRef,
     ModelStateLayout, StateStore, StoreBindings,
 };
-use seismic::{BackendName, DType, Device, Element, SlabLayout, SlabRegion};
+use seismic::{BackendName, Device, Element, SlabLayout, SlabRegion};
 use std::rc::Rc;
 
 /// The service's bounds a load plans for. None is a request-count batch
@@ -492,7 +492,7 @@ impl HistoryStorePlan {
             .iter()
             .flat_map(ComponentDescriptor::planes)
             .map(|plane| SlabRegion {
-                element: slab_element(plane.dtype),
+                element: Element::dense(plane.dtype),
                 row_shape: plane.row_extents.iter().map(|&size| size as u64).collect(),
             })
             .collect::<Vec<_>>();
@@ -540,6 +540,23 @@ impl StateStorePlan {
         })
     }
 
+    /// The raw keys' (Window) and block keys' (Block) domains of target
+    /// block `block`'s indexer (`LayerRef::Indexer`). `None` for a block
+    /// without one.
+    pub fn indexer_history(&self, block: u32) -> Option<(&HistoryStorePlan, &HistoryStorePlan)> {
+        let layer = LayerRef::Indexer(block);
+        let find = |blocks: bool| {
+            self.domains.iter().find(|store| {
+                matches!(store.kind, HistoryDomainKind::Block { .. }) == blocks
+                    && store
+                        .components
+                        .iter()
+                        .any(|component| component.layer == layer)
+            })
+        };
+        Some((find(false)?, find(true)?))
+    }
+
     /// The store's one history domain, for a store whose history the
     /// caller addresses as one domain (the draft head's).
     pub fn sole_history(&self) -> Result<&HistoryStorePlan, String> {
@@ -565,7 +582,7 @@ impl StateStorePlan {
             .recurrent_components
             .iter()
             .map(|component| SlabRegion {
-                element: slab_element(component.dtype),
+                element: Element::dense(component.dtype),
                 row_shape: component.shape.iter().map(|&size| size as u64).collect(),
             })
             .collect::<Vec<_>>();
@@ -1271,9 +1288,8 @@ impl HistoryRows {
                     )
             }
             HistoryDomainKind::Shared { .. } => 0,
-            HistoryDomainKind::Block { .. } => {
-                return Err(format!("history domain {kind:?} is not supported"));
-            }
+            // A block row per `rate` of the Token domain's.
+            HistoryDomainKind::Block { rate } => self.token.div_ceil(rate),
         })
     }
 }
@@ -1350,22 +1366,11 @@ fn state_store_plan(
     })
 }
 
-fn slab_element(dtype: DType) -> Element {
-    match dtype {
-        DType::F32 => Element::f32(),
-        DType::F16 => Element::f16(),
-        DType::BF16 => Element::bf16(),
-        DType::I32 => Element::i32(),
-        DType::U32 => Element::u32(),
-        DType::Bool => Element::bool(),
-    }
-}
-
 #[cfg(test)]
 mod slab_plan_tests {
     use super::*;
     use magnitude_state::LayerRef;
-    use seismic::{BackendName, DeviceCatalog};
+    use seismic::{BackendName, DType, DeviceCatalog};
 
     #[test]
     fn listed_history_classes_bound_capacity_for_small_and_large_extents() {
@@ -1483,16 +1488,23 @@ mod slab_plan_tests {
     }
 }
 
-/// History bytes per token of context: the rows of every Token domain.
-/// Window domains hold a bounded number of rows whatever the context (see
+/// History bytes per token of context: the rows of every Token domain, and
+/// a `rate`-th of every Block domain's (rounded up). Window domains hold a
+/// bounded number of rows whatever the context (see
 /// `StateStorePlan::history_bytes_at_depth`).
 pub(super) fn history_row_bytes(domains: &[HistoryDomainLayout]) -> Result<u64, String> {
     domains
         .iter()
-        .filter(|domain| domain.kind() == HistoryDomainKind::Token)
         .try_fold(0u64, |total, domain| {
+            let row_bytes = domain.row_bytes().map_err(|error| error.to_string())?;
+            // A Block domain keeps a row per `rate` tokens.
+            let bytes = match domain.kind() {
+                HistoryDomainKind::Token => row_bytes,
+                HistoryDomainKind::Block { rate } => row_bytes.div_ceil(rate as u64),
+                HistoryDomainKind::Window { .. } | HistoryDomainKind::Shared { .. } => 0,
+            };
             total
-                .checked_add(domain.row_bytes().map_err(|error| error.to_string())?)
+                .checked_add(bytes)
                 .ok_or_else(|| "history row byte count overflow".into())
         })
 }

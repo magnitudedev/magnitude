@@ -32,7 +32,8 @@ typedef ELEMENT_OF(SEISMIC_INPUT_NORM) norm_element;
     const uint qkv_rows = uint((2 * SEISMIC_DIM_NK + SEISMIC_DIM_NV) * SEISMIC_DIM_W);  \
     const uint gate_rows = uint(SEISMIC_DIM_NV * SEISMIC_DIM_W);                        \
     const uint head_rows = uint(SEISMIC_DIM_NV);                                        \
-    projection::Rms<activation, norm_element, projection::AllRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
+    projection::InputOf<activation, norm_element, projection::AllRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+        in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_1, input_norm, SEISMIC_INPUT_NORM_STRIDE_0,               \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {}};                            \
     projection::Weights<packets::W0> qkv{qkv_weight, KERNEL_W0_LAYOUT(k), k};           \

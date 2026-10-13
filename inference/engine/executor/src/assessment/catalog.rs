@@ -22,17 +22,46 @@ use magnitude_family_llama::LlamaFamily;
 use magnitude_family_muse_glimmer::MuseGlimmerFamily;
 use magnitude_family_nemotron_h::NemotronHFamily;
 use magnitude_family_qwen35::Qwen35Family;
+use magnitude_family_qwen4exp::Qwen4ExpFamily;
 use magnitude_state::KvCodec;
 use seismic::BackendName;
+use std::collections::BTreeMap;
 
-const FAMILIES: [&dyn ModelFamily; 6] = [
+const FAMILIES: [&dyn ModelFamily; 7] = [
     &Qwen35Family,
     &LlamaFamily,
     &NemotronHFamily,
     &Lfm2Family,
     &Gemma4Family,
     &MuseGlimmerFamily,
+    &Qwen4ExpFamily,
 ];
+
+/// Catalog targets whose load must derive whatever their catalog support
+/// level: (model, role).
+const REQUIRED: [(&str, &str); 2] = [
+    ("qwen3.8-flash-next", "target-gguf_q2"),
+    ("qwen3.8-flash-next", "target-gguf_q4"),
+];
+
+/// Each catalog model's support level (`catalog/models.json`).
+fn support_levels() -> BTreeMap<String, String> {
+    let path = headers::root().join("../models.json");
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")))
+            .unwrap();
+    catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| {
+            (
+                model["id"].as_str().unwrap().to_owned(),
+                model["support"]["level"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
+}
 
 const BACKENDS: [BackendName; 4] = [
     BackendName::Metal,
@@ -62,6 +91,8 @@ fn every_admitted_catalog_target_derives_complete_terms() {
     let mut admitted = Vec::new();
     let mut refused = Vec::new();
     let mut failures = Vec::new();
+    let levels = support_levels();
+    let mut required_seen = Vec::new();
     for (model, role, file) in headers::index() {
         if !role.starts_with("target") || file.ends_with("-allshards.json") {
             continue;
@@ -75,11 +106,29 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             file
         };
         let target = headers::directory(&file);
+        // A target that must serve: its catalog model is neither disabled
+        // nor deprecated, or it is named in `REQUIRED`.
+        let required = REQUIRED.contains(&(model.as_str(), role.as_str()));
+        if required {
+            required_seen.push((model.clone(), role.clone()));
+        }
+        let served = required
+            || !matches!(
+                levels.get(&model).map(String::as_str),
+                Some("disabled" | "deprecated")
+            );
         let Some(family) = FAMILIES.iter().find(|family| family.recognizes(&target)) else {
+            if served {
+                failures.push(format!("{model} {role}: no family recognizes the target"));
+            }
             continue;
         };
-        let Ok(definition) = family.inspect(&target, None, identity) else {
-            continue;
+        let definition = match family.inspect(&target, None, identity) {
+            Ok(definition) => definition,
+            Err(error) => {
+                failures.push(format!("{model} {role}: its family fails to inspect it: {error}"));
+                continue;
+            }
         };
         if let Err(error) = crate::operators::admit(&definition, false) {
             refused.push(format!("{model} {role}: {error}"));
@@ -106,9 +155,15 @@ fn every_admitted_catalog_target_derives_complete_terms() {
             let layout = resident_layout(ExecutionPath::Native, backend);
             let load = match ModelLoadPlan::derive(&manifest, &definition, selection, layout) {
                 Ok(load) => load,
-                // A representation the backend has no resident form for.
+                // A target that must serve derives its load on every
+                // backend; another may lack a resident form.
                 Err(error) => {
-                    refused.push(format!("{model} {role} {}: {error}", backend.as_str()));
+                    let line = format!("{model} {role} {}: {error}", backend.as_str());
+                    if served {
+                        failures.push(line);
+                    } else {
+                        refused.push(line);
+                    }
                     continue;
                 }
             };
@@ -191,6 +246,24 @@ fn every_admitted_catalog_target_derives_complete_terms() {
         failures.join("\n  ")
     );
     assert!(!admitted.is_empty());
+    // Every required target is in the catalog's headers and admitted on
+    // every backend.
+    for (model, role) in REQUIRED {
+        assert!(
+            required_seen
+                .iter()
+                .any(|(seen_model, seen_role)| seen_model == model && seen_role == role),
+            "required target {model} {role} has no catalog header"
+        );
+        for backend in BACKENDS {
+            let prefix = format!("{model} {role} {}:", backend.as_str());
+            assert!(
+                admitted.iter().any(|line| line.starts_with(&prefix)),
+                "required target {model} {role} is not admitted on {}",
+                backend.as_str()
+            );
+        }
+    }
 }
 
 /// Separate drafts of the qualification artifacts (target header, draft

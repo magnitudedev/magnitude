@@ -229,6 +229,9 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    /// The prefill's absent WorkList bitmap ([M, 0]).
+    selection: Tensor,
+    block_slots: Tensor,
     history_tiles: Tensor,
     _history_slabs: SlabTensor,
     key_codes: Tensor,
@@ -346,6 +349,8 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            selection: no_selection(device, m),
+            block_slots: block_slots(device, 1),
             history_tiles: {
                 let tiles = history_tiles(&case.visible);
                 i32_tensor(device, &[1, tiles.len()], &tiles)
@@ -436,6 +441,8 @@ macro_rules! prefill_args {
             visible: &$bound.visible,
             fresh: &$bound.fresh,
             destinations: &$bound.destinations,
+            selection: &$bound.selection,
+            block_slots: &$bound.block_slots,
             history_tiles: &$bound.history_tiles,
             history_key_codes: &mut $bound.key_codes,
             history_key_coefficients: &mut $bound.key_coefficients,
@@ -462,9 +469,11 @@ fn k8v4_devices() -> Vec<Device> {
             "cpu" => BackendName::Cpu,
             other => panic!("unsupported SEISMIC_TEST_BACKEND={other}"),
         };
-        return vec![catalog
-            .open_backend(backend)
-            .expect("selected backend opens")];
+        return vec![
+            catalog
+                .open_backend(backend)
+                .expect("selected backend opens"),
+        ];
     }
     [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan]
         .into_iter()
@@ -964,7 +973,7 @@ fn prefill_specialization(
     geometry: Geometry,
     params: &[(&'static str, u64)],
 ) -> NativeSpecialization {
-    let spec = specialization_on(device, geometry, params);
+    let spec = visible_prefill(device, specialization_on(device, geometry, params));
     let names = |name: &str| params.iter().any(|(param, _)| *param == name);
     if device.backend() == BackendName::Cuda {
         let spec = spec.with_static("L", 1);
@@ -1167,7 +1176,13 @@ fn metal_coissue_prefill_admits_only_launches_that_fit_every_segment_class() {
             );
         }
     }
-    let minicpm = [("QT", 16), ("HEADS", 2), ("SPLIT_GROUPS", 128), ("DIRECT", 1), ("COISSUE", 1)];
+    let minicpm = [
+        ("QT", 16),
+        ("HEADS", 2),
+        ("SPLIT_GROUPS", 128),
+        ("DIRECT", 1),
+        ("COISSUE", 1),
+    ];
     assert!(
         attention_prefill_k8v4::native_for_device_with(
             &device,
@@ -1548,13 +1563,13 @@ fn metal_prefill_reads_scattered_history_tiles() {
             attention_prefill_k8v4::native_for_device_with(
                 &device,
                 attention_prefill_k8v4::Elements { A: Element::bf16() },
-                &specialization_on(
+                &visible_prefill(&device, specialization_on(
                     &device,
                     geometry,
                     &[("QT", 16), ("SPLIT_GROUPS", 256), ("DIRECT", direct)],
                 )
                 .with_static("L", 0)
-                .with_param("COISSUE", 0),
+                .with_param("COISSUE", 0)),
             )
         };
         assert!(
@@ -1819,7 +1834,7 @@ fn check(
 /// tolerance.
 fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile, check_source},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1832,6 +1847,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     sources.push(SourceFile {
         path: "attention.seismic".into(),
         text: include_str!("../kernels/attention.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
     });
     let module = check_source(sources).unwrap();
     let logical = module
@@ -1901,6 +1920,10 @@ fn check_host_model_against_portable_body(entry: &str, encoded: &Encoded) {
     if entry == "attention_prefill_k8v4" {
         let tiles = history_tiles(&case.visible);
         args.insert(14, tensor(DType::I32, vec![1, tiles.len()], ints(&tiles)));
+        // Its WorkList bitmap (none: B = 0) and block keys (BR = 1) precede
+        // the tiles.
+        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
     }
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -2472,8 +2495,9 @@ impl DenseHistory {
 }
 
 macro_rules! dense_args {
-    ($module:ident, $bound:expr, $dense:expr, $case:expr) => {
+    ($module:ident, $bound:expr, $dense:expr, $case:expr $(, $extra:ident: $value:expr)*) => {
         $module::Args {
+            $($extra: $value,)*
             query: &$bound.query,
             gate: &$bound.gate,
             key: &$bound.key,
@@ -3226,7 +3250,7 @@ fn prefill_timing_on(device: &Device) {
             if only.iter().any(|(name, value)| value_of(name) != *value) {
                 continue;
             }
-            let specialization = form(specialization_on(device, geometry, &config));
+            let specialization = form(visible_prefill(device, specialization_on(device, geometry, &config)));
             if gemma12b {
                 eprintln!(
                     "exact timing form KV={} G={} W={} M={} history={history} I=0 U=0 F=1 N=1 NV=1 config={config:?}",
@@ -3292,7 +3316,7 @@ fn prefill_timing_on(device: &Device) {
                 // The dense entry has no producer warps and no co-issue
                 // form; its direct form takes 16-row query tiles, so an
                 // 8-row configuration is timed staged.
-                &form(specialization_on(
+                &form(visible_prefill(device, specialization_on(
                     device,
                     geometry,
                     &config
@@ -3304,12 +3328,13 @@ fn prefill_timing_on(device: &Device) {
                             _ => (name, value),
                         })
                         .collect::<Vec<_>>(),
-                )),
+                ))),
             )
             .unwrap();
             let dense_time = dense_kernel
                 .measure(
-                    vec![dense_args!(attention_prefill, bound, dense, encoded.case)],
+                    vec![dense_args!(attention_prefill, bound, dense, encoded.case,
+                        selection: &bound.selection, block_slots: &bound.block_slots)],
                     &TIMING,
                 )
                 .unwrap()
@@ -3430,17 +3455,17 @@ fn gemma_g8_tuning_uses_portable_reference() {
         seismic::Strategy::Search(seismic::SearchPlan {
             allowance: std::time::Duration::from_secs(600),
 
-            settings: seismic::SearchSettings {
-                error_rate: 0.05,
-            },
+            settings: seismic::SearchSettings { error_rate: 0.05 },
             min_sample_seconds: 0.0002,
-            start: vec![[
-                ("PARTS".into(), 16),
-                ("SIMDS".into(), 8),
-                ("SLICES".into(), 4),
-                ("SPAN".into(), 32),
-            ]
-            .into()],
+            start: vec![
+                [
+                    ("PARTS".into(), 16),
+                    ("SIMDS".into(), 8),
+                    ("SLICES".into(), 4),
+                    ("SPAN".into(), 32),
+                ]
+                .into(),
+            ],
         }),
     );
     eprintln!("Gemma portable-reference tuning: {result:?}");
