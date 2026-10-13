@@ -9,6 +9,7 @@ applies_to:
   - inference/seismic/runtime/src/**
   - inference/seismic/api/src/**
   - inference/seismic/compiler/src/blocks.rs
+  - inference/seismic/backends/metal/src/device.rs
   - inference/seismic/backends/cuda/src/blocks.rs
   - inference/seismic/backends/cuda/src/direct.rs
   - inference/seismic/backends/cuda/src/driver.rs
@@ -197,6 +198,23 @@ holding appears in movable memory and the kernel never compresses or swaps one. 
 not say whether a page is needed, so macOS headroom counts every movable page: a claim is refused
 only when it cannot fit beside wired and compressed memory.
 
+A residency set's residency is a request that can lapse about 1 s after the set's last GPU work (macOS
+26 on an M1 Ultra, with or without memory pressure; a 3 GB model on macOS 15.5 stayed wired). macOS
+then un-wires all of it (weights, state and scratch alike) into active pages, frees essentially
+nothing by doing so (quantized weights do not compress), and the next GPU work pays about 10 ms per
+GB to wire it again before its first result. The Metal device therefore renews its set's residency
+every 100 ms for as long as the set holds an allocation, so holdings stay wired through every idle
+gap; there is no idle timeout. Memory is returned by releasing holdings (the release order, or
+unloading), never by letting residency lapse. Renewal starts with the set's first allocation and
+stops, its thread joined, when the last one is released.
+
+Residency remains a request: under extreme shortage macOS may still revoke it and compress some of
+the holdings, and the next renewal asks for them back. Headroom subtracts nothing for this. Wired
+holdings are already outside movable memory, so subtracting the engine's charge would count them
+twice and refuse claims that fit. A revoked holding is counted in headroom only until a renewal
+re-wires it, and only on a host whose shortage is displacing memory, which the host-distress
+windows and the reserves already govern.
+
 | Domain | Band | Engine behavior |
 |---|---|---|
 | Headroom above the planning reserve and no host distress | Normal | Claims are granted if headroom stays above the planning reserve |
@@ -285,8 +303,9 @@ kill is independent fault containment; it chooses nothing to release.
   Seismic's limit grants, so a growth that would cross the reserve is a demand deficit, not Reclaim.
 - Threshold values exist in one policy definition. Host distress is derived only from Seismic's
   host observation; no other code path reads an OS pressure signal.
-- On macOS every engine holding is wired from allocation to release, and no holding is counted in
-  host headroom; a mapped import window stays file-backed.
+- On macOS every engine holding is wired from allocation to release, its residency renewed while it
+  is held so it stays wired through idle gaps, and no holding is counted in host headroom; a mapped
+  import window stays file-backed.
 - macOS host headroom is never below the free and inactive pages of the same sample.
 - A load whose host is in distress fails with `MemoryPressure` within one observation of the
   distress and returns its charge; a loaded model in persistent distress unloads within the
