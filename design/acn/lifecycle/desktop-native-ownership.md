@@ -314,11 +314,24 @@ group-traversable (0710) and its control socket is group-accessible (0660), so g
 owner control while the lock, data and keys stay private to the service account. Anyone else running
 `serve` while the profile is active is refused, since the service already serves.
 
+The `magnitude` group is also the boundary for application control over loopback. For every service
+start the owner issues a fresh random local control token, writes it atomically to `control-token`
+in its ownership directory before spawning ACN, and hands it to ACN in the private `Start` command;
+ACN then admits loopback callers to application control only with it (see
+[ACN service lifecycle](./service-lifecycle.md)). The file is readable by the service account and,
+under the server profile, its group (0640); on macOS it is owner-only (0600). CLI commands read it
+at every SDK admission, so a restart's new token is picked up when the SDK re-admits after the
+instance changes. A person setup has just added to the group, whose login does not carry the group
+yet, reads it through `sg`, which honours only listed membership; any other account is denied with a
+message naming the group. Removing someone from the group takes effect at the next service start.
+Desktop owners and a hand-run `serve` issue no token and remove any token a previous service left.
+
 On macOS the service is the root-owned `dev.magnitude.server` LaunchDaemon in the system domain,
 running the app's CLI as the person who set it up (`UserName`), loaded at boot and kept alive, and
 associated with the app's bundle identifier for Login Items. It uses the person's own profile, so
 no server profile exists, and it replaces the app bundle through the person's own update
-transaction. Its label is distinct from the retired `dev.magnitude.acn` agent, and the Linux system
+transaction. It still issues a local control token, readable only by that person, so other accounts
+on the Mac cannot control it over loopback. Its label is distinct from the retired `dev.magnitude.acn` agent, and the Linux system
 unit is distinct from the per-user unit that previous-installation retirement inspects.
 
 `server remove` stops and unregisters the service and removes the Linux account and marker; the

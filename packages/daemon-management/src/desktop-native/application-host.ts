@@ -2,7 +2,7 @@ import { resolveMacApplicationPath } from "./mac-application-path"
 import { ApplicationControlFailed, ApplicationControlUnavailable, requestApplication, requestLoginStartup, requestApplicationUpdate } from "./application-control"
 import { access } from "node:fs/promises"
 import { join } from "node:path"
-import { homedir } from "node:os"
+import { homedir, userInfo } from "node:os"
 import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/native"
 import { Effect, Layer, Option, Schema } from "effect"
 import { MAGNITUDE_RPC_VERSION } from "@magnitudedev/sdk"
@@ -11,7 +11,8 @@ import { NativeHost, NativeHostUnavailable, nativeHostLayer } from "./index"
 import { WindowsProcessObserver, WindowsProcessObserverUnavailable, nativeWindowsProcessObserverLayer } from "./windows-process-observer"
 import { WindowsProcessId } from "@magnitudedev/utils/windows-native"
 import { applicationStateDirectory } from "./application-state-directory"
-import { SERVER_DATA_DIRECTORY, isServerProfileActive } from "./server-profile"
+import { SERVER_DATA_DIRECTORY, SERVER_USER, isServerProfileActive } from "./server-profile"
+import { LocalControlDenied, readLocalControlToken } from "./local-control"
 import { BunFileSystem } from "@effect/platform-bun"
 import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { NativeMacApplicationInstallation, waitForMacApplicationInstallation } from "./mac-update-installation"
@@ -47,6 +48,11 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
     Effect.mapError(error => new ApplicationControlFailed({ message: error.message })),
     Effect.flatMap(Option.match({ onNone: () => Effect.fail(new ApplicationControlUnavailable({ message: "Magnitude desktop is not running" })), onSome: Effect.succeed })),
   ) : stateDirectory.pipe(Effect.map(directory => join(directory, "application.sock")), Effect.mapError(error => new ApplicationControlFailed({ message: error.message })))
+  // The server profile shares control with the `magnitude` group; a personal profile's token is the person's own.
+  const localControlToken = Effect.all([serverProfile, stateDirectory]).pipe(
+    Effect.mapError(error => new LocalControlDenied({ message: error.message })),
+    Effect.flatMap(([server, directory]) => readLocalControlToken({ stateDirectory: directory,
+      group: server ? Option.some(SERVER_USER) : Option.none(), user: userInfo().username })))
   const exists = (path: string) => Effect.tryPromise({ try: () => access(path), catch: () => new ApplicationLaunchFailed({ message: `Magnitude desktop is not installed at ${path}. Install the Magnitude desktop app before starting inference.` }) })
 
   const desktopApplication = makeApplicationClient({
@@ -118,6 +124,6 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
   const updateDesktopApplication = (action: import("@magnitudedev/sdk/desktop-host").ApplicationUpdateAction) =>
     endpoint.pipe(Effect.flatMap(path => requestApplicationUpdate(path, action)))
 
-  return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, serverProfile, applicationDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
+  return { updateDesktopApplication, localControlToken, desktopIsolatedProfile, desktopDataDirectory, serverProfile, applicationDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
 
 }

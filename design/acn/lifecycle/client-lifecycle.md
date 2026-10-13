@@ -19,7 +19,10 @@ operation, or explicit `connection.connect`, performs admission. Its state is
 
 Admission probes public health at the configured origin, normally loopback port 10100. A Ready
 response must supply the exact supported RPC version and an instance identity before RPC is
-dispatched. HTTP success, a process, or completion of a starter is not sufficient. A daemon that
+dispatched. A host may supply a local control token reader; the SDK reads it at every health probe
+and presents the token on health and RPC, since each service start issues its own. A health answer
+carrying readiness alone means the service does not admit this caller to control, reported as a
+typed access-denied error rather than a malformed response. HTTP success, a process, or completion of a starter is not sufficient. A daemon that
 predates the RPC version answers the older health shape and is read as speaking version 0. Protocol
 mismatch is a typed error; the SDK itself never negotiates, upgrades, downgrades, or replaces
 software.

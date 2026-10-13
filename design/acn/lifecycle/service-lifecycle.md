@@ -75,21 +75,35 @@ served at `/inference`.
 
 Network access is off by default and read once from `network` in `config.json` when ACN starts.
 When enabled, ACN also listens on all interfaces, or on one configured address beside loopback, so
-local clients are never displaced. Loopback is decided by socket peer address, never by header, and
-loopback callers never sign in. A remote caller gains application control only by signing in from a
-browser: `POST /auth/session` with the Network access key, compared in constant time, sets an
-`HttpOnly`, `SameSite=Strict` session cookie (`Secure` over HTTPS), and `GET /auth/session` reports
-whether the caller is local, signed in, or must sign in, and whether a key exists to sign in with.
-`/rpc` admits loopback callers and signed-in callers whose `Origin` matches their `Host`; anonymous
-remote callers get 401. `/health` returns the instance identity only to loopback and signed-in
-callers, so the SDK's admission works unchanged in a signed-in browser; anyone else learns readiness
-only. Sessions live in ACN memory, expire after 30 days unused, and end with `POST /auth/session/end`
+local clients are never displaced. Loopback is decided by socket peer address, never by header.
+
+A local controller is a loopback caller admitted to application control without signing in. Where
+the owner hands ACN a local control token at start (the system service; see
+[Native application ownership](./desktop-native-ownership.md)), a loopback caller is a local
+controller only when it presents that token in `x-magnitude-control-token`, compared in constant
+time; any other loopback caller is treated exactly like a remote one and must sign in. Without a
+token (the desktop app and a hand-run `serve`), every loopback caller is a local controller: such a
+machine is treated as single-user, so another account on a shared machine can control that
+person's application over loopback. That residual risk is accepted for personal installations and
+is the reason the system service, which every local account can reach, always requires the token.
+
+Any other caller gains application control only by signing in from a browser: `POST /auth/session`
+with the Network access key, compared in constant time, sets an `HttpOnly`, `SameSite=Strict`
+session cookie (`Secure` over HTTPS), and `GET /auth/session` reports whether the caller is local,
+signed in, or must sign in, and whether a key exists to sign in with. With Network access off there
+is no key, so on the system service a browser on the machine itself cannot sign in either.
+`/rpc` refuses a stale instance ID with 409 before anything else, then admits local controllers and
+signed-in callers whose `Origin` matches their `Host`; everyone else gets 401. `/health` returns the
+instance identity only to local controllers and signed-in callers, so the SDK's admission works
+unchanged in a signed-in browser; anyone else learns readiness only, never anything that admits
+control. Sessions live in ACN memory, expire after 30 days unused, and end with `POST /auth/session/end`
 or when ACN restarts. Because every network change, including a regenerated key or disabling
 network access, applies only when ACN restarts, that restart is also what signs every browser out.
 Failed sign-ins are throttled per remote address: after five, each attempt waits twice as long as
 the last, up to one minute; a success clears the count. With no key configured, nobody can sign in.
 Inference routes require the generated API key as a Bearer token or `x-api-key` from remote callers
-unless the key requirement is switched off, and never from loopback callers; the session cookie
+unless the key requirement is switched off, and never from loopback callers, with or without a local
+control token: keyless local inference is deliberate and grants no control; the session cookie
 never authorizes inference, and `requireApiKey` never affects sign-in. The Host header is accepted only for
 local names, and with network access on also for IP literals, `host.docker.internal`, `.ts.net`
 names, and names listed under `network.allowedHosts`; no wildcard is ever accepted. CORS stays

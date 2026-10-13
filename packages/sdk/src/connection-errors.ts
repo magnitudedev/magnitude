@@ -22,6 +22,14 @@ export class InvalidServiceResponse extends Schema.TaggedError<InvalidServiceRes
     message: Schema.String,
   }
 ) {}
+/** The service answers, but does not admit this caller to application control. */
+export class ServiceAccessDenied extends Schema.TaggedError<ServiceAccessDenied>()(
+  "ServiceAccessDenied",
+  {
+    origin: Schema.String,
+    message: Schema.String,
+  }
+) {}
 export class ProtocolMismatch extends Schema.TaggedError<ProtocolMismatch>()(
   "ProtocolMismatch",
   {
@@ -38,6 +46,7 @@ export const ConnectionErrorSchema = Schema.Union(
   ServiceUnavailable,
   ServiceStartErrorSchema,
   InvalidServiceResponse,
+  ServiceAccessDenied,
   ProtocolMismatch,
   ConnectionClosed
 );

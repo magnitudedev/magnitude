@@ -1,4 +1,4 @@
-import { HttpClient } from "@effect/platform";
+import { HttpClient, HttpClientRequest } from "@effect/platform";
 import { RpcClient, RpcClientError, RpcSerialization } from "@effect/rpc";
 import {
   AcnHealthResponseSchema,
@@ -7,6 +7,8 @@ import {
   AcnInstanceIdSchema,
   AcnRpcGroup,
   AcnRpcRecoveryPolicyTag,
+  LOCAL_CONTROL_HEADER,
+  MagnitudeReadinessResponseSchema,
   MagnitudeRpcs,
   MAGNITUDE_RPC_VERSION,
   namespaceClient,
@@ -25,6 +27,8 @@ import {
   Exit,
   Layer,
   Option,
+  Redacted,
+  Ref,
   Schema,
   Scope,
   Stream,
@@ -36,6 +40,7 @@ import {
   ConnectionErrorSchema,
   InvalidServiceResponse,
   ProtocolMismatch,
+  ServiceAccessDenied,
   ServiceUnavailable,
   type ConnectionError,
 } from "./connection-errors";
@@ -101,6 +106,12 @@ export interface ClientOptions {
    * network traffic, until `connection.connect` is called, so the host decides when to retry.
    */
   readonly reconnect?: "Automatic" | "OnConnect";
+  /**
+   * Reads the local control token a service on this machine requires of loopback callers, or none
+   * where loopback alone admits them. It is read again at every admission, since each service start
+   * issues its own.
+   */
+  readonly localControl?: Effect.Effect<Option.Option<Redacted.Redacted<string>>, ConnectionError>;
 }
 export function clientLayer(
   options: ClientOptions & { readonly autoStart: false }
@@ -126,7 +137,14 @@ const makeClient = (
   options: ClientOptions & { readonly autoStart?: boolean }
 ) =>
   Effect.gen(function* () {
-    const http = yield* HttpClient.HttpClient;
+    const controlToken = yield* Ref.make(Option.none<Redacted.Redacted<string>>());
+    const http = HttpClient.mapRequestEffect(yield* HttpClient.HttpClient, (request) =>
+      Ref.get(controlToken).pipe(Effect.map(Option.match({
+        onNone: () => request,
+        onSome: (token) => HttpClientRequest.setHeader(request, LOCAL_CONTROL_HEADER, Redacted.value(token)),
+      }))));
+    const readControlToken = (options.localControl ?? Effect.succeed(Option.none())).pipe(
+      Effect.flatMap((token) => Ref.set(controlToken, token)));
     const starter =
       options.autoStart === false
         ? Option.none()
@@ -178,7 +196,9 @@ const makeClient = (
     type ObservedHealth = typeof AcnHealthResponseSchema.Type & {
       readonly rpcVersion: number;
     };
-    const probe: Effect.Effect<ObservedHealth, ConnectionError> = http.get(`${origin}/health`).pipe(
+    const decodeReadiness = Schema.decodeUnknown(MagnitudeReadinessResponseSchema);
+    const invalidHealth = new InvalidServiceResponse({ origin, message: "Invalid Magnitude health response" });
+    const probe: Effect.Effect<ObservedHealth, ConnectionError> = readControlToken.pipe(Effect.zipRight(http.get(`${origin}/health`).pipe(
       Effect.timeoutFail({
         duration: "2 seconds",
         onTimeout: () => unavailable("Magnitude service health timed out"),
@@ -197,21 +217,24 @@ const makeClient = (
               })
             )
           : response.json.pipe(
-              Effect.flatMap(decodeHealth),
-              Effect.map(
-                (health): ObservedHealth =>
-                  "rpcVersion" in health ? health : { ...health, rpcVersion: 0 }
-              ),
-              Effect.mapError(
-                () =>
-                  new InvalidServiceResponse({
+              Effect.mapError(() => invalidHealth),
+              Effect.flatMap((body) => decodeHealth(body).pipe(
+                Effect.map(
+                  (health): ObservedHealth =>
+                    "rpcVersion" in health ? health : { ...health, rpcVersion: 0 }
+                ),
+                // Readiness alone means the service answers but does not admit this caller.
+                Effect.catchAll(() => decodeReadiness(body).pipe(
+                  Effect.mapError(() => invalidHealth),
+                  Effect.flatMap(() => Effect.fail(new ServiceAccessDenied({
                     origin,
-                    message: "Invalid Magnitude health response",
-                  })
-              )
+                    message: "This Magnitude service accepts control only from its signed-in browsers and from accounts allowed to control it on this machine.",
+                  })))
+                ))
+              ))
             )
       )
-    );
+    )));
     const report = (activity: typeof ServiceStartProgressSchema.Type) =>
       admission.withPermits(1)(
         Effect.gen(function* () {
@@ -413,7 +436,7 @@ const makeClient = (
           message: error._tag,
           cause: error,
         }),
-    }).pipe(Effect.provide(RpcSerialization.layerNdjson));
+    }).pipe(Effect.provide(RpcSerialization.layerNdjson), Effect.provideService(HttpClient.HttpClient, http));
     const raw = yield* RpcClient.make(AcnRpcGroup, { flatten: true }).pipe(
       Effect.provideService(RpcClient.Protocol, protocol)
     );

@@ -5,7 +5,7 @@ import type { OwnerReply } from "@magnitudedev/acn-protocol"
 import { AcnOwner, requestOwner, watchApplicationOwner } from "./application-owner"
 
 const owner = (reply: Effect.Effect<OwnerReply, JsonLineChannelFailed>) => AcnOwner.of({
-  awaitStart: Effect.void, awaitShutdown: Effect.never, reportHealth: () => Effect.void,
+  awaitStart: Effect.succeed(Option.none()), awaitShutdown: Effect.never, reportHealth: () => Effect.void,
   ownerState: Stream.make({ owner: "Desktop" as const, capabilities: ["Quit" as const], updates: Option.none(), loginStartup: Option.none() }),
   request: () => reply,
 })

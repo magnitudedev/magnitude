@@ -1,7 +1,8 @@
 import { HttpLayerRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform"
-import { Clock, Duration, Effect, Option, Ref, Schema } from "effect"
+import { Clock, Duration, Effect, Option, Redacted, Ref, Schema } from "effect"
 import { randomBytes, timingSafeEqual } from "node:crypto"
 import {
+  LOCAL_CONTROL_HEADER,
   REMOTE_ACCESS_SESSION_PATH,
   REMOTE_ACCESS_SIGN_OUT_PATH,
   RemoteAccessStatus,
@@ -18,7 +19,10 @@ const FREE_FAILURES = 5
 const FIRST_WAIT = Duration.seconds(1)
 const LONGEST_WAIT = Duration.minutes(1)
 
-/** Who is calling: this machine, a browser that signed in with the key, or anyone else. */
+/**
+ * Who is calling: a local controller (loopback, with the local control token where one is
+ * required), a browser that signed in with the key, or anyone else.
+ */
 export type CallerAccess = "Local" | "SignedIn" | "Anonymous"
 
 interface Throttle {
@@ -28,8 +32,8 @@ interface Throttle {
 }
 
 /**
- * Remote browser sessions for one ACN process. They live only in memory, so a restart, which is
- * also what applies a regenerated key or disabled Network access, signs every browser out.
+ * Browser sessions for one ACN process. They live only in memory, so a restart, which is also what
+ * applies a regenerated key or disabled Network access, signs every browser out.
  */
 export interface RemoteAccessApi {
   readonly network: NetworkAccess
@@ -38,7 +42,10 @@ export interface RemoteAccessApi {
   readonly signOut: (token: Option.Option<string>) => Effect.Effect<void>
 }
 
-/** Whether the request comes from this machine. With loopback binding every caller is local. */
+/**
+ * Whether the request comes from this machine. With loopback binding every caller is local. This
+ * alone admits keyless inference; application control may also require the local control token.
+ */
 export const isLocalCaller = (request: HttpServerRequest.HttpServerRequest, network: NetworkAccess) => Option.match(request.remoteAddress, {
   onNone: () => !network.enabled,
   onSome: isLoopbackAddress,
@@ -62,9 +69,22 @@ const keyMatches = (presented: string, expected: string) => {
   return left.length === right.length && timingSafeEqual(left, right)
 }
 
+/**
+ * Whether a local caller may control the application. Without a token every loopback caller may;
+ * with one (a system service, reachable by every account on the machine) only callers presenting it.
+ */
+const isLocalController = (request: HttpServerRequest.HttpServerRequest, network: NetworkAccess, controlToken: Option.Option<Redacted.Redacted<string>>) =>
+  isLocalCaller(request, network) && Option.match(controlToken, {
+    onNone: () => true,
+    onSome: token => {
+      const presented = request.headers[LOCAL_CONTROL_HEADER]
+      return presented !== undefined && keyMatches(presented, Redacted.value(token))
+    },
+  })
+
 const sessionToken = (request: HttpServerRequest.HttpServerRequest) => Option.fromNullable(request.cookies[SESSION_COOKIE])
 
-export const makeRemoteAccess = (network: NetworkAccess) => Effect.gen(function* () {
+export const makeRemoteAccess = (network: NetworkAccess, controlToken: Option.Option<Redacted.Redacted<string>>) => Effect.gen(function* () {
   const sessions = yield* Ref.make(new Map<string, number>())
   const throttles = yield* Ref.make(new Map<string, Throttle>())
 
@@ -95,7 +115,7 @@ export const makeRemoteAccess = (network: NetworkAccess) => Effect.gen(function*
 
   return {
     network,
-    access: request => isLocalCaller(request, network) ? Effect.succeed("Local" as const)
+    access: request => isLocalController(request, network, controlToken) ? Effect.succeed("Local" as const)
       : verify(sessionToken(request)).pipe(Effect.map(valid => valid ? "SignedIn" as const : "Anonymous" as const)),
     signIn: (address, key) => Effect.gen(function* () {
       if (!network.enabled) return yield* new SignInRefused({ reason: "NetworkAccessOff" })
@@ -161,7 +181,7 @@ export const installRemoteAccessRoutes = (router: HttpLayerRouter.HttpRouter, re
   }))
   yield* router.add("POST", REMOTE_ACCESS_SESSION_PATH, Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    if (isLocalCaller(request, remote.network)) return HttpServerResponse.empty({ status: 204 })
+    if ((yield* remote.access(request)) === "Local") return HttpServerResponse.empty({ status: 204 })
     const result = yield* Effect.gen(function* () {
       if (!isSameOrigin(request)) return yield* new SignInRefused({ reason: "CrossOrigin" })
       const body = yield* request.json.pipe(Effect.flatMap(decodeSignIn), Effect.orElseFail(() => new SignInRefused({ reason: "WrongKey" })))
@@ -178,7 +198,7 @@ export const installRemoteAccessRoutes = (router: HttpLayerRouter.HttpRouter, re
   }))
   yield* router.add("POST", REMOTE_ACCESS_SIGN_OUT_PATH, Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
-    if (!isLocalCaller(request, remote.network) && !isSameOrigin(request)) return HttpServerResponse.empty({ status: 403 })
+    if ((yield* remote.access(request)) !== "Local" && !isSameOrigin(request)) return HttpServerResponse.empty({ status: 403 })
     yield* remote.signOut(sessionToken(request))
     return withSessionCookie(HttpServerResponse.empty({ status: 204 }), request, "", Duration.zero)
   }))
