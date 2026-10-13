@@ -158,6 +158,8 @@ opt-level = 3
 
 [profile.release]
 debug = 1
+lto = "fat"
+codegen-units = 1
 
 # The language checker also runs as a build dependency while packaging native
 # kernels. Cargo otherwise compiles build dependencies at opt-level 0 even in
