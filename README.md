@@ -18,7 +18,7 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source inference engine that tunes its kernels to your hardware for every model you download, making it 2x faster than Ollama. It works on Apple Silicon, NVIDIA, AMD, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
+Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
 
 **[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
 
