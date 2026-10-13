@@ -4,13 +4,13 @@ import { Effect, Option, Schema } from "effect"
 import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { DesktopBuildFailed } from "./desktop"
-import { LINUX_DESKTOP_PACKAGE_NAME, LINUX_UPDATE_INSTALLER_PATH } from "../../src/executables"
+import { LINUX_DESKTOP_PACKAGE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
 import { LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
 import { linuxDesktopInstaller } from "../../src/targets"
 import { removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript } from "./linux-maintainer-scripts"
-import { linuxSystemFiles } from "./linux-system-files"
+import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
 const PackageFields = {
@@ -94,14 +94,14 @@ export const validateLinuxSystemFiles = (paths: readonly string[], entry: (path:
 })
 
 /**
- * The password-free Polkit action may name only the update installer wrapper. Polkit before 0.106
- * ignores argument annotations, so the program path is the action's whole restriction.
+ * A password-free Polkit action may name only its own wrapper. Polkit before 0.106 ignores argument
+ * annotations, so the program path is the action's whole restriction.
  */
-export const validateLinuxUpdatePolicy = (policy: string) => Effect.gen(function* () {
+export const validateLinuxPolkitPolicy = (policy: string, wrapper: string) => Effect.gen(function* () {
   const annotations = [...policy.matchAll(/<annotate\s+key="([^"]*)"\s*>([^<]*)<\/annotate>/g)].map(([, key, value]) => `${key}=${value}`)
-  if ((policy.match(/<annotate\b/g) ?? []).length !== 1 || annotations.length !== 1
-    || annotations[0] !== `org.freedesktop.policykit.exec.path=${LINUX_UPDATE_INSTALLER_PATH}`) {
-    return yield* new DesktopBuildFailed({ message: `The Linux update Polkit action must name only ${LINUX_UPDATE_INSTALLER_PATH}` })
+  if ((policy.match(/<action\b/g) ?? []).length !== 1 || (policy.match(/<annotate\b/g) ?? []).length !== 1 || annotations.length !== 1
+    || annotations[0] !== `org.freedesktop.policykit.exec.path=${wrapper}`) {
+    return yield* new DesktopBuildFailed({ message: `A Linux Polkit action must name only ${wrapper}` })
   }
 })
 
@@ -339,7 +339,7 @@ const buildPacmanPackage = (options: LinuxInstallerOptions, stage: string, paylo
 /** Package an already assembled, matched app/service. Publication requires native consumer acceptance. */
 export const buildLinuxDesktopInstaller = (options: LinuxInstallerOptions) => Effect.scoped(Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
-  yield* validateLinuxUpdatePolicy(yield* fs.readFileString(linuxSystemFiles.find(file => file.path.endsWith(".policy"))!.source))
+  for (const action of linuxPolkitActions) yield* validateLinuxPolkitPolicy(yield* fs.readFileString(action.policy), action.wrapper)
   const stage = yield* fs.makeTempDirectoryScoped({ prefix: `magnitude-desktop-${options.format}-` })
   const payload = join(stage, "application")
   yield* fs.copy(resolve(options.app), payload)

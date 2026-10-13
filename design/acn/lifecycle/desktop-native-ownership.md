@@ -339,8 +339,9 @@ on macOS, where the service serves in the person's own profile, a re-run treats 
 of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
 it runs, the whole window is one screen offering to keep the server, which opens it in the browser
-and quits, or to stop it with administrator authorization (on Linux, pkexec of the CLI's removal
-step under Polkit's generic administrator action) and continue. A background launch leaves
+and quits, or to stop it and continue. On Linux, stopping runs pkexec of the packaged removal
+wrapper, which Polkit admits without a password for the active local session; macOS asks for an
+administrator. A background launch leaves
 a running server alone, and a server that stops lets the app continue. Windows has no server
 mode; its command launcher ignores logoff, which Windows sends only to services, so a third-party
 service wrapper keeps serving.

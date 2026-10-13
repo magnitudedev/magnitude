@@ -5,6 +5,7 @@ import { Deferred, Duration, Effect, Option, Runtime, Schedule, Schema } from "e
 import { join } from "node:path"
 import { slate } from "@magnitudedev/client-common"
 import { MAC_SERVER_PLIST, installedServerCli, isServerProfileActive, requestApplication } from "@magnitudedev/daemon-management/desktop-native"
+import { LINUX_SERVER_REMOVER_PATH } from "@magnitudedev/release/executables"
 import { windowChrome } from "./window-chrome"
 
 export const SERVER_ADDRESS = "http://localhost:10100"
@@ -31,17 +32,20 @@ export const isServerRunning = (personalStateDirectory: string) => Effect.gen(fu
   return false
 }).pipe(Effect.orElseSucceed(() => false), Effect.provide(NodeContext.layer))
 
-/** Removes the server with the platform's administrator authorization; the server keeps its data. */
+/**
+ * Removes the server; the server keeps its data. On Linux, Polkit admits the person at the machine
+ * to the removal wrapper without a password; macOS asks for an administrator.
+ */
 const removeServer = Effect.gen(function* () {
   const cli = installedServerCli(process.platform)
   if (Option.isNone(cli)) return yield* new ServerRemovalFailed({ message: "Server mode isn't available here." })
   const executor = yield* CommandExecutor.CommandExecutor
   const command = process.platform === "darwin"
     ? Command.make("/usr/bin/osascript", "-e", `do shell script quoted form of "${cli.value}" & " _server-remove" with administrator privileges`)
-    // Polkit's generic exec action asks for an administrator, through the desktop's own authentication agent only.
-    : Command.make("/usr/bin/pkexec", "--disable-internal-agent", cli.value, "_server-remove")
+    // Any Polkit prompt, for a session that isn't the active one, comes from the desktop's own authentication agent only.
+    : Command.make("/usr/bin/pkexec", "--disable-internal-agent", LINUX_SERVER_REMOVER_PATH)
   const code = yield* executor.exitCode(command).pipe(Effect.orElseSucceed(() => -1))
-  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Authorization is needed to stop it." })
+  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Try again, or run `magnitude server remove` in a terminal." })
 }).pipe(Effect.provide(NodeContext.layer))
 
 /**

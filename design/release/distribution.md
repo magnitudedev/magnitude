@@ -101,8 +101,9 @@ bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or
 automatically open a window.
 Every Linux package also ships, root-owned, the `magnitude.service` system unit, the
-`dev.magnitude.update` Polkit action and its installer wrapper `resources/magnitude-install-update`
-(mode 0755). The unit is inert until `magnitude server setup` creates the `magnitude` system account
+`dev.magnitude.update` Polkit action with its installer wrapper `resources/magnitude-install-update`,
+and the `dev.magnitude.server-remove` action with its removal wrapper `resources/magnitude-server-remove`
+(wrappers mode 0755). The unit is inert until `magnitude server setup` creates the `magnitude` system account
 (home and data in `/var/lib/magnitude`) and enables the unit; a desktop that never opts in has no
 such account or service. No package ships a sudoers rule, and build validation rejects one:
 installing the package must never grant anything to an existing account that happens to be named
@@ -113,14 +114,17 @@ the service runs as `unconfined_service_t` like any packaged daemon; the `lib_t`
 directly would stay in confined `init_t`, which cannot reach its own engine over loopback.
 The sudoers rule lets only that account run the installed update helper
 without a password; without sudo installed, setup writes none and the service only notices updates.
-The Polkit action names only the installer wrapper, which accepts exactly the
-installer's arguments and executes the CLI's installer entry by absolute path; it is admitted
-without a password for the active local session and with admin authentication for inactive and
-remote sessions. The action never names the CLI itself and carries no argument annotation, since
-Polkit before 0.106 ignores those: the program path alone is its restriction on every Polkit
-version, and pkexec of the CLI falls back to Polkit's generic administrator authentication. As
-defense in depth, the CLI run as root under pkexec refuses every command except the update
-installer and server removal. Packaging validation requires the wrapper and this exact policy. On macOS `server setup` writes the root-owned
+Each Polkit action names only its own wrapper: the installer wrapper accepts exactly the
+installer's arguments and executes the CLI's installer entry by absolute path; the removal wrapper
+accepts no arguments and executes the CLI's `_server-remove` entry by absolute path, so the person
+at the machine stops the server from the desktop without a password. Both are admitted without a
+password for the active local session and with admin authentication for inactive and remote
+sessions. No action names the CLI itself or carries an argument annotation, since Polkit before
+0.106 ignores those: the program path alone is each action's restriction on every Polkit version,
+and pkexec of the CLI falls back to Polkit's generic administrator authentication. As defense in
+depth, the CLI run as root under pkexec refuses every command except the update installer and
+server removal. Packaging validation requires both wrappers and that each policy holds one action
+naming only its wrapper. On macOS `server setup` writes the root-owned
 `dev.magnitude.server` LaunchDaemon instead; no package ships it. Native DEB/RPM/pacman consumption and upgrade acceptance precede
 inclusion in the published artifact graph.
 

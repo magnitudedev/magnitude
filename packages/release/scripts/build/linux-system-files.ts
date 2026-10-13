@@ -1,6 +1,6 @@
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
-import { LINUX_UPDATE_INSTALLER_PATH } from "../../src/executables"
+import { LINUX_SERVER_REMOVER_PATH, LINUX_UPDATE_INSTALLER_PATH } from "../../src/executables"
 
 const resources = resolve(dirname(fileURLToPath(import.meta.url)), "../../resources/linux/system")
 
@@ -14,7 +14,15 @@ const resources = resolve(dirname(fileURLToPath(import.meta.url)), "../../resour
 export const linuxSystemFiles = [
   { source: join(resources, "dev.magnitude.update.policy"), path: "usr/share/polkit-1/actions/dev.magnitude.update.policy", mode: 0o644 },
   { source: join(resources, "magnitude-install-update"), path: LINUX_UPDATE_INSTALLER_PATH.slice(1), mode: 0o755 },
+  { source: join(resources, "dev.magnitude.server-remove.policy"), path: "usr/share/polkit-1/actions/dev.magnitude.server-remove.policy", mode: 0o644 },
+  { source: join(resources, "magnitude-server-remove"), path: LINUX_SERVER_REMOVER_PATH.slice(1), mode: 0o755 },
   { source: join(resources, "magnitude.service"), path: "usr/lib/systemd/system/magnitude.service", mode: 0o644 },
+] as const
+
+/** Each password-free Polkit action and the one wrapper it may name. */
+export const linuxPolkitActions = [
+  { policy: join(resources, "dev.magnitude.update.policy"), wrapper: LINUX_UPDATE_INSTALLER_PATH },
+  { policy: join(resources, "dev.magnitude.server-remove.policy"), wrapper: LINUX_SERVER_REMOVER_PATH },
 ] as const
 
 /** Written by `magnitude server setup`; package removal deletes it, since the helper it names goes with the package. */

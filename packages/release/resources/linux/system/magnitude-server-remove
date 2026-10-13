@@ -1,0 +1,7 @@
+#!/bin/sh
+# Polkit lets the active desktop user run this program as root without a password, so it is the
+# only program the dev.magnitude.server-remove action names. It accepts no arguments and runs
+# nothing but the installed CLI's server removal, by absolute path. Exit status 3 is a refused call.
+set -eu
+[ $# -eq 0 ] || exit 3
+exec /usr/lib/magnitude-desktop/resources/magnitude _server-remove

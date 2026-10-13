@@ -1,7 +1,7 @@
 /**
- * The only commands the CLI runs as root under pkexec: the update installer, which Polkit admits
- * through its wrapper, and server removal, which the desktop runs after administrator
- * authentication. Every other command is refused there, whatever a Polkit policy allowed.
+ * The only commands the CLI runs as root under pkexec: the update installer and server removal,
+ * which Polkit admits through their wrappers. Every other command is refused there, whatever a
+ * Polkit policy allowed.
  */
 export const PKEXEC_COMMANDS: ReadonlySet<string> = new Set(["_install-application-update", "_server-remove"])
 
