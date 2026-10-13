@@ -1,14 +1,13 @@
 import { Duration, Effect, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import type { PreparedUpdate, PreparedUpdateStore, UnattendedHold } from "@magnitudedev/daemon-management/desktop-native"
-import type { UpdateOutcome, UpdateOwner } from "@magnitudedev/release/hosted-update"
+import type { UpdateOutcome } from "@magnitudedev/release/hosted-update"
 import { CLI_VERSION } from "../version"
 import { IdleInstallationSystem, makeDownloadedNotice, makeIdleInstallation } from "./serve-updates"
 
 const release = { version: "99.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }
 
 const harness = (options: {
-  readonly owner?: UpdateOwner
   readonly authorized?: boolean
   readonly idle?: readonly boolean[]
   readonly lockFree?: readonly boolean[]
@@ -34,7 +33,6 @@ const harness = (options: {
     recordHold: (value: UnattendedHold) => Effect.sync(() => { hold = Option.some(value); events.push(`hold ${Option.getOrElse(value.version, () => "-")} ${value.until}`) }),
   } as unknown as PreparedUpdateStore
   const system = IdleInstallationSystem.of({
-    owner: options.owner ?? "service",
     canInstallUnattended: Effect.sync(() => options.authorized ?? true),
     isIdle: Effect.sync(() => { const value = idle.length > 1 ? idle.shift()! : idle[0]!; events.push(value ? "idle" : "busy"); return value }),
     installationLockFree: Effect.sync(() => lockFree.length > 1 ? lockFree.shift()! : lockFree[0]!),
@@ -75,7 +73,7 @@ describe("install when idle", () => {
     }))
     expect(h.events).toEqual(["busy", "busy", "idle"])
   })
-  it("keeps serving with one notice and no outcome without unattended authorization", async () => {
+  it("keeps serving with one notice and no outcome when it cannot install without a password", async () => {
     const h = harness({ authorized: false })
     await h.run(machine => Effect.gen(function* () {
       expect(yield* machine.installWhenIdle(release.version)).toBe(false)
@@ -139,15 +137,6 @@ describe("install when idle", () => {
     const h = harness({ installer: "admission-fails", hold: { version: Option.some("98.0.0"), until: 0 } })
     await h.run(machine => machine.install)
     expect(h.hold()).toEqual(Option.some({ version: Option.some("98.0.0"), until: 3_600_000 }))
-  })
-  it("never installs unattended from `serve` run by hand, even with password-free sudo", async () => {
-    const h = harness({ owner: "headless", authorized: true })
-    await h.run(machine => Effect.gen(function* () {
-      expect(yield* machine.installWhenIdle(release.version)).toBe(false)
-      expect(yield* machine.installWhenIdle(release.version)).toBe(false)
-    }))
-    expect(h.notices).toEqual([`Magnitude ${release.version} is downloaded. Install it with \`magnitude update install\`.`])
-    expect(h.events).toEqual([])
   })
   it("turns an unreported applied outcome into failed/startup and reports it before exiting", async () => {
     const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, reason: Option.none() } })

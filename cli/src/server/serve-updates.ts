@@ -57,20 +57,19 @@ export const prepareServeStartup = (runtime: ApplicationRuntime, profile: Applic
 const isIdle = (endpoint: string) => withLocalService(endpoint, client => client.application.getServiceActivity({})).pipe(
   Effect.map(activity => activity.workingSessions === 0 && activity.inferenceRequests === 0), Effect.orElseSucceed(() => false))
 
-/** The one line a server that does not install by itself prints for each downloaded version. */
+/** The one line a server that cannot install by itself prints for each downloaded version. */
 export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) => Effect.gen(function* () {
   const noticed = yield* Ref.make(new Set<string>())
   return (version: string) => Ref.modify(noticed, seen => [!seen.has(version), new Set([...seen, version])] as const).pipe(
     Effect.flatMap(first => first ? notify(`Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`) : Effect.void))
 })
 
-/**
- * The machine an idle installation acts on; replaced by fakes to exercise the decisions. Only the
- * `service` owner installs unattended; `serve` run by hand prints how to install.
- */
+/** The machine an idle installation acts on; replaced by fakes to exercise the decisions. */
 export interface IdleInstallationSystem {
-  readonly owner: UpdateOwner
-  /** Whether the service may install without asking anyone: its sudoers rule, or a writable app folder. */
+  /**
+   * Whether this server may install without asking anyone: on Linux, sudo admits the installer
+   * without a password (the service's sudoers rule, or the person's own); on macOS, a writable app folder.
+   */
   readonly canInstallUnattended: Effect.Effect<boolean>
   readonly isIdle: Effect.Effect<boolean>
   /** False while another Magnitude holds the installation lock the package checks. */
@@ -83,8 +82,9 @@ export interface IdleInstallationSystem {
 export const IdleInstallationSystem = Context.GenericTag<IdleInstallationSystem>("@magnitudedev/cli/IdleInstallationSystem")
 
 /**
- * Install when idle: the system service installs a downloaded update only between turns. Any other
- * server keeps serving and says how to install; a held installation lock defers. A failed attempt
+ * Install when idle: a server, the system service or `serve` run by hand, installs a downloaded
+ * update only between turns whenever it can without a password. Otherwise it keeps serving and says
+ * how to install; a held installation lock defers. A failed attempt
  * holds back unattended installation for `failureBackoff`, and the version that failed is not
  * downloaded or installed unattended again (see `UnattendedHold`), so restarts never loop.
  */
@@ -114,7 +114,7 @@ export const makeIdleInstallation = Effect.gen(function* () {
    * without stopping: the deferral is reported through `report` and the current version keeps serving.
    */
   const installWhenIdle = (version: string, report: Effect.Effect<void> = Effect.void) => Effect.gen(function* () {
-    if (system.owner !== "service" || !(yield* system.canInstallUnattended)) {
+    if (!(yield* system.canInstallUnattended)) {
       yield* notice(version)
       return false
     }
@@ -190,7 +190,6 @@ export const idleInstallationSystem = (options: {
       operation: "Install", continuation: { _tag: "Foreground", arguments: process.argv.slice(2) } }).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store))
   }))
   return IdleInstallationSystem.of({
-    owner: options.owner,
     canInstallUnattended: process.platform === "linux"
       ? executor.exitCode(Command.make("/usr/bin/sudo", "-n", "-l", "--", linuxInstalledCli, "_install-application-update",
         join(options.profile.dataDirectory, "updates", "update.json"), "--parent-stdin")).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false))

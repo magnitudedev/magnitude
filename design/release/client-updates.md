@@ -38,13 +38,13 @@ install and restart; a running Headless owner refuses an explicit install, becau
 itself when idle.
 
 No owner installs at startup: Desktop launch and `serve` start normally with a prepared update
-retained, and Desktop offers Restart. Only the system service (`magnitude server setup`: the Linux
-`magnitude` user under the server profile, or the macOS LaunchDaemon) installs unattended, at an
-idle point, when the service reports no working session and no inference request in flight, and
-only when it may do so without asking anyone (the Linux sudoers rule that setup writes, or a writable macOS
-application folder). Any other `serve`, including one run by hand with password-free sudo and every
-Windows `serve`, keeps serving and prints one line per downloaded version naming `magnitude update
-install`, recording no outcome. To install the service ends its owner scope, which releases its
+retained, and Desktop offers Restart. A macOS or Linux `serve`, the system service (`magnitude
+server setup`) or one run by hand alike, installs unattended at an idle point, when the service
+reports no working session and no inference request in flight, whenever it may do so without asking
+anyone: on Linux when `sudo -n` admits the installer (the sudoers rule that setup writes for the
+service, or a person's own password-free sudo), on macOS when the application folder is writable.
+A `serve` that cannot, and every Windows `serve`, keeps serving and prints one line per downloaded
+version naming `magnitude update install`, recording no outcome. To install the server ends its owner scope, which releases its
 leases, runs the platform installer, and on success replaces its own process with the new version
 (same PID). On failure it serves the current version again and holds back unattended installation:
 no unattended attempt starts for an hour, and when the package itself failed it keeps the `failed`
@@ -99,7 +99,8 @@ installation.
 - Invalid or failed checks never report up to date.
 - Download admission is distinct from successful native staging.
 - Install requires Ready and acknowledges before service/application shutdown.
-- No owner installs at startup; only the system service installs, at an idle point, and never blocks Ready.
+- No owner installs at startup; a Unix `serve` installs only at an idle point, only without a
+  password prompt, and never blocks Ready.
 - A failed unattended installation is never retried in a loop: the failed version is not downloaded
   or installed unattended again, and no unattended attempt starts within an hour, across restarts.
 - Packaged CLI and service versions match the application version.

@@ -132,7 +132,7 @@ To serve only until you stop it, for example to try things out:
 magnitude serve
 ```
 
-It runs in the foreground and Ctrl+C stops it. On Linux, `nohup magnitude serve &` keeps it serving after you disconnect, until the machine restarts; on macOS, closing the terminal stops it. Opening the desktop app stops it and takes over serving. For network access without the service, see [Network access](/api/network-access).
+It runs in the foreground and Ctrl+C stops it. On Linux, `nohup magnitude serve &` keeps it serving after you disconnect, until the machine restarts; on macOS, closing the terminal stops it. Opening the desktop app stops it and takes over serving. Like the service, it installs downloaded updates between requests whenever it can without asking for a password: on Linux when `sudo` doesn't ask you for one, on macOS when you can write to the Applications folder. Otherwise it prints a line saying the update is downloaded; stop it, run `magnitude update install`, and start it again. For network access without the service, see [Network access](/api/network-access).
 
 ## Windows
 

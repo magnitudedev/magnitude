@@ -33,7 +33,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
   const ready = yield* Ref.make(false)
   const notify = (line: string) => Effect.sync(() => { process.stderr.write(`${line}\n`) })
-  // The macOS and Linux system service installs downloaded updates at idle points; Windows serve only prepares them.
+  // macOS and Linux servers install downloaded updates at idle points when they can without a password; Windows serve only prepares them.
   const idle = runtime._tag === "Installed" && process.platform !== "win32"
     ? Option.some(yield* makeIdleInstallation.pipe(Effect.provide(idleInstallationSystem({ runtime, profile, stateDirectory, addon, owner, notify }))))
     : Option.none()

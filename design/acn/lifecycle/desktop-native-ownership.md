@@ -287,8 +287,8 @@ reach it, including a browser on another device:
   never performs owner work itself.
 
 Desktop supports every request. Headless supports updates, restart and quit. It refuses an
-explicit install while serving, because the system service installs downloaded updates by itself at
-idle points (a hand-run `serve` prints how to install instead),
+explicit install while serving, because a macOS or Linux `serve` installs downloaded updates by
+itself at idle points whenever it can without a password (otherwise it prints how to install),
 and reports launch at login as unsupported, so clients hide that control. Restart replies first,
 then ends the owner's scope, releasing the service tree, control endpoint, leases and ownership; the
 serving command admits a new owner with the same invocation, so settings read at service start
