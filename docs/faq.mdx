@@ -5,11 +5,11 @@ description: "Common questions about running Magnitude."
 
 ## What is Magnitude?
 
-An open source inference engine that optimizes itself for your hardware. It ships as a desktop app that runs open models and connects them to the agent you already use.
+An open source inference engine that optimizes each model for your exact hardware. It ships as a desktop app that runs open models and connects them to the agent you already use.
 
 ## How is it faster than llama.cpp, Ollama, or LM Studio?
 
-They ship kernels precompiled for broad classes of hardware. Magnitude compiles and tunes its kernels on your actual device before a model runs, so they fit your exact chip. [See the benchmarks against llama.cpp.](https://magnitude.dev/#benchmark)
+They ship one-size-fits-all kernels, because tuning each model for each chip by hand would take forever. Magnitude tunes them automatically. When you download a model, it spends up to a minute on your actual chip trying different ways to split up the math (how many GPU threads team up, how big a chunk each one takes, how far ahead to load data) and keeps the fastest combination that doesn't change the model's output. [See the benchmarks against Ollama.](https://magnitude.dev/#benchmark)
 
 ## What hardware do I need?
 
