@@ -152,7 +152,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             if lookahead.selected_tokens {
                 let choice = selected.get(slot).filter(|choice| choice.status == 0)?;
                 // A queued step that read a table row the device did not
-                // hold for this token is not the continuation.
+                // hold for this token is not the continuation. (A slot whose
+                // stored rows could not be read is claimed all the same: its
+                // sequence fails when the step finishes, and the others
+                // continue, `finish_target_work`.)
                 if !lookahead.flight.submission.output().found_selected(choice.token.0) {
                     return None;
                 }
@@ -353,6 +356,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             ));
             slots.push(slot);
         }
+        // The continuation follows the tokens fed so far.
+        let Ok(preceding) = self.target_preceding(&predicted) else {
+            return Ok(());
+        };
         let class_limits = self.target_class_limits();
         let vocabulary = self.definition.decoder.vocabulary as usize;
         let batch = if selected_tokens {
@@ -434,12 +441,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout_workspace,
             readout_output,
         )
-        .with_boundary(boundary);
+        .with_boundary(boundary)
+        .with_preceding(preceding);
         let launch = match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
             self.domain.id(),
             self.definition.decoder.hidden as usize,
+            self.definition.head.as_ref().map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder)) as usize,
         ) {
             Ok(launch) => launch,
             Err((_, error)) => return Err(DomainError::Invariant(error)),

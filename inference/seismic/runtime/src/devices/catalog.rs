@@ -208,6 +208,7 @@ fn inventory_from(
             } => DeviceMemory::Established(DeviceMemoryInfo {
                 allocation_pool: host_pool,
                 host_pool,
+                shared_pool: host_pool,
                 max_allocation_bytes,
             }),
             DiscoveredMemory::Dedicated {
@@ -216,6 +217,7 @@ fn inventory_from(
                 basis,
                 ledger,
                 max_allocation_bytes,
+                shared_device_local,
             } => {
                 // Multiple views of one physical pool are merged only by
                 // proven identity; distinct devices are never summed. A GPU
@@ -250,6 +252,11 @@ fn inventory_from(
                 DeviceMemory::Established(DeviceMemoryInfo {
                     allocation_pool,
                     host_pool,
+                    shared_pool: if shared_device_local {
+                        allocation_pool
+                    } else {
+                        host_pool
+                    },
                     max_allocation_bytes,
                 })
             }
@@ -323,6 +330,7 @@ mod tests {
                 },
                 ledger: LedgerKey::PhysicalGpu(uuid),
                 max_allocation_bytes: 24_000_000_000,
+                shared_device_local: false,
             },
             memory_bandwidth: None,
             descriptor: match backend {
@@ -358,6 +366,30 @@ mod tests {
                 _ => panic!("GPU memory must be established"),
             })
             .collect()
+    }
+
+    /// Host-shared storage consumes host RAM unless the device reports it
+    /// device-local, then the device's own pool.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn shared_storage_consumes_the_pool_the_device_reports() {
+        let mut local = gpu(BackendName::Vulkan, [5; 16]);
+        if let DiscoveredMemory::Dedicated {
+            shared_device_local,
+            ..
+        } = &mut local.memory
+        {
+            *shared_device_local = true;
+        }
+        let topology = gpu_topology(vec![gpu(BackendName::Cuda, [4; 16]), local]);
+        let host = topology.pools[0].id;
+        let memory = |index: usize| match &topology.devices[index].memory {
+            DeviceMemory::Established(memory) => *memory,
+            _ => panic!("GPU memory must be established"),
+        };
+        assert_eq!(memory(0).shared_pool, host);
+        assert_ne!(memory(0).allocation_pool, host);
+        assert_eq!(memory(1).shared_pool, memory(1).allocation_pool);
     }
 
     #[cfg(not(target_os = "macos"))]

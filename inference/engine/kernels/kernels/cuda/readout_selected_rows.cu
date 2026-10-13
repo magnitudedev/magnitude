@@ -8,7 +8,7 @@
 #include "lib/projection/projection.cuh"
 
 extern "C" __global__ void readout_selected_rows_stage(SEISMIC_KERNEL_PARAMS) {
-    using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+    using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
     __shared__ float factors[1];
     __shared__ float scratch[32];
     const unsigned row = blockIdx.x;

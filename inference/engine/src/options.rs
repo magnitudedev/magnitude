@@ -625,6 +625,7 @@ pub(crate) mod tests {
     fn definition(with_head: bool) -> ModelDefinition {
         let head = with_head.then(|| Head {
             blocks: vec![HeadBlock {
+                residual: magnitude_family_contracts::ResidualForm::Single,
                 input: HeadInput::Combine {
                     embedding_norm: rms("en"),
                     hidden_norm: rms("hn"),
@@ -908,7 +909,10 @@ pub(crate) mod tests {
         // Given neither a width nor a budget, a separate draft's rounds
         // choose their own; a width alone is that fixed width.
         assert_eq!(
-            policy(ModelMethod::Auto).resolve(&draft).unwrap().draft_policy,
+            policy(ModelMethod::Auto)
+                .resolve(&draft)
+                .unwrap()
+                .draft_policy,
             Some(DraftPolicy::Adaptive)
         );
         let fixed = ModelPolicy {

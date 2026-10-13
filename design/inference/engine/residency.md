@@ -7,6 +7,10 @@ applies_to:
   - inference/engine/executor/src/streamed_table.rs
   - inference/engine/executor/src/device_table.rs
   - inference/engine/executor/src/slot_directory.rs
+  - inference/engine/executor/src/stored_table.rs
+  - inference/engine/artifacts/src/uncached.rs
+  - inference/engine/kernels/kernels/*/stored_rows.*
+  - inference/engine/kernels/kernels/*/selection_notice.*
   - inference/engine/executor/src/host_tables.rs
   - inference/engine/executor/src/planning/weights.rs
   - inference/engine/kernels/kernels/*/repack_weight.*
@@ -81,13 +85,16 @@ upload, also without a prefill. The source file streams into that upload in boun
 a second whole-tensor host copy. Residency publishes each weight
 only after its submission completes; failed imports leave no cache entry.
 
-A gathered table (a weight a step reads by row index: the token embedding, a per-layer input table)
-is streamed instead of held whole wherever it can be. There is no setting: the weight plan decides,
+A gathered table (a weight a step reads by row index: the token embedding, a per-layer input table,
+an n-gram input table) is streamed instead of held whole wherever it can be. There is no setting: the weight plan decides,
 from the artifact alone, and admission charges what the plan says. A streamed table's results equal
 the whole table's bit for bit.
 - **A table the host gathers** claims a row cache of at most 16,384 rows in system RAM instead of
   its byte range. Its steps run the graphs and the reads of the whole table's steps; a held row is
-  not read again.
+  not read again. The host names its rows from host tokens (a per-layer table's row is its
+  token's), so its steps run on host tokens: a model with one has no lookahead. An n-gram table is
+  a table the device gathers: the device names its rows from the step's token rows
+  ([model input](model-input.md)); the host fills its slots (below).
 - **A table the device gathers** is streamed unless:
   - another role of its component reads the same stored tensor (a tied output projection reads
     every row);
@@ -98,18 +105,53 @@ the whole table's bit for bit.
     accompanies them).
 
   Otherwise it is held whole, as planned for any weight.
-- **A streamed device table** is one resident weight: slots for 16,384 rows, a directory of every
-  row's slot, and staging for the rows one step brings, all charged to the weight. Its plan's shape
-  is its slots'. Every program that reads the table (the target, an executed drafter, a head)
-  shares it through the residency cache. A row reaches a slot the first time a step names it, read
-  from the artifact and converted by the weight's own import entry, queued ahead of that step.
+- **A streamed device table** is one resident weight: its slots, a directory and staging for the
+  rows one step brings, all charged to the weight. Its plan's shape is its slots'. Every program
+  that reads the table (the target, an executed drafter, a head) shares it through the residency
+  cache. An imported table has slots for 16,384 rows; a row reaches a slot the first time a step
+  names it, read from the artifact and converted by the weight's own import entry, queued ahead of
+  that step.
+- **The directory's form** is the plan's, from the table's rows and slots alone: dense (`[rows, 1]`,
+  every row's slot or −1) when the rows are at most 16 times the slots, else hashed (`[buckets, 2]`
+  of (row, slot), buckets the least power of two at least twice the slots, murmur3 `fmix32` of the
+  row masked to the buckets, linear probing). In a hashed directory −1 is an empty bucket, which
+  ends a probe, and −2 a removed row's tombstone, which a probe passes, so a reader never misses a
+  row a step names while another row leaves. The host rebuilds a hashed directory only when no
+  queued step reads it, once live rows and tombstones exceed three quarters of its buckets.
+- **A stored table** (an n-gram table, `TableFill::Stored`) is streamed whatever its rows: its
+  slots hold rows as stored (IQ4_NL at 18 bytes or Q8_0 at 34 bytes per 32 values), never
+  converted, and its reader (`stored_rows`) decodes a slot's blocks as their registered conversion
+  (`iq4g32s` or `q8g32s`) does. It has slots for 180 × 16,384 rows (all of them, of a table of no more), no
+  staging, and the load uploads nothing. Its slots and directory are host-shared storage that the
+  host writes without device work: one filler thread per table takes steps in queue order, reads
+  the rows a step names that no slot holds from the artifact (sorted, coalesced and bypassing the
+  page cache: `O_DIRECT`, `F_NOCACHE` or `FILE_FLAG_NO_BUFFERING`), writes their slots and
+  directory entries, then opens the step's gate (a [host gate](execution-plan.md) ahead of the
+  reader). After the reader, the step signals that it has read. A step's rows are the n-gram rows
+  of its slots' tokens and the tokens each sequence holds before them (`NGramHash::rows`, the rule
+  the device's `ngram_rows` evaluates): of host tokens the host knows them when it queues the step;
+  of selected tokens the filler waits for the step's entry graph to copy the selection into
+  host-shared storage and signal (the selection notice). A selected row is never a miss.
+- **A stored table's slot is reused** only once every step that named its row has signaled its
+  read, never for a row the step being filled names. A filler waits for an earlier step's read
+  before taking a slot it named. A row that cannot be read is not published and fails the batch
+  slots (sequences) that named it; a failure that is no row's (the selection never reached the
+  host, no slot came free) fails every slot. The step still opens its gate (a step that never
+  opens deadlocks the queue), and its other sequences read and continue as usual. A failed
+  sequence is poisoned: its outcome of that step and of every later one is a typed failure
+  (`Outcome::TableReadFailed`, `TableReadError`), whose outputs are discarded and whose
+  accepted state returns as an orphan's, and the request fails (`WeightReadFailed`) until it
+  closes. A lookahead step is claimed as usual; its failed slots fail when it finishes.
+- **Reads that bypass the page cache** fall back to reads through the cache, dropping the pages
+  each read filled on Linux, for a file whose filesystem refuses direct I/O when it is opened or
+  at its first direct read; the fallback is kept for the file.
 - **Readers are the same for both.** Every reader of a gathered table addresses its rows through
   a directory (`gathered_row`): an empty one, under which it reads each row it is given, or the
   table's directory of every row's slot. A step whose rows the host knows is given their slots,
   as a whole table's step is given the rows, under the empty directory. A step whose rows the
   device selected reads a streamed table through its directory, in the reader's own address
   calculation: no entry runs before the reader and no reader knows a table is streamed.
-- **A device-selected row the device does not hold** is a miss: the target's lookahead is orphaned
+- **A device-selected row an imported table does not hold** is a miss: the target's lookahead is orphaned
   and resubmitted with the row brought ([state transactions](state-transactions.md)); a
   head's chained proposal embeds another row, and target verification rejects what follows.
 - **Replacement** takes the slot of a row no step named since the replacement last passed it,
@@ -118,7 +160,8 @@ the whole table's bit for bit.
 - **Rows at load.** Before readiness the slots are filled, most valuable first: the rows steps
   named when the table was last served, then the table's first rows. Load waits for their
   conversion. The rows steps name are kept in a file beside the kernel cache after the table's
-  first 256 steps and when the engine releases it.
+  first 256 steps and when the engine releases it. A stored table is seeded with the kept rows
+  only: n-gram rows have no order of value without them.
 - **Mapped windows** are bounded by the component's largest stored tensor whether or not that
   tensor is imported, so a streamed table does not change the windows of the weights around it.
 

@@ -18,9 +18,10 @@ fn attention_project_normalize<L: Isa, E: Elements>(
     let d = cx.dim_d() as usize;
     // SAFETY: each work item writes its own row of the scratch.
     let normalized = unsafe { cx.scratch_normalized().slice_mut::<f32>(4 * row * d, d) };
-    projection::normalize::<E::A>(
+    let norm = cx.arg_input_norm();
+    projection::form_input::<E::A>(
         cx.arg_hidden().row([row, 0]),
-        &cx.arg_input_norm(),
+        (cx.dim_nm() != 0).then_some(&norm),
         cx.arg_epsilon(),
         shared,
         normalized,

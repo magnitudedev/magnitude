@@ -343,6 +343,10 @@ pub enum RequestError {
     Overloaded,
     /// The device or driver failed during execution.
     DeviceLost { reason: String },
+    /// Weights the request's steps read from the model file during
+    /// execution (a streamed table's rows) could not be read. Other
+    /// requests continue. Retryable.
+    WeightReadFailed { reason: String },
     /// The caller cancelled.
     Cancelled,
     /// The worker ended before the request's terminal outcome.
@@ -363,6 +367,7 @@ impl RequestError {
                 }
                 | Self::Overloaded
                 | Self::DeviceLost { .. }
+                | Self::WeightReadFailed { .. }
                 | Self::WorkerLost { .. }
         )
     }
@@ -392,6 +397,9 @@ impl fmt::Display for RequestError {
             Self::ModelUnloaded { cause } => write!(formatter, "model unloaded: {cause}"),
             Self::Overloaded => formatter.write_str("the engine's request capacity is exhausted"),
             Self::DeviceLost { reason } => write!(formatter, "device lost: {reason}"),
+            Self::WeightReadFailed { reason } => {
+                write!(formatter, "model weights could not be read: {reason}")
+            }
             Self::Cancelled => formatter.write_str("request cancelled"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal engine failure: {reason}"),
@@ -452,6 +460,9 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
                 reason: error.to_string(),
             },
             Scheduled::Invariant(error) => Self::internal(error.to_string()),
+            Scheduled::TableRead(error) => Self::WeightReadFailed {
+                reason: error.detail,
+            },
             Scheduled::WorkerClosed => Self::WorkerLost {
                 reason: "the execution owner closed the request's stream".into(),
             },

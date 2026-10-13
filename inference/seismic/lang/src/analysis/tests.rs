@@ -325,7 +325,8 @@ fn attention_decode_k8v4_has_one_grid_per_code_plane() {
 #[test]
 fn attention_prefill_k8v4_decodes_history_it_has_already_appended_to() {
     let analysis = analyze(&kernel("attention_prefill_k8v4", &[("A", "bf16")]));
-    assert_eq!(analysis.parameters.len(), 19);
+    // The WorkList bitmap and its block keys' extent-only table among them.
+    assert_eq!(analysis.parameters.len(), 21);
     assert_eq!(stored(&analysis, "history_tiles"), &Stored::Discrete);
     assert_affine_history(&analysis);
 }

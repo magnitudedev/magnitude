@@ -477,9 +477,7 @@ fn cuda_dense_expand_scoped_tuning_is_factored() {
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
 
-        settings: seismic::SearchSettings {
-            error_rate: 0.05,
-        },
+        settings: seismic::SearchSettings { error_rate: 0.05 },
         min_sample_seconds: 0.001,
         start: Vec::new(),
     });
@@ -567,9 +565,7 @@ fn cuda_dense_output_scoped_tuning_is_factored() {
     let search = seismic::Strategy::Search(seismic::SearchPlan {
         allowance: std::time::Duration::from_secs(600),
 
-        settings: seismic::SearchSettings {
-            error_rate: 0.05,
-        },
+        settings: seismic::SearchSettings { error_rate: 0.05 },
         min_sample_seconds: 0.001,
         start: Vec::new(),
     });
@@ -857,6 +853,8 @@ fn cuda_head_rows_match_host_model() {
                         NativeSpecialization::new()
                             .with_static("V", v as u64)
                             .with_static("D", d as u64)
+                            .with_static("PT", 1)
+                            .with_static("NM", d as u64)
                             .with_static("WS", 0),
                     ),
                 )
@@ -1006,11 +1004,16 @@ fn cuda_features_and_selected_rows_match_host_model() {
                     NW: Element::f32(),
                     A: Element::bf16(),
                 },
-                &NativeSpecialization::new().with_static("D", d as u64),
+                &NativeSpecialization::new()
+                    .with_static("D", d as u64)
+                    .with_static("PT", 1)
+                    .with_static("NM", d as u64),
             )
             .unwrap()
             .call(readout_features_rows::Args {
-                hidden: &hidden,
+                hidden: &hidden
+                    .reshape(&[hidden.extents()[0], 1, hidden.extents()[1]])
+                    .unwrap(),
                 norm: &norm,
                 out_rows: &out_rows,
                 epsilon: EPSILON,
@@ -1041,7 +1044,9 @@ fn cuda_features_and_selected_rows_match_host_model() {
                 },
                 &NativeSpecialization::new()
                     .with_static("V", v as u64)
-                    .with_static("D", d as u64),
+                    .with_static("D", d as u64)
+                    .with_static("PT", 1)
+                    .with_static("NM", d as u64),
             )
             .unwrap()
             .call(readout_selected_rows::Args {
@@ -1076,7 +1081,7 @@ fn cuda_features_and_selected_rows_match_host_model() {
 #[test]
 fn dense_expand_host_model_matches_portable_body() {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile, check_source},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -1184,13 +1189,16 @@ fn cuda_embedding_rows_decode_table_rows() {
                 EW: format.resident(),
                 A: Element::bf16(),
             },
-            &NativeSpecialization::new().with_static("D", d as u64),
+            &NativeSpecialization::new()
+                .with_static("D", d as u64)
+                .with_static("PT", 1)
+                .with_static("NM", d as u64),
         )
         .unwrap()
         .call(embedding_rows::Args {
             table: &table.tensor,
             tokens: &tokens,
-            directory: &i32_tensor(&device, &[0], &[]),
+            directory: &i32_tensor(&device, &[0, 1], &[]),
             scale: 1.0,
             normalize: 0,
             epsilon: 0.0,
@@ -1226,10 +1234,16 @@ fn cuda_embedding_rows_read_the_slots_their_directory_names() {
     let (v, d, logical) = (40, 512, 130);
     // Every third logical row has a slot.
     let directory_values = (0..logical)
-        .map(|row| if row % 3 == 0 { ((7 * row + 3) % v) as i32 } else { -1 })
+        .map(|row| {
+            if row % 3 == 0 {
+                ((7 * row + 3) % v) as i32
+            } else {
+                -1
+            }
+        })
         .collect::<Vec<_>>();
-    let directory = i32_tensor(&device, &[logical as u64], &directory_values);
-    let direct = i32_tensor(&device, &[0], &[]);
+    let directory = i32_tensor(&device, &[logical as u64, 1], &directory_values);
+    let direct = i32_tensor(&device, &[0, 1], &[]);
     for format in Format::ALL {
         let table = weight(&device, format, v, d, &mut rng);
         let kernel = embedding_rows::native_for_device_with(
@@ -1238,7 +1252,10 @@ fn cuda_embedding_rows_read_the_slots_their_directory_names() {
                 EW: format.resident(),
                 A: Element::bf16(),
             },
-            &NativeSpecialization::new().with_static("D", d as u64),
+            &NativeSpecialization::new()
+                .with_static("D", d as u64)
+                .with_static("PT", 1)
+                .with_static("NM", d as u64),
         )
         .unwrap();
         for rows in [1usize, 3, 64, 513] {
@@ -1252,7 +1269,8 @@ fn cuda_embedding_rows_read_the_slots_their_directory_names() {
             let slots = selected
                 .chunks_exact(2)
                 .flat_map(|pair| {
-                    let slot = usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
+                    let slot =
+                        usize::try_from(pair[0]).map_or(0, |row| directory_values[row].max(0));
                     [slot, pair[1]]
                 })
                 .collect::<Vec<_>>();
@@ -1267,7 +1285,10 @@ fn cuda_embedding_rows_read_the_slots_their_directory_names() {
                         epsilon: 0.0,
                     })
                     .unwrap();
-                (out.r0.read_to_host().unwrap(), out.r1.read_to_host().unwrap())
+                (
+                    out.r0.read_to_host().unwrap(),
+                    out.r1.read_to_host().unwrap(),
+                )
             };
             assert_eq!(
                 read(&selected, &directory),
@@ -1408,7 +1429,16 @@ fn cuda_sample_rows_match_portable_semantics_for_every_partition() {
 
 /// The portable `shape_rows` body, row by row.
 fn shape_host(logits: &[f32], params: &[f32; 8], history: &[i32]) -> Vec<f32> {
-    let [temperature, top_k, top_p, min_p, repetition, presence, frequency, _] = *params;
+    let [
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        repetition,
+        presence,
+        frequency,
+        _,
+    ] = *params;
     let top_k = top_k as i32;
     let penalized: Vec<f32> = logits
         .iter()
@@ -1792,6 +1822,8 @@ fn cuda_head_timings() {
                     NativeSpecialization::new()
                         .with_static("V", v as u64)
                         .with_static("D", d as u64)
+                        .with_static("PT", 1)
+                        .with_static("NM", d as u64)
                         .with_static("WS", 0),
                 ),
             )

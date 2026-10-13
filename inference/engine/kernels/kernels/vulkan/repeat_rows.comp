@@ -1,0 +1,18 @@
+// repeat_rows: S scaled copies of each row; one invocation per value over a
+// grid-stride loop (the grid is capped below the 65535-group floor).
+#include <seismic/element.glsl>
+
+void repeat_rows() {
+    const uint64_t rows = SEISMIC_PTR(SEISMIC_BUFFER_ROWS);
+    const uint64_t scales = SEISMIC_PTR(SEISMIC_BUFFER_SCALES);
+    const uint64_t result = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+    const uint64_t h = SEISMIC_DIM_H, width = SEISMIC_DIM_S * h;
+    const uint64_t count = SEISMIC_DIM_M * width;
+    const uint64_t step = uint64_t(gl_NumWorkGroups.x) * gl_WorkGroupSize.x;
+    for (uint64_t index = gl_GlobalInvocationID.x; index < count; index += step) {
+        const uint64_t row = index / width, stream = index % width / h, column = index % h;
+        element_f32_put(result + (row * SEISMIC_RESULT_0_STRIDE_0 + (stream * h + column) * SEISMIC_RESULT_0_STRIDE_1) * 4ul,
+            element_f32_at(rows + (row * SEISMIC_ROWS_STRIDE_0 + column * SEISMIC_ROWS_STRIDE_1) * 4ul)
+                * element_f32_at(scales + stream * SEISMIC_SCALES_STRIDE_0 * 4ul));
+    }
+}

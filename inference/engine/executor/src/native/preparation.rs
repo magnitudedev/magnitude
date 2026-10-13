@@ -2,12 +2,13 @@ use super::specialization::{Specializer, Tuning};
 use super::tuning::readout_choice::{
     QualifiedRecipe, ReadoutContender, ReadoutRecipe, RecipePreparation, RecipeState,
 };
+use super::tuning::streams::{StreamMixDownTuning, StreamMixUpTuning};
 use super::tuning::{
     ModelInputs, TunedEntry, Tuner, TuningLimits, TuningWeights,
     attention::{
         AttentionDecodeK8V4Tuning, AttentionDecodeTuning, AttentionMix, AttentionOutputTuning,
-        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning, PrefillListing,
-        history_window,
+        AttentionPrefillK8V4Tuning, AttentionPrefillTuning, AttentionProjectTuning,
+        IndexerProjectTuning, PrefillListing, history_window,
     },
     cases::{DenseExpandTuning, DenseOutputTuning, DenseUpTuning},
     general_routed::{
@@ -39,17 +40,21 @@ use super::tuning::{
 use super::*;
 use crate::operators::gated_delta::graph::StepForm;
 use crate::operators::routed::fused_graph::DecodeForm;
+use crate::operators::streams::StreamsBinding;
 use crate::programs::invocation_demand::{GraphInvocationDemand, InvocationCounts};
 use crate::{
     DenseBinding, GeneralRoutedBinding, ModelLoadPlan, ReadoutHead, ShortConvBinding,
     StateSpaceBinding, SublayerTail,
 };
-use magnitude_family_contracts::{ModelDefinition, SublayerIndex, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    InputNorm, ModelDefinition, SublayerIndex, WeightKind, WeightScope,
+};
 use magnitude_kernels::{
     attention_append_dense, cluster_token_rows, conditioning_overlay, draft_convolve_input,
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
-    feature_rows, import_dense, moe_tail, packing_bound, per_layer_inputs, place_logits_rows,
-    post_norm_residual, repack_weight, tap_rows, widen_rows,
+    feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
+    per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
+    selection_notice, stored_rows, tap_rows, widen_rows,
 };
 use seismic::KernelRequest;
 use std::collections::HashSet;
@@ -564,6 +569,8 @@ struct Preparation<'a> {
     hidden: u64,
     /// The target's vocabulary: the static dimension of token selection.
     vocabulary: u64,
+    /// The scopes of the decoder's sublayer mix sites (`operators::streams`).
+    stream_sites: Vec<WeightScope>,
     target: TargetKernels,
     head: Option<HeadKernels>,
     shared_head: Option<SharedHeadKernels>,
@@ -595,6 +602,12 @@ impl<'a> Preparation<'a> {
             softcap: crate::programs::graph::readout::readout_softcap(&definition.decoder),
             hidden: definition.decoder.hidden,
             vocabulary: definition.decoder.vocabulary,
+            stream_sites: definition
+                .decoder
+                .sublayers()
+                .filter(|(_, sublayer)| matches!(sublayer.input, InputNorm::HyperConnectionMix(_)))
+                .map(|(index, _)| WeightScope::TargetSublayer(index))
+                .collect(),
             target: TargetKernels::default(),
             head: plan.head().map(|_| HeadKernels::default()),
             shared_head: plan.shared_head().map(|_| SharedHeadKernels::default()),
@@ -680,12 +693,6 @@ impl<'a> Preparation<'a> {
                 outcome,
             },
         )?;
-        let norm_plan = super::tuning::weight_plan(model.load, norm_scope, WeightKind::OutputNorm)
-            .map_err(|outcome| CatalogFailure::Preparation {
-                entry: "readout_recipe",
-                bindings: format!("{scope:?}"),
-                outcome,
-            })?;
         let [stored_vocabulary, hidden] = packed.shape[..] else {
             return Ok(None);
         };
@@ -693,6 +700,22 @@ impl<'a> Preparation<'a> {
         let [_, _, low_planes] = rest.shape[..] else {
             return Ok(None);
         };
+        let (parts, norm_extent) = model.readout_form(norm_scope, hidden).map_err(|outcome| {
+            CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome,
+            }
+        })?;
+        // A readout of unnormalized partials (`NM = 0`) has no norm.
+        let norm_plan = (norm_extent > 0)
+            .then(|| super::tuning::weight_plan(model.load, norm_scope, WeightKind::OutputNorm))
+            .transpose()
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "readout_recipe",
+                bindings: format!("{scope:?}"),
+                outcome,
+            })?;
         let recipe = ReadoutRecipe {
             scope,
             norm_scope,
@@ -704,12 +727,16 @@ impl<'a> Preparation<'a> {
             prepared,
             vocabulary,
             hidden,
+            parts,
+            norm_extent,
             low_planes,
             scale_extent,
         };
         let bound = seismic::NativeSpecialization::new()
             .with_static("V", vocabulary)
             .with_static("D", hidden)
+            .with_static("PT", parts)
+            .with_static("NM", norm_extent)
             .with_static("P", low_planes);
         let digest = magnitude_kernels::readout_top_rows::native_digest_with(
             device,
@@ -768,6 +795,8 @@ impl<'a> Preparation<'a> {
                     &seismic::NativeSpecialization::new()
                         .with_static("V", vocabulary)
                         .with_static("D", hidden)
+                        .with_static("PT", parts)
+                        .with_static("NM", norm_extent)
                         .with_static("WS", scale_extent),
                 )
             },
@@ -792,6 +821,10 @@ impl<'a> Preparation<'a> {
             .or_insert_with(|| Rc::new(RefCell::new(None)))
             .clone();
         let digest = format!("{digest}/{additional_digests:?}");
+        let norm_identity = norm_plan.map_or_else(
+            || "no-norm".to_owned(),
+            |plan| format!("{:?}", plan.storage_identity()),
+        );
         let mut selected_rows = Vec::new();
         let mut selected_state = None;
         for rows in magnitude_batching::row_classes(row_bound) {
@@ -808,10 +841,10 @@ impl<'a> Preparation<'a> {
             // budget it was qualified within.
             let budget = self.tuning.settings().map(|settings| settings.budget);
             let key = crate::TuningCacheKey::of(&format!(
-                "readout-recipe-v4/budget={budget:?}/device={:?}/{:?}/{:?}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
+                "readout-recipe-v4/budget={budget:?}/device={:?}/{:?}/{}/{recipe:?}/epsilon={:08x}/cap={:08x}/rows={}/dependency={dependency:?}/{digest}",
                 device.tuning_identity(),
                 packed.storage_identity(),
-                norm_plan.storage_identity(),
+                norm_identity,
                 self.epsilon.to_bits(),
                 softcap.to_bits(),
                 point.rows
@@ -1034,17 +1067,34 @@ impl<'a> Preparation<'a> {
                 feature_copy,
                 "activation",
                 feature_copy::Elements {
-                    A: plan.target().embedding().activation
+                    A: plan
+                        .head()
+                        .and_then(|head| head.blocks().first())
+                        .map_or(plan.target().embedding().activation, |head| head
+                            .conditioning)
                 }
             ),
             copy_rows_f32: copy(&mut self.spec, Element::f32(), "A=f32")?,
             copy_rows_f16: copy(&mut self.spec, Element::f16(), "A=f16")?,
             copy_rows_bf16: copy(&mut self.spec, Element::bf16(), "A=bf16")?,
             copy_rows_u32: copy(&mut self.spec, Element::u32(), "A=u32")?,
+            copy_rows_i32: copy(&mut self.spec, Element::i32(), "A=i32")?,
         })
     }
 
     fn target(&mut self, plan: &ProgramPlan) -> Result<(), CatalogFailure> {
+        if plan.head().is_some_and(|head| {
+            head.blocks()
+                .iter()
+                .any(|head| head.conditioning == Element::f32())
+        }) {
+            self.target.residual_features = fixed!(
+                self.spec,
+                feature_rows,
+                "residual",
+                feature_rows::Elements { A: Element::f32() }
+            );
+        }
         let spec = &mut self.spec;
         let target = plan.target();
         let b = target.embedding();
@@ -1278,9 +1328,34 @@ impl<'a> Preparation<'a> {
                 self.target.per_layer_entry.insert(b, kernels);
             }
         }
+        let ngram_layers = BindingLayers::of(
+            target
+                .blocks()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, block)| Some((block.ngram()?, sublayer_scope(index, 2)))),
+        );
+        let mut ngrams = HashSet::new();
+        for b in target.blocks().iter().filter_map(|block| block.ngram()) {
+            if ngrams.insert(b) && !self.target.ngram.contains_key(&b) {
+                if let Some(kernels) = self.ngram(b, ngram_layers.scopes(b))? {
+                    self.target.ngram.insert(b, kernels);
+                }
+            }
+        }
+        let mut streams = HashSet::new();
+        for b in target.blocks().iter().filter_map(|block| block.streams()) {
+            if streams.insert(b) && !self.target.streams.contains_key(&b) {
+                if let Some(kernels) =
+                    self.streams(b, self.stream_sites.clone(), WeightScope::Target)?
+                {
+                    self.target.streams.insert(b, kernels);
+                }
+            }
+        }
         let b = target.readout();
         let bindings = format!("{b:?}");
-        let features = self.features(&bindings, b.norm, b.activation)?;
+        let features = self.target_features(&bindings, b.norm, b.activation)?;
         let weight = b.head.packed();
         let head = match b.head {
             ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => {
@@ -1343,7 +1418,7 @@ impl<'a> Preparation<'a> {
                 .insert(b, ReadoutKernels { features, head });
         }
         if let Some(b) = target.features() {
-            if let Some(kernel) = self.features(&format!("{b:?}"), b.norm, b.activation)? {
+            if let Some(kernel) = self.target_features(&format!("{b:?}"), b.norm, b.activation)? {
                 self.target.features.insert(b, kernel);
             }
         }
@@ -1390,27 +1465,50 @@ impl<'a> Preparation<'a> {
         Ok(())
     }
 
-    /// `readout_features_rows` at this model's width.
+    /// `readout_features_rows` over one normalized row at this model's
+    /// width.
     fn features(
         &mut self,
         bindings: &str,
         norm: Element,
         activation: Element,
     ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
-        self.features_at(bindings, norm, activation, self.hidden)
+        self.features_at(bindings, norm, activation, self.hidden, (1, self.hidden))
     }
 
-    /// `readout_features_rows` over rows `width` wide.
+    /// `readout_features_rows` over the target decoder's exit: the exit
+    /// site's partial rows, or the final row under the output norm.
+    fn target_features(
+        &mut self,
+        bindings: &str,
+        norm: Element,
+        activation: Element,
+    ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
+        let form = self
+            .tuning
+            .model()
+            .readout_form(WeightScope::Target, self.hidden)
+            .map_err(|outcome| CatalogFailure::Preparation {
+                entry: "readout_features_rows",
+                bindings: bindings.into(),
+                outcome,
+            })?;
+        self.features_at(bindings, norm, activation, self.hidden, form)
+    }
+
+    /// `readout_features_rows` over rows `width` wide in the input form
+    /// `(parts, norm extent)`.
     fn features_at(
         &mut self,
         bindings: &str,
         norm: Element,
         activation: Element,
         width: u64,
+        (parts, norm_extent): (u64, u64),
     ) -> Result<Option<NativeKernel<readout_features_rows::Entry>>, CatalogFailure> {
         self.spec.fixed(
             bindings,
-            &[("D", width)],
+            &[("D", width), ("PT", parts), ("NM", norm_extent)],
             readout_features_rows::native_entry_with(readout_features_rows::Elements {
                 NW: norm,
                 A: activation,
@@ -1453,6 +1551,13 @@ impl<'a> Preparation<'a> {
             decode_rows: None,
             listing: PrefillListing::Every,
             window,
+            selection: binding.selection,
+        };
+        // The history's prefill reads every visible row (a selected read's
+        // classes without scoring too); its WorkList form is the selection's.
+        let visible = || AttentionMix {
+            selection: None,
+            ..mix()
         };
         let history = match binding.history.encoding() {
             magnitude_state::HistoryEncoding::Dense => {
@@ -1484,7 +1589,7 @@ impl<'a> Preparation<'a> {
                 };
                 let prefill = self
                     .spec
-                    .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?;
+                    .tuned(&mut self.tuning, &AttentionPrefillTuning(visible()))?;
                 let append = fixed!(
                     self.spec,
                     attention_append_dense,
@@ -1569,7 +1674,7 @@ impl<'a> Preparation<'a> {
                 // are two kernels with their own admissible forms.
                 // (`StateResourcePlan::lists_history_tiles`, of the opened
                 // device's own fact; graph preparation checks they agree.)
-                let lists = binding.history.encoding() == magnitude_state::HistoryEncoding::Affine
+                let lists = crate::operators::attention::graph::lists_history_tiles(binding)
                     && crate::planning::reads_decoded_history(
                         self.spec.backend(),
                         self.spec.forms_tensor_operations(),
@@ -1588,7 +1693,7 @@ impl<'a> Preparation<'a> {
                     bindings: format!("{shape:?}"),
                     outcome,
                 })?;
-                let mut unlisted = mix();
+                let mut unlisted = visible();
                 if lists {
                     unlisted.listing = PrefillListing::Unlisted { capacity };
                 }
@@ -1596,7 +1701,7 @@ impl<'a> Preparation<'a> {
                     .spec
                     .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(unlisted))?;
                 let prefill_listed = if lists {
-                    let mut listed = mix();
+                    let mut listed = visible();
                     listed.listing = PrefillListing::Listed { capacity };
                     self.spec
                         .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(listed))?
@@ -1644,6 +1749,55 @@ impl<'a> Preparation<'a> {
                 });
             }
         };
+        // A selected read's indexer: its projection, tuned over the layers'
+        // indexer weights, and its selection at the attention's rotary.
+        let selection = match binding.selection {
+            None => Some(None),
+            Some(selection) => {
+                let project = self.spec.tuned(
+                    &mut self.tuning,
+                    &IndexerProjectTuning {
+                        binding,
+                        selection,
+                        scopes: scopes.clone(),
+                        epsilon: self.epsilon,
+                    },
+                )?;
+                let select = fixed!(
+                    self.spec,
+                    indexer_select,
+                    format!("{selection:?};P={}", shape.rotary_pairs),
+                    indexer_select::Elements {
+                        A: binding.activation
+                    },
+                    statics
+                        & [
+                            ("H", selection.shape.heads),
+                            ("P", shape.rotary_pairs),
+                            ("S", selection.shape.width - 2 * shape.rotary_pairs),
+                            ("SB", selection.shape.block),
+                        ]
+                );
+                let prefill = match binding.history.encoding() {
+                    magnitude_state::HistoryEncoding::Affine => self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionPrefillK8V4Tuning(mix()))?
+                        .map(SelectedPrefillKernel::AffineK8V4),
+                    _ => self
+                        .spec
+                        .tuned(&mut self.tuning, &AttentionPrefillTuning(mix()))?
+                        .map(SelectedPrefillKernel::Dense),
+                };
+                match (project, select, prefill) {
+                    (Some(project), Some(select), Some(prefill)) => Some(Some(SelectionKernels {
+                        project,
+                        select,
+                        prefill,
+                    })),
+                    _ => None,
+                }
+            }
+        };
         let output = match binding.tail {
             SublayerTail::Residual => self
                 .spec
@@ -1667,13 +1821,16 @@ impl<'a> Preparation<'a> {
                 )?
                 .map(SublayerOutput::PostNorm),
         };
-        Ok(match (project, history, output) {
-            (Some(project), Some(history), Some(output)) => Some(AttentionKernels {
-                codec: binding.history,
-                project,
-                history,
-                output,
-            }),
+        Ok(match (project, history, output, selection) {
+            (Some(project), Some(history), Some(output), Some(selection)) => {
+                Some(AttentionKernels {
+                    codec: binding.history,
+                    project,
+                    history,
+                    output,
+                    selection,
+                })
+            }
             _ => None,
         })
     }
@@ -1933,6 +2090,132 @@ impl<'a> Preparation<'a> {
         Ok(gate
             .zip(output)
             .map(|(gate, output)| PerLayerKernels { gate, output }))
+    }
+
+    /// An n-gram input sublayer; `scopes` are its sublayers' scopes.
+    fn ngram(
+        &mut self,
+        binding: crate::NGramBinding,
+        scopes: Vec<WeightScope>,
+    ) -> Result<Option<NGramKernels>, CatalogFailure> {
+        let projection = |kind| ProjectRowsTuning {
+            weight: match kind {
+                WeightKind::NGramKey => binding.key,
+                _ => binding.value,
+            },
+            activation: binding.activation,
+            kind,
+            output: Element::f32(),
+            scopes: scopes.clone(),
+        };
+        let key = self
+            .spec
+            .tuned(&mut self.tuning, &projection(WeightKind::NGramKey))?;
+        let value = self
+            .spec
+            .tuned(&mut self.tuning, &projection(WeightKind::NGramValue))?;
+        let rows = self.spec.fixed(
+            "fixed",
+            &[("C", binding.context), ("P", binding.heads_per_order)],
+            ngram_rows::native_entry(),
+        )?;
+        let stored = self.spec.fixed(
+            &format!(
+                "E={},A={}",
+                binding.table_source.name(),
+                binding.activation.name()
+            ),
+            &[("W", binding.width)],
+            stored_rows::native_entry_with(stored_rows::Elements {
+                E: binding.table_source,
+                U: binding.table,
+                A: binding.activation,
+            }),
+        )?;
+        let norm = format!("NW={}", binding.norm.name());
+        let gate = self.spec.fixed(
+            &norm,
+            &[("H", binding.hidden), ("S", binding.streams)],
+            ngram_gate::native_entry_with(ngram_gate::Elements { NW: binding.norm }),
+        )?;
+        let inject = self.spec.fixed(
+            &norm,
+            &[
+                ("H", binding.hidden),
+                ("S", binding.streams),
+                ("K", binding.kernel),
+            ],
+            ngram_inject::native_entry_with(ngram_inject::Elements { NW: binding.norm }),
+        )?;
+        let notice = self
+            .spec
+            .fixed("fixed", &[], selection_notice::native_entry())?;
+        Ok(match (rows, stored, key, value, gate, inject, notice) {
+            (
+                Some(rows),
+                Some(stored),
+                Some(key),
+                Some(value),
+                Some(gate),
+                Some(inject),
+                Some(notice),
+            ) => Some(NGramKernels {
+                rows,
+                stored,
+                key,
+                value,
+                gate,
+                inject,
+                notice,
+            }),
+            _ => None,
+        })
+    }
+
+    /// A decoder's hyper-connection streams: the sublayers' mix sites, the
+    /// exit site, and the widening of the embedded rows.
+    fn streams(
+        &mut self,
+        binding: StreamsBinding,
+        sites: Vec<WeightScope>,
+        exit_scope: WeightScope,
+    ) -> Result<Option<StreamsKernels>, CatalogFailure> {
+        let down = self.spec.tuned(
+            &mut self.tuning,
+            &StreamMixDownTuning {
+                binding,
+                injected: true,
+                scopes: sites.clone(),
+                epsilon: self.epsilon,
+            },
+        )?;
+        let exit = self.spec.tuned(
+            &mut self.tuning,
+            &StreamMixDownTuning {
+                binding,
+                injected: false,
+                scopes: vec![exit_scope],
+                epsilon: self.epsilon,
+            },
+        )?;
+        let up = self.spec.tuned(
+            &mut self.tuning,
+            &StreamMixUpTuning {
+                binding,
+                scopes: sites.iter().copied().chain([exit_scope]).collect(),
+            },
+        )?;
+        let spec = &mut self.spec;
+        let repeat = fixed!(spec, repeat_rows, "fixed");
+        Ok(match (down, exit, up, repeat) {
+            (Some(down), Some(exit), Some(up), Some(repeat)) => Some(StreamsKernels {
+                down,
+                exit,
+                up,
+                repeat,
+            }),
+            _ => None,
+        })
     }
 
     /// The per-layer entry: the embedding's projection into F32 per-layer
@@ -2452,9 +2735,37 @@ impl<'a> Preparation<'a> {
                 self.tuning.set_invocations(calls, true);
             }
             let bindings = format!("{b:?}");
+            let stream_kernels = b
+                .streams
+                .map(|streams| {
+                    self.streams(
+                        streams,
+                        vec![
+                            head_sublayer_scope(head_index, 0),
+                            head_sublayer_scope(head_index, 1),
+                        ],
+                        head_scope(head_index),
+                    )
+                })
+                .transpose()?
+                .flatten();
+            let copy = fixed!(
+                self.spec,
+                feature_copy,
+                &bindings,
+                feature_copy::Elements { A: b.conditioning }
+            );
+            let gather = fixed!(
+                self.spec,
+                feature_rows,
+                &bindings,
+                feature_rows::Elements { A: b.conditioning }
+            );
             let input = self.spec.tuned(
                 &mut self.tuning,
                 &DraftRowsTuning {
+                    conditioning: b.conditioning,
+                    streams: b.streams.map_or(1, |s| s.geometry.streams),
                     embedding: b.embedding_table,
                     embedding_norm: b.embedding_norm,
                     hidden_norm: b.hidden_norm,
@@ -2511,7 +2822,11 @@ impl<'a> Preparation<'a> {
                 }
                 self.tuning.set_invocations(calls, false);
             }
-            let features = self.features(&bindings, b.output_norm, b.activation)?;
+            let form = b
+                .streams
+                .map_or((1, self.hidden), |streams| (streams.geometry.streams, 0));
+            let features =
+                self.features_at(&bindings, b.output_norm, b.activation, self.hidden, form)?;
             let weight = b.projection.packed();
             let logits = match b.projection {
                 ReadoutHead::Packed { weight, .. } | ReadoutHead::Qualified { weight, .. } => self
@@ -2564,6 +2879,15 @@ impl<'a> Preparation<'a> {
                 features,
                 logits,
             ) {
+                if let Some(streams) = stream_kernels {
+                    head.streams.insert(b, streams);
+                }
+                if let Some(copy) = copy {
+                    head.copy.insert(b, copy);
+                }
+                if let Some(gather) = gather {
+                    head.gather.insert(b, gather);
+                }
                 head.input.insert(b, input);
                 head.attention.insert(b, attention);
                 head.priming_project.insert(b, priming_project);
@@ -2644,6 +2968,7 @@ impl<'a> Preparation<'a> {
             head.output_norm,
             activation,
             head.width,
+            (1, head.width),
         )?;
         let compact_columns = head.clustered.as_ref().map(|cluster| {
             cluster.selected_clusters * (cluster.token_order.len() as u64 / cluster.clusters)

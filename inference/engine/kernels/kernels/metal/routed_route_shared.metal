@@ -39,7 +39,7 @@ kernel void routed_route_shared(
     threadgroup float parts[8 * route_simdgroups];
     threadgroup float inverses[8];
     threadgroup uint last;
-    const routing::Rows<Norm> in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
+    const RouteRows in = decode_rows(residual, norm, parts, inverses, seismic_words, simd, lane, tid);
     if (group < route_groups) {
         route_group(in, router, shared_router, routes, scores, normalized, coefficient, logits, arrivals,
             seismic_words, shared, &last, group, tid, simd, lane);

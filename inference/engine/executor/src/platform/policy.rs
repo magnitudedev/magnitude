@@ -289,6 +289,21 @@ pub enum DomainRole {
     Staging,
 }
 
+/// The role of the domain `device`'s host-shared storage (a stored table's
+/// slots and directory) consumes: the allocation domain when it is the
+/// device's own memory (a host-backed device, a Vulkan device with a large
+/// host-visible device-local heap), else host RAM, the staging domain of a
+/// dedicated device (CUDA's mapped pinned memory, a Vulkan device without
+/// such a heap).
+pub fn shared_role(device: &DeviceInfo) -> Result<DomainRole, MemoryPolicyError> {
+    let memory = established(device)?;
+    Ok(if memory.shared_pool == memory.allocation_pool {
+        DomainRole::Allocation
+    } else {
+        DomainRole::Staging
+    })
+}
+
 /// Stable fit capacities of every domain a load on `device` touches: its
 /// allocation domain first, then host RAM for staging when the device is
 /// dedicated. Uses no live availability.

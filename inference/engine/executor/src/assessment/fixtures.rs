@@ -167,7 +167,7 @@ pub(crate) fn declared_model(
         } else {
             Encoding::F32
         };
-        let nbytes = source_element(encoding)
+        let nbytes = source_element(encoding, *shape.last().unwrap())
             .unwrap()
             .canonical_byte_len(&shape)
             .unwrap();
@@ -268,6 +268,7 @@ pub(crate) fn declared_model(
                 decay: tensor(name("ssm_a"), vec![c.value_heads], false),
                 time_bias: tensor(name("ssm_dt"), vec![c.value_heads], false),
                 norm: rms(tensor(name("ssm_norm"), vec![c.state_width], false)),
+                output_gate: GateFunction::Silu,
                 output: tensor(name("ssm_out"), vec![c.hidden, inner], true),
             }))
         };

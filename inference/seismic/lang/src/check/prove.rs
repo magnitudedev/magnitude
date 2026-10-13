@@ -30,6 +30,17 @@ use std::rc::Rc;
 // ---------------------------------------------------------------------------
 
 /// The constant value of a node, when it has one.
+/// The inclusive range of an integer word of `dtype`; none for any other
+/// scalar.
+fn word_bounds(arena: &mut ExprArena, dtype: DType) -> Option<(IntExpr, IntExpr)> {
+    Some(match dtype {
+        DType::I32 => (arena.int(i64::from(i32::MIN)), arena.int(i64::from(i32::MAX))),
+        DType::U32 => (arena.int(0), arena.int(i64::from(u32::MAX))),
+        DType::U64 => (arena.int(0), arena.int_exact(crate::expr::BigInt::from(u64::MAX))),
+        DType::F32 | DType::F16 | DType::BF16 | DType::Bool => return None,
+    })
+}
+
 pub(crate) fn constant(arena: &ExprArena, e: IntExpr) -> Option<i64> {
     normalize_int(arena, e).as_constant()
 }
@@ -336,13 +347,9 @@ impl<'a> ReachedScalarNormalForm<'a> {
     }
 
     fn word_range(&mut self, value: IntExpr, dtype: DType) -> bool {
-        let (lo, hi) = match dtype {
-            DType::I32 => (i64::from(i32::MIN), i64::from(i32::MAX)),
-            DType::U32 => (0, i64::from(u32::MAX)),
-            _ => return false,
+        let Some((lower, upper)) = word_bounds(self.arena, dtype) else {
+            return false;
         };
-        let lower = self.arena.int(lo);
-        let upper = self.arena.int(hi);
         let from_lower = self.arena.int_sub(value, lower);
         let to_upper = self.arena.int_sub(upper, value);
         self.nonnegative(from_lower) && self.nonnegative(to_upper)
@@ -1423,22 +1430,21 @@ impl Facts {
 
     /// Conjoin the bounds of a value of type `ty` held by `symbol` (L32 (a)):
     /// `index[B]` is `0 <= v <= B - 1`, an `i32` word is its two's-complement
-    /// range and a `u32` word `0 <= v <= 2^32 - 1`. Every other type states
-    /// nothing. Publishing a known value again does not replace the bounds
-    /// already established by its source position. Missing primary endpoints
-    /// are seeded for fresh bindings; the type premises are retained separately
-    /// so later deliberate range replacement cannot erase them.
+    /// range and an unsigned word `0 <= v <= 2^bits - 1`. Every other type
+    /// states nothing. Publishing a known value again does not replace the
+    /// bounds already established by its source position. Missing primary
+    /// endpoints are seeded for fresh bindings; the type premises are retained
+    /// separately so later deliberate range replacement cannot erase them.
     pub(crate) fn assume_type(&mut self, arena: &mut ExprArena, symbol: SymbolId, ty: &ValueType) {
         let (lo, hi) = match ty {
             ValueType::Index { bound } => {
                 let one = arena.int(1);
                 (arena.int(0), arena.int_sub(*bound, one))
             }
-            ValueType::Scalar(DType::I32) => (
-                arena.int(i64::from(i32::MIN)),
-                arena.int(i64::from(i32::MAX)),
-            ),
-            ValueType::Scalar(DType::U32) => (arena.int(0), arena.int(i64::from(u32::MAX))),
+            ValueType::Scalar(dtype) => match word_bounds(arena, *dtype) {
+                Some(bounds) => bounds,
+                None => return,
+            },
             _ => return,
         };
         let seed_lower = !self.lower.contains_key(&symbol);
@@ -2968,6 +2974,8 @@ impl<'a> Engine<'a> {
                     return match dtype {
                         DType::I32 => (Poly::constant(i64::from(i32::MIN)), Some(Poly::constant(i64::from(i32::MAX)))),
                         DType::U32 => (Poly::constant(0), Some(Poly::constant(i64::from(u32::MAX)))),
+                        // Its upper end 2^64 - 1 is no i64 polynomial constant.
+                        DType::U64 => (Poly::constant(0), None),
                         _ => (Poly::atom(a.clone()), Some(Poly::atom(a.clone()))),
                     };
                 }
@@ -3133,7 +3141,7 @@ impl<'a> Engine<'a> {
             }
             Atom::Rem(..) => true,
             Atom::Foreign(f) => {
-                if self.word_dtype(f.node) == Some(DType::U32) { return true; }
+                if matches!(self.word_dtype(f.node), Some(DType::U32 | DType::U64)) { return true; }
                 if let NodeView::Binary {
                     op,
                     lhs: AnyExpr::Int(lhs),

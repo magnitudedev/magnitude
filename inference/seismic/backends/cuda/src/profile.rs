@@ -626,6 +626,7 @@ pub(crate) fn discover(ordinal: u32) -> Result<DiscoveredTarget<Cuda>, TargetErr
             DType::BF16,
             DType::I32,
             DType::U32,
+            DType::U64,
             DType::Bool,
         ]
         .into_iter()

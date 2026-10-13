@@ -31,6 +31,19 @@ pub fn activate(function: i32, x: f32) -> f32 {
     }
 }
 
+/// A gated delta net's output gate on `z`, by the code the entries take
+/// (`gate_function: i32`): 0 SiLU, 1 sigmoid.
+pub const GATE_SIGMOID: i32 = 1;
+
+#[inline(always)]
+pub fn output_gate(function: i32, z: f32) -> f32 {
+    if function == GATE_SIGMOID {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        z / (1.0 + (-z).exp())
+    }
+}
+
 #[inline(always)]
 pub fn softcap(cap: f32, z: f32) -> f32 {
     cap * (2.0 / (1.0 + (-2.0 * z / cap).exp()) - 1.0)

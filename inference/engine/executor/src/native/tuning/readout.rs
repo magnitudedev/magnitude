@@ -26,6 +26,8 @@ const SELECTED_TOKENS: u64 = 256;
 /// The MTP input's fused embedding, two RMS norms and combine projection.
 #[derive(Clone)]
 pub(crate) struct DraftRowsTuning {
+    pub conditioning: Element,
+    pub streams: u64,
     pub embedding: Element,
     pub embedding_norm: Element,
     pub hidden_norm: Element,
@@ -57,12 +59,14 @@ impl EntryTuning for DraftRowsTuning {
 
     fn bindings(&self) -> String {
         format!(
-            "EW={},EN={},HN={},CW={},A={}",
+            "EW={},EN={},HN={},CW={},A={},C={},S={}",
             self.embedding.name(),
             self.embedding_norm.name(),
             self.hidden_norm.name(),
             self.combine.name(),
-            self.activation.name()
+            self.activation.name(),
+            self.conditioning.name(),
+            self.streams
         )
     }
 
@@ -106,11 +110,11 @@ impl EntryTuning for DraftRowsTuning {
                     .collect::<Vec<_>>();
                 Ok(DraftRowsCase {
                     tokens: inputs.i32s(&[point.rows, 2], &tokens)?,
-                    directory: inputs.i32s(&[0], &[])?,
+                    directory: inputs.i32s(&[0, 1], &[])?,
                     table: table.clone(),
                     conditioning: inputs.activation(
-                        self.activation,
-                        &[point.rows, hidden],
+                        self.conditioning,
+                        &[point.rows, self.streams * hidden],
                         index as u64 + 1,
                     )?,
                     embedding_norm: inputs.weight(scope, WeightKind::HeadEmbeddingNorm)?,
@@ -136,6 +140,7 @@ impl EntryTuning for DraftRowsTuning {
     }
 
     generated_entry!(draft_rows, this => draft_rows::Elements {
+        C: this.conditioning,
         EW: this.embedding,
         A: this.activation,
         EN: this.embedding_norm,
@@ -213,12 +218,15 @@ impl EntryTuning for HeadRowsTuning {
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) =
             projection_shape(inputs, &[self.projection_scope], WeightKind::Output)?;
+        let (parts, norm) = inputs.readout_form(self.norm_scope, hidden)?;
         Ok(vec![
             (
                 "V",
                 self.rows.map_or(vocabulary, |rows| rows.min(vocabulary)),
             ),
             ("D", hidden),
+            ("PT", parts),
+            ("NM", norm),
             (
                 "WS",
                 inputs.scale_extent(self.projection_scope, WeightKind::Output)?,
@@ -242,9 +250,10 @@ impl EntryTuning for HeadRowsTuning {
         let weight = weight
             .slice_leading(0, self.rows.map_or(vocabulary, |rows| rows.min(vocabulary)))
             .map_err(|error| error.to_string())?;
+        let (parts, norm) = inputs.readout_form(self.norm_scope, hidden)?;
         Ok(vec![HeadRowsCase {
-            hidden: inputs.activation(Element::f32(), &[point.rows, hidden], 1)?,
-            norm: inputs.weight(self.norm_scope, WeightKind::OutputNorm)?,
+            hidden: inputs.activation(Element::f32(), &[point.rows, parts * hidden], 1)?,
+            norm: inputs.input_norm(self.norm_scope, WeightKind::OutputNorm, self.norm, norm)?,
             out_rows: inputs.every_row(point.rows)?,
             weight,
             weight_scale: inputs
@@ -312,7 +321,13 @@ impl EntryTuning for SelectedRowsTuning {
 
     fn statics(&self, inputs: &ModelInputs<'_>) -> Result<Vec<(&'static str, u64)>, String> {
         let (vocabulary, hidden) = vocabulary_shape(inputs)?;
-        Ok(vec![("V", vocabulary), ("D", hidden)])
+        let (parts, norm) = inputs.readout_form(WeightScope::Target, hidden)?;
+        Ok(vec![
+            ("V", vocabulary),
+            ("D", hidden),
+            ("PT", parts),
+            ("NM", norm),
+        ])
     }
 
     fn points(&self, limits: TuningLimits) -> Vec<PointShape> {

@@ -8,6 +8,7 @@ typedef element::Act activation;
 
 #define ATTENTION_OUTPUT_ARGUMENTS                                                      \
     device const float *hidden [[buffer(SEISMIC_BUFFER_HIDDEN)]],                       \
+    device const float *inject [[buffer(SEISMIC_BUFFER_INJECT)]],                       \
     device const uchar *gated [[buffer(SEISMIC_BUFFER_GATED)]],                         \
     device const uchar *output_weight [[buffer(SEISMIC_BUFFER_OUTPUT_WEIGHT)]],         \
     device float *result [[buffer(SEISMIC_RESULT_0_BUFFER)]],                           \
@@ -27,10 +28,16 @@ typedef element::Act activation;
     const uint k = uint(SEISMIC_DIM_Q * SEISMIC_DIM_W);                                 \
     projection::Plain<activation, projection::AllRows> in{gated, SEISMIC_GATED_STRIDE_0, \
         SEISMIC_GATED_STRIDE_2, k, {}};                                                 \
-    projection::Residual<activation, projection::AllRows> out{result, SEISMIC_RESULT_0_STRIDE_0, \
-        SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0,                     \
-        SEISMIC_HIDDEN_STRIDE_1, {}};                                                   \
+    ATTENTION_OUTPUT_EPILOGUE;                                                          \
     projection::Weights<packets::W0> w{output_weight, KERNEL_W0_LAYOUT(k), k}
+
+// The residual join: a plain residual, or the scatter into each
+// hyper-connection stream (`scatter`).
+typedef projection::OutputOf<activation, projection::AllRows, SEISMIC_DIM_SN, SEISMIC_DIM_IN != 0> output_join;
+#define ATTENTION_OUTPUT_EPILOGUE                                                       \
+    const output_join::type out = output_join::make(result, SEISMIC_RESULT_0_STRIDE_0,  \
+        SEISMIC_RESULT_0_STRIDE_1, hidden, SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, {}, \
+        inject, SEISMIC_INJECT_STRIDE_0, uint(SEISMIC_DIM_D))
 
 // The GEMV of a launch that serves COUNT (ONE, SEVERAL) rows.
 #define ATTENTION_OUTPUT_GEMV(ROWS, LANES, COUNT)                                       \

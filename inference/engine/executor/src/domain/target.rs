@@ -97,7 +97,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 }
             }
         };
-        // The step is on the device: any failure from here drops it.
+        // The step is on the device: any failure from here drops it. Its
+        // tokens, now known whether launched or claimed, follow the
+        // sequences' accepted ones.
+        self.feed_tokens(operations)
+            .map_err(|error| SubmitFailure::Failed(DomainError::invariant(error)))?;
         self.queue_lookahead(&mut bindings, &work, operations)
             .map_err(SubmitFailure::Failed)?;
         Ok(TargetFlight { work, bindings })
@@ -319,6 +323,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let class_limits = self.target_class_limits();
         let class = crate::LaunchClass::covering(rows, segments, demand, class_limits)
             .map_err(|error| broken(error.to_string()))?;
+        let preceding = self.target_preceding(operations).map_err(broken)?;
         let mut metadata = Vec::with_capacity(operations.len());
         for operation in operations {
             let request = operation.request();
@@ -385,12 +390,14 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             readout_workspace,
             readout_output,
         )
-        .with_boundary(boundary);
+        .with_boundary(boundary)
+        .with_preceding(preceding);
         let launch = match ValidatedTargetLaunch::new(
             inputs,
             &self.target_store,
             self.domain.id(),
             self.definition.decoder.hidden as usize,
+            self.definition.head.as_ref().map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder)) as usize,
         ) {
             Ok(launch) => launch,
             Err((inputs, error)) => {
@@ -428,6 +435,33 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// views before choosing physical prefixes. Returns the bindings the
     /// flight held, with the lookahead it queued; an error consumes them, as
     /// the domain cannot continue.
+    /// Per operation of a target group, the accepted tokens its sequence
+    /// holds before the operation's first row, as many as the model's row
+    /// rules read (`TargetLaunchCore::preceding`); none of a model without
+    /// one.
+    pub(super) fn target_preceding(&self, operations: &[Operation]) -> Result<Vec<Vec<u64>>, String> {
+        let context = crate::operators::row_rule_context(&self.definition.decoder);
+        if context == 0 {
+            return Ok(Vec::new());
+        }
+        operations
+            .iter()
+            .map(|operation| {
+                let Operation::Forward {
+                    request, position, ..
+                } = operation
+                else {
+                    return Err("target group contains another operation kind".to_owned());
+                };
+                Ok(self
+                    .preceding_tokens(*request, *position, context)?
+                    .iter()
+                    .map(|token| u64::from(token.0))
+                    .collect())
+            })
+            .collect()
+    }
+
     pub fn finish_target(
         &mut self,
         flight: TargetFlight<F>,
@@ -521,11 +555,21 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             );
         }
         let (core, output) = completed.into_parts();
+        // A sequence whose stored-table rows could not be read in this step
+        // read other rows: it is poisoned, and this outcome and every later
+        // one of it fail. The step's other sequences are unaffected.
+        for (slot, (request, ..)) in flight.requests.iter().enumerate() {
+            if let Some(error) = output.table_read_failure(slot) {
+                self.poisoned.entry(*request).or_insert(error);
+            }
+        }
+        output.retire_stored_reads();
         let crate::TargetOutput {
             readout: output,
             commits,
             boundary,
             selected_rows: _,
+            stored_reads: _,
         } = output;
         let batch = core.batch();
         if batch.actual_slots() != flight.requests.len() {
@@ -682,9 +726,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                     ));
                 }
             };
+            let outcome = match self.poisoned.get(&request) {
+                Some(error) => Outcome::TableReadFailed(error.clone()),
+                None => Outcome::Forward { rows: result },
+            };
             pending.push(PendingOperationOutcome {
                 request,
-                outcome: Outcome::Forward { rows: result },
+                outcome,
                 advance: Some(advance),
                 primed: primed
                     .take_if(|(primed, _)| *primed == request)
@@ -985,6 +1033,12 @@ pub(super) fn row_histories(
     let binding = advance.bindings();
     let end = |read: usize| span_end.filter(|_| bidirectional[read]);
     let stored = store.history_domains().map(|domain| {
+        if indexer_domain(store, domain) {
+            let appended = appends.causal[domain.0]
+                .as_ref()
+                .ok_or("an indexer domain has no appended rows")?;
+            return indexer_history(store, advance, appended, domain, index);
+        }
         let (mut visible, mut fresh_start) = accepted_history(store, advance, domain, index)?;
         // Policy comes from this target row's declared causal/media behavior,
         // never a window size or the shape of a drafter's block.
@@ -1027,16 +1081,89 @@ pub(super) fn row_histories(
     stored.chain(shared).collect()
 }
 
-/// Compressed target domains whose prior causal rows must use their stored
-/// representation even while those rows belong to the same launch.
+/// Whether `domain` holds a selected read's indexer keys
+/// (`ComponentDescriptor::attended`): no attention reads it, its indexer
+/// does (`indexer_history`).
+pub(crate) fn indexer_domain(store: &StateStore, domain: magnitude_state::HistoryDomainId) -> bool {
+    !store
+        .history_components(domain)
+        .iter()
+        .all(magnitude_state::ComponentDescriptor::attended)
+}
+
+/// What row `index` of `advance` reads of an indexer's `domain`
+/// (`indexer_select`), every row as stored history, this launch's earlier
+/// rows at their destinations: in its raw keys' Window domain the rows of
+/// the `rows` positions before it, and its own destination; in its block
+/// keys' Block domain every block complete before it, and the destination
+/// of the block it completes (or -1). Its fresh span is the row alone.
+/// `appended` is the advance's runs in `domain` (`AppendedRuns::of`).
+pub(crate) fn indexer_history(
+    store: &StateStore,
+    advance: &TentativeAdvance,
+    appended: &AppendedRuns,
+    domain: magnitude_state::HistoryDomainId,
+    index: usize,
+) -> Result<RowHistory, String> {
+    let start = advance.position();
+    let position = start
+        .checked_add(index)
+        .ok_or("target row position overflows")?;
+    let destinations = &advance.bindings().destinations[domain.0];
+    let (from, prior, destination) = match store.history_domain_kind(domain) {
+        magnitude_state::HistoryDomainKind::Window { rows } => {
+            let from = position.saturating_sub(rows);
+            (from, from.saturating_sub(start)..index, destinations.get(index))
+        }
+        magnitude_state::HistoryDomainKind::Block { rate } => {
+            // The blocks the advance completed before the row, then the one
+            // it completes.
+            let before = position / rate - start / rate;
+            let completes = (position + 1) % rate == 0;
+            (
+                0,
+                0..before,
+                completes.then(|| destinations.get(before)).flatten(),
+            )
+        }
+        kind => return Err(format!("an indexer in a {kind:?} history domain")),
+    };
+    let mut visible = advance
+        .visible_ranges(domain, from)
+        .into_iter()
+        .map(|(start, count)| {
+            Ok([
+                i32::try_from(start).map_err(|_| "history start exceeds i32")?,
+                i32::try_from(start.checked_add(count).ok_or("history end overflow")?)
+                    .map_err(|_| "history end exceeds i32")?,
+            ])
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    visible.extend(appended.causal_prior(prior.start, prior.end)?);
+    Ok(RowHistory {
+        visible,
+        fresh_start: i32::try_from(index).map_err(|_| "fresh start exceeds i32")?,
+        bidirectional_end: None,
+        destination: destination.map_or(Ok(-1), |value| {
+            i32::try_from(*value).map_err(|_| "indexer destination exceeds i32")
+        })?,
+    })
+}
+
+/// Target domains whose rows read their launch's earlier rows as stored
+/// history even while those rows belong to the same launch: a compressed
+/// history's, whose prior causal rows must use their stored representation,
+/// and a selected read's, whose indexer selects among stored rows and whose
+/// rows read only themselves fresh.
 pub(crate) fn cached_causal_domain(
     store: &StateStore,
     domain: magnitude_state::HistoryDomainId,
 ) -> bool {
-    store
-        .history_components(domain)
-        .iter()
-        .any(magnitude_state::ComponentDescriptor::causal_rows_use_cache)
+    store.history_components(domain).iter().any(|component| {
+        component.causal_rows_use_cache()
+            || matches!(component.layer, magnitude_state::LayerRef::Target(block)
+                if store.indexer_domains(block).is_some())
+    })
 }
 
 /// The rows one advance appends to one stored history domain, in slot order,
@@ -1218,9 +1345,9 @@ impl AppendedRuns {
 }
 
 /// The appended runs the rows of one advance read, formed once for its slot:
-/// of each compressed causal stored domain (`cached_causal_domain`), by
-/// domain, and of each Shared source domain, in `shared_source_domains`
-/// order.
+/// of each compressed causal stored domain (`cached_causal_domain`) and each
+/// indexer domain (`indexer_domain`), by domain, and of each Shared source
+/// domain, in `shared_source_domains` order.
 pub(super) struct SlotAppends {
     causal: Vec<Option<AppendedRuns>>,
     shared: Vec<(magnitude_state::HistoryDomainId, AppendedRuns)>,
@@ -1229,10 +1356,12 @@ pub(super) struct SlotAppends {
 impl SlotAppends {
     pub(super) fn of(store: &StateStore, advance: &TentativeAdvance) -> Self {
         Self {
+            // An indexer reads its launch's earlier rows as stored history
+            // too (`indexer_history`).
             causal: store
                 .history_domains()
                 .map(|domain| {
-                    cached_causal_domain(store, domain)
+                    (cached_causal_domain(store, domain) || indexer_domain(store, domain))
                         .then(|| AppendedRuns::of(store, advance, domain))
                 })
                 .collect(),
@@ -1257,11 +1386,9 @@ pub(super) fn reserved_segments(store: &StateStore, spans: usize, rows: usize) -
         + store
             .shared_source_domains()
             .into_iter()
-            .chain(
-                store
-                    .history_domains()
-                    .filter(|&domain| rows > 1 && cached_causal_domain(store, domain)),
-            )
+            .chain(store.history_domains().filter(|&domain| {
+                rows > 1 && (cached_causal_domain(store, domain) || indexer_domain(store, domain))
+            }))
             .map(|domain| rows.div_ceil(store.history_page_rows(domain)) + 1)
             .max()
             .unwrap_or(0)

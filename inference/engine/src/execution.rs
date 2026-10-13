@@ -668,7 +668,28 @@ pub(crate) fn build(
             .host_table_bytes()
             .map_err(|error| internal(error.to_string()))?,
     )?;
-    startup.claim("target import", target_peak, target_upload)?;
+    // The stored tables' slots and directories, part of the target's
+    // weights, are allocated where the device's host-shared storage lives:
+    // on a dedicated device whose shared storage is host RAM, they are
+    // claimed there, beside the staged upload, not in its own memory.
+    let shared_in_host = match magnitude_executor::platform::shared_role(device.info())
+        .map_err(|error| platform_error(PlatformError::Memory(error)))?
+    {
+        DomainRole::Allocation => 0,
+        DomainRole::Staging => execution_plan
+            .load()
+            .shared_table_bytes()
+            .map_err(|error| internal(error.to_string()))?,
+    };
+    startup.claim(
+        "target import",
+        target_peak
+            .checked_sub(shared_in_host)
+            .ok_or_else(|| internal("stored tables exceed the target import peak"))?,
+        target_upload
+            .checked_add(shared_in_host)
+            .ok_or_else(|| internal("target import staging byte count overflow"))?,
+    )?;
     let import_progress = progress.clone();
     let import_device = device.clone();
     let mut band_observed = Instant::now();

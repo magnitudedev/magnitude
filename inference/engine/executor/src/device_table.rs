@@ -9,7 +9,10 @@
 //!
 //! Nothing here knows which table it holds or what its readers compute.
 
+use crate::planning::DirectoryForm;
 use crate::slot_directory::SlotDirectory;
+use crate::stored_table::StoredTable;
+use std::sync::Arc;
 use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
@@ -23,38 +26,68 @@ use std::{
 /// rows the device selects finds their slots in the directory and says so
 /// when it is queued (`read_selected`); what it is given tells, once the host
 /// knows the rows, whether the device held them.
+///
+/// A stored table (`StoredTable`) is read only through its directory, by
+/// steps that wait at its gate until the host has written the rows they
+/// name: every row such a read names is found.
 #[derive(Clone)]
-pub struct ResidentTable(Option<Rc<DeviceTable>>);
+pub enum ResidentTable {
+    /// A table the device holds whole: a row is its own index.
+    Whole,
+    Streamed(Rc<DeviceTable>),
+    Stored(Arc<StoredTable>),
+}
 
 impl ResidentTable {
     /// A table the device holds whole: a row is its own index.
     pub fn whole() -> Self {
-        Self(None)
+        Self::Whole
     }
 
     pub fn streamed(table: Rc<DeviceTable>) -> Self {
-        Self(Some(table))
+        Self::Streamed(table)
     }
 
-    /// A streamed table's directory: per table row, its slot, or -1.
+    /// A streamed table's directory (`gathered_row`).
     pub fn directory(&self) -> Option<&seismic::Tensor> {
-        self.0.as_ref().map(|table| &table.directory)
+        match self {
+            Self::Whole => None,
+            Self::Streamed(table) => Some(&table.directory),
+            Self::Stored(table) => Some(table.directory()),
+        }
+    }
+
+    /// The stored table this is.
+    pub fn stored(&self) -> Option<&Arc<StoredTable>> {
+        match self {
+            Self::Stored(table) => Some(table),
+            _ => None,
+        }
     }
 
     /// What a streamed table allocates beside its slots: its directory and
     /// its staging (`WeightPlan::streamed_bytes`).
     pub fn streamed_bytes(&self) -> u64 {
-        self.0.as_ref().map_or(0, |table| {
-            table.directory.storage_bytes() + table.staging.storage_bytes()
-        })
+        match self {
+            Self::Whole => 0,
+            Self::Streamed(table) => {
+                table.directory.storage_bytes() + table.staging.storage_bytes()
+            }
+            Self::Stored(table) => table.directory_bytes(),
+        }
     }
 
     /// The indices a kernel gathers `rows` by: the rows themselves, or a
     /// streamed table's slots, which brings the rows the device lacks ahead
-    /// of the work queued next.
+    /// of the work queued next. A stored table's rows are read only through
+    /// its directory.
     pub fn indices(&self, rows: &[i32]) -> Result<Vec<i32>, String> {
-        let Some(table) = &self.0 else {
-            return Ok(rows.to_vec());
+        let table = match self {
+            Self::Whole => return Ok(rows.to_vec()),
+            Self::Streamed(table) => table,
+            Self::Stored(_) => {
+                return Err("a stored table's rows are read through its directory".into());
+            }
         };
         let rows = rows
             .iter()
@@ -66,7 +99,10 @@ impl ResidentTable {
     /// A reader of rows the device selects is being queued.
     pub fn read_selected(&self) -> SelectedRead {
         SelectedRead {
-            queued: self.0.as_ref().map(|table| (table.clone(), table.queue_reader())),
+            queued: match self {
+                Self::Streamed(table) => Some((table.clone(), table.queue_reader())),
+                Self::Whole | Self::Stored(_) => None,
+            },
         }
     }
 }
@@ -180,7 +216,7 @@ impl KeptRows {
         Self(directory.join(format!("{name}.rows")))
     }
 
-    fn read(&self) -> Vec<u64> {
+    pub(crate) fn read(&self) -> Vec<u64> {
         std::fs::read_to_string(&self.0)
             .ok()
             .and_then(|text| {
@@ -191,7 +227,7 @@ impl KeptRows {
             .unwrap_or_default()
     }
 
-    fn write(&self, rows: &[u64]) {
+    pub(crate) fn write(&self, rows: &[u64]) {
         let text = rows.iter().map(u64::to_string).collect::<Vec<_>>().join(" ");
         let _ = self
             .0
@@ -225,6 +261,7 @@ impl DeviceTable {
         row_shape: &[u64],
         slots: u64,
         staging_rows: u64,
+        form: DirectoryForm,
         source: Box<dyn TileSource>,
         kept: Option<KeptRows>,
     ) -> Result<Self, String> {
@@ -239,8 +276,9 @@ impl DeviceTable {
                 .chain(row_shape.iter().copied())
                 .collect::<Vec<_>>()
         };
-        let tiles = SlotDirectory::new(rows, slots, tile);
+        let mut tiles = SlotDirectory::new(rows, slots, tile, form);
         let slot_tiles = tiles.slot_tiles();
+        let directory_shape = [form.entries(rows, slots), form.fields()];
         let slots = seismic::Tensor::zeros(device, element, &shape(slots))
             .map_err(|error| format!("device table slots: {error}"))?;
         Ok(Self {
@@ -249,8 +287,8 @@ impl DeviceTable {
             directory: seismic::Tensor::from_host(
                 device,
                 seismic::Element::i32(),
-                &[rows],
-                &tiles.entry_bytes(0, rows),
+                &directory_shape,
+                &tiles.entry_bytes(),
             )
             .map_err(|error| format!("device table directory: {error}"))?,
             source,
@@ -306,7 +344,7 @@ impl DeviceTable {
         absent.truncate(free);
         let taken = (state.filled..state.filled + absent.len()).collect::<Vec<_>>();
         state.filled += absent.len();
-        self.bring(&mut state, &absent, &taken, &[], served)?;
+        self.bring(&mut state, &absent, &taken, served)?;
         match state.brought.take() {
             Some(brought) => brought(),
             None => Ok(()),
@@ -367,19 +405,18 @@ impl DeviceTable {
         if held + absent.len() > state.tiles.slot_tiles() {
             return Err("a step names more rows than the device has slots for".into());
         }
-        let (mut taken, mut replaced) = (Vec::with_capacity(absent.len()), Vec::new());
+        let mut taken = Vec::with_capacity(absent.len());
         for _ in &absent {
             let (named, step) = (&state.named, state.step);
-            let (slot, held) = state
+            let (slot, _) = state
                 .tiles
                 .free(|slot| named[slot] == step)
                 .ok_or("a streamed table found no slot for a step's row")?;
             state.named[slot] = state.step;
             taken.push(slot);
-            replaced.extend(held);
         }
         taken.sort_unstable();
-        self.bring(state, &absent, &taken, &replaced, true)?;
+        self.bring(state, &absent, &taken, true)?;
         if state.step == Self::KEPT_AFTER_STEPS {
             self.keep(state);
         }
@@ -390,17 +427,15 @@ impl DeviceTable {
     }
 
     /// Queue the table tiles of first rows `tiles` (ascending) into the slot
-    /// tiles `taken` (ascending), which held the tiles of first rows
-    /// `replaced`. Tiles in table order into slots in slot order: tiles
-    /// that follow one another are read together, and adjacent slots are
-    /// filled together. `served`: a step named the tiles, now or when the
-    /// table was last served.
+    /// tiles `taken` (ascending), which the directory released. Tiles in
+    /// table order into slots in slot order: tiles that follow one another
+    /// are read together, and adjacent slots are filled together. `served`:
+    /// a step named the tiles, now or when the table was last served.
     fn bring(
         &self,
         state: &mut State,
         tiles: &[u64],
         taken: &[usize],
-        replaced: &[u64],
         served: bool,
     ) -> Result<(), String> {
         if tiles.is_empty() {
@@ -447,21 +482,24 @@ impl DeviceTable {
             true => brought()?,
             false => state.brought = Some(brought),
         }
-        // The directory is written once, over the rows from the first to
-        // the last that changed.
-        let low = replaced.iter().chain(tiles).copied().min().expect("tiles");
-        let high = replaced.iter().chain(tiles).copied().max().expect("tiles") + tile;
+        // The directory's entries that changed (the tiles that left their
+        // slots and the ones brought) are written: a dense directory's once,
+        // from the first row that changed to the last.
         state.changes += 1;
         for (first, slot) in tiles.iter().zip(taken) {
             state.tiles.hold(*first, *slot, served);
             state.served[*slot] = served;
             state.brought_at[*slot] = state.changes;
         }
-        self.directory
-            .slice_leading(low, high)
-            .map_err(device)?
-            .write_from_host(&state.tiles.entry_bytes(low, high))
-            .map_err(device)
+        for (first, bytes) in state.tiles.take_changes() {
+            let entries = (bytes.len() / 4) as u64 / self.directory.extents()[1];
+            self.directory
+                .slice_leading(first, first + entries)
+                .map_err(device)?
+                .write_from_host(&bytes)
+                .map_err(device)?;
+        }
+        Ok(())
     }
 
     /// Keep the first row of every tile the device holds that a step named,
@@ -547,6 +585,7 @@ mod tests {
             &[3],
             4,
             1,
+            DirectoryForm::Dense,
             Box::new(Rows),
             kept.map(|directory| KeptRows::of(directory, "table")),
         )
@@ -591,7 +630,9 @@ mod tests {
         assert_eq!(directory(&table), [0, 1, 2, 3, -1, -1, -1, -1]);
         assert_eq!(slot(&table, 2), row(2));
         let table = ResidentTable::streamed(table);
-        let streamed = table.0.as_ref().unwrap();
+        let ResidentTable::Streamed(streamed) = &table else {
+            unreachable!("a streamed table");
+        };
         // Its directory and its one staged row.
         assert_eq!(table.streamed_bytes(), 8 * 4 + 12);
 

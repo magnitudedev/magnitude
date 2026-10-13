@@ -85,6 +85,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let installed = self.input.get_mut(&request).expect("input checked above");
         installed.resident = true;
         installed.boundary = from.and_then(|from| from.boundary.clone());
+        // A resumed sequence holds the tokens of the state it resumes.
+        installed.tokens = from.map_or_else(Default::default, |from| {
+            input::TokenHistory::starting(&from.tokens)
+        });
         let spans = installed.input.layout().spans();
         let mut encodes = Vec::new();
         for (identity, slot) in &mut installed.images {
@@ -194,6 +198,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             })
             .collect::<Result<_, String>>()?;
         Ok(ResumeState {
+            tokens: installed.tokens.before(position)?.into(),
             target,
             head,
             features,
@@ -214,6 +219,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         self.head.remove(&request);
         self.input.remove(&request);
         self.target.remove(&request);
+        self.poisoned.remove(&request);
         Ok(())
     }
 

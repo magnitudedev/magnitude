@@ -46,6 +46,22 @@
 #endif
 
 #define PREFILL_KEYS FLASH_KEYS
+// A WorkList prefill (the entry's PREFILL_SELECTED: `indexer_select`'s
+// per-row block bitmap, PREFILL_SELECTION_WORDS words a row, the
+// PREFILL_BLOCK_ROWS keys of a block) walks the key tiles its list launch
+// (`prefill_list`) listed for its query tile and masks every key per row.
+// The entry names the bitmap and the list launch's scratch: each row's key
+// ordinal at the start of each of its spans ([M][R + 1] i32), each query
+// tile's listed (span, first) pairs ([tiles][PREFILL_LIST_CAPACITY]) and
+// their counts.
+#ifndef PREFILL_SELECTED
+#define PREFILL_SELECTED false
+#endif
+#ifdef PREFILL_DECODE
+#define PREFILL_SELECTED_PASS false
+#else
+#define PREFILL_SELECTED_PASS PREFILL_SELECTED
+#endif
 // PREFILL_ROWS, the matrix rows of a workgroup, is the entry's (and with
 // PREFILL_DECODE, PREFILL_PARTS its partitions).
 
@@ -227,6 +243,116 @@ void prefill_lane_scores(uint scratch, float scale, int first, bool inside, int 
     }
 }
 
+#if !defined(PREFILL_DECODE)
+// Whether row `row` reads key `key` of span `index` (bounds from `lo`) under
+// the WorkList: the bit of the key's block; a block past the bitmap is not
+// read.
+// `base` is the row's key ordinal at the span's start.
+bool prefill_reads(uint64_t row, int base, int key, int lo) {
+    if (!PREFILL_SELECTED)
+        return true;
+    const int ordinal = base + key - lo;
+    const uint block = uint(ordinal) / uint(PREFILL_BLOCK_ROWS);
+    if (block / 32u >= uint(PREFILL_SELECTION_WORDS))
+        return false;
+    const uint word = element_u32_at(PREFILL_SELECTION_BUFFER
+        + (row * uint64_t(PREFILL_SELECTION_WORDS) + uint64_t(block / 32u)) * 4ul);
+    return ((word >> (block % 32u)) & 1u) != 0u;
+}
+
+// The list launch (PREFILL_SELECTED): workgroup per QT-row query tile, 256
+// invocations. It writes each tile row's span ordinals, then lists, in L2's
+// tile order (each span's union interval in PREFILL_KEYS-key tiles, spans
+// then fresh), the key tiles some row of the tile reads. Shared u32: a flag
+// per invocation, then the running count.
+void prefill_list() {
+    const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
+    const uint64_t fresh = SEISMIC_PTR(SEISMIC_BUFFER_FRESH);
+    const uint64_t rows = SEISMIC_DIM_M;
+    const uint64_t spans = SEISMIC_DIM_R;
+    const uint tile = gl_WorkGroupID.x;
+    const uint thread = gl_LocalInvocationIndex;
+    const uint threads = gl_WorkGroupSize.x;
+    const uint64_t tile_first = uint64_t(tile) * PREFILL_QT;
+    if (thread < PREFILL_QT && tile_first + thread < rows) {
+        const uint64_t row = tile_first + thread;
+        int base = 0;
+        for (uint64_t index = 0ul; index <= spans; ++index) {
+            int lo, hi;
+            attention_span(visible, fresh, row, spans, index, lo, hi);
+            element_i32_put(PREFILL_BASES_BUFFER + (row * (spans + 1ul) + index) * 4ul, base);
+            base += max(hi - lo, 0);
+        }
+    }
+    if (thread == 0u)
+        seismic_shared_u32[threads] = 0u;
+    barrier();
+    uint total = 0u;
+    for (uint64_t index = 0ul; index <= spans; ++index)
+        total += prefill_span_tiles(prefill_interval(visible, fresh, tile_first, rows, spans, index));
+    for (uint first_candidate = 0u; first_candidate < total; first_candidate += threads) {
+        const uint candidate = first_candidate + thread;
+        bool read = false;
+        int entry_span = 0, entry_first = 0;
+        if (candidate < total) {
+            uint before = 0u;
+            ivec4 interval = ivec4(0);
+            for (uint64_t index = 0ul; index <= spans; ++index) {
+                interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
+                const uint n = prefill_span_tiles(interval);
+                if (candidate < before + n) {
+                    entry_span = int(index);
+                    entry_first = interval.x + int((candidate - before) * PREFILL_KEYS);
+                    break;
+                }
+                before += n;
+            }
+            const int end = min(entry_first + int(PREFILL_KEYS), interval.y);
+            for (uint i = 0u; i < PREFILL_QT && !read; ++i) {
+                const uint64_t row = tile_first + i;
+                if (row >= rows)
+                    break;
+                // The row's ordinal at the span's start (the bases this
+                // launch writes are read by the attend launch only).
+                int base = 0;
+                int lo = 0, hi = 0;
+                for (uint64_t index = 0ul; index < uint64_t(entry_span); ++index) {
+                    attention_span(visible, fresh, row, spans, index, lo, hi);
+                    base += max(hi - lo, 0);
+                }
+                attention_span(visible, fresh, row, spans, uint64_t(entry_span), lo, hi);
+                const int first_key = max(entry_first, lo);
+                const int last_key = min(end, hi);
+                if (first_key >= last_key)
+                    continue;
+                for (int key = first_key; key < last_key && !read; ++key)
+                    read = prefill_reads(row, base, key, lo);
+            }
+        }
+        seismic_shared_u32[thread] = read ? 1u : 0u;
+        barrier();
+        uint offset = seismic_shared_u32[threads];
+        for (uint other = 0u; other < thread; ++other)
+            offset += seismic_shared_u32[other];
+        if (read && offset < PREFILL_LIST_CAPACITY) {
+            const uint64_t slot = PREFILL_LISTS_BUFFER + ((uint64_t(tile) * PREFILL_LIST_CAPACITY + offset) * 2ul) * 4ul;
+            element_i32_put(slot, entry_span);
+            element_i32_put(slot + 4ul, entry_first);
+        }
+        barrier();
+        if (thread == 0u) {
+            uint added = 0u;
+            for (uint other = 0u; other < threads; ++other)
+                added += seismic_shared_u32[other];
+            seismic_shared_u32[threads] += added;
+        }
+        barrier();
+    }
+    if (thread == 0u)
+        element_u32_put(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul, min(seismic_shared_u32[threads], PREFILL_LIST_CAPACITY));
+}
+#endif
+
 void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     const uint W = ATTENTION_W, KV = ATTENTION_KV, G = ATTENTION_G;
     const uint64_t visible = SEISMIC_PTR(SEISMIC_BUFFER_VISIBLE);
@@ -295,6 +421,11 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
     uint total_tiles = 0u;
     for (uint64_t index = 0ul; index <= spans; ++index)
         total_tiles += prefill_span_tiles(prefill_interval(visible, fresh, tile_first, rows, spans, index));
+#ifndef PREFILL_DECODE
+    // A WorkList's key tiles are its query tile's listed ones.
+    if (PREFILL_SELECTED)
+        total_tiles = element_u32_at(PREFILL_LISTED_BUFFER + uint64_t(tile) * 4ul);
+#endif
     const uint per = max(PREFILL_MIN_TILES, (total_tiles + parts - 1u) / parts);
     const uint used = max(1u, (total_tiles + per - 1u) / per);
     if (part >= used) {
@@ -348,8 +479,52 @@ void prefill_attend(attention_history h, prefill_scratch scratch_planes) {
         const uint column0 = pass * PREFILL_WINDOW;
         flash_output_clear(W, PREFILL_WINDOW, o);
         flash_softmax softmax = flash_softmax_start();
+#ifndef PREFILL_DECODE
+        // A WorkList walks its listed key tiles, every key masked per row.
+        for (uint listed = tiles_lo; PREFILL_SELECTED && listed < tiles_hi; ++listed) {
+            const uint64_t slot = PREFILL_LISTS_BUFFER + ((uint64_t(tile) * PREFILL_LIST_CAPACITY + listed) * 2ul) * 4ul;
+            const uint64_t index = uint64_t(element_i32_at(slot));
+            const int first = element_i32_at(slot + 4ul);
+            const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
+            const bool historical = index < spans;
+            int row_lo = 0, row_hi = 0, row_base = 0;
+            if (valid) {
+                attention_span(visible, fresh, token, spans, index, row_lo, row_hi);
+                row_base = element_i32_at(PREFILL_BASES_BUFFER + (token * (spans + 1ul) + index) * 4ul);
+            }
+            flash_scores_state scores;
+            flash_scores_clear(scores);
+            for (uint column = 0u; column < W; column += chunk) {
+                barrier();
+                prefill_stage(h, scratch_planes, true, historical, first, interval.y, kv_head, column, chunk);
+                barrier();
+                if (computes)
+                    flash_scores_add(block_queries + uint64_t(column) * 2ul, uint64_t(W), chunk, 0u, scores);
+            }
+            uint p_half = 0u;
+            if (computes) {
+                flash_scores_publish(scores, scratch);
+                float s[16];
+                prefill_lane_scores(scratch, scale, first, false, row_lo, row_hi, s);
+                const uint lane_half = SEISMIC_LANE / 16u;
+                [[unroll]] for (uint j = 0u; j < 16u; ++j) {
+                    const int t = first + int(16u * lane_half + j);
+                    if (valid && t >= row_lo && t < row_hi && !prefill_reads(token, row_base, t, row_lo))
+                        s[j] = -ATTENTION_INF;
+                }
+                const float alpha = flash_online(softmax, s);
+                p_half = flash_publish_probabilities(scratch, s);
+                flash_rescale(scratch, alpha, W, PREFILL_WINDOW, o);
+            }
+            barrier();
+            prefill_stage(h, scratch_planes, false, historical, first, interval.y, kv_head, column0, width);
+            barrier();
+            if (computes)
+                flash_accumulate(p_half, 0u, width, width, 0u, o);
+        }
+#endif
         uint tiles_before = 0u;
-        for (uint64_t index = 0ul; index <= spans; ++index) {
+        for (uint64_t index = 0ul; index <= spans && !PREFILL_SELECTED_PASS; ++index) {
             const ivec4 interval = prefill_interval(visible, fresh, tile_first, rows, spans, index);
             const uint span_tiles = prefill_span_tiles(interval);
             const uint span_first = tiles_before;

@@ -14,9 +14,10 @@ use crate::{
 use magnitude_family_contracts::{ProgressivePlane, SublayerIndex, WeightScope};
 use magnitude_kernels::{
     attention_append_dense, cluster_token_rows, draft_convolve_input, draft_convolve_residual,
-    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, packing_bound,
-    place_logits_rows, post_norm_residual, project_rows, readout_project_rows, repack_weight,
-    tap_rows, widen_rows,
+    draft_gated_rows, draft_path_step, draft_top_k, feature_rows, import_dense, indexer_select,
+    ngram_gate, ngram_inject, ngram_rows, packing_bound, place_logits_rows, post_norm_residual,
+    project_rows, readout_project_rows, repack_weight, repeat_rows, selection_notice, stored_rows,
+    stream_mix_down, stream_mix_up, tap_rows, widen_rows,
 };
 use std::{collections::HashSet, rc::Rc};
 
@@ -66,6 +67,7 @@ pub struct AttestedPrograms {
 
 #[derive(Clone)]
 pub(crate) struct AttestedTarget {
+    pub residual_features: Option<NativeKernel<feature_rows::Entry>>,
     pub embedding: NativeKernel<embedding_rows::Entry>,
     pub blocks: Vec<AttestedTargetBlock>,
     pub readout: ReadoutKernels,
@@ -87,6 +89,10 @@ pub(crate) struct AttestedTargetBlock {
     pub output_scales: OutputScales,
     /// The per-layer input sublayer's entries, when the block has one.
     pub per_layer: Option<PerLayerKernels>,
+    /// The decoder's hyper-connection streams' entries, when it has them.
+    pub streams: Option<StreamsKernels>,
+    /// The n-gram input's entries, when the block has one.
+    pub ngram: Option<NGramKernels>,
 }
 
 /// The factor a sublayer's post-norm row op scales its result by: 1, or the
@@ -234,7 +240,6 @@ pub(crate) enum AttestedFeedForward {
 
 #[derive(Clone)]
 pub(crate) struct AttestedHead {
-    pub feature_copy: NativeKernel<feature_copy::Entry>,
     pub blocks: Vec<AttestedHeadBlock>,
     /// Token selection over the draft vocabulary.
     pub shape: NativeKernel<shape_rows::Entry>,
@@ -243,6 +248,9 @@ pub(crate) struct AttestedHead {
 
 #[derive(Clone)]
 pub(crate) struct AttestedHeadBlock {
+    pub streams: Option<super::StreamsKernels>,
+    pub copy: NativeKernel<feature_copy::Entry>,
+    pub gather: NativeKernel<feature_rows::Entry>,
     pub binding: HeadBinding,
     pub input: NativeKernel<draft_rows::Entry>,
     pub attention: AttentionKernels,
@@ -460,7 +468,7 @@ impl AttestedPrograms {
                 .head
                 .as_ref()
                 .ok_or("head graph requires a draft head")?;
-            let head = crate::operators::EmbeddedHeadBlock::of(
+            let head = crate::operators::CausalHeadBlock::of(
                 head,
                 head.blocks
                     .first()
@@ -651,7 +659,9 @@ impl AttestedPrograms {
                 };
             }
             if let ImportProgramSlot::Repack { resident, .. } = slot {
-                if crate::planning::packing_run(*resident).is_some() && charged_bounds.insert(*resident) {
+                if crate::planning::packing_run(*resident).is_some()
+                    && charged_bounds.insert(*resident)
+                {
                     bytes += bytes!(packing_bound);
                 }
             }
@@ -717,6 +727,21 @@ impl AttestedPrograms {
                                     "native rotated K4/V4 KV codec",
                                 ));
                             }
+                        }
+                        // A selected read's indexer projection, selection
+                        // and WorkList prefill.
+                        + match binding.selection {
+                            Some(_) => {
+                                bytes!(attention_project)
+                                    + bytes!(indexer_select)
+                                    + match binding.history.encoding() {
+                                        magnitude_state::HistoryEncoding::Affine => {
+                                            bytes!(attention_prefill_k8v4)
+                                        }
+                                        _ => bytes!(attention_prefill),
+                                    }
+                            }
+                            None => 0,
                         }
                 }
                 MixerProgramSlot::Recurrent(binding)
@@ -791,6 +816,23 @@ impl AttestedPrograms {
                 bytes += bytes!(per_layer_gate) + bytes!(project_rows) + bytes!(post_norm_residual);
             }
         }
+        let mut charged_ngrams = HashSet::new();
+        for binding in target.blocks().iter().filter_map(|block| block.ngram()) {
+            if charged_ngrams.insert(binding) {
+                bytes += bytes!(ngram_rows)
+                    + bytes!(stored_rows)
+                    + bytes!(selection_notice)
+                    + 2 * bytes!(project_rows)
+                    + bytes!(ngram_gate)
+                    + bytes!(ngram_inject);
+            }
+        }
+        let mut charged_streams = HashSet::new();
+        for binding in target.blocks().iter().filter_map(|block| block.streams()) {
+            if charged_streams.insert(binding) {
+                bytes += 2 * bytes!(stream_mix_down) + bytes!(stream_mix_up) + bytes!(repeat_rows);
+            }
+        }
         if target.per_layer().is_some() {
             bytes += 2 * bytes!(import_dense)
                 + bytes!(repack_weight)
@@ -817,11 +859,24 @@ impl AttestedPrograms {
         if target.taps().is_some() {
             bytes += bytes!(tap_rows) + bytes!(project_rows) + bytes!(feature_rows);
         }
+        if plan.head().is_some_and(|head| {
+            head.blocks()
+                .iter()
+                .any(|block| block.conditioning == Element::f32())
+        }) {
+            bytes += bytes!(feature_rows);
+        }
         if let Some(head) = plan.head() {
             // Token selection over the draft vocabulary.
             bytes += bytes!(shape_rows) + bytes!(sample_rows);
             for &binding in head.blocks() {
                 if charged_heads.insert(binding) {
+                    bytes += bytes!(feature_copy) + bytes!(feature_rows);
+                    if binding.streams.is_some() {
+                        bytes += 2 * bytes!(stream_mix_down)
+                            + bytes!(stream_mix_up)
+                            + bytes!(repeat_rows);
+                    }
                     bytes += bytes!(draft_rows)
                         + 2 * bytes!(attention_project)
                         + bytes!(attention_append_dense)
@@ -1198,11 +1253,35 @@ impl AttestedPrograms {
                             .ok_or_else(|| missing("parallel_stages", binding)),
                     })
                     .transpose()?;
+                let streams = block
+                    .streams()
+                    .map(|binding| {
+                        prepared
+                            .target
+                            .streams
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("stream_mix", binding))
+                    })
+                    .transpose()?;
+                let ngram = block
+                    .ngram()
+                    .map(|binding| {
+                        prepared
+                            .target
+                            .ngram
+                            .get(&binding)
+                            .cloned()
+                            .ok_or_else(|| missing("ngram_inject", binding))
+                    })
+                    .transpose()?;
                 blocks.push(AttestedTargetBlock {
                     mixer,
                     feed_forward,
                     output_scales,
                     per_layer,
+                    streams,
+                    ngram,
                 });
             }
             Ok(blocks)
@@ -1256,6 +1335,7 @@ impl AttestedPrograms {
             })
             .transpose()?;
         let target = AttestedTarget {
+            residual_features: prepared.target.residual_features.clone(),
             embedding: slot(
                 &prepared.target.embedding,
                 target_plan.embedding(),
@@ -1327,6 +1407,18 @@ impl AttestedPrograms {
                         };
                     }
                     blocks.push(AttestedHeadBlock {
+                        streams: binding
+                            .streams
+                            .map(|_| {
+                                handles
+                                    .streams
+                                    .get(&binding)
+                                    .cloned()
+                                    .ok_or_else(|| missing("head streams", binding))
+                            })
+                            .transpose()?,
+                        copy: slot(&handles.copy, binding, "feature_copy")?,
+                        gather: slot(&handles.gather, binding, "feature_rows")?,
                         binding: attested_binding,
                         input: slot(&handles.input, binding, "draft_rows")?,
                         priming_project: slot(
@@ -1370,11 +1462,6 @@ impl AttestedPrograms {
                     });
                 }
                 Ok::<_, CatalogFailure>(AttestedHead {
-                    feature_copy: prepared
-                        .glue
-                        .feature_copy
-                        .clone()
-                        .ok_or_else(|| missing("feature_copy", "activation"))?,
                     blocks,
                     shape: handles
                         .shape
@@ -1486,6 +1573,7 @@ impl AttestedPrograms {
                 Some(DType::F16) => &prepared.glue.copy_rows_f16,
                 Some(DType::BF16) => &prepared.glue.copy_rows_bf16,
                 Some(DType::U32) => &prepared.glue.copy_rows_u32,
+                Some(DType::I32) => &prepared.glue.copy_rows_i32,
                 _ => return Err(missing("copy_rows", element)),
             };
             copies.push((
@@ -1601,7 +1689,13 @@ impl AttestedPrograms {
         for handles in prepared.target.attention.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
                 + u128::from(handles.history.invocation_workspace_bytes())
-                + u128::from(handles.output.invocation_workspace_bytes());
+                + u128::from(handles.output.invocation_workspace_bytes())
+                + u128::from(
+                    handles
+                        .selection
+                        .as_ref()
+                        .map_or(0, |selection| selection.invocation_workspace_bytes()),
+                );
         }
         for handles in prepared.target.recurrent.values() {
             bytes += u128::from(handles.project.invocation_workspace_bytes())
@@ -1641,6 +1735,21 @@ impl AttestedPrograms {
             bytes += u128::from(handles.gate.invocation_workspace_bytes())
                 + u128::from(handles.output.project.invocation_workspace_bytes())
                 + u128::from(handles.output.residual.invocation_workspace_bytes());
+        }
+        for handles in prepared.target.ngram.values() {
+            bytes += u128::from(handles.rows.invocation_workspace_bytes())
+                + u128::from(handles.stored.invocation_workspace_bytes())
+                + u128::from(handles.key.invocation_workspace_bytes())
+                + u128::from(handles.value.invocation_workspace_bytes())
+                + u128::from(handles.gate.invocation_workspace_bytes())
+                + u128::from(handles.inject.invocation_workspace_bytes())
+                + u128::from(handles.notice.invocation_workspace_bytes());
+        }
+        for handles in prepared.target.streams.values() {
+            bytes += u128::from(handles.down.invocation_workspace_bytes())
+                + u128::from(handles.exit.invocation_workspace_bytes())
+                + u128::from(handles.up.invocation_workspace_bytes())
+                + u128::from(handles.repeat.invocation_workspace_bytes());
         }
         for entry in prepared.target.per_layer_entry.values() {
             bytes += u128::from(entry.round.invocation_workspace_bytes())
@@ -1699,6 +1808,7 @@ impl AttestedPrograms {
             bytes += u128::from(handles.features.invocation_workspace_bytes())
                 + handles.head.invocation_workspace_bytes();
         }
+        charge!(prepared.target.residual_features.iter());
         charge!(prepared.target.features.values());
         if let Some(taps) = &prepared.target.taps {
             bytes += u128::from(taps.tap.invocation_workspace_bytes())
@@ -1707,6 +1817,14 @@ impl AttestedPrograms {
         }
         if let Some(head) = &prepared.head {
             charge!(head.input.values());
+            charge!(head.copy.values());
+            charge!(head.gather.values());
+            for handles in head.streams.values() {
+                bytes += u128::from(handles.down.invocation_workspace_bytes())
+                    + u128::from(handles.exit.invocation_workspace_bytes())
+                    + u128::from(handles.up.invocation_workspace_bytes())
+                    + u128::from(handles.repeat.invocation_workspace_bytes());
+            }
             charge!(head.priming_project.values());
             for handles in head.attention.values() {
                 bytes += u128::from(handles.project.invocation_workspace_bytes())
@@ -1807,6 +1925,7 @@ impl AttestedPrograms {
             prepared.glue.copy_rows_f16.as_ref(),
             prepared.glue.copy_rows_bf16.as_ref(),
             prepared.glue.copy_rows_u32.as_ref(),
+            prepared.glue.copy_rows_i32.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -1948,7 +2067,7 @@ impl AttestedPrograms {
                     outcome: error,
                 })?;
             crate::programs::native_target::NativeTargetProgram::new(
-                model.output_norm.tensor().device(),
+                model.embedding.tensor().device(),
                 self.state.clone(),
                 geometry,
                 graphs,
@@ -2198,6 +2317,16 @@ impl AttestedPrograms {
                         }
                     }
                 }
+                if let Some(selection) = &handles.selection {
+                    charge!(&selection.project);
+                    charge!(&selection.select);
+                    match &selection.prefill {
+                        super::target::SelectedPrefillKernel::Dense(kernel) => charge!(kernel),
+                        super::target::SelectedPrefillKernel::AffineK8V4(kernel) => {
+                            charge!(kernel)
+                        }
+                    }
+                }
                 tail!(&handles.output);
             }};
         }
@@ -2335,6 +2464,9 @@ impl AttestedPrograms {
                 }
             }
         }
+        if let Some(features) = &self.target.residual_features {
+            charge!(features);
+        }
         if let Some(features) = &self.target.features {
             charge!(features);
         }
@@ -2347,6 +2479,14 @@ impl AttestedPrograms {
         charge!(&self.target.sample);
         if let Some(head) = &self.head {
             for block in &head.blocks {
+                charge!(&block.copy);
+                charge!(&block.gather);
+                if let Some(streams) = &block.streams {
+                    charge!(&streams.down);
+                    charge!(&streams.exit);
+                    charge!(&streams.up);
+                    charge!(&streams.repeat);
+                }
                 charge!(&block.input);
                 charge!(&block.priming_project);
                 attention!(&block.attention);

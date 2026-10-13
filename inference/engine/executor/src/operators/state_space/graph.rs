@@ -8,6 +8,7 @@
 use crate::operators::gated_delta::graph::{
     RecurrentControlPorts, RecurrentStatePorts, bank_ports, chunked,
 };
+use crate::operators::{InputForm, Join};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
@@ -99,6 +100,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
+    join: &Join,
     block: StateSpaceBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
@@ -129,7 +131,13 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             kernels.project,
             &[
                 shape.project_dimensions(block.rows).as_slice(),
-                &[("QB", projection_bound.extent), ("GB", 0), ("KB", 0), ("VB", 0)],
+                &[
+                    ("QB", projection_bound.extent),
+                    ("GB", 0),
+                    ("KB", 0),
+                    ("VB", 0),
+                ],
+                &InputForm::SINGLE.dimensions(shape.hidden),
             ]
             .concat(),
             attention_project::WorkflowArgs {
@@ -181,7 +189,8 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                         state: ports.delta.tensor_mut().into(),
                         tape: ports.tape.tensor_mut().into(),
                         slab_banks: block.slab_banks,
-                    },                )?
+                    },
+                )?
                 .value
         };
     }
@@ -202,8 +211,10 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
                 projection: (&projection).into(),
                 state_norm: (&state_norm).into(),
                 epsilon: block.norm_epsilon,
-            },        )?
+            },
+        )?
         .value;
+    let inject = join.inject(graph, block.rows, constants)?;
     let output = graph
         .enqueue(
             kernels.output,
@@ -214,6 +225,7 @@ pub(crate) fn state_space<'a, G: GraphDraft + 'a>(
             .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
+                inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
                 output_bound: (&output_bound.tensor).into(),
@@ -270,7 +282,7 @@ mod tests {
         let mut offset = 0;
         let mut tensor = |name: String, shape: Vec<u64>| {
             let mut stored = |name: String, shape: Vec<u64>, encoding: Encoding| {
-                let nbytes = source_element(encoding)
+                let nbytes = source_element(encoding, *shape.last().unwrap())
                     .unwrap()
                     .canonical_byte_len(&shape)
                     .unwrap();

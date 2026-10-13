@@ -216,6 +216,118 @@ pub enum CodeInterpretation {
     TwosComplement,
     Offset(i32),
     Table(&'static [i32]),
+    /// One entry codes eight values through a grid (`GridCodes`); the code
+    /// of a value depends on its lane within the eight.
+    Grid(&'static GridCodes),
+}
+
+/// Vector codes (the GGUF IQ grids): one entry codes `GRID_VALUES`
+/// consecutive values. It holds `GRID_VALUES / lanes` grid indices of
+/// `index_bits` each, first index lowest, then `GRID_SIGN_BITS` sign bits;
+/// an eighth sign bit makes the count of set signs even (ggml's
+/// `ksigns_iq2xs`). The code of the value at `lane` is the grid magnitude
+/// for that lane, negated when its sign bit is set: byte `lane % lanes` of
+/// `points[index lane / lanes]`. An entry is `entry_bits` wide, whole bytes
+/// (so every layout addresses entries bytewise); bits past the signs are
+/// zero.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct GridCodes {
+    /// Values one grid point codes.
+    pub lanes: u32,
+    pub index_bits: u32,
+    pub entry_bits: u32,
+    /// Byte `j` of point `i` is the magnitude of its lane `j`.
+    pub points: &'static [u64],
+}
+
+/// Values one grid entry codes.
+pub const GRID_VALUES: u32 = 8;
+/// Explicit sign bits of one grid entry.
+pub const GRID_SIGN_BITS: u32 = 7;
+
+impl GridCodes {
+    /// Grid indices one entry holds.
+    pub const fn indices(&self) -> u32 {
+        GRID_VALUES / self.lanes
+    }
+
+    /// Bits of one entry.
+    pub const fn entry_bits(&self) -> u32 {
+        assert!(
+            self.entry_bits % 8 == 0
+                && self.entry_bits >= self.indices() * self.index_bits + GRID_SIGN_BITS,
+            "a grid entry is whole bytes holding its indices and signs"
+        );
+        self.entry_bits
+    }
+
+    /// The code of the value at `lane` (< `GRID_VALUES`) of `entry`.
+    pub fn code(&self, entry: u32, lane: u32) -> i32 {
+        let index_mask = (1u32 << self.index_bits) - 1;
+        let index = (entry >> (self.index_bits * (lane / self.lanes))) & index_mask;
+        let magnitude = (self.points[index as usize] >> (8 * (lane % self.lanes))) as u8;
+        let signs = (entry >> (self.index_bits * self.indices())) & ((1 << GRID_SIGN_BITS) - 1);
+        let signs = signs | ((signs.count_ones() & 1) << GRID_SIGN_BITS);
+        if (signs >> lane) & 1 == 0 {
+            i32::from(magnitude)
+        } else {
+            -i32::from(magnitude)
+        }
+    }
+
+    /// The grid's magnitudes as one table: point `i`'s lane `j` at
+    /// `i * lanes + j`. Built once per grid, for code generators that read a
+    /// table.
+    pub fn magnitudes(&'static self) -> &'static [i32] {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static TABLES: OnceLock<Mutex<HashMap<usize, &'static [i32]>>> = OnceLock::new();
+        let mut tables = TABLES
+            .get_or_init(Default::default)
+            .lock()
+            .expect("grid tables lock");
+        tables
+            .entry(self as *const Self as usize)
+            .or_insert_with(|| {
+                self.points
+                    .iter()
+                    .flat_map(|point| {
+                        (0..self.lanes).map(move |lane| i32::from((point >> (8 * lane)) as u8))
+                    })
+                    .collect::<Vec<_>>()
+                    .leak()
+            })
+    }
+
+    /// Every code the grid gives, ascending.
+    pub fn codes(&self) -> Vec<i32> {
+        let mut codes = self
+            .points
+            .iter()
+            .flat_map(|point| (0..self.lanes).map(move |lane| (point >> (8 * lane)) as u8))
+            .flat_map(|magnitude| [i32::from(magnitude), -i32::from(magnitude)])
+            .collect::<Vec<_>>();
+        codes.sort_unstable();
+        codes.dedup();
+        codes
+    }
+}
+
+impl CodeInterpretation {
+    /// Every code the interpretation gives a `bits`-wide entry, ascending.
+    pub fn codes(&self, bits: u32) -> Vec<i32> {
+        match self {
+            Self::Grid(grid) => grid.codes(),
+            _ => {
+                let mut codes = (0..1u32 << bits)
+                    .map(|raw| self.decode(raw, bits))
+                    .collect::<Vec<_>>();
+                codes.sort_unstable();
+                codes.dedup();
+                codes
+            }
+        }
+    }
 }
 #[cfg(test)]
 impl Repr {
@@ -289,6 +401,10 @@ pub enum DecodeStep {
         plane: u32,
         field: u32,
     },
+    /// `into: u32 :=` the position of the logical value being decoded among
+    /// the `planes[plane].group` values one entry of the plane at ordinal
+    /// `plane` covers: a vector code's lane.
+    ReadPlaneLane { into: DecodeTemp, plane: u32 },
     /// `into: i32 := interpretation.decode(raw, bits)` (unsigned, two's
     /// complement, zero-point offset, or table).
     InterpretCode {
@@ -296,6 +412,14 @@ pub enum DecodeStep {
         raw: DecodeTemp,
         bits: u32,
         interpretation: CodeInterpretation,
+    },
+    /// `into: i32 := grid.code(raw, lane)`: a vector code's value at its
+    /// lane.
+    InterpretGridCode {
+        into: DecodeTemp,
+        raw: DecodeTemp,
+        lane: DecodeTemp,
+        grid: &'static GridCodes,
     },
     /// Decode one closed floating code to its exact `f32` value.
     DecodeFloatCode {
@@ -336,7 +460,9 @@ impl DecodeStep {
     pub fn defines(&self) -> DecodeTemp {
         match self {
             DecodeStep::ReadPlaneField { into, .. }
+            | DecodeStep::ReadPlaneLane { into, .. }
             | DecodeStep::InterpretCode { into, .. }
+            | DecodeStep::InterpretGridCode { into, .. }
             | DecodeStep::DecodeFloatCode { into, .. }
             | DecodeStep::ConvertToF32 { into, .. }
             | DecodeStep::Multiply { into, .. }
@@ -349,8 +475,9 @@ impl DecodeStep {
     /// The temporaries this step reads, in operand order.
     pub(crate) fn uses(&self) -> Vec<DecodeTemp> {
         match self {
-            DecodeStep::ReadPlaneField { .. } => Vec::new(),
+            DecodeStep::ReadPlaneField { .. } | DecodeStep::ReadPlaneLane { .. } => Vec::new(),
             DecodeStep::InterpretCode { raw, .. } => vec![*raw],
+            DecodeStep::InterpretGridCode { raw, lane, .. } => vec![*raw, *lane],
             DecodeStep::DecodeFloatCode { raw, .. } => vec![*raw],
             DecodeStep::ConvertToF32 { from, .. }
             | DecodeStep::Negate { from, .. }
@@ -508,7 +635,7 @@ impl DecodeRecipe {
             )),
             QuantizedComponent::CodeMin | QuantizedComponent::CodeMax => {
                 let code = self.integer_code?;
-                let (bits, interpretation) = self
+                let codes = self
                     .steps
                     .iter()
                     .find_map(|step| match step {
@@ -517,16 +644,19 @@ impl DecodeRecipe {
                             bits,
                             interpretation,
                             ..
-                        } if *into == code => Some((*bits, interpretation)),
+                        } if *into == code => Some(interpretation.codes(*bits)),
+                        DecodeStep::InterpretGridCode { into, grid, .. } if *into == code => {
+                            Some(grid.codes())
+                        }
                         _ => None,
                     })
                     .expect("integer code owns its interpretation");
-                let values = (0..(1u32 << bits)).map(|raw| interpretation.decode(raw, bits));
                 let value = if role == QuantizedComponent::CodeMin {
-                    values.min()
+                    codes.first()
                 } else {
-                    values.max()
+                    codes.last()
                 }
+                .copied()
                 .expect("code domain nonempty");
                 Some(DecodeComponent::Constant(
                     crate::reference_math::ReferenceScalar::I32(value),
@@ -623,6 +753,20 @@ impl RecipeBuilder<'_> {
         bits: u32,
         interpretation: CodeInterpretation,
     ) -> DecodeTemp {
+        if let CodeInterpretation::Grid(grid) = interpretation {
+            let plane = self.ordinal(PlaneField::Words);
+            let lane = self.temp(DType::U32);
+            self.steps
+                .push(DecodeStep::ReadPlaneLane { into: lane, plane });
+            let into = self.temp(DType::I32);
+            self.steps.push(DecodeStep::InterpretGridCode {
+                into,
+                raw,
+                lane,
+                grid,
+            });
+            return into;
+        }
         let into = self.temp(DType::I32);
         self.steps.push(DecodeStep::InterpretCode {
             into,
@@ -845,6 +989,24 @@ pub(crate) const REPRS: &[Repr] = &[
         code: CodeInterpretation::Offset(8),
         float_code: None,
     },
+    // A GGUF IQ4_NL block: the IQ4 codebook, one f16 scale per 32, packets
+    // of 32 values (`iq4g32` above keeps eight blocks per packet with their
+    // scales widened).
+    Repr {
+        name: "iq4g32s",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: 4,
+        coefficients: Coefficients::Direct {
+            dtype: DType::F16,
+            bias: false,
+            packet_group: 32,
+        },
+        code: CodeInterpretation::Table(&[
+            -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+        ]),
+        float_code: None,
+    },
     // GGUF MXFP4 (OCP MX): E2M1 codes, one E8M0 power-of-two scale per 32.
     Repr {
         name: "mxfp4g32",
@@ -900,7 +1062,62 @@ pub(crate) const REPRS: &[Repr] = &[
         code: CodeInterpretation::Unsigned,
         float_code: None,
     },
+    // GGUF IQ2_XS: vector codes of eight values (a 9-bit grid index and 7
+    // sign bits, ggml's `qs` word), an odd 4-bit scale `2 s + 1` per 16 and
+    // one f32 factor `d / 8` per 256: ggml's `d (0.5 + s) / 4` exactly.
+    Repr {
+        name: "iq2xs",
+        packing_axis: PackingAxisRule::Last,
+        group: 16,
+        bits: IQ2XS_CODES.entry_bits(),
+        code: CodeInterpretation::Grid(&IQ2XS_CODES),
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F32,
+            bits: 4,
+            interpretation: CodeInterpretation::Table(&ODD_SCALES),
+            bias: false,
+            bias_sign: 1,
+        },
+    },
+    // GGUF IQ3_XXS: vector codes of eight values (two 8-bit grid indices of
+    // four values and 7 sign bits, in a 24-bit entry), an odd 4-bit scale `2 s + 1` per 32 and
+    // one f32 factor `d / 4` per 256: ggml's `d (0.5 + s) / 2` exactly.
+    Repr {
+        name: "iq3xxs",
+        packing_axis: PackingAxisRule::Last,
+        group: 32,
+        bits: IQ3XXS_CODES.entry_bits(),
+        code: CodeInterpretation::Grid(&IQ3XXS_CODES),
+        float_code: None,
+        coefficients: Coefficients::Hierarchical {
+            factor_group: 256,
+            factor_dtype: DType::F32,
+            bits: 4,
+            interpretation: CodeInterpretation::Table(&ODD_SCALES),
+            bias: false,
+            bias_sign: 1,
+        },
+    },
 ];
+
+pub(crate) static IQ2XS_CODES: GridCodes = GridCodes {
+    lanes: 8,
+    index_bits: 9,
+    entry_bits: 16,
+    points: &crate::grids::IQ2XS_GRID,
+};
+
+pub(crate) static IQ3XXS_CODES: GridCodes = GridCodes {
+    lanes: 4,
+    index_bits: 8,
+    entry_bits: 24,
+    points: &crate::grids::IQ3XXS_GRID,
+};
+
+/// The odd scale codes `2 s + 1` of a 4-bit IQ sub-block scale `s`.
+const ODD_SCALES: [i32; 16] = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31];
 
 pub(crate) fn lookup(name: &str) -> Option<&'static Repr> {
     REPRS.iter().find(|r| r.name == name)
@@ -945,7 +1162,11 @@ impl Repr {
             PlaneField::Words,
             Plane {
                 name: "words",
-                group: 1,
+                // A vector code's entry is shared by its eight values.
+                group: match self.code {
+                    CodeInterpretation::Grid(_) => GRID_VALUES,
+                    _ => 1,
+                },
                 fields: 1,
                 encoding: match self.float_code {
                     Some(format) => PlaneEncoding::FloatCode { format },
@@ -1270,6 +1491,15 @@ mod tests {
                     interpretation,
                     ..
                 } => f64::from(interpretation.decode(get(&temporaries, *raw) as u32, *bits)),
+                DecodeStep::ReadPlaneLane { plane, .. } => {
+                    (value % u64::from(recipe.planes()[*plane as usize].group)) as f64
+                }
+                DecodeStep::InterpretGridCode {
+                    raw, lane, grid, ..
+                } => f64::from(grid.code(
+                    get(&temporaries, *raw) as u32,
+                    get(&temporaries, *lane) as u32,
+                )),
                 DecodeStep::DecodeFloatCode { raw, format, .. } => {
                     f64::from(format.decode(get(&temporaries, *raw) as u32))
                 }
@@ -1383,10 +1613,13 @@ mod tests {
                         }
                     }
                 };
-                let code = plane_entry(0, flat as u64) as u32;
-                let decoded_code = match repr.float_code {
-                    Some(format) => format.decode(code),
-                    None => repr.decode_code(code) as f32,
+                let code = plane_entry(0, flat as u64 / u64::from(planes[0].group)) as u32;
+                let decoded_code = match (repr.float_code, &repr.code) {
+                    (Some(format), _) => format.decode(code),
+                    (None, CodeInterpretation::Grid(grid)) => {
+                        grid.code(code, flat as u32 % GRID_VALUES) as f32
+                    }
+                    (None, _) => repr.decode_code(code) as f32,
                 };
                 let expected = (coefficient(false) as f64 * f64::from(decoded_code)
                     + coefficient(true) as f64) as f32 as f64;
@@ -1429,6 +1662,17 @@ mod tests {
                             assert_eq!(recipe.dtype(*raw), DType::U32);
                             assert_eq!(recipe.dtype(*into), DType::I32);
                             assert!((1..=32).contains(bits));
+                        }
+                        DecodeStep::ReadPlaneLane { into, plane } => {
+                            assert!((*plane as usize) < recipe.planes().len());
+                            assert_eq!(recipe.dtype(*into), DType::U32);
+                        }
+                        DecodeStep::InterpretGridCode {
+                            into, raw, lane, ..
+                        } => {
+                            assert_eq!(recipe.dtype(*raw), DType::U32);
+                            assert_eq!(recipe.dtype(*lane), DType::U32);
+                            assert_eq!(recipe.dtype(*into), DType::I32);
                         }
                         DecodeStep::DecodeFloatCode {
                             into, raw, format, ..

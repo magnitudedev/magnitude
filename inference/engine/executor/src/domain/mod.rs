@@ -52,7 +52,9 @@ use in_flight::{PrimingFlight, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
 pub use state::MemoryChargeReconciliation;
 pub use target::TargetHostTiming;
-pub(crate) use target::{AppendedRuns, accepted_history, cached_causal_domain};
+pub(crate) use target::{
+    AppendedRuns, accepted_history, cached_causal_domain, indexer_domain, indexer_history,
+};
 
 use std::{
     cell::RefCell,
@@ -81,6 +83,9 @@ pub enum DomainError {
     Submit(crate::SubmitError),
     Device(crate::DeviceError),
     Invariant(crate::InvariantError),
+    /// One sequence's table rows could not be read: that sequence fails,
+    /// and execution continues.
+    TableRead(crate::TableReadError),
 }
 
 impl DomainError {
@@ -103,6 +108,7 @@ impl std::fmt::Display for DomainError {
             Self::Submit(error) => error.fmt(f),
             Self::Device(error) => error.fmt(f),
             Self::Invariant(error) => error.fmt(f),
+            Self::TableRead(error) => error.fmt(f),
         }
     }
 }
@@ -434,6 +440,8 @@ struct RequestInput {
     images: BTreeMap<String, InputImage>,
     resident: bool,
     boundary: Option<FeatureRef>,
+    /// The tokens of the resident sequence.
+    tokens: input::TokenHistory,
 }
 
 /// Everything needed to make a request resident at a position without
@@ -445,6 +453,8 @@ pub struct ResumeState {
     head: Option<StateCheckpoint>,
     features: BTreeMap<String, FeatureRef>,
     boundary: Option<FeatureRef>,
+    /// The sequence's tokens before its position.
+    tokens: Rc<[crate::TokenId]>,
 }
 
 impl ResumeState {
@@ -487,6 +497,10 @@ pub struct ExecutorDomain<F: ProgramFamily = NativeFamily> {
     next_flight: u64,
     /// Log lookahead queues, claims and orphans (read once at start).
     trace_lookahead: bool,
+    /// Sequences a step of which could not read its table rows: every
+    /// later outcome of theirs fails (`Outcome::TableReadFailed`) until they
+    /// close.
+    poisoned: BTreeMap<RequestId, crate::TableReadError>,
 }
 
 impl ExecutorDomain<NativeFamily> {
@@ -727,6 +741,18 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Bytes of the model's host-resident tables held in host RAM.
     pub fn host_table_bytes(&self) -> u64 {
         self.memory.borrow().host_table_bytes()
+    }
+
+    /// Bytes of the target's stored tables in host RAM rather than the
+    /// device's own memory: those of a dedicated device whose host-shared
+    /// storage is host RAM (`platform::shared_role`); 0 elsewhere.
+    pub fn host_stored_table_bytes(&self) -> Result<u64, String> {
+        let role = crate::platform::shared_role(self.memory.borrow().device().info())
+            .map_err(|error| error.to_string())?;
+        match role {
+            crate::platform::DomainRole::Allocation => Ok(0),
+            crate::platform::DomainRole::Staging => self.execution.load().shared_table_bytes(),
+        }
     }
 
     /// Refuse a launch whose vocabulary work the load did not plan: more
@@ -1529,6 +1555,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             planned: Vec::new(),
             next_flight: 0,
             trace_lookahead: std::env::var_os("MAGNITUDE_TRACE_LOOKAHEAD").is_some(),
+            poisoned: BTreeMap::new(),
         };
         let bindings = StateBindings {
             target: target_state,

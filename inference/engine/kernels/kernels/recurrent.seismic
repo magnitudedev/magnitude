@@ -31,20 +31,21 @@
 # Output contract: `gated[M, NV, W] A`. The raw recurrent output `S q` per row
 # and value head is rounded to A (zero on rows outside every slot), then
 # RMS-normalized over the head with `epsilon`, scaled by `recurrent_norm`
-# (rounded to A), and multiplied by SiLU(z) (rounded to A); the product is
+# (rounded to A), and multiplied by the output gate of z (`output_gate`:
+# SiLU, or sigmoid, by `gate_function`; rounded to A); the product is
 # rounded to A. The raw output is internal to the entry: each native keeps it
 # in its `mixed` scratch, in A on the GPUs (sized for elements of up to four
 # bytes) and as F32 values rounded to A on the CPU.
 
-fn gated_delta_project[M, H, NK, NV, W, QB, ZB](hidden: &tensor[M, H] f32,
-    input_norm: &tensor[H] NW, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
+fn gated_delta_project[M, H, PT, NM, NK, NV, W, QB, ZB](hidden: &tensor[M, PT * H] f32,
+    input_norm: &tensor[NM] NW, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
     gate_weight: &tensor[NV * W, H] GW, alpha_weight: &tensor[NV, H] AW,
     beta_weight: &tensor[NV, H] BW, epsilon: f32, qkv_bound: &tensor[QB] f32,
     gate_bound: &tensor[ZB] f32)
     -> tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A
-    where QB >= 0 and ZB >= 0 and (QB == 0 or H % QB == 0) and (ZB == 0 or H % ZB == 0):
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)) and QB >= 0 and ZB >= 0 and (QB == 0 or H % QB == 0) and (ZB == 0 or H % ZB == 0):
     let mut normalized = tensor[M, H] A
-    rms_norm(hidden, input_norm, normalized, epsilon)
+    form_input(hidden, input_norm, normalized, epsilon)
     let mut projection = tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A
     for row in 0..M:
         for column in 0..(2 * NK + NV) * W + NV * W + 2 * NV:
@@ -90,7 +91,7 @@ fn gated_delta_project[M, H, NK, NV, W, QB, ZB](hidden: &tensor[M, H] f32,
 # results. The scratch is transient, per call, with `dense_output`'s sizes per
 # padded row and per qkv and z weight row.
 native gated_delta_project for metal from "metal/gated_delta_project.metal":
-    static (H, NK, NV, W, QB, ZB)
+    static (H, PT, NM, NK, NV, W, QB, ZB)
     params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form PACK in [0, 1],
         code arithmetic form RESIDUE in [1, 2])
     where (TALL == 0 or H % 128 == 0) and (PACK == 0 or (TALL == 1 and H % 256 == 0 and H < 1048576 and (2 * NK + NV) * W % 32 == 0 and NV * W % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and QB + ZB > 0))
@@ -155,7 +156,7 @@ native gated_delta_project for metal from "metal/gated_delta_project.metal":
 # (`gemm_small` to 64 rows, `gemm` beyond; either supports selected operands; see
 # `cuda_dense.seismic`); one shared stage forms semantic rows or selected S8/F16 matrix operands. (Metal: batched GEMV class, no INT8 path.)
 native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
-    static (H, NK, NV, W)
+    static (H, PT, NM, NK, NV, W)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
     where H % 64 == 0 and (OPERAND == 0 or INT8 == 0)
     scratch staged bytes (M * H * 2) when M > 1
@@ -197,7 +198,7 @@ native gated_delta_project for cuda from "cuda/gated_delta_project.cu":
 # TILE_M x TILE_N tiles (cooperative-matrix f16 multiplies under
 # SEISMIC_HAS_MATRIX, F32 FMAs otherwise).
 native gated_delta_project for vulkan from "vulkan/gated_delta_project.comp":
-    static (H, NK, NV, W)
+    static (H, PT, NM, NK, NV, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where SUB_M <= TILE_M and SUB_N <= TILE_N
@@ -287,7 +288,7 @@ fn gated_delta_convolve[M, B, S, P, CH, C, T](projection: &tensor[M, P] A,
 # its version's state (the bank's state advanced by its first `previous_tape`
 # tape rows); the rows after `stop` (up to T) are recorded in the successor's
 # tape. Each row's raw outputs are then gated: per value head, RMS-normalized,
-# scaled by the recurrent norm and multiplied by SiLU(z).
+# scaled by the recurrent norm and multiplied by the output gate of z.
 fn gated_delta_advance[M, B, S, NK, NV, W, T](
     projection: &tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A,
     convolved: &tensor[M, (2 * NK + NV) * W] f32,
@@ -296,7 +297,7 @@ fn gated_delta_advance[M, B, S, NK, NV, W, T](
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
     delta: &mut tensor[S, NV, W, W] f32,
     tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
-    norm_epsilon: f32, epsilon: f32, grouped: bool) -> tensor[M, NV, W] A where T >= 0:
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32) -> tensor[M, NV, W] A where T >= 0:
     let mut mixed = tensor[M, NV, W] A
     for row in 0..M:
         for head in 0..NV:
@@ -403,7 +404,7 @@ fn gated_delta_advance[M, B, S, NK, NV, W, T](
             for column in 0..W:
                 let gate = f32(projection[row, (2 * NK + NV) * W + value_head * W + column])
                 normalized[row, value_head, column] = f32(mixed[row, value_head, column]) * inverse * f32(recurrent_norm[column])
-                activated[row, value_head, column] = gate / (1.0 + exp(-gate))
+                activated[row, value_head, column] = output_gate(gate, gate_function)
                 gated[row, value_head, column] = f32(normalized[row, value_head, column]) * f32(activated[row, value_head, column])
     return gated
 
@@ -417,11 +418,12 @@ fn gated_delta_rows[M, B, S, NK, NV, W, C, T](
     window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
     delta: &mut tensor[S, NV, W, W] f32,
     tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
-    norm_epsilon: f32, epsilon: f32, grouped: bool) -> tensor[M, NV, W] A where T >= 0:
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32) -> tensor[M, NV, W] A where T >= 0:
     let convolved = gated_delta_convolve(projection, convolution, segments, stop, previous_bank,
         previous_tape, following_bank, window)
     return gated_delta_advance(projection, convolved, rate, time_bias, recurrent_norm, segments, stop,
-        previous_bank, previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped)
+        previous_bank, previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped,
+        gate_function)
 
 
 # Row-sequential state advance for small row classes. Each threadgroup owns
@@ -438,9 +440,11 @@ fn gated_delta_step[M, B, S, NK, NV, W, C, T](
     window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
     delta: &mut tensor[S, NV, W, W] f32,
     tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
-    norm_epsilon: f32, epsilon: f32, grouped: bool, slab_banks: u32) -> tensor[M, NV, W] A where T >= 0:
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32, slab_banks: u32)
+    -> tensor[M, NV, W] A where T >= 0:
     return gated_delta_rows(projection, convolution, rate, time_bias, recurrent_norm, segments, stop,
-        previous_bank, previous_tape, following_bank, window, delta, tape, norm_epsilon, epsilon, grouped)
+        previous_bank, previous_tape, following_bank, window, delta, tape, norm_epsilon, epsilon, grouped,
+        gate_function)
 
 # Metal: each threadgroup stores its raw outputs to `mixed`; the last of a
 # value head's threadgroups to arrive (`arrivals`, one counter per head)
@@ -523,14 +527,15 @@ native gated_delta_step for cpu from "cpu/gated_delta_step.rs":
 # has at least one row. Given equal rounded projection values, the convolved
 # channels and successor window have `gated_delta_step`'s bits: the F32 tap
 # chain reads the projection values rounded to A.
-fn gated_delta_project_convolved[M, B, S, H, NK, NV, W, C, T](hidden: &tensor[M, H] f32,
-    input_norm: &tensor[H] NW, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
+fn gated_delta_project_convolved[M, B, S, H, PT, NM, NK, NV, W, C, T](hidden: &tensor[M, PT * H] f32,
+    input_norm: &tensor[NM] NW, qkv_weight: &tensor[(2 * NK + NV) * W, H] QW,
     gate_weight: &tensor[NV * W, H] GW, alpha_weight: &tensor[NV, H] AW,
     beta_weight: &tensor[NV, H] BW, convolution: &tensor[(2 * NK + NV) * W, C] f32,
     segments: &tensor[B + 1, 2] i32, stop: &tensor[B] i32,
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
     window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A, epsilon: f32, slab_banks: u32)
-    -> (tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A, tensor[M, (2 * NK + NV) * W] f32) where T >= 0:
+    -> (tensor[M, (2 * NK + NV) * W + NV * W + 2 * NV] A, tensor[M, (2 * NK + NV) * W] f32)
+    where T >= 0 and NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
     # Decode classes: no packed form, so no packing bounds.
     let qkv_bound = tensor[0] f32
     let gate_bound = tensor[0] f32
@@ -553,7 +558,7 @@ fn gated_delta_project_convolved[M, B, S, H, NK, NV, W, C, T](hidden: &tensor[M,
 # it; the owner of a slot's first row also copies the source window rows the
 # successor keeps.
 native gated_delta_project_convolved for metal from "metal/gated_delta_project_convolved.metal":
-    static (H, NK, NV, W, C)
+    static (H, PT, NM, NK, NV, W, C)
     params (arithmetic BATCH_FROM in [5, 3, 9])
     scratch normalized bytes (M * H * 2) when M >= BATCH_FROM and M <= 16
     launch gated_delta_project_convolved_normalize when M >= BATCH_FROM and M <= 16:
@@ -595,9 +600,11 @@ fn gated_delta_step_convolved[M, B, S, NK, NV, W, T](
     previous_bank: &tensor[B] i32, previous_tape: &tensor[B] i32, following_bank: &tensor[B] i32,
     delta: &mut tensor[S, NV, W, W] f32,
     tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
-    norm_epsilon: f32, epsilon: f32, grouped: bool, slab_banks: u32) -> tensor[M, NV, W] A where T >= 0:
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32, slab_banks: u32)
+    -> tensor[M, NV, W] A where T >= 0:
     return gated_delta_advance(projection, convolved, rate, time_bias, recurrent_norm, segments, stop,
-        previous_bank, previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped)
+        previous_bank, previous_tape, following_bank, delta, tape, norm_epsilon, epsilon, grouped,
+        gate_function)
 
 # Metal: `gated_delta_step`'s launch and arithmetic, whose prologue loads the
 # convolved channels: a simdgroup L2-normalizes a q or k row with one
@@ -637,9 +644,11 @@ fn gated_delta_chunk[M, B, S, NK, NV, W, C, T](
     window: &mut tensor[S, C - 1 + T, (2 * NK + NV) * W] A,
     delta: &mut tensor[S, NV, W, W] f32,
     tape: &mut tensor[S, T, NV * W + NK * W + NV] f32,
-    norm_epsilon: f32, epsilon: f32, grouped: bool, slab_banks: u32) -> tensor[M, NV, W] A where T >= 0:
+    norm_epsilon: f32, epsilon: f32, grouped: bool, gate_function: i32, slab_banks: u32)
+    -> tensor[M, NV, W] A where T >= 0:
     return gated_delta_rows(projection, convolution, rate, time_bias, recurrent_norm, segments, stop,
-        previous_bank, previous_tape, following_bank, window, delta, tape, norm_epsilon, epsilon, grouped)
+        previous_bank, previous_tape, following_bank, window, delta, tape, norm_epsilon, epsilon, grouped,
+        gate_function)
 
 # Metal: `inputs` convolves every row once into scratch, and the scan builds
 # each piece's system in threadgroup memory and stores the raw outputs to

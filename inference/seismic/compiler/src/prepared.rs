@@ -283,6 +283,7 @@ pub enum ArgumentValue {
     BF16(u16),
     I32(i32),
     U32(u32),
+    U64(u64),
     Bool(bool),
     Index(seismic_lang::expr::BigUint),
     Range {
@@ -665,6 +666,9 @@ mod internals {
             }
             (seismic_lang::types::DType::U32, ArgumentValue::U32(value)) => {
                 Some(SymbolValue::U32(*value))
+            }
+            (seismic_lang::types::DType::U64, ArgumentValue::U64(value)) => {
+                Some(SymbolValue::U64(*value))
             }
             (seismic_lang::types::DType::Bool, ArgumentValue::Bool(value)) => {
                 Some(SymbolValue::Bool(*value))

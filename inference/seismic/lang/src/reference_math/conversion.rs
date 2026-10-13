@@ -3,20 +3,22 @@
 //! Conversions use the owning recipe or literal quantizer (memoized for finite
 //! payload domains), so host code
 //! (registries, runtime binding, comparison) never carries a second formula for
-//! narrow floating formats. Bits are the dtype's payload in the low bits of the word.
+//! narrow floating formats. Bits are the dtype's payload in the low bits of the
+//! word; these host conversions cover the 32-bit dtypes, never U64.
 use super::*;
 
 /// The payload of `bits` of `from` converted by the source cast to `to`.
 pub fn convert_bits(from: DType, to: DType, bits: u32) -> u32 {
     let recipe = scalar_recipe(ScalarOp::Cast(to), &[from]);
-    evaluate(&recipe, &[ReferenceScalar::from_bits(from, bits)])
+    assert!(from != DType::U64 && to != DType::U64, "32-bit payload conversion");
+    evaluate(&recipe, &[ReferenceScalar::from_bits(from, bits.into())])
         .expect("casts have no failures")
-        .bits()
+        .bits() as u32
 }
 
 /// Round-to-nearest-even quantization of an exact F64 value to a floating dtype.
 pub fn quantize(dtype: DType, value: f64) -> u32 {
-    float_literal(dtype, value).bits()
+    float_literal(dtype, value).bits() as u32
 }
 
 /// The exact value of floating payload `bits`. Every NaN payload maps to NaN.
@@ -39,10 +41,10 @@ pub fn exact_f64(dtype: DType, bits: u32) -> f64 {
             .map(|bits| {
                 let widened = evaluate(
                     &recipe,
-                    &[ReferenceScalar::from_bits(dtype, u32::from(bits))],
+                    &[ReferenceScalar::from_bits(dtype, u64::from(bits))],
                 )
                 .expect("casts have no failures")
-                .bits();
+                .bits() as u32;
                 f64::from(f32::from_bits(widened))
             })
             .collect()
@@ -61,8 +63,8 @@ pub fn compare_bits(op: CmpOp, dtype: DType, a: u32, b: u32) -> bool {
     };
     let recipe = scalar_recipe(ScalarOp::Binary(source), &[dtype, dtype]);
     let inputs = [
-        ReferenceScalar::from_bits(dtype, a),
-        ReferenceScalar::from_bits(dtype, b),
+        ReferenceScalar::from_bits(dtype, a.into()),
+        ReferenceScalar::from_bits(dtype, b.into()),
     ];
     match evaluate(&recipe, &inputs).expect("comparisons have no failures") {
         ReferenceScalar::Bool(result) => result,

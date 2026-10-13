@@ -24,8 +24,8 @@ pub fn compare_element_bits(
     policy: &PrecisionPolicy,
     subject: &str,
     dtype: DType,
-    reference: u32,
-    actual: u32,
+    reference: u64,
+    actual: u64,
 ) -> ElementComparison {
     if !dtype.is_float() {
         return ElementComparison {
@@ -36,10 +36,11 @@ pub fn compare_element_bits(
         };
     }
     let tolerance = policy.tolerance(subject);
+    // Floating payloads are at most 32 bits wide.
     let difference = FloatDifference::measure(
         dtype,
-        reference,
-        actual,
+        reference as u32,
+        actual as u32,
         tolerance.map_or(0.0, |tolerance| tolerance.relative_floor.get()),
     );
     let accepted = match policy {
@@ -92,7 +93,7 @@ impl FloatDifference {
         let minimum_normal = match dtype {
             DType::F32 | DType::BF16 => 2.0_f64.powi(-126),
             DType::F16 => 2.0_f64.powi(-14),
-            DType::I32 | DType::U32 | DType::Bool => {
+            DType::I32 | DType::U32 | DType::U64 | DType::Bool => {
                 unreachable!("{dtype} is not a floating dtype")
             }
         };
@@ -160,10 +161,10 @@ impl FloatDifference {
 }
 
 /// The value of a discrete payload, for the absolute-error diagnostic.
-fn discrete_value(dtype: DType, bits: u32) -> f64 {
+fn discrete_value(dtype: DType, bits: u64) -> f64 {
     match dtype {
-        DType::I32 => f64::from(bits as i32),
-        DType::U32 | DType::Bool => f64::from(bits),
+        DType::I32 => f64::from(bits as u32 as i32),
+        DType::U32 | DType::U64 | DType::Bool => bits as f64,
         DType::F32 | DType::BF16 | DType::F16 => unreachable!("{dtype} is not a discrete dtype"),
     }
 }
@@ -176,7 +177,7 @@ pub fn compare_element(
     actual: f64,
 ) -> ElementComparison {
     // Integer/Boolean semantics are never relaxed by a floating-point policy.
-    if matches!(dtype, DType::Bool | DType::I32 | DType::U32) {
+    if matches!(dtype, DType::Bool | DType::I32 | DType::U32 | DType::U64) {
         return ElementComparison {
             accepted: reference == actual,
             absolute_error: (reference - actual).abs(),
@@ -258,6 +259,17 @@ mod tests {
     use super::*;
     use seismic_lang::precision::Limit;
     use std::collections::BTreeMap;
+
+    /// The rule over 32-bit payloads, which every case here uses.
+    fn compare_element_bits(
+        policy: &PrecisionPolicy,
+        subject: &str,
+        dtype: DType,
+        reference: u32,
+        actual: u32,
+    ) -> ElementComparison {
+        super::compare_element_bits(policy, subject, dtype, reference.into(), actual.into())
+    }
 
     const F32_ONE: u32 = 0x3f80_0000;
 

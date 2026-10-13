@@ -510,7 +510,14 @@ mod tests {
             seismic::generated::native_implementation::<routed_output::Entry>(&device)
                 .unwrap()
                 .unwrap();
-        let values = [("H", 256), ("K", 2), ("F", 16_384), ("S", 256)];
+        let values = [
+            ("H", 256),
+            ("SN", 1),
+            ("IN", 0),
+            ("K", 2),
+            ("F", 16_384),
+            ("S", 256),
+        ];
         let Err(CatalogFailure::KernelDomain { entry, statics }) =
             domain_statics(&implementation, "routed_output", "A=bf16", &values)
         else {
@@ -519,7 +526,14 @@ mod tests {
         assert_eq!(entry, "routed_output");
         assert_eq!(
             statics,
-            [("F", 16_384), ("H", 256), ("K", 2), ("S", 256)]
+            [
+                ("F", 16_384),
+                ("H", 256),
+                ("IN", 0),
+                ("K", 2),
+                ("S", 256),
+                ("SN", 1),
+            ]
                 .map(|(name, value)| (name.to_owned(), value))
                 .to_vec()
         );
@@ -528,7 +542,14 @@ mod tests {
                 &implementation,
                 "routed_output",
                 "A=bf16",
-                &[("H", 256), ("K", 2), ("F", 512), ("S", 256)],
+                &[
+                    ("H", 256),
+                    ("SN", 1),
+                    ("IN", 0),
+                    ("K", 2),
+                    ("F", 512),
+                    ("S", 256),
+                ],
             )
             .is_ok()
         );

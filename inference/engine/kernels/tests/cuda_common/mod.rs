@@ -45,10 +45,13 @@ pub enum Format {
     Q5_1,
     Mxfp4,
     Nvfp4,
+    /// GGUF IQ2_XS and IQ3_XXS (vector codes, representations of their own).
+    Iq2Xs,
+    Iq3Xxs,
 }
 
 impl Format {
-    pub const ALL: [Format; 10] = [
+    pub const ALL: [Format; 12] = [
         Format::Q4K,
         Format::Q5K,
         Format::Q6K,
@@ -59,6 +62,8 @@ impl Format {
         Format::Q5_1,
         Format::Mxfp4,
         Format::Nvfp4,
+        Format::Iq2Xs,
+        Format::Iq3Xxs,
     ];
     pub fn external(self) -> &'static str {
         match self {
@@ -72,6 +77,8 @@ impl Format {
             Format::Q5_1 => "gguf_q5_1",
             Format::Mxfp4 => "gguf_mxfp4",
             Format::Nvfp4 => "gguf_nvfp4",
+            Format::Iq2Xs => "gguf_iq2_xs",
+            Format::Iq3Xxs => "gguf_iq3_xxs",
         }
     }
     pub fn representation(self) -> &'static str {
@@ -86,6 +93,8 @@ impl Format {
             Format::Q5_1 => "q5g32",
             Format::Mxfp4 => "mxfp4g32",
             Format::Nvfp4 => "nvfp4g16",
+            Format::Iq2Xs => "iq2xs",
+            Format::Iq3Xxs => "iq3xxs",
         }
     }
     /// Whether the CUDA GEMM keeps this format's codes exact and scales its
@@ -94,7 +103,13 @@ impl Format {
     pub fn scaled_gemm(self) -> bool {
         matches!(
             self,
-            Format::Q4_0 | Format::Q5_0 | Format::Q5_1 | Format::Mxfp4 | Format::Nvfp4
+            Format::Q4_0
+                | Format::Q5_0
+                | Format::Q5_1
+                | Format::Mxfp4
+                | Format::Nvfp4
+                | Format::Iq2Xs
+                | Format::Iq3Xxs
         )
     }
     pub fn resident(self) -> Element {
@@ -152,6 +167,18 @@ impl Format {
                 // UE4M3 subnormal and smallest-normal scales (<= 2^-5).
                 block.extend((0..4).map(|_| (rng.next() % 16) as u8));
                 block.extend((0..32).map(|_| rng.byte()));
+            }
+            Format::Iq2Xs => {
+                // d (values reach d * 31 * 43 / 8), 32 grid entries, eight
+                // scale bytes.
+                block.extend(f16(rng.uniform(0.0002, 0.001)));
+                block.extend((0..64 + 8).map(|_| rng.byte()));
+            }
+            Format::Iq3Xxs => {
+                // d (values reach d * 31 * 62 / 4), 64 grid indices, eight
+                // sign-and-scale words.
+                block.extend(f16(rng.uniform(0.00005, 0.0003)));
+                block.extend((0..64 + 32).map(|_| rng.byte()));
             }
         }
         block

@@ -83,6 +83,14 @@
 #define ROUTE_PACKED 1
 #define ROUTE_ROUTER_KIND PACKETS_Q5G32
 #define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_Q5(SEISMIC_ROUTER)
+#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ2XS)
+#define ROUTE_PACKED 1
+#define ROUTE_ROUTER_KIND PACKETS_IQ2XS
+#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_ROUTER)
+#elif defined(SEISMIC_ROUTER_REPRESENTATION_IQ3XXS)
+#define ROUTE_PACKED 1
+#define ROUTE_ROUTER_KIND PACKETS_IQ3XXS
+#define ROUTE_ROUTER_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_ROUTER)
 #else
 #error "unsupported routed router representation"
 #endif
@@ -101,7 +109,25 @@ float route_residual(uint64_t row, uint source) {
 }
 
 float route_norm(uint source) {
+#if SEISMIC_STATIC_NM == 0
+    return 0.0;
+#else
     return element_at(ROUTE_NORM, SEISMIC_PTR(SEISMIC_BUFFER_NORM), uint64_t(source) * SEISMIC_NORM_STRIDE_0);
+#endif
+}
+
+// The routed input at (row, source), rounded to A (`form_input`): the
+// residual times the row's RMS `inverse` and the norm weight `scale`, or (no
+// norm) the sum in part order of the mix site's partials.
+float route_input(uint64_t row, uint source, float inverse, float scale) {
+#if SEISMIC_STATIC_NM == 0
+    float sum = 0.0;
+    for (uint part = 0u; part < uint(SEISMIC_DIM_PT); ++part)
+        sum = seismic_add_rn(sum, route_residual(row, part * uint(SEISMIC_DIM_H) + source));
+    return element_round(ROUTE_ACT, sum);
+#else
+    return element_round(ROUTE_ACT, route_residual(row, source) * inverse * scale);
+#endif
 }
 
 void route_publish(uint64_t row, uint source, float value) {
@@ -138,7 +164,7 @@ void routed_route_stage() {
     }
     const float inverse = inversesqrt(seismic_div_rn(reduce_group_sum(squares, 0u), float(hidden)) + eps);
     for (uint source = thread; source < hidden; source += ROUTE_THREADS)
-        route_publish(row, source, element_round(ROUTE_ACT, route_residual(row, source) * inverse * route_norm(source)));
+        route_publish(row, source, route_input(row, source, inverse, route_norm(source)));
 }
 
 // M <= 8, one launch before the selection. Shared floats: parts [8][8], then
@@ -173,8 +199,7 @@ void routed_route_gemv() {
     if (gl_WorkGroupID.x == 0u) {
         for (uint item = thread; item < rows * hidden; item += gl_WorkGroupSize.x) {
             const uint row = item / hidden, source = item % hidden;
-            route_publish(row, source,
-                element_round(ROUTE_ACT, route_residual(row, source) * seismic_shared_f32[inverses + row] * route_norm(source)));
+            route_publish(row, source, route_input(row, source, seismic_shared_f32[inverses + row], route_norm(source)));
         }
     }
     const uint expert = gl_WorkGroupID.x * SEISMIC_SUBGROUPS + sg;
@@ -202,9 +227,8 @@ void routed_route_gemv() {
                     const float scale = route_norm(source);
                     [[unroll]] for (uint row = 0u; row < 8u; ++row)
                         if (row < rows)
-                            sums[row] = seismic_fma_rn(element_round(ROUTE_ACT,
-                                route_residual(row, source) * seismic_shared_f32[inverses + row] * scale),
-                                weight, sums[row]);
+                            sums[row] = seismic_fma_rn(
+                                route_input(row, source, seismic_shared_f32[inverses + row], scale), weight, sums[row]);
                 }
             }
         } else {
@@ -215,9 +239,8 @@ void routed_route_gemv() {
                 const float scale = route_norm(source);
                 [[unroll]] for (uint row = 0u; row < 8u; ++row)
                     if (row < rows)
-                        sums[row] = seismic_fma_rn(element_round(ROUTE_ACT,
-                            route_residual(row, source) * seismic_shared_f32[inverses + row] * scale),
-                            weight, sums[row]);
+                        sums[row] = seismic_fma_rn(
+                            route_input(row, source, seismic_shared_f32[inverses + row], scale), weight, sums[row]);
             }
         }
     }
@@ -232,8 +255,7 @@ void routed_route_gemv() {
             if (row < rows) {
                 const float inverse = seismic_shared_f32[inverses + row];
                 [[unroll]] for (uint j = 0u; j < 4u; ++j)
-                    sums[row] = seismic_fma_rn(element_round(ROUTE_ACT, route_residual(row, base + j) * inverse * scale[j]),
-                        weight[j], sums[row]);
+                    sums[row] = seismic_fma_rn(route_input(row, base + j, inverse, scale[j]), weight[j], sums[row]);
             }
         }
     }

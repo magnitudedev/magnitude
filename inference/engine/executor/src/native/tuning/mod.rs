@@ -158,6 +158,7 @@ pub(crate) mod recurrent;
 pub(crate) mod routed;
 pub(crate) mod short_conv;
 pub(crate) mod state_space;
+pub(crate) mod streams;
 #[cfg(feature = "tuning-survey")]
 pub mod survey;
 mod trace;
@@ -177,9 +178,13 @@ use super::CatalogFailure;
 use super::specialization::{UntunedEntries, UntunedFormation};
 use crate::ModelLoadPlan;
 use crate::kernel_cache::{KernelCache, TuningCacheKey};
+use crate::operators::InputForm;
 use crate::programs::invocation_demand::Launch;
 use magnitude_batching::{ClassLimits, Demand, PackedRowTables, Row, RowHistory, Slot};
-use magnitude_family_contracts::{ModelDefinition, Operator, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    InputNorm, ModelDefinition, Operator, OutputForm, ResidualForm, Sublayer, WeightKind,
+    WeightScope,
+};
 #[cfg(feature = "tuning-survey")]
 use seismic::Strategy;
 use seismic::{
@@ -2029,6 +2034,111 @@ impl ModelInputs<'_> {
             .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
     }
 
+    /// The sublayer and residual form named by the first tuning scope.
+    fn sublayer(
+        &self,
+        scopes: &[WeightScope],
+    ) -> Result<Option<(&Sublayer, &ResidualForm)>, String> {
+        let scope = *scopes
+            .first()
+            .ok_or("a tuning case needs at least one layer")?;
+        let (block, index, residual) = match scope {
+            WeightScope::TargetSublayer(index) => (
+                self.definition.decoder.blocks.get(index.block as usize),
+                index,
+                &self.definition.decoder.residual,
+            ),
+            WeightScope::HeadSublayer(index) => {
+                let (head, block) = self
+                    .definition
+                    .head
+                    .as_ref()
+                    .and_then(|head| {
+                        head.blocks
+                            .iter()
+                            .flat_map(|head| head.blocks.iter().map(move |block| (head, block)))
+                            .nth(index.block as usize)
+                    })
+                    .ok_or("head tuning scope has no block")?;
+                (Some(block), index, &head.residual)
+            }
+            _ => return Ok(None),
+        };
+        block
+            .and_then(|block| block.sublayers.get(index.sublayer as usize))
+            .map(|sublayer| Some((sublayer, residual)))
+            .ok_or_else(|| format!("{scope:?} names no sublayer of the model"))
+    }
+
+    fn streams(residual: &ResidualForm) -> Result<u64, String> {
+        match residual {
+            ResidualForm::HyperConnections(form) => Ok(form.streams),
+            ResidualForm::Single => Err("the sublayer has a single residual stream".into()),
+        }
+    }
+
+    /// The residual join of the sublayers `scopes` name (`scatter`): its
+    /// streams `SN` and inject extent `IN`, (S, S) for a scatter into the
+    /// hyper-connection streams, else (1, 0).
+    pub fn join(&self, scopes: &[WeightScope]) -> Result<(u64, u64), String> {
+        match self.sublayer(scopes)? {
+            Some((
+                Sublayer {
+                    output: OutputForm::Scatter,
+                    ..
+                },
+                residual,
+            )) => {
+                let streams = Self::streams(residual)?;
+                Ok((streams, streams))
+            }
+            _ => Ok((1, 0)),
+        }
+    }
+
+    /// The input form of the sublayers `scopes` name (`form_input`): its
+    /// parts `PT` and norm extent `NM`, a mix site's S partials without a
+    /// norm, else one row normalized by a norm of `width`.
+    pub fn input_form(&self, scopes: &[WeightScope], width: u64) -> Result<(u64, u64), String> {
+        match self.sublayer(scopes)? {
+            Some((
+                Sublayer {
+                    input: InputNorm::HyperConnectionMix(_),
+                    ..
+                },
+                residual,
+            )) => Ok((Self::streams(residual)?, 0)),
+            _ => Ok((1, width)),
+        }
+    }
+
+    /// The input form of a readout normalized by the norm of `scope`: the
+    /// decoder exit site's S partials without a norm, or the final row
+    /// normalized by a norm of `width`.
+    pub fn readout_form(&self, scope: WeightScope, width: u64) -> Result<(u64, u64), String> {
+        let form = match scope {
+            WeightScope::Target => InputForm::exit(&self.definition.decoder),
+            WeightScope::HeadBlock(index) => {
+                let block = self
+                    .definition
+                    .head
+                    .as_ref()
+                    .and_then(|head| head.blocks.get(index as usize))
+                    .ok_or("head readout scope is absent")?;
+                match &block.residual {
+                    magnitude_family_contracts::ResidualForm::HyperConnections(form) => InputForm {
+                        parts: form.streams,
+                        normalized: false,
+                    },
+                    _ => InputForm::SINGLE,
+                }
+            }
+            _ => InputForm::SINGLE,
+        };
+        let [(_, parts), (_, norm)] = form.dimensions(width);
+        Ok((parts, norm))
+    }
+
     /// The planned shape of one weight role.
     pub fn weight_shape(&self, scope: WeightScope, kind: WeightKind) -> Result<Vec<u64>, String> {
         Ok(weights::weight_plan(self.load, scope, kind)?.shape.clone())
@@ -2114,6 +2224,23 @@ impl TuningInputs<'_, '_> {
         match self.weights.bound(scope, kind)? {
             Some(bound) => Ok(bound),
             None => self.unit_scale(0),
+        }
+    }
+
+    /// A consumer entry's norm port of `extent` (`NM`): the resident norm
+    /// `kind`, or an empty `element` port when the input is a mix site's
+    /// partials.
+    pub fn input_norm(
+        &mut self,
+        scope: WeightScope,
+        kind: WeightKind,
+        element: Element,
+        extent: u64,
+    ) -> Result<Tensor, String> {
+        if extent == 0 {
+            self.scratch(element, &[0])
+        } else {
+            self.weight(scope, kind)
         }
     }
 

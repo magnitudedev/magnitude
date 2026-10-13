@@ -1470,7 +1470,7 @@ pub(crate) fn repack_bytes(
                     for (entry, expression) in expressions.iter().enumerate() {
                         let value =
                             scalar::cast(DType::I32, eval_repack(expression, source_packet));
-                        write_bits(plane_bytes, entry * bits as usize, bits, value.bits());
+                        write_bits(plane_bytes, entry * bits as usize, bits, value.bits() as u32);
                     }
                 }
             }
@@ -1531,6 +1531,13 @@ fn eval_repack(expression: &RepackExpr, source: &[u8]) -> ReferenceScalar {
             Some(DType::F32),
         )
         .unwrap(),
+        RepackExpr::ScaleF32 { value, exponent } => scalar::binary(
+            BinaryOp::Mul,
+            eval_repack(value, source),
+            ReferenceScalar::F32(2f32.powi(i32::from(*exponent)).to_bits()),
+            Some(DType::F32),
+        )
+        .unwrap(),
         RepackExpr::Lookup { index, table } => {
             let index = scalar::cast(DType::I32, eval_repack(index, source)).bits();
             ReferenceScalar::I32(table[index as usize])
@@ -1561,6 +1568,7 @@ fn scalar_symbol(value: ReferenceScalar) -> SymbolValue {
         ReferenceScalar::BF16(bits) => SymbolValue::BF16(bits),
         ReferenceScalar::I32(value) => SymbolValue::I32(value),
         ReferenceScalar::U32(value) => SymbolValue::U32(value),
+        ReferenceScalar::U64(value) => SymbolValue::U64(value),
         ReferenceScalar::Bool(value) => SymbolValue::Bool(value),
     }
 }
@@ -1582,6 +1590,7 @@ mod runtime_symbol_tests {
             ReferenceScalar::Bool(true),
             ReferenceScalar::I32(i32::MIN),
             ReferenceScalar::U32(u32::MAX),
+            ReferenceScalar::U64(u64::MAX - 1),
         ];
         let publications: Vec<_> = scalars
             .iter()
@@ -1624,8 +1633,9 @@ fn word_literal(dtype: DType, value: &BigInt) -> ReferenceScalar {
         dtype.is_int(),
         "checked quantity conversion targets a non-word dtype"
     );
-    let bits = (value & BigInt::from(u32::MAX))
-        .to_u32()
+    let mask = BigInt::from(u64::MAX >> (64 - 8 * dtype.bytes()));
+    let bits = (value & mask)
+        .to_u64()
         .expect("masked mathematical integer fits one word");
     ReferenceScalar::from_bits(dtype, bits)
 }

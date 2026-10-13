@@ -682,6 +682,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             | (value @ ops::ConstantValue::BF16(_), ValueType::Scalar(DType::BF16))
             | (value @ ops::ConstantValue::I32(_), ValueType::Scalar(DType::I32))
             | (value @ ops::ConstantValue::U32(_), ValueType::Scalar(DType::U32))
+            | (value @ ops::ConstantValue::U64(_), ValueType::Scalar(DType::U64))
             | (value @ ops::ConstantValue::Bool(_), ValueType::Bool)
             | (value @ ops::ConstantValue::Index(_), ValueType::Index) => value,
             _ => panic!("portable constant payload differs from its closed value type"),
@@ -880,6 +881,25 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         });
         PortableValue { raw: out, ty: to }
     }
+    /// A word of the other width (`ReferenceNode::Resize`): the zero
+    /// extension of a U32 word, or the low word of a U64. Every emitter
+    /// realizes this integer `Cast` exactly.
+    pub fn word_resize(&mut self, a: PortableValue, dtype: DType) -> PortableValue {
+        assert!(
+            matches!(
+                (a.ty, dtype),
+                (ValueType::Scalar(DType::U32), DType::U64)
+                    | (ValueType::Scalar(DType::U64), DType::U32)
+            ),
+            "word resize is between U32 and U64 words"
+        );
+        let to = ValueType::Scalar(dtype);
+        let uniformity = self.inner.uniformity_of(a.raw);
+        let a = self.used(a);
+        let out = self.inner.define_with(to, None, uniformity);
+        self.inner.emit(Op::Cast { out, a, to });
+        PortableValue { raw: out, ty: to }
+    }
     pub fn bitcast(&mut self, a: PortableValue, to: ValueType) -> PortableValue {
         // Bitcast transports a complete scalar payload. Equal byte counts do
         // not define vector lane packing or make Boolean carriers bit fields.
@@ -913,7 +933,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
     pub fn scalar_bits(&mut self, a: PortableValue) -> PortableValue {
         let to = ValueType::Scalar(DType::U32);
         match a.ty {
-            ValueType::Scalar(DType::U32) => a,
+            ValueType::Scalar(DType::U32 | DType::U64) => a,
             ValueType::Scalar(DType::F32 | DType::I32) => self.bitcast(a, to),
             ValueType::Bool => {
                 let one = self.constant(ops::ConstantValue::U32(1), to);
@@ -931,14 +951,17 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
         }
     }
     pub fn scalar_from_bits(&mut self, a: PortableValue, dtype: DType) -> PortableValue {
-        assert_eq!(a.ty, ValueType::Scalar(DType::U32));
+        assert_eq!(
+            a.ty,
+            ValueType::Scalar(seismic_lang::reference_math::word_type(dtype))
+        );
         let to = if dtype == DType::Bool {
             ValueType::Bool
         } else {
             ValueType::Scalar(dtype)
         };
         match dtype {
-            DType::U32 => a,
+            DType::U32 | DType::U64 => a,
             DType::F32 | DType::I32 => self.bitcast(a, to),
             DType::Bool => {
                 let zero = self.constant(ops::ConstantValue::U32(0), a.ty);
@@ -1050,6 +1073,26 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
             place: entry.place,
             plane,
             field,
+            index: indices,
+        });
+        PortableValue { raw: out, ty }
+    }
+    pub(super) fn read_plane_lane(
+        &mut self,
+        entry: PlaceEntry,
+        index: &[PortableValue],
+        plane: u32,
+    ) -> PortableValue {
+        let indices = self.read_indices(entry, index);
+        let ty = dtype_value_type(DType::U32);
+        let uniformity = self
+            .inner
+            .read_uniformity(entry.place, indices.iter().copied());
+        let out = self.inner.define_with(ty, None, uniformity);
+        self.inner.emit(Op::ReadPlaneLane {
+            out,
+            place: entry.place,
+            plane,
             index: indices,
         });
         PortableValue { raw: out, ty }
@@ -1924,6 +1967,7 @@ impl<'a, B: PhysicalDialect> PortableBuilder<'a, B> {
                     ValueType::Scalar(DType::BF16) => ConstantValue::BF16(0),
                     ValueType::Scalar(DType::I32) => ConstantValue::I32(0),
                     ValueType::Scalar(DType::U32) => ConstantValue::U32(0),
+                    ValueType::Scalar(DType::U64) => ConstantValue::U64(0),
                     ValueType::Scalar(DType::Bool) | ValueType::Bool => ConstantValue::Bool(false),
                     ValueType::Index => ConstantValue::Index(0),
                     ValueType::Opaque { .. } | ValueType::Vector { .. } => {
@@ -2985,6 +3029,12 @@ fn rebrand_op<B: PhysicalDialect>(
             ..
         }
         | Op::ReadPlaneField {
+            out,
+            place: p,
+            index,
+            ..
+        }
+        | Op::ReadPlaneLane {
             out,
             place: p,
             index,

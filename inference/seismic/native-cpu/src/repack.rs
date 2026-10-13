@@ -9,7 +9,9 @@
 //! tensors; [`rows`] resolves the conversion from their representations.
 
 use crate::element::f16_to_f32;
-use crate::weights::{Format, Iq4, Mxfp4, Nvfp4, RowGeometry, Q4G32, Q4K, Q5G32, Q5K, Q6K, Q8};
+use crate::weights::{
+    Format, Iq2Xs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32, Q5K, Q6K, Q8, RowGeometry,
+};
 use std::marker::PhantomData;
 
 /// One registered conversion of an external packet format into a `rows16`
@@ -27,8 +29,18 @@ trait Conversion {
     const SCALE_BYTES: usize;
     const SUPER_BYTES: usize;
 
+    /// Bytes of the target's vector-code entries per group, for a grid
+    /// target, whose entries `grids` writes whole; 0 for per-value codes.
+    const GRID_BYTES: usize = 0;
+
     /// The raw code of value `p` of `packet`.
-    fn code(packet: &[u8], p: usize) -> u8;
+    fn code(_packet: &[u8], _p: usize) -> u8 {
+        unreachable!("a grid conversion moves whole entries")
+    }
+    /// The group's vector-code entries.
+    fn grids(_packet: &[u8], _out: &mut [u8]) {
+        unreachable!("a per-value conversion moves codes")
+    }
     /// The group's local-coefficient plane bytes.
     fn scales(_packet: &[u8], _out: &mut [u8]) {}
     /// The group's super-plane bytes.
@@ -240,6 +252,71 @@ impl Conversion for GgufIq3S {
     }
 }
 
+/// GGUF iq2_xs into iq2xs: its sixteen-bit entries and 4-bit scale codes
+/// move bit for bit; the f16 `d` becomes the f32 factor `d / 8`, exactly.
+struct GgufIq2Xs;
+
+impl Conversion for GgufIq2Xs {
+    const SOURCE: &'static str = "gguf_iq2_xs";
+    type Target = Iq2Xs;
+    const PACKET_BYTES: usize = 74;
+    const GROUP: usize = 256;
+    const BITS: u32 = 0;
+    const GRID_BYTES: usize = 64;
+    const SCALE_BYTES: usize = 8;
+    const SUPER_BYTES: usize = 4;
+
+    fn grids(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[2..66]);
+    }
+    fn scales(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[66..74]);
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        let d = f16_to_f32(u16::from_le_bytes([packet[0], packet[1]]));
+        out.copy_from_slice(&(d * 0.125).to_le_bytes());
+    }
+}
+
+/// GGUF iq3_xxs into iq3xxs: entry `e` (values `8 e ..`) is its sub-block's
+/// grid indices `2 (e % 4)` and `2 (e % 4) + 1` and sign group `e % 4`, a
+/// three-byte entry; each sub-block's 4-bit scale code moves; the f16 `d`
+/// becomes the f32 factor `d / 4`, exactly.
+struct GgufIq3Xxs;
+
+impl Conversion for GgufIq3Xxs {
+    const SOURCE: &'static str = "gguf_iq3_xxs";
+    type Target = Iq3Xxs;
+    const PACKET_BYTES: usize = 98;
+    const GROUP: usize = 256;
+    const BITS: u32 = 0;
+    const GRID_BYTES: usize = 96;
+    const SCALE_BYTES: usize = 4;
+    const SUPER_BYTES: usize = 4;
+
+    fn grids(packet: &[u8], out: &mut [u8]) {
+        for (entry, out) in out.chunks_exact_mut(3).enumerate() {
+            let (block, group) = (entry / 4, entry % 4);
+            let word =
+                u32::from_le_bytes(packet[66 + 4 * block..70 + 4 * block].try_into().unwrap());
+            out[0] = packet[2 + 8 * block + 2 * group];
+            out[1] = packet[3 + 8 * block + 2 * group];
+            out[2] = ((word >> (7 * group)) & 127) as u8;
+        }
+    }
+    fn scales(packet: &[u8], out: &mut [u8]) {
+        out.fill(0);
+        for block in 0..8 {
+            let scale = packet[69 + 4 * block] >> 4;
+            out[block / 2] |= scale << (4 * (block % 2));
+        }
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        let d = f16_to_f32(u16::from_le_bytes([packet[0], packet[1]]));
+        out.copy_from_slice(&(d * 0.25).to_le_bytes());
+    }
+}
+
 /// ggml's `iq3s_grid`: byte `j` of point `i` is magnitude `j` (odd, 1..=15).
 static IQ3S_GRID: [u32; 512] = [
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
@@ -338,6 +415,27 @@ fn block_nibble(packet: &[u8], at: usize, p: usize) -> u8 {
     (packet[at + p % 16] >> ((p / 16) * 4)) & 15
 }
 
+/// One GGUF iq4_nl block (`d | qs[16]`) into iq4g32s: the codes and the f16
+/// scale move bit for bit.
+struct GgufIq4NlBlock;
+
+impl Conversion for GgufIq4NlBlock {
+    const SOURCE: &'static str = "gguf_iq4_nl_block";
+    type Target = Iq4S;
+    const PACKET_BYTES: usize = 18;
+    const GROUP: usize = 32;
+    const BITS: u32 = 4;
+    const SCALE_BYTES: usize = 0;
+    const SUPER_BYTES: usize = 2;
+
+    fn code(packet: &[u8], p: usize) -> u8 {
+        block_nibble(packet, 2, p)
+    }
+    fn supers(packet: &[u8], out: &mut [u8]) {
+        out.copy_from_slice(&packet[..2]);
+    }
+}
+
 /// GGUF q4_0 (`d | qs[16]`) into q4g32s.
 struct GgufQ4_0;
 
@@ -383,11 +481,7 @@ impl<const MINIMUM: bool> Conversion for GgufQ5<MINIMUM> {
 /// The resident E2M1 code of a GGUF MXFP4 / NVFP4 code: code 8 (E2M1 -0),
 /// which ggml decodes as +0, becomes code 0.
 fn e2m1_positive_zero(code: u8) -> u8 {
-    if code == 8 {
-        0
-    } else {
-        code
-    }
+    if code == 8 { 0 } else { code }
 }
 
 /// GGUF mxfp4 (`e | qs[16]`) into mxfp4g32.
@@ -447,6 +541,21 @@ unsafe fn convert_row<C: Conversion>(source: *const u8, row: *mut u8, k: usize) 
     out.fill(0);
     let mut codes = [0u8; 256];
     for (g, packet) in source.chunks_exact(C::PACKET_BYTES).enumerate() {
+        if C::GRID_BYTES > 0 {
+            C::grids(
+                packet,
+                &mut out[geometry.codes + g * C::GRID_BYTES..][..C::GRID_BYTES],
+            );
+            C::scales(
+                packet,
+                &mut out[geometry.scales + g * C::SCALE_BYTES..][..C::SCALE_BYTES],
+            );
+            C::supers(
+                packet,
+                &mut out[geometry.supers + g * C::SUPER_BYTES..][..C::SUPER_BYTES],
+            );
+            continue;
+        }
         let codes = &mut codes[..C::GROUP];
         for (p, code) in codes.iter_mut().enumerate() {
             *code = C::code(packet, p);
@@ -520,7 +629,13 @@ const fn conversion<C: Conversion>(
     }
 }
 
-static CONVERSIONS: [RowConversion; 26] = [
+static CONVERSIONS: [RowConversion; 32] = [
+    conversion::<GgufIq4NlBlock>("iq4g32s@rows16", false, &[16, 2]),
+    conversion::<GgufIq4NlBlock>("iq4g32s@rows8", true, &[16, 2]),
+    conversion::<GgufIq2Xs>("iq2xs@rows16", false, &[64, 8, 4]),
+    conversion::<GgufIq3Xxs>("iq3xxs@rows16", false, &[96, 4, 4]),
+    conversion::<GgufIq2Xs>("iq2xs@rows8", true, &[64, 8, 4]),
+    conversion::<GgufIq3Xxs>("iq3xxs@rows8", true, &[96, 4, 4]),
     conversion::<GgufQ4_0>("q4g32s@rows16", false, &[16, 2]),
     conversion::<GgufQ5<false>>("q5g32s@rows16", false, &[16, 4, 2]),
     conversion::<GgufQ5<true>>("q5g32@rows16", false, &[16, 4, 4]),
@@ -607,12 +722,8 @@ impl<'a> External<'a> {
         representation: &'static str,
     ) -> Self {
         let k = extents[extents.len() - 1];
-        let group = CONVERSIONS
-            .iter()
-            .find(|conversion| conversion.source == representation)
-            .unwrap_or_else(|| panic!("`{representation}` is not a registered external source"))
-            .group as u64;
-        let rows = canonical_rows(extents, strides, k.div_ceil(group));
+        let (group, _) = external_packet(representation);
+        let rows = canonical_rows(extents, strides, k.div_ceil(group as u64));
         Self {
             base,
             rows,
@@ -630,6 +741,25 @@ impl<'a> External<'a> {
     pub fn representation(&self) -> &'static str {
         self.representation
     }
+
+    /// The stored bytes of row `row`: its whole packets, as stored.
+    pub fn row(&self, row: usize) -> &'a [u8] {
+        assert!(row < self.rows, "row {row} outside the operand");
+        let (group, packet_bytes) = external_packet(self.representation);
+        let bytes = self.k.div_ceil(group) * packet_bytes;
+        // SAFETY: the operand's rows are canonical and lie within it.
+        unsafe { std::slice::from_raw_parts(self.base.add(row * bytes), bytes) }
+    }
+}
+
+/// The values and bytes of a packet of the external encoding
+/// `representation`.
+fn external_packet(representation: &str) -> (usize, usize) {
+    CONVERSIONS
+        .iter()
+        .find(|conversion| conversion.source == representation)
+        .map(|conversion| (conversion.group, conversion.packet_bytes))
+        .unwrap_or_else(|| panic!("`{representation}` is not a registered external source"))
 }
 
 /// A bound result tensor of a packed `rows16` representation, written only

@@ -6,7 +6,7 @@
 //! admission-command capacity.
 
 use magnitude_generation::{DetailedUsage, FinishReason, OutputToken};
-use magnitude_executor::{DeviceError, InvariantError, ResourceKind};
+use magnitude_executor::{DeviceError, InvariantError, ResourceKind, TableReadError};
 use std::{
     collections::VecDeque,
     sync::{
@@ -46,6 +46,9 @@ pub enum RequestError {
     Capacity(ServiceCapacityError),
     Device(DeviceError),
     Invariant(InvariantError),
+    /// The request's table rows could not be read from the model's
+    /// artifact; other requests continue.
+    TableRead(TableReadError),
     WorkerClosed,
     ModelUnloaded { cause: ModelUnloadCause },
 }
@@ -62,6 +65,7 @@ impl std::fmt::Display for RequestError {
             ),
             Self::Device(error) => error.fmt(formatter),
             Self::Invariant(error) => error.fmt(formatter),
+            Self::TableRead(error) => error.fmt(formatter),
             Self::WorkerClosed => formatter.write_str("the execution worker closed"),
             Self::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,

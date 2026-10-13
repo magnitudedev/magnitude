@@ -644,4 +644,8 @@ pub enum Outcome {
     Encode {
         features: FeatureRef,
     },
+    /// A forward whose sequence's table rows could not be read, in this
+    /// step or an earlier one (the sequence is poisoned): its outputs were
+    /// discarded, and reconciling it fails the sequence.
+    TableReadFailed(crate::TableReadError),
 }

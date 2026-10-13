@@ -9,7 +9,7 @@
 #define KERNEL_W0 SEISMIC_WEIGHT
 #include "lib/projection/projection.cuh"
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 using Source = projection::GemvSource<Pro>;
 using Scaling = projection::scaling<(SEISMIC_DIM_WS != 0)>;
 using Epi = Scaling::type<projection::Logits>;

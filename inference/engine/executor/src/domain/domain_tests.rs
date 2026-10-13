@@ -34,6 +34,13 @@ fn tiny_manifest(definition: &ModelDefinition) -> PackageManifest {
 
 type Fixture = (ExecutorDomain<TestFamily>, StateBindings<TestFamily>);
 
+thread_local! {
+    /// The stored-table reads the next target submission's output carries:
+    /// a test sets them to inject a step's table reads.
+    static STORED_READS: std::cell::RefCell<Vec<crate::programs::StoredRead>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn fixture(control: Option<PendingControl>) -> Option<Fixture> {
     fixture_with(control, false, false)
 }
@@ -83,6 +90,18 @@ fn fixture_on(
     head: bool,
     device_request: platform::DeviceRequest,
 ) -> Option<Fixture> {
+    fixture_of(tiny_definition(), 2, control, lookahead, head, device_request)
+}
+
+/// A domain over `definition` launching up to `rows` rows.
+fn fixture_of(
+    definition: ModelDefinition,
+    rows: usize,
+    control: Option<PendingControl>,
+    lookahead: bool,
+    head: bool,
+    device_request: platform::DeviceRequest,
+) -> Option<Fixture> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     let reserves = platform::MemoryReserves::standard();
     let selected =
@@ -92,10 +111,10 @@ fn fixture_on(
             .open(catalog.resolve(selected.info.selector).unwrap())
             .unwrap(),
     );
-    let definition = Rc::new(tiny_definition());
+    let definition = Rc::new(definition);
     let manifest = tiny_manifest(&definition);
     let limits = ResourceLimits {
-        max_launch_rows: 2,
+        max_launch_rows: rows,
         max_launch_slots: 2,
         max_selected_rows: 2,
         max_drafting_slots: 2,
@@ -479,6 +498,7 @@ impl ProgramFamily for TestFamily {
                     last: now,
                 },
                 selected_rows: None,
+                stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
             },
         ))
     }
@@ -1579,4 +1599,465 @@ fn boundary_features_commit_fork_and_abort_with_numerical_state() {
             .unwrap()
             .same_allocation(&first)
     );
+}
+
+/// A forward of `values` at `position`, every row committed.
+fn feed(request: RequestId, position: usize, values: &[u32]) -> Operation {
+    Operation::Forward {
+        request,
+        kind: WorkKind::Prefill,
+        tokens: values.iter().map(|value| crate::TokenId(*value)).collect(),
+        position,
+        conditioning: None,
+        demand: crate::batching::Demand::NONE,
+        select: Vec::new(),
+        committed: values.len(),
+        prime: None,
+    }
+}
+
+fn token_values(tokens: &[crate::TokenId]) -> Vec<u32> {
+    tokens.iter().map(|token| token.0).collect()
+}
+
+/// A request's tokens follow its sequence as its state does: an aborted
+/// step's tokens give way to the forward fed again at its position, and a
+/// sequence resumed from another's state holds that state's tokens and feeds
+/// on from them, leaving its source's unchanged.
+#[test]
+fn token_history_follows_rollback_and_fork() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let source = RequestId(81);
+    open(&mut domain, &mut bindings, source);
+    // The fixture launches at most two rows.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &[10, 11])]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 2, &[12])]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    // A step past the accepted rows is fed, then aborted.
+    let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 3, &[20, 21])]);
+    let (pending, returned) = finish_one(&mut domain, flight);
+    domain.abort(pending).unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 3);
+    assert_eq!(
+        token_values(domain.preceding_tokens(source, 3, 2).unwrap()),
+        [11, 12]
+    );
+    let flight = submit_reserved_target(&mut domain, returned, vec![feed(source, 3, &[40])]);
+    let (pending, mut bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(
+        token_values(domain.preceding_tokens(source, 4, 2).unwrap()),
+        [12, 40]
+    );
+    // Nothing is known past the fed tokens.
+    assert!(domain.preceding_tokens(source, 5, 2).is_err());
+
+    let checkpoint = domain.resume_state(source).unwrap();
+    let copy = RequestId(82);
+    domain
+        .install_input(copy, PreparedModelInput::continuation_only())
+        .unwrap();
+    domain
+        .open_state(&mut bindings, copy, Some(&checkpoint))
+        .unwrap();
+    assert_eq!(
+        token_values(domain.preceding_tokens(copy, 4, 8).unwrap()),
+        [10, 11, 12, 40]
+    );
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(copy, 4, &[50])]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    assert_eq!(
+        token_values(domain.preceding_tokens(copy, 5, 2).unwrap()),
+        [40, 50]
+    );
+    assert!(domain.preceding_tokens(source, 5, 1).is_err());
+}
+
+#[test]
+fn a_forward_replaces_the_tokens_at_and_after_its_position() {
+    use super::input::TokenHistory;
+    let tokens = |values: &[u32]| values.iter().map(|value| crate::TokenId(*value)).collect::<Vec<_>>();
+    let mut history = TokenHistory::default();
+    history.feed(0, &tokens(&[1, 2, 3, 4])).unwrap();
+    // A verification's rejected rows are fed again from the first rejected.
+    history.feed(2, &tokens(&[9])).unwrap();
+    assert_eq!(token_values(history.before(3).unwrap()), [1, 2, 9]);
+    assert!(history.before(4).is_err());
+    // No forward follows tokens never fed.
+    assert!(history.feed(5, &tokens(&[7])).is_err());
+    let resumed = TokenHistory::starting(history.before(2).unwrap());
+    assert_eq!(token_values(resumed.before(2).unwrap()), [1, 2]);
+}
+
+/// The host's rows for a step (`NGramHash::rows` over the request's token
+/// history) equal the rows the device's `ngram_rows` names from the step's
+/// tokens and the bank's token window: through a prefill chunk, a
+/// verification of which only some rows are accepted, and the decode that
+/// continues from the tape version.
+#[test]
+fn host_rows_from_the_token_history_equal_the_device_rows() {
+    use magnitude_family_contracts::NGramHash;
+    use magnitude_kernels::ngram_rows;
+    use seismic::{BackendName, DeviceCatalog, Element, NativeSpecialization, SlabRegion, SlabTensor, Tensor};
+    let hash = NGramHash {
+        context: 2,
+        heads_per_order: 8,
+        multipliers: vec![(i64::MAX as u64 / 248_320) | 1, 1_000_003, (1 << 41) + 17],
+        sizes: (0..16).map(|head| 20_000_003 + 2 * head).collect(),
+        offsets: (0..16).map(|head| head * 20_000_040).collect(),
+        reset: 7,
+    };
+    let (context, heads) = (2u64, 16usize);
+    let tape = 3u64;
+    let (banks, slab_banks) = (4u64, 2u64);
+    let catalog = DeviceCatalog::discover().unwrap();
+    let devices = [BackendName::Metal, BackendName::Cuda, BackendName::Vulkan, BackendName::Cpu]
+        .into_iter()
+        .filter_map(|backend| catalog.open_backend(backend).ok())
+        .collect::<Vec<_>>();
+    let ints = |device: &seismic::Device, shape: &[u64], values: &[i32]| {
+        Tensor::from_host(
+            device,
+            Element::i32(),
+            shape,
+            &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let words = |device: &seismic::Device, values: &[u64]| {
+        Tensor::from_host(
+            device,
+            Element::u64(),
+            &[values.len() as u64],
+            &values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    };
+    let tokens = |values: &[u32]| values.iter().map(|value| crate::TokenId(*value)).collect::<Vec<_>>();
+    // (position, tokens, the version read (bank, tape rows), stop, the bank
+    // published, rows accepted).
+    let steps: [(usize, Vec<u32>, (i32, i32), i32, i32, usize); 3] = [
+        (0, vec![3, 7, 7, 12, 40, 41, 7, 9, 13], (0, 0), 9, 1, 9),
+        (9, vec![22, 7, 31, 5], (1, 0), 1, 2, 2),
+        (11, vec![17], (2, 1), 1, 3, 1),
+    ];
+    for device in devices {
+        let backend = device.backend().as_str();
+        let mut slabs = SlabTensor::new(
+            &device,
+            slab_banks,
+            banks,
+            vec![SlabRegion {
+                element: Element::u32(),
+                row_shape: vec![context + tape, 1],
+            }],
+        )
+        .unwrap();
+        for slab in 0..banks.div_ceil(slab_banks) {
+            assert_eq!(slabs.add_slab().unwrap(), slab as usize);
+            slabs
+                .region_rows(0, slab * slab_banks, slab_banks)
+                .unwrap()
+                .write_from_host(&vec![0u8; (slab_banks * (context + tape) * 4) as usize])
+                .unwrap();
+        }
+        let mut window = slabs.logical_region(0).unwrap();
+        let implementation = seismic::generated::native_implementation::<ngram_rows::Entry>(&device)
+            .unwrap()
+            .unwrap();
+        let statics = match backend {
+            "cpu" => NativeSpecialization::new(),
+            _ => NativeSpecialization::new()
+                .with_static("C", context)
+                .with_static("P", 8),
+        };
+        let kernel = ngram_rows::native_for_device(
+            &device,
+            &implementation.default_specialization(&statics).unwrap(),
+        )
+        .unwrap();
+        let mut history = super::input::TokenHistory::default();
+        for (position, fed, (source, taped), stop, target, accepted) in &steps {
+            let fed = tokens(fed);
+            let preceding = history
+                .before(*position)
+                .unwrap()
+                .iter()
+                .rev()
+                .take(context as usize)
+                .rev()
+                .map(|token| u64::from(token.0))
+                .collect::<Vec<_>>();
+            let host = hash.rows(&preceding, &fed.iter().map(|token| u64::from(token.0)).collect::<Vec<_>>());
+            let rows = fed.len();
+            let result = kernel
+                .call(ngram_rows::Args {
+                    tokens: &ints(
+                        &device,
+                        &[rows as u64, 2],
+                        &fed.iter().flat_map(|token| [token.0 as i32, 0]).collect::<Vec<_>>(),
+                    ),
+                    multipliers: &words(&device, &hash.multipliers),
+                    sizes: &words(&device, &hash.sizes),
+                    offsets: &words(&device, &hash.offsets),
+                    segments: &ints(&device, &[2, 2], &[0, rows as i32, rows as i32, rows as i32]),
+                    stop: &ints(&device, &[1], &[*stop]),
+                    previous_bank: &ints(&device, &[1], &[*source]),
+                    previous_tape: &ints(&device, &[1], &[*taped]),
+                    following_bank: &ints(&device, &[1], &[*target]),
+                    window: &mut window,
+                    reset: hash.reset as i32,
+                    slab_banks: slab_banks as u32,
+                })
+                .unwrap()
+                .value;
+            let device_rows = result
+                .read_to_host()
+                .unwrap()
+                .chunks_exact(8)
+                .map(|pair| u64::from(u32::from_le_bytes(pair[..4].try_into().unwrap())))
+                .collect::<Vec<_>>();
+            assert_eq!(device_rows.len(), rows * heads);
+            assert_eq!(device_rows, host, "{backend}: step at {position}");
+            // The step's tokens are fed; the next forward follows the
+            // accepted ones.
+            history.feed(*position, &fed).unwrap();
+            history.before(position + accepted).unwrap();
+        }
+    }
+}
+
+/// A stored table of 4096 IQ4_NL rows 160 wide whose step 1 named row 1 for
+/// batch slot 0 and row 3500 for slot 1, read after the artifact was cut
+/// short under the open table: slot 1's row could not be read. The table
+/// file's path, to remove, and the step's read.
+fn failed_table_read(name: &str) -> (std::path::PathBuf, crate::programs::StoredRead) {
+    use crate::stored_table::{StepRows, StoredTable};
+    const ROWS: u64 = 4096;
+    const ROW_BYTES: u64 = 90;
+    let path = std::env::temp_dir().join(format!(
+        "magnitude-domain-table-{name}-{}.bin",
+        std::process::id()
+    ));
+    std::fs::write(&path, vec![0x11u8; (ROWS * ROW_BYTES) as usize]).unwrap();
+    let device = seismic::DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(seismic::BackendName::Cpu)
+        .unwrap();
+    let table = Arc::new(
+        StoredTable::new(
+            &device,
+            seismic::Element::named("gguf_iq4_nl_block").unwrap(),
+            ROWS,
+            160,
+            64,
+            crate::planning::DirectoryForm::Hashed,
+            magnitude_artifacts::UncachedSource::open(&path).unwrap(),
+            0,
+            None,
+        )
+        .unwrap(),
+    );
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(2048 * ROW_BYTES)
+        .unwrap();
+    let step = table
+        .queue(StepRows::Known(vec![vec![1], vec![3500]]))
+        .unwrap();
+    assert!(step.gate.wait(step.value, std::time::Duration::from_secs(10)));
+    // The device read the step's rows.
+    step.read.signal(step.value).unwrap();
+    (path, crate::programs::StoredRead::new(table, step.value))
+}
+
+/// Spec §7.3: a step whose stored-table rows could not be read for one of
+/// its two sequences fails that sequence alone, with its typed error. Its
+/// outputs are discarded and its accepted state returns, as an orphan's;
+/// it is poisoned, so its next step fails too though that step reads
+/// nothing that failed, until it closes. The other sequence commits both
+/// steps.
+#[test]
+fn a_table_read_failure_fails_only_the_sequence_that_named_the_rows() {
+    let Some((mut domain, mut bindings)) = fixture(None) else {
+        return;
+    };
+    let (kept, failed) = (RequestId(91), RequestId(92));
+    open(&mut domain, &mut bindings, kept);
+    open(&mut domain, &mut bindings, failed);
+    let (path, read) = failed_table_read("poison");
+    STORED_READS.with(|reads| reads.borrow_mut().push(read));
+    let mut bindings = bindings;
+    for (step, position) in [(0, 0usize), (1, 1)] {
+        let flight = submit_reserved_target(
+            &mut domain,
+            bindings,
+            vec![feed(kept, position, &[10 + step]), feed(failed, 0, &[20])],
+        );
+        let (pending, returned) = domain.finish_target(flight).unwrap();
+        bindings = returned;
+        assert_eq!(pending.len(), 2);
+        for pending in pending {
+            if pending.request() == kept {
+                assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
+                domain
+                    .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+                    .unwrap();
+            } else {
+                let Outcome::TableReadFailed(error) = pending.outcome() else {
+                    panic!("step {step}: the failed sequence's outcome is not its failure");
+                };
+                assert!(error.detail.contains("3500"), "{error}");
+                assert!(matches!(
+                    domain.reconcile(pending, PhysicalDecision { accepted_rows: 1 }),
+                    Err(DomainError::TableRead(_))
+                ));
+            }
+        }
+        assert_eq!(domain.resume_state(kept).unwrap().position(), position + 1);
+        assert_eq!(domain.resume_state(failed).unwrap().position(), 0);
+    }
+    // Closing the sequence clears its poison.
+    domain.close(failed).unwrap();
+    open(&mut domain, &mut bindings, failed);
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(failed, 0, &[20])]);
+    let (pending, _) = finish_one(&mut domain, flight);
+    assert!(matches!(pending.outcome(), Outcome::Forward { .. }));
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The planning fixture with its attention selecting one block of four rows
+/// past the dense limit, by an indexer of two 64-wide heads, over a 64-token
+/// context.
+fn selected_definition() -> ModelDefinition {
+    use magnitude_family_contracts::{
+        HistoryReads, Indexer, Operator, RmsNorm, WeightDescriptor,
+    };
+    let mut definition = tiny_definition();
+    definition.decoder.context_limit = 64;
+    let Operator::Attention(attention) = &mut definition.decoder.blocks[0].sublayers[0].op else {
+        panic!("the fixture's mixer is attention");
+    };
+    let hidden = definition.decoder.hidden;
+    let norm = |name: &str| RmsNorm {
+        weight: WeightDescriptor::stored(name, vec![64]),
+        epsilon: 1e-6,
+    };
+    attention.reads = HistoryReads::Selected {
+        block: 4,
+        blocks: 1,
+        indexer: Indexer {
+            heads: 2,
+            width: 64,
+            query: WeightDescriptor::stored("indexer_q", vec![128, hidden]),
+            key: WeightDescriptor::stored("indexer_k", vec![64, hidden]),
+            query_norm: norm("indexer_q_norm"),
+            key_norm: norm("indexer_k_norm"),
+        },
+    };
+    definition
+}
+
+/// A selected read's launches carry its indexer's histories as the state
+/// holds them: every row reads the raw keys of the three positions before
+/// it and the blocks complete before it, writes its raw key and the block
+/// it completes; a commit of an accepted prefix keeps the blocks that prefix
+/// completes, so a rollback across a block boundary continues as a straight
+/// run does. The graphs of every class (the indexer, the Segments decode,
+/// the WorkList prefill) prepare and seal on the device.
+#[test]
+fn selected_histories_follow_blocks_across_rollback() {
+    use magnitude_state::HistoryDomainId;
+    const RAW: HistoryDomainId = HistoryDomainId(1);
+    const BLOCKS: HistoryDomainId = HistoryDomainId(2);
+    let Some((mut domain, mut bindings)) = fixture_of(
+        selected_definition(),
+        16,
+        None,
+        false,
+        false,
+        platform::DeviceRequest::Automatic,
+    ) else {
+        return;
+    };
+    let blocks = |domain: &ExecutorDomain<TestFamily>, request| {
+        domain
+            .resume_state(request)
+            .unwrap()
+            .target
+            .history_ranges(BLOCKS)
+            .iter()
+            .map(|(_, rows)| rows)
+            .sum::<usize>()
+    };
+    let source = RequestId(91);
+    open(&mut domain, &mut bindings, source);
+    // Ten prompt rows complete blocks 0 and 1.
+    let tokens = (0..10).collect::<Vec<u32>>();
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 0, &tokens)]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 10 })
+        .unwrap();
+    assert_eq!(blocks(&domain, source), 2);
+    // Six rows from 10 complete blocks 2 and 3, then roll back whole: the
+    // history keeps blocks 0 and 1.
+    let flight = submit_reserved_target(
+        &mut domain,
+        bindings,
+        vec![feed(source, 10, &[20, 21, 22, 23, 24, 25])],
+    );
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain.abort(pending).unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 10);
+    assert_eq!(blocks(&domain, source), 2);
+    // Two other rows from 10 (positions 10, 11) complete block 2 alone.
+    let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, 10, &[40, 41])]);
+    let (pending, bindings) = finish_one(&mut domain, flight);
+    domain
+        .reconcile(pending, PhysicalDecision { accepted_rows: 2 })
+        .unwrap();
+    assert_eq!(domain.resume_state(source).unwrap().position(), 12);
+    assert_eq!(blocks(&domain, source), 3);
+    // The raw keys of positions 9..12 remain for the next block.
+    let checkpoint = domain.resume_state(source).unwrap();
+    assert_eq!(
+        checkpoint
+            .target
+            .history_ranges(RAW)
+            .iter()
+            .map(|(_, rows)| rows)
+            .sum::<usize>(),
+        3
+    );
+    // Single decode rows continue past the dense limit, completing block 3.
+    let mut bindings = bindings;
+    for (position, token) in (12..16).zip(30..) {
+        let flight = submit_reserved_target(&mut domain, bindings, vec![feed(source, position, &[token])]);
+        let (pending, returned) = finish_one(&mut domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        bindings = returned;
+    }
+    assert_eq!(blocks(&domain, source), 4);
 }

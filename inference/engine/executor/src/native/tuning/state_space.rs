@@ -16,6 +16,7 @@ use super::{
     CaseState, EntryTuning, ModelInputs, PointShape, TuningInputs, TuningLimits, row_points,
     served_row_points,
 };
+use crate::operators::InputForm;
 use crate::operators::gated_delta::graph::CHUNKED_ROWS;
 use crate::{StateSpaceBinding, StateSpaceShape};
 use magnitude_family_contracts::{WeightKind, WeightScope};
@@ -104,6 +105,7 @@ impl EntryTuning for StateSpaceProjectTuning {
                 ("VB", None),
             ],
         )?);
+        statics.extend(InputForm::SINGLE.dimensions(shape.hidden));
         Ok(statics)
     }
 
@@ -170,6 +172,7 @@ pub(crate) struct StateSpaceOutputTuning {
 
 pub(crate) struct StateSpaceOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
     bound: Tensor,
@@ -229,6 +232,7 @@ impl EntryTuning for StateSpaceOutputTuning {
                         &[point.rows, shape.hidden],
                         seed + 1,
                     )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, 0], seed + 3)?,
                     gated: inputs.activation(
                         self.binding.activation,
                         &[point.rows, shape.heads, shape.head_width],
@@ -244,6 +248,7 @@ impl EntryTuning for StateSpaceOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
             output_bound: &case.bound,

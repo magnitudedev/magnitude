@@ -11,6 +11,9 @@ use std::collections::HashMap;
 /// native entries needed by that head block.
 #[derive(Debug, Default)]
 pub struct HeadKernels {
+    pub(super) streams: HashMap<HeadBinding, super::StreamsKernels>,
+    pub(super) copy: HashMap<HeadBinding, NativeKernel<magnitude_kernels::feature_copy::Entry>>,
+    pub(super) gather: HashMap<HeadBinding, NativeKernel<magnitude_kernels::feature_rows::Entry>>,
     pub(super) input: HashMap<HeadBinding, NativeKernel<draft_rows::Entry>>,
     pub(super) attention: HashMap<HeadBinding, AttentionKernels>,
     pub(super) priming_project: HashMap<HeadBinding, NativeKernel<attention_project::Entry>>,

@@ -24,11 +24,12 @@ pub use decoder::{
     DeferredForm, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection,
     FeedForwardUp, GateFunction, GateGranularity, GatedDelta, HashRoutingTable, HeadNorm,
     HistoryDomain, HistoryReads, HyperConnectionMixing, HyperConnectionWeights, HyperConnections,
-    InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention, Operator,
-    OutputForm, PerLayerEntry, PerLayerInput, RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary,
-    RotaryDivisors, RotaryPair, RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction,
-    SharedExpert, SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms,
-    ValueNorm, ValueSource,
+    Indexer, InputNorm, KeyValue, LatentAttention, LatentExperts, LayerNorm, MediaRowAttention,
+    NGramHash, NGramInput, Operator, OutputForm, PerLayerEntry, PerLayerInput,
+    RecurrentHeadMapping, ResidualForm, RmsNorm, Rotary, RotaryDivisors, RotaryPair,
+    RouteNormalization, RoutedFfn, Router, RouterInput, ScoreFunction, SharedExpert,
+    SharedExpertGate, ShortConv, StateSpace, Sublayer, SublayerIndex, UnweightedRms, ValueNorm,
+    ValueSource,
 };
 pub use draft::{
     BlockAttention, BlockLayout, CandidateSelector, ConfidenceHead, DraftDefinition,
@@ -341,7 +342,12 @@ pub enum WeightKind {
     /// A sublayer's or branch's output normalization.
     PostNorm,
     LayerScale,
-    HyperConnectionMix,
+    /// A hyper-connection site's weights: a sublayer's mix (sublayer
+    /// scope) or the exit's (target scope).
+    HyperConnectionNorm,
+    HyperConnectionDown,
+    HyperConnectionUp,
+    HyperConnectionInject,
     Query,
     QueryGate,
     AttentionGate,
@@ -350,6 +356,10 @@ pub enum WeightKind {
     QueryNorm,
     KeyNorm,
     AttentionOutput,
+    IndexerQuery,
+    IndexerKey,
+    IndexerQueryNorm,
+    IndexerKeyNorm,
     RecurrentQueryKeyValue,
     RecurrentGate,
     RecurrentAlpha,
@@ -386,6 +396,13 @@ pub enum WeightKind {
     SharedDown,
     PerLayerGate,
     PerLayerProjection,
+    NGramTable,
+    NGramKey,
+    NGramValue,
+    NGramKeyNorm,
+    NGramQueryNorm,
+    NGramConvolutionNorm,
+    NGramConvolution,
     RotaryDivisors,
     OutputNorm,
     Output,
@@ -524,6 +541,8 @@ impl HeadReadout {
 pub enum HeadChain {
     /// The head's normalized output.
     Output,
+    /// The head's residual streams before its output normalization/mix.
+    Residual,
     /// `post ·` the head's normalized output: `[hidden, width]`.
     Projected { post: WeightDescriptor },
 }
@@ -555,6 +574,7 @@ pub enum HeadComponent {
 /// its own width and normalizes their output for its vocabulary projection.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HeadBlock {
+    pub residual: ResidualForm,
     pub input: HeadInput,
     pub blocks: Vec<Block>,
     pub output_norm: ExitNorm,
@@ -582,6 +602,24 @@ pub struct Head {
 }
 
 impl Head {
+    /// A residual-chaining head consumes the target's residual streams; an
+    /// output-chaining head consumes its normalized output feature.
+    pub fn residual_conditioning(&self) -> bool {
+        self.blocks
+            .first()
+            .is_some_and(|block| matches!(block.chain, HeadChain::Residual))
+    }
+
+    pub fn conditioning_width(&self, decoder: &Decoder) -> u64 {
+        if self.residual_conditioning() {
+            match &decoder.residual {
+                ResidualForm::Single => decoder.hidden,
+                ResidualForm::HyperConnections(form) => decoder.hidden * form.streams,
+            }
+        } else {
+            decoder.hidden
+        }
+    }
     pub fn depth(&self) -> usize {
         self.blocks.len()
     }
@@ -592,6 +630,11 @@ impl Head {
         }
         let combined_hidden = checked_product(&[2, decoder.hidden])?;
         for block in &self.blocks {
+            if matches!(block.chain, HeadChain::Residual) != self.residual_conditioning() {
+                return Err(DefinitionError::new(
+                    "head blocks must preserve their conditioning representation",
+                ));
+            }
             let width = block.width(decoder);
             match &block.input {
                 HeadInput::Combine {
@@ -600,7 +643,11 @@ impl Head {
                     combine,
                 } => {
                     decoder::validate_rms(embedding_norm, decoder.hidden, "draft head norm")?;
-                    decoder::validate_rms(hidden_norm, decoder.hidden, "draft head norm")?;
+                    decoder::validate_rms(
+                        hidden_norm,
+                        self.conditioning_width(decoder),
+                        "draft head norm",
+                    )?;
                     expect_shape(
                         combine,
                         &[decoder.hidden, combined_hidden],
@@ -623,7 +670,9 @@ impl Head {
             }
             let context = decoder::Context {
                 hidden: width,
+                vocabulary: decoder.vocabulary,
                 coordinate_axes,
+                residual: &block.residual,
                 per_layer: None,
                 shared_sources: match self.history {
                     HeadHistory::Own => None,
@@ -631,7 +680,7 @@ impl Head {
                 },
             };
             decoder::validate_blocks(&block.blocks, &context)?;
-            decoder::validate_exit_norm(&block.output_norm, width, "draft head norm")?;
+            decoder::validate_exit_norm(&block.output_norm, &context, "draft head norm")?;
             if let Some(table) = block.readout.own_table() {
                 expect_shape(
                     table,
@@ -677,6 +726,14 @@ impl Head {
                 }
             }
             match &block.chain {
+                HeadChain::Residual
+                    if block.residual != decoder.residual || width != decoder.hidden =>
+                {
+                    return Err(DefinitionError::new(
+                        "a residual-chaining head must preserve the target's residual form",
+                    ));
+                }
+                HeadChain::Residual => {}
                 HeadChain::Output if width != decoder.hidden => {
                     return Err(DefinitionError::new(
                         "a draft head of its own width chains through a projection",
@@ -752,9 +809,6 @@ impl ModelDefinition {
         if let Some(head) = &self.head {
             for block in &head.blocks {
                 decoder::blocks_deferred_forms(&block.blocks, &mut forms);
-                if matches!(block.output_norm, ExitNorm::HyperConnectionHead(_)) {
-                    forms.push(DeferredForm::HyperConnectionHead);
-                }
             }
         }
         forms
@@ -960,6 +1014,7 @@ mod tests {
         };
         let head = |key_value, history| Head {
             blocks: vec![HeadBlock {
+                residual: ResidualForm::Single,
                 input: HeadInput::Projected {
                     pre: weight("pre", &[4, 8]),
                     embedding_scale: EmbeddingScale::Unit,
@@ -1019,19 +1074,238 @@ mod tests {
 
     #[test]
     fn deferred_forms_are_named_not_rejected_by_the_contract() {
-        let mut model = definition(vec![attention(
+        let model = definition(vec![attention(
             "a",
             owned("a", HistoryDomain::Block { rate: 4 }),
         )]);
-        model.decoder.residual = ResidualForm::HyperConnections(HyperConnections {
-            streams: 4,
-            mixing: HyperConnectionMixing::Sinkhorn { iterations: 20 },
-        });
         assert!(model.validate().is_ok());
+        assert_eq!(model.deferred_forms(), [DeferredForm::BlockHistory]);
+    }
+
+    /// A two-stream, rank-3 site over hidden 4.
+    fn site(name: &str, inject: bool) -> HyperConnectionWeights {
+        HyperConnectionWeights {
+            norm: rms(&format!("{name}.hc_norm"), 8),
+            down: weight(&format!("{name}.hc_down"), &[3, 8]),
+            up: weight(&format!("{name}.hc_up"), &[8, 3]),
+            inject: inject.then(|| weight(&format!("{name}.hc_inject"), &[2, 8])),
+        }
+    }
+
+    fn ngram() -> Sublayer {
+        Sublayer {
+            input: InputNorm::None,
+            op: Operator::NGramInput(Box::new(NGramInput {
+                hash: NGramHash {
+                    context: 2,
+                    heads_per_order: 1,
+                    multipliers: vec![3, 5, 7],
+                    sizes: vec![5, 7],
+                    offsets: vec![0, 5],
+                    reset: 7,
+                },
+                width: 2,
+                table: weight("ple.table", &[12, 2]),
+                key: weight("ple.key", &[8, 4]),
+                value: weight("ple.value", &[4, 4]),
+                key_norm: rms("ple.norm_key", 8),
+                query_norm: rms("ple.norm_query", 8),
+                convolution_norm: rms("ple.norm_conv", 8),
+                convolution: weight("ple.conv", &[8, 4]),
+                kernel: 4,
+                dilation: 3,
+            })),
+            output: OutputForm::Residual,
+        }
+    }
+
+    fn hyper_connected(sublayers: Vec<Sublayer>) -> ModelDefinition {
+        let mut model = definition(sublayers);
+        model.decoder.residual = ResidualForm::HyperConnections(HyperConnections {
+            streams: 2,
+            mixing: HyperConnectionMixing::LowRankGated { rank: 3 },
+        });
+        model.decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output", false));
+        model
+    }
+
+    fn mixed(mut sublayer: Sublayer, name: &str) -> Sublayer {
+        sublayer.input = InputNorm::HyperConnectionMix(site(name, true));
+        sublayer.output = OutputForm::Scatter;
+        sublayer
+    }
+
+    #[test]
+    fn hyper_connections_with_selected_history_and_ngram_input_validate() {
+        let mut selected = attention("a", owned("a", HistoryDomain::Token));
+        let Operator::Attention(operator) = &mut selected.op else {
+            unreachable!()
+        };
+        operator.reads = HistoryReads::Selected {
+            block: 4,
+            blocks: 2,
+            indexer: Indexer {
+                heads: 2,
+                width: 2,
+                query: weight("a.indexer.q", &[4, 4]),
+                key: weight("a.indexer.k", &[2, 4]),
+                query_norm: rms("a.indexer.q_norm", 2),
+                key_norm: rms("a.indexer.k_norm", 2),
+            },
+        };
+        let model = hyper_connected(vec![ngram(), mixed(selected, "a")]);
+        model.validate().unwrap();
+        assert_eq!(model.deferred_forms(), []);
+    }
+
+    #[test]
+    fn sublayers_must_match_the_residual_form() {
+        let plain = attention("a", owned("a", HistoryDomain::Token));
+        let rejects = |model: ModelDefinition| model.validate().unwrap_err().to_string();
         assert_eq!(
-            model.deferred_forms(),
-            [DeferredForm::HyperConnections, DeferredForm::BlockHistory]
+            rejects(hyper_connected(vec![plain.clone()])),
+            "attention sublayer disagrees with the residual form"
         );
+        assert_eq!(
+            rejects(definition(vec![mixed(plain.clone(), "a")])),
+            "attention sublayer disagrees with the residual form"
+        );
+        assert_eq!(
+            rejects(definition(vec![ngram()])),
+            "n-gram input sublayer disagrees with the residual form"
+        );
+        let mut exit_injects = hyper_connected(vec![mixed(plain, "a")]);
+        exit_injects.decoder.exit.norm = ExitNorm::HyperConnectionHead(site("output", true));
+        assert_eq!(
+            rejects(exit_injects),
+            "decoder output norm disagrees with the residual form"
+        );
+    }
+
+    #[test]
+    fn ngram_products_must_be_exact() {
+        let mut sublayer = ngram();
+        let Operator::NGramInput(input) = &mut sublayer.op else {
+            unreachable!()
+        };
+        input.hash.multipliers[2] = u64::MAX / 4;
+        assert_eq!(
+            hyper_connected(vec![sublayer])
+                .validate()
+                .unwrap_err()
+                .to_string(),
+            "invalid n-gram input geometry"
+        );
+    }
+
+    /// The reference's vectorized rule (`references/families/qwen4exp.py`
+    /// `ngram_rows`, mlx's `ngram_ids`): the sequence after its `context`
+    /// previous tokens (reset tokens before the sequence), each shift valid
+    /// while the position's segment since the latest reset strictly before
+    /// it reaches back that far.
+    fn reference_rows(hash: &NGramHash, tokens: &[u64]) -> Vec<u64> {
+        let previous = vec![hash.reset; hash.context as usize];
+        reference_rows_after(hash, &previous, tokens)
+    }
+
+    fn reference_rows_after(hash: &NGramHash, previous: &[u64], tokens: &[u64]) -> Vec<u64> {
+        let context = hash.context as usize;
+        assert_eq!(previous.len(), context);
+        let history = previous.iter().chain(tokens).copied().collect::<Vec<_>>();
+        let mut rows = Vec::new();
+        for at in context..history.len() {
+            let previous = history[..at]
+                .iter()
+                .rposition(|token| *token == hash.reset)
+                .map_or(-1, |index| index as i64);
+            let in_segment = at as i64 - (previous + 1);
+            let shifted = (0..=context)
+                .map(|shift| match in_segment >= shift as i64 {
+                    true => history[at - shift],
+                    false => hash.reset,
+                })
+                .collect::<Vec<_>>();
+            for order in 2..=context + 1 {
+                let mixed = (1..order).fold(shifted[0] * hash.multipliers[0], |mixed, distance| {
+                    mixed ^ (shifted[distance] * hash.multipliers[distance])
+                });
+                let first = (order - 2) * hash.heads_per_order as usize;
+                for head in first..first + hash.heads_per_order as usize {
+                    rows.push(mixed % hash.sizes[head] + hash.offsets[head]);
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn ngram_rows_follow_the_reference_across_chunks() {
+        let hash = NGramHash {
+            context: 2,
+            heads_per_order: 2,
+            multipliers: vec![1_000_003, 999_983, 1_000_033],
+            sizes: vec![101, 103, 107, 109],
+            offsets: vec![0, 101, 204, 311],
+            reset: 7,
+        };
+        // Resets at the start, adjacent and mid-sequence.
+        let mut state = 11u64;
+        let tokens = (0..64)
+            .map(|index| match index {
+                0 | 9 | 10 | 33 => 7,
+                _ => {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (state >> 33) % 50
+                }
+            })
+            .collect::<Vec<_>>();
+        let whole = hash.rows(&[], &tokens);
+        assert_eq!(whole, reference_rows(&hash, &tokens));
+        // Chunked: each chunk reads the tokens before it.
+        for split in [1, 2, 9, 10, 11, 34, 63] {
+            let mut chunked = hash.rows(&[], &tokens[..split]);
+            chunked.extend(hash.rows(&tokens[..split], &tokens[split..]));
+            assert_eq!(chunked, whole, "split at {split}");
+        }
+    }
+
+    /// mlx's `ngram_ids` cases (`test_integer_planner_matches_library_eos_and_batch`):
+    /// every third token the reset, after a previous context that holds a
+    /// reset and a token, at lengths 1, 2, 19 and 512; multipliers of the
+    /// released size (just under `i64::MAX / vocabulary`).
+    #[test]
+    fn ngram_rows_follow_the_reference_after_a_previous_context() {
+        let hash = NGramHash {
+            context: 2,
+            heads_per_order: 8,
+            multipliers: vec![
+                (i64::MAX as u64 / 248_320) | 1,
+                (i64::MAX as u64 / 248_320 / 3) | 1,
+                (i64::MAX as u64 / 248_320 / 7) | 1,
+            ],
+            sizes: (0..16).map(|head| 20_000_003 + 2 * head).collect(),
+            offsets: (0..16).map(|head| head * 20_000_040).collect(),
+            reset: 2,
+        };
+        for length in [1usize, 2, 19, 512] {
+            let mut state = length as u64;
+            let tokens = (0..length)
+                .map(|index| {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    match index % 3 {
+                        0 => 2,
+                        _ => (state >> 33) % 100,
+                    }
+                })
+                .collect::<Vec<_>>();
+            for previous in [[2, 7], [8, 2]] {
+                assert_eq!(
+                    hash.rows(&previous, &tokens),
+                    reference_rows_after(&hash, &previous, &tokens),
+                    "length {length}, previous {previous:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -161,7 +161,7 @@ impl Steps {
             DType::F16 => Self::Enumerated(dtype, F16.get_or_init(|| Enumerated::of(&cells))),
             DType::BF16 => Self::Enumerated(dtype, BF16.get_or_init(|| Enumerated::of(&cells))),
             DType::F32 => Self::Wide(cells),
-            DType::I32 | DType::U32 | DType::Bool => {
+            DType::I32 | DType::U32 | DType::U64 | DType::Bool => {
                 unreachable!("only floating types have rounding cells")
             }
         }

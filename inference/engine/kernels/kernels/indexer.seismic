@@ -1,0 +1,306 @@
+# Selected attention history (`HistoryReads::Selected`): the indexer of one
+# attention layer keeps its raw keys and the keys of its finished blocks,
+# scores each row's complete blocks and selects the rows attention reads.
+#
+# With W = 2P + S, H indexer heads and blocks of SB rows:
+#   q[h]  = rotary(rms(query[h]) * query_norm, coordinates(row))
+#   K[b]  = rotary(rms(mean(raw keys of block b)) * key_norm,
+#                  coordinates(first row of b))
+#   s[b]  = sum_h relu(q[h] . K[b]) / sqrt(W), heads ascending
+# The projected query and raw key arrive in the activation element A, as
+# every projection's outputs do; from them on everything is F32 (the stored
+# raw and block keys, the prepared queries, the scores) and nothing is
+# rounded, as the F32 reference computes it.
+# A row at position t has n = (t + 1) / SB complete blocks. While n <= K
+# (`selected`) it reads every visible row (dense); past it the K best-scoring
+# complete blocks (ties select the lower block) and its tail, the rows
+# [n SB, t].
+#
+# State contract: the raw keys, each with its row's rotary coordinates, live
+# in a Window(SB - 1) history domain (`window_keys`, `window_coordinates`),
+# the finished block keys in a Block(SB) history domain (`block_keys`), all
+# history slab planes of the layer. Every row appends its raw key and
+# coordinates at `window_destinations[row]`. A row that completes a block
+# (block_destinations[row] >= 0) reads its block's SB raw keys: the last
+# SB - 1 rows of its window spans `window_visible[row]` (the raw keys of the
+# SB - 1 positions before it, this launch's appended first), then its own.
+# It appends the block key at `block_destinations[row]`, rotated at the
+# coordinates stored with the block's first raw key.
+#
+# A row's complete blocks are the block rows of its spans
+# `block_visible[row]`, in block order, then its own block when it completes
+# one: block b is the b-th of them (blocks completed by this launch's rows
+# are read after they are appended).
+# A row's keys are the rows of its attention spans `visible[row]`, then its
+# fresh rows (which attention reads itself), in position order: key o is at
+# position o, so block b holds keys [b SB, (b + 1) SB).
+#
+# Read forms. A class that scores (B > 0) emits each row's block bitmap over
+# 32 B blocks: bit b of word b / 32 is set when the row reads block b's keys
+# (a dense row reads every block, a selecting row its selected blocks and
+# every block from its tail's on); every complete block of a row is one of
+# the 32 B. The class without scoring (B = C = 0) only appends.
+# - WorkList (prefill rows): the bitmap. The attention entry applies it as a
+#   key mask and lists, per row group, the key tiles some row of the group
+#   reads.
+# - Segments (decode rows, C > 0 as well): the rows of the row's visible
+#   spans it reads, as [start, end) runs in key order, each within one slab
+#   of `slab_rows` rows, then empty runs. Attention reads its fresh rows
+#   itself, so they must lie in the row's tail (a decode row's fresh rows
+#   are itself alone; its launch's earlier rows are visible spans).
+#   C >= K + 1 + R holds every run: the read blocks form at most K + 1 runs
+#   of keys, split further only where a visible span ends (spans never
+#   cross a slab edge).
+# `block_slots`, `segment_slots` and `bitmap_words` hold no values: their
+# extents are the rows of a block SB, a row's segments C and its bitmap
+# words B.
+fn indexer_select[M, TW, TB, H, P, S, SB, R, C, B](
+    query: &tensor[M, H, 2 * P + S] A, key: &tensor[M, 2 * P + S] A,
+    query_norm: &tensor[1, 2 * P + S] f32, key_norm: &tensor[1, 2 * P + S] f32,
+    rotary_components: &tensor[P] i32, rotary_frequencies: &tensor[P] f32,
+    rotary_amplitudes: &tensor[P] f32, coordinates: &tensor[M, 4] i32,
+    window_visible: &tensor[M, R, 2] i32, window_destinations: &tensor[M] i32,
+    block_visible: &tensor[M, R, 2] i32, block_destinations: &tensor[M] i32,
+    visible: &tensor[M, R, 2] i32,
+    block_slots: &tensor[0, SB] i32, segment_slots: &tensor[0, C] i32,
+    bitmap_words: &tensor[0, B] u32,
+    window_keys: &mut tensor[TW, 2 * P + S] f32, window_coordinates: &mut tensor[TW, 4] i32,
+    block_keys: &mut tensor[TB, 2 * P + S] f32,
+    selected: i32, epsilon: f32, slab_rows: u32, window_slab_rows: u32, block_slab_rows: u32)
+    -> (tensor[M, C, 2] i32, tensor[M, B] u32)
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and H >= 1 and SB >= 1 and C >= 0 and B >= 0:
+    # Raw keys first: a completing row reads raw keys of earlier rows.
+    for row in 0..M:
+        if window_destinations[row] >= 0:
+            for column in 0..2 * P + S:
+                window_keys[window_destinations[row], column] = f32(key[row, column])
+            window_coordinates[window_destinations[row]] = coordinates[row]
+    # Finished blocks, before any row scores them.
+    for row in 0..M:
+        if block_destinations[row] >= 0:
+            # The block's raw-key rows: the last SB - 1 window rows, then
+            # the row's own.
+            let mut members = tensor[SB] i32
+            for member in 0..SB:
+                members[member] = window_destinations[row]
+            let mut earlier = 0
+            for span in 0..R:
+                if window_visible[row, span, 1] > window_visible[row, span, 0]:
+                    earlier = earlier + window_visible[row, span, 1] - window_visible[row, span, 0]
+            let mut ordinal = 0
+            for span in 0..R:
+                let first = window_visible[row, span, 0]
+                let last = window_visible[row, span, 1]
+                if first >= 0 and last >= first:
+                    for window_row in first..last:
+                        let member = ordinal - (earlier - (SB - 1))
+                        if member >= 0 and member < SB - 1:
+                            members[member] = i32(window_row)
+                        ordinal = ordinal + 1
+            let mut sum = tensor[2 * P + S] f32
+            for column in 0..2 * P + S:
+                sum[column] = 0.0
+            for member in 0..SB:
+                for column in 0..2 * P + S:
+                    sum[column] = sum[column] + window_keys[members[member], column]
+            let mut mean = tensor[2 * P + S] f32
+            for column in 0..2 * P + S:
+                mean[column] = sum[column] / f32(SB)
+            let mut finished = tensor[2 * P + S] f32
+            finished[:] = head_rotary(mean, key_norm, window_coordinates[members[0]],
+                rotary_components, rotary_frequencies, rotary_amplitudes, epsilon)
+            block_keys[block_destinations[row]] = finished
+    let mut segments = tensor[M, C, 2] i32
+    let mut selection = tensor[M, B] u32
+    for row in 0..M:
+        for entry in 0..C:
+            segments[row, entry, 0] = 0
+            segments[row, entry, 1] = 0
+        for word in 0..B:
+            selection[row, word] = u32(0)
+    if B > 0:
+        for row in 0..M:
+            let mut prepared = tensor[H, 2 * P + S] f32
+            for head in 0..H:
+                prepared[head] = head_rotary(query[row, head], query_norm, coordinates[row],
+                    rotary_components, rotary_frequencies, rotary_amplitudes, epsilon)
+            # The row's complete blocks, in block order, scored.
+            let mut complete = 0
+            for span in 0..R:
+                if block_visible[row, span, 1] > block_visible[row, span, 0]:
+                    complete = complete + block_visible[row, span, 1] - block_visible[row, span, 0]
+            let mut scores = tensor[32 * B] f32
+            let mut physical = tensor[32 * B] i32
+            for block in 0..32 * B:
+                physical[block] = 0
+            let mut ordinal = 0
+            for span in 0..R:
+                let first = block_visible[row, span, 0]
+                let last = block_visible[row, span, 1]
+                if first >= 0 and last >= first:
+                    for block_row in first..last:
+                        if ordinal >= 0 and ordinal < 32 * B:
+                            physical[ordinal] = i32(block_row)
+                        ordinal = ordinal + 1
+            if block_destinations[row] >= 0:
+                if complete >= 0 and complete < 32 * B:
+                    physical[complete] = block_destinations[row]
+                complete = complete + 1
+            for block in 0..32 * B:
+                scores[block] = 0.0
+                if block < complete:
+                    let mut score = f32(0.0)
+                    for head in 0..H:
+                        let mut dot = f32(0.0)
+                        for column in 0..2 * P + S:
+                            dot = fma(prepared[head, column],
+                                block_keys[physical[block], column], dot)
+                        score = score + max(dot, 0.0)
+                    scores[block] = score / sqrt(f32(2 * P + S))
+            # Read blocks: every block while dense, else the K best (score
+            # descending, block ascending) and the tail's block.
+            let mut reads = tensor[32 * B + 1] i32
+            for block in 0..32 * B + 1:
+                reads[block] = 1
+            for block in 0..32 * B:
+                if complete > selected and block < complete:
+                    let mut better = 0
+                    for other in 0..32 * B:
+                        if other < complete:
+                            if scores[other] > scores[block] or (scores[other] == scores[block] and other < block):
+                                better = better + 1
+                    if better >= selected:
+                        reads[block] = 0
+            for word in 0..B:
+                for bit in 0..32:
+                    let block = word * 32 + bit
+                    if block > 32 * B:
+                        selection[row, word] = selection[row, word] | (u32(1) << u32(bit))
+                    else:
+                        if reads[block] != 0:
+                            selection[row, word] = selection[row, word] | (u32(1) << u32(bit))
+            if C > 0:
+                # The row's keys in position order, read where its blocks are.
+                let mut count = 0
+                let mut open = 0
+                let mut start = 0
+                let mut end = 0
+                let mut position = 0
+                for span in 0..R:
+                    let lo = visible[row, span, 0]
+                    let hi = visible[row, span, 1]
+                    if lo >= 0 and hi >= lo:
+                        for at in lo..hi:
+                            let stored = i32(at)
+                            let block = min(max(position, 0) / SB, 32 * B)
+                            if reads[block] != 0:
+                                if open == 1 and stored == end and stored % i32(slab_rows) != 0:
+                                    end = end + 1
+                                else:
+                                    if open == 1 and count < C:
+                                        segments[row, count, 0] = start
+                                        segments[row, count, 1] = end
+                                        count = count + 1
+                                    open = 1
+                                    start = stored
+                                    end = stored + 1
+                            else:
+                                if open == 1 and count < C:
+                                    segments[row, count, 0] = start
+                                    segments[row, count, 1] = end
+                                    count = count + 1
+                                open = 0
+                            position = position + 1
+                if open == 1 and count < C:
+                    segments[row, count, 0] = start
+                    segments[row, count, 1] = end
+    return segments, selection
+
+# Metal, CUDA and Vulkan: `append` (a threadgroup per row), `complete` (a
+# simdgroup per row that completes a block), then in a class that scores
+# `score` (a threadgroup per 256 blocks of a row, the row's query heads
+# prepared in threadgroup memory, a simdgroup per 32 blocks), `select` (a
+# threadgroup per row: a radix select over the scores' bits, which order as
+# the non-negative scores do, then the marking in block order) and, for
+# Segments, `segments` (a simdgroup per row walking the marked blocks).
+# Scratch: the scores of every row's complete blocks.
+native indexer_select for metal from "metal/indexer_select.metal":
+    static (H, P, S, SB)
+    where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and H <= 8
+    scratch scores bytes (M * 32 * B * 4) when B > 0
+    launch indexer_select_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch indexer_select_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch indexer_select_score when B > 0:
+        threadgroups (ceil_div(32 * B, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+    launch indexer_select_select when B > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((256 + 256 + 2) * 4)
+    launch indexer_select_segments when C > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native indexer_select for cuda from "cuda/indexer_select.cu":
+    static (H, P, S, SB)
+    where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and H <= 8
+    scratch scores bytes (M * 32 * B * 4) when B > 0
+    launch indexer_select_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch indexer_select_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch indexer_select_score when B > 0:
+        threadgroups (ceil_div(32 * B, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+    launch indexer_select_select when B > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+    launch indexer_select_segments when C > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+native indexer_select for vulkan from "vulkan/indexer_select.comp":
+    static (H, P, S, SB)
+    where (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and H <= 8
+    scratch scores bytes (M * 32 * B * 4) when B > 0
+    launch indexer_select_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (128, 1, 1)
+    launch indexer_select_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+    launch indexer_select_score when B > 0:
+        threadgroups (ceil_div(32 * B, 256), M, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (H * (2 * P + S) * 4)
+    launch indexer_select_select when B > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((256 + 256 + 2) * 4)
+    launch indexer_select_segments when C > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# CPU: `append` and `complete` per row, then `select` per row (prepare,
+# score, select, emit) in a class that scores.
+native indexer_select for cpu from "cpu/indexer_select.rs":
+    scratch scores bytes (M * 32 * B * 4) when B > 0
+    launch indexer_select_append:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+    launch indexer_select_complete:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + 3 * (2 * P + S)) * 4)
+    launch indexer_select_select when B > 0:
+        threadgroups (M, 1, 1)
+        threads_per_threadgroup (1, 1, 1)
+        shared_bytes ((2 * P + (H + 1) * (2 * P + S)) * 4)

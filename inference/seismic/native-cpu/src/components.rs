@@ -10,12 +10,12 @@
 use crate::isa::Tier;
 use crate::quant::Q8Block;
 use crate::weights::{
-    self, DenseRows, Format, Iq4, Mxfp4, Nvfp4, RowGeometry, Rows8, Q4G32, Q4K, Q5G32M, Q5G32S, Q5K,
-    Q6K, Q8,
+    self, DenseRows, Format, Iq2Xs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32M, Q5G32S,
+    Q5K, Q6K, Q8, RowGeometry, Rows8,
 };
 
 /// Weight representations with components.
-const REPRESENTATIONS: usize = 23;
+const REPRESENTATIONS: usize = 29;
 
 /// Row blocks of the dot component, in the order of [`WeightKernels::dot`].
 pub const ROW_BLOCKS: [usize; 4] = [1, 2, 4, 8];
@@ -270,20 +270,26 @@ macro_rules! tier_components {
                 kernels::<Q8>(),
                 kernels::<Iq4>(),
                 kernels::<Q4G32>(),
+                kernels::<Iq4S>(),
                 kernels::<Q5G32S>(),
                 kernels::<Q5G32M>(),
                 kernels::<Mxfp4>(),
                 kernels::<Nvfp4>(),
+                kernels::<Iq2Xs>(),
+                kernels::<Iq3Xxs>(),
                 kernels::<Rows8<Q4K>>(),
                 kernels::<Rows8<Q5K>>(),
                 kernels::<Rows8<Q6K>>(),
                 kernels::<Rows8<Q8>>(),
                 kernels::<Rows8<Iq4>>(),
                 kernels::<Rows8<Q4G32>>(),
+                kernels::<Rows8<Iq4S>>(),
                 kernels::<Rows8<Q5G32S>>(),
                 kernels::<Rows8<Q5G32M>>(),
                 kernels::<Rows8<Mxfp4>>(),
                 kernels::<Rows8<Nvfp4>>(),
+                kernels::<Rows8<Iq2Xs>>(),
+                kernels::<Rows8<Iq3Xxs>>(),
             ];
         }
     };
@@ -407,7 +413,7 @@ mod tests {
             let mut geometry = kernels.geometry(k, 0);
             let mut data = vec![0u8; rows.div_ceil(8) * 8 * geometry.stride];
             let groups = match format {
-                "q8g32s" | "q4g32s" | "q5g32s" | "q5g32" | "mxfp4g32" => k.div_ceil(32),
+                "q8g32s" | "q4g32s" | "iq4g32s" | "q5g32s" | "q5g32" | "mxfp4g32" => k.div_ceil(32),
                 "nvfp4g16" => k.div_ceil(64),
                 _ => k.div_ceil(256),
             };
@@ -495,7 +501,7 @@ mod tests {
                             .copy_from_slice(&(0.0003 * (packet % 3 + 1) as f32).to_le_bytes());
                     }
                 }
-                "q4g32s@rows16" | "q5g32s@rows16" | "q5g32@rows16" => {
+                "q4g32s@rows16" | "iq4g32s@rows16" | "q5g32s@rows16" | "q5g32@rows16" => {
                     for field in 0..(geometry.stride - geometry.supers) / 2 {
                         let at = base + geometry.supers + 2 * field;
                         data[at..at + 2].copy_from_slice(&half(0.004 + (field % 3) as f32 * 1e-3));
@@ -511,6 +517,14 @@ mod tests {
                     // UE4M3 exponent codes 1..=4 (2^-6 ..= 2^-3), varied mantissas.
                     for field in 0..geometry.stride - geometry.supers {
                         data[base + geometry.supers + field] = 8 + (field % 32) as u8;
+                    }
+                }
+                // Random entries and scale codes; a small f32 factor per block.
+                "iq2xs@rows16" | "iq3xxs@rows16" => {
+                    for block in 0..k.div_ceil(256) {
+                        let at = base + geometry.supers + 4 * block;
+                        data[at..at + 4]
+                            .copy_from_slice(&(0.0004 * (block % 3 + 1) as f32).to_le_bytes());
                     }
                 }
                 other => panic!("no generator for {other}"),
@@ -827,6 +841,7 @@ mod tests {
                     "q8g32s@rows16" => by_block!(Q8),
                     "iq4g32@rows16" => by_block!(Iq4),
                     "q4g32s@rows16" => by_block!(Q4G32),
+                    "iq4g32s@rows16" => by_block!(Iq4S),
                     "q5g32s@rows16" => by_block!(Q5G32S),
                     "q5g32@rows16" => by_block!(Q5G32M),
                     "mxfp4g32@rows16" => by_block!(Mxfp4),
@@ -837,10 +852,15 @@ mod tests {
                     "q8g32s@rows8" => by_block!(Rows8<Q8>),
                     "iq4g32@rows8" => by_block!(Rows8<Iq4>),
                     "q4g32s@rows8" => by_block!(Rows8<Q4G32>),
+                    "iq4g32s@rows8" => by_block!(Rows8<Iq4S>),
                     "q5g32s@rows8" => by_block!(Rows8<Q5G32S>),
                     "q5g32@rows8" => by_block!(Rows8<Q5G32M>),
                     "mxfp4g32@rows8" => by_block!(Rows8<Mxfp4>),
                     "nvfp4g16@rows8" => by_block!(Rows8<Nvfp4>),
+                    "iq2xs@rows16" => by_block!(Iq2Xs),
+                    "iq3xxs@rows16" => by_block!(Iq3Xxs),
+                    "iq2xs@rows8" => by_block!(Rows8<Iq2Xs>),
+                    "iq3xxs@rows8" => by_block!(Rows8<Iq3Xxs>),
                     other => panic!("no format for {other}"),
                 }
             }};
@@ -868,7 +888,7 @@ mod tests {
     #[test]
     #[ignore = "measurement; run with --release --ignored --nocapture"]
     fn parallel_dot_streaming() {
-        use crate::quant::{blocks, quantize, Q8Block};
+        use crate::quant::{Q8Block, blocks, quantize};
         use std::sync::atomic::{AtomicUsize, Ordering};
         let tier = Tier::detected().unwrap();
         let threads = std::env::var("CPU_DOT_THREADS").map_or(10, |t| t.parse().unwrap());
@@ -1043,7 +1063,7 @@ mod tests {
     /// rounding: half a quantization step per value, times |w|.
     #[test]
     fn quantized_dots_are_tier_invariant_and_within_the_activation_rounding() {
-        use crate::quant::{blocks, quantize, Q8Block, Q8_BLOCK};
+        use crate::quant::{Q8_BLOCK, Q8Block, blocks, quantize};
         let k = 2 * 256 + 32 * 3;
         let x = bytes(7, k)
             .iter()

@@ -16,7 +16,9 @@ pub enum BankComponent {
     /// `[width - 1 + tape, channels]`. Replaying the tape shifts the window.
     /// The gated delta window stores raw projection rows in activation
     /// precision; LFM2's short convolution stores `u = B⊙X` in F32 so the
-    /// product is not rounded before its sum.
+    /// product is not rounded before its sum. The n-gram token window is one
+    /// U32 channel of the tokens before the state (token + 1; 0, the zero
+    /// seed, for none).
     ConvWindow {
         width: usize,
         channels: usize,

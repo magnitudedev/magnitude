@@ -285,6 +285,9 @@ fn request_class(error: &RequestError) -> Class {
         | RequestError::DeviceLost { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "device_lost", true)
         }
+        RequestError::WeightReadFailed { .. } => {
+            (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "weight_read_failed", true)
+        }
         RequestError::ModelUnloaded {
             cause: UnloadCause::Shutdown,
         } => (StatusCode::CONFLICT, MODEL, "model_instance_stopped", false),

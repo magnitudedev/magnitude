@@ -53,7 +53,12 @@ impl RowCache {
     fn new(slots: usize, table: &HostTable) -> Self {
         Self {
             row_bytes: table.row_bytes(),
-            slots: SlotDirectory::new(table.rows(), slots as u64, 1),
+            slots: SlotDirectory::new(
+                table.rows(),
+                slots as u64,
+                1,
+                crate::planning::DirectoryForm::Dense,
+            ),
             bytes: vec![0; slots * table.row_bytes()],
             assembled: Vec::new(),
         }

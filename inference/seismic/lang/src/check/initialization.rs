@@ -359,7 +359,7 @@ impl Initialization<'_, '_> {
                 Value::Scalar(Scalar::Boolean { value, condition })
             }
             ValueType::Integer
-            | ValueType::Scalar(DType::I32 | DType::U32)
+            | ValueType::Scalar(DType::I32 | DType::U32 | DType::U64)
             | ValueType::Index { .. } => {
                 let (symbol, integer) = self.fresh_integer();
                 world.facts.assume_type(self.arena(), symbol, ty);
@@ -383,7 +383,7 @@ impl Initialization<'_, '_> {
     }
     fn integer_value(&self, ty: &ValueType, value: IntExpr) -> Value {
         Value::Scalar(match ty {
-            ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) => Scalar::Word {
+            ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) => Scalar::Word {
                 dtype: *dtype,
                 value,
                 binding: None,
@@ -404,6 +404,10 @@ impl Initialization<'_, '_> {
             ReferenceScalar::U32(v) => {
                 let value = self.arena().int(i64::from(v));
                 self.integer_value(&ValueType::Scalar(DType::U32), value)
+            }
+            ReferenceScalar::U64(v) => {
+                let value = self.arena().int_exact(v.into());
+                self.integer_value(&ValueType::Scalar(DType::U64), value)
             }
             ReferenceScalar::Bool(v) => {
                 let value = self.arena().scalar_const_erased(literal);
@@ -435,7 +439,7 @@ impl Initialization<'_, '_> {
                 )
             }
             (
-                ValueType::Scalar(dtype @ (DType::I32 | DType::U32)),
+                ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)),
                 ir::SourceValue::Scalar(source),
             ) => {
                 let binding = source
@@ -547,7 +551,7 @@ impl Initialization<'_, '_> {
     }
 
     fn quantity_word(&mut self, ty: &ValueType, quantity: IntExpr) -> Value {
-        let ValueType::Scalar(dtype @ (DType::I32 | DType::U32)) = ty else {
+        let ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) = ty else {
             return self.integer_value(ty, quantity);
         };
         let value = self.arena().int_to_word(quantity, *dtype);
@@ -587,7 +591,7 @@ impl Initialization<'_, '_> {
             )),
             ValueType::Integer
             | ValueType::Index { .. }
-            | ValueType::Scalar(DType::I32 | DType::U32) => {
+            | ValueType::Scalar(DType::I32 | DType::U32 | DType::U64) => {
                 let (symbol, value) =
                     if let Some(s) = self.parameter_source(local, &path.fields).binding() {
                         (s, self.arena().int_symbol(s))

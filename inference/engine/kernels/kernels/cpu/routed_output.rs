@@ -123,15 +123,24 @@ fn routed_output_rows<L: Isa, E: Elements>(
         projected,
     );
     let coefficient = cx.arg_coefficient().get([row]);
-    let residual = cx.arg_residual().span([row, columns.start], columns.len());
-    // SAFETY: each work item writes its own channels of its own row.
-    let out = unsafe { cx.result_0().span_mut([row, columns.start], columns.len()) };
-    for (((target, residual), selected), projected) in out
-        .iter_mut()
-        .zip(residual)
-        .zip(selected.iter())
-        .zip(projected.iter())
-    {
-        *target = residual + selected + activation::publish::<E::A>(*projected) * coefficient;
+    let (h, streams, injected) = (cx.dim_h() as usize, cx.dim_sn() as usize, cx.dim_in() != 0);
+    for stream in 0..streams {
+        let first = stream * h + columns.start;
+        let factor = injected.then(|| cx.arg_inject().get([row, stream]));
+        let residual = cx.arg_residual().span([row, first], columns.len());
+        // SAFETY: each work item writes its own channels of its own row.
+        let out = unsafe { cx.result_0().span_mut([row, first], columns.len()) };
+        for (((target, residual), selected), projected) in out
+            .iter_mut()
+            .zip(residual)
+            .zip(selected.iter())
+            .zip(projected.iter())
+        {
+            let shared = activation::publish::<E::A>(*projected) * coefficient;
+            *target = match factor {
+                None => residual + selected + shared,
+                Some(factor) => residual + (selected + shared) * factor,
+            };
+        }
     }
 }

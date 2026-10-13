@@ -31,7 +31,7 @@ __device__ __forceinline__ void publish(const Operands &in, u64 index, u64 chann
     const float *source =
         reinterpret_cast<const float *>(versions::bank(in.window, slot.source, bank_bytes, seismic_words_value));
     float *target = reinterpret_cast<float *>(versions::bank(in.window, slot.target, bank_bytes, seismic_words_value));
-    const int published = taps + versions::tape_rows(slot, seismic_words_value);
+    const int published = taps + versions::tape_rows(slot, static_cast<int>(SEISMIC_DIM_T));
     for (int tap = 0; tap < published; ++tap) {
         const int position = slot.stop + tap - taps;
         target[static_cast<u64>(tap) * SEISMIC_WINDOW_STRIDE_1 + channel * SEISMIC_WINDOW_STRIDE_2] =

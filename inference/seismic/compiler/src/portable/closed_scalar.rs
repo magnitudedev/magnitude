@@ -44,6 +44,8 @@ pub(super) enum Node {
     Select(Term, Term, Term),
     Bits(Term),
     FromBits(Term, DType),
+    /// A word of the other width (`ReferenceNode::Resize`).
+    Resize(Term, DType),
     NaturalFromWord(Term, DType),
     WordFromNatural(Term, DType),
     NaturalAdd(Term, Term),
@@ -180,6 +182,7 @@ impl Terms {
                 Node::Not(value)
                 | Node::Bits(value)
                 | Node::FromBits(value, _)
+                | Node::Resize(value, _)
                 | Node::NaturalFromWord(value, _)
                 | Node::WordFromNatural(value, _)
                 | Node::NaturalDiv(value, _)
@@ -217,6 +220,7 @@ impl Terms {
                     Node::Select(c, a, b) => self.select(get(c), get(a), get(b)),
                     Node::Bits(a) => self.node(Node::Bits(get(a))),
                     Node::FromBits(a, dtype) => self.node(Node::FromBits(get(a), dtype)),
+                    Node::Resize(a, dtype) => self.node(Node::Resize(get(a), dtype)),
                     Node::NaturalFromWord(a, dtype) => {
                         self.node(Node::NaturalFromWord(get(a), dtype))
                     }
@@ -387,7 +391,7 @@ impl Terms {
     }
     pub(super) fn word_from_natural(&mut self, value: Term, dtype: DType) -> Term {
         if let Node::Natural(value) = self.nodes[value.0] {
-            return self.scalar(ReferenceScalar::from_bits(dtype, value as u32));
+            return self.scalar(ReferenceScalar::from_bits(dtype, value));
         }
         self.node(Node::WordFromNatural(value, dtype))
     }
@@ -417,7 +421,7 @@ impl Terms {
     }
     pub(super) fn bits(&mut self, value: Term, dtype: DType) -> Term {
         match dtype {
-            DType::U32 => value,
+            DType::U32 | DType::U64 => value,
             DType::Bool => {
                 let one = self.scalar(ReferenceScalar::U32(1));
                 let zero = self.scalar(ReferenceScalar::U32(0));
@@ -428,7 +432,7 @@ impl Terms {
     }
     pub(super) fn from_bits(&mut self, value: Term, dtype: DType) -> Term {
         match dtype {
-            DType::U32 => value,
+            DType::U32 | DType::U64 => value,
             DType::Bool => {
                 let zero = self.scalar(ReferenceScalar::U32(0));
                 self.compare(reference::CmpOp::Ne, value, zero)
@@ -456,6 +460,7 @@ impl Terms {
                 }
                 ReferenceNode::Bits { value } => self.bits(get(value), value.ty()),
                 ReferenceNode::FromBits { value, dtype } => self.from_bits(get(value), dtype),
+                ReferenceNode::Resize { value, dtype } => self.node(Node::Resize(get(value), dtype)),
             };
             values.push(value);
         }
@@ -681,14 +686,14 @@ impl<'a> Analysis<'a> {
                 if address < *start || read_end > end {
                     return Err("partial filled scalar relation is unfinished");
                 }
-                let mut bits = [0; 4];
+                let mut bits = [0; 8];
                 for (index, byte) in bits[..place.dtype.bytes() as usize].iter_mut().enumerate() {
                     *byte = pattern.pattern()
                         [((address - start) as usize + index) % pattern.pattern().len()];
                 }
                 value = self.terms.scalar(ReferenceScalar::from_bits(
                     place.dtype,
-                    u32::from_le_bytes(bits),
+                    u64::from_le_bytes(bits),
                 ));
             }
         }
@@ -839,6 +844,9 @@ impl<'a> Analysis<'a> {
                             ops::ConstantValue::U32(value) => {
                                 self.terms.scalar(ReferenceScalar::U32(*value))
                             }
+                            ops::ConstantValue::U64(value) => {
+                                self.terms.scalar(ReferenceScalar::U64(*value))
+                            }
                             ops::ConstantValue::I32(value) => {
                                 self.terms.scalar(ReferenceScalar::I32(*value))
                             }
@@ -930,7 +938,10 @@ impl<'a> Analysis<'a> {
                         Some((*out, value))
                     }
                     Op::Binary { op, out, a, b }
-                        if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
+                        if matches!(
+                            kernel.value_type(*out),
+                            ValueType::Scalar(DType::U32 | DType::U64)
+                        ) =>
                     {
                         let operation = match op {
                             ops::BinaryOp::Add => WordOp::Add,
@@ -947,7 +958,10 @@ impl<'a> Analysis<'a> {
                         ))
                     }
                     Op::Bit { op, out, a, b }
-                        if kernel.value_type(*out) == ValueType::Scalar(DType::U32) =>
+                        if matches!(
+                            kernel.value_type(*out),
+                            ValueType::Scalar(DType::U32 | DType::U64)
+                        ) =>
                     {
                         let operation = match op {
                             ops::BitOp::And => WordOp::And,
@@ -964,7 +978,9 @@ impl<'a> Analysis<'a> {
                     Op::Cmp { op, out, a, b }
                         if matches!(
                             kernel.value_type(*a),
-                            ValueType::Scalar(DType::U32) | ValueType::Index | ValueType::Bool
+                            ValueType::Scalar(DType::U32 | DType::U64)
+                                | ValueType::Index
+                                | ValueType::Bool
                         ) =>
                     {
                         let operation = match op {
@@ -1001,9 +1017,20 @@ impl<'a> Analysis<'a> {
                     Op::Cast {
                         out,
                         a,
-                        to: ValueType::Scalar(dtype @ (DType::I32 | DType::U32)),
+                        to: ValueType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)),
                     } if kernel.value_type(*a) == ValueType::Index => {
                         Some((*out, self.terms.word_from_natural(get(a)?, *dtype)))
+                    }
+                    Op::Cast {
+                        out,
+                        a,
+                        to: ValueType::Scalar(dtype @ (DType::U32 | DType::U64)),
+                    } if matches!(
+                        kernel.value_type(*a),
+                        ValueType::Scalar(DType::U32 | DType::U64)
+                    ) =>
+                    {
+                        Some((*out, self.terms.node(Node::Resize(get(a)?, *dtype))))
                     }
                     Op::Read {
                         out, place, index, ..
@@ -1032,6 +1059,19 @@ impl<'a> Analysis<'a> {
                             *out,
                             self.plane_field(view, &coordinates, *plane, *field, state)?,
                         ))
+                    }
+                    Op::ReadPlaneLane {
+                        out,
+                        place,
+                        plane,
+                        index,
+                    } => {
+                        let ops::PlaceRef::Global { slot } = place else {
+                            return Err("local packed lane relation is unfinished");
+                        };
+                        let view = kernel.interface().bindings[slot.ordinal() as usize].view;
+                        let coordinates = index.iter().map(get).collect::<Result<Vec<_>>>()?;
+                        Some((*out, self.plane_lane(view, &coordinates, *plane, state)?))
                     }
                     Op::Write {
                         place,
@@ -1457,9 +1497,11 @@ mod tests {
         analysis
             .physical_block(kernel, kernel.root(), &mut HashMap::new(), &mut state)
             .unwrap();
-        assert!(analysis
-            .terms
-            .contains_opaque(state.slots[&unknown_slot.symbol()]));
+        assert!(
+            analysis
+                .terms
+                .contains_opaque(state.slots[&unknown_slot.symbol()])
+        );
         let literal = state.slots[&literal_slot.symbol()];
         assert!(!analysis.terms.contains_opaque(literal));
         assert!(matches!(

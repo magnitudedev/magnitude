@@ -19,9 +19,10 @@ fn readout_head_rows_normalize<L: Isa, E: Elements>(
     let source = cx.arg_out_rows().get([row]) as usize;
     // SAFETY: each work item writes its own row of the scratch.
     let normalized = unsafe { cx.scratch_normalized().slice_mut::<f32>(4 * row * d, d) };
-    projection::normalize::<E::A>(
+    let norm = cx.arg_norm();
+    projection::form_input::<E::A>(
         cx.arg_hidden().row([source, 0]),
-        &cx.arg_norm(),
+        (cx.dim_nm() != 0).then_some(&norm),
         cx.arg_epsilon(),
         shared,
         normalized,

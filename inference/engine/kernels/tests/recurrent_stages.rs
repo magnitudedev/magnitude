@@ -81,6 +81,8 @@ struct Case {
     rows: usize,
     slots: Vec<SlotCase>,
     grouped: bool,
+    /// The output gate's code: 0 SiLU, 1 sigmoid.
+    gate_function: i32,
     epsilon: f32,
     /// The gating's RMS epsilon.
     rms_epsilon: f32,
@@ -140,6 +142,7 @@ impl Tensors {
             norm_epsilon: case.epsilon,
             epsilon: case.rms_epsilon,
             grouped: case.grouped,
+            gate_function: case.gate_function,
             slab_banks: self.slab_banks,
         }
     }
@@ -162,6 +165,7 @@ impl Tensors {
             norm_epsilon: case.epsilon,
             epsilon: case.rms_epsilon,
             grouped: case.grouped,
+            gate_function: case.gate_function,
             slab_banks: self.slab_banks,
         }
     }
@@ -257,6 +261,7 @@ impl Case {
             rows,
             slots,
             grouped,
+            gate_function: 0,
             epsilon: 1.0e-6 * geometry.width as f32,
             rms_epsilon: 1.0e-6,
             projection,
@@ -292,8 +297,15 @@ impl Case {
             delta: outcome.delta.clone(),
             tape: outcome.tape.clone(),
             bf16: self.bf16,
+            gate_function: self.gate_function,
             ..fresh
         }
+    }
+
+    /// Gate the outputs with the sigmoid of z (code 1) in place of SiLU.
+    fn with_sigmoid_gate(mut self) -> Self {
+        self.gate_function = 1;
+        self
     }
 
     /// BF16 activations: projection and window values are BF16 numbers.
@@ -510,7 +522,8 @@ impl Case {
                     let gate =
                         self.projection[row * g.projection_width() + z + head * w + column] as f64;
                     let normalized = round(raw[column] * inverse * self.norm[column] as f64) as f64;
-                    let activated = round(gate / (1.0 + (-gate).exp())) as f64;
+                    let numerator = if self.gate_function == 1 { 1.0 } else { gate };
+                    let activated = round(numerator / (1.0 + (-gate).exp())) as f64;
                     gated[(row * nv + head) * w + column] = round(normalized * activated);
                 }
             }
@@ -521,7 +534,7 @@ impl Case {
     /// The portable body executed by the Seismic interpreter.
     fn oracle(&self) -> Outcome {
         use seismic_lang::{
-            checked::{check_source, SourceFile},
+            checked::{SourceFile, check_source},
             entry::ElementBindings,
             failure::SourceTermination,
             interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -533,6 +546,10 @@ impl Case {
         sources.push(SourceFile {
             path: "recurrent.seismic".into(),
             text: include_str!("../kernels/recurrent.seismic").into(),
+        });
+        sources.push(SourceFile {
+            path: "functions.seismic".into(),
+            text: include_str!("../kernels/functions.seismic").into(),
         });
         let module = check_source(sources).unwrap();
         let elements = ElementBindings::new()
@@ -590,6 +607,7 @@ impl Case {
             self.rms_epsilon.to_bits(),
         )));
         arguments.push(Arg::Scalar(ReferenceScalar::Bool(self.grouped)));
+        arguments.push(Arg::Scalar(ReferenceScalar::I32(self.gate_function)));
         arguments.push(Arg::Scalar(ReferenceScalar::U32(2)));
         let outcome = interpreter.run_bounded(&arguments, u64::MAX).unwrap();
         if let SourceTermination::Failed(failure) = outcome.termination() {
@@ -1078,6 +1096,17 @@ fn small_cases() -> Vec<(&'static str, Case)> {
                 4,
             )
             .with_resets(&[5, 40, 71, 100]),
+        ),
+        (
+            "sigmoid output gate over short and chunked slots",
+            Case::new(
+                SMALL,
+                64,
+                vec![slot(3, 3, 1, 4), slot(40, 33, 2, 5)],
+                true,
+                5,
+            )
+            .with_sigmoid_gate(),
         ),
     ]
 }
@@ -1857,10 +1886,9 @@ fn convolved_step_form_gives_the_step_bits() {
             batch_rows: 4,
         },
     ];
-    for (index, (label, geometry, rows, slots, grouped, hidden)) in cases.into_iter().enumerate()
-    {
-        let case = Case::new(geometry, rows, slots, grouped, 70 + index as u64)
-            .with_bf16_activations();
+    for (index, (label, geometry, rows, slots, grouped, hidden)) in cases.into_iter().enumerate() {
+        let case =
+            Case::new(geometry, rows, slots, grouped, 70 + index as u64).with_bf16_activations();
         let inputs = ProjectionInputs::new(&device, &case, hidden, 90 + index as u64);
         for mapping in mappings {
             let (old_projection, old) = step_form(&device, &case, &inputs, hidden, mapping);
@@ -1868,8 +1896,15 @@ fn convolved_step_form_gives_the_step_bits() {
             let label = format!("{label} {mapping:?}");
             let same = |what: &str, a: &[f32], b: &[f32]| {
                 assert_eq!(a.len(), b.len(), "{label}: {what} length");
-                if let Some(index) = a.iter().zip(b).position(|(a, b)| a.to_bits() != b.to_bits()) {
-                    panic!("{label}: {what}[{index}] {} differs from {}", b[index], a[index]);
+                if let Some(index) = a
+                    .iter()
+                    .zip(b)
+                    .position(|(a, b)| a.to_bits() != b.to_bits())
+                {
+                    panic!(
+                        "{label}: {what}[{index}] {} differs from {}",
+                        b[index], a[index]
+                    );
                 }
             };
             same("projection", &old_projection, &new_projection);
@@ -1902,6 +1937,8 @@ fn step_form(
         .with_static("W", g.width as u64)
         .with_static("QB", 0)
         .with_static("ZB", 0)
+        .with_static("PT", 1)
+        .with_static("NM", hidden as u64)
         .with_param("BATCH_FROM", mapping.batch_from)
         .with_param("TALL", 0)
         .with_param("PACK", 0)
@@ -1981,6 +2018,8 @@ fn convolved_form(
         .with_static("NV", g.value_heads as u64)
         .with_static("W", g.width as u64)
         .with_static("C", g.convolution as u64)
+        .with_static("PT", 1)
+        .with_static("NM", hidden as u64)
         .with_param("BATCH_FROM", mapping.batch_from)
         .with_launch_param(1, "SIMDGROUPS", mapping.simdgroups)
         .with_launch_param(1, "ROWS", mapping.rows)
@@ -2056,6 +2095,7 @@ fn convolved_form(
         norm_epsilon: case.epsilon,
         epsilon: case.rms_epsilon,
         grouped: case.grouped,
+        gate_function: case.gate_function,
         slab_banks: t.slab_banks,
     })
     .unwrap()

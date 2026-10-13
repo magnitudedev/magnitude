@@ -1,0 +1,14 @@
+// selection_notice: notice[row] = selection[row], a (token, status) pair per
+// row; an invocation per row.
+#include <seismic/element.glsl>
+
+void selection_notice() {
+    const uint64_t selection = SEISMIC_PTR(SEISMIC_BUFFER_SELECTION);
+    const uint64_t notice = SEISMIC_PTR(SEISMIC_BUFFER_NOTICE);
+    const uint64_t row = gl_GlobalInvocationID.x;
+    if (row >= SEISMIC_DIM_M)
+        return;
+    for (uint64_t field = 0ul; field < 2ul; ++field)
+        element_i32_put(notice + (row * SEISMIC_NOTICE_STRIDE_0 + field * SEISMIC_NOTICE_STRIDE_1) * 4ul,
+            element_i32_index(selection, row * SEISMIC_SELECTION_STRIDE_0 + field * SEISMIC_SELECTION_STRIDE_1));
+}

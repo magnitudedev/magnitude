@@ -2,8 +2,8 @@ use crate::{
     BankComponent, ComponentDescriptor, ComponentSpec, HistoryDomainLayout, KvCodec, LayerRef,
 };
 use magnitude_family_contracts::{
-    ActivationDType, Attention, Block, Decoder, GatedDelta, HistoryDomain, KeyValue, Operator,
-    ShortConv, StateSpace, SublayerIndex,
+    ActivationDType, Attention, Block, Decoder, GatedDelta, HistoryDomain, HistoryReads, Indexer,
+    KeyValue, NGramInput, Operator, ResidualForm, ShortConv, StateSpace, SublayerIndex,
 };
 use seismic::DType;
 
@@ -96,10 +96,12 @@ pub fn banks_per_slab(bank_bytes: u64) -> Result<usize, String> {
 ///
 /// Target history is grouped into history domains: one Token domain, one
 /// Window domain per distinct window, and one Shared domain per source layer,
-/// in that order (each only when present). Recurrent banks list each
+/// in that order (each only when present), then, with selected attention,
+/// its indexers' raw-key Window and block-key Block domains. Recurrent banks list each
 /// recurrent block's components in block order: gated delta
 /// `[window, state, tape]`, short convolution `[window]`, state space
-/// `[window, state, tape]`. `target_recurrent` is their physical form.
+/// `[window, state, tape]`, then an n-gram input's `[window]` after its
+/// block's mixer's. `target_recurrent` is their physical form.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelStateLayout {
     pub target_history: Vec<HistoryDomainLayout>,
@@ -116,7 +118,8 @@ impl ModelStateLayout {
     ///
     /// A target history component is named by its decoder block and a
     /// drafter component by its drafter block; a block holds at most one
-    /// stateful sublayer. Drafter history is grouped into domains as the
+    /// stateful mixer, and its n-gram input's bank follows the mixer's.
+    /// Drafter history is grouped into domains as the
     /// target's is.
     pub fn derive(
         decoder: &Decoder,
@@ -129,23 +132,30 @@ impl ModelStateLayout {
         let mut target_banks = Vec::new();
         for (index, block) in decoder.blocks.iter().enumerate() {
             let layer = LayerRef::Target(layer(index)?);
-            match block_state(block)? {
-                None => {}
-                Some(Stateful::History(attention, domain)) => target_history.own(
-                    domain,
-                    history_component(attention, layer, target_codec, activation)?,
-                )?,
-                Some(Stateful::Shared(source)) => {
-                    target_history.share(LayerRef::Target(source.block), layer)
-                }
-                Some(Stateful::GatedDelta(delta)) => {
-                    target_banks.extend(delta_bank(delta, activation)?)
-                }
-                Some(Stateful::ShortConv(convolution)) => {
-                    target_banks.push(short_convolution_bank(convolution)?)
-                }
-                Some(Stateful::StateSpace(space)) => {
-                    target_banks.extend(state_space_bank(space, activation)?)
+            for stateful in block_state(block)? {
+                match stateful {
+                    Stateful::History(attention, domain) => {
+                        target_history.own(
+                            domain,
+                            history_component(attention, layer, target_codec, activation)?,
+                        )?;
+                        if let HistoryReads::Selected { block, indexer, .. } = &attention.reads {
+                            target_history.index(index, *block, indexer)?;
+                        }
+                    }
+                    Stateful::Shared(source) => {
+                        target_history.share(LayerRef::Target(source.block), layer)
+                    }
+                    Stateful::GatedDelta(delta) => {
+                        target_banks.extend(delta_bank(delta, activation)?)
+                    }
+                    Stateful::ShortConv(convolution) => {
+                        target_banks.push(short_convolution_bank(convolution)?)
+                    }
+                    Stateful::StateSpace(space) => {
+                        target_banks.extend(state_space_bank(space, activation)?)
+                    }
+                    Stateful::NGram(input) => target_banks.extend(ngram_bank(decoder, input)?),
                 }
             }
         }
@@ -157,11 +167,11 @@ impl ModelStateLayout {
 
         let mut head_history = HistoryDomains::default();
         for (index, block) in drafter.iter().enumerate() {
-            match block_state(block)? {
+            match block_state(block)?.as_slice() {
                 // Drafter history stays dense whatever the target codec: the
                 // drafters' attention reads dense planes only.
-                Some(Stateful::History(attention, domain)) => head_history.own(
-                    domain,
+                [Stateful::History(attention, domain)] => head_history.own(
+                    *domain,
                     history_component(
                         attention,
                         LayerRef::Head(layer(index)?),
@@ -172,7 +182,7 @@ impl ModelStateLayout {
                 _ => {
                     return Err(
                         "a drafter block must hold exactly one owned attention history".into(),
-                    )
+                    );
                 }
             }
         }
@@ -192,6 +202,10 @@ struct HistoryDomains {
     token: Vec<ComponentDescriptor>,
     windows: Vec<(usize, Vec<ComponentDescriptor>)>,
     shared: Vec<(LayerRef, Vec<LayerRef>)>,
+    /// Selected attention's indexers: their block size, their raw keys
+    /// (the incomplete block's, a Window of `block - 1` rows) and their
+    /// finished block keys (a Block domain of that rate).
+    indexers: Option<(usize, Vec<ComponentDescriptor>, Vec<ComponentDescriptor>)>,
 }
 
 impl HistoryDomains {
@@ -206,9 +220,38 @@ impl HistoryDomains {
                 }
             }
             HistoryDomain::Block { .. } => {
-                return Err("block history domains are not supported".into())
+                return Err("block history domains are not supported".into());
             }
         }
+        Ok(())
+    }
+
+    /// Block `index`'s indexer: one key row of `indexer.width` F32 values
+    /// (the indexer scores in F32, as the reference does) per token, with
+    /// its coordinates, in the raw-key domain and per block in the
+    /// block-key domain. Every indexer of a decoder shares one block size.
+    fn index(&mut self, index: usize, block: u64, indexer: &Indexer) -> Result<(), String> {
+        let rate = host(block, "selection block")?;
+        if rate < 2 {
+            return Err("a selection block holds at least two rows".into());
+        }
+        let component = |coordinates| {
+            ComponentDescriptor::indexer(
+                LayerRef::Indexer(layer(index)?),
+                DType::F32,
+                host(indexer.width, "indexer width")?,
+                coordinates,
+            )
+            .map_err(|error| error.to_string())
+        };
+        let (block, raw, finished) = self
+            .indexers
+            .get_or_insert_with(|| (rate, Vec::new(), Vec::new()));
+        if *block != rate {
+            return Err("selected attention layers with differing blocks".into());
+        }
+        raw.push(component(true)?);
+        finished.push(component(false)?);
         Ok(())
     }
 
@@ -235,21 +278,37 @@ impl HistoryDomains {
                     .into_iter()
                     .map(|(source, layers)| HistoryDomainLayout::Shared { source, layers }),
             )
+            .chain(self.indexers.into_iter().flat_map(|(rate, raw, finished)| {
+                [
+                    HistoryDomainLayout::Window {
+                        rows: rate - 1,
+                        components: raw,
+                    },
+                    HistoryDomainLayout::Block {
+                        rate,
+                        components: finished,
+                    },
+                ]
+            }))
             .collect()
     }
 }
 
-/// The state one block keeps.
+/// The state one stateful sublayer keeps.
 enum Stateful<'a> {
     History(&'a Attention, HistoryDomain),
     Shared(SublayerIndex),
     GatedDelta(&'a GatedDelta),
     ShortConv(&'a ShortConv),
     StateSpace(&'a StateSpace),
+    NGram(&'a NGramInput),
 }
 
-fn block_state(block: &Block) -> Result<Option<Stateful<'_>>, String> {
-    let mut state = None;
+/// The state a block keeps, in sublayer order: at most one mixer's (an
+/// attention history or a recurrent bank), and the n-gram input's bank.
+fn block_state(block: &Block) -> Result<Vec<Stateful<'_>>, String> {
+    let mut state = Vec::new();
+    let mut mixers = 0;
     for sublayer in &block.sublayers {
         let stateful = match &sublayer.op {
             // Stored rows hold the key and the value whatever the value's
@@ -261,9 +320,11 @@ fn block_state(block: &Block) -> Result<Option<Stateful<'_>>, String> {
             Operator::GatedDelta(delta) => Stateful::GatedDelta(delta),
             Operator::ShortConv(convolution) => Stateful::ShortConv(convolution),
             Operator::StateSpace(space) => Stateful::StateSpace(space),
-            Operator::DenseFfn(_) | Operator::RoutedFfn(_) | Operator::PerLayerInput(_) => {
-                continue
+            Operator::NGramInput(input) => {
+                state.push(Stateful::NGram(input));
+                continue;
             }
+            Operator::DenseFfn(_) | Operator::RoutedFfn(_) | Operator::PerLayerInput(_) => continue,
             Operator::Parallel(branches)
                 if branches.iter().all(|branch| {
                     matches!(
@@ -272,15 +333,17 @@ fn block_state(block: &Block) -> Result<Option<Stateful<'_>>, String> {
                     )
                 }) =>
             {
-                continue
+                continue;
             }
             op @ (Operator::LatentAttention(_) | Operator::Parallel(_)) => {
-                return Err(format!("{} state has no layout yet", op.name()))
+                return Err(format!("{} state has no layout yet", op.name()));
             }
         };
-        if state.replace(stateful).is_some() {
-            return Err("a block holds more than one stateful sublayer".into());
+        mixers += 1;
+        if mixers > 1 {
+            return Err("a block holds more than one stateful mixer".into());
         }
+        state.push(stateful);
     }
     Ok(state)
 }
@@ -330,6 +393,52 @@ fn delta_bank(recurrent: &GatedDelta, activation: DType) -> Result<[BankComponen
             value_heads,
             key_heads: host(recurrent.key_heads, "recurrent key heads")?,
             width,
+        },
+    ])
+}
+
+/// The n-gram input's bank components, in the order its entries take them:
+/// its window of u rows (`ngram_inject`), F32, over the decoder's S * H
+/// stream channels, `dilation (kernel - 1)` rows before the state (a dense
+/// window of that reach plus one); then its token window (`ngram_rows`),
+/// the sequence's `context` tokens before the state, each stored as
+/// token + 1 in one U32 channel so the zero seed holds no token.
+fn ngram_bank(decoder: &Decoder, input: &NGramInput) -> Result<[BankComponent; 2], String> {
+    let ResidualForm::HyperConnections(streams) = &decoder.residual else {
+        return Err("an n-gram input without residual streams".into());
+    };
+    let reach = input
+        .dilation
+        .checked_mul(
+            input
+                .kernel
+                .checked_sub(1)
+                .ok_or("n-gram kernel must be positive")?,
+        )
+        .ok_or("n-gram reach overflows")?;
+    Ok([
+        BankComponent::ConvWindow {
+            width: host(reach + 1, "n-gram convolution reach")?,
+            channels: host(
+                streams
+                    .streams
+                    .checked_mul(decoder.hidden)
+                    .ok_or("n-gram channels overflow")?,
+                "n-gram channels",
+            )?,
+            dtype: DType::F32,
+        },
+        BankComponent::ConvWindow {
+            width: host(
+                input
+                    .hash
+                    .context
+                    .checked_add(1)
+                    .ok_or("n-gram context overflows")?,
+                "n-gram context",
+            )?,
+            channels: 1,
+            dtype: DType::U32,
         },
     ])
 }
@@ -385,9 +494,9 @@ fn layer(index: usize) -> Result<u32, String> {
 mod tests {
     use super::*;
     use magnitude_family_contracts::{
-        AttentionGate, EmbeddingScale, EntryForm, ExitForm, ExitNorm, HeadNorm,
-        HistoryReads, InputNorm, MediaRowAttention, OutputForm, RecurrentHeadMapping,
-        ResidualForm, RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
+        AttentionGate, EmbeddingScale, EntryForm, ExitForm, ExitNorm, GateFunction, HeadNorm,
+        HistoryReads, InputNorm, MediaRowAttention, OutputForm, RecurrentHeadMapping, ResidualForm,
+        RmsNorm, Rotary, Sublayer, ValueNorm, ValueSource, WeightDescriptor,
     };
 
     #[test]
@@ -549,6 +658,7 @@ mod tests {
             decay: weight(&[4]),
             time_bias: weight(&[4]),
             norm: norm(8),
+            output_gate: GateFunction::Silu,
             output: weight(&[32, 32]),
         };
         let decoder = decoder(
@@ -567,13 +677,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layout.target_history.len(), 1);
-        assert_eq!(layout.target_history[0].components()[0].layer, LayerRef::Target(0));
+        assert_eq!(
+            layout.target_history[0].components()[0].layer,
+            LayerRef::Target(0)
+        );
         // 2 heads of width 32: 8-bit key code rows of 8 words and one affine
         // group (one (scale, zero) pair) per (row, kv head) vector.
         assert_eq!(layout.target_history[0].components()[0].codec.key_width, 32);
         assert_eq!(layout.target_history[0].components()[0].heads, 2);
-        assert_eq!(layout.target_history[0].components()[0].planes()[0].row_extents, [2, 8]);
-        assert_eq!(layout.target_history[0].components()[0].planes()[1].row_extents, [2, 2]);
+        assert_eq!(
+            layout.target_history[0].components()[0].planes()[0].row_extents,
+            [2, 8]
+        );
+        assert_eq!(
+            layout.target_history[0].components()[0].planes()[1].row_extents,
+            [2, 2]
+        );
         // Window: 3 history rows + 3 tape rows of 64 channels; delta; tape rows
         // of u [4, 8] | k [2, 8] | d [4].
         assert_eq!(layout.target_recurrent.len(), 3);
@@ -585,21 +704,116 @@ mod tests {
         assert_eq!(layout.target_recurrent[2].dtype, DType::F32);
         assert_eq!(layout.head_history.len(), 1);
         assert_eq!(layout.head_history[0].components().len(), 2);
-        assert_eq!(layout.head_history[0].components()[1].layer, LayerRef::Head(1));
+        assert_eq!(
+            layout.head_history[0].components()[1].layer,
+            LayerRef::Head(1)
+        );
         assert_eq!(layout.head_history[0].components()[1].codec.key_width, 32);
-        assert_eq!(layout.head_history[0].components()[1].planes()[0].row_extents, [2, 32]);
+        assert_eq!(
+            layout.head_history[0].components()[1].planes()[0].row_extents,
+            [2, 32]
+        );
         assert!(matches!(
             layout.head_history[0].components()[1].codec.key,
             crate::Codec::Dense { dtype: DType::BF16 }
         ));
     }
 
+    /// A block's bank list: its mixer's components, then its n-gram input's
+    /// window of convolution inputs and its token window.
+    #[test]
+    fn an_ngram_input_banks_its_window_and_its_token_window_after_the_mixer() {
+        let short = ShortConv {
+            channels: 16,
+            width: 3,
+            input_gate: weight(&[16, 32]),
+            value: weight(&[16, 32]),
+            output_gate: weight(&[16, 32]),
+            convolution: weight(&[16, 3]),
+            output: weight(&[32, 16]),
+        };
+        let ngram = magnitude_family_contracts::NGramInput {
+            hash: magnitude_family_contracts::NGramHash {
+                context: 2,
+                heads_per_order: 1,
+                multipliers: vec![3, 5, 7],
+                sizes: vec![5, 7],
+                offsets: vec![0, 5],
+                reset: 7,
+            },
+            width: 2,
+            table: weight(&[12, 2]),
+            key: weight(&[128, 4]),
+            value: weight(&[32, 4]),
+            key_norm: norm(128),
+            query_norm: norm(128),
+            convolution_norm: norm(128),
+            convolution: weight(&[128, 4]),
+            kernel: 4,
+            dilation: 3,
+        };
+        let mut decoder = decoder(
+            ActivationDType::BF16,
+            vec![Block {
+                sublayers: vec![
+                    Sublayer {
+                        input: InputNorm::Rms(norm(32)),
+                        op: Operator::ShortConv(Box::new(short)),
+                        output: OutputForm::Residual,
+                    },
+                    Sublayer {
+                        input: InputNorm::None,
+                        op: Operator::NGramInput(Box::new(ngram)),
+                        output: OutputForm::Residual,
+                    },
+                ],
+            }],
+        );
+        decoder.residual = ResidualForm::HyperConnections(
+            magnitude_family_contracts::HyperConnections {
+                streams: 4,
+                mixing: magnitude_family_contracts::HyperConnectionMixing::LowRankGated { rank: 2 },
+            },
+        );
+        let layout = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 2).unwrap();
+        assert_eq!(
+            layout.target_banks,
+            [
+                BankComponent::ConvWindow {
+                    width: 3,
+                    channels: 16,
+                    dtype: DType::F32,
+                },
+                BankComponent::ConvWindow {
+                    width: 10,
+                    channels: 128,
+                    dtype: DType::F32,
+                },
+                BankComponent::ConvWindow {
+                    width: 3,
+                    channels: 1,
+                    dtype: DType::U32,
+                },
+            ]
+        );
+        // Every window records the same 2 tape rows after its reach.
+        assert_eq!(layout.target_recurrent[1].shape, [9 + 2, 128]);
+        assert_eq!(layout.target_recurrent[2].shape, [2 + 2, 1]);
+        assert_eq!(layout.target_recurrent[2].dtype, DType::U32);
+    }
+
     #[test]
     fn dense_target_history_preserves_head_and_width_axes() {
         let decoder = decoder(ActivationDType::F16, vec![block(attention())]);
         let layout = ModelStateLayout::derive(&decoder, &[], KvCodec::Dense, 0).unwrap();
-        assert_eq!(layout.target_history[0].components()[0].planes()[0].row_extents, [2, 32]);
-        assert_eq!(layout.target_history[0].components()[0].planes()[1].row_extents, [2, 32]);
+        assert_eq!(
+            layout.target_history[0].components()[0].planes()[0].row_extents,
+            [2, 32]
+        );
+        assert_eq!(
+            layout.target_history[0].components()[0].planes()[1].row_extents,
+            [2, 32]
+        );
     }
 
     #[test]
@@ -657,7 +871,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(layout.target_history.len(), 5);
-        assert_eq!(layout.target_history[0].kind(), crate::HistoryDomainKind::Token);
+        assert_eq!(
+            layout.target_history[0].kind(),
+            crate::HistoryDomainKind::Token
+        );
         assert_eq!(layers(&layout.target_history[0]), [LayerRef::Target(1)]);
         assert_eq!(
             layout.target_history[1].kind(),

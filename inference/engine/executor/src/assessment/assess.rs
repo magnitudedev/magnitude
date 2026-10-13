@@ -174,9 +174,11 @@ pub fn finish_execution_assessment(
         })?;
     let capacities = fit_capacities(topology, device, host, &request.reserves)
         .map_err(|error| AssessmentError::Memory(error.to_string()))?;
+    let shared = crate::platform::shared_role(device)
+        .map_err(|error| AssessmentError::Memory(error.to_string()))?;
     let fit = prepared
         .charge
-        .assess_fit(&capacities)
+        .assess_fit(&capacities, shared)
         .map_err(AssessmentError::Memory)?;
     let fit_context_tokens = prepared.fit_context_tokens;
     match fit.verdict {

@@ -16,7 +16,15 @@ state when the request can continue.
 Recurrent state lives in bank slabs; a bank contains one conversation's recurrent-layer state
 and tape. Banks are claimed and returned through shared ownership exactly as separate allocations
 would be. A bank's components derive from its layers: convolution windows, gated delta states,
-Mamba-2 state-space states (always F32) and their tapes. A bank publishes its state after an
+Mamba-2 state-space states (always F32) and their tapes, as an ordered list of sublayer banks per
+block. A block's n-gram input keeps two windows after its mixer's components: an F32 window of its
+dilated convolution's reach, and a token window of the sequence's tokens before the state (as many
+as its row rule reads, stored token + 1 in U32 so the zero seed holds none). The token window is
+how checkpoints, forks, prefix reuse and rollback carry the n-gram rule's preceding tokens; nothing
+else holds them on the device. The executor keeps each resident sequence's tokens on the host to
+the same rule: a target forward at a position replaces every token from that position on (rejected
+verification rows, a discarded lookahead and a rollback are all fed again), and a resume state
+carries the tokens before its position into the sequence that opens from it. A bank publishes its state after an
 advance's committed rows and records every later row on its tape: the input rows of each
 convolution window, the gated delta rule's innovations, keys and decays, and the Mamba-2 additive
 rule's inputs, `B` rows and steps. A reader of version (bank, tape rows) replays those rows onto the
@@ -37,14 +45,26 @@ span bound, free space and per-row references. A domain is one of:
   plus its tentative rows.
 - **Shared**: no storage; its layers bind the regions of a source layer in a stored domain and
   see that domain's spans.
-- **Block(rate)**: one row per `rate` tokens. It is an interface only, and a store rejects it with
-  a typed error.
+- **Block(rate)**: one row per `rate` tokens: block `b`'s row is written by the advance whose rows
+  reach position `(b + 1)·rate`, and a history at position `p` references blocks `[0, p/rate)`.
 
 A model has one Window domain per distinct window size. Qwen's stores have one Token domain.
 
+A selected attention read's indexer (`LayerRef::Indexer`) keeps its raw keys, each with its row's
+rotary coordinates, in a Window(rate − 1) domain and its finished block keys in a Block(rate)
+domain; these domains hold indexer keys alone and follow every domain attention reads. Each is one
+history read of a launch row: a row reads, as stored spans, the raw keys of the `rate − 1` positions
+before it and every block complete before it (its advance's earlier rows and blocks at their
+destinations), and writes its own raw key and the block it completes. An advance reserves one Block
+row per block it completes; its commit of an accepted prefix keeps the blocks that prefix
+completes; a checkpoint at `p` references raw keys `[p − rate + 1, p)` and blocks `[0, p/rate)`. So
+prefix reuse, verification and rollback across a block boundary hold the blocks a straight run
+does.
+
 Each accepted history holds, per stored domain, an ordered list of spans; one span is contiguous
 within one slab of its domain and spans need not ascend in address order. An advance of `n` rows
-reserves `n` rows in every stored domain of its store, as one transaction: a refusal in any domain
+reserves the rows it adds in every stored domain of its store (`n`, or one per completed block in a
+Block domain), as one transaction: a refusal in any domain
 releases the rows reserved in the others. In each domain it first grows its history into free rows
 after its last row within that slab. Otherwise it continues in another free span or a new slab. A
 fresh history begins within the largest free span, leaving room for the history ending before it; a
@@ -166,10 +186,15 @@ Commit publishes the destination position and history only after the state progr
   `p` keeps rows `[p − n, p)` for every fork and resumed request.
 - A store of one Token domain has one row numbering and one history slab tensor for every
   attention layer.
+- A Block(rate) history holds exactly the blocks complete at its position: a commit of an accepted
+  prefix keeps the blocks that prefix completes, a checkpoint at `p` references blocks
+  `[0, p/rate)`, and forks and successors continue them.
 - Compaction publishes only after all copies complete, preserves greedy continuation, and needs
   no new memory claim on any backend.
 - Failed joint history and bank slab growth restores both published backings and their charge.
 - A new sequence observes zero recurrent state even after prior sequences have returned dirty banks.
+- The n-gram token window of version (bank, tape rows) and the host's tokens before that position
+  name the same rows, across chunks, verification, rollback, forks and prefix reuse.
 - A successor bank is never the zero seed, an accepted bank a live state, checkpoint or fork can
   read, or another in-flight successor.
 - Submit failure and cancellation leave accepted state unchanged and release tentative claims.

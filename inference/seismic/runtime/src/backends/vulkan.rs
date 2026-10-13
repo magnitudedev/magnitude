@@ -49,6 +49,7 @@ pub(super) fn discovered(description: seismic_vulkan::Description) -> Discovered
             },
             ledger: LedgerKey::PhysicalGpu(facts.uuid),
             max_allocation_bytes: facts.limits.max_allocation_bytes,
+            shared_device_local: facts.uploads_device_local(),
         }
     } else {
         DiscoveredMemory::Host {

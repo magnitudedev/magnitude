@@ -80,6 +80,7 @@ fn encode(value: SymbolValue) -> Option<(SymbolSort, u64)> {
             ((v as u32) ^ (1 << 31)) as u64,
         ),
         SymbolValue::U32(v) => (SymbolSort::Scalar(DType::U32), v as u64),
+        SymbolValue::U64(v) => (SymbolSort::Scalar(DType::U64), v),
         SymbolValue::Bool(v) => (SymbolSort::Scalar(DType::Bool), v as u64),
         SymbolValue::F32(v) => (
             SymbolSort::Scalar(DType::F32),
@@ -111,6 +112,7 @@ fn decode(sort: SymbolSort, rank: u64) -> SymbolValue {
         SymbolSort::Int => SymbolValue::Int(BigInt::from((rank ^ (1 << 63)) as i64)),
         SymbolSort::Scalar(DType::I32) => SymbolValue::I32(((rank as u32) ^ (1 << 31)) as i32),
         SymbolSort::Scalar(DType::U32) => SymbolValue::U32(rank as u32),
+        SymbolSort::Scalar(DType::U64) => SymbolValue::U64(rank),
         SymbolSort::Scalar(DType::Bool) => SymbolValue::Bool(rank != 0),
         SymbolSort::Scalar(DType::F32) => {
             SymbolValue::F32(f32::from_bits(float_bits(rank, 32) as u32))
@@ -121,7 +123,7 @@ fn decode(sort: SymbolSort, rank: u64) -> SymbolValue {
 }
 fn range(sort: SymbolSort) -> (u64, u64) {
     match sort {
-        SymbolSort::Nat | SymbolSort::Int => (0, u64::MAX),
+        SymbolSort::Nat | SymbolSort::Int | SymbolSort::Scalar(DType::U64) => (0, u64::MAX),
         SymbolSort::Scalar(DType::I32 | DType::U32) => (0, u32::MAX as u64),
         SymbolSort::Scalar(DType::Bool) => (0, 1),
         SymbolSort::Scalar(DType::F32) => (0, u32::MAX as u64),
@@ -949,6 +951,7 @@ pub(super) fn compare(
         }
         SymbolValue::I32(v) => scalar!(expr::I32, v),
         SymbolValue::U32(v) => scalar!(expr::U32, v),
+        SymbolValue::U64(v) => scalar!(expr::U64, v),
         SymbolValue::Bool(v) => scalar!(expr::BoolScalar, v),
     })
 }

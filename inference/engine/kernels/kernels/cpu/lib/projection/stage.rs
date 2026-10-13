@@ -23,6 +23,38 @@ pub fn normalize<A: Dense>(
     rms_row::<A>(x, weight, epsilon, out);
 }
 
+/// A projection entry's input row (`form_input` in functions.seismic): the
+/// RMS normalization of residual row `x` with `norm` when the entry has one,
+/// else the sum in part order of the parts of `x`, rows of `out.len()`
+/// values a hyper-connection mix site publishes; each value published to `A`.
+#[inline(always)]
+pub fn form_input<A: Dense>(
+    x: &[f32],
+    norm: Option<&Weights<'_>>,
+    epsilon: f32,
+    shared: &mut [u8],
+    out: &mut [f32],
+) {
+    match norm {
+        Some(norm) => normalize::<A>(x, norm, epsilon, shared, out),
+        None => sum_parts::<A>(x, out),
+    }
+}
+
+/// The sum in part order of the `out.len()`-wide parts of `x`, each value
+/// published to `A`.
+#[inline(always)]
+pub fn sum_parts<A: Dense>(x: &[f32], out: &mut [f32]) {
+    let width = out.len();
+    for (column, target) in out.iter_mut().enumerate() {
+        let mut sum = 0.0f32;
+        for part in x.chunks_exact(width) {
+            sum += part[column];
+        }
+        *target = activation::publish::<A>(sum);
+    }
+}
+
 /// The RMS normalization of residual row `x` with the decoded norm `weight`,
 /// each value published to `A`: `A(x * rsqrt(sum(x^2) / len + epsilon) * w)`.
 #[inline(always)]

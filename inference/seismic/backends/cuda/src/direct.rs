@@ -328,6 +328,37 @@ impl Drop for DirectGraph {
     }
 }
 
+/// A 32-bit word in pinned host memory mapped into the device's address
+/// space, which the host and the device's stream both write and wait on.
+pub struct HostWord {
+    mapped: driver::HostMapped,
+}
+
+impl HostWord {
+    /// A word at 0.
+    pub fn new(device: &Device) -> Result<Self, ExecutionError> {
+        let mapped = driver::HostMapped::new(device.context(), 4).map_err(submission)?;
+        mapped.write_at(0, &0u32.to_le_bytes());
+        Ok(Self { mapped })
+    }
+
+    fn atomic(&self) -> &std::sync::atomic::AtomicU32 {
+        // SAFETY: the mapping is four aligned bytes owned by `self`; the
+        // device accesses them only through the word operations.
+        unsafe { &*self.mapped.host().cast::<std::sync::atomic::AtomicU32>() }
+    }
+
+    /// Set the word from the host, after every host write before it.
+    pub fn store(&self, value: u32) {
+        self.atomic().store(value, Ordering::Release);
+    }
+
+    /// The word, with every write the device made before it.
+    pub fn load(&self) -> u32 {
+        self.atomic().load(Ordering::Acquire)
+    }
+}
+
 /// Launches issued in order on the device's stream. The stream orders each
 /// launch after the previous one's writes.
 pub struct DirectBatch {
@@ -398,6 +429,56 @@ impl DirectBatch {
         };
         driver
             .check(status, "native kernel launch")
+            .map_err(submission)
+    }
+
+    /// The stream's following work waits until `word` reaches `value`
+    /// (`cuStreamWaitValue32`, compared cyclically: `word - value` as I32
+    /// at least 0): the host gate.
+    pub fn wait_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        // CU_STREAM_WAIT_VALUE_GEQ
+        const GEQ: u32 = 0;
+        self.word_operation(word, value, GEQ, |driver| driver.stream_wait_value_32)
+    }
+
+    /// `word` becomes `value` once the stream's preceding work completes,
+    /// its writes visible first (`cuStreamWriteValue32` with its memory
+    /// barrier).
+    pub fn write_word(&mut self, word: &HostWord, value: u32) -> Result<(), ExecutionError> {
+        // CU_STREAM_WRITE_VALUE_DEFAULT
+        const DEFAULT: u32 = 0;
+        self.word_operation(word, value, DEFAULT, |driver| driver.stream_write_value_32)
+    }
+
+    fn word_operation(
+        &mut self,
+        word: &HostWord,
+        value: u32,
+        flags: u32,
+        symbol: impl FnOnce(
+            &driver::Driver,
+        ) -> Option<
+            unsafe extern "system" fn(Handle, u64, u32, std::ffi::c_uint) -> std::ffi::c_int,
+        >,
+    ) -> Result<(), ExecutionError> {
+        let context = self.device.context();
+        let operation = symbol(&context.driver).ok_or_else(|| {
+            ExecutionError::SubmissionFailed(
+                "the CUDA driver predates driver API 11.7 stream memory operations".into(),
+            )
+        })?;
+        let _current = context.enter().map_err(submission)?;
+        let status = unsafe {
+            operation(
+                self.device.stream().raw(),
+                word.mapped.device,
+                value,
+                flags,
+            )
+        };
+        context
+            .driver
+            .check(status, "stream memory operation")
             .map_err(submission)
     }
 

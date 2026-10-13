@@ -68,10 +68,13 @@ impl ShortConvShape {
     }
 
     /// `attention_output`'s dimensions: one head of `channels`.
-    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        // One residual stream (`scatter` without inject).
         [
             ("M", rows),
             ("D", self.hidden),
+            ("SN", 1),
+            ("IN", 0),
             ("Q", 1),
             ("W", self.channels),
         ]

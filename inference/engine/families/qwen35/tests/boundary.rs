@@ -41,7 +41,7 @@ fn adapter_sources_do_not_import_engine_implementation_layers() {
         );
     }
 
-    let all_sources = [source, include_str!("../src/inputs.rs")].join("\n");
+    let all_sources = [source, include_str!("../src/family.rs")].join("\n");
     for generic_payload in ["tokenizer.ggml", "tokenizer.chat_template"] {
         assert!(
             !all_sources.contains(generic_payload),

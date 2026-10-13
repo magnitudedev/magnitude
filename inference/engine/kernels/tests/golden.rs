@@ -1077,9 +1077,10 @@ fn features_rows(ctx: &Ctx) -> Vec<Variant> {
             .map(|(m, o)| Case {
                 label: format!("m{m}o{o}"),
                 args: vec![
+                    // The rows as their `[M, PT, D]` parts (one part).
                     ctx.dense(
                         f32e(),
-                        &[m as u64, HIDDEN as u64],
+                        &[m as u64, 1, HIDDEN as u64],
                         &activations(&mut rng, m, HIDDEN, 1.0),
                     ),
                     norm.clone(),
@@ -2764,11 +2765,20 @@ fn run_entry(
     let mut lines: BTreeMap<String, String> = BTreeMap::new();
     let mut prepared = 0usize;
     for variant in &variants {
-        // A variant names the statics of either backend's declaration.
+        // A variant names the statics of either backend's declaration. The
+        // golden entries run over the single residual stream: those of the
+        // streams' join (`SN` 1, `IN` 0) and input form (`PT` 1, `NM` the
+        // row width, `D` or `H`) that the declaration names.
+        let width = variant
+            .statics
+            .iter()
+            .find(|(name, _)| *name == "D" || *name == "H")
+            .map_or(0, |(_, value)| *value);
         let statics = variant
             .statics
             .iter()
             .copied()
+            .chain([("SN", 1), ("IN", 0), ("PT", 1), ("NM", width)])
             .filter(|(name, _)| native.statics.iter().any(|s| s == name))
             .collect::<Vec<_>>();
         let mut configs = configurations(native, &statics, spec.id);

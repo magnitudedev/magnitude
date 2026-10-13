@@ -5,6 +5,7 @@
 //! contract, so the block binds the recurrent control ports; its bank is the
 //! window alone.
 
+use crate::operators::Join;
 use crate::operators::gated_delta::graph::RecurrentControlPorts;
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
@@ -84,6 +85,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
     hidden: &WorkflowTensor,
+    join: &Join,
     block: ShortConvBlock,
 ) -> Result<(WorkflowTensor, NativePort, RecurrentControlPorts), GraphError> {
     let shape = block.shape;
@@ -149,7 +151,8 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 b_scale: weight_scale.into(),
                 c_scale: weight_scale.into(),
                 x_scale: weight_scale.into(),
-            },        )?
+            },
+        )?
         .value;
     let dimensions = shape.rows_dimensions(block.rows, block.slots, banks, tape_rows);
     let input = |graph: &mut G, name: &str| graph.input_for(kernels.rows, name, &dimensions);
@@ -174,10 +177,12 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
                 following_bank: controls.following_bank.tensor().into(),
                 window: window.tensor_mut().into(),
                 slab_banks: block.slab_banks,
-            },        )?
+            },
+        )?
         .value;
     // One output head of every channel.
     let gated = gated.reshape(&[block.rows, 1, shape.channels]);
+    let inject = join.inject(graph, block.rows, constants)?;
     let output = graph
         .enqueue(
             kernels.output,
@@ -188,6 +193,7 @@ pub(crate) fn short_conv<'a, G: GraphDraft + 'a>(
             .concat(),
             attention_output::WorkflowArgs {
                 hidden: hidden.into(),
+                inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
                 output_bound: (&output_bound.tensor).into(),
@@ -235,7 +241,7 @@ mod tests {
             } else {
                 Encoding::F32
             };
-            let nbytes = source_element(encoding)
+            let nbytes = source_element(encoding, *shape.last().unwrap())
                 .unwrap()
                 .canonical_byte_len(&shape)
                 .unwrap();

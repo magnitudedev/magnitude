@@ -84,13 +84,13 @@ fn attention_absorb[G, W](qt: &tensor[G, W] A, key: &tensor[W] f32,
 
 # The output projection of the Q = KV * G gated attention heads plus the F32
 # residual. Both backends: the K1 projection library.
-fn attention_output[M, D, Q, W, OB](hidden: &tensor[M, D] f32,
-    gated: &tensor[M, Q, W] A, output_weight: &tensor[D, Q * W] OW,
-    output_bound: &tensor[OB] f32) -> tensor[M, D] f32 where OB >= 0 and (OB == 0 or Q * W % OB == 0):
+fn attention_output[M, D, SN, IN, Q, W, OB](hidden: &tensor[M, SN * D] f32, inject: &tensor[M, IN] f32,
+    gated: &tensor[M, Q, W] A, output_weight: &tensor[D, Q * W] OW, output_bound: &tensor[OB] f32) -> tensor[M, SN * D] f32
+    where OB >= 0 and (OB == 0 or Q * W % OB == 0) and IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)):
     let mut projected = tensor[M, D] A
-    let mut result = tensor[M, D] f32
+    let mut result = tensor[M, SN * D] f32
     linear(reshape(gated, (M, Q * W)), output_weight, projected)
-    add(hidden, projected, result)
+    scatter(hidden, projected, inject, result)
     return result
 
 # Metal: GEMV below BATCH_FROM rows (`gemv` for one row, `gemv_pair` for two,
@@ -106,7 +106,7 @@ fn attention_output[M, D, Q, W, OB](hidden: &tensor[M, D] f32,
 # row); weights or devices without the packed path run the staged tile, with
 # its results.
 native attention_output for metal from "metal/attention_output.metal":
-    static (D, Q, W, OB)
+    static (D, SN, IN, Q, W, OB)
     params (arithmetic BATCH_FROM in [5, 3, 9], arithmetic SPLIT in [1, 2, 4], form TALL in [1, 0],
         arithmetic form PACK in [0, 1], code arithmetic form RESIDUE in [1, 2])
     where Q * W > 0 and (TALL == 0 or (SPLIT == 1 and Q * W % 128 == 0)) and (PACK == 0 or (TALL == 1 and Q * W % 256 == 0 and Q * W < 1048576 and D % 64 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and OB > 0))
@@ -180,7 +180,7 @@ native attention_output for metal from "metal/attention_output.metal":
 # `cuda_dense.seismic`); the shared stage produces selected S8 or F16 matrix operands.
 # (Metal: batched GEMV class, no INT8 path.)
 native attention_output for cuda from "cuda/attention_output.cu":
-    static (D, Q, W)
+    static (D, SN, IN, Q, W)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
     where Q * W > 0 and Q * W % 64 == 0 and (OPERAND == 0 or INT8 == 0)
     scratch staged bytes (M * Q * W * (1 + OPERAND)) when M > 16 and (INT8 == 1 or OPERAND == 1)
@@ -216,7 +216,7 @@ native attention_output for cuda from "cuda/attention_output.cu":
 # Vulkan: the K1 projection (see `attention_project`): GEMV to 8 rows,
 # GEMM beyond with SPLIT-way split-K summed in order by `finalize`.
 native attention_output for vulkan from "vulkan/attention_output.comp":
-    static (D, Q, W)
+    static (D, SN, IN, Q, W)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64],
             arithmetic SPLIT in [1, 2, 4])
@@ -292,19 +292,20 @@ native attention_output for cpu from "cpu/attention_output.rs":
 # enumerate their tile groups or block columns in segment order. Mode 1 is
 # draft-history injection: Q/gate outputs are zero and only K/V is consumed.
 # Native backends may omit the Q/gate projection work in that mode.
-fn attention_project[M, D, Q, GR, K, V, QB, GB, KB, VB](hidden: &tensor[M, D] f32,
-    input_norm: &tensor[D] NW, query_weight: &tensor[Q, D] QW, gate_weight: &tensor[GR, D] GW,
+fn attention_project[M, D, PT, NM, Q, GR, K, V, QB, GB, KB, VB](hidden: &tensor[M, PT * D] f32,
+    input_norm: &tensor[NM] NW,
+    query_weight: &tensor[Q, D] QW, gate_weight: &tensor[GR, D] GW,
     key_weight: &tensor[K, D] KW, value_weight: &tensor[V, D] VW, epsilon: f32,
     project_mode: i32, query_bound: &tensor[QB] f32, gate_bound: &tensor[GB] f32,
     key_bound: &tensor[KB] f32, value_bound: &tensor[VB] f32)
     -> (tensor[M, Q] A, tensor[M, GR] A, tensor[M, K] A, tensor[M, V] A)
-    where Q >= 0 and GR >= 0 and K >= 0 and V >= 0 and QB >= 0 and GB >= 0 and KB >= 0 and VB >= 0 and (QB == 0 or D % QB == 0) and (GB == 0 or D % GB == 0) and (KB == 0 or D % KB == 0) and (VB == 0 or D % VB == 0):
+    where Q >= 0 and GR >= 0 and K >= 0 and V >= 0 and QB >= 0 and GB >= 0 and KB >= 0 and VB >= 0 and (QB == 0 or D % QB == 0) and (GB == 0 or D % GB == 0) and (KB == 0 or D % KB == 0) and (VB == 0 or D % VB == 0) and NM >= 0 and ((NM == D and PT == 1) or (NM == 0 and PT >= 1)):
     let mut normalized = tensor[M, D] A
     let mut query = tensor[M, Q] A
     let mut gate = tensor[M, GR] A
     let mut key = tensor[M, K] A
     let mut value = tensor[M, V] A
-    rms_norm(hidden, input_norm, normalized, epsilon)
+    form_input(hidden, input_norm, normalized, epsilon)
     if Q > 0 and project_mode == 0:
         linear(normalized, query_weight, query)
     else:
@@ -332,7 +333,7 @@ fn attention_project[M, D, Q, GR, K, V, QB, GB, KB, VB](hidden: &tensor[M, D] f3
 # segment order, and the staged 64 x 64 tiles (`unpacked`) for a segment whose
 # weights the operand does not serve and for the zero tiles of mode 1.
 native attention_project for metal from "metal/attention_project.metal":
-    static (D, Q, GR, K, V, QB, GB, KB, VB)
+    static (D, PT, NM, Q, GR, K, V, QB, GB, KB, VB)
     params (arithmetic BATCH_FROM in [5, 3, 9], form TALL in [1, 0], arithmetic form PACK in [0, 1],
         code arithmetic form RESIDUE in [1, 2])
     where D > 0 and (TALL == 0 or D % 128 == 0) and (PACK == 0 or (TALL == 1 and D % 256 == 0 and D < 1048576 and Q % 32 == 0 and GR % 32 == 0 and K % 32 == 0 and V % 32 == 0)) and (PACK == 1 or (PACK_TOKENS == 4 and WEIGHTS_AHEAD == 0)) and (PACK == 0 or (TILE_M == 64 and TILE_N == 64)) and (PACK == 0 or (TALL_M == 128 and TALL_K == 64 and STAGERS == 2)) and (RESIDUE == 1 or (PACK == 1 and QB + GB + KB + VB > 0))
@@ -412,7 +413,7 @@ native attention_project for metal from "metal/attention_project.metal":
         threads_per_threadgroup (128, 1, 1)
 
 native attention_project for cuda from "cuda/attention_project.cu":
-    static (D, Q, GR, K, V)
+    static (D, PT, NM, Q, GR, K, V)
     params (code arithmetic INT8 in [0, 1], code arithmetic OPERAND in [0, 1])
     where D > 0 and D % 64 == 0 and (OPERAND == 0 or INT8 == 0)
     scratch staged bytes (M * D * 2) when M > 1
@@ -445,7 +446,7 @@ native attention_project for cuda from "cuda/attention_project.cu":
         shared_bytes (2 * (128 * 144 + 10240) + 2048)
 
 native attention_project for vulkan from "vulkan/attention_project.comp":
-    static (D, Q, GR, K, V)
+    static (D, PT, NM, Q, GR, K, V)
     params (SIMDGROUPS in [16, 8, 4, 2, 32], ROWS in [1, 2, 4], arithmetic LANES in [16, 32],
             TILE_M in [128, 64, 32], TILE_N in [128, 64], SUB_M in [32, 64], SUB_N in [32, 64])
     where D > 0 and SUB_M <= TILE_M and SUB_N <= TILE_N
@@ -544,7 +545,7 @@ fn gate_row[W, I, U](attended: &tensor[W] f32, interleaved: &tensor[I] A,
                     gate_function)
     return result
 
-fn attention_rows[M, T, KV, G, P, S, I, U, F, N, NV, R](
+fn attention_rows[M, T, KV, G, P, S, I, U, F, N, NV, R, B](
     query: &tensor[M, KV * G, 2 * P + S + I] A, gate: &tensor[M, KV * G, U] A,
     key: &tensor[F, M, KV * (2 * P + S)] A, value: &tensor[F, M, KV * (2 * P + S)] A,
     query_norm: &tensor[N, 2 * P + S] f32, key_norm: &tensor[N, 2 * P + S] f32,
@@ -553,10 +554,11 @@ fn attention_rows[M, T, KV, G, P, S, I, U, F, N, NV, R](
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    selection: &tensor[M, B] u32, block_rows: i32,
     history_key: &mut tensor[T, KV, 2 * P + S] A,
     history_value: &mut tensor[T, KV, 2 * P + S] A,
     epsilon: f32, scale: f32, gate_function: i32) -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and B >= 0:
     let mut fresh_key = tensor[F, M, KV, 2 * P + S] A
     let mut fresh_value = tensor[F, M, KV, 2 * P + S] A
     for layer in 0..F:
@@ -584,20 +586,38 @@ fn attention_rows[M, T, KV, G, P, S, I, U, F, N, NV, R](
                 denominator[head] = 0.0
                 for column in 0..2 * P + S:
                     accumulator[head, column] = 0.0
+            # Key o of the row (its position along its spans, then its fresh
+            # span) is read when B = 0, or when its block's bit is set.
+            let mut ordinal = 0
             for span in 0..R:
                 let lo = visible[row, span, 0]
                 let hi = visible[row, span, 1]
-                if hi > lo:
-                    attention_update(qt, history_key[lo : hi, kv_head],
-                        history_value[lo : hi, kv_head], maximum, denominator,
-                        accumulator, scale)
+                if hi > lo and lo >= 0:
+                    if B == 0:
+                        attention_update(qt, history_key[lo : hi, kv_head],
+                            history_value[lo : hi, kv_head], maximum, denominator,
+                            accumulator, scale)
+                    else:
+                        for token in lo..hi:
+                            if selected(selection[row], ordinal + token - lo, block_rows):
+                                attention_absorb(qt, f32(history_key[token, kv_head]),
+                                    f32(history_value[token, kv_head]), maximum, denominator,
+                                    accumulator, scale)
+                    ordinal = ordinal + hi - lo
             let fresh_lo = fresh[row, 0]
             let fresh_hi = fresh[row, 1]
             for layer in 0..F:
-                if fresh_hi > fresh_lo:
-                    attention_update(qt, fresh_key[layer, fresh_lo : fresh_hi, kv_head],
-                        fresh_value[layer, fresh_lo : fresh_hi, kv_head], maximum,
-                        denominator, accumulator, scale)
+                if fresh_hi > fresh_lo and fresh_lo >= 0:
+                    if B == 0:
+                        attention_update(qt, fresh_key[layer, fresh_lo : fresh_hi, kv_head],
+                            fresh_value[layer, fresh_lo : fresh_hi, kv_head], maximum,
+                            denominator, accumulator, scale)
+                    else:
+                        for token in fresh_lo..fresh_hi:
+                            if token < M and selected(selection[row], ordinal + token - fresh_lo, block_rows):
+                                attention_absorb(qt, f32(fresh_key[layer, token, kv_head]),
+                                    f32(fresh_value[layer, token, kv_head]), maximum, denominator,
+                                    accumulator, scale)
             for head in 0..G:
                 let mut attended = tensor[2 * P + S] f32
                 for column in 0..2 * P + S:
@@ -614,6 +634,18 @@ fn attention_rows[M, T, KV, G, P, S, I, U, F, N, NV, R](
                     history_key[destinations[row], head] = fresh_key[layer, row, head]
                     history_value[destinations[row], head] = fresh_value[layer, row, head]
     return result
+
+# Whether a row's WorkList bitmap (B > 0) reads key `ordinal`: the bit of its
+# block (`block_rows` keys a block) in word block / 32. A block past the
+# bitmap is not read: the bitmap covers the served context, which bounds
+# the keys a query tile lists (`attention_prefill`).
+fn selected[B](bitmap: &tensor[B] u32, ordinal: i32, block_rows: i32) -> bool:
+    let mut read = false
+    if block_rows > 0 and ordinal >= 0:
+        let block = ordinal / block_rows
+        if block / 32 < B:
+            read = ((bitmap[block / 32] >> u32(block % 32)) & u32(1)) != u32(0)
+    return read
 
 # Decode rows (M <= 8). L1: one threadgroup per (kv head, partition, row). A
 # row's visible keys (spans in order, then its fresh span) split into
@@ -638,9 +670,10 @@ fn attention_decode[M, T, KV, G, P, S, I, U, F, N, NV, R](
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
     where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+    let every = tensor[M, 0] u32
     return attention_rows(query, gate, key, value, query_norm, key_norm, value_norm,
         rotary_components, rotary_frequencies, rotary_amplitudes, coordinates, visible,
-        fresh, destinations, history_key, history_value, epsilon, scale, gate_function)
+        fresh, destinations, every, 1, history_key, history_value, epsilon, scale, gate_function)
 
 # Metal: partitions of max(SPAN, ceil(keys / PARTS)) keys; each simdgroup
 # holds the G / SLICES query heads of its slice, W / 32 columns per lane.
@@ -760,7 +793,15 @@ native attention_decode for cpu from "cpu/attention_decode.rs":
 # directly; otherwise L3 merges the partitions' (partial output, maximum,
 # denominator) in partition order with the decode merge rule and applies the
 # gate.
-fn attention_prefill[M, T, KV, G, P, S, I, U, F, N, NV, R](
+#
+# A WorkList read (B > 0) reads key `ordinal` of a row when the bit of its
+# block of BR keys is set in the row's `selection`; `block_slots` holds no
+# values, its extent is BR (1 for a Visible read). The bitmap's 32 * B * BR
+# keys cover the served context, so a row reads at most that many keys: a
+# query tile's list holds at most its rows' tiles of them (its rows may
+# belong to different requests, whose keys differ), whatever the history's
+# reservation T.
+fn attention_prefill[M, T, KV, G, P, S, I, U, F, N, NV, R, B, BR](
     query: &tensor[M, KV * G, 2 * P + S + I] A, gate: &tensor[M, KV * G, U] A,
     key: &tensor[F, M, KV * (2 * P + S)] A, value: &tensor[F, M, KV * (2 * P + S)] A,
     query_norm: &tensor[N, 2 * P + S] f32, key_norm: &tensor[N, 2 * P + S] f32,
@@ -769,14 +810,15 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, N, NV, R](
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    selection: &tensor[M, B] u32, block_slots: &tensor[0, BR] i32,
     history_key: &mut tensor[T, KV, 2 * P + S] A,
     history_value: &mut tensor[T, KV, 2 * P + S] A,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0:
+    where P >= 0 and S >= 0 and 2 * P + S >= 1 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and B >= 0 and BR >= 1:
     return attention_rows(query, gate, key, value, query_norm, key_norm, value_norm,
         rotary_components, rotary_frequencies, rotary_amplitudes, coordinates, visible,
-        fresh, destinations, history_key, history_value, epsilon, scale, gate_function)
+        fresh, destinations, selection, i32(BR), history_key, history_value, epsilon, scale, gate_function)
 
 # Metal: tiles of 32 keys (16 for heads wider than 256, whose output
 # accumulates in 256-column windows) on simdgroup matrices or tensor
@@ -787,19 +829,24 @@ fn attention_prefill[M, T, KV, G, P, S, I, U, F, N, NV, R](
 # such value is admitted. An attend threadgroup fits the device's 1024
 # threads.
 native attention_prefill for metal from "metal/attention_prefill.metal":
-    static (KV, G, P, S, I, U, F, N, NV)
+    static (KV, G, P, S, I, U, F, N, NV, B)
     params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
         arithmetic form DIRECT in [0, 1])
-    where (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
+    where (B == 0 or DIRECT == 0) and (DIRECT == 0 or QT >= 16) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and P % ((2 * P + S) / 32) == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and (32 - 16 * min(1, (2 * P + S) / 257)) * (2 * P + S + 8) * 2 + 64 * 16 <= 32768
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
     scratch values bytes ((M + 32 * DIRECT) * KV * (2 * P + S) * 2)
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
+    scratch worklist bytes (ceil_div(M, QT) * (QT * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
         threadgroups (ceil_div((ceil_div(M, QT) * QT + 32 * DIRECT) * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_list when B > 0:
+        threadgroups (ceil_div(M, QT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((R + 1) * 16 + 9 * 4)
     launch attention_prefill_attend:
         threadgroups (ceil_div(M, QT), KV * ceil_div(G, HEADS), max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS))))
         threads_per_threadgroup (QT * min(HEADS, G) * (4 - 2 * DIRECT), 1, 1)
@@ -818,7 +865,7 @@ native attention_prefill for metal from "metal/attention_prefill.metal":
 # 16 tiles (so long histories fill the device) and a merge launch combines
 # them; SPLIT_GROUPS = 1 never splits.
 native attention_prefill for cuda from "cuda/attention_prefill.cu":
-    static (KV, G, P, S, I, U, F, N, NV)
+    static (KV, G, P, S, I, U, F, N, NV, B)
     params (arithmetic WARPS in [4, 2, 8, 1], arithmetic SPLIT_GROUPS in [1, 256, 512], arithmetic STAGES in [2, 3],
         arithmetic COLUMNS in [1, 2], QREG in [0, 1])
     where (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and ((1 - QREG) * (WARPS * 16 * (2 * P + S) + STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS))) + QREG * max(WARPS * 16 * (2 * P + S), STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * (min(2 * P + S, 256) + min(2 * P + S, 256 * COLUMNS)))) * 2 <= 98304
@@ -828,9 +875,14 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, WARPS * 16 / G) * 4)
+    scratch worklist bytes (ceil_div(M, (WARPS * 16 / G)) * ((WARPS * 16 / G) * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
         threadgroups (ceil_div(M * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_list when B > 0:
+        threadgroups (ceil_div(M, (WARPS * 16 / G)), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((R + 1) * 8 + 9 * 4)
     launch attention_prefill_attend:
         threadgroups (ceil_div(M, WARPS * 16 / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)))
         threads_per_threadgroup (COLUMNS * WARPS * 32, 1, 1)
@@ -844,7 +896,7 @@ native attention_prefill for cuda from "cuda/attention_prefill.cu":
 # tokens x G query heads, kv head, key partition), a head wider than 256 in
 # 256-column chunks; L3 merges split tiles.
 native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
-    static (KV, G, P, S, I, U, F, N, NV)
+    static (KV, G, P, S, I, U, F, N, NV, B)
     params (arithmetic ROWS in [64, 128], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S) % 32 == 0 and (2 * P + S <= 64 or (2 * P + S) % 64 == 0) and (2 * P + S <= 256 or (2 * P + S) % 256 == 0) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
@@ -853,9 +905,14 @@ native attention_prefill for vulkan from "vulkan/attention_prefill.comp":
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
+    scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_prepare:
         threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_list when B > 0:
+        threadgroups (ceil_div(M, ROWS / G), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (257 * 4)
     launch attention_prefill_attend:
         threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
         threads_per_threadgroup (ROWS * 2, 1, 1)
@@ -889,7 +946,7 @@ native attention_prefill for cpu from "cpu/attention_prefill.rs":
 # and value decoded as it is absorbed and the fresh rows' prepared key (as
 # rounded to the activation dtype) and value encoded at their destinations.
 # Fresh rows of the batch attend dense.
-fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, KC, KP, VC, VP](
+fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, B, KC, KP, VC, VP](
     query: &tensor[M, KV * G, 2 * P + S + I] A, gate: &tensor[M, KV * G, U] A,
     key: &tensor[F, M, KV * (2 * P + S)] A, value: &tensor[F, M, KV * (2 * P + S)] A,
     query_norm: &tensor[N, 2 * P + S] f32, key_norm: &tensor[N, 2 * P + S] f32,
@@ -898,12 +955,13 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, KC, KP, VC, VP](
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    selection: &tensor[M, B] u32, block_rows: i32,
     history_key_codes: &mut tensor[T, KV, KC] u32,
     history_key_coefficients: &mut tensor[T, KV, KP] f16,
     history_value_codes: &mut tensor[T, KV, VC] u32,
     history_value_coefficients: &mut tensor[T, KV, VP] f16,
     epsilon: f32, scale: f32, gate_function: i32) -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP:
+    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0:
     let mut fresh_key = tensor[F, M, KV, 2 * P + S] A
     let mut fresh_value = tensor[F, M, KV, 2 * P + S] A
     for layer in 0..F:
@@ -936,24 +994,39 @@ fn attention_rows_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, KC, KP, VC, VP](
                 denominator[head] = 0.0
                 for column in 0..2 * P + S:
                     accumulator[head, column] = 0.0
+            # Key o of the row is read when B = 0 or its block's bit is set
+            # (`attention_rows`).
+            let mut ordinal = 0
             for span in 0..R:
                 let lo = visible[row, span, 0]
                 let hi = visible[row, span, 1]
                 if lo >= 0 and hi > lo and (2 * P + S) / 16 >= 1 and (2 * P + S) / 8 >= 1 and (2 * P + S) / 4 >= 1:
                     for token in lo..hi:
-                        affine_decode(history_key_codes[token, kv_head],
-                            history_key_coefficients[token, kv_head], decoded_key)
-                        affine_decode(history_value_codes[token, kv_head],
-                            history_value_coefficients[token, kv_head], decoded_value)
-                        attention_absorb(qt, decoded_key, decoded_value, maximum, denominator,
-                            accumulator, scale)
+                        let mut read = true
+                        if B > 0:
+                            read = selected(selection[row], ordinal + token - lo, block_rows)
+                        if read:
+                            affine_decode(history_key_codes[token, kv_head],
+                                history_key_coefficients[token, kv_head], decoded_key)
+                            affine_decode(history_value_codes[token, kv_head],
+                                history_value_coefficients[token, kv_head], decoded_value)
+                            attention_absorb(qt, decoded_key, decoded_value, maximum, denominator,
+                                accumulator, scale)
+                    ordinal = ordinal + hi - lo
             let fresh_lo = fresh[row, 0]
             let fresh_hi = fresh[row, 1]
             for layer in 0..F:
-                if fresh_hi > fresh_lo:
-                    attention_update(qt, fresh_key[layer, fresh_lo : fresh_hi, kv_head],
-                        fresh_value[layer, fresh_lo : fresh_hi, kv_head], maximum,
-                        denominator, accumulator, scale)
+                if fresh_hi > fresh_lo and fresh_lo >= 0:
+                    if B == 0:
+                        attention_update(qt, fresh_key[layer, fresh_lo : fresh_hi, kv_head],
+                            fresh_value[layer, fresh_lo : fresh_hi, kv_head], maximum,
+                            denominator, accumulator, scale)
+                    else:
+                        for token in fresh_lo..fresh_hi:
+                            if token < M and selected(selection[row], ordinal + token - fresh_lo, block_rows):
+                                attention_absorb(qt, f32(fresh_key[layer, token, kv_head]),
+                                    f32(fresh_value[layer, token, kv_head]), maximum, denominator,
+                                    accumulator, scale)
             for head in 0..G:
                 let mut attended = tensor[2 * P + S] f32
                 for column in 0..2 * P + S:
@@ -1114,9 +1187,10 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, KC, KP, VC, VP](
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
     where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP:
+    let every = tensor[M, 0] u32
     return attention_rows_k8v4(query, gate, key, value, query_norm, key_norm, value_norm,
         rotary_components, rotary_frequencies, rotary_amplitudes, coordinates, visible,
-        fresh, destinations, history_key_codes, history_key_coefficients, history_value_codes,
+        fresh, destinations, every, 1, history_key_codes, history_key_coefficients, history_value_codes,
         history_value_coefficients, epsilon, scale, gate_function)
 
 # Prefill rows (M >= 16) over affine K8/V4 history: `attention_prefill`'s
@@ -1132,8 +1206,9 @@ fn attention_decode_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, KC, KP, VC, VP](
 # (so tiles adjacent in the history stay adjacent), a bounded part at a time.
 # A call whose rows see more tiles than its caller lists passes no list (L =
 # 0), and only implementations that read history rows in place serve it. The
-# body and those implementations ignore the list.
-fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, L, HT, KC, KP, VC, VP](
+# body and those implementations ignore the list. `selection` and
+# `block_slots` (BR) are `attention_prefill`'s WorkList read.
+fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, B, BR, L, HT, KC, KP, VC, VP](
     query: &tensor[M, KV * G, 2 * P + S + I] A, gate: &tensor[M, KV * G, U] A,
     key: &tensor[F, M, KV * (2 * P + S)] A, value: &tensor[F, M, KV * (2 * P + S)] A,
     query_norm: &tensor[N, 2 * P + S] f32, key_norm: &tensor[N, 2 * P + S] f32,
@@ -1142,6 +1217,7 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, L, HT, KC, KP, V
     rotary_amplitudes: &tensor[P] f32,
     coordinates: &tensor[M, 4] i32, visible: &tensor[M, R, 2] i32,
     fresh: &tensor[M, 2] i32, destinations: &tensor[M] i32,
+    selection: &tensor[M, B] u32, block_slots: &tensor[0, BR] i32,
     history_tiles: &tensor[L, HT] i32,
     history_key_codes: &mut tensor[T, KV, KC] u32,
     history_key_coefficients: &mut tensor[T, KV, KP] f16,
@@ -1149,7 +1225,7 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, L, HT, KC, KP, V
     history_value_coefficients: &mut tensor[T, KV, VP] f16,
     epsilon: f32, scale: f32, gate_function: i32, slab_rows: u32)
     -> tensor[M, KV * G, 2 * P + S] A
-    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and L >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP:
+    where P >= 0 and S >= 0 and 2 * P + S >= 32 and I >= 0 and U >= 0 and F >= 0 and N >= 0 and NV >= 0 and L >= 0 and (2 * P + S) % 32 == 0 and 4 * KC == 2 * P + S and 8 * VC == 2 * P + S and 16 * KP == 2 * P + S and KP == VP and B >= 0 and BR >= 1:
     # Prefill publishes before reading, including earlier destinations in
     # the current causal batch. The common body repeats those same writes
     # after attention; both executions have identical observable final state.
@@ -1159,8 +1235,8 @@ fn attention_prefill_k8v4[M, T, KV, G, P, S, I, U, F, N, NV, R, L, HT, KC, KP, V
         history_value_coefficients, epsilon, slab_rows)
     return attention_rows_k8v4(query, gate, key, value, query_norm, key_norm, value_norm,
         rotary_components, rotary_frequencies, rotary_amplitudes, coordinates, visible,
-        fresh, destinations, history_key_codes, history_key_coefficients, history_value_codes,
-        history_value_coefficients, epsilon, scale, gate_function)
+        fresh, destinations, selection, i32(BR), history_key_codes, history_key_coefficients,
+        history_value_codes, history_value_coefficients, epsilon, scale, gate_function)
 
 # A lane's W / 32 codes must be whole words or a power-of-two part of one, so
 # W is a power of two. The query group splits into SLICES slices, as in
@@ -1347,7 +1423,7 @@ native attention_decode_k8v4 for cpu from "cpu/attention_decode_k8v4.rs":
 # under DIRECT is this form's alone, on every device: a 16-row threadgroup
 # does not hold four pairs).
 native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal":
-    static (KV, G, P, S, I, U, F, N, NV, L, KC, KP, VC, VP)
+    static (KV, G, P, S, I, U, F, N, NV, B, L, KC, KP, VC, VP)
     params (arithmetic QT in [16, 8, 32], arithmetic HEADS in [16, 8, 4, 2, 1], arithmetic SPLIT_GROUPS in [256, 128, 512, 1],
         arithmetic form DIRECT in [0, 1], arithmetic form COISSUE in [0, 1])
     let SPLIT = max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, QT) * KV * ceil_div(G, HEADS)))
@@ -1360,16 +1436,21 @@ native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal
     let WINDOW = SPARE / 256 * 256
     let ROUND = max((SPARE - STATE) / 256 * 256, 256 * (1 - DIRECT))
     let ROUNDS = max(1, DIRECT * min(1, HT * 256 / (WINDOW + 1)) * ceil_div(HT * 256, ROUND))
-    where 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 65 * 64 + 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE + 8 * COISSUE * ((2 * P + S) / 512)) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
+    where (B == 0 or (DIRECT == 0 and COISSUE == 0 and L == 0)) and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and L <= 1 and (DIRECT == 0 or (L == 1 and KV * ceil_div(G, 16) <= 8)) and (DIRECT == 0 or QT >= 16 or (COISSUE == 1 and 2 * P + S == 512)) and (COISSUE == 0 or (DIRECT == 1 and (2 * P + S == 128 or 2 * P + S == 256 or (2 * P + S == 512 and QT == 8)) and 32 + QT * min(HEADS, G) / 8 * max(1, (2 * P + S) / 256) * (48 + 2 * ((96 - 64 * min(1, (2 * P + S) / 129)) * 16 + 32) + 32 * min(2 * P + S, 256) + 2048 * min(1, (2 * P + S) / 512)) + 65 * 64 + 16 <= 32768)) and (HEADS <= G or HEADS / 2 < G) and QT * min(HEADS, G) * (4 - 2 * DIRECT + 6 * COISSUE + 8 * COISSUE * ((2 * P + S) / 512)) <= 1024 and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0
     scratch queries bytes (ceil_div(M, QT) * QT * KV * G * (2 * P + S) * 2)
     scratch keys bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
     scratch values bytes (max(M + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV * (2 * P + S) * 2)
     scratch partials bytes (((1 - L) * SPLIT + L * CHARGED) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (SPLIT * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, QT) * 4)
+    scratch worklist bytes (ceil_div(M, QT) * (QT * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_k8v4_prepare:
         threadgroups (ceil_div(max(ceil_div(M, QT) * QT + 32 * DIRECT, COISSUE * (96 - 64 * min(1, (2 * P + S) / 129))) * KV, 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_k8v4_list when B > 0:
+        threadgroups (ceil_div(M, QT), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((R + 1) * 16 + 9 * 4)
     repeat (ROUNDS):
         launch attention_prefill_k8v4_decode when DIRECT == 1:
             threadgroups (ceil_div(min(HT * 256, WINDOW) + 32 + 64 * COISSUE, 32), 1, 1)
@@ -1410,16 +1491,17 @@ native attention_prefill_k8v4 for metal from "metal/attention_prefill_k8v4.metal
 # default with 256 was at most 1.46x the best (median 1.15x), with 1 (no
 # split) at most 10.3x (median 1.42x), with 512 at most 1.67x.
 native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
-    static (KV, G, P, S, I, U, F, N, NV, L, KC, KP, VC, VP)
+    static (KV, G, P, S, I, U, F, N, NV, B, L, KC, KP, VC, VP)
     params (arithmetic WARPS in [4, 2, 8], arithmetic SPLIT_GROUPS in [256, 1, 512], arithmetic STAGES in [2, 3],
         arithmetic COLUMNS in [1, 2], QREG in [0, 1], arithmetic PRODUCERS in [4, 0, 1, 2, 8], form HISTORY_STAGE in [0, 1])
-    where (HISTORY_STAGE == 0 or (L == 1 and PRODUCERS == 0)) and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256 or COLUMNS >= 2) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and (HISTORY_STAGE == 1 or PRODUCERS > 0 or ((2 * P + S) >= 128 and (2 * P + S) <= 256) or (2 * P + S) == 512) and ((1 - QREG) * ((WARPS * 16 * (2 * P + S) * 2) + (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8)) + QREG * max((WARPS * 16 * (2 * P + S) * 2), (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8))) + min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257) * (1 + min(1, PRODUCERS)) * COLUMNS * WARPS * 1024 <= 98304
+    where (B == 0 or (HISTORY_STAGE == 0 and L == 0)) and (HISTORY_STAGE == 0 or (L == 1 and PRODUCERS == 0)) and 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and G <= WARPS * 16 and (QREG == 0 or 2 * P + S <= 256 or COLUMNS >= 2) and min(2 * P + S, 256 * COLUMNS) % (16 * COLUMNS) == 0 and (HISTORY_STAGE == 1 or PRODUCERS > 0 or ((2 * P + S) >= 128 and (2 * P + S) <= 256) or (2 * P + S) == 512) and ((1 - QREG) * ((WARPS * 16 * (2 * P + S) * 2) + (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8)) + QREG * max((WARPS * 16 * (2 * P + S) * 2), (STAGES * (32 - 16 * min(1, (2 * P + S) / 257)) * ((min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + min((2 * P + S), 256 * COLUMNS)) * 2 + (1 - HISTORY_STAGE) * (max(1, PRODUCERS) - PRODUCERS) * (STAGES - (STAGES - 1) * min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257)) * (32 - 16 * min(1, (2 * P + S) / 257)) * (9 * (min((2 * P + S), 256) + min(1, COLUMNS - 1) * ((2 * P + S) - min((2 * P + S), 256))) + 5 * min((2 * P + S), 256 * COLUMNS)) / 8))) + min(1, COLUMNS - 1) * min(1, (2 * P + S) / 257) * (1 + min(1, PRODUCERS)) * COLUMNS * WARPS * 1024 <= 98304
     scratch queries bytes (M * KV * G * (2 * P + S) * 2)
     scratch keys bytes (M * KV * (2 * P + S) * 2)
     scratch values bytes (M * KV * (2 * P + S) * 2)
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, WARPS * 16 / G) * 4)
+    scratch worklist bytes (ceil_div(M, (WARPS * 16 / G)) * ((WARPS * 16 / G) * (ceil_div(32 * B * BR, (32 - 16 * min(1, (2 * P + S) / 257))) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     scratch history_valid bytes (HT * 8 * 4) when HISTORY_STAGE == 1
     scratch history_keys bytes (HT * 256 * KV * (2 * P + S) * 2) when HISTORY_STAGE == 1
     scratch history_values bytes (HT * 256 * KV * (2 * P + S) * 2) when HISTORY_STAGE == 1
@@ -1432,6 +1514,10 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
     launch attention_prefill_k8v4_history_stage when HISTORY_STAGE == 1:
         threadgroups (ceil_div(HT * 256 * KV * (2 * P + S), 8 * 256), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_k8v4_list when B > 0:
+        threadgroups (ceil_div(M, (WARPS * 16 / G)), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes ((R + 1) * 8 + 9 * 4)
     launch attention_prefill_k8v4_attend:
         threadgroups (ceil_div(M, WARPS * 16 / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, WARPS * 16 / G) * KV)))
         threads_per_threadgroup ((COLUMNS * WARPS + PRODUCERS) * 32, 1, 1)
@@ -1444,7 +1530,7 @@ native attention_prefill_k8v4 for cuda from "cuda/attention_prefill_k8v4.cu":
 # the prepare launch appends encoded rows and history tiles decode (rounded to
 # the f16 operand) as they are staged.
 native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.comp":
-    static (KV, G, P, S, I, U, F, N, NV, KC, KP, VC, VP)
+    static (KV, G, P, S, I, U, F, N, NV, B, KC, KP, VC, VP)
     params (arithmetic ROWS in [64, 128], arithmetic SPLIT_GROUPS in [256, 128, 512, 1])
     where 32 * KC == 8 * (2 * P + S) and 32 * VC == 4 * (2 * P + S) and 16 * KP == 2 * P + S and KP == VP and (I == 0 or I == 2 * P + S) and (U == 0 or U == 1 or U == 2 * P + S) and (I == 0 or U == 0) and F <= 1 and N <= 1 and NV <= 1 and (2 * P + S == 32 or 2 * P + S == 64 or 2 * P + S == 128 or 2 * P + S == 256 or 2 * P + S == 512) and P % ((2 * P + S) / 32) == 0 and G <= ROWS and ROWS / G <= 32 and 64 * (min(2 * P + S, 256) + 8) + ROWS / 16 * 2048 <= 32768
     scratch queries bytes ((ceil_div(M, ROWS / G) * (ROWS / G) * KV * G + ROWS) * (2 * P + S) * 2)
@@ -1453,9 +1539,14 @@ native attention_prefill_k8v4 for vulkan from "vulkan/attention_prefill_k8v4.com
     scratch partials bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * (2 * P + S) * 4)
     scratch statistics bytes (max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)) * M * KV * G * 8)
     scratch counts bytes (ceil_div(M, ROWS / G) * 4)
+    scratch worklist bytes (ceil_div(M, (ROWS / G)) * ((ROWS / G) * (ceil_div(32 * B * BR, 32) + R + 1) * 8 + 4) + M * (R + 1) * 4) when B > 0
     launch attention_prefill_k8v4_prepare:
         threadgroups (ceil_div(ceil_div(M, ROWS / G) * (ROWS / G) * KV * (G + 1), 8), 1, 1)
         threads_per_threadgroup (256, 1, 1)
+    launch attention_prefill_k8v4_list when B > 0:
+        threadgroups (ceil_div(M, ROWS / G), 1, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (257 * 4)
     launch attention_prefill_k8v4_attend:
         threadgroups (ceil_div(M, ROWS / G), KV, max(1, ceil_div(SPLIT_GROUPS, ceil_div(M, ROWS / G) * KV)))
         threads_per_threadgroup (ROWS * 2, 1, 1)

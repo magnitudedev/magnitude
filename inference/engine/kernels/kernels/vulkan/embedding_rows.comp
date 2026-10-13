@@ -42,6 +42,12 @@
 #elif defined(SEISMIC_TABLE_REPRESENTATION_Q5G32)
 #define TABLE_KIND PACKETS_Q5G32
 #define TABLE_LAYOUT PACKETS_ROWS16_Q5(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_IQ2XS)
+#define TABLE_KIND PACKETS_IQ2XS
+#define TABLE_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_TABLE)
+#elif defined(SEISMIC_TABLE_REPRESENTATION_IQ3XXS)
+#define TABLE_KIND PACKETS_IQ3XXS
+#define TABLE_LAYOUT PACKETS_ROWS16_GRID(SEISMIC_TABLE)
 #elif defined(SEISMIC_TABLE_REPRESENTATION_BF16)
 #define TABLE_KIND PACKETS_BF16
 #define TABLE_LAYOUT packets_rows16(SEISMIC_TABLE_STRIDE_0 * 2ul, 0ul, 0ul, 0ul, 0ul)
@@ -70,7 +76,7 @@ void embedding_rows_inverse() {
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = TABLE_LAYOUT;
     const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
-        SEISMIC_DIM_R, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
+        SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(SEISMIC_PTR(SEISMIC_BUFFER_TOKENS), row * SEISMIC_TOKENS_STRIDE_0));
     const uint64_t table_row = SEISMIC_PTR(SEISMIC_BUFFER_TABLE) + token * geometry.stride;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     float squares = 0.0;
@@ -96,7 +102,7 @@ void embedding_rows() {
     const uint64_t row = gl_WorkGroupID.x;
     const packets_rows16 geometry = TABLE_LAYOUT;
     const uint64_t token = gathered_row(SEISMIC_PTR(SEISMIC_BUFFER_DIRECTORY), SEISMIC_DIRECTORY_STRIDE_0,
-        SEISMIC_DIM_R, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
+        SEISMIC_DIM_R, SEISMIC_DIM_F, element_i32_index(tokens, row * SEISMIC_TOKENS_STRIDE_0));
     const uint64_t table_row = table + token * geometry.stride;
     const float scale = element_word_f32(SEISMIC_PARAM_SCALE);
     for (uint p = gl_LocalInvocationID.x; p * 32u < width; p += gl_WorkGroupSize.x) {

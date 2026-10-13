@@ -11,6 +11,7 @@ from magnitude_references.families.llama import LlamaReference
 from magnitude_references.families.muse import MuseReference
 from magnitude_references.families.nemotron_h import NemotronHReference
 from magnitude_references.families.qwen35 import Qwen35Reference
+from magnitude_references.families.qwen4exp import Qwen4ExpReference
 from magnitude_references.gguf import Package
 from magnitude_references.model import Reference, Weights
 
@@ -25,6 +26,7 @@ REFERENCES: dict[str, tuple[str, type[Reference]]] = {
     "nemotron_h_moe": ("nemotron_h", NemotronHReference),
     "qwen35": ("qwen35", Qwen35Reference),
     "qwen35moe": ("qwen35", Qwen35Reference),
+    "qwen4exp": ("qwen4exp", Qwen4ExpReference),
 }
 
 

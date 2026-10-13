@@ -1157,7 +1157,7 @@ mod tests {
             assert_eq!(not.admits_dtype(dtype), dtype == DType::Bool);
             assert_eq!(
                 bit_not.admits_dtype(dtype),
-                matches!(dtype, DType::I32 | DType::U32)
+                matches!(dtype, DType::I32 | DType::U32 | DType::U64)
             );
             assert_eq!(neg.admits_dtype(dtype), dtype != DType::Bool);
         }

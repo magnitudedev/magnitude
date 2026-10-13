@@ -66,11 +66,7 @@ impl Form {
         self.kv * self.g
     }
     fn i(&self) -> usize {
-        if self.interleaved {
-            self.w()
-        } else {
-            0
-        }
+        if self.interleaved { self.w() } else { 0 }
     }
     /// The gate values of one query head.
     fn gates(&self) -> usize {
@@ -384,7 +380,7 @@ impl Case {
 /// Checks the host model against the portable body of `entry`.
 fn check_host_model(entry: &str, case: &Case) {
     use seismic_lang::{
-        checked::{check_source, SourceFile},
+        checked::{SourceFile, check_source},
         entry::ElementBindings,
         failure::SourceTermination,
         interp::{Arg, Interpreter, OutcomeValue, TensorData},
@@ -396,6 +392,10 @@ fn check_host_model(entry: &str, case: &Case) {
     sources.push(SourceFile {
         path: "attention.seismic".into(),
         text: include_str!("../kernels/attention.seismic").into(),
+    });
+    sources.push(SourceFile {
+        path: "functions.seismic".into(),
+        text: include_str!("../kernels/functions.seismic").into(),
     });
     let module = check_source(sources).unwrap();
     let logical = module
@@ -431,7 +431,7 @@ fn check_host_model(entry: &str, case: &Case) {
                 .collect::<Vec<_>>(),
         )
     };
-    let args = vec![
+    let mut args = vec![
         tensor(
             DType::BF16,
             vec![m, heads, w + form.i()],
@@ -461,6 +461,14 @@ fn check_host_model(entry: &str, case: &Case) {
         Arg::Scalar(ReferenceScalar::I32(i32::from(form.softplus))),
         Arg::Scalar(ReferenceScalar::U32(t as u32)),
     ];
+    // The prefill takes its WorkList bitmap (none: B = 0) and block keys
+    // (BR = 1) after the destinations.
+    let prefill = entry == "attention_prefill";
+    if prefill {
+        args.insert(14, tensor(DType::I32, vec![0, 1], Vec::new()));
+        args.insert(14, tensor(DType::U32, vec![m, 0], Vec::new()));
+    }
+    let planes = if prefill { 16 } else { 14 };
     let outcome = interpreter.run(&args).unwrap();
     if let SourceTermination::Failed(failure) = outcome.termination() {
         panic!("{entry} portable body failed: {failure}");
@@ -479,8 +487,8 @@ fn check_host_model(entry: &str, case: &Case) {
     }
     let inputs = outcome.inputs().collect::<Vec<_>>();
     for (ordinal, expected, name) in [
-        (14, &expected.1, "history_key"),
-        (15, &expected.2, "history_value"),
+        (planes, &expected.1, "history_key"),
+        (planes + 1, &expected.2, "history_value"),
     ] {
         let input = inputs
             .iter()
@@ -579,6 +587,10 @@ struct Bound {
     visible: Tensor,
     fresh: Tensor,
     destinations: Tensor,
+    /// The prefill's absent WorkList bitmap ([M, 0]).
+    selection: Tensor,
+    /// Its blocks' keys (`[0, 1]`: every key read).
+    block_slots: Tensor,
     _slabs: SlabTensor,
     history_key: Tensor,
     history_value: Tensor,
@@ -654,6 +666,8 @@ impl Bound {
             visible: i32_tensor(device, &[m, case.spans, 2], &case.visible),
             fresh: i32_tensor(device, &[m, 2], &case.fresh),
             destinations: i32_tensor(device, &[m], &case.destinations),
+            selection: Tensor::from_host(device, Element::u32(), &[m as u64, 0], &[]).unwrap(),
+            block_slots: Tensor::from_host(device, Element::i32(), &[0, 1], &[]).unwrap(),
             history_key: slabs.logical_region(0).unwrap(),
             history_value: slabs.logical_region(1).unwrap(),
             _slabs: slabs,
@@ -836,10 +850,30 @@ fn configurations(device: &Device, decode: bool, form: Form) -> Vec<Vec<(&'stati
             // The smallest declared HEADS holding all of a kv head's query heads.
             let heads = (form.g.next_power_of_two() as u64).min(16);
             vec![
-                vec![("QT", 16), ("HEADS", heads), ("SPLIT_GROUPS", 256), ("DIRECT", 0)],
-                vec![("QT", 8), ("HEADS", heads), ("SPLIT_GROUPS", 1), ("DIRECT", 0)],
-                vec![("QT", 16), ("HEADS", heads), ("SPLIT_GROUPS", 256), ("DIRECT", 1)],
-                vec![("QT", 16), ("HEADS", heads), ("SPLIT_GROUPS", 1), ("DIRECT", 1)],
+                vec![
+                    ("QT", 16),
+                    ("HEADS", heads),
+                    ("SPLIT_GROUPS", 256),
+                    ("DIRECT", 0),
+                ],
+                vec![
+                    ("QT", 8),
+                    ("HEADS", heads),
+                    ("SPLIT_GROUPS", 1),
+                    ("DIRECT", 0),
+                ],
+                vec![
+                    ("QT", 16),
+                    ("HEADS", heads),
+                    ("SPLIT_GROUPS", 256),
+                    ("DIRECT", 1),
+                ],
+                vec![
+                    ("QT", 16),
+                    ("HEADS", heads),
+                    ("SPLIT_GROUPS", 1),
+                    ("DIRECT", 1),
+                ],
             ]
         }
         (BackendName::Cuda, true) => {
@@ -946,8 +980,15 @@ fn run(
     case: &Case,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
     let mut bound = Bound::new(device, case);
+    // The prefill in its Visible form: no WorkList bitmap (B = 0, a static
+    // of the GPU natives).
+    let specialization = &if decode || device.backend() == BackendName::Cpu {
+        specialization.clone()
+    } else {
+        specialization.clone().with_static("B", 0)
+    };
     macro_rules! call {
-        ($module:ident) => {{
+        ($module:ident $(, $extra:ident: $value:expr)*) => {{
             let kernel = $module::native_for_device_with(
                 device,
                 $module::Elements { A: Element::bf16() },
@@ -956,6 +997,7 @@ fn run(
             .map_err(|error| error.to_string())?;
             kernel
                 .call($module::Args {
+                    $($extra: $value,)*
                     query: &bound.query,
                     gate: &bound.gate,
                     key: &bound.key,
@@ -984,7 +1026,7 @@ fn run(
     let result = if decode {
         call!(attention_decode)
     } else {
-        call!(attention_prefill)
+        call!(attention_prefill, selection: &bound.selection, block_slots: &bound.block_slots)
     };
     Ok((
         bf16_values(&result),

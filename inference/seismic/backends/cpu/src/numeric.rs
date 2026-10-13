@@ -23,6 +23,7 @@ pub fn round_to(dtype: DType, value: f64) -> f64 {
         DType::F16 => f16_round(value as f32) as f64,
         DType::I32 => value as i32 as f64,
         DType::U32 => value as u32 as f64,
+        DType::U64 => value as u64 as f64,
         DType::Bool => {
             if value != 0.0 {
                 1.0

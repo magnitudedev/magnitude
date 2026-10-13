@@ -35,4 +35,14 @@ inline float softcap(float cap, float z) {
     return cap * (2.0f / (1.0f + metal::exp(-2.0f * z / cap)) - 1.0f);
 }
 
+// A gated delta net's output gate on z, by the code the entries take
+// (`gate_function: i32`): 0 SiLU, 1 sigmoid.
+constant constexpr int gate_sigmoid = 1;
+
+inline float output_gate(int function, float z) {
+    if (function == gate_sigmoid)
+        return 1.0f / (1.0f + metal::exp(-z));
+    return z / (1.0f + metal::exp(-z));
+}
+
 } // namespace functions

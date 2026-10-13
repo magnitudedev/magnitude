@@ -68,13 +68,20 @@ fn encoding(name: &str) -> Encoding {
         "Q5_0" => 6,
         "Q5_1" => 7,
         "Q8_0" => 8,
+        "Q2_K" => 10,
         "Q3_K" => 11,
         "Q4_K" => 12,
         "Q5_K" => 13,
         "Q6_K" => 14,
+        "IQ2_XXS" => 16,
+        "IQ2_XS" => 17,
+        "IQ3_XXS" => 18,
+        "IQ1_S" => 19,
         "IQ4_NL" => 20,
         "IQ3_S" => 21,
+        "IQ2_S" => 22,
         "IQ4_XS" => 23,
+        "IQ1_M" => 29,
         "I32" => 26,
         "BF16" => 30,
         "MXFP4" => 39,
@@ -147,7 +154,11 @@ pub fn set(directory: &mut Directory, name: &str, value: Value) {
 pub fn remove_tensor(directory: &mut Directory, name: &str) {
     let before = directory.tensors.len();
     directory.tensors.retain(|tensor| tensor.name != name);
-    assert_eq!(directory.tensors.len() + 1, before, "{name} is recorded once");
+    assert_eq!(
+        directory.tensors.len() + 1,
+        before,
+        "{name} is recorded once"
+    );
 }
 
 pub fn reshape_tensor(directory: &mut Directory, name: &str, shape: &[u64]) {

@@ -134,10 +134,13 @@ impl StateSpaceShape {
     }
 
     /// `attention_output`'s dimensions: `heads` heads of `head_width`.
-    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 4] {
+    pub fn output_dimensions(&self, rows: u64) -> [(&'static str, u64); 6] {
+        // One residual stream (`scatter` without inject).
         [
             ("M", rows),
             ("D", self.hidden),
+            ("SN", 1),
+            ("IN", 0),
             ("Q", self.heads),
             ("W", self.head_width),
         ]

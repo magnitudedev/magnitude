@@ -125,7 +125,7 @@ fn interpret(entry: &str, inputs: &[Input]) -> (Option<String>, Vec<(usize, Vec<
                     .unwrap_or_else(|e| panic!("{entry}: {e}"));
                 Arg::Tensor(interpreter.add_tensor(data))
             }
-            Input::I32(value) => Arg::Scalar(ReferenceScalar::from_bits(DType::I32, *value as u32)),
+            Input::I32(value) => Arg::Scalar(ReferenceScalar::from_bits(DType::I32, *value as u32 as u64)),
         })
         .collect();
     let outcome = interpreter

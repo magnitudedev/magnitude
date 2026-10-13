@@ -170,9 +170,10 @@ and derives iteration/index bounds separately. Symbolic runtime integer values r
 mathematical integer sort independently of scalar storage representation.
 
 Dimensions, range endpoints, loop coordinates, and their arithmetic are mathematical quantities;
-Index is the nonnegative bounded refinement of that domain, not an I32 alias. An authored I32/U32
-scalar operation instead has the exact fixed-width source meaning, including wrapping and signed
-conversion. Its symbolic projection must preserve that typed result. A mathematical rewrite may
+Index is the nonnegative bounded refinement of that domain, not an I32 alias. An authored
+I32/U32/U64 scalar operation instead has the exact fixed-width source meaning, including wrapping
+and signed conversion; U64 words are full 64-bit words on every backend (a native's `ulong`,
+`unsigned long long`, `uint64_t` or `u64`), never narrowed. Its symbolic projection must preserve that typed result. A mathematical rewrite may
 replace it only after the applicable source facts prove equality. Converting between a quantity
 and a scalar occurs at the expression's actual typed boundary, before an operation when an operand
 is typed scalar and after an operation when its consumer requires a scalar.

@@ -6,8 +6,10 @@
 // a q4k/q5k/q6k packet is one 16-byte load of its low-nibble code plane
 // (codes 2i/2i+1 in the low/high nibble of byte i), plus its slice of the
 // high-bit plane (q5k: one u32, q6k: one uvec2), its local coefficients and
-// its super factors; a q8 packet is two 16-byte loads of int8 codes. A packet
-// is consumed in four 8-element sub-steps. Each sub-step decodes its codes as
+// its super factors; a q8 packet is two 16-byte loads of int8 codes; a
+// vector-coded (iq2xs, iq3xxs) packet is its four grid entries, one a
+// sub-step, decoded through the grid. A packet is consumed in four
+// 8-element sub-steps. Each sub-step decodes its codes as
 // exact small integers in two vec4s, `even` (elements 0,2,4,6) and `odd`
 // (1,3,5,7), by splitting code bytes on nibble boundaries: every decoded code
 // is an exact integer, so the decode has no rounding or subnormal case.
@@ -27,6 +29,7 @@
 //
 // This file is independent of any entry ABI.
 #include <seismic/element.glsl>
+#include <seismic/grids.glsl>
 
 #define PACKETS_Q4K 0
 #define PACKETS_Q5K 1
@@ -42,11 +45,22 @@
 #define PACKETS_NVFP4 10
 #define PACKETS_Q5G32S 11
 #define PACKETS_Q5G32 12
+// The vector-coded kinds.
+#define PACKETS_IQ2XS 13
+#define PACKETS_IQ3XXS 14
+// IQ4_NL blocks of a row whose width is not a multiple of 256 (iq4g32s): the
+// IQ4 table with one f16 scale per 32.
+#define PACKETS_IQ4S 15
 // Every kind, as PROJECTION_GEMM_KINDS bits.
-#define PACKETS_ALL_KINDS 0x1fff
+#define PACKETS_ALL_KINDS 0xffff
 
-// Coefficient groups per packet (q6k, nvfp4g16: one per 16 elements).
-uint packets_groups(const int kind) { return kind == PACKETS_Q6K || kind == PACKETS_NVFP4 ? 2u : 1u; }
+// Coefficient groups per packet (q6k, nvfp4g16, iq2xs: one per 16 elements).
+uint packets_groups(const int kind) {
+    return kind == PACKETS_Q6K || kind == PACKETS_NVFP4 || kind == PACKETS_IQ2XS ? 2u : 1u;
+}
+
+// Vector codes through a grid.
+bool packets_grid(const int kind) { return kind == PACKETS_IQ2XS || kind == PACKETS_IQ3XXS; }
 
 // The kind has a per-group bias term (the factored `bias * sum(x)`).
 bool packets_biased(const int kind) {
@@ -71,7 +85,7 @@ int packets_element(const int kind) {
 
 struct packets_rows16 {
     uint64_t stride;
-    uint64_t codes;   // codes_lo (k-quants), codes (q8) or the values (dense)
+    uint64_t codes;   // codes_lo (k-quants), codes (q8), grids or the values (dense)
     uint64_t high;    // codes_hi (q5k, q6k)
     uint64_t scales;  // packed local coefficients (k-quants)
     uint64_t supers;  // super factors (k-quants) or group scales (q8)
@@ -85,11 +99,12 @@ struct packets_rows16 {
 #define PACKETS_ROWS16_Q8(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_ROW_OFFSET, 0ul, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_ROWS16_C4(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, 0ul, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_ROWS16_Q5(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_CODES_LO_ROW_OFFSET, T##_PLANE_CODES_HI_ROW_OFFSET, 0ul, T##_PLANE_SUPERS_ROW_OFFSET)
+#define PACKETS_ROWS16_GRID(T) packets_rows16(T##_ROW_STRIDE_BYTES, T##_PLANE_GRIDS_ROW_OFFSET, 0ul, T##_PLANE_SCALES_ROW_OFFSET, T##_PLANE_SUPERS_ROW_OFFSET)
 #define PACKETS_ROWS16_DENSE(T, BYTES) packets_rows16(T##_STRIDE_0 * uint64_t(BYTES), 0ul, 0ul, 0ul, 0ul)
 
 // One loaded packet of any kind.
 struct packets_packet {
-    uvec4 low;       // codes_lo (k-quants) or the first 16 codes (q8)
+    uvec4 low;       // codes_lo (k-quants), the first 16 codes (q8) or the grid entries
     uvec4 second;    // the last 16 codes (q8)
     uvec2 high;      // codes_hi: q5k in .x, q6k in .xy
     float scale0;
@@ -135,7 +150,7 @@ float packets_e2m1_code(uint code) {
 
 // The eight table values of one step word's codes, as (0,2,4,6), (1,3,5,7).
 void packets_table_codes(const int kind, uint word, out vec4 even, out vec4 odd) {
-    if (kind == PACKETS_IQ4) {
+    if (kind == PACKETS_IQ4 || kind == PACKETS_IQ4S) {
         even = vec4(packets_iq4_code(word & 15u), packets_iq4_code((word >> 8u) & 15u),
             packets_iq4_code((word >> 16u) & 15u), packets_iq4_code((word >> 24u) & 15u));
         odd = vec4(packets_iq4_code((word >> 4u) & 15u), packets_iq4_code((word >> 12u) & 15u),
@@ -160,6 +175,42 @@ float packets_ue4m3_half(uint raw) {
     const uint e = raw >> 3, m = raw & 7u;
     const float normal = uintBitsToFloat(((e + 119u) << 23) | (m << 20));
     return raw == 0x7fu ? uintBitsToFloat(0x7fc00000u) : e == 0u ? float(m) * 0.0009765625 : normal;
+}
+
+// Vector codes (the registry's grid codes: iq2xs, iq3xxs). An entry of the
+// grids plane codes eight values: grid indices name their magnitudes
+// (<seismic/grids.glsl>), and seven sign bits, completed by an eighth of even
+// parity, their signs. Every 16 (iq2xs) or 32 (iq3xxs) values have an odd
+// scale code 2s + 1 (a nibble of the scales plane) and every 256 one f32
+// factor: value = factor * (2s + 1) * code, every product exact.
+
+// Entry `step` of a packet's entries: iq2xs sixteen-bit entries (a 9-bit
+// index into the 512-point grid, then the signs), iq3xxs three-byte entries
+// (two 8-bit indices into the 256-point grid of four values, then the
+// signs). Its grid point (lanes 0..3 in x, 4..7 in y) and its sign bits.
+void packets_grid_entry(const int kind, uvec4 entries, uint step, out uvec2 point, out uint signs) {
+    if (kind == PACKETS_IQ2XS) {
+        const uint entry = (entries[step >> 1] >> (16u * (step & 1u))) & 0xffffu;
+        point = grids_iq2xs[entry & 511u];
+        signs = entry >> 9;
+    } else {
+        const uint word = (3u * step) >> 2, shift = (24u * step) & 31u;
+        const uint spill = shift > 8u ? entries[word + 1u] << (32u - shift) : 0u;
+        const uint entry = ((entries[word] >> shift) | spill) & 0xffffffu;
+        point = uvec2(grids_iq3xxs[entry & 255u], grids_iq3xxs[(entry >> 8) & 255u]);
+        signs = (entry >> 16) & 127u;
+    }
+}
+
+// The eight signed codes of `point` under sign bits `signs` (the eighth makes
+// the count of set bits even), as (0,2,4,6), (1,3,5,7).
+void packets_grid_codes(uvec2 point, uint signs, out vec4 even, out vec4 odd) {
+    signs |= (uint(bitCount(signs)) & 1u) << 7;
+    const vec4 low = packets_unsigned_bytes(point.x), high = packets_unsigned_bytes(point.y);
+    even = uintBitsToFloat(floatBitsToUint(vec4(low.x, low.z, high.x, high.z)) ^
+                           (((uvec4(signs) >> uvec4(0u, 2u, 4u, 6u)) & 1u) << 31));
+    odd = uintBitsToFloat(floatBitsToUint(vec4(low.y, low.w, high.y, high.w)) ^
+                          (((uvec4(signs) >> uvec4(1u, 3u, 5u, 7u)) & 1u) << 31));
 }
 
 // The (scale6, min6) pair of k-quant packet `p` and its super factors.
@@ -199,6 +250,9 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
     } else if (kind == PACKETS_IQ4) {
         packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
         packet.scale0 = element_f32_at(row + geometry.supers + 4ul * p);
+    } else if (kind == PACKETS_IQ4S) {
+        packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
+        packet.scale0 = seismic_f16_to_f32(uint16_t(element_u16_at(row + geometry.supers + 2ul * p)));
     } else if (kind == PACKETS_Q4G32S) {
         // Codes 0..15 with the exact bias -8 d: value = d * (code - 8).
         packet.low = element_uvec4_at(row + geometry.codes + 16ul * p);
@@ -229,6 +283,23 @@ packets_packet packets_load(const int kind, uint64_t row, packets_rows16 geometr
         packet.low = element_uvec4_at(codes);
         packet.second = element_uvec4_at(codes + 16ul);
         packet.scale0 = seismic_f16_to_f32(uint16_t(element_u16_at(row + geometry.supers + 2ul * p)));
+    } else if (packets_grid(kind)) {
+        // The packet's four entries (8 or 12 bytes), its scale code field
+        // (iq2xs: a byte of two codes; iq3xxs: a nibble) and its group's
+        // factor.
+        const uint block = p >> 3, local = p & 7u;
+        uint field;
+        if (kind == PACKETS_IQ2XS) {
+            packet.low.xy = element_uvec2_at(row + geometry.codes + 8ul * p);
+            field = element_u8_at(row + geometry.scales + 8ul * block + uint64_t(local));
+        } else {
+            const uint64_t entries = row + geometry.codes + 12ul * p;
+            packet.low.xyz = uvec3(element_u32_at(entries), element_u32_at(entries + 4ul), element_u32_at(entries + 8ul));
+            field = (element_u8_at(row + geometry.scales + 4ul * block + uint64_t(local >> 1)) >> (4u * (local & 1u))) & 15u;
+        }
+        const float factor = element_f32_at(row + geometry.supers + 4ul * block);
+        packet.scale0 = factor * float(2u * (field & 15u) + 1u);
+        packet.scale1 = factor * float(2u * (field >> 4) + 1u);
     } else {
         packet.values = row + geometry.codes + uint64_t(p) * 32ul * ELEMENT_BYTES(packets_element(kind));
         packet.valid = min(32u, k - 32u * p);
@@ -243,8 +314,13 @@ float packets_dense_element(const int kind, packets_packet packet, uint i) {
 
 // The codes of sub-step `step` (elements 8 step ..) as (0,2,4,6), (1,3,5,7).
 void packets_codes(const int kind, packets_packet packet, uint step, out vec4 even, out vec4 odd) {
-    if (kind == PACKETS_IQ4 || kind == PACKETS_MXFP4 || kind == PACKETS_NVFP4) {
+    if (kind == PACKETS_IQ4 || kind == PACKETS_IQ4S || kind == PACKETS_MXFP4 || kind == PACKETS_NVFP4) {
         packets_table_codes(kind, packet.low[step], even, odd);
+    } else if (packets_grid(kind)) {
+        uvec2 point;
+        uint signs;
+        packets_grid_entry(kind, packet.low, step, point, signs);
+        packets_grid_codes(point, signs, even, odd);
     } else if (kind == PACKETS_Q4K || kind == PACKETS_Q4G32S) {
         const uint word = packet.low[step];
         even = packets_unsigned_bytes(word & 0x0f0f0f0fu);

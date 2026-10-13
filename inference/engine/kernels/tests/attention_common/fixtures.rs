@@ -179,6 +179,12 @@ impl Case {
 
     /// The portable body's result and final histories, computed on the host.
     fn expected(&self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        self.expected_reading(&|_, _| true)
+    }
+
+    /// `expected` where row `row` reads its key `o` (spans in order, then
+    /// fresh rows) only when `reads(row, o)`: a WorkList prefill.
+    fn expected_reading(&self, reads: &dyn Fn(usize, usize) -> bool) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let Geometry { kv, g, .. } = self.geometry;
         let w = self.geometry.w();
         let keys = (0..self.rows)
@@ -219,6 +225,12 @@ impl Case {
                         &self.value[(token * kv + kv_head) * w..][..w],
                     ));
                 }
+                let entries = entries
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(ordinal, _)| reads(row, *ordinal))
+                    .map(|(_, entry)| entry)
+                    .collect::<Vec<_>>();
                 let scores = entries
                     .iter()
                     .map(|(key, _)| {
@@ -336,6 +348,28 @@ fn bf16_values(tensor: &Tensor) -> Vec<f32> {
         .chunks_exact(2)
         .map(|bytes| f32::from_bits(u32::from(u16::from_le_bytes([bytes[0], bytes[1]])) << 16))
         .collect()
+}
+
+/// A prefill specialization in the Visible form: no WorkList bitmap (`B`,
+/// a static of the GPU natives, is 0).
+fn visible_prefill(device: &Device, specialization: NativeSpecialization) -> NativeSpecialization {
+    if is_cpu(device) {
+        specialization
+    } else {
+        specialization.with_static("B", 0)
+    }
+}
+
+/// A prefill's absent WorkList bitmap: `rows` rows of no words.
+fn no_selection(device: &Device, rows: usize) -> Tensor {
+    Tensor::from_host(device, Element::u32(), &[rows as u64, 0], &[]).unwrap()
+}
+
+/// A prefill's WorkList block keys `keys` (`BR`), carried by the extent of
+/// an empty table: 1 for a read of every visible row.
+#[allow(dead_code)]
+fn block_slots(device: &Device, keys: usize) -> Tensor {
+    Tensor::from_host(device, Element::i32(), &[0, keys as u64], &[]).unwrap()
 }
 
 fn statics(geometry: Geometry) -> NativeSpecialization {

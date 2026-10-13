@@ -23,9 +23,18 @@
 void readout_features_rows() {
     const uint width = uint(SEISMIC_DIM_D);
     const uint row = gl_WorkGroupID.x, thread = gl_LocalInvocationIndex;
-    const projection_prologue in_ = projection_rms(FEATURES_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
-        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_1, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
-        FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS));
+    const projection_prologue in_ = projection_input(FEATURES_ACT, SEISMIC_PTR(SEISMIC_BUFFER_HIDDEN),
+        SEISMIC_HIDDEN_STRIDE_0, SEISMIC_HIDDEN_STRIDE_2, SEISMIC_PTR(SEISMIC_BUFFER_NORM), SEISMIC_NORM_STRIDE_0,
+        FEATURES_NORM, element_word_f32(SEISMIC_PARAM_EPSILON), width, SEISMIC_PTR(SEISMIC_BUFFER_OUT_ROWS),
+        uint(SEISMIC_DIM_NM), uint(SEISMIC_DIM_PT));
+    const uint64_t features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
+#if SEISMIC_STATIC_NM == 0
+    // No norm: the sum in part order of the mix site's partials.
+    for (uint i = thread; i < width; i += gl_WorkGroupSize.x)
+        element_put(FEATURES_ACT, features,
+            uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1,
+            element_round(FEATURES_ACT, projection_summed_at(in_, row, i)));
+#else
     float squares = 0.0;
     for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
         const float v = projection_norm_input(in_, row, i);
@@ -33,7 +42,6 @@ void readout_features_rows() {
     }
     squares = reduce_group_sum(squares, 0u);
     const float inverse = inversesqrt(seismic_div_rn(squares, float(width)) + in_.eps);
-    const uint64_t features = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
     for (uint i = thread; i < width; i += gl_WorkGroupSize.x) {
         const float value = element_round(FEATURES_ACT,
             projection_norm_input(in_, row, i) * inverse
@@ -41,4 +49,5 @@ void readout_features_rows() {
         element_put(FEATURES_ACT, features,
             uint64_t(row) * SEISMIC_RESULT_0_STRIDE_0 + uint64_t(i) * SEISMIC_RESULT_0_STRIDE_1, value);
     }
+#endif
 }

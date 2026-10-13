@@ -103,6 +103,10 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
         SlabTensor::from_bound(cx.arg_history_key(), slab_rows),
         SlabTensor::from_bound(cx.arg_history_value(), slab_rows),
     );
+    // The WorkList bitmap of the row (none in the Visible form).
+    let selection = cx.arg_selection();
+    let bitmap: &[u32] = if cx.dim_b() == 0 { &[] } else { selection.row([row, 0]) };
+    let block_rows = cx.dim_br() as i32;
     attention::attend_rows(
         &mut state,
         queries,
@@ -112,6 +116,7 @@ fn attention_prefill_attend<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
         spans,
         fresh,
         range,
+        |ordinal| attention::selected(bitmap, block_rows, ordinal),
         |token, out| activation::widen::<E::A>(history_key.row([token, kv_head, 0]), out),
         |token, out| activation::widen::<E::A>(history_value.row([token, kv_head, 0]), out),
         |token, out| out.copy_from_slice(&keys[(token * kv + kv_head) * w..][..w]),

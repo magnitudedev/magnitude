@@ -1119,7 +1119,16 @@ fn collect_body_element_parameters(block: &ast::Block, out: &mut Vec<String>) {
                 args,
             } => {
                 expr(callee, out);
-                for (_, value) in bindings {
+                for (parameter, value) in bindings {
+                    // Repack's destination is a representation even when it
+                    // appears only in an intermediate, not the signature.
+                    if matches!(&callee.kind, ast::ExprKind::Name(name) if name.name == "repack")
+                        && parameter.name == "U"
+                    {
+                        if let ast::ExprKind::Name(name) = &value.kind {
+                            element(name, out);
+                        }
+                    }
                     expr(value, out);
                 }
                 for argument in args {

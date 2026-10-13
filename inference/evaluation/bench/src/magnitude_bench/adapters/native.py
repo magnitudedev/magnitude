@@ -78,6 +78,8 @@ class Native(Adapter):
             return ["--method", "plain"]
         if self.magnitude.method is not None:
             arguments = ["--method", self.magnitude.method]
+            if drafter is not None and drafter.method == self.magnitude.method and not self.acquisition.embedded_drafter:
+                arguments += ["--draft", str(drafter.path)]
         elif self.acquisition.embedded_drafter:
             arguments = ["--method", drafter.method]
         else:

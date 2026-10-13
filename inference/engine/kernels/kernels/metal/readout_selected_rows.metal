@@ -18,7 +18,8 @@ typedef ELEMENT_OF(SEISMIC_NORM) norm_element;
 
 #define SELECTED_ROWS_OPERANDS                                                              \
     const uint k = uint(SEISMIC_DIM_D);                                                 \
-    projection::Rms<activation, norm_element, projection::SelectedRows> in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
+    projection::InputOf<activation, norm_element, projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>::type \
+        in{hidden, SEISMIC_HIDDEN_STRIDE_0, \
         SEISMIC_HIDDEN_STRIDE_1, norm, SEISMIC_NORM_STRIDE_0,                           \
         as_type<float>(uint(SEISMIC_PARAM_EPSILON)), k, {out_rows}};                    \
     projection::Logits out{logits, SEISMIC_RESULT_0_STRIDE_0, SEISMIC_RESULT_0_STRIDE_1,         \

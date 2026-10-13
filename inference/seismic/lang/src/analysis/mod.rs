@@ -307,9 +307,16 @@ fn canonical(mut grid: Grid) -> Grid {
         }
     }
     kept.sort_unstable();
-    grid.coordinates = kept.into_iter().map(|position| grid.coordinates[position].clone()).collect();
+    grid.coordinates = kept
+        .into_iter()
+        .map(|position| grid.coordinates[position].clone())
+        .collect();
 
-    let mut binders: Vec<u32> = grid.coordinates.iter().map(|coordinate| coordinate.binder).collect();
+    let mut binders: Vec<u32> = grid
+        .coordinates
+        .iter()
+        .map(|coordinate| coordinate.binder)
+        .collect();
     let mut note = |term: &Term| {
         term.visit(&mut |term| {
             let binder = match term.node() {
@@ -325,7 +332,10 @@ fn canonical(mut grid: Grid) -> Grid {
         note(&coordinate.start);
         note(&coordinate.end);
     }
-    grid.index.iter().chain([&grid.code, &grid.slope]).for_each(&mut note);
+    grid.index
+        .iter()
+        .chain([&grid.code, &grid.slope])
+        .for_each(&mut note);
     let number = |binder: u32| {
         binders
             .iter()
@@ -360,7 +370,9 @@ fn merge_reductions(records: &[trace::ReductionRecord]) -> Vec<Reduction> {
             coordinates: record.coordinates.iter().map(coordinate).collect(),
         };
         match merged.iter_mut().find(|(storage, existing)| {
-            storage.is_some() && *storage == record.storage && existing.coordinates == reduction.coordinates
+            storage.is_some()
+                && *storage == record.storage
+                && existing.coordinates == reduction.coordinates
         }) {
             Some((_, existing)) => existing.extent = existing.extent.clone().add(reduction.extent),
             None => merged.push((record.storage, reduction)),
@@ -378,7 +390,7 @@ fn lattice(encoding: &PlaneEncoding) -> Lattice {
             bits,
             interpretation,
         } => Lattice::Codes(CodeLevels::of(
-            (0..1u32 << bits).map(|raw| f64::from(interpretation.decode(raw, *bits))),
+            interpretation.codes(*bits).into_iter().map(f64::from),
         )),
         PlaneEncoding::FloatCode { format } => Lattice::Codes(CodeLevels::of(
             (0..1u32 << format.bits())
@@ -442,7 +454,12 @@ fn packed(
                 }
                 read
             }
+            // A function of the element's position alone.
+            DecodeStep::ReadPlaneLane { .. } => {
+                Term::opaque(index.last().map(Term::variables).unwrap_or_default())
+            }
             DecodeStep::InterpretCode { raw: from, .. }
+            | DecodeStep::InterpretGridCode { raw: from, .. }
             | DecodeStep::DecodeFloatCode { raw: from, .. }
             | DecodeStep::ConvertToF32 { from, .. } => get(*from),
             DecodeStep::Cast { from, to, .. } => Term::round(*to, get(*from)),

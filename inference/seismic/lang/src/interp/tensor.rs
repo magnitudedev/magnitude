@@ -180,7 +180,10 @@ impl TensorData {
         )
         .ok_or("the representation has no decode recipe")?;
         if recipe.component(role).is_none() {
-            return Err(format!("the representation has no `{}` component", role.name()));
+            return Err(format!(
+                "the representation has no `{}` component",
+                role.name()
+            ));
         }
         let count: usize = shape.iter().product();
         Ok((0..count)
@@ -414,8 +417,17 @@ fn decode(
                 interpretation,
                 ..
             } => ReferenceScalar::I32(
-                interpretation.decode(temporaries[recipe.ordinal(*raw)].bits(), *bits),
+                interpretation.decode(temporaries[recipe.ordinal(*raw)].bits() as u32, *bits),
             ),
+            DecodeStep::ReadPlaneLane { plane, .. } => ReferenceScalar::U32(
+                (local % u64::from(recipe.planes()[*plane as usize].group)) as u32,
+            ),
+            DecodeStep::InterpretGridCode {
+                raw, lane, grid, ..
+            } => ReferenceScalar::I32(grid.code(
+                temporaries[recipe.ordinal(*raw)].bits() as u32,
+                temporaries[recipe.ordinal(*lane)].bits() as u32,
+            )),
             DecodeStep::DecodeFloatCode { raw, format, .. } => {
                 let scalar = crate::reference_math::float_code_recipe(*format);
                 crate::reference_math::evaluate(&scalar, &[temporaries[recipe.ordinal(*raw)]])
@@ -557,9 +569,9 @@ pub(super) fn write_bits(bytes: &mut [u8], first: usize, width: u32, value: u32)
 }
 
 fn read_dense(dtype: DType, bytes: &[u8]) -> ReferenceScalar {
-    let mut payload = [0; 4];
+    let mut payload = [0; 8];
     payload[..bytes.len()].copy_from_slice(bytes);
-    ReferenceScalar::from_bits(dtype, u32::from_le_bytes(payload))
+    ReferenceScalar::from_bits(dtype, u64::from_le_bytes(payload))
 }
 
 pub(super) fn scalar_from_number(dtype: DType, value: f64) -> ReferenceScalar {
@@ -569,6 +581,7 @@ pub(super) fn scalar_from_number(dtype: DType, value: f64) -> ReferenceScalar {
         match dtype {
             DType::I32 => ReferenceScalar::I32(value as i32),
             DType::U32 => ReferenceScalar::U32(value as u32),
+            DType::U64 => ReferenceScalar::U64(value as u64),
             DType::Bool => ReferenceScalar::Bool(value != 0.0),
             _ => unreachable!(),
         }
@@ -624,6 +637,7 @@ mod tests {
             DType::BF16,
             DType::I32,
             DType::U32,
+            DType::U64,
             DType::Bool,
         ] {
             let representation = registry::dense(dtype);

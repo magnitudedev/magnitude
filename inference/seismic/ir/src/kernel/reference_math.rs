@@ -143,6 +143,9 @@ fn expand_recipe<B: PhysicalDialect>(
             reference::ReferenceNode::FromBits { value, dtype } => {
                 builder.scalar_from_bits(get(value), dtype)
             }
+            reference::ReferenceNode::Resize { value, dtype } => {
+                builder.word_resize(get(value), dtype)
+            }
         };
         values.push(value);
     }

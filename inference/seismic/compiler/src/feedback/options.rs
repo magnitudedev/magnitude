@@ -162,6 +162,7 @@ impl EvaluationMethod {
                                 SymbolValue::I32(v) => (5, v.to_le_bytes().to_vec()),
                                 SymbolValue::U32(v) => (6, v.to_le_bytes().to_vec()),
                                 SymbolValue::Bool(v) => (7, [u8::from(*v)].to_vec()),
+                                SymbolValue::U64(v) => (8, v.to_le_bytes().to_vec()),
                             };
                             digest.update([tag]);
                             digest.update((bits.len() as u64).to_le_bytes());

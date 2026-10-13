@@ -1378,6 +1378,22 @@ inline void prefill_prepare(History history, device const Scalar *query,
 // and the F32 output from activation-dtype probabilities. `scores` forms a
 // key tile's probabilities and rescales the output (K staged); `accumulate`
 // adds their product with the staged V; `store` publishes the window.
+// A launch's WorkList selection (`indexer_select`'s per-row block bitmap,
+// `words` words a row, `block_rows` keys a block; none when `words` is 0),
+// with what its list launch (`prefill_list`) leaves: each row's key ordinal
+// at the start of each of its spans (`bases`, [M][R + 1]) and each query
+// tile's listed key tiles (`lists`, [tiles][capacity] (span, first);
+// `listed` counts them).
+struct prefill_selection {
+    device const uint *bitmap;
+    device const int *bases;
+    device const int2 *lists;
+    device const uint *listed;
+    uint words;
+    int block_rows;
+    uint capacity;
+};
+
 struct prefill_rows {
     device const int *visible;
     device const int *fresh;
@@ -1387,12 +1403,27 @@ struct prefill_rows {
     // When `to` is past `from`, only the keys [from, to) of the span count.
     int from;
     int to;
+    // The WorkList selection, when the launch has one (zero `words`
+    // otherwise).
+    prefill_selection selection;
     // The [lo, hi) key bounds of token `token` in this span.
     inline int2 at(ulong token) const {
         device const int *bounds = historical ? visible + (token * R + index) * 2 : fresh + token * 2;
         if (to > from)
             return int2(metal::max(bounds[0], from), metal::min(bounds[1], to));
         return int2(bounds[0], bounds[1]);
+    }
+    // Whether token `token` reads key `key` of this span, which lies within
+    // its bounds: always without a selection, else when the bit of the
+    // key's block is set (a block past the bitmap is not read).
+    inline bool reads(ulong token, int key) const {
+        if (selection.words == 0)
+            return true;
+        device const int *bounds = historical ? visible + (token * R + index) * 2 : fresh + token * 2;
+        const int ordinal = selection.bases[token * (R + 1) + (historical ? index : R)] + key - bounds[0];
+        const uint block = uint(ordinal) / uint(selection.block_rows);
+        return block / 32 < selection.words
+            && ((selection.bitmap[token * selection.words + block / 32] >> (block % 32)) & 1u) != 0u;
     }
 };
 
@@ -1472,7 +1503,7 @@ struct prefill_fragments {
                 float s = scores[j].thread_elements()[e] * scale;
                 if (!common) {
                     const int t = first + int(j * 8 + self.fn + e);
-                    if (!(t >= row_lo && t < row_hi))
+                    if (!(t >= row_lo && t < row_hi) || !rows.reads(token, t))
                         s = -INFINITY;
                 }
                 scores[j].thread_elements()[e] = s;
@@ -2097,7 +2128,7 @@ inline void prefill_windows(History history, device const Scalar *query, device 
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,
     uint kv_head, uint partition, uint active, uint tiles_lo, uint tiles_hi,
     device const typename History::Operand *query_rows, uint head, ulong first_token, bool computes,
-    uint thread_index, thread prefill_fragments<QT, History> &state) {
+    uint thread_index, thread prefill_fragments<QT, History> &state, prefill_selection selection, uint tile) {
     typedef prefill_fragments<QT, History> Form;
     constexpr uint W = ATTENTION_W;
     constexpr uint KEYS = PREFILL_KEYS;
@@ -2108,8 +2139,35 @@ inline void prefill_windows(History history, device const Scalar *query, device 
         if (computes)
             Form::reset(state);
 
+        // A WorkList walks its query tile's listed key tiles, every key
+        // masked per row.
+        for (uint listed = tiles_lo; selection.words > 0 && listed < tiles_hi; ++listed) {
+            const int2 entry = selection.lists[ulong(tile) * selection.capacity + listed];
+            const ulong index = ulong(entry.x);
+            const int first = entry.y;
+            const prefill_interval interval = intervals[index];
+            const bool historical = index < R;
+            const prefill_rows rows{visible, fresh, R, index, historical, 0, 0, selection};
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (historical)
+                history.template stage_key<THREADS>(staged, first, interval.hi, kv_head, thread_index);
+            else
+                prefill_stage<THREADS>(staged, keys, first, interval.hi, kv_head, thread_index);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (computes)
+                Form::scores(query_rows, staged, Form::PITCH, first, false, rows, first_token, M, scale, state);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (historical)
+                history.template stage_value<THREADS>(staged, first, interval.hi, kv_head, thread_index);
+            else
+                prefill_stage<THREADS>(staged, values, first, interval.hi, kv_head, thread_index);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (computes)
+                Form::accumulate(staged, Form::PITCH, window_first, state);
+        }
+
         uint tiles_before = 0;
-        for (ulong index = 0; index <= R; ++index) {
+        for (ulong index = 0; index <= R && selection.words == 0; ++index) {
             const prefill_interval interval = intervals[index];
             if (interval.hi <= interval.lo)
                 continue;
@@ -2181,11 +2239,11 @@ struct prefill_owner {
     device float *partials, device float *statistics, ulong M, ulong R, float scale, bool softplus,        \
     threadgroup typename History::Operand *staged, threadgroup const prefill_interval *intervals,          \
     threadgroup float *exchange, uint tile, uint kv_head, uint head_group, uint partition, uint active,    \
-    uint tiles_lo, uint tiles_hi, uint thread_index, uint simd, uint lane
+    uint tiles_lo, uint tiles_hi, uint thread_index, uint simd, uint lane, prefill_selection selection
 #define PREFILL_OWNED_ARGUMENTS                                                                           \
     history, query, gate, visible, fresh, result, queries, keys, values, partials, statistics, M, R, scale, \
     softplus, staged, intervals, exchange, tile, kv_head, head_group, partition, stored, tiles_lo,         \
-    tiles_hi, thread_index, simd, lane
+    tiles_hi, thread_index, simd, lane, selection
 
 template <uint QT, class History>
 inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
@@ -2196,7 +2254,7 @@ inline void prefill_owned_fragments(PREFILL_OWNED_PARAMETERS) {
     prefill_windows<QT, History>(history, query, gate, visible, fresh, result, keys, values, partials,
         statistics, M, R, scale, softplus, staged, intervals, kv_head, partition, active, tiles_lo, tiles_hi,
         queries + (own.first_token * SEISMIC_DIM_KV * ATTENTION_QUERY_GROUP + own.head) * ATTENTION_W, own.head,
-        own.first_token, own.computes, thread_index, state);
+        own.first_token, own.computes, thread_index, state, selection, tile);
 }
 
 #if SEISMIC_HAS_TENSOR_OPS
@@ -2857,6 +2915,121 @@ struct prefill_coissue {
     }
 };
 
+// Whether the entry reads a WorkList selection (its bitmap words, a static
+// extent): the fragment form alone walks one.
+#ifndef PREFILL_SELECTED
+#define PREFILL_SELECTED 0
+#endif
+
+// The list launch of a WorkList prefill: threadgroup per QT-row query tile,
+// 256 threads. It writes each tile row's key ordinal at the start of each of
+// its spans (`bases`), then lists, in the attend launch's tile order (each
+// span's union interval in PREFILL_KEYS-key tiles, spans then fresh), the
+// key tiles that some row of the tile reads (`lists`, `listed`). A row reads
+// a key of its span interval when the bit of the key's block is set. The
+// attend launch walks exactly these tiles (`prefill_windows`).
+template <uint QT>
+inline void prefill_list(device const int *visible, device const int *fresh, device const uint *bitmap,
+    device int *bases, device int2 *lists, device uint *listed, ulong M, ulong R, uint words, int block_rows,
+    uint capacity, threadgroup uchar *shared, uint tile, uint thread_index, uint simd, uint lane) {
+    constexpr uint KEYS = PREFILL_KEYS;
+    constexpr uint THREADS = 256;
+    threadgroup prefill_interval *intervals = reinterpret_cast<threadgroup prefill_interval *>(shared);
+    threadgroup uint *sums = reinterpret_cast<threadgroup uint *>(intervals + R + 1);  // [8], then the count
+    if (simd == 0) {
+        const ulong tile_row = ulong(tile) * QT + lane;
+        const bool row_valid = lane < QT && tile_row < M;
+        int base = 0;
+        for (ulong index = 0; index <= R; ++index) {
+            int lo = 0;
+            int hi = 0;
+            if (row_valid)
+                form_span(visible, fresh, tile_row, R, index, lo, hi);
+            if (row_valid) {
+                bases[tile_row * (R + 1) + index] = base;
+                base += metal::max(hi - lo, 0);
+            }
+            const bool nonempty = row_valid && hi > lo;
+            const int union_lo = simd_min(nonempty ? lo : INT_MAX);
+            const int union_hi = simd_max(nonempty ? hi : INT_MIN);
+            if (lane == 0)
+                intervals[index] = prefill_interval{union_lo, union_hi, 0, 0};
+        }
+    }
+    if (thread_index == 0)
+        sums[8] = 0;
+    // The bases are read below by other threads.
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    uint total = 0;
+    for (ulong index = 0; index <= R; ++index) {
+        const prefill_interval interval = intervals[index];
+        if (interval.hi > interval.lo)
+            total += uint(interval.hi - interval.lo + int(KEYS) - 1) / KEYS;
+    }
+    for (uint round = 0; round < total; round += THREADS) {
+        const uint candidate = round + thread_index;
+        bool read = false;
+        int2 entry = int2(0, 0);
+        if (candidate < total) {
+            // Tile `candidate` of the sequence: its span and first key.
+            uint before = 0;
+            for (ulong index = 0; index <= R; ++index) {
+                const prefill_interval interval = intervals[index];
+                if (interval.hi <= interval.lo)
+                    continue;
+                const uint span_tiles = uint(interval.hi - interval.lo + int(KEYS) - 1) / KEYS;
+                if (candidate < before + span_tiles) {
+                    entry = int2(int(index), interval.lo + int((candidate - before) * KEYS));
+                    break;
+                }
+                before += span_tiles;
+            }
+            const ulong index = ulong(entry.x);
+            const int end = metal::min(entry.y + int(KEYS), intervals[index].hi);
+            for (uint t = 0; t < QT && !read; ++t) {
+                const ulong row = ulong(tile) * QT + t;
+                if (row >= M)
+                    break;
+                int lo = 0;
+                int hi = 0;
+                form_span(visible, fresh, row, R, index, lo, hi);
+                const int first_key = metal::max(entry.y, lo);
+                const int last_key = metal::min(end, hi);
+                if (first_key >= last_key)
+                    continue;
+                const int base = bases[row * (R + 1) + index];
+                const uint first_block = uint(base + first_key - lo) / uint(block_rows);
+                const uint last_block = uint(base + last_key - 1 - lo) / uint(block_rows);
+                for (uint block = first_block; block <= last_block && !read; ++block)
+                    read = block / 32 < words && ((bitmap[row * words + block / 32] >> (block % 32)) & 1u) != 0u;
+            }
+        }
+        // Compact this round's listed tiles in tile order.
+        const uint flag = read ? 1u : 0u;
+        const uint before_lane = simd_prefix_exclusive_sum(flag);
+        const uint in_simd = simd_sum(flag);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane == 0)
+            sums[simd] = in_simd;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint offset = sums[8];
+        for (uint other = 0; other < simd; ++other)
+            offset += sums[other];
+        if (read && offset + before_lane < capacity)
+            lists[ulong(tile) * capacity + offset + before_lane] = entry;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index == 0) {
+            uint added = 0;
+            for (uint other = 0; other < THREADS / 32; ++other)
+                added += sums[other];
+            sums[8] += added;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_index == 0)
+        listed[tile] = metal::min(sums[8], capacity);
+}
+
 // L2: threadgroup (QT-row tile, kv head and head group, key partition). A
 // simdgroup owns ROWS rows of one query head of the group (8 in the fragment
 // form, every simdgroup; 16 in the tensor form, the first half of the
@@ -2882,7 +3055,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     device const typename History::Operand *values, device float *partials,
     device float *statistics, device uint *counts, ulong M, ulong R, float scale, bool softplus,
     threadgroup uchar *shared, threadgroup float *exchange, uint3 group, uint3 groups, uint thread_index,
-    uint simd, uint lane) {
+    uint simd, uint lane, prefill_selection selection) {
     typedef typename History::Operand Operand;
     constexpr uint W = ATTENTION_W;
     constexpr uint KV = SEISMIC_DIM_KV;
@@ -2937,12 +3110,15 @@ inline void prefill_attend(History history, device const Scalar *query, device c
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // A WorkList's key tiles are its query tile's listed ones.
     uint total_tiles = 0;
-    for (ulong index = 0; index <= R; ++index) {
+    for (ulong index = 0; index <= R && selection.words == 0; ++index) {
         const prefill_interval interval = intervals[index];
         if (interval.hi > interval.lo)
             total_tiles += uint(interval.hi - interval.lo + int(KEYS) - 1) / KEYS;
     }
+    if (selection.words > 0)
+        total_tiles = selection.listed[tile];
     // The grid's key partitions: max(1, ceil(SPLIT_GROUPS / (tiles * KV))).
     const uint parts = groups.z;
     const uint per = metal::max(uint(PREFILL_MIN_TILES), (total_tiles + parts - 1) / parts);
@@ -2986,7 +3162,7 @@ inline void prefill_attend(History history, device const Scalar *query, device c
                     tiles_hi);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             prefill_owned_direct<QT, History>(PREFILL_OWNED_ARGUMENTS);
-        } else if constexpr (prefill_tensors_fit(QT)) {
+        } else if constexpr (prefill_tensors_fit(QT) && !PREFILL_SELECTED) {
             prefill_owned_tensors<QT, History>(PREFILL_OWNED_ARGUMENTS);
         } else {
             prefill_owned_fragments<QT, History>(PREFILL_OWNED_ARGUMENTS);

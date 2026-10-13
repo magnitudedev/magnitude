@@ -18,6 +18,7 @@
 
 pub mod components;
 pub mod element;
+mod grids;
 pub mod isa;
 pub mod math;
 pub mod quant;
@@ -28,7 +29,7 @@ pub mod tensor;
 pub mod weights;
 
 pub use components::WeightKernels;
-pub use element::{Bf16, Dense, Element, F16, F32, I32, U32};
+pub use element::{Bf16, Dense, Element, F16, F32, I32, U32, U64};
 pub use isa::{Isa, Tier};
 pub use repack::{External, Packed};
 pub use tensor::{Scalars, Scratch, Tensor};
@@ -37,7 +38,7 @@ pub use weights::RowGeometry;
 #[cfg(target_arch = "aarch64")]
 pub use isa::Neon;
 #[cfg(target_arch = "x86_64")]
-pub use isa::{X86V4Vnni, X86V2, X86V3, X86V4};
+pub use isa::{X86V2, X86V3, X86V4, X86V4Vnni};
 
 /// The version of this library, part of every CPU implementation digest.
 pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+cpu-library-4");

@@ -8,7 +8,9 @@ impl<'a> QualificationView<'a> {
             magnitude_family_contracts::ActivationDType::F16 => Element::f16(),
             magnitude_family_contracts::ActivationDType::BF16 => Element::bf16(),
         };
-        let bytes = (0..128u8).collect::<Vec<_>>();
+        let element = self.plan.head().and_then(|head| head.blocks().first()).map_or(element, |head| head.conditioning);
+        let row_bytes = if element == Element::f32() { 64 } else { 32 };
+        let bytes = (0..4 * row_bytes).map(|i| i as u8).collect::<Vec<_>>();
         let source = Tensor::from_host(device, element, &[4, 16], &bytes)
             .map_err(|error| failure(error.to_string()))?;
         let destination =
@@ -30,8 +32,8 @@ impl<'a> QualificationView<'a> {
         let actual = destination
             .read_to_host()
             .map_err(|error| failure(error.to_string()))?;
-        let mut expected = vec![0u8; 64];
-        expected.extend_from_slice(&bytes[32..96]);
+        let mut expected = vec![0u8; 2 * row_bytes];
+        expected.extend_from_slice(&bytes[row_bytes..3 * row_bytes]);
         if actual != expected {
             return Err(failure("feature copy changed activation storage".into()));
         }

@@ -2,8 +2,8 @@
 //! there is no second kernel-key set or broad semantic coverage class here.
 
 use super::weights::{
-    ParallelBinding, PerLayerBinding, PerLayerEntryBinding, activation_dtype,
-    planned_readout_recipe,
+    NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, TableFill,
+    activation_dtype, planned_readout_recipe,
 };
 use super::{
     AttentionBinding, DenseBinding, EmbeddingBinding, FeaturesBinding, HeadBinding, HostTablePlan,
@@ -14,14 +14,15 @@ use crate::error::PlanError;
 use crate::operators::routed::GeneralRoutedBinding;
 use crate::operators::short_conv::ShortConvBinding;
 use crate::operators::state_space::StateSpaceBinding;
+use crate::operators::streams::StreamsBinding;
 use crate::operators::vision::VisionKernel;
 use crate::operators::{
-    self, EmbeddedHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot,
-    paired_block,
+    self, CausalHeadBlock, attention_slot, dense_slot, feed_forward_slot, mixer_slot, paired_block,
 };
 use magnitude_family_contracts::{
-    DraftDefinition, DraftEmbedding, DraftMethod, ModelDefinition, ProposalReadoutPolicy,
-    SublayerIndex, TapPoint, TokenId, WeightKind, WeightScope,
+    DraftDefinition, DraftEmbedding, DraftMethod, ExitNorm, HistoryReads, ModelDefinition,
+    Operator, ProposalReadoutPolicy, SublayerIndex, TapPoint, TokenId, WeightKind, WeightRole,
+    WeightScope,
 };
 use magnitude_state::KvCodec;
 use seismic::{DType, Element};
@@ -69,6 +70,11 @@ pub struct TargetBlockProgramSlot {
     feed_forward: Option<FeedForwardProgramSlot>,
     /// The per-layer input sublayer after the feed-forward.
     per_layer: Option<PerLayerBinding>,
+    /// The decoder's hyper-connection streams, which the block reads and
+    /// writes through mix sites.
+    streams: Option<StreamsBinding>,
+    /// The n-gram input after the feed-forward.
+    ngram: Option<NGramBinding>,
 }
 
 impl TargetBlockProgramSlot {
@@ -77,6 +83,8 @@ impl TargetBlockProgramSlot {
             mixer,
             feed_forward,
             per_layer: None,
+            streams: None,
+            ngram: None,
         }
     }
 
@@ -86,6 +94,22 @@ impl TargetBlockProgramSlot {
 
     pub fn per_layer(&self) -> Option<PerLayerBinding> {
         self.per_layer
+    }
+
+    pub fn with_streams(self, streams: Option<StreamsBinding>) -> Self {
+        Self { streams, ..self }
+    }
+
+    pub fn streams(&self) -> Option<StreamsBinding> {
+        self.streams
+    }
+
+    pub fn with_ngram(self, ngram: Option<NGramBinding>) -> Self {
+        Self { ngram, ..self }
+    }
+
+    pub fn ngram(&self) -> Option<NGramBinding> {
+        self.ngram
     }
 
     pub fn mixer(&self) -> MixerProgramSlot {
@@ -486,7 +510,7 @@ pub(super) fn derive_program_plan(
         .chain(head.unwrap_or_default())
         .chain(vision.unwrap_or_default())
         // A host-placed weight needs no import entry.
-        .filter(|weight| !weight.placed_on_host())
+        .filter(|weight| !weight.placed_on_host() && !weight.stored_in_slots())
         .map(ImportProgramSlot::of)
     {
         if seen_imports.insert(slot) {
@@ -500,6 +524,11 @@ pub(super) fn derive_program_plan(
         activation: active_element,
     };
     let decoder = &definition.decoder;
+    let streams = operators::streams::binding(
+        decoder,
+        |scope, kind| lookup(target, scope, kind),
+        active_element,
+    )?;
     let mut blocks = Vec::with_capacity(decoder.blocks.len());
     for (index, block) in decoder.blocks.iter().enumerate() {
         let index = u32::try_from(index)
@@ -511,6 +540,7 @@ pub(super) fn derive_program_plan(
                 mixer_slot(
                     &paired,
                     decoder.hidden,
+                    decoder.context_limit,
                     |kind| lookup(target, mixer, kind),
                     active_element,
                     history,
@@ -545,6 +575,43 @@ pub(super) fn derive_program_plan(
                             entry,
                             decoder.hidden,
                             |kind| lookup(target, scope, kind),
+                            active_element,
+                        )
+                    })
+                    .transpose()?,
+            )
+            .with_streams(streams)
+            .with_ngram(
+                paired
+                    .ngram
+                    .map(|sublayer| {
+                        let scope = WeightScope::TargetSublayer(SublayerIndex {
+                            block: index,
+                            sublayer: 2,
+                        });
+                        // The table is read as stored and decoded as the
+                        // representation it would be imported to.
+                        let table = target
+                            .iter()
+                            .find(|table| {
+                                table.role
+                                    == WeightRole {
+                                        scope,
+                                        kind: WeightKind::NGramTable,
+                                    }
+                            })
+                            .and_then(|table| match table.streamed?.fill {
+                                TableFill::Stored { decoded } => Some((table.resident, decoded)),
+                                TableFill::Imported => None,
+                            })
+                            .ok_or(PlanError::Topology(
+                                "an n-gram input without its stored table",
+                            ))?;
+                        operators::ngram::binding(
+                            sublayer,
+                            decoder,
+                            |kind| lookup(target, scope, kind),
+                            table,
                             active_element,
                         )
                     })
@@ -585,7 +652,11 @@ pub(super) fn derive_program_plan(
         .transpose()?;
     let readout_head = planned_readout_recipe(target, WeightScope::Target, readout_choices)?;
     let readout = ReadoutBinding {
-        norm: lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
+        // A hyper-connection exit's partials bind an empty F32 norm.
+        norm: match &decoder.exit.norm {
+            ExitNorm::HyperConnectionHead(_) => Element::f32(),
+            _ => lookup(target, WeightScope::Target, WeightKind::OutputNorm)?,
+        },
         head: readout_head,
         activation: active_element,
     };
@@ -644,7 +715,7 @@ pub(super) fn derive_program_plan(
         _ => None,
     };
     let head_program = head
-        .filter(|_| matches!(head_form, Some(operators::HeadForm::Embedded)))
+        .filter(|_| matches!(head_form, Some(operators::HeadForm::Causal)))
         .map(|weights| {
             let head = definition.head.as_ref().ok_or(PlanError::Topology(
                 "head weights without a head definition",
@@ -654,7 +725,7 @@ pub(super) fn derive_program_plan(
                 let index = u32::try_from(index)
                     .map_err(|_| PlanError::Arithmetic("head block index exceeds u32"))?;
                 let scope = WeightScope::HeadBlock(index);
-                let paired = paired_block(EmbeddedHeadBlock::of(head, head_block)?.block)?;
+                let paired = paired_block(CausalHeadBlock::of(head, head_block)?.block)?;
                 let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
                 let attention = attention_slot(
                     &paired,
@@ -663,7 +734,27 @@ pub(super) fn derive_program_plan(
                     active_element,
                     KvCodec::Dense,
                 )?;
+                let streams = operators::streams::StreamsGeometry::from_residual(
+                    decoder.hidden,
+                    &head_block.residual,
+                )?
+                .map(|geometry| {
+                    operators::streams::binding_sites(
+                        geometry,
+                        scope,
+                        [mixer, feed_forward],
+                        |scope, kind| lookup(weights, scope, kind),
+                        active_element,
+                    )
+                })
+                .transpose()?;
                 slots.push(HeadBinding {
+                    streams,
+                    conditioning: if head.residual_conditioning() {
+                        Element::f32()
+                    } else {
+                        active_element
+                    },
                     embedding_table: lookup(target, WeightScope::Target, WeightKind::Embedding)?,
                     embedding_norm: lookup(weights, scope, WeightKind::HeadEmbeddingNorm)?,
                     hidden_norm: lookup(weights, scope, WeightKind::HeadHiddenNorm)?,
@@ -683,7 +774,11 @@ pub(super) fn derive_program_plan(
                         },
                         active_element,
                     )?,
-                    output_norm: lookup(weights, scope, WeightKind::OutputNorm)?,
+                    output_norm: if streams.is_some() {
+                        active_element
+                    } else {
+                        lookup(weights, scope, WeightKind::OutputNorm)?
+                    },
                     projection: planned_readout_recipe(
                         target,
                         WeightScope::Target,
@@ -711,12 +806,23 @@ pub(super) fn derive_program_plan(
             ));
         }
     };
-    let state = StateProgramPlan::new(vec![
+    let mut copies = vec![
         Element::f32(),
         Element::f16(),
         Element::bf16(),
         Element::u32(),
-    ]);
+    ];
+    // A selected read's indexer keeps its raw keys' coordinates as i32.
+    if decoder.sublayers().any(|(_, sublayer)| {
+        matches!(
+            &sublayer.op,
+            Operator::Attention(attention)
+                if matches!(attention.reads, HistoryReads::Selected { .. })
+        )
+    }) {
+        copies.push(Element::i32());
+    }
+    let state = StateProgramPlan::new(copies);
     ProgramPlan::new(
         definition,
         imports,
@@ -749,9 +855,11 @@ fn shared_head_program_plan(
         let paired = paired_block(block)?;
         let [mixer, feed_forward] = paired_scopes(index, WeightScope::HeadSublayer);
         blocks.push(TargetBlockProgramSlot::new(
+            // A Shared head reads every visible row (`admit_shared_head`).
             mixer_slot(
                 &paired,
                 head.width,
+                0,
                 |kind| lookup(mixer, kind),
                 activation,
                 history,

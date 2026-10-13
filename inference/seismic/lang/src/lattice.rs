@@ -46,8 +46,10 @@
 //!   value. When several raw codes decode to the target value (the two zeros
 //!   of a sign-magnitude code, a code whose sign bit the format ignores), the
 //!   lowest raw code is stored. A raw code that decodes to a non-finite value
-//!   is off the lattice. Nothing here names a representation, a plane or a
-//!   code format, so a representation added to the registry is covered.
+//!   is off the lattice. A plane of vector codes (one entry codes several
+//!   values through a grid) has no adjacent entry by value: its entries
+//!   stay, every draw blocked. Nothing here names a representation, a plane
+//!   or a code format, so a representation added to the registry is covered.
 //!
 //! # Layouts
 //!
@@ -83,10 +85,10 @@
 //! of the `packet` layout, or one row tile of a row layout.
 
 use crate::ids::RepresentationId;
-use crate::reference_math::{self, conversion, ReferenceScalar};
+use crate::reference_math::{self, ReferenceScalar, conversion};
 use crate::registry::{
-    self, PackedPacketLayout, PackedRowLayout, PlaneEncoding, RepresentationKind, RowGeometry,
-    RowPlaneContent,
+    self, CodeInterpretation, PackedPacketLayout, PackedRowLayout, PlaneEncoding,
+    RepresentationKind, RowGeometry, RowPlaneContent,
 };
 use crate::types::DType;
 use std::fmt;
@@ -252,6 +254,9 @@ enum Steps {
     Range { min: u32, max: u32 },
     /// For every raw code, the step down and the step up.
     Levels(Vec<[Step; 2]>),
+    /// Vector codes: an entry codes several values at once and has no
+    /// adjacent entry by value, so every move is blocked.
+    Fixed,
 }
 
 impl Steps {
@@ -299,6 +304,10 @@ impl Steps {
     fn of(encoding: &PlaneEncoding) -> Option<Steps> {
         match encoding {
             PlaneEncoding::Dense(dtype) => Steps::float(*dtype),
+            PlaneEncoding::Packed {
+                interpretation: CodeInterpretation::Grid(_),
+                ..
+            } => Some(Steps::Fixed),
             PlaneEncoding::Packed {
                 bits,
                 interpretation,
@@ -354,6 +363,7 @@ impl Steps {
                 }
             }
             Steps::Levels(steps) => steps[raw as usize][direction as usize],
+            Steps::Fixed => Step::Blocked,
         }
     }
 
@@ -425,14 +435,16 @@ impl RoundingCells {
     pub fn width(&self, bits: u32) -> Option<f64> {
         let value = conversion::exact_f64(self.dtype, bits);
         let gap = |direction| match self.steps.step(bits, direction) {
-            Step::To(adjacent) => {
-                Some(Some((conversion::exact_f64(self.dtype, adjacent) - value).abs()))
-            }
+            Step::To(adjacent) => Some(Some(
+                (conversion::exact_f64(self.dtype, adjacent) - value).abs(),
+            )),
             Step::Blocked => Some(None),
             Step::OffLattice => None,
         };
         let (below, above) = (gap(Direction::Down)?, gap(Direction::Up)?);
-        let inward = below.or(above).expect("a floating dtype has two finite values");
+        let inward = below
+            .or(above)
+            .expect("a floating dtype has two finite values");
         Some(0.5 * below.unwrap_or(inward) + 0.5 * above.unwrap_or(inward))
     }
 }
@@ -584,62 +596,69 @@ impl Lattice {
             .split_last()
             .expect("a packed tensor with a canonical byte count has a packing axis");
         let group = u64::from(packet.group);
-        let planes = packet
-            .planes
-            .iter()
-            .enumerate()
-            .map(|(ordinal, plane)| {
-                let steps = Steps::of(&plane.encoding).ok_or(LatticeError::Plane {
-                    representation: info.representation,
-                    plane: plane.name,
-                })?;
-                let whole = Run {
-                    first: 0,
-                    bits: plane.entry_bits,
-                };
-                // A row layout splits the codes of packet plane 0 across its
-                // code planes, each holding a run of every code's bits; every
-                // other packet plane keeps its bytes together
-                // (`RowPlaneContent`). The `packet` layout keeps every plane's
-                // bytes together.
-                let runs = match rows {
-                    Some(layout) if ordinal == 0 => {
-                        let mut runs: Vec<Run> = layout
-                            .planes
-                            .iter()
-                            .filter_map(|row_plane| match row_plane.content {
-                                RowPlaneContent::Codes { shift, bits } => {
-                                    Some(Run { first: shift, bits })
-                                }
-                                RowPlaneContent::Groups { .. } => None,
-                            })
-                            .collect();
-                        runs.sort_by_key(|run| run.first);
-                        let covered = runs.iter().try_fold(0, |covered, run| {
-                            (run.first == covered).then_some(covered + run.bits)
-                        });
-                        assert_eq!(
-                            covered,
-                            Some(plane.entry_bits),
-                            "every code bit has one row code plane"
-                        );
-                        runs
-                    }
-                    Some(_) | None => vec![whole],
-                };
-                let mut plane = Plane {
-                    steps,
-                    offset_bits: plane.offset as usize * 8,
-                    entry_bits: plane.entry_bits,
-                    runs,
-                    group: u64::from(plane.group),
-                    fields: u64::from(plane.fields),
-                    entries_per_packet: 0,
-                };
-                plane.entries_per_packet = plane.entries(group);
-                Ok(plane)
-            })
-            .collect::<Result<Vec<_>, LatticeError>>()?;
+        let planes =
+            packet
+                .planes
+                .iter()
+                .enumerate()
+                .map(|(ordinal, plane)| {
+                    let steps = Steps::of(&plane.encoding).ok_or(LatticeError::Plane {
+                        representation: info.representation,
+                        plane: plane.name,
+                    })?;
+                    let whole = Run {
+                        first: 0,
+                        bits: plane.entry_bits,
+                    };
+                    // A row layout splits the codes of packet plane 0 across its
+                    // code planes, each holding a run of every code's bits, unless
+                    // it keeps vector-code entries whole (`grids`); every other
+                    // packet plane keeps its bytes together (`RowPlaneContent`).
+                    // The `packet` layout keeps every plane's bytes together.
+                    let sliced = rows.is_some_and(|layout| {
+                        layout.planes.iter().any(|row_plane| {
+                            matches!(row_plane.content, RowPlaneContent::Codes { .. })
+                        })
+                    });
+                    let runs = match rows {
+                        Some(layout) if ordinal == 0 && sliced => {
+                            let mut runs: Vec<Run> = layout
+                                .planes
+                                .iter()
+                                .filter_map(|row_plane| match row_plane.content {
+                                    RowPlaneContent::Codes { shift, bits } => {
+                                        Some(Run { first: shift, bits })
+                                    }
+                                    RowPlaneContent::Grids { .. }
+                                    | RowPlaneContent::Groups { .. } => None,
+                                })
+                                .collect();
+                            runs.sort_by_key(|run| run.first);
+                            let covered = runs.iter().try_fold(0, |covered, run| {
+                                (run.first == covered).then_some(covered + run.bits)
+                            });
+                            assert_eq!(
+                                covered,
+                                Some(plane.entry_bits),
+                                "every code bit has one row code plane"
+                            );
+                            runs
+                        }
+                        Some(_) | None => vec![whole],
+                    };
+                    let mut plane = Plane {
+                        steps,
+                        offset_bits: plane.offset as usize * 8,
+                        entry_bits: plane.entry_bits,
+                        runs,
+                        group: u64::from(plane.group),
+                        fields: u64::from(plane.fields),
+                        entries_per_packet: 0,
+                    };
+                    plane.entries_per_packet = plane.entries(group);
+                    Ok(plane)
+                })
+                .collect::<Result<Vec<_>, LatticeError>>()?;
         let (placement, chunk_bytes) = match rows {
             None => (Placement::Packet, u64::from(packet.packet_size)),
             Some(layout) => {

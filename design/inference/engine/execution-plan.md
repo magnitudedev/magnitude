@@ -333,7 +333,9 @@ Per-request state and feature tensors require fitting heap claims. Retained chec
 their physical charge when their final owner drops them.
 
 Seismic composes native checked entries into prepared workflows for decoder blocks and other
-numerical units. Its checked entry contracts derive graph-local mutable scratch, host-uploaded
+numerical units. Block graphs share a plan only when their complete computation agrees,
+including decoder-boundary work: widening the entry into residual streams and mixing the exit
+streams for readout. Equal sublayer geometry alone does not permit sharing those boundary graphs. Its checked entry contracts derive graph-local mutable scratch, host-uploaded
 inputs, intermediate and result tensors' representations, extents, alias conditions, and lifetimes.
 It reports exact storage charges and owns bounded concurrent activations. A device executes one
 submission at a time, in submission order, and a graph's workspace holds only its own run's
@@ -413,7 +415,12 @@ latent width. Its grouped capacity counts at most min(E, M·K) receiving experts
 exact workflow for the selected physical batch class, so a small decode batch does not execute the
 maximum class width. Draft head blocks use their declared dense or routed feed-forward geometry
 and the same routed numerical composition as target blocks. Header assessment includes the head's
-routed weights, program entries, and class-dependent workspace before residency begins. Linear
+routed weights, program entries, and class-dependent workspace before residency begins. A causal
+head's residual form determines its mix/scatter entries and its conditioning width and
+element. Raw residual conditioning is exported before the target's exit mix and remains
+F32 through selection, prefix-boundary retention, and chained head steps. Vocabulary
+readout features are computed separately. Both exports and every mix/gather entry belong
+to the same checked graph topology and resource plan used for execution. Linear
 projection stages use cooperative subgroup reductions for the smallest row classes and subgroup
 matrix operations above them. A projection entry that reads packed weights has one
 accumulator-scale port per weight, whose static extent is 0 (absent, compiled out) or the extent of
@@ -548,6 +555,39 @@ History and recurrent state ports bind slab address tables, with each slab retai
 as a used resource until submitted work completes. Every visible span is slab-contained. No
 attention launch concurrently appends a row it reads through a visible span; a preceding ordered
 preparation may publish reserved rows for that launch. Preparation does not commit tentative state.
+An attention history is read whole (the host's visible spans and fresh rows) or selected by an
+indexer (`HistoryReads::Selected`). A selected read's graph adds the indexer: an
+`attention_project` of its query heads and raw key from the sublayer's own input under the same
+norm, then `indexer_select`, which appends each row's raw key (with its coordinates) and the block
+key it finishes to the indexer's Window and Block domains (`state-transactions.md`) and selects
+each row's blocks: past `blocks` complete blocks the `blocks` best by score (ties to the lower
+block) and the row's tail, every visible row before. The indexer's projection outputs its query
+and raw key in the activation element, as every projection does (the projection families stage
+2-byte operands); from them on the indexer is F32 (stored raw and block keys, prepared queries,
+scores) and rounds nowhere, as the F32 reference computes it. A selected read's domains are causally
+cached: a row's earlier launch rows are visible spans, its own row is fresh, and its prepared key
+and value are read dense, never through the cache's quantization, as a dense decode row reads
+them. Decode rows read the Segments form: `indexer_select` emits each row's read rows of its
+visible spans as at most `C = blocks + 1 + 64` slab-contained `[start, end)` runs in key order (64
+the visible-span class bound), and attention reads the row's own row fresh; a multi-row launch
+appends its rows first in an ordered append launch and suppresses the fused append (the scored
+decode entries' `R` is `C`). Prefill rows read the WorkList form: a per-row bitmap of `B` 32-block
+words of `BR`-key blocks (`B` enough for every block of the served context; both static axes of
+the prefill entries) that the prefill applies as a key mask (a block past the bitmap is not read),
+and from which a list launch of the prefill entry builds, per query tile of the backend's own row
+tiling, the key tiles some row of the tile reads; the attend launch walks only those tiles. The
+list belongs to the prefill entry rather than to `indexer_select` because its tiles follow the
+attend launch's query and key tiling, a tuned parameter of each backend's prefill that no other
+entry may assume. A query tile lists at most its rows' tiles of the bitmap's `32·B·BR` keys (its
+rows may belong to different requests), so the list scratch follows the served context, not the
+history reservation. WorkList forms are the staged fragment forms, and their graphs list no
+history tiles. Each selected block graph comes in two classes, a fifth class axis: one that scores
+and one that does not. A launch whose rows all have at most `blocks` complete blocks takes the
+class without scoring: `indexer_select` only appends, and attention binds the host's visible
+spans and fresh rows as a read of every visible row does. The indexer's score scratch (`M · 32 · B`
+F32 scores) is charged in the class's certified workspace, and the decode demand charges the
+indexer's projection, its select call and its per-token block key and score traffic, and caps
+attention's selected read at `(blocks + 1) · block` tokens.
 An attention sublayer is one segmented query | gate | key | value projection, the fused entry and
 the output projection, whatever its form: each optional part of the operator (interleaved or
 separate gate, own keys and values, head norms, value norm, rotated pairs) is a static axis of
@@ -641,7 +681,24 @@ the store's bank slabs and, per run, bank tables for its exact active request sl
 that binds them (the state entry, and the convolved step form's projection for the windows) reads
 the slot's accepted bank and writes only its successor bank, in place, within the block's ordered
 submission. The engine does not dispatch state transfers around the block,
-copy state between banks, or bind padded request state. Workflow activations cover
+copy state between banks, or bind padded request state. A block with an n-gram input binds the
+step's token rows as a device tensor whatever their source (the previous step's selection, or the
+host's tokens, which such a model's entry copies into token rows it keeps bound for the blocks)
+and evaluates its table rows on the device from them and its bank's token window (`ngram_rows`),
+so its one graph per class serves both sources and its steps chain on device-selected tokens like
+any other. Its stored table's
+rows ([residency](residency.md)) are read behind a host gate: the block's graph waits at a gate
+node until the table's filler has written the step's rows, reads them (`stored_rows`), then
+signals that it has read them. A gate node is a Seismic timeline node sealed into the graph
+(`TimelineNode::Wait` or `Signal`, at a position between its calls); each run binds every node to
+a timeline and the value it waits for or signals, and a run with an unbound node is refused. A
+timeline is a monotonic host-visible value: a shared event on Metal, a mapped host word the
+stream waits on (`cuStreamWaitValue32`) and writes on CUDA, a timeline semaphore on Vulkan
+(waited and signaled at queue-submission boundaries, so a gate divides its run's submission), and
+a host condition on the CPU, whose run executes its segments in order across the gates. The
+entry graph of a step on selected tokens copies the selection into host-shared storage and
+signals the step's selection notice, from which the filler names the step's rows; a step on the
+host's tokens is named when it is queued. Workflow activations cover
 submitted concurrency, and retained outputs cover submitted and live request owners. The target's
 residual stream between block graphs is one device pair, returned at the end of each submission:
 every reader of it is queued in that submission and the device runs the next launch after it.

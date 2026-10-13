@@ -138,6 +138,7 @@ pub(crate) struct ShortConvOutputTuning {
 
 pub(crate) struct ShortConvOutputCase {
     hidden: Tensor,
+    inject: Tensor,
     gated: Tensor,
     output: Tensor,
     bound: Tensor,
@@ -199,6 +200,7 @@ impl EntryTuning for ShortConvOutputTuning {
                         &[point.rows, shape.hidden],
                         seed + 1,
                     )?,
+                    inject: inputs.activation(Element::f32(), &[point.rows, 0], seed + 3)?,
                     gated: inputs.activation(
                         self.binding.activation,
                         &[point.rows, 1, shape.channels],
@@ -214,6 +216,7 @@ impl EntryTuning for ShortConvOutputTuning {
     fn args<'a>(case: &'a mut Self::Case) -> attention_output::Args<'a> {
         attention_output::Args {
             hidden: &case.hidden,
+            inject: &case.inject,
             gated: &case.gated,
             output_weight: &case.output,
             output_bound: &case.bound,

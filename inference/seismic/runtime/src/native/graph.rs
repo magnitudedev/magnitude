@@ -11,6 +11,7 @@
 //! and the tensors bound to external ports; attaching checks those bindings
 //! alone, so per-run host work does not revalidate nodes.
 
+use super::timeline::{TimelineInner, TimelineNode, TimelineOperation};
 use super::{
     merge_access, submit, word_bytes, CallLaunches, Dispatch, DispatchList, LaunchGeometry,
     NativePrepared, NativeSubmission, NativeTensorSpec, ScratchNeed, BUFFER_ALIGNMENT,
@@ -213,6 +214,16 @@ pub struct NativeGraphDraft {
     nodes: Vec<NodeDraft>,
     exports: Vec<WorkflowResultRef>,
     layout: Option<Arc<NativeGraphLayout>>,
+    /// Timeline nodes, each before the kernel node of its position.
+    timelines: Vec<(usize, TimelineNode)>,
+}
+
+/// A timeline node of a graph (`timeline`): each run binds it to a
+/// timeline and a value (`NativeGraphBindings::set_timeline`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeTimelinePort {
+    workflow: u64,
+    ordinal: u32,
 }
 
 impl NativeGraphDraft {
@@ -224,6 +235,19 @@ impl NativeGraphDraft {
             nodes: Vec::new(),
             exports: Vec::new(),
             layout: None,
+            timelines: Vec::new(),
+        }
+    }
+
+    /// A timeline node after every node enqueued so far: a host gate the
+    /// device waits at (`TimelineNode::Wait`), or a signal the host waits
+    /// for (`TimelineNode::Signal`).
+    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        let ordinal = u32::try_from(self.timelines.len()).expect("timeline ordinal exhausted");
+        self.timelines.push((self.nodes.len(), node));
+        NativeTimelinePort {
+            workflow: self.identity,
+            ordinal,
         }
     }
 
@@ -394,11 +418,13 @@ impl NativeGraphDraft {
         } else {
             plan_storage(&self.ports, &planned, &results, &self.exports)
         };
+        self.timelines.shrink_to_fit();
         let mut executable = Executable {
             nodes: Vec::with_capacity(planned.len()),
             external_writes: vec![false; self.ports.len()],
             upload_written: false,
             disjoint: Vec::new(),
+            timelines: self.timelines,
         };
         for (node, ((kernel, arguments, shape), planned)) in
             shaped.into_iter().zip(&planned).enumerate()
@@ -434,6 +460,7 @@ pub struct NativeGraphMetadataDraft {
     shapes: Vec<SealedNodeShape>,
     results: Vec<Vec<Option<NativeTensorSpec>>>,
     exports: Vec<WorkflowResultRef>,
+    timelines: Vec<(usize, TimelineNode)>,
 }
 
 /// A Seismic placement for a dominating graph class. Exact graphs with the
@@ -447,6 +474,8 @@ pub struct NativeGraphLayout {
     /// The host heap of a plan sealed into this layout
     /// (`NativeGraphMetadataDraft::plan_heap` of the layout's topology).
     plan_heap: HostHeap,
+    /// The topology's timeline nodes.
+    timelines: usize,
 }
 
 impl NativeGraphLayout {
@@ -461,9 +490,10 @@ impl NativeGraphLayout {
     /// The host heap of one static binding of a plan sealed into this
     /// layout (`BoundNativeGraphPlan::host_heap` is what a binding holds):
     /// a binding holds, for each port of the plan, the tensor bound to it
-    /// and whether it is external and checked.
+    /// and whether it is external and checked, and for each timeline node
+    /// its timeline and value.
     pub fn bound_heap(&self) -> HostHeap {
-        bindings_heap(self.port_capacity.len())
+        bindings_heap(self.port_capacity.len(), self.timelines)
     }
 
     pub fn storage_bytes(&self) -> NativeGraphStorageBytes {
@@ -588,6 +618,18 @@ impl NativeGraphMetadataDraft {
             shapes: Vec::new(),
             results: Vec::new(),
             exports: Vec::new(),
+            timelines: Vec::new(),
+        }
+    }
+
+    /// A timeline node after every node enqueued so far
+    /// (`NativeGraphDraft::timeline`).
+    pub fn timeline(&mut self, node: TimelineNode) -> NativeTimelinePort {
+        let ordinal = u32::try_from(self.timelines.len()).expect("timeline ordinal exhausted");
+        self.timelines.push((self.nodes.len(), node));
+        NativeTimelinePort {
+            workflow: self.identity,
+            ordinal,
         }
     }
 
@@ -607,6 +649,7 @@ impl NativeGraphMetadataDraft {
         }
         heap.hold(self.nodes.len(), size_of::<SealedNode>());
         heap.hold(self.ports.len(), size_of::<bool>());
+        heap.hold(self.timelines.len(), size_of::<(usize, TimelineNode)>());
         let mut disjoint = 0usize;
         for (node, shape) in self.nodes.iter().zip(&self.shapes) {
             heap.hold(shape.buffers, size_of::<Site>());
@@ -836,6 +879,7 @@ impl NativeGraphMetadataDraft {
             &results,
             &self.exports,
             self.plan_heap(),
+            self.timelines.len(),
         ))
     }
 }
@@ -846,9 +890,11 @@ fn make_layout(
     results: &[Vec<Option<NativeTensorSpec>>],
     exports: &[WorkflowResultRef],
     plan_heap: HostHeap,
+    timelines: usize,
 ) -> NativeGraphLayout {
     NativeGraphLayout {
         plan_heap,
+        timelines,
         storage: plan_storage(ports, nodes, results, exports),
         signature: storage_signature(ports, nodes, results, exports),
         port_capacity: ports.iter().map(|port| port.byte_len).collect(),
@@ -1220,6 +1266,9 @@ struct Executable {
     /// requires to be disjoint. Pairs on graph storage, or on one port,
     /// were decided at seal.
     disjoint: Vec<(PortRange, PortRange)>,
+    /// Timeline nodes in order, each with the kernel node it precedes
+    /// (`nodes.len()` after the last).
+    timelines: Vec<(usize, TimelineNode)>,
 }
 
 impl Executable {
@@ -1658,6 +1707,7 @@ impl NativeGraphPlan {
             heap.hold_vec(&node.launches.geometry);
         }
         heap.hold_vec(&self.executable.external_writes);
+        heap.hold_vec(&self.executable.timelines);
         heap.hold_vec(&self.executable.disjoint);
         for (first, second) in &self.executable.disjoint {
             heap.hold(first.parameter.capacity(), 1);
@@ -1709,6 +1759,7 @@ impl NativeGraphPlan {
             inputs: vec![None; self.ports.len()],
             external: self.ports.iter().map(|port| !port.local).collect(),
             checked: vec![false; self.ports.len()],
+            timelines: vec![None; self.executable.timelines.len()],
         }
     }
     /// Bind the ports that stay fixed across runs, checked once here; a
@@ -1863,18 +1914,20 @@ impl BoundNativeGraphPlan {
         heap.hold_vec(&self.fixed.inputs);
         heap.hold_vec(&self.fixed.external);
         heap.hold_vec(&self.fixed.checked);
+        heap.hold_vec(&self.fixed.timelines);
         heap
     }
 }
 
-/// The host heap of the bindings of a plan of `ports` ports
-/// (`NativeGraphPlan::bindings`).
-fn bindings_heap(ports: usize) -> HostHeap {
+/// The host heap of the bindings of a plan of `ports` ports and
+/// `timelines` timeline nodes (`NativeGraphPlan::bindings`).
+fn bindings_heap(ports: usize, timelines: usize) -> HostHeap {
     use std::mem::size_of;
     let mut heap = HostHeap::default();
     heap.hold(ports, size_of::<Option<Arc<TensorInner>>>());
     heap.hold(ports, size_of::<bool>());
     heap.hold(ports, size_of::<bool>());
+    heap.hold(timelines, size_of::<Option<(Arc<TimelineInner>, u64)>>());
     heap
 }
 
@@ -2295,10 +2348,35 @@ impl NativeGraphSlot {
                 }));
             }
         }
+        let mut timelines = Vec::with_capacity(bindings.timelines.len());
+        for (node, (bound, &(position, kind))) in bindings
+            .timelines
+            .into_iter()
+            .zip(&self.plan.executable.timelines)
+            .enumerate()
+        {
+            let (timeline, value) = bound.ok_or(CallError::Workflow(
+                WorkflowError::NativeTimelineUnbound { node },
+            ))?;
+            if !Arc::ptr_eq(timeline.device(), &self.plan.device) {
+                return Err(CallError::Workflow(WorkflowError::NativeTimelineMismatch {
+                    node,
+                }));
+            }
+            timelines.push((
+                position,
+                TimelineOperation {
+                    node: kind,
+                    timeline,
+                    value,
+                },
+            ));
+        }
         Ok(ReadyNativeGraphRun {
             slot: self,
             externals: bindings.inputs,
             exports,
+            timelines,
         })
     }
 }
@@ -2381,9 +2459,34 @@ pub struct NativeGraphBindings {
     external: Vec<bool>,
     /// Ports whose binding was checked by `bind_static`.
     checked: Vec<bool>,
+    /// Per timeline node, its timeline and value for the run.
+    timelines: Vec<Option<(Arc<TimelineInner>, u64)>>,
 }
 
 impl NativeGraphBindings {
+    /// Bind timeline node `port` to `timeline` at `value` for this run.
+    pub fn set_timeline(
+        &mut self,
+        port: NativeTimelinePort,
+        timeline: Arc<TimelineInner>,
+        value: u64,
+    ) -> Result<(), WorkflowError> {
+        if port.workflow != self.identity {
+            return Err(WorkflowError::CrossWorkflowResult);
+        }
+        let slot = self
+            .timelines
+            .get_mut(port.ordinal as usize)
+            .ok_or(WorkflowError::CrossWorkflowResult)?;
+        if slot.is_some() {
+            return Err(WorkflowError::NativeTimelineAlreadyBound {
+                node: port.ordinal as usize,
+            });
+        }
+        *slot = Some((timeline, value));
+        Ok(())
+    }
+
     /// Attach an exported tensor from a reserved, unsubmitted result lease.
     /// The destination port descriptor and aliases are checked by `attach`.
     pub fn set_reserved_export(
@@ -2421,6 +2524,8 @@ pub struct ReadyNativeGraphRun<'a> {
     /// The tensor of every external port (`None` for graph locals).
     externals: Vec<Option<Arc<TensorInner>>>,
     exports: NativeGraphOutputs,
+    /// The run's timeline operations, each with the kernel node it precedes.
+    timelines: Vec<(usize, TimelineOperation)>,
 }
 
 impl ReadyNativeGraphRun<'_> {
@@ -2501,6 +2606,7 @@ impl ReadyNativeGraphRun<'_> {
             workspace: self.slot.workspace.clone(),
             upload: self.slot.upload.clone(),
             outputs: self.exports.arena.clone(),
+            timelines: self.timelines,
         });
         let mut exports = self.exports;
         exports.submitted = true;
@@ -2546,12 +2652,18 @@ impl NativeGraphSequence {
     /// outcome of all of them.
     pub fn submit(self) -> Result<NativeGraphCompletion, CallError> {
         let access = merge_access(self.access.iter().cloned());
-        let retained: Arc<dyn std::any::Any + Send + Sync> = Arc::new(
+        // The work keeps its plans and the timelines it waits on or signals.
+        let retained: Arc<dyn std::any::Any + Send + Sync> = Arc::new((
             self.runs
                 .iter()
                 .map(|run| run.plan.clone())
                 .collect::<Vec<_>>(),
-        );
+            self.runs
+                .iter()
+                .flat_map(|run| run.timelines.iter())
+                .map(|(_, operation)| operation.timeline.clone())
+                .collect::<Vec<_>>(),
+        ));
         let nodes = self
             .runs
             .iter()
@@ -2560,9 +2672,20 @@ impl NativeGraphSequence {
                 (0..queued.plan.executable.nodes.len()).map(move |node| (run, node))
             })
             .collect::<Vec<_>>();
+        // A run's operation before its node `n` is at the boundary before
+        // that node's dispatch; the runs' dispatches follow one another.
+        let mut boundaries = vec![Vec::new(); nodes.len() + 1];
+        let mut first = 0;
+        for run in &self.runs {
+            for (position, operation) in &run.timelines {
+                boundaries[first + position].push(operation.clone());
+            }
+            first += run.plan.executable.nodes.len();
+        }
         let list = SequenceList {
             runs: &self.runs,
             nodes,
+            boundaries,
         };
         let submission = submit(&list, &access, retained, 1)?;
         Ok(NativeGraphCompletion { submission })
@@ -2578,6 +2701,8 @@ struct QueuedRun {
     workspace: Option<Arc<Allocation>>,
     upload: Option<Arc<Allocation>>,
     outputs: Option<Arc<Allocation>>,
+    /// Its timeline operations, each with the node it precedes.
+    timelines: Vec<(usize, TimelineOperation)>,
 }
 
 /// A sequence's runs as the encoder reads them: every node of every run.
@@ -2585,6 +2710,9 @@ struct SequenceList<'a> {
     runs: &'a [QueuedRun],
     /// (run, node) of each dispatch, in order.
     nodes: Vec<(usize, usize)>,
+    /// Per dispatch boundary (before dispatch `i`, `nodes.len()` after the
+    /// last), the timeline operations there, in run order.
+    boundaries: Vec<Vec<TimelineOperation>>,
 }
 
 impl DispatchList for SequenceList<'_> {
@@ -2628,6 +2756,14 @@ impl DispatchList for SequenceList<'_> {
 
     fn plans(&self) -> Option<Vec<u64>> {
         Some(self.runs.iter().map(|run| run.plan.identity).collect())
+    }
+
+    fn timelines(&self, boundary: usize) -> &[TimelineOperation] {
+        &self.boundaries[boundary]
+    }
+
+    fn has_timelines(&self) -> bool {
+        self.boundaries.iter().any(|operations| !operations.is_empty())
     }
 }
 
@@ -2694,7 +2830,7 @@ mod layout_certificate_tests {
     #[test]
     fn dominating_layout_accepts_smaller_exact_graph_and_rejects_larger_one() {
         let (ports, nodes, results) = class(16);
-        let certified = make_layout(&ports, &nodes, &results, &[], HostHeap::default());
+        let certified = make_layout(&ports, &nodes, &results, &[], HostHeap::default(), 0);
         let charge = certified.storage_bytes();
         let (ports, nodes, results) = class(8);
         let exact = certified

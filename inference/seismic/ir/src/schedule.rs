@@ -253,6 +253,7 @@ pub enum FillValue {
     U8([u8; 1]),
     U16([u8; 2]),
     U32([u8; 4]),
+    U64([u8; 8]),
 }
 impl FillValue {
     pub fn pattern(&self) -> &[u8] {
@@ -260,6 +261,7 @@ impl FillValue {
             Self::U8(value) => value,
             Self::U16(value) => value,
             Self::U32(value) => value,
+            Self::U64(value) => value,
         }
     }
     pub const fn width(&self) -> u64 {
@@ -267,6 +269,7 @@ impl FillValue {
             Self::U8(_) => 1,
             Self::U16(_) => 2,
             Self::U32(_) => 4,
+            Self::U64(_) => 8,
         }
     }
 }

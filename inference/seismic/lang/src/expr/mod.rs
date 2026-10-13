@@ -521,16 +521,18 @@ impl ExprArena {
     pub(crate) fn int_from_scalar_value(&mut self, value: ErasedScalarExpr) -> IntExpr {
         self.inner.int_from_scalar(value)
     }
-    /// Interpret a mathematical integer in the actual I32/U32 representation.
-    /// This is a conversion boundary, not an already-converted word operand.
+    /// Interpret a mathematical integer in the actual I32/U32/U64
+    /// representation. This is a conversion boundary, not an
+    /// already-converted word operand.
     pub fn int_to_word(&mut self, quantity: IntExpr, dtype: DType) -> IntExpr {
         assert!(
             dtype.is_int(),
-            "mathematical word conversion requires I32/U32"
+            "mathematical word conversion requires an integer word"
         );
-        let modulus = self.int(1_i64 << 32);
+        let bits = dtype.bytes() as usize * 8;
+        let modulus = self.int_exact(BigInt::from(1u32) << bits);
         let unsigned = self.int_rem(quantity, modulus);
-        if dtype == DType::U32 {
+        if dtype != DType::I32 {
             return unsigned;
         }
         let half = self.int(1_i64 << 31);
@@ -927,7 +929,7 @@ pub trait ScalarSort: 'static + Copy + fmt::Debug + private::Sealed {
     type Value: Copy + fmt::Debug + PartialEq;
     const DTYPE: DType;
     #[doc(hidden)]
-    fn encode(value: Self::Value) -> u32;
+    fn encode(value: Self::Value) -> u64;
 }
 
 mod private {
@@ -942,19 +944,20 @@ macro_rules! scalar_sort {
         impl ScalarSort for $name {
             type Value = $value;
             const DTYPE: DType = $dtype;
-            fn encode(value: Self::Value) -> u32 {
+            fn encode(value: Self::Value) -> u64 {
                 ($encode)(value)
             }
         }
     };
 }
 
-scalar_sort!(F32, f32, DType::F32, f32::to_bits);
-scalar_sort!(F16, u16, DType::F16, u32::from);
-scalar_sort!(BF16, u16, DType::BF16, u32::from);
-scalar_sort!(BoolScalar, bool, DType::Bool, u32::from);
-scalar_sort!(I32, i32, DType::I32, |value: i32| value as u32);
-scalar_sort!(U32, u32, DType::U32, |value: u32| value);
+scalar_sort!(F32, f32, DType::F32, |value: f32| u64::from(value.to_bits()));
+scalar_sort!(F16, u16, DType::F16, u64::from);
+scalar_sort!(BF16, u16, DType::BF16, u64::from);
+scalar_sort!(BoolScalar, bool, DType::Bool, u64::from);
+scalar_sort!(I32, i32, DType::I32, |value: i32| u64::from(value as u32));
+scalar_sort!(U32, u32, DType::U32, u64::from);
+scalar_sort!(U64, u64, DType::U64, |value: u64| value);
 
 /// One additive contribution to a physical duration interval, in nanoseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1354,7 +1357,7 @@ pub enum NodeView<'a> {
     BoolConst(bool),
     ScalarConst {
         dtype: DType,
-        bits: u32,
+        bits: u64,
     },
     ScalarInteger {
         operation: crate::reference_math::ScalarOp,
@@ -1476,6 +1479,7 @@ pub enum SymbolValue {
     Bool(bool),
     I32(i32),
     U32(u32),
+    U64(u64),
 }
 
 impl SymbolValue {
@@ -1500,6 +1504,7 @@ impl SymbolValue {
             Self::F16(value) | Self::BF16(value) => u64::from(value),
             Self::I32(value) => u64::from(value as u32),
             Self::U32(value) => u64::from(value),
+            Self::U64(value) => value,
             Self::Bool(value) => u64::from(value),
         })
     }
@@ -1813,6 +1818,16 @@ mod tests {
             let u = arena.int_to_word(quantity, DType::U32);
             assert_eq!(arena.eval_int_i64(i, &Assignment::new()).unwrap(), signed);
             assert_eq!(arena.eval_int_i64(u, &Assignment::new()).unwrap(), unsigned);
+        }
+        for (input, wide) in [
+            (BigInt::from(-1), BigInt::from(u64::MAX)),
+            (BigInt::from(4294967296_u64), BigInt::from(4294967296_u64)),
+            (BigInt::from(1u32) << 64usize, BigInt::from(0)),
+            ((BigInt::from(1u32) << 64usize) + 5, BigInt::from(5)),
+        ] {
+            let quantity = arena.int_exact(input);
+            let word = arena.int_to_word(quantity, DType::U64);
+            assert_eq!(arena.eval_int(word, &Assignment::new()).unwrap(), wide);
         }
         let one = arena.int(1);
         let zero = arena.int(0);

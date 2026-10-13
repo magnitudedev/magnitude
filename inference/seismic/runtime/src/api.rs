@@ -89,6 +89,17 @@ pub enum WorkflowError {
     NativePortAlreadyBound {
         port: usize,
     },
+    /// A run's timeline node was not bound to a timeline.
+    NativeTimelineUnbound {
+        node: usize,
+    },
+    NativeTimelineAlreadyBound {
+        node: usize,
+    },
+    /// A timeline node was bound to another device's timeline.
+    NativeTimelineMismatch {
+        node: usize,
+    },
     NativeGraphSlotMismatch,
     NativeGraphLayoutMismatch,
     NativeOutputLeaseConsumed,
@@ -152,6 +163,15 @@ impl fmt::Display for CallError {
             }
             Self::Workflow(WorkflowError::NativePortAlreadyBound { port }) => {
                 write!(f, "native graph port {port} was bound twice")
+            }
+            Self::Workflow(WorkflowError::NativeTimelineUnbound { node }) => {
+                write!(f, "native graph timeline node {node} is unbound")
+            }
+            Self::Workflow(WorkflowError::NativeTimelineAlreadyBound { node }) => {
+                write!(f, "native graph timeline node {node} was bound twice")
+            }
+            Self::Workflow(WorkflowError::NativeTimelineMismatch { node }) => {
+                write!(f, "native graph timeline node {node} names another device's timeline")
             }
             Self::Workflow(WorkflowError::NativeGraphSlotMismatch) => {
                 f.write_str("native graph slot belongs to another graph")
@@ -986,6 +1006,75 @@ pub mod tensor {
             Ok(layout::canonical(representation, extents)?.byte_len)
         }
 
+        /// A zero-filled tensor in storage the host writes and reads in
+        /// place while device work that uses it is queued or running
+        /// (`OpenedKind::allocate_upload`: host-visible on every backend,
+        /// mapped pinned host memory on CUDA).
+        pub fn shared(
+            device: &Arc<DeviceInner>,
+            representation: RepresentationId,
+            extents: &[u64],
+        ) -> Result<Self, TensorError> {
+            if !device.supports_representation(representation) {
+                return Err(TensorError::UnsupportedRepresentation {
+                    backend: device.info().backend,
+                    representation: representation_info(representation).name,
+                });
+            }
+            let layout = layout::canonical(representation, extents)?;
+            let allocation = device.allocate_upload(layout.byte_len, layout.alignment)?;
+            write_zeros(allocation.storage(), layout.byte_len)?;
+            Ok(Self::new_view(
+                device.clone(),
+                allocation,
+                0,
+                layout.byte_len,
+                representation,
+                extents.to_vec(),
+                layout.strides,
+            ))
+        }
+
+        /// Write `bytes` at `offset` bytes into this view without waiting
+        /// for device work that uses its storage.
+        ///
+        /// # Safety
+        /// The tensor was made by [`Self::shared`] (or is a view of one),
+        /// and no device work in flight reads or writes these bytes.
+        pub unsafe fn write_shared(&self, offset: u64, bytes: &[u8]) -> Result<(), TensorError> {
+            offset
+                .checked_add(bytes.len() as u64)
+                .filter(|end| *end <= self.byte_len)
+                .ok_or(TensorError::HostByteLength {
+                    expected: self.byte_len,
+                    actual: offset.saturating_add(bytes.len() as u64),
+                })?;
+            self.allocation
+                .storage()
+                .write(self.byte_offset + offset, bytes)
+                .map_err(TensorError::Execution)
+        }
+
+        /// Read `into.len()` bytes at `offset` bytes into this view without
+        /// waiting for device work that uses its storage.
+        ///
+        /// # Safety
+        /// The tensor was made by [`Self::shared`] (or is a view of one),
+        /// and no device work in flight writes these bytes.
+        pub unsafe fn read_shared(&self, offset: u64, into: &mut [u8]) -> Result<(), TensorError> {
+            offset
+                .checked_add(into.len() as u64)
+                .filter(|end| *end <= self.byte_len)
+                .ok_or(TensorError::HostByteLength {
+                    expected: self.byte_len,
+                    actual: offset.saturating_add(into.len() as u64),
+                })?;
+            self.allocation
+                .storage()
+                .read(self.byte_offset + offset, into)
+                .map_err(TensorError::Execution)
+        }
+
         pub fn zeros(
             device: &Arc<DeviceInner>,
             representation: RepresentationId,
@@ -1688,6 +1777,7 @@ pub mod kernel {
                 Self::BF16(value) => ArgumentValue::BF16(value),
                 Self::I32(value) => ArgumentValue::I32(value),
                 Self::U32(value) => ArgumentValue::U32(value),
+                Self::U64(value) => ArgumentValue::U64(value),
                 Self::Bool(value) => ArgumentValue::Bool(value),
                 Self::Index(value) => ArgumentValue::Index(value),
                 Self::Range { start, end } => ArgumentValue::Range { start, end },

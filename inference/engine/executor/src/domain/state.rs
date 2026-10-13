@@ -31,15 +31,14 @@ impl MemoryChargeReconciliation {
 
 impl<F: ProgramFamily> ExecutorDomain<F> {
     pub(super) fn allocate_boundary(&mut self) -> Result<FeatureRef, DomainError> {
-        let width = self.definition.decoder.hidden;
-        let element = crate::planning::activation_dtype(self.definition.decoder.activation_dtype);
-        let bytes = width
-            .checked_mul(self.definition.decoder.activation_dtype.bytes() as u64)
-            .ok_or_else(|| DomainError::invariant("boundary feature size overflows"))?;
+        let head = self.definition.head.as_ref();
+        let width = head.map_or(self.definition.decoder.hidden, |head| head.conditioning_width(&self.definition.decoder));
+        let element = if head.is_some_and(|head| head.residual_conditioning()) { seismic::Element::f32() } else { seismic::Element::dense(crate::planning::activation_dtype(self.definition.decoder.activation_dtype)) };
+        let bytes = self.head_conditioning_bytes() as u64;
         let claim = self.claim_device_growth(bytes, 0, HoldingClass::Live)?;
         let tensor = Tensor::zeros(
             self.domain.device(),
-            seismic::Element::dense(element),
+            element,
             &[1, width],
         );
         self.release_claim(claim);

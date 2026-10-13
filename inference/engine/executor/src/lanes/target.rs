@@ -27,6 +27,10 @@ pub struct TargetLaunchInputs {
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
     boundary: Option<FeatureRef>,
+    /// Per slot, the accepted tokens its sequence holds before the slot's
+    /// first row, oldest first, as many as the model's row rules read (none
+    /// of a model without one): the host's form of the n-gram token window.
+    preceding: Vec<Vec<u64>>,
     graph_workspace: TargetGraphWorkspaceLease,
     graph_outputs: [TargetGraphOutputLease; 2],
     readout_workspace: NativeGraphWorkspaceLease,
@@ -64,11 +68,19 @@ impl TargetLaunchInputs {
             readout_workspace,
             readout_output: Some(readout_output),
             boundary: None,
+            preceding: Vec::new(),
         }
     }
 
     pub(crate) fn with_boundary(mut self, boundary: Option<FeatureRef>) -> Self {
         self.boundary = boundary;
+        self
+    }
+
+    /// Per slot, the accepted tokens before its first row
+    /// (`TargetLaunchCore::preceding`).
+    pub(crate) fn with_preceding(mut self, preceding: Vec<Vec<u64>>) -> Self {
+        self.preceding = preceding;
         self
     }
 
@@ -93,6 +105,7 @@ impl TargetLaunchInputs {
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
         hidden_width: usize,
+        boundary_width: usize,
     ) -> Result<(), InvariantError> {
         let invalid = |detail: String| InvariantError {
             context: "target launch",
@@ -102,7 +115,7 @@ impl TargetLaunchInputs {
             if self.batch.actual_slots() != 1
                 || boundary.domain() != domain
                 || boundary.allocation().rows() != 1
-                || boundary.allocation().width() != hidden_width
+                || boundary.allocation().width() != boundary_width
                 || boundary.allocation().is_graph_backed()
                 || boundary.allocation().tensor().is_err()
                 || !self
@@ -120,6 +133,7 @@ impl TargetLaunchInputs {
         if slots != self.advances.len()
             || slots != self.conditioning.len()
             || slots != self.conditioning_slices.len()
+            || !(self.preceding.is_empty() || self.preceding.len() == slots)
         {
             return Err(invalid(
                 "slot, advance, and conditioning counts disagree".into(),
@@ -211,6 +225,29 @@ impl TargetLaunchInputs {
                 let packed = slot
                     .history(domain.0)
                     .ok_or_else(|| invalid(format!("slot {index} lacks a history domain")))?;
+                // An indexer's rows read as `indexer_history` forms them.
+                if crate::domain::indexer_domain(store, domain) {
+                    let appended = crate::domain::AppendedRuns::of(store, advance, domain);
+                    for (row, (destination, visible)) in
+                        packed.destinations.iter().zip(packed.visible).enumerate()
+                    {
+                        let expected = crate::domain::indexer_history(
+                            store, advance, &appended, domain, row,
+                        )
+                        .map_err(invalid)?;
+                        if expected.destination != *destination
+                            || visible.iter().filter(|range| **range != [0, 0]).ne(expected
+                                .visible
+                                .iter()
+                                .filter(|range| **range != [0, 0]))
+                        {
+                            return Err(invalid(format!(
+                                "slot {index} row {row} indexer history differs from its state"
+                            )));
+                        }
+                    }
+                    continue;
+                }
                 let destinations = &binding.destinations[domain.0];
                 if !destinations.is_empty() && destinations.len() != packed.destinations.len() {
                     return Err(invalid(format!("slot {index} destination count differs")));
@@ -334,8 +371,9 @@ impl ValidatedTargetLaunch {
         store: &Rc<StateStore>,
         domain: &ResourceDomainId,
         hidden_width: usize,
+        boundary_width: usize,
     ) -> Result<Self, (TargetLaunchInputs, InvariantError)> {
-        if let Err(error) = inputs.validate(store, domain, hidden_width) {
+        if let Err(error) = inputs.validate(store, domain, hidden_width, boundary_width) {
             return Err((inputs, error));
         }
         let TargetLaunchInputs {
@@ -345,6 +383,7 @@ impl ValidatedTargetLaunch {
             conditioning,
             conditioning_slices,
             boundary,
+            preceding,
             graph_workspace,
             graph_outputs,
             readout_workspace,
@@ -358,6 +397,7 @@ impl ValidatedTargetLaunch {
                 conditioning,
                 conditioning_slices,
                 boundary,
+                preceding,
                 store: store.clone(),
                 domain: domain.clone(),
             },
@@ -429,6 +469,7 @@ pub struct TargetLaunchCore {
     conditioning: Vec<Option<ConditioningRef>>,
     conditioning_slices: Vec<Vec<ConditioningSlice>>,
     boundary: Option<FeatureRef>,
+    preceding: Vec<Vec<u64>>,
     /// The store every advance belongs to: it names each attention layer's
     /// history domain and the layer whose regions it binds.
     store: Rc<StateStore>,
@@ -462,6 +503,13 @@ impl TargetLaunchCore {
 
     pub fn conditioning_slices(&self) -> &[Vec<ConditioningSlice>] {
         &self.conditioning_slices
+    }
+
+    /// Per slot, the accepted tokens its sequence holds before the slot's
+    /// first row, oldest first, as many as the model's row rules read;
+    /// empty of a model without one.
+    pub fn preceding(&self) -> &[Vec<u64>] {
+        &self.preceding
     }
 
     pub fn into_parts(

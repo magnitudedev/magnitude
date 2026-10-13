@@ -8,6 +8,7 @@
 //! tables select which version (bank and tape rows) each slot reads and which
 //! bank it publishes to.
 
+use crate::operators::{Join, SublayerInput};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
 use crate::programs::native_target_graph::{PackingBound, WeightPort, weight};
@@ -176,6 +177,8 @@ pub(crate) struct RecurrentBlock {
     pub width: u64,
     pub convolution_width: u64,
     pub grouped: bool,
+    /// The output gate's code (`gated_delta::gate_function`).
+    pub gate_function: i32,
     pub epsilon: f32,
     /// Index of this layer's window component in the store's recurrent
     /// components; its delta and tape components follow it.
@@ -237,7 +240,9 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     scope: WeightScope,
     weights: &mut Vec<(WeightPort, NativePort)>,
     constants: &mut Vec<GraphConstant>,
-    hidden: &WorkflowTensor,
+    input: SublayerInput<'_>,
+    residual: &WorkflowTensor,
+    join: &Join,
     block: RecurrentBlock,
 ) -> Result<(WorkflowTensor, RecurrentStatePorts, RecurrentControlPorts), GraphError> {
     // The packed projections' bounds. The convolved decode form has no
@@ -255,7 +260,12 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         false => None,
     };
     let output_bound = bound(graph, WeightKind::RecurrentOutput)?;
-    let input_norm = weight(graph, load, scope, WeightKind::InputNorm, weights)?;
+    // A mix site's partials have no input norm: the port is empty.
+    let input_norm = if input.form.normalized {
+        weight(graph, load, scope, WeightKind::InputNorm, weights)?
+    } else {
+        GraphConstant::absent(graph, constants)?.tensor().clone()
+    };
     let qkv_weight = weight(
         graph,
         load,
@@ -288,6 +298,7 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
         tape_rows,
     ) = bank_ports(graph, state, block.component_index)?;
 
+    let [parts, normalized] = input.form.dimensions(block.hidden);
     let project = |graph: &mut G| {
         let Some((qkv_bound, gate_bound)) = &projection_bounds else {
             return Err("the recurrent projection's packing bounds are absent".into());
@@ -301,11 +312,13 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     ("NK", block.key_heads),
                     ("NV", block.value_heads),
                     ("W", block.width),
+                    parts,
+                    normalized,
                     ("QB", qkv_bound.extent),
                     ("ZB", gate_bound.extent),
                 ],
                 gated_delta_project::WorkflowArgs {
-                    hidden: hidden.into(),
+                    hidden: input.rows.into(),
                     input_norm: (&input_norm).into(),
                     qkv_weight: (&qkv_weight).into(),
                     gate_weight: (&gate_weight).into(),
@@ -330,13 +343,13 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
     ];
     // Every entry that binds the slot tables gives them the chunk's geometry,
     // whichever advances this class.
-    let input = |graph: &mut G, name: &str| graph.input_for(kernels.chunk, name, &dimensions);
+    let table = |graph: &mut G, name: &str| graph.input_for(kernels.chunk, name, &dimensions);
     let controls = RecurrentControlPorts {
-        segments: input(graph, "segments")?,
-        stop: input(graph, "stop")?,
-        previous_bank: input(graph, "previous_bank")?,
-        previous_tape: input(graph, "previous_tape")?,
-        following_bank: input(graph, "following_bank")?,
+        segments: table(graph, "segments")?,
+        stop: table(graph, "stop")?,
+        previous_bank: table(graph, "previous_bank")?,
+        previous_tape: table(graph, "previous_tape")?,
+        following_bank: table(graph, "following_bank")?,
     };
     // The L2-norm epsilon of the q/k prologue, scaled as the model defines it.
     let norm_epsilon = block.epsilon * block.width as f32;
@@ -363,8 +376,10 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                     norm_epsilon,
                     epsilon: block.epsilon,
                     grouped: block.grouped,
+                    gate_function: block.gate_function,
                     slab_banks: block.slab_banks,
-                },            )?
+                },
+            )?
             .value
     } else {
         match kernels.step {
@@ -391,8 +406,10 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                             norm_epsilon,
                             epsilon: block.epsilon,
                             grouped: block.grouped,
+                            gate_function: block.gate_function,
                             slab_banks: block.slab_banks,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
             RecurrentStepEntries::Convolved { project, step } => {
@@ -410,9 +427,11 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                         ("W", block.width),
                         ("C", block.convolution_width),
                         ("T", tape_rows),
+                        parts,
+                        normalized,
                     ],
                     gated_delta_project_convolved::WorkflowArgs {
-                        hidden: hidden.into(),
+                        hidden: input.rows.into(),
                         input_norm: (&input_norm).into(),
                         qkv_weight: (&qkv_weight).into(),
                         gate_weight: (&gate_weight).into(),
@@ -427,7 +446,8 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                         window: window.tensor_mut().into(),
                         epsilon: block.epsilon,
                         slab_banks: block.slab_banks,
-                    },                )?;
+                    },
+                )?;
                 graph
                     .enqueue(
                         step,
@@ -456,24 +476,30 @@ pub(crate) fn recurrent<'a, G: GraphDraft + 'a>(
                             norm_epsilon,
                             epsilon: block.epsilon,
                             grouped: block.grouped,
+                            gate_function: block.gate_function,
                             slab_banks: block.slab_banks,
-                        },                    )?
+                        },
+                    )?
                     .value
             }
         }
     };
+    let inject = join.inject(graph, block.rows, constants)?;
     let output = graph
         .enqueue(
             kernels.output,
             &[
                 ("M", block.rows),
                 ("D", block.hidden),
+                join.dimensions()[0],
+                join.dimensions()[1],
                 ("Q", block.value_heads),
                 ("W", block.width),
                 ("OB", output_bound.extent),
             ],
             attention_output::WorkflowArgs {
-                hidden: hidden.into(),
+                hidden: residual.into(),
+                inject: (&inject).into(),
                 gated: (&gated).into(),
                 output_weight: (&output_weight).into(),
                 output_bound: (&output_bound.tensor).into(),

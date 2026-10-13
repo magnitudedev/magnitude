@@ -10,6 +10,7 @@
 
 #include "../core/activation.h"
 #include "../core/arrive.h"
+#include "../core/functions.h"
 #include <seismic/slab.h>
 
 namespace recurrent {
@@ -317,7 +318,8 @@ inline void advance_rows(device const Storage *projection, Inputs inputs,
 
 // ---------------------------------------------------------------------------
 // Gating: the result's value (row, head, i) is
-//   round_A(round_A(raw * inverse * norm[i]) * round_A(silu(z)))
+//   round_A(round_A(raw * inverse * norm[i]) * round_A(gate(z)))
+// with gate the output gate of `gate_function` (`functions::output_gate`)
 // with raw the stored raw output, z column CH + head * W + i of the
 // projection row and inverse = rsqrt(sum_head raw^2 / W + epsilon). The
 // entries differ only in how a head's square sum is reduced.
@@ -352,7 +354,10 @@ inline Gated8 gated_inputs8(Mixed mixed, device const Storage *projection,
 inline void store_gated8(thread const Gated8 &v, float inverse, device Storage *gated, ulong row, ulong head,
     uint i, constant ulong *seismic_words) {
     const float4 e = v.raw_even * inverse * v.norm_even, o = v.raw_odd * inverse * v.norm_odd;
-    const float4 ae = v.z_even / (1.0f + metal::exp(-v.z_even)), ao = v.z_odd / (1.0f + metal::exp(-v.z_odd));
+    // `functions::output_gate` over four lanes.
+    const bool sigmoid = int(uint(SEISMIC_PARAM_GATE_FUNCTION)) == functions::gate_sigmoid;
+    const float4 ae = (sigmoid ? 1.0f : v.z_even) / (1.0f + metal::exp(-v.z_even));
+    const float4 ao = (sigmoid ? 1.0f : v.z_odd) / (1.0f + metal::exp(-v.z_odd));
     device Storage *out = gated + row * SEISMIC_RESULT_0_STRIDE_0 + head * SEISMIC_RESULT_0_STRIDE_1;
     RECURRENT_UNROLL for (uint j = 0; j < 4; ++j) {
         out[(i + 2 * j) * SEISMIC_RESULT_0_STRIDE_2] = element::Act::store(

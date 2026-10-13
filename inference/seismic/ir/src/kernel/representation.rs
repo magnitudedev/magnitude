@@ -48,6 +48,19 @@ pub(super) fn read_component<B: PhysicalDialect>(
                 let scalar = reference_math::code_recipe(interpretation, *bits);
                 super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])
             }
+            DecodeStep::ReadPlaneLane { plane, .. } => {
+                builder.read_plane_lane(place, indices, *plane)
+            }
+            DecodeStep::InterpretGridCode {
+                raw, lane, grid, ..
+            } => {
+                let scalar = reference_math::grid_code_recipe(grid);
+                super::reference_math::expand_total_recipe(
+                    builder,
+                    &scalar,
+                    &[get(*raw), get(*lane)],
+                )
+            }
             DecodeStep::DecodeFloatCode { raw, format, .. } => {
                 let scalar = reference_math::float_code_recipe(*format);
                 super::reference_math::expand_total_recipe(builder, &scalar, &[get(*raw)])

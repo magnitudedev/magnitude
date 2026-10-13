@@ -93,7 +93,7 @@ enum Node {
     BoolConst(bool),
     ScalarConst {
         dtype: DType,
-        bits: u32,
+        bits: u64,
     },
     ScalarInteger {
         operation: ScalarOp,
@@ -1385,16 +1385,17 @@ impl Arena {
     pub(super) fn int_from_scalar(&mut self, value: ErasedScalarExpr) -> IntExpr {
         let ordinal = self.index(AnyExpr::Scalar(value));
         assert!(
-            matches!(self.sort(ordinal), Sort::Scalar(DType::I32 | DType::U32)),
+            matches!(self.sort(ordinal), Sort::Scalar(dtype) if dtype.is_int()),
             "mathematical integer injection requires an integer word"
         );
         if let Node::ScalarConst { dtype, bits } = *self.node(ordinal) {
             let integer = match dtype {
-                DType::I32 => i64::from(bits as i32),
-                DType::U32 => i64::from(bits),
+                DType::I32 => BigInt::from(bits as u32 as i32),
+                DType::U32 => BigInt::from(bits as u32),
+                DType::U64 => BigInt::from(bits),
                 _ => unreachable!(),
             };
-            return self.int_const(integer);
+            return self.int_exact(integer);
         }
         handle(
             self.id,
@@ -1455,7 +1456,7 @@ impl Arena {
             .collect::<Option<Vec<_>>>();
         if let Some(inputs) = constants {
             if let Ok(value) = reference_math::evaluate(&recipe, &inputs) {
-                return self.int_const(scalar_integer_value(value));
+                return self.int_exact(scalar_integer_value(value));
             }
         }
         handle(
@@ -3000,6 +3001,7 @@ fn dtype_tag(dtype: DType) -> u8 {
         DType::F32 => 3,
         DType::I32 => 4,
         DType::U32 => 5,
+        DType::U64 => 6,
     }
 }
 fn symbol_sort_tag(sort: SymbolSort) -> u8 {
@@ -3076,7 +3078,7 @@ fn reflexive(op: CmpOp) -> bool {
     matches!(op, CmpOp::Eq | CmpOp::Le | CmpOp::Ge)
 }
 
-fn scalar_bits<T: ScalarSort>(value: T::Value) -> u32 {
+fn scalar_bits<T: ScalarSort>(value: T::Value) -> u64 {
     T::encode(value)
 }
 
@@ -3091,6 +3093,7 @@ fn symbol_value_matches(sort: SymbolSort, value: SymbolValue) -> bool {
             | (SymbolSort::Scalar(DType::Bool), SymbolValue::Bool(_))
             | (SymbolSort::Scalar(DType::I32), SymbolValue::I32(_))
             | (SymbolSort::Scalar(DType::U32), SymbolValue::U32(_))
+            | (SymbolSort::Scalar(DType::U64), SymbolValue::U64(_))
     )
 }
 
@@ -3102,6 +3105,7 @@ enum ScalarVal {
     Bool(bool),
     I32(i32),
     U32(u32),
+    U64(u64),
 }
 
 impl ScalarVal {
@@ -3113,13 +3117,15 @@ impl ScalarVal {
             Self::Bool(value) => ReferenceScalar::Bool(value),
             Self::I32(value) => ReferenceScalar::I32(value),
             Self::U32(value) => ReferenceScalar::U32(value),
+            Self::U64(value) => ReferenceScalar::U64(value),
         }
     }
-    fn decode(dtype: DType, bits: u32) -> Self {
+    fn decode(dtype: DType, bits: u64) -> Self {
         match dtype {
             DType::I32 => Self::I32(bits as i32),
-            DType::U32 => Self::U32(bits),
-            DType::F32 => Self::F32(f32::from_bits(bits)),
+            DType::U32 => Self::U32(bits as u32),
+            DType::U64 => Self::U64(bits),
+            DType::F32 => Self::F32(f32::from_bits(bits as u32)),
             DType::F16 => Self::F16(bits as u16),
             DType::BF16 => Self::BF16(bits as u16),
             DType::Bool => Self::Bool(bits != 0),
@@ -3133,6 +3139,7 @@ impl ScalarVal {
             SymbolValue::Bool(v) => Some(Self::Bool(v)),
             SymbolValue::I32(v) => Some(Self::I32(v)),
             SymbolValue::U32(v) => Some(Self::U32(v)),
+            SymbolValue::U64(v) => Some(Self::U64(v)),
             SymbolValue::Nat(_) | SymbolValue::Int(_) => None,
         }
     }
@@ -3141,20 +3148,15 @@ impl ScalarVal {
             (self, dtype),
             (Self::I32(_), DType::I32)
                 | (Self::U32(_), DType::U32)
+                | (Self::U64(_), DType::U64)
                 | (Self::F32(_), DType::F32)
                 | (Self::F16(_), DType::F16)
                 | (Self::BF16(_), DType::BF16)
                 | (Self::Bool(_), DType::Bool)
         )
     }
-    fn bits(self) -> u32 {
-        match self {
-            Self::F32(value) => value.to_bits(),
-            Self::F16(value) | Self::BF16(value) => value as u32,
-            Self::Bool(value) => u32::from(value),
-            Self::I32(value) => value as u32,
-            Self::U32(value) => value,
-        }
+    fn bits(self) -> u64 {
+        self.reference().bits()
     }
     /// Comparison with IEEE semantics for floats: every ordered comparison
     /// and equality with a NaN is false, inequality is true.
@@ -3162,6 +3164,7 @@ impl ScalarVal {
         match (self, other) {
             (Self::I32(x), Self::I32(y)) => compare(op, x, y),
             (Self::U32(x), Self::U32(y)) => compare(op, x, y),
+            (Self::U64(x), Self::U64(y)) => compare(op, x, y),
             (Self::Bool(x), Self::Bool(y)) => compare(op, x, y),
             (Self::F32(x), Self::F32(y)) => match op {
                 CmpOp::Eq => x == y,
@@ -4473,7 +4476,7 @@ impl<'a> Evaluator<'a> {
                 let recipe = reference_math::scalar_recipe(operation, &types);
                 let result =
                     reference_math::evaluate(&recipe, &inputs).map_err(EvalError::ScalarFailure)?;
-                Val::Int(scalar_integer_value(result).into())
+                Val::Int(scalar_integer_value(result))
             }
             Node::Symbol(s) => self.symbol(*s)?,
             Node::Unary { op, operand } => match op {
@@ -4500,7 +4503,8 @@ impl<'a> Evaluator<'a> {
                 UnaryOp::IntFromScalar => match self.run(ordinal(*operand))? {
                     Val::Scalar(ScalarVal::I32(value)) => Val::Int(value.into()),
                     Val::Scalar(ScalarVal::U32(value)) => Val::Int(value.into()),
-                    _ => unreachable!("integer injection is constructed only for I32/U32"),
+                    Val::Scalar(ScalarVal::U64(value)) => Val::Int(value.into()),
+                    _ => unreachable!("integer injection is constructed only for integer words"),
                 },
             },
             Node::Binary { op, lhs, rhs } => {
@@ -4716,18 +4720,17 @@ impl<'a> Evaluator<'a> {
 }
 
 fn integer_word(dtype: DType, value: &BigInt) -> ReferenceScalar {
-    let bits = value.rem_euclid(&(BigInt::one() << 32_u32));
-    let bits = u32::try_from(bits).expect("word residue is within u32");
-    match dtype {
-        DType::I32 => ReferenceScalar::I32(bits as i32),
-        DType::U32 => ReferenceScalar::U32(bits),
-        _ => unreachable!("integer projection has only integer word operands"),
-    }
+    assert!(dtype.is_int(), "integer projection has only integer word operands");
+    let width = 8 * dtype.bytes();
+    let bits = value.rem_euclid(&(BigInt::one() << width));
+    let bits = u64::try_from(bits).expect("word residue is within u64");
+    ReferenceScalar::from_bits(dtype, bits)
 }
-fn scalar_integer_value(value: ReferenceScalar) -> i64 {
+fn scalar_integer_value(value: ReferenceScalar) -> BigInt {
     match value {
-        ReferenceScalar::I32(value) => i64::from(value),
-        ReferenceScalar::U32(value) => i64::from(value),
+        ReferenceScalar::I32(value) => BigInt::from(value),
+        ReferenceScalar::U32(value) => BigInt::from(value),
+        ReferenceScalar::U64(value) => BigInt::from(value),
         _ => unreachable!("integer projection has only integer word results"),
     }
 }

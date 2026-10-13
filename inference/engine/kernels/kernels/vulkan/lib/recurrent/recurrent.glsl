@@ -7,6 +7,7 @@
 // `cuda/lib/recurrent/recurrent.cuh`, whose arithmetic it follows.
 // Activation tensors are canonical in their last axis.
 #include "../core/activation.glsl"
+#include "../core/functions.glsl"
 #include "../core/reduce.glsl"
 #include "versions.glsl"
 
@@ -375,7 +376,8 @@ void recurrent_sequential(const uint rows) {
 
 // ---------------------------------------------------------------------------
 // Gating: the result's value (row, head, i) is
-//   round_A(round_A(raw * inverse * norm[i]) * round_A(silu(z)))
+//   round_A(round_A(raw * inverse * norm[i]) * round_A(gate(z)))
+// with gate the output gate of `gate_function` (`functions_output_gate`)
 // with raw the stored raw output, z column CH + head * W + i of the
 // projection row and inverse = rsqrt(sum_head raw^2 / W + epsilon).
 
@@ -411,8 +413,9 @@ recurrent_gated8 recurrent_gated_inputs8(recurrent_inputs in_, uint64_t mixed, u
     return v;
 }
 
-float recurrent_silu_rounded(float gate) {
-    return element_round(ELEMENT_ACT, seismic_div_rn(gate, 1.0 + exp(-gate)));
+// The output gate of z by the entry's `gate_function` (`functions_output_gate`), rounded to A.
+float recurrent_gate_rounded(float z) {
+    return element_round(ELEMENT_ACT, functions_output_gate(int(SEISMIC_PARAM_GATE_FUNCTION), z));
 }
 
 // Stores the gated columns i..i+7 of (row, head) given the head's inverse.
@@ -422,9 +425,9 @@ void recurrent_store_gated8(recurrent_gated8 v, float inverse, uint64_t row, uin
     const vec4 e = v.me * inverse * v.ne, o = v.mo * inverse * v.no;
     [[unroll]] for (uint j = 0u; j < 4u; ++j) {
         element_put(ELEMENT_ACT, gated, at + uint64_t(i + 2u * j) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, e[j]) * recurrent_silu_rounded(v.ze[j])));
+            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, e[j]) * recurrent_gate_rounded(v.ze[j])));
         element_put(ELEMENT_ACT, gated, at + uint64_t(i + 2u * j + 1u) * SEISMIC_RESULT_0_STRIDE_2,
-            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, o[j]) * recurrent_silu_rounded(v.zo[j])));
+            element_round(ELEMENT_ACT, element_round(ELEMENT_ACT, o[j]) * recurrent_gate_rounded(v.zo[j])));
     }
 }
 

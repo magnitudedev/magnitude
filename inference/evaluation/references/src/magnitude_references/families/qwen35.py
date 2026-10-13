@@ -96,11 +96,19 @@ def gated_delta(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tens
 class Qwen35Reference(Reference):
     """`qwen35` (dense SwiGLU) and `qwen35moe` (routed experts with a gated shared expert)."""
 
+    # architecture -> routed
+    ARCHITECTURES = {"qwen35": False, "qwen35moe": True}
+
+    @staticmethod
+    def output_gate(z: torch.Tensor) -> torch.Tensor:
+        """The gated delta net's output gate on z."""
+        return silu(z)
+
     def __init__(self, package: Package, weights: Weights, layers: int | None = None):
         super().__init__(package, weights, layers)
         self.architecture = package.architecture
-        if self.architecture not in ("qwen35", "qwen35moe"):
-            raise ValueError(f"not a Qwen3.5 package: {self.architecture}")
+        if self.architecture not in self.ARCHITECTURES:
+            raise ValueError(f"not a {type(self).__name__} package: {self.architecture}")
         self.mtp_layers = package.key("nextn_predict_layers", 0)
         main = package.key("block_count") - self.mtp_layers
         if layers is not None and not 0 < layers <= main:
@@ -124,7 +132,7 @@ class Qwen35Reference(Reference):
         if self.v_heads % self.k_heads:
             raise ValueError(f"{self.v_heads} value heads do not group over {self.k_heads} key heads")
         self.per_k = self.v_heads // self.k_heads
-        self.routed = self.architecture == "qwen35moe"
+        self.routed = self.ARCHITECTURES[self.architecture]
         if self.routed:
             self.experts = package.key("expert_count")
             self.experts_used = package.key("expert_used_count")
@@ -178,7 +186,7 @@ class Qwen35Reference(Reference):
         k = k.repeat_interleave(self.per_k, dim=2)
         o = gated_delta(q, k, v, g, beta)
         z = linear(x, self.z_weight(layer)).view(batch, steps, self.v_heads, self.v_width)
-        o = rms_norm(o, w(p + "ssm_norm.weight"), self.eps) * silu(z)
+        o = rms_norm(o, w(p + "ssm_norm.weight"), self.eps) * self.output_gate(z)
         return linear(o.reshape(batch, steps, -1), self.out_weight(layer))
 
     def self_attention(self, layer: int, x: torch.Tensor, rotary: Rotary, visible: torch.Tensor) -> torch.Tensor:

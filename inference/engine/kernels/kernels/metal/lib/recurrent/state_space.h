@@ -135,7 +135,7 @@ inline Step step_of(Operands in, ulong row, uint head) {
 inline void publish_window(Operands in, versions::Slot slot, uint head, uint thread_index, uint threads) {
     constant ulong *seismic_words = in.seismic_words;
     const long taps = long(TAPS) - 1;
-    const long rows = taps + versions::tape_rows(slot, seismic_words);
+    const long rows = taps + versions::tape_rows(slot, long(SEISMIC_DIM_T));
     device Storage *target = versions::bank<Storage>(in.window, slot.target, SEISMIC_WINDOW_STRIDE_0, seismic_words);
     const uint group = group_of(head);
     const ulong per_tap = P + (leads_group(head) ? 2 * N : 0);
@@ -222,7 +222,7 @@ inline void advance_rows(Operands in, versions::Slot slot, long begin, uint head
     constant ulong *seismic_words = in.seismic_words;
     const uint group = group_of(head);
     const long publish = slot.lo + slot.stop;
-    const long recorded = versions::tape_rows(slot, seismic_words);
+    const long recorded = versions::tape_rows(slot, long(SEISMIC_DIM_T));
     const float skip = in.skip[head * SEISMIC_SKIP_STRIDE_0];
     // The simdgroup that owns state row 0 records the decay, and B when the
     // head leads its group.

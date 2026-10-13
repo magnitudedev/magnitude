@@ -20,6 +20,53 @@ fn activate[M, N](x: &tensor[M, N] T, result: &mut tensor[M, N] U, function: i32
                 value = r * r
             result[rows, cols] = value
 
+# A projection entry's input rows, rounded to the result's element: the
+# RMS-normalized residual (`N = H`, `P = 1`), or the sum in part order of the
+# `P` per-stream partials a hyper-connection mix site publishes (`N = 0`, no
+# norm). Natives form either in the projection library's prologue
+# (`<backend>/lib/projection`).
+fn form_input[M, H, P, N](hidden: &tensor[M, P * H] f32, norm: &tensor[N] T,
+    result: &mut tensor[M, H] U, epsilon: f32) where N >= 0 and ((N == H and P == 1) or (N == 0 and P >= 1)):
+    if N == 0:
+        sum_parts(hidden, result)
+    else:
+        rms_norm(hidden[:, 0:H], norm[0:H], result, epsilon)
+
+fn sum_parts[M, H, P](parts: &tensor[M, P * H] f32, result: &mut tensor[M, H] U):
+    parallel for row in 0..M:
+        parallel for column in 0..H:
+            let mut sum = f32(0.0)
+            for part in 0..P:
+                sum = sum + parts[row, part * H + column]
+            result[row, column] = sum
+
+# A sublayer's output `y` joining the residual: `residual + y` (`IN = 0`, one
+# stream), or `residual[s] + y · inject[s]` for each of the `SN`
+# hyper-connection streams (`IN = SN`, the inject values of the sublayer's mix
+# site). Natives apply it as the projection library's output epilogue.
+fn scatter[M, D, SN, IN](residual: &tensor[M, SN * D] f32, y: &tensor[M, D] T,
+    inject: &tensor[M, IN] f32, result: &mut tensor[M, SN * D] f32)
+    where IN >= 0 and ((IN == 0 and SN == 1) or (IN == SN and SN >= 1)):
+    # Every stream is written: stream s < IN scales `y` by its inject value
+    # (`IN = SN`); the one stream of `IN = 0` adds `y` itself.
+    parallel for row in 0..M:
+        parallel for stream in 0..SN:
+            parallel for column in 0..D:
+                let mut joined = f32(y[row, column])
+                if stream < IN:
+                    joined = joined * inject[row, stream]
+                result[row, stream * D + column] = residual[row, stream * D + column] + joined
+
+# A gated delta net's output gate on z, by code (natives in
+# `<backend>/lib/core/functions.*`):
+#   0  SiLU      z / (1 + exp(-z))
+#   1  sigmoid   1 / (1 + exp(-z))
+fn output_gate(z: f32, function: i32) -> f32:
+    let mut value = z / (1.0 + exp(-z))
+    if function == 1:
+        value = 1.0 / (1.0 + exp(-z))
+    return value
+
 # A weight's second-level scale (NVFP4 `.scale`) on F32 projections, then
 # published in U: result = x * scale[0] for a present port (S = 1), x
 # unscaled for an absent one (S = 0). Every entry that reads packed weights

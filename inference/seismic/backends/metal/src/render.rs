@@ -27,8 +27,8 @@ use seismic_ir::physical_target::KernelEmissionLayout;
 use seismic_ir::storage::LaunchLocalKind;
 use seismic_lang::intrinsics::{AtomicOp, MathOp, ReduceOp};
 use seismic_lang::registry::{
-    CodeInterpretation, DecodeStep, FloatCodeFormat, PlaneEncoding, PlaneRepackRecipe, RepackExpr,
-    RepresentationKind,
+    CodeInterpretation, DecodeStep, FloatCodeFormat, GRID_SIGN_BITS, GridCodes, PlaneEncoding,
+    PlaneRepackRecipe, RepackExpr, RepresentationKind,
 };
 use seismic_lang::types::DType;
 use std::collections::BTreeMap;
@@ -316,7 +316,9 @@ struct Renderer<'a> {
     globals: Vec<GlobalPlace>,
     locals: Vec<LocalPlace>,
     temporaries: u32,
-    lookups: LookupTables,
+    /// Constant tables the kernel reads: repack lookups and the magnitudes
+    /// of vector-code grids, registered as reads are rendered.
+    lookups: std::cell::RefCell<LookupTables>,
 }
 
 impl<'a> Renderer<'a> {
@@ -364,10 +366,10 @@ impl<'a> Renderer<'a> {
             globals,
             locals,
             temporaries: 0,
-            lookups: LookupTables {
+            lookups: std::cell::RefCell::new(LookupTables {
                 prefix: name.to_string(),
                 tables: Vec::new(),
-            },
+            }),
         }
     }
 
@@ -494,7 +496,7 @@ impl<'a> Renderer<'a> {
         let root = self.kernel.root();
         self.render_block(root, &[], &mut body);
 
-        let mut source = self.lookups.declarations();
+        let mut source = self.lookups.borrow().declarations();
         let _ = writeln!(
             source,
             "kernel void {name}(\n    {}\n) {{",
@@ -794,6 +796,20 @@ impl<'a> Renderer<'a> {
                             interpretation,
                             ..
                         } => interpret_code(&temps[recipe.ordinal(*raw)], *bits, interpretation),
+                        DecodeStep::ReadPlaneLane { plane, .. } => {
+                            plane_lane(coords, layout.planes[*plane as usize].group)
+                        }
+                        DecodeStep::InterpretGridCode {
+                            raw, lane, grid, ..
+                        } => {
+                            let table = self.lookups.borrow_mut().name(grid.magnitudes());
+                            grid_code(
+                                &temps[recipe.ordinal(*raw)],
+                                &temps[recipe.ordinal(*lane)],
+                                grid,
+                                &table,
+                            )
+                        }
                         DecodeStep::DecodeFloatCode { raw, format, .. } => format!(
                             "{}({})",
                             float_code_function(*format),
@@ -965,8 +981,18 @@ impl<'a> Renderer<'a> {
             ClosedOpView::Unary { op, out, a } => {
                 let name = self.name(raw(a)).to_string();
                 let expression = match (op, scalar_kind(&a.ty)) {
-                    (UnaryOp::Neg, _) if a.ty == ValueType::Index => format!("(0ul - {name})"),
-                    (UnaryOp::Abs, _) if a.ty == ValueType::Index => name.clone(),
+                    // 64-bit words: negation wraps, and an unsigned word is its
+                    // own magnitude.
+                    (UnaryOp::Neg, _)
+                        if matches!(a.ty, ValueType::Index | ValueType::Scalar(DType::U64)) =>
+                    {
+                        format!("(0ul - {name})")
+                    }
+                    (UnaryOp::Abs, _)
+                        if matches!(a.ty, ValueType::Index | ValueType::Scalar(DType::U64)) =>
+                    {
+                        name.clone()
+                    }
                     (UnaryOp::Neg, Kind::Float) => float_sign_op(&a.ty, &name, true),
                     (UnaryOp::Neg, Kind::Int | Kind::Bool) => {
                         format!(
@@ -982,7 +1008,7 @@ impl<'a> Renderer<'a> {
             ClosedOpView::Bit { op, out, a, b } => {
                 let ty = a.ty;
                 let name = value_type_name(&ty);
-                let bits = if ty == ValueType::Index {
+                let bits = if matches!(ty, ValueType::Index | ValueType::Scalar(DType::U64)) {
                     "ulong"
                 } else {
                     "uint"
@@ -1143,6 +1169,19 @@ impl<'a> Renderer<'a> {
                     field,
                 );
                 self.assign(raw(out), payload_from_storage(&out.ty, &expression), lines);
+            }
+            ClosedOpView::ReadPlaneLane {
+                out,
+                plane_info,
+                indices,
+                ..
+            } => {
+                let raw_indices = indices
+                    .iter()
+                    .map(|value| value.value())
+                    .collect::<Vec<_>>();
+                let coords = self.coords(&raw_indices);
+                self.assign(raw(out), plane_lane(&coords, plane_info.group), lines);
             }
             ClosedOpView::ReadPlane {
                 out,
@@ -1401,8 +1440,11 @@ impl<'a> Renderer<'a> {
                         panic!("dense conversion recipe targets a non-dense plane")
                     };
                     for (element, expression) in values.iter().enumerate() {
-                        let expression =
-                            repack_expression(expression, &source_base, &mut self.lookups);
+                        let expression = repack_expression(
+                            expression,
+                            &source_base,
+                            &mut self.lookups.borrow_mut(),
+                        );
                         let expression = strict_f32_publication(*dtype, &expression);
                         let offset =
                             u64::from(plane.offset) + element as u64 * u64::from(dtype.bytes());
@@ -1421,7 +1463,11 @@ impl<'a> Renderer<'a> {
                             let entry = self.temporary_name();
                             lines.push(format!(
                                 "uint {entry} = uint({}) & {mask}u;",
-                                repack_expression(expression, &source_base, &mut self.lookups)
+                                repack_expression(
+                                    expression,
+                                    &source_base,
+                                    &mut self.lookups.borrow_mut()
+                                )
                             ));
                             entry
                         })
@@ -1540,8 +1586,8 @@ impl<'a> Renderer<'a> {
                      memory_order_relaxed, memory_order_relaxed)) break; }} }}"
                 ));
             }
-            DType::Bool => unreachable!(
-                "the typed builder admits atomics on numeric elements only (`AtomicType`)"
+            DType::Bool | DType::U64 => unreachable!(
+                "the typed builder admits atomics on 32-bit and narrower numeric elements only (`AtomicType`)"
             ),
         }
     }
@@ -1719,6 +1765,11 @@ fn repack_expression(expression: &RepackExpr, source: &str, lookups: &mut Lookup
             repack_expression(left, source, lookups),
             repack_expression(right, source, lookups)
         ),
+        RepackExpr::ScaleF32 { value, exponent } => format!(
+            "f32_mul(float({}), as_type<float>({:#010x}u))",
+            repack_expression(value, source, lookups),
+            2f32.powi(i32::from(*exponent)).to_bits()
+        ),
         RepackExpr::Lookup { index, table } => {
             let index = repack_expression(index, source, lookups);
             format!("{}[uint({index})]", lookups.name(table))
@@ -1733,6 +1784,7 @@ fn strict_f32_publication(dtype: DType, expression: &str) -> String {
         DType::BF16 => format!("seismic_bf16_narrow(float({expression}))"),
         DType::I32 => format!("int({expression})"),
         DType::U32 => format!("uint({expression})"),
+        DType::U64 => format!("ulong({expression})"),
         DType::Bool => format!("bool({expression})"),
     }
 }
@@ -1764,7 +1816,41 @@ fn interpret_code(raw: &str, bits: u32, interpretation: &CodeInterpretation) -> 
             }
             expression
         }
+        CodeInterpretation::Grid(_) => {
+            unreachable!("a vector code is a grid code step, which reads its lane")
+        }
     }
+}
+
+/// The U32 lane of the element at `coords` among the `group` elements one
+/// entry of its plane covers (a plane group divides the packet group, so the
+/// packing coordinate's remainder is the lane).
+fn plane_lane(coords: &[String], group: u32) -> String {
+    let column = coords.last().map(String::as_str).unwrap_or("0");
+    format!("uint(ulong({column}) % {group}ul)")
+}
+
+/// The code of the value at `lane` of vector-code entry `raw`
+/// (`GridCodes::code`), reading the grid's magnitudes from `table`.
+fn grid_code(raw: &str, lane: &str, grid: &GridCodes, table: &str) -> String {
+    let lanes = grid.lanes;
+    let index = format!(
+        "((uint({raw}) >> ({}u * (({lane}) >> {}u))) & {}u)",
+        grid.index_bits,
+        lanes.trailing_zeros(),
+        (1u32 << grid.index_bits) - 1
+    );
+    let magnitude = format!(
+        "{table}[({index}) * {lanes}u + (({lane}) & {}u)]",
+        lanes - 1
+    );
+    let signs = format!(
+        "((uint({raw}) >> {}u) & {}u)",
+        grid.indices() * grid.index_bits,
+        (1u32 << GRID_SIGN_BITS) - 1
+    );
+    let signs = format!("({signs} | ((popcount({signs}) & 1u) << {GRID_SIGN_BITS}u))");
+    format!("(((({signs}) >> ({lane})) & 1u) != 0u ? -int({magnitude}) : int({magnitude}))")
 }
 
 fn float_code_function(format: FloatCodeFormat) -> &'static str {
@@ -1781,6 +1867,7 @@ pub(crate) fn dtype_name(dtype: DType) -> &'static str {
         DType::Bool => "bool",
         DType::I32 => "int",
         DType::U32 => "uint",
+        DType::U64 => "ulong",
         DType::F16 => "half",
         DType::BF16 => "bfloat",
         DType::F32 => "float",
@@ -1839,6 +1926,7 @@ fn constant_expr(value: ConstantValue, ty: &ValueType) -> String {
         ConstantValue::F16(v) | ConstantValue::BF16(v) => format!("ushort({v}u)"),
         ConstantValue::I32(v) => format!("{name}({v})"),
         ConstantValue::U32(v) => format!("{name}({v}u)"),
+        ConstantValue::U64(v) => format!("{name}({v}ul)"),
         ConstantValue::Bool(v) => format!("{v}"),
         ConstantValue::Index(v) => format!("{name}({v}ul)"),
     }
@@ -1922,6 +2010,17 @@ fn physical_binary_expr(
         (BinaryOp::Mul, Kind::Float) => format!("{a} * {b}"),
         (BinaryOp::Div, Kind::Float) => format!("{a} / {b}"),
         (BinaryOp::Rem, Kind::Float) => format!("fmod({a}, {b})"),
+        // 64-bit words wrap natively as `ulong`.
+        (BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul, _)
+            if matches!(ty, ValueType::Scalar(DType::U64)) =>
+        {
+            let symbol = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Sub => "-",
+                _ => "*",
+            };
+            format!("({a} {symbol} {b})")
+        }
         (BinaryOp::Add, _) => format!("as_type<{name}>(as_type<uint>({a}) + as_type<uint>({b}))"),
         (BinaryOp::Sub, _) => format!("as_type<{name}>(as_type<uint>({a}) - as_type<uint>({b}))"),
         (BinaryOp::Mul, _) => format!("as_type<{name}>(as_type<uint>({a}) * as_type<uint>({b}))"),
@@ -2042,6 +2141,16 @@ fn physical_cast_expr(from: &ValueType, to: &ValueType, a: &str) -> String {
     }
     let from_kind = scalar_kind(from);
     let to_name = numeric_type_name(to);
+    if from_kind == Kind::Float && matches!(to, ValueType::Scalar(DType::U64)) {
+        // Truncation saturating at 0 and the largest F32 below 2^64; NaN
+        // (which `fmax` drops) is 0.
+        return format!("ulong(clamp(trunc(float({a})), 0.0f, 18446742974197923840.0f))");
+    }
+    if matches!(from, ValueType::Scalar(DType::U64)) || matches!(to, ValueType::Scalar(DType::U64))
+    {
+        // Word resize: zero extension of a U32, or the low word of a U64.
+        return format!("{to_name}({a})");
+    }
     match (from_kind, to) {
         (_, ValueType::Bool) | (_, ValueType::Scalar(DType::Bool)) => format!("({a} != 0)"),
         (
@@ -2113,13 +2222,16 @@ fn decode_word(dtype: DType, word: &str) -> String {
         DType::F16 | DType::BF16 => format!("ushort({word})"),
         DType::I32 => format!("as_type<int>(uint({word}))"),
         DType::U32 => format!("uint({word})"),
+        DType::U64 => format!("ulong({word})"),
         DType::Bool => format!("({word} != 0ul)"),
     }
 }
 
-/// Encodes a scalar of `dtype` into the 32-bit side word.
+/// Encodes a scalar of `dtype` into its side word: the low 32 bits, or all
+/// 64 of a U64.
 fn encode_word(dtype: DType, value: &str) -> String {
     match dtype {
+        DType::U64 => value.to_owned(),
         DType::F32 => format!("as_type<uint>({value})"),
         DType::F16 | DType::BF16 => format!("uint({value})"),
         DType::I32 => format!("as_type<uint>({value})"),

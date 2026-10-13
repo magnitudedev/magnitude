@@ -161,6 +161,12 @@ pub struct DeviceMemoryInfo {
     /// The host pool used for host-side copies (loading, staging). Equal to
     /// `allocation_pool` when the device allocates host RAM.
     pub host_pool: MemoryPoolId,
+    /// The pool host-shared storage consumes (`Tensor::shared`, which the
+    /// host writes in place while device work reads it): `allocation_pool`
+    /// when it is the device's own memory (host RAM of a host-backed device,
+    /// a large host-visible device-local heap), else `host_pool` (CUDA's
+    /// mapped pinned memory, a Vulkan device without one).
+    pub shared_pool: MemoryPoolId,
     /// The single-allocation limit (`TargetLimits::max_allocation_bytes`).
     /// Neither capacity nor availability.
     pub max_allocation_bytes: u64,

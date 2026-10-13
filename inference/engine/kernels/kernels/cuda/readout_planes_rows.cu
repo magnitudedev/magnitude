@@ -4,7 +4,7 @@
 // the routine the certified exact level shares (`lib/readout/progressive.cuh`).
 #include "lib/readout/progressive.cuh"
 
-using Pro = projection::Rms<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows>;
+using Pro = projection::Input<ELEMENT_OF(SEISMIC_NORM), projection::SelectedRows, SEISMIC_DIM_NM, SEISMIC_DIM_PT>;
 
 #ifdef SEISMIC_FORMING_READOUT_PLANES_ROWS_FORM
 extern "C" __global__ void readout_planes_rows_form(SEISMIC_KERNEL_PARAMS) {

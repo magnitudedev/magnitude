@@ -34,29 +34,58 @@ SEISMIC_PROGRAMMATIC_DEPENDENCY
 
 constexpr unsigned ROUTE_THREADS = 256;
 constexpr unsigned ROUTE_WARPS = ROUTE_THREADS / 32;
+// Whether the input is RMS-normalized (`form_input` with a norm), else the
+// sum of a mix site's partials.
+constexpr bool ROUTE_NORMED = SEISMIC_DIM_NM != 0;
+
+// The routed input at (row, source), rounded to A (`form_input`): the
+// residual times its row's RMS `inverse` and the norm, or (no norm) the sum in
+// part order of a mix site's PT partials.
+__device__ __forceinline__ float routed_input(const float *residual, const unsigned char *norm,
+                                              unsigned long long row, unsigned long long source, float inverse,
+                                              const seismic_words_t &seismic_words_value) {
+    if constexpr (!ROUTE_NORMED) {
+        float sum = 0.0f;
+        for (unsigned long long part = 0; part < SEISMIC_DIM_PT; ++part)
+            sum = seismic_add_rn(sum, residual[row * SEISMIC_RESIDUAL_STRIDE_0
+                                               + (part * SEISMIC_DIM_H + source) * SEISMIC_RESIDUAL_STRIDE_1]);
+        return Act::round(sum);
+    } else {
+        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
+        return Act::round(seismic_mul_rn(seismic_mul_rn(value, inverse),
+            element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0)));
+    }
+}
+
+// Row `row`'s RMS inverse (the whole block reduces it), or 0 without a norm.
+__device__ __forceinline__ float routed_inverse(const float *residual, unsigned long long row, float eps,
+                                                const seismic_words_t &seismic_words_value) {
+    if constexpr (!ROUTE_NORMED) {
+        return 0.0f;
+    } else {
+        __shared__ float partials[ROUTE_WARPS];
+        float squares = 0.0f;
+        for (unsigned source = threadIdx.x; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
+            const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
+            squares = seismic_fma_rn(value, value, squares);
+        }
+        const float total = reduce::group_sum(squares, partials);
+        return rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
+    }
+}
 
 extern "C" __global__ void routed_route_stage(SEISMIC_KERNEL_PARAMS) {
     seismic_dependency_start();
     const float *residual = reinterpret_cast<const float *>(SEISMIC_PTR(SEISMIC_BUFFER_RESIDUAL));
     const unsigned char *norm = SEISMIC_PTR(SEISMIC_BUFFER_NORM);
     unsigned char *normalized = SEISMIC_PTR(SEISMIC_RESULT_0_BUFFER);
-    __shared__ float partials[ROUTE_WARPS];
     const unsigned thread = threadIdx.x;
     const unsigned long long row = blockIdx.x;
-    const float eps = __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS));
-    float squares = 0.0f;
-    for (unsigned source = thread; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
-        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-        squares = seismic_fma_rn(value, value, squares);
-    }
-    const float total = reduce::group_sum(squares, partials);
-    const float inverse = rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
-    for (unsigned source = thread; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
-        const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
+    const float inverse =
+        routed_inverse(residual, row, __uint_as_float(static_cast<unsigned>(SEISMIC_PARAM_EPS)), seismic_words_value);
+    for (unsigned source = thread; source < SEISMIC_DIM_H; source += ROUTE_THREADS)
         element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-            Act::round(seismic_mul_rn(seismic_mul_rn(value, inverse),
-                element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0))));
-    }
+            routed_input(residual, norm, row, source, inverse, seismic_words_value));
 }
 
 // The router logits scratch is SPLIT planes [M, E + 1]: column E holds the
@@ -209,35 +238,38 @@ extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
     }
 #endif
     seismic_dependency_start();
-    // The normalize launch's sum order (256 strided partials, warp sums, then
-    // the eight warp partials in order): item (row, part) is part `part`'s
-    // warp sum, and the items spread over every warp.
-    for (unsigned item = warp; item < rows * ROUTE_WARPS; item += SEISMIC_TUNE_SIMDGROUPS) {
-        const unsigned row = item / ROUTE_WARPS, part = item % ROUTE_WARPS;
-        float squares = 0.0f;
-        for (unsigned source = part * 32 + lane; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
-            const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-            squares = seismic_fma_rn(value, value, squares);
+    if constexpr (ROUTE_NORMED) {
+        // The normalize launch's sum order (256 strided partials, warp sums,
+        // then the eight warp partials in order): item (row, part) is part
+        // `part`'s warp sum, and the items spread over every warp.
+        for (unsigned item = warp; item < rows * ROUTE_WARPS; item += SEISMIC_TUNE_SIMDGROUPS) {
+            const unsigned row = item / ROUTE_WARPS, part = item % ROUTE_WARPS;
+            float squares = 0.0f;
+            for (unsigned source = part * 32 + lane; source < SEISMIC_DIM_H; source += ROUTE_THREADS) {
+                const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
+                squares = seismic_fma_rn(value, value, squares);
+            }
+            squares = seismic_warp_sum_f32(squares);
+            if (lane == 0)
+                parts[row][part] = squares;
         }
-        squares = seismic_warp_sum_f32(squares);
-        if (lane == 0)
-            parts[row][part] = squares;
-    }
-    __syncthreads();
-    if (thread < rows) {
-        float total = 0.0f;
-        for (unsigned part = 0; part < ROUTE_WARPS; ++part)
-            total = seismic_add_rn(total, parts[thread][part]);
-        inverses[thread] = rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
+        __syncthreads();
+        if (thread < rows) {
+            float total = 0.0f;
+            for (unsigned part = 0; part < ROUTE_WARPS; ++part)
+                total = seismic_add_rn(total, parts[thread][part]);
+            inverses[thread] = rsqrtf(seismic_add_rn(total / static_cast<float>(SEISMIC_DIM_H), eps));
+        }
+    } else {
+        if (thread < 8)
+            inverses[thread] = 0.0f;
     }
     __syncthreads();
     if (blockIdx.x == 0) {
         for (unsigned item = thread; item < rows * static_cast<unsigned>(SEISMIC_DIM_H); item += 32 * SEISMIC_TUNE_SIMDGROUPS) {
             const unsigned long long row = item / SEISMIC_DIM_H, source = item % SEISMIC_DIM_H;
-            const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
             element::put<Act>(normalized, row * SEISMIC_RESULT_0_STRIDE_0 + source * SEISMIC_RESULT_0_STRIDE_1,
-                Act::round(seismic_mul_rn(seismic_mul_rn(value, inverses[row]),
-                    element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0))));
+                routed_input(residual, norm, row, source, inverses[row], seismic_words_value));
         }
     }
     float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -259,14 +291,11 @@ extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
                     const unsigned long long source = 64 * kb + 16 * s + offsets[j];
                     const float weight = expert < SEISMIC_DIM_E
                         ? values[4 * s + j] : shared_router[source * SEISMIC_SHARED_ROUTER_STRIDE_0];
-                    const float scale = element::at<Norm>(norm, source * SEISMIC_NORM_STRIDE_0);
 #pragma unroll
                     for (unsigned row = 0; row < 8; ++row)
-                        if (row < rows) {
-                            const float value = residual[row * SEISMIC_RESIDUAL_STRIDE_0 + source * SEISMIC_RESIDUAL_STRIDE_1];
-                            sums[row] = seismic_fma_rn(Act::round(seismic_mul_rn(seismic_mul_rn(value, inverses[row]),
-                                scale)), weight, sums[row]);
-                        }
+                        if (row < rows)
+                            sums[row] = seismic_fma_rn(routed_input(residual, norm, row, source, inverses[row], seismic_words_value),
+                                weight, sums[row]);
                 }
         }
 #else
@@ -275,6 +304,21 @@ extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
         // memory once per batch rather than once per i; each row still
         // accumulates its sources in i order, then j order.
         constexpr unsigned BATCH = 4;
+        if constexpr (!ROUTE_NORMED) {
+        // The mix site's partials: each source's input sums PT reads.
+        for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128) {
+#pragma unroll
+            for (unsigned j = 0; j < 4; ++j) {
+                const float weight = first + j < SEISMIC_DIM_H
+                    ? routed_column_weight(router, shared_router, expert, first + j) : 0.0f;
+#pragma unroll
+                for (unsigned row = 0; row < 8; ++row)
+                    if (row < rows && first + j < SEISMIC_DIM_H)
+                        sums[row] = seismic_fma_rn(routed_input(residual, norm, row, first + j, 0.0f, seismic_words_value), weight,
+                            sums[row]);
+            }
+        }
+        } else {
         for (unsigned first = 4 * lane; first < SEISMIC_DIM_H; first += 128 * BATCH) {
             float weight[BATCH][4], scale[BATCH][4];
 #pragma unroll
@@ -310,6 +354,7 @@ extern "C" __global__ void routed_route_gemv(SEISMIC_KERNEL_PARAMS) {
                     }
                 }
             }
+        }
         }
 #endif
 #pragma unroll

@@ -12,4 +12,5 @@ pub struct GlueKernels {
     pub(super) copy_rows_f16: Option<NativeKernel<copy_rows::Entry>>,
     pub(super) copy_rows_bf16: Option<NativeKernel<copy_rows::Entry>>,
     pub(super) copy_rows_u32: Option<NativeKernel<copy_rows::Entry>>,
+    pub(super) copy_rows_i32: Option<NativeKernel<copy_rows::Entry>>,
 }

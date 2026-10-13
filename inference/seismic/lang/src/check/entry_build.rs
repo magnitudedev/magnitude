@@ -2671,7 +2671,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         // A constant word is its own mathematical value; it is never
         // observed at run time, so it names no runtime symbol.
         if let Some(constant) = self.constant_word(value) {
-            return self.builder.arena.int(constant);
+            return self.builder.arena.int_exact(constant);
         }
         if let Some(expression) = self.runtime_values.get(&value).copied() {
             return match expression {
@@ -2682,7 +2682,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                 _ => panic!("a typed non-integral source result cannot become a quantity"),
             };
         }
-        if let SemanticType::Scalar(dtype @ (DType::I32 | DType::U32)) =
+        if let SemanticType::Scalar(dtype @ (DType::I32 | DType::U32 | DType::U64)) =
             self.values[value.index()].ty
         {
             // Observe the already evaluated word, including its wrapping and
@@ -2697,20 +2697,22 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
     }
 
     /// The value of a word produced by a `Constant` primitive.
-    fn constant_word(&self, value: SemanticValueId) -> Option<i64> {
+    fn constant_word(&self, value: SemanticValueId) -> Option<crate::expr::BigInt> {
         let ValueOrigin::Node(node) = self.values[value.index()].origin else {
             return None;
         };
         let work = self.regions[node.region().index()].as_ref()?;
-        match work.nodes[node.ordinal()].view() {
-            SemanticNodeView::Primitive {
-                primitive: PrimitiveId::Constant(ReferenceScalar::I32(constant)),
-                ..
-            } => Some(i64::from(*constant)),
-            SemanticNodeView::Primitive {
-                primitive: PrimitiveId::Constant(ReferenceScalar::U32(constant)),
-                ..
-            } => Some(i64::from(*constant)),
+        let SemanticNodeView::Primitive {
+            primitive: PrimitiveId::Constant(constant),
+            ..
+        } = work.nodes[node.ordinal()].view()
+        else {
+            return None;
+        };
+        match *constant {
+            ReferenceScalar::I32(constant) => Some(constant.into()),
+            ReferenceScalar::U32(constant) => Some(constant.into()),
+            ReferenceScalar::U64(constant) => Some(constant.into()),
             _ => None,
         }
     }
