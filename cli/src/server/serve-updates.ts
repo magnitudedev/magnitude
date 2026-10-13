@@ -16,6 +16,8 @@ const linuxInstalledCli = "/usr/lib/magnitude-desktop/resources/magnitude"
 const linuxInstallationLock = "/var/lib/magnitude-desktop/installation.lock"
 /** How long a deferred installation waits before trying again at the next idle point. */
 const deferredRetry = Duration.minutes(15)
+/** How long a failed unattended installation holds back the next unattended attempt. */
+const failureBackoff = Duration.hours(1)
 const idlePoll = Duration.seconds(10)
 
 const architectureOf = Schema.decodeUnknown(Schema.Literal("arm64", "x64"))
@@ -55,9 +57,20 @@ export const prepareServeStartup = (runtime: ApplicationRuntime, profile: Applic
 const isIdle = (endpoint: string) => withLocalService(endpoint, client => client.application.getServiceActivity({})).pipe(
   Effect.map(activity => activity.workingSessions === 0 && activity.inferenceRequests === 0), Effect.orElseSucceed(() => false))
 
-/** The machine an idle installation acts on; replaced by fakes to exercise the decisions. */
+/** The one line a server that does not install by itself prints for each downloaded version. */
+export const makeDownloadedNotice = (notify: (line: string) => Effect.Effect<void>) => Effect.gen(function* () {
+  const noticed = yield* Ref.make(new Set<string>())
+  return (version: string) => Ref.modify(noticed, seen => [!seen.has(version), new Set([...seen, version])] as const).pipe(
+    Effect.flatMap(first => first ? notify(`Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`) : Effect.void))
+})
+
+/**
+ * The machine an idle installation acts on; replaced by fakes to exercise the decisions. Only the
+ * `service` owner installs unattended; `serve` run by hand prints how to install.
+ */
 export interface IdleInstallationSystem {
-  /** Whether this process may install without asking anyone: the service's sudoers rule, or a writable app folder. */
+  readonly owner: UpdateOwner
+  /** Whether the service may install without asking anyone: its sudoers rule, or a writable app folder. */
   readonly canInstallUnattended: Effect.Effect<boolean>
   readonly isIdle: Effect.Effect<boolean>
   /** False while another Magnitude holds the installation lock the package checks. */
@@ -70,19 +83,30 @@ export interface IdleInstallationSystem {
 export const IdleInstallationSystem = Context.GenericTag<IdleInstallationSystem>("@magnitudedev/cli/IdleInstallationSystem")
 
 /**
- * Install when idle: a running server installs a downloaded update only between turns. Without
- * unattended authorization it keeps serving and says how to install; a held installation lock defers.
+ * Install when idle: the system service installs a downloaded update only between turns. Any other
+ * server keeps serving and says how to install; a held installation lock defers. A failed attempt
+ * holds back unattended installation for `failureBackoff`, and the version that failed is not
+ * downloaded or installed unattended again (see `UnattendedHold`), so restarts never loop.
  */
 export const makeIdleInstallation = Effect.gen(function* () {
   const system = yield* IdleInstallationSystem
-  const retryAfter = yield* Ref.make(0)
-  const noticed = yield* Ref.make(new Set<string>())
+  const notice = yield* makeDownloadedNotice(system.notify)
+
+  const holdFor = (duration: Duration.Duration, failed: Option.Option<string>) => Effect.gen(function* () {
+    const store = yield* system.store
+    const previous = yield* store.hold.pipe(Effect.map(Option.flatMap(hold => hold.version)))
+    yield* store.recordHold({ version: Option.orElse(failed, () => previous), until: (yield* Clock.currentTimeMillis) + Duration.toMillis(duration) })
+  })
 
   const defer = (version: string) => Effect.gen(function* () {
-    yield* (yield* system.store).recordOutcome({ outcome: "deferred", version, reason: Option.none() })
-    yield* Ref.set(retryAfter, (yield* Clock.currentTimeMillis) + Duration.toMillis(deferredRetry))
+    const store = yield* system.store
+    yield* store.recordOutcome({ outcome: "deferred", version, reason: Option.none() })
+    yield* holdFor(deferredRetry, Option.none())
     yield* system.notify(`Magnitude ${version} is waiting for another Magnitude to quit; trying again later.`)
   })
+
+  const holdUntil = system.store.pipe(Effect.flatMap(store => store.hold),
+    Effect.map(hold => Option.match(hold, { onNone: () => 0, onSome: hold => hold.until })), Effect.orElseSucceed(() => 0))
 
   /**
    * Resolves true at an idle point where the installation lock is free, so the caller may stop and
@@ -90,14 +114,12 @@ export const makeIdleInstallation = Effect.gen(function* () {
    * without stopping: the deferral is reported through `report` and the current version keeps serving.
    */
   const installWhenIdle = (version: string, report: Effect.Effect<void> = Effect.void) => Effect.gen(function* () {
-    if (!(yield* system.canInstallUnattended)) {
-      const first = !(yield* Ref.get(noticed)).has(version)
-      yield* Ref.update(noticed, seen => new Set([...seen, version]))
-      if (first) yield* system.notify(`Magnitude ${version} is downloaded. Install it with \`magnitude update install\`.`)
+    if (system.owner !== "service" || !(yield* system.canInstallUnattended)) {
+      yield* notice(version)
       return false
     }
     while (true) {
-      const wait = (yield* Ref.get(retryAfter)) - (yield* Clock.currentTimeMillis)
+      const wait = (yield* holdUntil) - (yield* Clock.currentTimeMillis)
       if (wait > 0) yield* Effect.sleep(Duration.millis(wait))
       while (!(yield* system.isIdle)) yield* Effect.sleep(idlePoll)
       if (yield* system.installationLockFree) return true
@@ -114,22 +136,26 @@ export const makeIdleInstallation = Effect.gen(function* () {
     if (!(yield* system.installationLockFree)) return yield* defer(version)
     yield* system.installPrepared
   }).pipe(Effect.catchAll(error => Effect.gen(function* () {
-    // Unattended, a failed download would hold back every later release: keep only its outcome, so
-    // the next check can fetch a newer version (or this one again, unless it was withdrawn).
+    // A failed package keeps only its outcome and stays held back, so the next check can fetch a
+    // newer version without fetching this one again. Any other failure keeps the download for later.
     const store = yield* system.store
-    const failed = yield* store.read
+    const pending = yield* store.read
+    const failed = Option.filter(pending, update => update.installation._tag === "Failed")
+    yield* holdFor(failureBackoff, Option.map(failed, update => update.release.version))
     if (Option.isSome(failed) && failed.value.installation._tag === "Failed") {
       yield* store.recordOutcome({ outcome: "failed", version: failed.value.release.version, reason: Option.some(failed.value.installation.kind) })
       yield* store.discard
     }
-    yield* system.notify(`The update could not be installed: ${error.message} Serving the current version.`)
-  }).pipe(Effect.catchAll(() => system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))))
+  }).pipe(Effect.ignore, Effect.zipRight(system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))))
 
-  const startupFailed = system.store.pipe(Effect.flatMap(store => Effect.gen(function* () {
+  /** An applied version that never became ready is recorded as `failed`/`startup` and reported once. */
+  const startupFailed = (report: Effect.Effect<void>) => system.store.pipe(Effect.flatMap(store => Effect.gen(function* () {
     const outcome = yield* store.outcome
-    if (Option.isSome(outcome) && outcome.value.outcome === "applied" && outcome.value.version === CLI_VERSION) {
+    if (Option.isNone(outcome)) return
+    if (outcome.value.outcome === "applied" && outcome.value.version === CLI_VERSION) {
       yield* store.recordOutcome({ outcome: "failed", version: CLI_VERSION, reason: Option.some("startup") })
     }
+    yield* report
   })), Effect.ignore)
 
   return { installWhenIdle, install, startupFailed }
@@ -164,6 +190,7 @@ export const idleInstallationSystem = (options: {
       operation: "Install", continuation: { _tag: "Foreground", arguments: process.argv.slice(2) } }).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store))
   }))
   return IdleInstallationSystem.of({
+    owner: options.owner,
     canInstallUnattended: process.platform === "linux"
       ? executor.exitCode(Command.make("/usr/bin/sudo", "-n", "-l", "--", linuxInstalledCli, "_install-application-update",
         join(options.profile.dataDirectory, "updates", "update.json"), "--parent-stdin")).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false))

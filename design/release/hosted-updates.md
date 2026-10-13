@@ -69,7 +69,9 @@ the installed version does not reach Ready, and `incomplete` for an attempt with
 The privileged Linux helper reports its class through a distinct exit status, separate from the
 statuses sudo and pkexec use for authorization. `deferred` records an idle installation postponed
 because another Magnitude held the installation lock; the service reports it with an immediate
-check. Other outcomes are sent once with the next check.
+check. A `startup` failure is sent by the failing owner with an immediate check it awaits before
+exiting, since an owner that never becomes ready makes no scheduled check. Other outcomes are sent
+once with the next check.
 
 Every request names its `owner`: `desktop`, `headless` (`serve` run by hand, or a finite CLI
 command), or `service` (the system service). Requests from older clients have no owner. The

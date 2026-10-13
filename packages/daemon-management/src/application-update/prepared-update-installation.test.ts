@@ -11,7 +11,7 @@ const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattem
   const events: string[] = []
   const outcomes: UpdateOutcome[] = []
   const store: PreparedUpdateStore = {
-    outcome: Effect.succeed(Option.none()), markOutcomeReported: Effect.void,
+    outcome: Effect.succeed(Option.none()), markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     recordOutcome: outcome => Effect.sync(() => { outcomes.push(outcome) }),
     read: Effect.sync(() => pending),
     prepare: () => Effect.die("No download belongs in restart recovery"),

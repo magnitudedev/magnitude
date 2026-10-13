@@ -2,7 +2,7 @@ import { FileSystem } from "@effect/platform"
 import { Context, Effect, Option, Schema, Stream } from "effect"
 import { createHash, randomUUID, type KeyObject } from "node:crypto"
 import { join, dirname, basename } from "node:path"
-import { UpdateFailureReason, UpdateOutcome, UpdateRelease, verifyUpdateRelease, updateInstallerFilename, type ReleaseTarget } from "@magnitudedev/release/hosted-update"
+import { UpdateFailureReason, UpdateOutcome, UpdateRelease, Version, verifyUpdateRelease, updateInstallerFilename, type ReleaseTarget } from "@magnitudedev/release/hosted-update"
 import { PrivateFilePermissions } from "./private-files"
 
 export const UpdateInstallation = Schema.Union(
@@ -19,6 +19,16 @@ export type PreparedUpdate = typeof PreparedUpdate.Type
 /** Result of the last prepared update. Sent with the next update check and kept so it is reported once. */
 export const UpdateOutcomeRecord = Schema.Struct({ outcome: UpdateOutcome, reported: Schema.Boolean })
 export type UpdateOutcomeRecord = typeof UpdateOutcomeRecord.Type
+/**
+ * Holds back unattended installation after one fails: no unattended attempt starts before `until`
+ * (epoch milliseconds), and `version`, whose installation failed, is never downloaded or installed
+ * unattended again. Kept across restarts until a person checks or downloads explicitly.
+ */
+export const UnattendedHold = Schema.Struct({
+  version: Schema.optionalWith(Version, { as: "Option", exact: true }),
+  until: Schema.Number,
+})
+export type UnattendedHold = typeof UnattendedHold.Type
 export class PreparedUpdateFailed extends Schema.TaggedError<PreparedUpdateFailed>()("PreparedUpdateFailed", {
   message: Schema.String,
 }) {}
@@ -36,6 +46,9 @@ export interface PreparedUpdateStore {
   readonly outcome: Effect.Effect<Option.Option<UpdateOutcome>, PreparedUpdateFailed>
   readonly recordOutcome: (outcome: UpdateOutcome) => Effect.Effect<void, PreparedUpdateFailed>
   readonly markOutcomeReported: Effect.Effect<void, PreparedUpdateFailed>
+  readonly hold: Effect.Effect<Option.Option<UnattendedHold>, PreparedUpdateFailed>
+  readonly recordHold: (hold: UnattendedHold) => Effect.Effect<void, PreparedUpdateFailed>
+  readonly releaseHold: Effect.Effect<void, PreparedUpdateFailed>
 }
 export const PreparedUpdateStore = Context.GenericTag<PreparedUpdateStore>("daemon-management/PreparedUpdateStore")
 
@@ -106,7 +119,12 @@ const makePreparedUpdateRecord = (dataDirectory: string) => Effect.gen(function*
     yield* outcomes.write({ ...current.value, reported: true })
   }).pipe(Effect.mapError(() => failed("The update result could not be saved.")))
 
-  return { read, write, change, directory, metadata, syncDirectory, outcome, recordOutcome, markOutcomeReported }
+  const holds = record("unattended-hold.json", UnattendedHold)
+  const hold = holds.read.pipe(Effect.catchAll(() => fs.remove(holds.path, { force: true }).pipe(Effect.ignore, Effect.as(Option.none<UnattendedHold>()))))
+  const recordHold = (value: UnattendedHold) => holds.write(value).pipe(Effect.mapError(() => failed("The update hold could not be saved.")))
+  const releaseHold = fs.remove(holds.path, { force: true }).pipe(Effect.mapError(() => failed("The update hold could not be removed.")))
+
+  return { read, write, change, directory, metadata, syncDirectory, outcome, recordOutcome, markOutcomeReported, hold, recordHold, releaseHold }
 })
 
 /** The helper records only its exact attempt, while retaining the native installation lease. */
@@ -121,7 +139,7 @@ export const makePreparedUpdateStore = (options: {
 }) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const permissions = yield* PrivateFilePermissions
-  const { read, write, change, directory, metadata, syncDirectory, outcome, recordOutcome, markOutcomeReported } = yield* makePreparedUpdateRecord(options.dataDirectory)
+  const { read, write, change, directory, metadata, syncDirectory, outcome, recordOutcome, markOutcomeReported, hold, recordHold, releaseHold } = yield* makePreparedUpdateRecord(options.dataDirectory)
   const installer = join(directory, updateInstallerFilename(options.target))
   const verifyFile = (path: string, release: UpdateRelease) => Effect.gen(function* () {
     yield* verifyUpdateRelease(release, options.target, options.trustedPublishers)
@@ -148,7 +166,7 @@ export const makePreparedUpdateStore = (options: {
   }).pipe(Effect.uninterruptible, Effect.mapError(() => failed("The prepared update could not be removed.")))
 
   return PreparedUpdateStore.of({
-    read, outcome, recordOutcome, markOutcomeReported,
+    read, outcome, recordOutcome, markOutcomeReported, hold, recordHold, releaseHold,
     verify: release => verifyFile(installer, release),
     recordAttempt: release => change(release, { _tag: "Attempted" }),
     recordFailure: (release, kind, reason) => change(release, failureState(kind, reason)),

@@ -8,6 +8,8 @@ applies_to:
   - cli/src/commands/update-runtime.ts
   - cli/src/startup/*update*
   - cli/src/runtime/**
+  - cli/src/server/serve-updates.ts
+  - cli/src/commands/serve-runtime.ts
 ---
 
 # Client release updates
@@ -36,21 +38,30 @@ install and restart; a running Headless owner refuses an explicit install, becau
 itself when idle.
 
 No owner installs at startup: Desktop launch and `serve` start normally with a prepared update
-retained, and Desktop offers Restart. A running Headless owner installs a downloaded update at an
-idle point, when the service reports no working session and no inference request in flight. It
-first checks that it may install unattended (the Linux server's sudoers rule, or a writable macOS
-application folder); otherwise it keeps serving and prints one line naming `magnitude update
-install`, recording no outcome. To install it ends its owner scope, which releases its leases, runs
-the platform installer, and on success replaces its own process with the new version (same PID);
-on failure it serves the current version again and, keeping the `failed` outcome, drops the failed
-download, so the next check can fetch a newer release (or retry this one unless it was withdrawn). It checks the installation lock before stopping
-anything: if another process holds or awaits it (the service's own shared lease does not count,
-so this reads the kernel's lock table rather than trying the lock), it keeps serving, records `deferred`, reports it with an
-immediate update check, and tries again at an idle point 15 minutes later. (A started service
-refuses to run while the lock is held, so stopping first would leave it down until the lock frees.) Update checks, scheduled or requested, start only once the
+retained, and Desktop offers Restart. Only the system service (`magnitude server setup`: the Linux
+`magnitude` user under the server profile, or the macOS LaunchDaemon) installs unattended, at an
+idle point, when the service reports no working session and no inference request in flight, and
+only when it may do so without asking anyone (the Linux sudoers rule, or a writable macOS
+application folder). Any other `serve`, including one run by hand with password-free sudo and every
+Windows `serve`, keeps serving and prints one line per downloaded version naming `magnitude update
+install`, recording no outcome. To install the service ends its owner scope, which releases its
+leases, runs the platform installer, and on success replaces its own process with the new version
+(same PID). On failure it serves the current version again and holds back unattended installation:
+no unattended attempt starts for an hour, and when the package itself failed it keeps the `failed`
+outcome, drops the download and never downloads or installs that version unattended again, so the
+next check can fetch only a newer release. The hold is persisted beside the prepared update, so it
+outlives service restarts and the outcome's report; a failure before the installer ran keeps the
+download for the next attempt after the hour. A person lifts the hold with a manual check or an
+explicit download, which may retry the same version. It checks the installation lock before
+stopping anything: if another process holds or awaits it (the service's own shared lease does not
+count, so this reads the kernel's lock table rather than trying the lock), it keeps serving,
+records `deferred`, reports it with an immediate update check, and holds unattended installation
+for 15 minutes. (A started service refuses to run while the lock is held, so stopping first would
+leave it down until the lock frees.) Update checks, scheduled or requested, start only once the
 service is ready, so a new version reports `applied` only after it starts; one that fails before
-Ready reports `failed`/`startup` and exits non-zero for the service manager to retry. There is no
-rollback; withdrawing the release stops it being offered.
+Ready records `failed`/`startup`, sends it with an immediate check whose result it awaits, and
+exits non-zero for the service manager to retry. A restart after that report sends nothing more.
+There is no rollback; withdrawing the release stops it being offered.
 
 Update commands never launch Desktop. With no owner, status observes persisted preparation without
 creating state; finite check, download and discard retain maintenance ownership. A finite download
@@ -88,5 +99,7 @@ installation.
 - Invalid or failed checks never report up to date.
 - Download admission is distinct from successful native staging.
 - Install requires Ready and acknowledges before service/application shutdown.
-- No owner installs at startup; Headless installs only at an idle point, and never blocks Ready.
+- No owner installs at startup; only the system service installs, at an idle point, and never blocks Ready.
+- A failed unattended installation is never retried in a loop: the failed version is not downloaded
+  or installed unattended again, and no unattended attempt starts within an hour, across restarts.
 - Packaged CLI and service versions match the application version.

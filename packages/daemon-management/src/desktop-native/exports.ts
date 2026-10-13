@@ -25,7 +25,7 @@ export { installLinuxApplicationUpdate, guardLinuxInstallerParent, parseLinuxUpd
 export { LinuxPackageUpdate, linuxPackageUpdateExitCode, linuxUpdateFailureReason } from "./linux-update-package"
 export { relaunchLinuxAfterUpdate, LinuxUpdateHandoffRequest, startLinuxUpdateHandoff, completeLinuxUpdateHandoff } from "./linux-update-handoff"
 export { relaunchWindowsAfterUpdate, WindowsUpdateHandoffRequest, startWindowsUpdateHandoff, completeWindowsUpdateHandoff } from "./windows-update-handoff"
-export { PreparedUpdate, UpdateInstallation, PreparedUpdateStore, PreparedUpdateFailed, makePreparedUpdateStore, recordPreparedUpdateFailure } from "./prepared-update"
+export { PreparedUpdate, UpdateInstallation, UnattendedHold, PreparedUpdateStore, PreparedUpdateFailed, makePreparedUpdateStore, recordPreparedUpdateFailure } from "./prepared-update"
 export { acquireUpdateInstallationLease, isUpdateInstallationActive } from "./update-installation-lease"
 export { UpdatePreferences, UpdatePreferencesFailed, makeUpdatePreferences } from "./update-preferences"
 

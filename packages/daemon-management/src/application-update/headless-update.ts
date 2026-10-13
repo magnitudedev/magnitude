@@ -1,4 +1,5 @@
-import { Deferred, Effect } from "effect"
+import { Deferred, Effect, Stream } from "effect"
+import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@magnitudedev/sdk/desktop-host"
 import type { ApplicationUpdate } from "./application-update"
 import { makeUpdateSchedule } from "./update-schedule"
@@ -19,3 +20,11 @@ export const makeHeadlessUpdateControl = (updates: ApplicationUpdate, start: Eff
     return { state: yield* updates.state, afterReply: Effect.void }
   }).pipe(Effect.mapError(error => new ApplicationUpdateControlFailed({ message: error.message })))
 })
+
+/**
+ * Sends any recorded outcome with a check now and waits for its result. The check runs on the update
+ * owner's worker, so an owner about to stop waits here rather than cutting the request off.
+ */
+export const reportUpdateOutcome = (updates: ApplicationUpdate, reason: UpdateCheckReason) => updates.check(reason).pipe(
+  Effect.zipRight(updates.changes.pipe(Stream.filter(state => state.check._tag !== "Checking"), Stream.runHead)),
+  Effect.timeout("15 seconds"), Effect.ignore)

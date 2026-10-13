@@ -1,8 +1,9 @@
 import { Deferred, Effect, Exit, Option, Schema, Stream, type Scope } from "effect"
 import { dirname } from "node:path"
 import { LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
+import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import { unavailableApplicationUpdate, type ApplicationUpdate } from "../application-update/application-update"
-import { makeHeadlessUpdateControl } from "../application-update/headless-update"
+import { makeHeadlessUpdateControl, reportUpdateOutcome } from "../application-update/headless-update"
 import { WindowsPipeName, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { NativeHost } from "./index"
 import { acquireApplicationOwner } from "./application-owner"
@@ -42,11 +43,14 @@ export const runHeadlessApplication = (options: {
   /**
    * Called while serving with each downloaded update version. It waits for an idle point and answers
    * whether to stop the service and install it; interruption means the version changed or the owner stops.
+   * `report` sends a recorded outcome now.
    */
-  /** Resolves true when the owner should stop to install; `report` sends a recorded outcome now. */
   readonly installWhenIdle?: (version: string, report: Effect.Effect<void>) => Effect.Effect<boolean>
-  /** Runs when the service fails before its first Ready, before the outcome is reported and the owner fails. */
-  readonly startupFailed?: Effect.Effect<void>
+  /**
+   * Runs when the service fails before its first Ready, before the owner fails. A service that never
+   * becomes ready makes no scheduled check, so `report` sends a recorded outcome before it exits.
+   */
+  readonly startupFailed?: (report: Effect.Effect<void>) => Effect.Effect<void>
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<HeadlessStop>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
@@ -73,6 +77,7 @@ export const runHeadlessApplication = (options: {
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
   const firstReady = yield* Deferred.make<void>()
+  const report = (reason: UpdateCheckReason) => reportUpdateOutcome(updates, reason)
   const update = yield* makeHeadlessUpdateControl(updates, Deferred.await(firstReady))
   if (options.updateReady) {
     const notify = options.updateReady
@@ -115,7 +120,7 @@ export const runHeadlessApplication = (options: {
     yield* updates.changes.pipe(Stream.map(state => state.transfer), Stream.filter(transfer => transfer._tag === "Ready"),
       Stream.map(transfer => transfer.version), Stream.changes,
       Stream.flatMap(version => Stream.fromEffect(Deferred.await(firstReady).pipe(
-        Effect.zipRight(decide(version, updates.check("scheduled").pipe(Effect.timeout("15 seconds"), Effect.ignore))))), { switch: true }),
+        Effect.zipRight(decide(version, report("scheduled"))))), { switch: true }),
       Stream.filter(install => install), Stream.take(1),
       Stream.runForEach(() => Deferred.succeed(stop, "InstallUpdate")), Effect.forkScoped)
   }
@@ -125,8 +130,7 @@ export const runHeadlessApplication = (options: {
   if (Exit.isSuccess(result) && options.stopping) yield* options.stopping(result.value)
   if (Exit.isFailure(result) && !(yield* Deferred.isDone(firstReady)) && options.startupFailed) {
     // An update that installed but never became ready is reported before the owner exits for a retry.
-    yield* options.startupFailed
-    yield* updates.check("launch").pipe(Effect.timeout("15 seconds"), Effect.ignore)
+    yield* options.startupFailed(report("launch"))
   }
   yield* service.shutdown
   if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
