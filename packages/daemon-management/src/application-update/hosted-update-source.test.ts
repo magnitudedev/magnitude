@@ -29,7 +29,7 @@ vi.mock("@magnitudedev/release/hosted-update", async importOriginal => {
 })
 
 const store = (outcome: Option.Option<UpdateOutcome>, reported: Ref.Ref<number>): PreparedUpdateStore => ({
-  outcome: Effect.succeed(outcome), markOutcomeReported: Ref.update(reported, n => n + 1), recordOutcome: () => Effect.void,
+  outcome: Effect.succeed(outcome), markOutcomeReported: Ref.update(reported, n => n + 1), recordOutcome: () => Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
   read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("unused"), recordAttempt: () => Effect.void,
   recordFailure: () => Effect.void, complete: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void,
 })

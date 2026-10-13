@@ -55,6 +55,28 @@ describe("last update outcome", () => {
   })
 })
 
+describe("unattended hold", () => {
+  it("keeps the failed version held back across store reconstruction, after its outcome is reported, until released", async () => {
+    const hold = { version: Option.some("2.0.0"), until: 1_000 }
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      expect(Option.isNone(yield* store.hold)).toBe(true)
+      yield* store.recordHold(hold)
+      yield* store.recordOutcome({ outcome: "failed", version: "2.0.0", reason: Option.some("install") })
+      yield* store.markOutcomeReported
+      yield* store.discard
+    }))
+    await run(Effect.gen(function* () {
+      const store = yield* make
+      expect(yield* store.hold).toEqual(Option.some(hold))
+      yield* store.releaseHold
+      expect(Option.isNone(yield* store.hold)).toBe(true)
+    }))
+    await writeFile(join(root, "updates/unattended-hold.json"), "{not json")
+    expect(Option.isNone(await run(Effect.flatMap(make, store => store.hold)))).toBe(true)
+  })
+})
+
 describe("one durable prepared update", () => {
   it("persists verified bytes and only the release and installation union across reconstruction", async () => {
     await run(Effect.gen(function* () { const store = yield* make; yield* store.prepare(archive, release) }))

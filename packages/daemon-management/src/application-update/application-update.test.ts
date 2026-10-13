@@ -1,7 +1,7 @@
 import { generateKeyPairSync } from 'node:crypto'
 import { Deferred, Effect, Option, Ref, Schema, Scope, Stream } from "effect"
 import { UpdateManifest, PublisherKeyId, signUpdateManifest } from "../../../release/src/hosted-update/manifest"
-import { PreparedUpdateStore, PreparedUpdateFailed, UpdatePreferences, UpdatePreferencesFailed } from "@magnitudedev/daemon-management/desktop-native"
+import { PreparedUpdateStore, PreparedUpdateFailed, UpdatePreferences, UpdatePreferencesFailed, type UnattendedHold } from "@magnitudedev/daemon-management/desktop-native"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, type ApplicationUpdate } from "./application-update"
 
@@ -11,7 +11,7 @@ const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@
 } })
 const candidate = (await Effect.runPromise(signUpdateManifest(manifest, generateKeyPairSync("ed25519").privateKey))).release
 const waitFor = (owner: ApplicationUpdate, tag: string) => owner.changes.pipe(Stream.filter(state => state.transfer._tag === tag), Stream.take(1), Stream.runDrain)
-const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope | UpdatePreferences | PreparedUpdateStore>) => Effect.runPromise(effect.pipe(Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("Unexpected verification"), recordAttempt: () => Effect.void, recordFailure: () => Effect.void, complete: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void }), Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.scoped, Effect.timeout("3 seconds")))
+const run = <A, E>(effect: Effect.Effect<A, E, Scope.Scope | UpdatePreferences | PreparedUpdateStore>) => Effect.runPromise(effect.pipe(Effect.provideService(PreparedUpdateStore, { read: Effect.succeed(Option.none()), prepare: () => Effect.void, verify: () => Effect.die("Unexpected verification"), recordAttempt: () => Effect.void, recordFailure: () => Effect.void, complete: () => Effect.void, discard: Effect.void, removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void }), Effect.provideService(UpdatePreferences, { read: Effect.succeed(false), write: () => Effect.void }), Effect.scoped, Effect.timeout("3 seconds")))
 
 describe("application-owned updates", () => {
   it.each([false, true])("discards a retained update only after durable cleanup succeeds (failure=%s)", fail => run(Effect.gen(function* () {
@@ -208,4 +208,57 @@ describe("application-owned updates", () => {
     yield* waitFor(owner, "Failed")
     expect((yield* owner.requireReady.pipe(Effect.either))._tag).toBe("Left")
   })))
+
+  describe("after an unattended installation failed", () => {
+    const owner = (hold: Ref.Ref<Option.Option<UnattendedHold>>, offer: typeof candidate, downloads: Ref.Ref<string[]>) => Effect.gen(function* () {
+      const store = yield* PreparedUpdateStore
+      return yield* makeApplicationUpdate().pipe(
+        Effect.provideService(PreparedUpdateStore, { ...store, hold: Ref.get(hold), releaseHold: Ref.set(hold, Option.none()) }),
+        Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }),
+        Effect.provideService(ApplicationUpdateSource, { check: () => Effect.succeed(Option.some(offer)),
+          download: release => Ref.update(downloads, all => [...all, release.version]).pipe(Effect.as("archive")), stage: () => Effect.void }))
+    })
+    const checked = (update: ApplicationUpdate) => update.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
+
+    it.each(["launch", "scheduled"] as const)("does not download the failed version again on a %s check, in any later owner", reason => run(Effect.gen(function* () {
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: 0 }))
+      const downloads = yield* Ref.make<string[]>([])
+      for (let restart = 0; restart < 3; restart++) {
+        const update = yield* owner(hold, candidate, downloads)
+        yield* update.check(reason)
+        yield* checked(update)
+        expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: candidate.version, bytes: candidate.bytes })
+      }
+      expect(yield* Ref.get(downloads)).toEqual([])
+      expect(Option.isSome(yield* Ref.get(hold))).toBe(true)
+    })))
+    it("still downloads a newer version automatically", () => run(Effect.gen(function* () {
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: 0 }))
+      const downloads = yield* Ref.make<string[]>([])
+      const update = yield* owner(hold, { ...candidate, version: "2.1.0" }, downloads)
+      yield* update.check("scheduled")
+      yield* waitFor(update, "Ready")
+      expect(yield* Ref.get(downloads)).toEqual(["2.1.0"])
+    })))
+    it("lets a person retry it: a manual check lifts the hold and downloads it", () => run(Effect.gen(function* () {
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: Number.MAX_SAFE_INTEGER }))
+      const downloads = yield* Ref.make<string[]>([])
+      const update = yield* owner(hold, candidate, downloads)
+      yield* update.check("manual")
+      yield* waitFor(update, "Ready")
+      expect(yield* Ref.get(downloads)).toEqual([candidate.version])
+      expect(Option.isNone(yield* Ref.get(hold))).toBe(true)
+    })))
+    it("lets a person download it explicitly, lifting the hold", () => run(Effect.gen(function* () {
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: Number.MAX_SAFE_INTEGER }))
+      const downloads = yield* Ref.make<string[]>([])
+      const update = yield* owner(hold, candidate, downloads)
+      yield* update.check("launch")
+      yield* waitFor(update, "Available")
+      yield* update.download
+      yield* waitFor(update, "Ready")
+      expect(yield* Ref.get(downloads)).toEqual([candidate.version])
+      expect(Option.isNone(yield* Ref.get(hold))).toBe(true)
+    })))
+  })
 })

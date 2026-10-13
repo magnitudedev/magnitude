@@ -8,7 +8,7 @@ import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { applicationNativeHostPath, applicationStateDirectory, nativeHostLayer, resolveApplicationProfile,
   resolveInstalledApplicationRuntime, runHeadlessApplication, type ApplicationRuntime } from "@magnitudedev/daemon-management/desktop-native"
 import { isDevelopmentBuild } from "../runtime/environment"
-import { idleInstallationSystem, initializeServeUpdates, makeIdleInstallation, prepareServeStartup } from "../server/serve-updates"
+import { idleInstallationSystem, initializeServeUpdates, makeDownloadedNotice, makeIdleInstallation, prepareServeStartup } from "../server/serve-updates"
 import { resolveServeOwner } from "../server/serve-owner"
 import { readServerReach, renderServeReady } from "../server/server-reach"
 import { serveStopSignals } from "./serve-signals"
@@ -32,11 +32,13 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
   const stateDirectory = yield* applicationStateDirectory({ platform: process.platform, dataDirectory: profile.dataDirectory, override: Option.fromNullable(process.env.MAGNITUDE_DESKTOP_STATE_DIR) })
   const addon = applicationNativeHostPath(runtime, process.platform, process.arch)
   const ready = yield* Ref.make(false)
-  // Unix servers install downloaded updates at idle points; Windows serve only prepares them.
+  const notify = (line: string) => Effect.sync(() => { process.stderr.write(`${line}\n`) })
+  // The macOS and Linux system service installs downloaded updates at idle points; Windows serve only prepares them.
   const idle = runtime._tag === "Installed" && process.platform !== "win32"
-    ? Option.some(yield* makeIdleInstallation.pipe(Effect.provide(idleInstallationSystem({ runtime, profile, stateDirectory, addon, owner,
-      notify: line => Effect.sync(() => { process.stderr.write(`${line}\n`) }) }))))
+    ? Option.some(yield* makeIdleInstallation.pipe(Effect.provide(idleInstallationSystem({ runtime, profile, stateDirectory, addon, owner, notify }))))
     : Option.none()
+  const updateHooks = Option.isSome(idle) ? { installWhenIdle: idle.value.installWhenIdle, startupFailed: idle.value.startupFailed }
+    : runtime._tag === "Installed" ? { updateReady: yield* makeDownloadedNotice(notify) } : {}
   // A restart request re-admits the owner in place, so settings read at service start take effect.
   for (;;) {
     yield* Ref.set(ready, false)
@@ -44,7 +46,7 @@ export const runServe = () => Effect.runPromise(Effect.scoped(Effect.gen(functio
     prepareStartup: prepareServeStartup(runtime, profile, stateDirectory).pipe(
       Effect.provide(process.platform === "win32" ? bundledWindowsNative.host : nativeHostLayer(addon))),
     initializeUpdates: initializeServeUpdates(runtime, profile, addon, owner),
-    ...(Option.isSome(idle) ? { installWhenIdle: idle.value.installWhenIdle, startupFailed: idle.value.startupFailed } : {}),
+    ...updateHooks,
     stopping: reason => Effect.sync(() => { process.stderr.write(reason === "DesktopTakeover"
       ? "The desktop app was opened and is taking over. Stopping the headless server.\n"
       : reason === "Restart" ? "Restarting the Magnitude server.\n"

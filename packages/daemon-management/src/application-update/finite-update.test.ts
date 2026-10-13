@@ -19,7 +19,7 @@ const fixture = Effect.gen(function* () {
     prepare: (_archive, candidate) => event("publish").pipe(Effect.zipRight(Ref.set(pending, Option.some({ release: candidate, installation: { _tag: "Unattempted" } })))),
     discard: event("discard").pipe(Effect.zipRight(Ref.set(pending, Option.none()))),
     removeAbandonedTransfers: event("scratch-cleanup"),
-    outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
+    outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     verify: () => Effect.die("Preparation cannot install"), recordAttempt: () => Effect.die("Preparation cannot attempt installation"),
     recordFailure: () => Effect.die("Preparation cannot record installation failure"),
     complete: () => Effect.die("Preparation cannot complete an installation"),

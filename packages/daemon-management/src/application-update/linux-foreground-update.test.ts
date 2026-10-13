@@ -18,7 +18,7 @@ const fixture = (scenario: "success" | "absent" | "verify" | "attempt" | "instal
     read: Effect.succeed(scenario === "absent" ? Option.none() : Option.some({ release, installation: { _tag: "Unattempted" } })),
     verify: () => step("verify").pipe(Effect.zipRight(scenario === "verify" ? failed : Effect.succeed("archive"))),
     recordAttempt: () => step("attempt").pipe(Effect.zipRight(scenario === "attempt" ? failed : Effect.void)),
-    recordFailure: (_, kind) => step(`failure:${kind}`), complete: () => step("complete"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void,
+    recordFailure: (_, kind) => step(`failure:${kind}`), complete: () => step("complete"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     prepare: () => Effect.die("Installation cannot prepare a different download"),
   })
   const terminal = TerminalCommand.of({

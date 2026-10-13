@@ -107,10 +107,16 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
     yield* Scope.close(owner, Exit.void)
   }).pipe(Effect.uninterruptible)
   yield* Effect.addFinalizer(() => close)
+  // A version whose unattended installation failed is offered, but only a person downloads it again.
+  const held = (candidate: Candidate) => store.hold.pipe(Effect.map(hold => Option.exists(Option.flatMap(hold, hold => hold.version), version => version === candidate.version)),
+    Effect.orElseSucceed(() => false))
+  // A person asking again lifts the hold, so an unattended retry follows without waiting it out.
+  const releaseHold = store.releaseHold.pipe(Effect.ignore)
   const check = (reason: UpdateCheckReason) => gate.withPermits(1)(Effect.gen(function* () {
     const current = yield* SubscriptionRef.get(state)
     if (current.transfer._tag === "Closed") return yield* closed
     if (current.check._tag === "Checking") return
+    if (reason === "manual") yield* releaseHold
     yield* SubscriptionRef.set(state, { ...current, check: { _tag: "Checking" } })
     yield* source.check(reason).pipe(
       Effect.flatMap(candidate => gate.withPermits(1)(Effect.gen(function* () {
@@ -120,7 +126,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
         const next: State = { ...current, check: { _tag: "Succeeded", at: yield* Clock.currentTimeMillis },
           transfer: replaceable ? Option.isSome(candidate) ? { _tag: "Available", candidate: candidate.value } : { _tag: "Idle" } : current.transfer }
         yield* SubscriptionRef.set(state, next)
-        if (replaceable && Option.isSome(candidate) && autoEnabled(next)) yield* startDownload(candidate.value, true)
+        if (replaceable && Option.isSome(candidate) && autoEnabled(next) && !(yield* held(candidate.value))) yield* startDownload(candidate.value, true)
       }))),
       Effect.catchAll(error => gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Closed" ? current
         : { ...current, check: { _tag: "Failed", message: error.message } }))),
@@ -144,6 +150,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
     download: gate.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(state)
       if (current.transfer._tag !== "Available") return yield* new ApplicationUpdateFailed({ message: "Check for an available update before downloading." })
+      yield* releaseHold
       yield* startDownload(current.transfer.candidate, false)
     })).pipe(Effect.uninterruptible),
     setAutoDownload: enabled => gate.withPermits(1)(Effect.gen(function* () {
@@ -151,7 +158,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
       yield* preferences.write(enabled).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
       yield* SubscriptionRef.update(state, (current): State => ({ ...current, preference: { _tag: "Known", autoDownload: enabled } }))
       const current = yield* SubscriptionRef.get(state)
-      if (enabled && current.transfer._tag === "Available") yield* startDownload(current.transfer.candidate, true)
+      if (enabled && current.transfer._tag === "Available" && !(yield* held(current.transfer.candidate))) yield* startDownload(current.transfer.candidate, true)
       if (!enabled && current.transfer._tag === "Downloading" && current.transfer.automatic) {
         yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Cancelling", candidate: current.transfer.candidate } })
         if (Option.isSome(transferWorker)) yield* Fiber.interruptFork(transferWorker.value)
