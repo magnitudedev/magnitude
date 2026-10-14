@@ -54,9 +54,14 @@ export const readServerReach = (options: { readonly endpoint: string; readonly d
     Effect.option,
     Effect.map((network): ServerReach => ({ endpoint: options.endpoint, network, configPath: join(options.dataDirectory, "config.json"), service: options.service })))
 
-export const renderServeReady = (reach: ServerReach) => [
+/** How to stop the system service: systemd stops a Linux service in place; the macOS daemon is removed. */
+const stopService = (platform: NodeJS.Platform) => platform === "linux"
+  ? "Stop it with `sudo systemctl stop magnitude`; `magnitude server remove` removes the server."
+  : "Stop it with `magnitude server remove`."
+
+export const renderServeReady = (reach: ServerReach, platform: NodeJS.Platform = process.platform) => [
   "Magnitude is ready.",
   ...renderServerReach(reach),
-  reach.service ? "Stop it with `magnitude server remove`." : "Press Ctrl+C to stop.",
+  reach.service ? stopService(platform) : "Press Ctrl+C to stop.",
   "",
 ].join("\n")

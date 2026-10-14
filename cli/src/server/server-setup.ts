@@ -148,7 +148,7 @@ export const renderServerReady = (platform: NodeJS.Platform, access: ServerAcces
   "",
   `Status:  magnitude status`,
   `Logs:    ${serverLogs(platform)}`,
-  `Stop:    magnitude server remove`,
+  ...(platform === "linux" ? ["Stop:    sudo systemctl stop magnitude", "Remove:  magnitude server remove"] : ["Stop:    magnitude server remove"]),
   "",
 ].join("\n")
 

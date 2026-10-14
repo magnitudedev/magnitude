@@ -32,9 +32,10 @@ describe("serve ready output", () => {
     expect(renderServeReady(reach({ network: off }))).toContain("/home/ada/.magnitude/config.json")
   })
   it("tells the service how to stop instead of Ctrl+C", () => {
-    const output = renderServeReady(reach({ service: true }))
-    expect(output).not.toContain("Ctrl+C")
-    expect(output).toContain("magnitude server remove")
+    const linux = renderServeReady(reach({ service: true }), "linux")
+    expect(linux).not.toContain("Ctrl+C")
+    expect(linux).toContain("Stop it with `sudo systemctl stop magnitude`; `magnitude server remove` removes the server.")
+    expect(renderServeReady(reach({ service: true }), "darwin")).toContain("Stop it with `magnitude server remove`.")
   })
   it("never prints the network access key", () => {
     const settings = { enabled: true, bind: Option.none(), port: 10100, pending: false, interfaces: [], apiKey: Option.some("secret-key"), requireApiKey: true }
