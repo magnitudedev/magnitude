@@ -27,7 +27,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, po
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, FiberId, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
   acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
@@ -78,7 +78,9 @@ let startupMacUpdate = false
 let macUpdateOperation: "Install" | "Recover" = "Install"
 let startupUpdateDeferred = false
 let reopenAfterUpdate = false
-let requestQuit: () => void = () => { earlyQuitRequested = true }
+// Quit before the main runtime starts, including from the server conflict screen.
+const earlyQuit = Deferred.unsafeMake<void>(FiberId.none)
+let requestQuit: () => void = () => { earlyQuitRequested = true; Deferred.unsafeDone(earlyQuit, Exit.void) }
 app.on("before-quit", event => { if (!exiting) { event.preventDefault(); requestQuit() } })
 // OS-requested termination must retire the owned service before Electron exits.
 if (process.platform !== "win32") process.on("SIGTERM", () => requestQuit())
@@ -101,8 +103,14 @@ const program = Effect.scoped(Effect.gen(function* () {
       : yield* resolveServerConflict({ personalStateDirectory: stateDir,
         pageUrl: `${process.env.ELECTRON_RENDERER_URL ?? DESKTOP_APP_ORIGIN}/server-conflict.html`,
         preload: join(here, "../preload/server-conflict-preload.mjs"),
-        icon: join(process.resourcesPath, "application-icon.png") })
-    if (decision === "Quit") return "Quit" as const
+        icon: join(process.resourcesPath, "application-icon.png"),
+        quitRequested: Deferred.await(earlyQuit) })
+    if (decision === "Quit") {
+      // A Mac serving with `magnitude server setup` needs no desktop at login; Settings can turn it back on.
+      if (process.platform === "darwin") yield* makeLoginStartup(isolatedProfile).pipe(Effect.flatMap(startup => startup.set(false)),
+        Effect.catchAll(error => Effect.logWarning(error.message)))
+      return "Quit" as const
+    }
   }
   const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: background ? "EnsureRunning" : "ShowWindow" })
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }

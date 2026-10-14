@@ -348,6 +348,8 @@ it runs, the whole window is one screen offering to keep the server, which opens
 and quits, or to stop it and continue. On Linux, stopping runs pkexec of the packaged removal
 wrapper, which Polkit admits without a password for the active local session; macOS asks for an
 administrator. A background launch leaves
-a running server alone, and a server that stops lets the app continue. Windows has no server
+a running server alone, and a server that stops lets the app continue. A quit request (Cmd-Q,
+logout, SIGTERM) on that screen quits like closing it. When the screen or a background launch quits
+in favour of the macOS server, the desktop turns off its own launch at login. Windows has no server
 mode; its command launcher ignores logoff, which Windows sends only to services, so a third-party
 service wrapper keeps serving.
