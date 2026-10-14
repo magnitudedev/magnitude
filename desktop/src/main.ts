@@ -430,7 +430,7 @@ const program = Effect.scoped(Effect.gen(function* () {
       const environment = yield* Fiber.join(harnessEnvironment)
       return yield* makeMacCliRegistration({ home: homedir(), resourcesDirectory: process.resourcesPath, environment })
     }).pipe(Effect.provide(NodeContext.layer)) : undefined
-  const installCli = cliLink?.install ?? Effect.void
+  const installCli: Effect.Effect<void, { readonly message: string }> = cliLink?.install ?? Effect.void
   const cliResult = (operation: typeof installCli) => operation.pipe(
     Effect.tapError(Effect.logError),
     Effect.catchAll(() => showNotice({ title: "Couldn’t install the command-line tool", description: "Magnitude couldn’t register its terminal command. Check that your application is installed in a writable location." })),
