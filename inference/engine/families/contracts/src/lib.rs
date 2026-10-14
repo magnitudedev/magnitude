@@ -36,7 +36,10 @@ pub use draft::{
     TapPoint,
 };
 pub use family::{FamilyError, FamilyInputAdapter, MarkerTokens, ModelFamily};
-pub use images::{ImageMarkers, SequentialImageInput, SpatialControls};
+pub use images::{
+    ImageCrop, ImageMarkers, SequentialImageInput, SpatialControls, image_crop_identity,
+    image_crops,
+};
 pub use inputs::{
     InputPreparationError, ModelInputAdapter, PreparedModelInput, PreparedVisionInput, TokenPlan,
     VisionSpatialControls,

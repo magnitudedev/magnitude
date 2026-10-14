@@ -2,7 +2,7 @@
 
 use crate::inputs::{QwenImageTokens, QwenInputAdapter};
 use crate::{inspect_components, recognize};
-use magnitude_artifacts::{gguf::Directory, PackageIdentity};
+use magnitude_artifacts::{PackageIdentity, gguf::Directory};
 use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, MarkerTokens, ModelDefinition, ModelFamily,
 };
@@ -29,7 +29,8 @@ impl ModelFamily for Qwen35Family {
         projector: Option<&Directory>,
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
-        inspect_components(target, projector, identity).map_err(|error| FamilyError(error.to_string()))
+        inspect_components(target, projector, identity)
+            .map_err(|error| FamilyError(error.to_string()))
     }
 
     fn input_adapter(
@@ -37,6 +38,14 @@ impl ModelFamily for Qwen35Family {
         definition: &ModelDefinition,
         markers: &dyn MarkerTokens,
     ) -> Result<FamilyInputAdapter, FamilyError> {
+        if definition.vision.as_ref().is_some_and(|v| {
+            matches!(
+                v.preprocessing.resize,
+                magnitude_family_contracts::VisionResize::Slices { .. }
+            )
+        }) {
+            return crate::minicpm::inputs::adapter(definition, markers);
+        }
         let image_tokens = definition
             .vision
             .as_ref()
@@ -53,6 +62,15 @@ impl ModelFamily for Qwen35Family {
     }
 
     fn media_placeholder(&self, definition: &ModelDefinition) -> Option<&'static str> {
-        definition.vision.as_ref().map(|_| IMAGE_PLACEHOLDER)
+        definition.vision.as_ref().map(|v| {
+            if matches!(
+                v.preprocessing.resize,
+                magnitude_family_contracts::VisionResize::Slices { .. }
+            ) {
+                "<|image_pad|>"
+            } else {
+                IMAGE_PLACEHOLDER
+            }
+        })
     }
 }

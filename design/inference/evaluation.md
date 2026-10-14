@@ -31,7 +31,7 @@ Models are always selected by catalog reference (`<model>:<variant>`). The draft
 **A fixture is a deterministic chat conversation, and it is the only model input.** Raw-text corpora, token lists and random tokens are not accepted anywhere.
 - **Rendering:** fixtures are rendered only by the engine's own serving path (the model's chat template and tokenizer), and every rendered output records its exact tokens and template identity.
 - **References** consume rendered tokens and never tokenize on their own. A reference and our engine therefore always evaluate identical input.
-- **Families:** tool sessions with completed history, prose continue, prose repeat, retrieval and code. Sources are pinned and hash-locked, and builders are deterministic.
+- **Families:** tool sessions with completed history, prose continue, prose repeat, retrieval, code and vision. Sources are pinned and hash-locked, and builders are deterministic.
 - **Quality** is measured by teacher forcing on scored assistant turns. Serving requests use a declared conversation prefix with family-specific answer validation.
 - **Sizing:** fitting a fixture to a context length uses the target model's rendered length and takes whole conversational units. Rebuilding the same size with the same fixture and model reproduces identical tokens.
 
@@ -91,7 +91,8 @@ Each adapter owns its engine's preparation, launch, readiness and cleanup. Share
 - Sampling is greedy, with seed 42 where supported and model-selected thinking disabled.
 - **Validation:**
   - Tool calls are matched as a multiset with complete assignment.
-  - Retrieval answers are exact string mappings, reported as whole-answer and partial-field accuracy.
+  - Retrieval and fixed vision answers are exact string mappings, reported as whole-answer and partial-field accuracy.
+  - Image qualification uses deterministic source images in chat fixtures and the catalog projector. Plain and speculative requests use the same fixtures; the speculative pass must report draft proposals. This serving check does not claim distributional quality against a reference.
   - Truncation, protocol errors, timeouts and cancellation never enter performance summaries, but always enter accuracy denominators.
 
 ## Remote execution

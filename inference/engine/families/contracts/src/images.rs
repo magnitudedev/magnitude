@@ -9,11 +9,11 @@ use crate::{
     PreparedVisionInput, TokenPlan, VisionSpatialControls,
 };
 use magnitude_artifacts::{
-    media::{DType, PreparedMedia, PreparedTensor},
     BoundaryRule, ImageProcessor, InputLayout, InputSpan, TokenId,
+    media::{DType, PreparedMedia, PreparedTensor},
 };
 use sha2::{Digest, Sha256};
-use std::collections::{btree_map::Entry, BTreeMap};
+use std::collections::{BTreeMap, btree_map::Entry};
 
 /// The three tokens an image renders as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,7 +25,9 @@ pub struct ImageMarkers {
 
 impl ImageMarkers {
     pub fn new(start: TokenId, row: TokenId, end: TokenId) -> Result<Self, InputPreparationError> {
-        if [start, row, end].iter().any(|token| token.0 > i32::MAX as u32)
+        if [start, row, end]
+            .iter()
+            .any(|token| token.0 > i32::MAX as u32)
             || start == row
             || start == end
             || row == end
@@ -72,13 +74,16 @@ impl SequentialImageInput {
 }
 
 /// One image's patch grid and pixel rows.
-struct Image {
-    grid: [usize; 3],
-    pixels: PreparedTensor,
+pub struct ImageCrop {
+    pub grid: [usize; 3],
+    pub pixels: PreparedTensor,
 }
 
 /// The images of one prepared media item, in processor order.
-fn images(definition: &ModelDefinition, media: &PreparedMedia) -> Result<(String, Vec<Image>), InputPreparationError> {
+pub fn image_crops(
+    definition: &ModelDefinition,
+    media: &PreparedMedia,
+) -> Result<(String, Vec<ImageCrop>), InputPreparationError> {
     let vision = definition
         .vision
         .as_ref()
@@ -89,7 +94,17 @@ fn images(definition: &ModelDefinition, media: &PreparedMedia) -> Result<(String
             .map_err(|_| InputPreparationError::VisionGeometry)?,
     )
     .map_err(|_| InputPreparationError::VisionGeometry)?;
-    if media.processor() != processor.identity() || media.tensors().len() != 2 {
+    if media.processor() != processor.identity()
+        || media.tensors().len()
+            != if matches!(
+                vision.preprocessing.resize,
+                crate::VisionResize::Slices { .. }
+            ) {
+                3
+            } else {
+                2
+            }
+    {
         return Err(InputPreparationError::UnsupportedMedia);
     }
     let width = vision
@@ -134,22 +149,31 @@ fn images(definition: &ModelDefinition, media: &PreparedMedia) -> Result<(String
         if t != 1 || h < merge || w < merge || h % merge != 0 || w % merge != 0 {
             return Err(InputPreparationError::VisionGeometry);
         }
-        let rows = h.checked_mul(w).ok_or(InputPreparationError::VisionGeometry)?;
+        let rows = h
+            .checked_mul(w)
+            .ok_or(InputPreparationError::VisionGeometry)?;
         let bytes = |row: usize| {
             row.checked_mul(width)
                 .and_then(|value| value.checked_mul(4))
                 .ok_or(InputPreparationError::VisionGeometry)
         };
-        let end = first.checked_add(rows).ok_or(InputPreparationError::VisionGeometry)?;
+        let end = first
+            .checked_add(rows)
+            .ok_or(InputPreparationError::VisionGeometry)?;
         let values = pixels
             .data()
             .get(bytes(first)?..bytes(end)?)
             .ok_or(InputPreparationError::VisionGeometry)?
             .to_vec();
-        images.push(Image {
+        images.push(ImageCrop {
             grid,
-            pixels: PreparedTensor::new("pixel_values".into(), DType::F32, vec![rows, width], values)
-                .map_err(|_| InputPreparationError::VisionGeometry)?,
+            pixels: PreparedTensor::new(
+                "pixel_values".into(),
+                DType::F32,
+                vec![rows, width],
+                values,
+            )
+            .map_err(|_| InputPreparationError::VisionGeometry)?,
         });
         first = end;
     }
@@ -160,7 +184,7 @@ fn images(definition: &ModelDefinition, media: &PreparedMedia) -> Result<(String
 }
 
 /// The content identity of one image: its processor, grid and pixels.
-fn identity(processor: &str, image: &Image) -> String {
+pub fn image_crop_identity(processor: &str, image: &ImageCrop) -> String {
     let mut digest = Sha256::new();
     digest.update(processor.as_bytes());
     for value in image.grid {
@@ -187,7 +211,7 @@ impl ModelInputAdapter for SequentialImageInput {
         let (tokens, _) = token_plan.into_parts();
         let (processor, images) = match media {
             [] => (String::new(), Vec::new()),
-            [prepared] => images(definition, prepared)?,
+            [prepared] => image_crops(definition, prepared)?,
             _ => return Err(InputPreparationError::UnsupportedMedia),
         };
         let markers = match (self.markers, images.is_empty()) {
@@ -220,7 +244,7 @@ impl ModelInputAdapter for SequentialImageInput {
                     let start = expanded.len();
                     expanded.extend(std::iter::repeat_n(markers.row, rows));
                     expanded.push(markers.end);
-                    let identity = identity(&processor, &image);
+                    let identity = image_crop_identity(&processor, &image);
                     spans.push(InputSpan {
                         start,
                         end: start + rows,
@@ -251,7 +275,9 @@ impl ModelInputAdapter for SequentialImageInput {
             return Err(InputPreparationError::InputAlignment);
         }
         let continuation = expanded.len();
-        let coordinates = (0..continuation).map(|position| [position as i32; 3]).collect();
+        let coordinates = (0..continuation)
+            .map(|position| [position as i32; 3])
+            .collect();
         let layout = InputLayout::new(continuation, spans)
             .map_err(|_| InputPreparationError::InputAlignment)?;
         let plan = TokenPlan::new(expanded, layout)?;

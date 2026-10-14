@@ -33,7 +33,7 @@ extern "C" __global__ void vision_attention_prepare(SEISMIC_KERNEL_PARAMS) {
     const int *coordinates = reinterpret_cast<const int *>(SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES));
     vision::prepare_head<A, W, WP>(source + (row * SEISMIC_DIM_H + head) * W * A::bytes,
                                    OPERANDS + ((row * 3 + part) * SEISMIC_DIM_H + head) * WP * A::bytes, normed, norm,
-                                   __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), part < 2, coordinates + row * 2,
+                                   __uint_as_float((unsigned)SEISMIC_PARAM_EPSILON), part < 2 && __uint_as_float((unsigned)SEISMIC_PARAM_LOG_BASE) != 0.0f, coordinates + row * 2,
                                    __uint_as_float((unsigned)SEISMIC_PARAM_LOG_BASE), threadIdx.x % 32);
 }
 

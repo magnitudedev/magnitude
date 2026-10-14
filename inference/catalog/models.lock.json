@@ -16,6 +16,14 @@
     "target": "dfd5fdcad7a1c0d31473fb4ca443b8befbacddf0",
     "speculativeDraft": "0e2ce447c266c98603073cf9927a56130b9dca43"
   },
+  "minicpm-v-4.7-1b": {
+    "target": "59cd286146b6ce70f818508ccf512e11438d8957",
+    "speculativeDraft": "7ded9ee60a1c62530266faba221a4cc23251850b"
+  },
+  "minicpm-v-4.7-35b-a3b": {
+    "target": "3c3f7e84f14a760ff26d17ab5932d4aa996227c0",
+    "speculativeDraft": "06e20d2ca305f10ab0c4436b07cd48240b815963"
+  },
   "minicpm5-1b": { "target": "3d55fac80935ae6456986ad2384b5cbcc4d6c948" },
   "minicpm5-2b": {
     "target": "2079a22f3beaa4e306449978533478fe0522f4b3",

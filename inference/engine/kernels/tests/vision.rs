@@ -561,17 +561,25 @@ fn clamp_matches_its_portable_body() {
 /// widths 64 and 96 (Muse Glimmer).
 #[test]
 fn attention_matches_its_portable_body() {
+    check_attention_forms(&[
+        (2usize, 16usize, false, false, false, false, true),
+        (2, 18, true, true, false, true, true),
+        (1, 16, false, false, true, false, true),
+        (1, 24, false, false, true, false, true),
+    ]);
+}
+
+#[test]
+fn learned_position_attention_matches_its_portable_body() {
+    // SigLIP: 72-column heads, learned positions, no rotary or head norm.
+    check_attention_forms(&[(2, 18, false, false, false, false, false)]);
+}
+
+fn check_attention_forms(forms: &[(usize, usize, bool, bool, bool, bool, bool)]) {
     let module = module();
     let rows = 100usize;
-    // (heads, quarter, head norms, value norm, windows, unit scale)
-    let forms = [
-        (2usize, 16usize, false, false, false, false),
-        (2, 18, true, true, false, true),
-        (1, 16, false, false, true, false),
-        (1, 24, false, false, true, false),
-    ];
     for device in devices() {
-        for (heads, quarter, head_norms, value_norm, windows, unit_scale) in forms {
+        for &(heads, quarter, head_norms, value_norm, windows, unit_scale, rotary) in forms {
             let width = 4 * quarter;
             let (nq, nv, ws) = (usize::from(head_norms), usize::from(value_norm), usize::from(windows));
             let mut rng = Rng::new(25);
@@ -589,7 +597,7 @@ fn attention_matches_its_portable_body() {
                 &[ws, rows, 2],
                 (0..ws * rows).flat_map(|row| [row / 48 * 48, (row / 48 * 48 + 48).min(rows)]),
             );
-            let log_base = 100f32.ln();
+            let log_base = if rotary { 100f32.ln() } else { 0.0 };
             let expected = interpret(
                 &module,
                 "vision_attention",

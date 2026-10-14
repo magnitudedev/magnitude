@@ -6,6 +6,7 @@
 
 mod family;
 pub mod inputs;
+pub mod minicpm;
 
 pub use family::Qwen35Family;
 
@@ -164,6 +165,13 @@ fn triple(directory: &Directory, key: &str) -> Result<[f64; 3], Error> {
 /// Interpret a validated Qwen3-VL projector inventory without importing it.
 pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Error> {
     if directory
+        .value("clip.projector_type")
+        .and_then(Value::string)
+        == Some("minicpmv4_7")
+    {
+        return minicpm::describe_projector(directory);
+    }
+    if directory
         .value("general.architecture")
         .and_then(Value::string)
         != Some("clip")
@@ -289,7 +297,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                 query_norm: None,
                 key_norm: None,
                 value_norm: None,
-                rotary_base: 10_000.0,
+                rotary_base: Some(10_000.0),
                 scale: VisionAttentionScale::InverseSqrtWidth,
                 span: VisionAttentionSpan::Full,
                 output: VisionLinear {

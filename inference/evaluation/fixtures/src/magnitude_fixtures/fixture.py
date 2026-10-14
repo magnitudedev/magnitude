@@ -10,7 +10,9 @@ from pydantic import Field, JsonValue, model_validator
 
 from .canonical import Record
 
-Family = Literal["tools", "prose-continue", "prose-repeat", "prose-shift", "retrieval", "code"]
+Family = Literal[
+    "tools", "prose-continue", "prose-repeat", "prose-shift", "retrieval", "code", "vision"
+]
 FAMILIES: tuple[Family, ...] = (
     "tools",
     "prose-continue",
@@ -18,6 +20,7 @@ FAMILIES: tuple[Family, ...] = (
     "prose-shift",
     "retrieval",
     "code",
+    "vision",
 )
 Message = dict[str, JsonValue]
 

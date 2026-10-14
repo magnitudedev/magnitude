@@ -165,3 +165,20 @@ fn bicubic_resize_preserves_pil_rgb_quantization() {
         assert!((value * 255.0 - (value * 255.0).round()).abs() <= 2.0e-5);
     }
 }
+
+#[test]
+fn oversized_preparation_is_refused_before_resizing_or_slicing() {
+    let mut bytes = Cursor::new(Vec::new());
+    DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, Rgb([255, 0, 0])))
+        .write_to(&mut bytes, ImageFormat::Png)
+        .unwrap();
+    for resize in [
+        ImageResize::PixelBounds { min_pixels: 1 << 28, max_pixels: 1 << 28 },
+        ImageResize::Slices { resolution: 16_384, max_slices: 9 },
+    ] {
+        let error = configured(1, 1, resize)
+            .prepare(&[bytes.get_ref().clone()])
+            .unwrap_err();
+        assert!(error.contains("prepared image pixels exceed capacity"), "{error}");
+    }
+}
