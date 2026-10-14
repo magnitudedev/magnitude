@@ -98,14 +98,21 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     expect(seen[0]).toBe("sudo -n true")
     expect(seen.findIndex(line => line.startsWith("download"))).toBeGreaterThan(0)
     expect(seen.at(-1)).toBe("magnitude server setup")
-    expect(result.output).not.toContain("Skipped")
+    expect(result.output).not.toContain("Not set up as a server")
   })
   it.each([["n", "No"], ["", "Enter"], ["<eof>", "Ctrl-D"]])("skips server setup for %j (%s)", value => {
     const result = answer(value)
     expect(result.status, result.output).toBe(0)
-    expect(result.output).toContain("Skipped. To set it up later: magnitude server setup")
+    expect(result.output).toContain("Not set up as a server. To run it as one later: magnitude server setup")
     expect(events()).not.toContain("magnitude server setup")
     expect(events()).toContain("install")
+  })
+  it("names the version it installed or upgraded from, without the package revision", () => {
+    const installed = join(root, "installed")
+    rmSync(installed, { force: true })
+    expect(answer("n", { TEST_INSTALLED: installed }).output).toContain("Magnitude 0.1.6 was installed.")
+    writeFileSync(installed, "0.1.5-58")
+    expect(answer("n", { TEST_INSTALLED: installed }).output).toContain("Magnitude was upgraded from 0.1.5 to 0.1.6.")
   })
   it("treats no answer within 60 seconds as No", () => {
     // The real timeout is exercised on the test machines; here it reports expiry at once.
@@ -114,14 +121,14 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     const result = answer("<none>")
     expect(result.status, result.output).toBe(0)
     expect(result.output).toContain(question)
-    expect(result.output).toContain("No answer, skipping. To set it up later: magnitude server setup")
+    expect(result.output).toContain("No answer, so it was not set up as a server. To run it as one later: magnitude server setup")
     expect(events()).not.toContain("magnitude server setup")
   })
-  it("does not ask without a terminal, uses non-interactive sudo, and prints the Skipped line", () => {
+  it("does not ask without a terminal, uses non-interactive sudo, and says the server was not set up", () => {
     const result = unattended()
     expect(result.status, result.stderr).toBe(0)
     expect(`${result.stdout}${result.stderr}`).not.toContain("[y/N]")
-    expect(result.stdout).toContain("Skipped. To set it up later: magnitude server setup")
+    expect(result.stdout).toContain("Not set up as a server. To run it as one later: magnitude server setup")
     expect(events()[0]).toBe("sudo -n true")
   })
   it("never validates with sudo -v, which asks NOPASSWD accounts for a password under verifypw=all", () => {
@@ -156,7 +163,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       expect(result.status, result.stderr).toBe(0)
       expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
         "systemctl stop magnitude.service", "install", "sudo systemctl start magnitude.service", "systemctl start magnitude.service"])
-      expect(result.stdout).toContain("Magnitude was upgraded to 0.1.6.")
+      expect(result.stdout).toContain("Magnitude was upgraded from 0.1.5 to 0.1.6.")
       expect(result.stdout).toContain("The server restarted.")
     })
     it("says so when the installed version is already current", () => {
