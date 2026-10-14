@@ -2400,6 +2400,7 @@ dependencies = [
  "magnitude-family-common",
  "magnitude-family-contracts",
  "magnitude-family-qwen",
+ "sha2 0.11.0",
 ]
 
 [[package]]
