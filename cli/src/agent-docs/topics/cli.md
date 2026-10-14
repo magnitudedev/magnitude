@@ -7,6 +7,7 @@ Use Desktop or `magnitude serve` to run inference. The following commands manage
 magnitude update [check|status|download|install|discard]
 magnitude app open
 magnitude serve
+magnitude server setup|remove
 magnitude status
 magnitude hardware
 magnitude catalog status
@@ -23,16 +24,21 @@ magnitude connections remove <harness>
 magnitude docs [topic-id]
 ```
 
-Run `magnitude serve` to host inference in the foreground, or open the desktop app.
+Run `magnitude serve` to host inference in the foreground, or open the desktop app. On Linux and
+macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, with Network access
+on; `magnitude server remove` removes it and keeps its data. See `magnitude docs remote-access`.
 Model, catalog, hardware, and connection setup commands require an existing service; they do not
 start one. `magnitude status` reports service and model status without starting anything. Stop a
 foreground server with Ctrl+C. Desktop launch-at-login and Quit are available in the desktop app.
 
 `update check` checks for a release; `download` waits until it is prepared; `status` reports the
 current update state; `discard` removes a prepared update. None of these commands opens Desktop.
-`update install` restarts a running Desktop but refuses to interrupt
-a headless server. Stop `serve` first, then either run it again to apply a prepared update that has not failed installation at startup or run `update install` to install while leaving the server stopped.
-Failed installation attempts require explicit retry. Linux installation may require system authorization.
+`update install` restarts a running Desktop to install. It refuses to interrupt a running server:
+on Linux and macOS a server installs downloaded updates by itself between requests when it can without
+a password, and otherwise prints that the update is downloaded. Stop `serve` (or a Windows service
+wrapper) first, run `update install`, then start it again. Starting `serve` again does not install a
+downloaded update. Failed installation attempts require explicit retry. Linux installation may require
+system authorization.
 
 Each command prints only the product information relevant to that operation. Collection commands
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.
