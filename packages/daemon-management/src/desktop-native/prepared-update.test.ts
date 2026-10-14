@@ -57,7 +57,7 @@ describe("last update outcome", () => {
 
 describe("unattended hold", () => {
   it("keeps the failed version held back across store reconstruction, after its outcome is reported, until released", async () => {
-    const hold = { version: Option.some("2.0.0"), until: 1_000 }
+    const hold = { version: Option.some("2.0.0"), reason: Option.some("install" as const), until: 1_000 }
     await run(Effect.gen(function* () {
       const store = yield* make
       expect(Option.isNone(yield* store.hold)).toBe(true)

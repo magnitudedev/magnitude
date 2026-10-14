@@ -110,13 +110,16 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
   // A version whose unattended installation failed is offered, but only a person downloads it again.
   const held = (candidate: Candidate) => store.hold.pipe(Effect.map(hold => Option.exists(Option.flatMap(hold, hold => hold.version), version => version === candidate.version)),
     Effect.orElseSucceed(() => false))
-  // A person asking again lifts the hold, so an unattended retry follows without waiting it out.
+  // Downloading explicitly lifts the hold, so an unattended retry follows without waiting it out.
   const releaseHold = store.releaseHold.pipe(Effect.ignore)
+  // A person checking again lifts only the wait; the version that failed stays held until downloaded explicitly.
+  const liftHoldWait = store.hold.pipe(Effect.flatMap(Option.match({ onNone: () => Effect.void,
+    onSome: hold => Option.isSome(hold.version) ? store.recordHold({ ...hold, until: 0 }) : store.releaseHold })), Effect.ignore)
   const check = (reason: UpdateCheckReason) => gate.withPermits(1)(Effect.gen(function* () {
     const current = yield* SubscriptionRef.get(state)
     if (current.transfer._tag === "Closed") return yield* closed
     if (current.check._tag === "Checking") return
-    if (reason === "manual") yield* releaseHold
+    if (reason === "manual") yield* liftHoldWait
     yield* SubscriptionRef.set(state, { ...current, check: { _tag: "Checking" } })
     yield* source.check(reason).pipe(
       Effect.flatMap(candidate => gate.withPermits(1)(Effect.gen(function* () {
