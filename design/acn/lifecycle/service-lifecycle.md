@@ -87,7 +87,10 @@ only. Sessions live in ACN memory, expire after 30 days unused, and end with `PO
 or when ACN restarts. Because every network change, including a regenerated key or disabling
 network access, applies only when ACN restarts, that restart is also what signs every browser out.
 Failed sign-ins are throttled per remote address: after five, each attempt waits twice as long as
-the last, up to one minute; a success clears the count. With no key configured, nobody can sign in.
+the last, up to one minute; a success clears the count. With no key configured, nobody can sign in,
+so ACN, reading network access at startup, makes and saves a key when network access is on with the
+key required and none exists (as when `network.enabled` is set in `config.json` by hand), and logs
+where it is saved, never the key itself.
 Inference routes require the generated API key as a Bearer token or `x-api-key` from remote callers
 unless the key requirement is switched off, and never from loopback callers; the session cookie
 never authorizes inference, and `requireApiKey` never affects sign-in. The Host header is accepted only for
