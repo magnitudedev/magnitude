@@ -530,7 +530,7 @@ function ModelStatus() {
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
   if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
-  if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400">Your model loads automatically when you start chatting.</p></div>
+  if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400">No model is loaded. Load one from My Models.</p></div>
   return <div className="mt-5">
     <div className="flex min-h-12 items-center justify-between gap-5">
       <div className="flex min-w-0 items-center gap-3">
