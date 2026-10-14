@@ -194,7 +194,8 @@ sudo session. Sudo is obtained and refreshed by running a command, never `sudo -
 default `verifypw=all`, validation asks a NOPASSWD account for a password whenever another of its
 rules needs one. It asks for a password only when `sudo -n` cannot run a command, and only from the
 terminal. Re-running it on a set-up server upgrades the package around a stopped service without
-asking again; however the installer ends, a service it stopped is started again. macOS and Windows
+asking again; however the installer ends, a service it stopped is started again, and a service an
+administrator had stopped stays stopped. It reports whether the version changed. macOS and Windows
 install the desktop app without a question. Linux bootstrap requires curl, coreutils `timeout`,
 Python 3 and OpenSSL with Ed25519 support; Windows bootstrap uses the publisher-signed CLI from the
 selected release.

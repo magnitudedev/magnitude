@@ -14,7 +14,8 @@ fail() { printf '%s\n' "$*" >&2; exit 1; }
 case "$origin" in https://*) ;; *) fail 'The installation script has no release origin.' ;; esac
 case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64) arch=x64 ;; *) fail 'This architecture is not supported.' ;; esac
 umask 077
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-install.XXXXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/magnitude-install.XXXXXXXX") \
+  || fail "Could not create a temporary directory in ${TMPDIR:-/tmp}. Check that it exists, is writable and has free space."
 keepalive=''
 stopped_server=''
 privilege=''
@@ -30,17 +31,33 @@ restore_server() {
 }
 cleanup() { restore_server; [ -z "$keepalive" ] || kill "$keepalive" 2>/dev/null || true; rm -rf "$scratch"; }
 trap cleanup EXIT
-trap 'exit 130' INT
+# Ends the line ^C left, so the shell prompt starts on its own line.
+trap 'printf "\n" >&2; exit 130' INT
 trap 'exit 143' TERM HUP
 scratch=$(cd "$scratch" && pwd -P)
 download() {
   curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
-    --connect-timeout 15 --max-time 600 --max-filesize "$3" --output "$2" "$1"
+    --connect-timeout 15 --max-time 600 --max-filesize "$3" --output "$2" "$1" && return 0
+  case $? in
+    22) fail 'The download server answered with an error. Try again later; if it keeps failing, this release may have been withdrawn.' ;;
+    23) fail "Could not save the download in $scratch. Check that there is free disk space." ;;
+    63) fail 'The download is larger than the release says.' ;;
+    *) fail 'The download failed. Check the network connection and try again.' ;;
+  esac
 }
 # The landing server counts each request and answers with the publisher-signed offer for this target.
 offer() { download "$origin/api/installer?os=$1&arch=$arch&package=$2&offer=1" "$scratch/offer.json" 16384; }
 # Answers come from the terminal, never from the script's piped stdin.
 has_terminal() { (: </dev/tty) 2>/dev/null; }
+# The installed package's version, or nothing when it is not installed.
+installed_version() {
+  case "$package" in
+    deb) version=$(dpkg-query -W -f '${Version}' magnitude-desktop 2>/dev/null) || version='' ;;
+    rpm) version=$(rpm -q --qf '%{VERSION}-%{RELEASE}' magnitude-desktop 2>/dev/null) || version='' ;;
+    *) version=$(pacman -Q magnitude-desktop 2>/dev/null) && version=${version#* } || version='' ;;
+  esac
+  printf '%s' "$version"
+}
 
 case "$(uname -s)" in
   Darwin)
@@ -124,8 +141,8 @@ case "$(uname -s)" in
     if [ "$(id -u)" -ne 0 ]; then
       command -v sudo >/dev/null 2>&1 || fail 'Installing Magnitude needs sudo. Install it, or run this installer as root.'
       if sudo -n true 2>/dev/null; then :
-      elif has_terminal; then sudo true </dev/tty || fail 'Installing Magnitude needs administrator access.'
-      else fail 'Installing Magnitude needs administrator access, and there is no terminal to ask for a password. Run it in a terminal, or allow passwordless sudo.'
+      elif has_terminal; then sudo true </dev/tty || fail 'Installing Magnitude needs an administrator account (one that can use sudo). Run this installer as an administrator.'
+      else fail 'Installing Magnitude needs an administrator account (one that can use sudo), and there is no terminal to ask for a password. Run it in a terminal as an administrator, or as an administrator with passwordless sudo.'
       fi
       privilege=sudo
       # Detached from the terminal so the installer's session ends when it does.
@@ -184,6 +201,9 @@ PY
     if [ "$package" = deb ]; then
       $privilege apt-get update || printf '%s\n' 'Could not refresh the package lists; installing anyway.' >&2
     fi
+    # The scratch directory is private; apt reads the already verified package as its _apt account.
+    if [ "$package" = deb ]; then chmod 755 "$scratch"; chmod 644 "$scratch/magnitude.deb"; fi
+    before=''; [ "$answer" != configured ] || before=$(installed_version)
     # A running server holds the installation lock the package checks, so upgrade it stopped.
     if [ "$answer" = configured ] && systemctl is-active --quiet magnitude.service; then
       stopped_server=1
@@ -193,20 +213,29 @@ PY
     elif [ "$package" = rpm ]; then $privilege dnf install -y "$scratch/magnitude.rpm"
     else $privilege pacman -U --noconfirm "$scratch/magnitude.pacman"
     fi || fail 'The Magnitude package could not be installed; see the package manager output above.'
+    restart=$stopped_server
     stopped_server=''
+    after=''; [ "$answer" != configured ] || after=$(installed_version)
 
     # 4. Set up the server, reusing the sudo session from step 2, or say how to later.
     case "$answer" in
       configured)
-        $privilege systemctl start magnitude.service
-        printf '%s\n' 'Magnitude was upgraded and the server restarted. Run `magnitude status` to check on it.' ;;
+        if [ -n "$after" ] && [ "$after" = "$before" ]; then printf '%s\n' "Magnitude $after is already up to date."
+        else printf '%s\n' "Magnitude was upgraded${after:+ to $after}."
+        fi
+        # Only a server this installer stopped is started; one an administrator stopped stays stopped.
+        if [ -n "$restart" ]; then
+          $privilege systemctl start magnitude.service
+          printf '%s\n' 'The server restarted. Run `magnitude status` to check on it.'
+        else printf '%s\n' 'The server was not running and was left stopped. Start it with: sudo systemctl start magnitude'
+        fi ;;
       yes)
         if [ -z "$privilege" ] && [ -n "${SUDO_USER:-}" ]; then
           printf '%s\n' "Magnitude was installed. To set up the server, run as $SUDO_USER: magnitude server setup"
         else magnitude server setup </dev/null
         fi ;;
-      timeout) printf '%s\n' 'Magnitude was installed.' 'No answer, skipping. To set it up later: magnitude server setup' ;;
-      *) printf '%s\n' 'Magnitude was installed.' 'Skipped. To set it up later: magnitude server setup' ;;
+      timeout) printf '%s\n' 'Magnitude was installed. Open it from your applications menu.' 'No answer, skipping. To set it up later: magnitude server setup' ;;
+      *) printf '%s\n' 'Magnitude was installed. Open it from your applications menu.' 'Skipped. To set it up later: magnitude server setup' ;;
     esac
     ;;
   *) fail 'This operating system is not supported.' ;;

@@ -11,7 +11,7 @@ import { renderUnixInstallationScript } from "./installation-scripts"
 
 const which = (tool: string) => spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
 const python = which("python3"), setsid = which("setsid")
-const tools = ["cat", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
+const tools = ["cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 // Drives the installer in a new session whose controlling terminal is a pty, with the script on
 // stdin as `curl | sh` does, and answers the question once it appears.
 const driver = `
@@ -62,9 +62,10 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       '[ "$1" != -n ] || shift',
       'exec "$@"',
     ].join("\n") + "\n")
-    stub("systemctl", 'printf "systemctl %s\\n" "$*" >> "$TEST_LOG"\n')
+    stub("systemctl", 'printf "systemctl %s\\n" "$*" >> "$TEST_LOG"\n[ "$1 ${TEST_SERVICE_INACTIVE:-}" != "is-active 1" ] || exit 3\n')
+    stub("dpkg-query", '[ -n "${TEST_INSTALLED:-}" ] || exit 1\nprintf "%s" "$(cat "$TEST_INSTALLED")"\n')
     stub("env", 'while [ "$#" -gt 0 ]; do case "$1" in *=*) shift;; *) break;; esac; done\nexec "$@"\n')
-    stub("apt-get", 'printf "%s\\n" "$1" >> "$TEST_LOG"\n[ "$1" != install ] || [ -z "${TEST_INSTALL_FAILS:-}" ] || exit 100\n')
+    stub("apt-get", 'printf "%s\\n" "$1" >> "$TEST_LOG"\n[ "$1" != install ] || [ -z "${TEST_INSTALL_FAILS:-}" ] || exit 100\n[ "$1" != install ] || [ -z "${TEST_INSTALLED:-}" ] || printf "0.1.6" > "$TEST_INSTALLED"\n')
     stub("magnitude", 'printf "magnitude %s\\n" "$*" >> "$TEST_LOG"\n')
     // The installer behaves as an ordinary account, whatever account runs the tests.
     stub("id", 'case "$1" in -u) echo 1000;; *) exec /usr/bin/id "$@";; esac\n')
@@ -146,6 +147,8 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     // The marker lives under /etc; point this copy of the script at one the test owns.
     beforeEach(() => {
       writeFileSync(join(root, "server"), "")
+      writeFileSync(join(root, "installed"), "0.1.5")
+      environment.TEST_INSTALLED = join(root, "installed")
       writeFileSync(script, readFileSync(script, "utf8").replace("server_marker=/etc/magnitude/server", `server_marker=${join(root, "server")}`))
     })
     it("upgrades around a stopped service without asking", () => {
@@ -153,7 +156,21 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       expect(result.status, result.stderr).toBe(0)
       expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
         "systemctl stop magnitude.service", "install", "sudo systemctl start magnitude.service", "systemctl start magnitude.service"])
-      expect(result.stdout).toContain("the server restarted")
+      expect(result.stdout).toContain("Magnitude was upgraded to 0.1.6.")
+      expect(result.stdout).toContain("The server restarted.")
+    })
+    it("says so when the installed version is already current", () => {
+      writeFileSync(join(root, "installed"), "0.1.6")
+      const result = unattended()
+      expect(result.status, result.stderr).toBe(0)
+      expect(result.stdout).toContain("Magnitude 0.1.6 is already up to date.")
+      expect(result.stdout).not.toContain("upgraded")
+    })
+    it("leaves a server the administrator stopped stopped", () => {
+      const result = unattended({ TEST_SERVICE_INACTIVE: "1" })
+      expect(result.status, result.stderr).toBe(0)
+      expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "install"])
+      expect(result.stdout).toContain("left stopped")
     })
     it("starts the server again when the package does not install", () => {
       const result = unattended({ TEST_INSTALL_FAILS: "1" })
