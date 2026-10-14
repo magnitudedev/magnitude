@@ -18,7 +18,7 @@
   <a href="https://github.com/magnitudedev/magnitude/stargazers"><img src="https://img.shields.io/github/stars/magnitudedev/magnitude" alt="GitHub Repo stars"></a>
 </p>
 
-Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
+Magnitude is an open source inference engine that tunes its kernels on your hardware to find the fastest way to run each model. It's over 2x faster than Ollama and works on Apple Silicon, NVIDIA, AMD, or just a CPU. One click connects it to the agent you already use (Pi, OpenCode, Hermes, Codex, and more).
 
 **[Download Magnitude for macOS, Windows, or Linux](https://magnitude.dev/download)**
 
@@ -43,7 +43,7 @@ The desktop app includes the `magnitude` CLI. No separate installation is needed
 
 ### Run it on a server
 
-On Linux and macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, keeps running after logout, updates itself, and serves browsers and agents on other computers. On Linux, the install command offers to set this up for you. See [Remote server](https://docs.magnitude.dev/remote-server).
+On Linux and macOS, `magnitude server setup` runs Magnitude as a service that starts at boot, keeps running after logout, updates itself, and serves browsers and agents on other computers. See [Remote server](https://docs.magnitude.dev/remote-server).
 
 ## Why Magnitude?
 
@@ -55,11 +55,11 @@ On Linux and macOS, `magnitude server setup` runs Magnitude as a service that st
 - **Works with your agent:** one click to connect Pi, OpenCode, Hermes, Codex, and more
 - **Free, private, open source:** no token costs, nothing leaves your machine, Apache 2.0
 
-## 2x faster than Ollama
+## Over 2x faster than Ollama
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/ollama-dark.svg">
-  <img alt="Magnitude vs Ollama, average of 11 popular local models: 34% faster prefill and 100% faster decode on Mac, 27% faster prefill and 100% faster decode on NVIDIA" src="assets/benchmarks/ollama-light.svg" width="800">
+  <img alt="Magnitude vs Ollama, average of 11 popular local models: 32% faster prefill and 119% faster decode on Mac, 34% faster prefill and 117% faster decode on NVIDIA" src="assets/benchmarks/ollama-light.svg" width="800">
 </picture>
 
 ## FAQ
@@ -70,7 +70,7 @@ An open source inference engine that optimizes each model for your exact hardwar
 
 ### How is it faster than llama.cpp, Ollama, or LM Studio?
 
-They ship one-size-fits-all kernels, because tuning each model for each chip by hand would take forever. Magnitude tunes them automatically. When you download a model, it spends up to a minute on your actual chip trying different ways to split up the math (how many GPU threads team up, how big a chunk each one takes, how far ahead to load data) and keeps the fastest combination that doesn't change the model's output. [See the benchmarks against Ollama.](#2x-faster-than-ollama)
+They ship one-size-fits-all kernels, because tuning each model for each chip by hand would take forever. Magnitude tunes them automatically. When you download a model, it spends up to a minute on your actual chip trying different ways to split up the math (how many GPU threads team up, how big a chunk each one takes, how far ahead to load data) and keeps the fastest combination that doesn't change the model's output. [See the benchmarks against Ollama.](#over-2x-faster-than-ollama)
 
 ### What hardware do I need?
 
