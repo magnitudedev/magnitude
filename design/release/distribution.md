@@ -113,7 +113,9 @@ removal (not upgrade) delete it. The unit starts the CLI through a `bin_t` progr
 the service runs as `unconfined_service_t` like any packaged daemon; the `lib_t` CLI started
 directly would stay in confined `init_t`, which cannot reach its own engine over loopback.
 The sudoers rule lets only that account run the installed update helper
-without a password; without sudo installed, setup writes none and the service only notices updates.
+without a password, naming the exact arguments the service passes (the server's own update request),
+since sudo-rs, the default sudo from Ubuntu 25.10, refuses rules with argument wildcards; without sudo
+installed, setup writes none and the service only notices updates.
 Each Polkit action names only its own wrapper: the installer wrapper accepts exactly the
 installer's arguments and executes the CLI's installer entry by absolute path; the removal wrapper
 accepts no arguments and executes the CLI's `_server-remove` entry by absolute path, so the person

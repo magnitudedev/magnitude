@@ -11,12 +11,14 @@ export const SERVER_PORT = 10100
 export const SERVER_MARKER_PATH = "/etc/magnitude/server"
 export const SERVER_MARKER_CONTENT = "Magnitude runs as the system service on this machine. Remove it with `magnitude server remove`.\n"
 /**
- * Lets only the service account run the installed update helper as root. Setup writes it once that
- * system account exists, and removal (or removing the package) deletes it; no package ships it.
+ * Lets only the service account run the installed update helper as root, with the exact arguments the
+ * service passes: sudo-rs (the default sudo from Ubuntu 25.10) refuses rules with argument wildcards.
+ * Setup writes it once that system account exists, and removal (or removing the package) deletes it;
+ * no package ships it.
  */
 export const SERVER_SUDOERS_PATH = "/etc/sudoers.d/magnitude"
 export const SERVER_SUDOERS_RULE = `# Lets the Magnitude server service install verified Magnitude updates. Written by \`magnitude server setup\`.
-magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update *
+magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update ${SERVER_DATA_DIRECTORY}/updates/update.json --parent-stdin
 `
 
 /** macOS runs the server as a LaunchDaemon for the person who set it up; no server profile is needed. */
