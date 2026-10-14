@@ -8,7 +8,7 @@ describe("AcnServiceLifecycle", () => {
       const lifecycle = yield* makeAcnServiceLifecycle()
       yield* lifecycle.reportStarting("Resolving", Option.none())
       const starting = yield* lifecycle.state
-      yield* lifecycle.becomeReady(Effect.die("unused RPC"))
+      yield* lifecycle.becomeReady(Effect.die("unused RPC"), Option.none())
       const ready = yield* lifecycle.state
       expect(yield* lifecycle.beginStopping({ reason: "replacement" })).toBe(true)
       expect(yield* lifecycle.beginStopping({ reason: "fatal" })).toBe(false)

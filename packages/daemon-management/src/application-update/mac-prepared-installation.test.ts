@@ -124,12 +124,12 @@ describe.skipIf(process.platform !== "darwin")("prepared macOS installation", ()
     expect(yield* f.fs.exists(join(f.root, ".Magnitude.app.update"))).toBe(false)
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.5")
   })))
-  it("does not record an attempt or stage after archive verification fails", () => run(Effect.gen(function* () {
+  it("records only a verification failure, without an attempt or staging, when the archive is invalid", () => run(Effect.gen(function* () {
     const f = yield* fixture
     expect(yield* f.install.pipe(Effect.provideService(PreparedUpdateStore, { ...f.store,
       verify: () => Effect.fail(new PreparedUpdateFailed({ message: "Invalid archive" })) }),
       Effect.provideService(MacUpdateArchiveStager, f.stager), Effect.isFailure)).toBe(true)
-    expect(f.events).toEqual([])
+    expect(f.events).toEqual(["failure"])
     expect(yield* f.fs.readFileString(join(f.bundle, "version"))).toBe("0.1.5")
   })))
 })

@@ -20,8 +20,8 @@ describe.skipIf(process.platform === "win32")("nodeTerminalCommand", () => {
 
   it("returns the exit code and gives a lifetime stdin that stays open", async () => {
     expect(await Effect.runPromise(runInTerminal("/bin/sh", ["-c", "exit 3"], { stdin: "inherit" }))).toBe(3)
-    // read -t returns nonzero on timeout (pipe open, no data) and zero on EOF.
-    expect(await Effect.runPromise(runInTerminal("/bin/bash", ["-c", "read -t 1 line; [ $? -gt 128 ]"], { stdin: "lifetime" }))).toBe(0)
+    // A read from an open, empty stdin is still waiting a second later; at EOF it has already returned.
+    expect(await Effect.runPromise(runInTerminal("/bin/sh", ["-c", "exec 3<&0; read line <&3 & p=$!; sleep 1; kill -0 $p 2>/dev/null; s=$?; kill $p 2>/dev/null; exit $s"], { stdin: "lifetime" }))).toBe(0)
   })
 
   it("stops the child when interrupted", async () => {

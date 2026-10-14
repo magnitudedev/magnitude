@@ -19,8 +19,8 @@ const publicBytes = (key: KeyObject): Buffer => {
   return der.subarray(spkiPrefix.length)
 }
 
-/** Match Go url.Values.Encode, including the characters encodeURIComponent leaves unescaped. */
-const escapeQuery = (value: string) => encodeURIComponent(value).replace(/[!'()*]/g, value => `%${value.charCodeAt(0).toString(16).toUpperCase()}`).replace(/%20/g, "+")
+/** Plain percent-encoding: the hosting platform rewrites a "+" and the escaped forms of !'()* before the signature is verified. */
+const escapeQuery = (value: string) => encodeURIComponent(value)
 export const updateQuery = (fields: Readonly<Record<string, string>>): string => Object.keys(fields).sort()
   .map(key => `${escapeQuery(key)}=${escapeQuery(fields[key]!)}`).join("&")
 export const newUpdateNonce = Effect.sync(() => RequestNonce.make(randomBytes(16).toString("base64url")))

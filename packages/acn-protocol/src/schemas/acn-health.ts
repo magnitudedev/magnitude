@@ -76,7 +76,22 @@ export class AcnStarting extends Schema.TaggedClass<AcnStarting>()("Starting", {
   }),
 }) {}
 
-export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {}) {}
+export const AcnHardwareSummarySchema = Schema.Struct({
+  backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
+  gpuName: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  gpuKind: Schema.optionalWith(Schema.Literal("discrete", "integrated"), { as: "Option", exact: true }),
+  gpuMemoryBytes: Schema.optionalWith(NonNegativeSafeInteger, { as: "Option", exact: true }),
+  gpuCount: NonNegativeSafeInteger,
+  gpuUnusedReason: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  cpuModel: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  cpuCores: Schema.optionalWith(PositiveSafeInteger, { as: "Option", exact: true }),
+  memoryBytes: NonNegativeSafeInteger,
+})
+export type AcnHardwareSummary = typeof AcnHardwareSummarySchema.Type
+
+export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {
+  hardware: Schema.optionalWith(AcnHardwareSummarySchema, { as: "Option", exact: true }),
+}) {}
 
 export class AcnStopping extends Schema.TaggedClass<AcnStopping>()("Stopping", {
   reason: AcnStoppingReasonSchema,

@@ -10,6 +10,8 @@ import { UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makePreparedUpdateStore, PreparedUpdateStore, unixPrivateFilePermissions } from "@magnitudedev/daemon-management/desktop-native"
 import { makeLinuxUpdateSource } from "./linux-update-source"
 import { installPreparedUpdate, PreparedUpdateInstaller } from "./index"
+import { UpdateHardwareSource, unavailableUpdateHardware } from "./update-hardware"
+const runWithHardware = <A, E>(effect: Effect.Effect<A, E, UpdateHardwareSource>) => Effect.runPromise(Effect.provideService(effect, UpdateHardwareSource, unavailableUpdateHardware))
 
 describe("Linux prepared update", () => {
   it("retains one signed package across owner exit and defers background authorization", async () => {
@@ -19,11 +21,11 @@ describe("Linux prepared update", () => {
     await writeFile(archive, bytes)
     const publisher = generateKeyPairSync("ed25519")
     const target = { os: "linux", arch: "arm64", package: "deb" } as const
-    const release = await Effect.runPromise(signUpdateRelease({ version: "2.0.0", bytes: bytes.length,
+    const release = await runWithHardware(signUpdateRelease({ version: "2.0.0", bytes: bytes.length,
       sha256: createHash("sha256").update(bytes).digest("hex") }, target, publisher.privateKey))
     const options = { dataDirectory: directory, target, trustedPublishers: new Map([["test", publisher.publicKey]]) }
     try {
-      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      await runWithHardware(Effect.scoped(Effect.gen(function* () {
         const store = yield* makePreparedUpdateStore(options)
         const linux = yield* makeLinuxUpdateSource({ origin: "https://magnitude.dev", trustedPublishers: options.trustedPublishers,
           metadata: yield* Schema.decodeUnknown(UpdateClientMetadata)({ version: "1.0.0", os: "linux", os_version: "6.1", arch: "arm64", package: "deb" }),
@@ -36,7 +38,7 @@ describe("Linux prepared update", () => {
       })).pipe(Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer)))))
       expect((await readdir(join(directory, "updates"))).sort()).toEqual(["magnitude.deb", "update.json"])
       expect(await readFile(join(directory, "updates", "magnitude.deb"))).toEqual(bytes)
-      const pending = await Effect.runPromise(makePreparedUpdateStore(options).pipe(Effect.flatMap(store => store.read),
+      const pending = await runWithHardware(makePreparedUpdateStore(options).pipe(Effect.flatMap(store => store.read),
         Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer)))))
       expect(Option.getOrThrow(pending)).toEqual({ release, from: Option.some("1.0.0"), installation: { _tag: "Unattempted" } })
     } finally { await rm(directory, { recursive: true, force: true }) }

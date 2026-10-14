@@ -1,12 +1,15 @@
 import {
   AcnServiceLifecycleFsm,
   AcnStarting,
+  summarizeInferenceHardware,
   type AcnHealthState,
   type AcnStartupActivity,
   type AcnStartupProgress,
   type AcnStopping,
   type AcnStoppingReason,
+  type StartupBackend,
 } from "@magnitudedev/acn-protocol"
+import type { HardwareSnapshot } from "@magnitudedev/icn-protocol/schemas"
 import { HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Context, Deferred, Effect, Layer, Option, SubscriptionRef, Stream, type Scope } from "effect"
 
@@ -24,6 +27,7 @@ export interface AcnStopRequest {
 interface AcnRuntimeState {
   readonly lifecycle: AcnHealthState
   readonly rpc: Option.Option<AcnRpcApplication>
+  readonly backend: Option.Option<StartupBackend>
 }
 
 export interface AcnServiceLifecycleApi {
@@ -34,7 +38,7 @@ export interface AcnServiceLifecycleApi {
     activity: AcnStartupActivity,
     progress: Option.Option<AcnStartupProgress>,
   ) => Effect.Effect<void>
-  readonly becomeReady: (rpc: AcnRpcApplication) => Effect.Effect<void>
+  readonly becomeReady: (rpc: AcnRpcApplication, hardware: Option.Option<HardwareSnapshot>) => Effect.Effect<void>
   readonly beginStopping: (request: AcnStopRequest) => Effect.Effect<boolean>
   readonly awaitStopping: Effect.Effect<AcnStopping>
 }
@@ -61,6 +65,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
         progress: Option.none(),
       }),
       rpc: Option.none(),
+      backend: Option.none(),
     })
     const transitionLock = yield* Effect.makeSemaphore(1)
     const stopping = yield* Deferred.make<AcnStopping>()
@@ -84,6 +89,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
       yield* replaceState({
         lifecycle: next,
         rpc: Option.none(),
+        backend: current.backend,
       })
       yield* Deferred.succeed(stopping, next)
       return true
@@ -114,11 +120,12 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
                 progress,
               }),
               rpc: current.rpc,
+              backend: typeof activity === "object" && activity._tag === "PreparingBackend" ? Option.some(activity.backend) : current.backend,
             })
           }),
         )
 
-    const becomeReady: AcnServiceLifecycleApi["becomeReady"] = (rpc) =>
+    const becomeReady: AcnServiceLifecycleApi["becomeReady"] = (rpc, hardware) =>
       transitionLock.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* SubscriptionRef.get(runtime)
@@ -130,9 +137,10 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
             lifecycle: AcnServiceLifecycleFsm.transition(
               current.lifecycle,
               "Ready",
-              {},
+              { hardware: Option.map(hardware, snapshot => summarizeInferenceHardware(current.backend, snapshot)) },
             ),
             rpc: Option.some(rpc),
+            backend: current.backend,
           })
         }).pipe(Effect.uninterruptible),
       )

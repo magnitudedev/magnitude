@@ -1,9 +1,10 @@
-import { Deferred, Effect, Exit, Option, Schema, Stream, type Scope } from "effect"
+import { Deferred, Effect, Exit, Option, Ref, Schema, Stream, type Scope } from "effect"
 import { dirname } from "node:path"
 import { LoginStartupFailed, type OwnedServiceState } from "@magnitudedev/sdk/desktop-host"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import { unavailableApplicationUpdate, type ApplicationUpdate } from "../application-update/application-update"
 import { makeHeadlessUpdateControl, reportUpdateOutcome } from "../application-update/headless-update"
+import { UpdateHardwareSource, updateHardwareFromService } from "../application-update/update-hardware"
 import { WindowsPipeName, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native"
 import { NativeHost } from "./index"
 import { acquireApplicationOwner } from "./application-owner"
@@ -37,7 +38,7 @@ export const runHeadlessApplication = (options: {
   readonly stop: Effect.Effect<void>
   readonly stopping?: (reason: HeadlessStop) => Effect.Effect<void>
   readonly observe: (state: OwnedServiceState) => Effect.Effect<void>
-  readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope>
+  readonly initializeUpdates?: Effect.Effect<ApplicationUpdate, never, Scope.Scope | UpdateHardwareSource>
   readonly prepareStartup?: Effect.Effect<void, { readonly message: string }, Scope.Scope>
   readonly updateReady?: (version: string) => Effect.Effect<void>
   /**
@@ -73,7 +74,9 @@ export const runHeadlessApplication = (options: {
     }
   }
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
-  const updates = yield* options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("Application updates require an installed Magnitude application."))
+  const serviceState = yield* Ref.make<Option.Option<OwnedServiceState>>(Option.none())
+  const updates = yield* (options.initializeUpdates ?? Effect.succeed(unavailableApplicationUpdate("Application updates require an installed Magnitude application."))).pipe(
+    Effect.provideService(UpdateHardwareSource, { current: Ref.get(serviceState).pipe(Effect.map(Option.flatMap(updateHardwareFromService))) }))
   if (yield* Deferred.isDone(stop)) return yield* Deferred.await(stop)
   // Update checks start once the service is ready, so a new version reports `applied` only after it starts.
   const firstReady = yield* Deferred.make<void>()
@@ -102,6 +105,7 @@ export const runHeadlessApplication = (options: {
     },
   }
   const service = yield* makeApplicationService({ ...options, output: "Foreground", admission: "Immediate", owner: ownerAgent })
+  yield* service.changes.pipe(Stream.runForEach(state => Ref.set(serviceState, Option.some(state))), Effect.forkScoped)
   const control: ApplicationControlOptions = {
     snapshot: service.state.pipe(Effect.map(state => ({ version: 1 as const, pid: process.pid, endpoint: options.profile.endpoint, owner: { _tag: "Headless" as const }, service: state }))),
     dispatch: intent => intent === "Yield" || intent === "Quit" ? Deferred.succeed(stop, intent === "Yield" ? "DesktopTakeover" : "Requested").pipe(Effect.asVoid) : Effect.void,

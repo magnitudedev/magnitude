@@ -10,6 +10,8 @@ import { PreparedUpdateStore } from "../desktop-native/prepared-update"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
 import { makeInstalledUpdatePreparation } from "./installed-preparation"
 import { readPreparedUpdateState } from "./finite-update"
+import { UpdateHardwareSource, unavailableUpdateHardware } from "./update-hardware"
+const runWithHardware = <A, E>(effect: Effect.Effect<A, E, UpdateHardwareSource>) => Effect.runPromise(Effect.provideService(effect, UpdateHardwareSource, unavailableUpdateHardware))
 
 const publicKey = generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }).toString()
 const noWrites = PrivateFilePermissions.of({
@@ -23,7 +25,7 @@ describe("installed update preparation", () => {
     const root = await mkdtemp(join(tmpdir(), "magnitude-installed-preparation-"))
     try {
       await writeFile(join(root, "update-configuration.json"), JSON.stringify({ origin: "https://magnitude.dev", keyId: "test", publicKey, acceptance: false }))
-      const state = await Effect.runPromise(Effect.gen(function* () {
+      const state = await runWithHardware(Effect.gen(function* () {
         const preparation = yield* makeInstalledUpdatePreparation({ resources: root, addonPath: "must-not-load.node",
           dataDirectory: join(root, "missing-profile"), version: "0.1.5", osVersion: "24.0.0", platform,
           architecture: platform === "win32" ? "x64" : "arm64", isolated: true, owner: "headless" })

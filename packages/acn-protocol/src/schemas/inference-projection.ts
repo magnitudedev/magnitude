@@ -5,6 +5,7 @@ import {
   LocalInferenceMemoryDomainIdSchema,
   type LocalInferenceHardware,
 } from "./model-state"
+import type { AcnHardwareSummary, StartupBackend } from "./acn-health"
 
 export class InferenceHardwareProjectionError extends Data.TaggedError(
   "InferenceHardwareProjectionError",
@@ -72,3 +73,50 @@ export const projectInferenceHardware = (
     memoryDomains,
   }
 })
+
+type SnapshotDevice = { readonly device: InferenceSchema.HardwareDevice; readonly domain: InferenceSchema.HardwareMemoryDomain }
+const deviceBytes = ({ device, domain }: SnapshotDevice): number => Option.match(Option.flatMap(device.memory_limit, Option.fromNullable), {
+  onNone: () => domain.total_capacity_bytes,
+  onSome: limit => limit.total_bytes,
+})
+const usable = ({ device }: SnapshotDevice): boolean => Option.isNone(device.unavailable_reason)
+const startupBackendName = (backend: StartupBackend): AcnHardwareSummary["backend"] =>
+  backend._tag === "Cpu" ? "cpu" : backend._tag === "Metal" ? "metal" : backend._tag === "Cuda" ? "cuda" : "vulkan"
+
+/** The machine as one record: the backend the engine runs on, the GPU it runs on if any, and why a present GPU is not used. */
+export const summarizeInferenceHardware = (
+  loaded: Option.Option<StartupBackend>,
+  hardware: InferenceSchema.HardwareSnapshot,
+): AcnHardwareSummary => {
+  const devices: SnapshotDevice[] = hardware.memory_domains.flatMap(domain => domain.devices
+    .filter(device => device.kind !== "cpu")
+    .map(device => ({ device, domain })))
+  const largestFirst = [...devices].sort((a, b) => deviceBytes(b) - deviceBytes(a))
+  const backend = Option.match(loaded, {
+    onSome: startupBackendName,
+    onNone: () => largestFirst.find(usable)?.device.backend ?? "cpu",
+  })
+  const used = backend === "cpu" ? undefined : largestFirst.find(entry => entry.device.backend === backend && usable(entry))
+  const diagnostics = Option.getOrElse(hardware.backend_diagnostics, () => [])
+  const unusedReason = (entry: SnapshotDevice): string => Option.getOrElse(entry.device.unavailable_reason, () => {
+    const diagnostic = diagnostics.find(item => item.backend === entry.device.backend)
+    if (diagnostic) return `${entry.device.backend}: ${diagnostic.message}`
+    if (!hardware.enabled_backends.includes(entry.device.backend)) return `${entry.device.backend}: not available in this build`
+    if (entry.device.backend === "vulkan" && entry.device.kind === "integrated_gpu") return "vulkan: integrated GPU is not selected automatically"
+    return `${entry.device.backend}: not selected`
+  })
+  const unused = used ? undefined : largestFirst[0]
+  const physical = new Set(devices.map(entry => `${entry.domain.id}|${entry.device.name}`))
+  return {
+    backend,
+    gpuName: Option.fromNullable(used?.device.name).pipe(Option.filter(name => name.length > 0)),
+    gpuKind: used ? Option.some(used.device.kind === "integrated_gpu" ? "integrated" : "discrete") : Option.none(),
+    gpuMemoryBytes: used ? Option.some(deviceBytes(used)) : Option.none(),
+    gpuCount: physical.size,
+    gpuUnusedReason: unused ? Option.some(unusedReason(unused)) : Option.none(),
+    cpuModel: Option.flatMap(hardware.cpu_model, Option.fromNullable).pipe(Option.filter(model => model.trim().length > 0)),
+    cpuCores: Option.flatMap(hardware.physical_cores, Option.fromNullable).pipe(Option.filter(count => count > 0),
+      Option.orElse(() => hardware.logical_cores > 0 ? Option.some(hardware.logical_cores) : Option.none())),
+    memoryBytes: hardware.system_memory.physical_capacity_bytes,
+  }
+}

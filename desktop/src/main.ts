@@ -9,7 +9,7 @@ import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
 import { loadTrayStatusRow } from "./tray-status"
 import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource, hostedUpdateSource, startMacForegroundInstallation, macStartupUpdateOperation } from "@magnitudedev/daemon-management/application-update"
-import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
+import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, UpdateHardwareSource, updateHardwareFromService, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
 import { isNewerVersion } from "@magnitudedev/release"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
@@ -171,7 +171,9 @@ const program = Effect.scoped(Effect.gen(function* () {
         }
         return { source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release, metadata.version).pipe(
           Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))), installer: undefined }
-      }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provide(NodeContext.layer))
+      }).pipe(Effect.provideService(PreparedUpdateStore, store),
+        Effect.provideService(UpdateHardwareSource, { current: Ref.get(state).pipe(Effect.map(current => current ? updateHardwareFromService(current) : Option.none())) }),
+        Effect.provide(NodeContext.layer))
       restartPreparedUpdate = platform.installer ? intent => installPreparedUpdate(intent).pipe(
         Effect.provideService(PreparedUpdateStore, store), Effect.provideService(PreparedUpdateInstaller, platform.installer!)) : undefined
       const saved = yield* store.read

@@ -14,7 +14,7 @@ const metadata = Schema.decodeUnknownSync(UpdateClientMetadata)({ version: "1.0.
 const manifest = Schema.decodeUnknownSync(UpdateManifest)({ protocol: 1, tag: "@magnitudedev/cli@2.0.0", version: "2.0.0", commit: "a".repeat(40), artifact: {
   id: "desktop-arm64", target: { os: "darwin", arch: "arm64", package: "mac-zip" }, filename: "app.zip", bytes: 123, sha256: "b".repeat(64),
 } })
-const check = (fetch: (...args: Parameters<typeof globalThis.fetch>) => Promise<Response>, request: UpdateCheck = { reason: "manual", outcome: Option.none() }) => checkHostedUpdate({ origin: "https://magnitude.dev", metadata,
+const check = (fetch: (...args: Parameters<typeof globalThis.fetch>) => Promise<Response>, request: UpdateCheck = { reason: "manual", outcome: Option.none(), hardware: Option.none() }) => checkHostedUpdate({ origin: "https://magnitude.dev", metadata,
   sign: url => signUpdateRequest(installation.privateKey, url), trustedPublishers: new Map([[keyId, publisher.publicKey]]), userAgent: "Magnitude/1.0.0",
 }, request).pipe(Effect.provide(FetchHttpClient.layer), Effect.provideService(FetchHttpClient.Fetch, Object.assign(fetch, { preconnect: () => {} })))
 
@@ -49,13 +49,18 @@ describe("hosted update client", () => {
       expect(Option.isSome(await Effect.runPromise(Effect.option(decodeUpdateRequest(url, Math.floor(Date.now() / 1000)))))).toBe(true)
       return new Response(null, { status: 204 })
     }
-    await Effect.runPromise(check(fetch, { reason: "launch", outcome: Option.some({ outcome: "failed", version: "1.0.1", from: Option.some("1.0.0"), reason: Option.some("verify") }) }))
-    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.some("0.9.0"), reason: Option.none() }) }))
-    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.none(), reason: Option.none() }) }))
-    await Effect.runPromise(check(fetch, { reason: "manual", outcome: Option.none() }))
+    const hardware = { backend: "cuda" as const, gpu_name: Option.some("NVIDIA A10-8Q"), gpu_kind: Option.some("discrete" as const), gpu_memory_gb: Option.some(8), gpu_count: Option.some(1),
+      gpu_unused_reason: Option.none(), cpu_model: Option.some("AMD EPYC 7V13 64-Core Processor"), cpu_cores: Option.some(12), memory_gb: Option.some(110) }
+    await Effect.runPromise(check(fetch, { reason: "launch", outcome: Option.some({ outcome: "failed", version: "1.0.1", from: Option.some("1.0.0"), reason: Option.some("verify") }), hardware: Option.none() }))
+    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.some("0.9.0"), reason: Option.none() }), hardware: Option.some(hardware) }))
+    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.none(), reason: Option.none() }), hardware: Option.none() }))
+    await Effect.runPromise(check(fetch, { reason: "manual", outcome: Option.none(), hardware: Option.none() }))
     expect(seen.map(url => [url.searchParams.get("reason"), url.searchParams.get("outcome"), url.searchParams.get("outcome_version"), url.searchParams.get("outcome_reason"), url.searchParams.get("outcome_from")])).toEqual([
       ["launch", "failed", "1.0.1", "verify", "1.0.0"], ["scheduled", "applied", "1.0.0", null, "0.9.0"],
       ["scheduled", "applied", "1.0.0", null, null], ["manual", null, null, null, null],
+    ])
+    expect(seen.map(url => [url.searchParams.get("backend"), url.searchParams.get("gpu_name"), url.searchParams.get("gpu_memory_gb"), url.searchParams.get("cpu_cores"), url.searchParams.has("gpu_unused_reason")])).toEqual([
+      [null, null, null, null, false], ["cuda", "NVIDIA A10-8Q", "8", "12", false], [null, null, null, null, false], [null, null, null, null, false],
     ])
   })
   it("sends a verifiable complete request and accepts 204 without a body", async () => {

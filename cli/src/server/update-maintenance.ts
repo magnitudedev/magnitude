@@ -6,7 +6,7 @@ import { ApplicationUpdateControlFailed, type ApplicationUpdateAction } from "@m
 import { bundledWindowsNative } from "@magnitudedev/daemon-management/bun"
 import { acquireApplicationMaintenance, acquireUpdateInstallationLease, applicationNativeHostPath, nativeHostLayer, resolveInstalledApplicationRuntime,
   PreparedUpdateStore, UpdatePreferences, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
-import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
+import { ApplicationUpdateSource, makeInstalledUpdatePreparation, readPreparedUpdateState, discardPreparedUpdate, runFiniteUpdatePreparation, completeLinuxForegroundUpdate, startMacForegroundInstallation, UpdateHardwareSource, unavailableUpdateHardware } from "@magnitudedev/daemon-management/application-update"
 import { runWindowsInstalledUpdate } from "./windows-startup-update"
 import { CLI_VERSION } from "../version"
 import { isDevelopmentBuild } from "../runtime/environment"
@@ -47,7 +47,7 @@ export const runLocalUpdateMaintenance = (options: {
         return yield* readPreparedUpdateState
       }
       if (options.action === "discard") return yield* discardPreparedUpdate
-      const source = yield* preparation.makeSource
+      const source = yield* preparation.makeSource.pipe(Effect.provideService(UpdateHardwareSource, unavailableUpdateHardware))
       return yield* runFiniteUpdatePreparation(options.action === "check" ? "check" : "download").pipe(
         Effect.provideService(ApplicationUpdateSource, source))
     })

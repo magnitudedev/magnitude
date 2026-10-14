@@ -41,7 +41,7 @@ describe("privileged update installer grammar", () => {
   })
 })
 
-describe("privileged update installer refusals", () => {
+describe.skipIf(process.getuid?.() !== 0)("privileged update installer refusals", () => {
   let root: string
   let system: string
   let data: string
