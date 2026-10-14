@@ -12,11 +12,12 @@ function DocsLink({ path, children }: { path: string; children: ReactNode }) {
 }
 
 /** The inference API for other apps; from another device it describes the key that device must send. */
-export function OtherApps({ origin, model, platform, remote = false, onOpenSettings }: {
+export function OtherApps({ origin, model, platform, remote = false, networkAccess = false, onOpenSettings }: {
   origin: string
   model: string | undefined
   platform: string
   remote?: boolean
+  networkAccess?: boolean
   onOpenSettings: () => void
 }) {
   const [showExample, setShowExample] = useState(false)
@@ -40,7 +41,7 @@ export function OtherApps({ origin, model, platform, remote = false, onOpenSetti
         </div>
         {showExample && <div id="other-apps-example" className="mt-3"><CopyCommand multiline command={exampleRequest(baseUrl, model ?? "MODEL_ID", platform, remote)} label="Copy example request" /></div>}
       </div>
-      <p className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750">{remote ? "Copy the key from Network access in " : "To use it from another device, turn on network access in "}<button type="button" onClick={onOpenSettings} className={`${inlineLink} cursor-pointer`}>Settings</button>.</p>
+      <p className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750">{remote ? "Copy the key from Network access in " : networkAccess ? "Other devices use the address and API key under Network access in " : "To use it from another device, turn on network access in "}<button type="button" onClick={onOpenSettings} className={`${inlineLink} cursor-pointer`}>Settings</button>.</p>
     </article>
   </section>
 }

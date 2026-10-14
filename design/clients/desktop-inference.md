@@ -272,7 +272,8 @@ OpenAI-compatible API runs on this computer that any app or agent can use. The b
 control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
 request toggle pinned right on the note's row, wrapping beneath it in narrow windows, reveals a request for the active or best downloaded model in the
 user's shell. A divided footer links to Settings for network
-access. Network addresses and controls stay in Settings. Viewed from another device, the card
+access, asking to turn it on while it is off and pointing to its address and key once it is on.
+Network addresses and controls stay in Settings. Viewed from another device, the card
 describes the server's API at the address the browser used: the caption asks for the Network access
 key, the example request is in the viewer's shell and sends the key as a placeholder Bearer header,
 and the footer points to the key in Settings. In a browser, local or remote, the harness rows have no

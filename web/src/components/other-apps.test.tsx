@@ -18,6 +18,12 @@ it("shows the local base URL and a Settings link with the example request collap
   expect(html).not.toContain("chat/completions")
 })
 
+it("points to the address and key in Settings once network access is on", () => {
+  const html = renderToStaticMarkup(<OtherApps origin="http://127.0.0.1:10100" model="m" platform="linux" networkAccess onOpenSettings={() => {}} />)
+  expect(html).toContain("Other devices use the address and API key under Network access in")
+  expect(html).not.toContain("turn on network access")
+})
+
 it("quotes the example for the user's shell", () => {
   expect(exampleRequest(baseUrl, "it's", "darwin")).toContain(`'{"model":"it'\\''s"`)
   expect(exampleRequest(baseUrl, "it's", "win32")).toMatch(/^Invoke-RestMethod .* -Body '\{"model":"it''s"/)

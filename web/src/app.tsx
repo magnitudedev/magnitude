@@ -467,6 +467,8 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
     : Option.some(window.location.origin)
   const platform = useServerPlatform()
   const { remote } = useRemoteAccess()
+  const client = useAgentClient()
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
@@ -478,7 +480,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
-    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} onOpenSettings={() => navigate("settings")} />}
+    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} networkAccess={Result.isSuccess(network) && network.value.enabled} onOpenSettings={() => navigate("settings")} />}
   </>
 }
 /** One-click connections, for the desktop app only: it runs where the agents run. */
