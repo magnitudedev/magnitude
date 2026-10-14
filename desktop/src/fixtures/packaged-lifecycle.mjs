@@ -191,8 +191,8 @@ try {
   await eventually(visibility, [{ visible: true, minimized: false }]);
   const window = await app.firstWindow();
   window.setDefaultTimeout(10000);
-  // Connections go through the service, so the packaged CLI reaches the same failure the app shows.
-  const rejectedCommand = spawnSync(join(dirname(dirname(executablePath)), 'Resources', 'magnitude'), ['connections', 'add', 'codex'], { env, encoding: 'utf8' });
+  // The packaged CLI connects a harness for the person running it and reports the same failure the app shows.
+  const rejectedCommand = spawnSync(join(dirname(dirname(executablePath)), 'Resources', 'magnitude'), ['connections', 'connect', 'codex'], { env, encoding: 'utf8' });
   assert.notEqual(rejectedCommand.status, 0);
   const rejectedConnection = `${rejectedCommand.stdout}${rejectedCommand.stderr}`;
   assert.match(rejectedConnection, /No installed Magnitude models are available|Codex is not installed/);
