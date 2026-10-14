@@ -1,5 +1,70 @@
 # @magnitudedev/cli
 
+## 0.2.9
+
+### Patch Changes
+
+- [`5bbdd73`](https://github.com/magnitudedev/magnitude/commit/5bbdd73809a17be7f4dae2e0aed25eac800eb158) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Connect Claude Code without a Claude login. Requests, including those from its built-in subagents, use the loaded local model. If you sign in later, reconnect to use your own login for Claude models.
+
+- [`195481a`](https://github.com/magnitudedev/magnitude/commit/195481a154c389cfd4b1c9c00d7c08baf3209408) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Clarify Discover's speed-versus-quality preference under "Recommended for your machine", and update the README and documentation to explain hardware-specific kernel tuning and the performance comparison with Ollama.
+
+- [`ff42cdb`](https://github.com/magnitudedev/magnitude/commit/ff42cdb2a12d1c33a61bbaff1a97525f81829475) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Fix installation, update and reliability problems found in release testing.
+
+  - Linux packages install on RHEL 9 and other systems with glibc 2.34, and the Ubuntu and Debian package no longer pulls a KDE desktop onto headless machines.
+  - The Linux desktop app no longer crashes when it restarts to apply a setting.
+  - On Windows, the app window comes back after Restart to update, and the Magnitude app and service show Magnitude's name, publisher and version in firewall prompts, Task Manager and file properties.
+  - On a Mac, another account's leftover installation lock no longer stops the app from opening, and installing says plainly when another account owns the app or left an update behind.
+  - An update that installs but never starts is reported as failed by the desktop app too, and isn't installed again automatically. `magnitude update status` and Settings show a failed update as failed, update errors are readable sentences, and `magnitude update check` prints its result. Linux updates wait for another package manager to finish instead of failing.
+  - A failed inference engine download is reported in one plain sentence instead of an internal error, and when port 10100 is taken, Magnitude says whether another account's Magnitude or another program holds it.
+  - Cancelling a model download removes its partial files, and the free-space check counts a model and its separate draft together. A model folder Magnitude can't write to is refused, and an unusable saved folder no longer stops Magnitude from starting.
+  - `magnitude status` shows the address the service actually listens on, and `magnitude connections list` shows agents you never connected as not connected.
+
+- [`00f2045`](https://github.com/magnitudedev/magnitude/commit/00f20455cb9dc643da59edbc2115c520984300b9) Thanks [@anerli](https://github.com/anerli)! - Improve inference performance through better kernel tuning and token packing.
+
+  - The one-time optimization spends its time on the kernels that account for the most measured work, within the existing time budget. This improves generation speed, including Gemma 4 on Apple Silicon.
+  - Token packing on Apple Silicon now supports 8-bit weight formats, including DFlash draft models, and improves packing accuracy for existing formats. This also speeds up prompt processing.
+
+- [`ce324d2`](https://github.com/magnitudedev/magnitude/commit/ce324d23b7f85f3f1de806900d97b5f698e7e4bf) Thanks [@anerli](https://github.com/anerli)! - Add Liquid LFM2.5 24B-A2B to the catalog in Q4, Q5, Q6 and Q8. This reasoning model supports local agents, coding and tool use.
+
+- [`707b012`](https://github.com/magnitudedev/magnitude/commit/707b012cba52a043a1eae8a557893572c6353df8) Thanks [@anerli](https://github.com/anerli)! - Add MiniCPM-V 4.7 1B and 35B-A3B in Q4, Q5, Q6 and Q8, with image understanding and DSpark speculative decoding. Both models include their 4x vision projectors and Q8 drafters. Image processing reuses identical crops and checks memory capacity before allocating resized images; 16x visual compression is not supported.
+
+- [`f462efd`](https://github.com/magnitudedev/magnitude/commit/f462efd6b822042ea153efe06306050f264931a1) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Improve model memory management and loading reliability.
+
+  - Keep loaded models' GPU memory resident through idle gaps on Macs, avoiding the delay of wiring it back into memory when the next request arrives.
+  - Fix large model loads being rejected because of brief memory pressure caused by the load itself. Memory protection now responds to sustained thrashing or swapping.
+  - Refuse to load a model assessed as not fitting before unloading the current model, and disable its Load action in the desktop.
+  - Fix NVIDIA GPU capacity being underestimated on Linux when other programs hold GPU memory at startup, so model recommendations and fit assessments use the device's usable capacity.
+
+- [`539c333`](https://github.com/magnitudedev/magnitude/commit/539c3333864bbd19e1db9030821802eece049e46) Thanks [@anerli](https://github.com/anerli)! - Add Qwen3.8 Flash Next in Q2, Q4, Q6 and Q8, with its shared MTP drafting head for faster generation. Its large n-gram tables stream from storage instead of being held whole in memory. Also add a smaller Q2 variant of Qwen3.6 35B A3B, with DFlash speculative decoding.
+
+- [`33907ee`](https://github.com/magnitudedev/magnitude/commit/33907ee513b7291c1227ebdfdbefbd80b187e353) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Run Magnitude as a server. `magnitude server setup` makes it a background service that starts at boot, keeps running after you log out, restarts if it crashes, updates itself, and serves browsers and agents on other computers. `magnitude server remove` stops it and keeps your models and settings.
+
+  - Linux: a systemd service running as a dedicated `magnitude` system account, with its data in `/var/lib/magnitude`. On Fedora and other firewalld systems, setup opens port 10100 for you.
+  - macOS: a background service that runs as you, starts before anyone logs in, and keeps using your models and settings in `~/.magnitude`.
+  - Windows: the remote server guide shows how to run `magnitude serve` as a Windows service with NSSM.
+  - Install from a terminal: `curl -fsSL https://magnitude.dev/install.sh | sh` on macOS and Linux, or `irm https://magnitude.dev/install.ps1 | iex` in Windows PowerShell. On Linux the installer asks once, up front, whether to run Magnitude as a server (default no, skipped automatically after 60 seconds or when there's no terminal), then installs without further questions. It doesn't ask for a password when your account already has password-free sudo, refreshes the package lists so it works on fresh Ubuntu and Debian cloud images, waits for another package manager to finish instead of failing, refuses unsupported systems before downloading anything, and says which version it installed or upgraded from.
+  - Servers update themselves, including on Ubuntu 25.10 and later, where sudo is sudo-rs: a downloaded update installs when Magnitude is idle, never in the middle of a request, and the server comes back on the new version on its own. If an update fails to install, the server keeps running the current version and won't keep retrying it; a newer release installs normally, and `magnitude update check` retries on demand. If a new version installs but fails to start, the server reports it, won't install that version again on its own, and keeps checking so a fixed release reaches it.
+  - Updates never install at startup any more on any platform: Magnitude always starts right away, and tells you when an update is ready (Restart in the desktop app, or `magnitude update install`).
+  - On Linux desktops, installing an update with Restart no longer asks for your password.
+  - When Magnitude runs as a server, `magnitude serve` and `magnitude status` show how to reach it: the address on this computer, the addresses other devices can use, and the address for apps and agents. The network access key is shown once during setup and never in logs or status. If network access is turned on in `config.json` without a key, Magnitude creates one.
+  - `magnitude server setup` refuses to start if another account's Magnitude is already using port 10100, and changes nothing. If the service can't start, setup and `magnitude status` show why, including when it keeps restarting. On Ubuntu with ufw active, setup prints the command that opens the port.
+  - Reinstalling the package keeps a server able to update itself, and purging the Debian or Ubuntu package removes the server's setup.
+  - If you open the desktop app while the server is running, it explains that the two can't run together and lets you keep the server (and open it in your browser) or stop it and use the app, without a password on Linux.
+  - `magnitude connections connect <agent>` sets up the agent for the person running the command, so connecting an agent on a server configures your own account rather than the service's.
+  - `magnitude serve` on Windows keeps running when another user logs off the machine.
+  - Fixes: update reports now say which version a computer updated from, and successful updates installed from the terminal are reported; installing on a Mac no longer fails when your shell profile can't be edited; a failed reinstall no longer leaves the server stopped.
+
+- [#176](https://github.com/magnitudedev/magnitude/pull/176) [`c57fcea`](https://github.com/magnitudedev/magnitude/commit/c57fceadfd01a3580fa3c2d29b56a30b2c567f37) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - Improve grammar preparation for structured output and parallel tool calls. Large repetition bounds and shared rules no longer unnecessarily inflate certification and flattening work, and loop handling accounts for overlapping text. Fix JSON-schema additional-property keys to use valid JSON string grammar.
+
+- [#176](https://github.com/magnitudedev/magnitude/pull/176) [`c57fcea`](https://github.com/magnitudedev/magnitude/commit/c57fceadfd01a3580fa3c2d29b56a30b2c567f37) Thanks [@thrgreenwald](https://github.com/thrgreenwald)! - - Use Magnitude from a web browser. The Magnitude service now serves the full app at `http://<computer>:10100`, the same interface as the desktop app: Discover, Catalog, My Models, Connections, Usage, Status and Settings.
+  - Open the app from another device on your network. Turn on Network access in Settings, then sign in from the other device's browser with the network access key. You stay signed in across restarts and updates until you sign out or the key changes, and the app warns you before changes that would disconnect your browser (turning off network access, a new key, a different address, or a restart).
+  - Run Magnitude on a headless machine with `magnitude serve` and manage it entirely from your browser: download and load models, watch usage, connect agents and change settings without the desktop app.
+  - Settings that belong to the machine running Magnitude now work from every app and browser: agent connections, the model storage folder (with a folder picker inside the app that refuses folders the service can't write to), network access and machine details.
+  - Updates, launch at login, restart and quit can be controlled from any connected app or browser, not only the desktop window. Controls that a headless server can't offer are hidden there.
+  - If the browser loses the service, it shows "Can't reach Magnitude" and keeps retrying, so it reconnects on its own when the service comes back, however long it was gone.
+  - The app works in narrow windows and on phones: below tablet width it switches to a top bar and a navigation drawer, and every page reflows to fit.
+  - Removed the old unused agent web app.
+
 ## 0.2.8
 
 ### Patch Changes
