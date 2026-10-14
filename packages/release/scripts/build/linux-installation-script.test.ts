@@ -13,7 +13,7 @@ import { renderUnixInstallationScript } from "./installation-scripts"
 const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "utf8" }).stdout.trim()
 const systemTools = ["cat", "cp", "cut", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
-  { manager: "apt-get", package: "deb", receipt: /^install\n-y\n.*magnitude\.deb\n$/ },
+  { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n.*magnitude\.deb\n$/ },
   { manager: "pacman", package: "pacman", receipt: /^-U\n--noconfirm\n.*magnitude\.pacman\n$/ },
 ] as const
 
@@ -32,7 +32,7 @@ describe.skipIf(process.platform !== "linux").each(managers)("Linux installation
       const executable = (name: string, contents: string) => writeFileSync(join(bin, name), contents, { mode: 0o700 })
       // Only network and privileged package mutation are replaced; parsing and OpenSSL run natively.
       executable("curl", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do\n case "$1" in --output) output=$2; shift 2;; *) url=$1; shift;; esac\ndone\ncase "$url" in */api/installer?*"&offer=1") cp "$TEST_OFFER" "$output";; *) cp "$TEST_PACKAGE" "$output";; esac\n')
-      executable(manager, '#!/bin/sh\nprintf "%s\\n" "$@" > "$TEST_APT_RECEIPT"\n')
+      executable(manager, '#!/bin/sh\nprintf "%s\\n" "$@" >> "$TEST_APT_RECEIPT"\n')
       // The installer runs apt-get through env to set a noninteractive frontend.
       executable("env", '#!/bin/sh\nwhile [ "$#" -gt 0 ]; do case "$1" in *=*) shift;; *) break;; esac; done\nexec "$@"\n')
       executable("sudo", '#!/bin/sh\ncase "$1" in -v|-n) exit 0;; esac\nexec "$@"\n')

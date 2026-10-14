@@ -64,7 +64,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     ].join("\n") + "\n")
     stub("systemctl", 'printf "systemctl %s\\n" "$*" >> "$TEST_LOG"\n')
     stub("env", 'while [ "$#" -gt 0 ]; do case "$1" in *=*) shift;; *) break;; esac; done\nexec "$@"\n')
-    stub("apt-get", 'printf "install\\n" >> "$TEST_LOG"\n[ -z "${TEST_INSTALL_FAILS:-}" ] || exit 100\n')
+    stub("apt-get", 'printf "%s\\n" "$1" >> "$TEST_LOG"\n[ "$1" != install ] || [ -z "${TEST_INSTALL_FAILS:-}" ] || exit 100\n')
     stub("magnitude", 'printf "magnitude %s\\n" "$*" >> "$TEST_LOG"\n')
     // The installer behaves as an ordinary account, whatever account runs the tests.
     stub("id", 'case "$1" in -u) echo 1000;; *) exec /usr/bin/id "$@";; esac\n')
@@ -142,7 +142,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     expect(events().some(line => line.startsWith("download"))).toBe(false)
   })
   describe("on a set-up server", () => {
-    const service = () => events().filter(line => line.includes("systemctl") || line === "install")
+    const service = () => events().filter(line => line.includes("systemctl") || line === "update" || line === "install")
     // The marker lives under /etc; point this copy of the script at one the test owns.
     beforeEach(() => {
       writeFileSync(join(root, "server"), "")
@@ -151,7 +151,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
     it("upgrades around a stopped service without asking", () => {
       const result = unattended()
       expect(result.status, result.stderr).toBe(0)
-      expect(service()).toEqual(["systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
+      expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
         "systemctl stop magnitude.service", "install", "sudo systemctl start magnitude.service", "systemctl start magnitude.service"])
       expect(result.stdout).toContain("the server restarted")
     })
@@ -160,7 +160,7 @@ describe.skipIf(process.platform !== "linux" || !arch || !python || !setsid)("Li
       expect(result.status).toBe(1)
       expect(result.stderr).toContain("The Magnitude package could not be installed")
       expect(result.stderr).toContain("The Magnitude server was started again.")
-      expect(service()).toEqual(["systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
+      expect(service()).toEqual(["update", "systemctl is-active --quiet magnitude.service", "sudo systemctl stop magnitude.service",
         "systemctl stop magnitude.service", "install", "sudo -n systemctl start magnitude.service", "systemctl start magnitude.service"])
     })
   })
