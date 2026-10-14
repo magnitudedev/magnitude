@@ -202,7 +202,7 @@ export const idleInstallationSystem = (options: {
     yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.sharedControl)
     const continuation = yield* makeUnixProcessContinuation(options.addon)
     yield* acquireUpdateInstallationLease(options.stateDirectory)
-    const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, false).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store), Effect.provide(nodeTerminalCommand))
+    const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, "Server").pipe(Effect.provideServiceEffect(PreparedUpdateStore, store), Effect.provide(nodeTerminalCommand))
     yield* options.notify(`Installed Magnitude ${version}. Restarting.`)
     return yield* continuation.replace(process.execPath, process.argv.slice(2), process.env)
   }))
