@@ -493,7 +493,7 @@ impl Builder<'_> {
                 key_norm,
                 value_norm: attention.value_norm.is_some(),
                 span: attention.span,
-                log_base: attention.rotary_base.ln() as f32,
+                log_base: attention.rotary_base.map_or(0.0, f64::ln) as f32,
                 // Unread without head norms.
                 epsilon: epsilon.unwrap_or(0.0) as f32,
                 unit_scale: attention.scale == VisionAttentionScale::Unit,
@@ -785,27 +785,64 @@ pub(crate) fn vision_program(
     let mut x = match merger.reduction {
         CellReduction::Concatenate | CellReduction::Interleave => {
             let interleave = merger.reduction == CellReduction::Interleave;
-            let (norm, site) = match (&merger.norm, &merger.projection_norm) {
-                (Some(norm), None) => (norm, VisionNormSite::Merger),
-                (None, Some(norm)) if cell_rows == 1 => (norm, VisionNormSite::MergerProjection),
-                _ => {
+            // A tower post-norm precedes concatenation; the projector's norm
+            // then sees the complete cell. Keep the first result in F32 so
+            // the second norm reads the declared residual representation.
+            if let (Some(norm), Some(projection_norm)) = (&merger.norm, &merger.projection_norm) {
+                if windows || interleave {
                     return Err(unsupported(
-                        "vision merger norms around a cell concatenation",
+                        "two merger norms require contiguous cell concatenation",
                     ));
                 }
-            };
-            b.norm(
-                h,
-                VisionRows::Cells,
-                cell_rows,
-                hidden,
-                norm,
-                vision,
-                site,
-                activation,
-                windows,
-                interleave,
-            )?
+                let normalized = b.norm(
+                    h,
+                    VisionRows::Patches,
+                    1,
+                    hidden,
+                    norm,
+                    vision,
+                    VisionNormSite::Merger,
+                    f32e,
+                    false,
+                    false,
+                )?;
+                b.norm(
+                    normalized,
+                    VisionRows::Cells,
+                    1,
+                    cell_rows * hidden,
+                    projection_norm,
+                    vision,
+                    VisionNormSite::MergerProjection,
+                    activation,
+                    false,
+                    false,
+                )?
+            } else {
+                let (norm, site) = match (&merger.norm, &merger.projection_norm) {
+                    (Some(norm), None) => (norm, VisionNormSite::Merger),
+                    (None, Some(norm)) if cell_rows == 1 => {
+                        (norm, VisionNormSite::MergerProjection)
+                    }
+                    _ => {
+                        return Err(unsupported(
+                            "vision merger norms around a cell concatenation",
+                        ));
+                    }
+                };
+                b.norm(
+                    h,
+                    VisionRows::Cells,
+                    cell_rows,
+                    hidden,
+                    norm,
+                    vision,
+                    site,
+                    activation,
+                    windows,
+                    interleave,
+                )?
+            }
         }
         CellReduction::Average { scale } => {
             if merger.norm.is_some() || windows {

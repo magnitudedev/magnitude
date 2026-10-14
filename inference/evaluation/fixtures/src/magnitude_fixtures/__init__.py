@@ -1,6 +1,6 @@
 """Fixtures: the only model inputs of evaluation, as deterministic chat conversations."""
 
-from . import code, prose, retrieval, tools, validation
+from . import code, prose, retrieval, tools, validation, vision
 from .fixture import (
     FAMILIES,
     Conversation,
@@ -28,6 +28,8 @@ def build(family: Family, *, count: int = 8, queries: int = 4) -> list[Fixture]:
         return prose.build(*prose.load(), family, count=count)
     if family == "retrieval":
         return retrieval.build(count=count, queries=queries)
+    if family == "vision":
+        return list(vision.fixtures())
     if family == "code":
         return code.build(*code.load(), count=count)
     raise ValueError(f"unknown fixture family: {family}")

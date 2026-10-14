@@ -1,10 +1,12 @@
 //! Family-neutral host image preprocessing. Model adapters supply the numeric
 //! processor contract; this module owns decoding and tensor construction.
 
-use crate::media::{DType, PreparedMedia, PreparedTensor, MAX_PREPARED_BYTES};
+use crate::media::{DType, MAX_PREPARED_BYTES, PreparedMedia, PreparedTensor};
 use image::{ImageDecoder, ImageReader};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
+
+mod slicing;
 
 /// Maximum images admitted by one prepared request. Resource planning uses
 /// the same bound for output leases retained across a request's lifetime.
@@ -15,9 +17,17 @@ const ASPECT_LIMIT: usize = 200;
 /// multiples of the cell side, `patch · merge` pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageResize {
+    /// Aspect-preserving overview followed by row-major detail crops.
+    Slices {
+        resolution: usize,
+        max_slices: usize,
+    },
     /// Sides rounded half to even to cell multiples, then scaled into the
     /// pixel bounds (Qwen3-VL `smart_resize`).
-    PixelBounds { min_pixels: usize, max_pixels: usize },
+    PixelBounds {
+        min_pixels: usize,
+        max_pixels: usize,
+    },
     /// Aspect preserved: the largest cell-multiple sides with at most
     /// `max_patches` patches (Gemma 4 `get_aspect_ratio_preserving_size`).
     PatchBudget { max_patches: usize },
@@ -57,6 +67,10 @@ impl ImageProcessorConfig {
         if factor == 0
             || self.frames == 0
             || match self.resize {
+                ImageResize::Slices {
+                    resolution,
+                    max_slices,
+                } => resolution < 4 * self.patch || max_slices == 0 || max_slices > 9,
                 ImageResize::PixelBounds {
                     min_pixels,
                     max_pixels,
@@ -78,12 +92,18 @@ impl ImageProcessorConfig {
     fn identity(&self) -> String {
         let mut digest = Sha256::new();
         let (resize, bounds): (&[u8], [usize; 2]) = match self.resize {
+            ImageResize::Slices {
+                resolution,
+                max_slices,
+            } => (b"slices:half-even:4-patch-align", [resolution, max_slices]),
             ImageResize::PixelBounds {
                 min_pixels,
                 max_pixels,
             } => (b"pixel-bounds:half-even", [min_pixels, max_pixels]),
             ImageResize::PatchBudget { max_patches } => (b"patch-budget", [max_patches, 0]),
-            ImageResize::CellBudget { max_cells } => (b"cell-budget:closest-aspect", [max_cells, 0]),
+            ImageResize::CellBudget { max_cells } => {
+                (b"cell-budget:closest-aspect", [max_cells, 0])
+            }
         };
         let resampling: &[u8] = match self.resampling {
             Resampling::Bicubic => b"bicubic:a=-0.5:scale-aware-antialias:rgb8",
@@ -146,6 +166,13 @@ impl ImageProcessor {
         }
         let cell = self.config.patch * self.config.merge;
         match self.config.resize {
+            ImageResize::Slices { resolution, .. } => Ok(slicing::best_size(
+                height as f64,
+                width as f64,
+                resolution,
+                self.config.patch,
+                true,
+            )),
             ImageResize::PixelBounds {
                 min_pixels,
                 max_pixels,
@@ -157,7 +184,9 @@ impl ImageProcessor {
                 self.config.merge,
                 max_patches,
             ),
-            ImageResize::CellBudget { max_cells } => cell_budget_size(height, width, cell, max_cells),
+            ImageResize::CellBudget { max_cells } => {
+                cell_budget_size(height, width, cell, max_cells)
+            }
         }
     }
 
@@ -173,6 +202,8 @@ impl ImageProcessor {
         let mut pixels = Vec::new();
         let mut grids = Vec::with_capacity(encoded_images.len() * 3 * 8);
         let mut rows = 0usize;
+        let mut slice_grids = Vec::new();
+        let sliced = matches!(self.config.resize, ImageResize::Slices { .. });
         for encoded in encoded_images {
             let reader = ImageReader::new(Cursor::new(encoded))
                 .with_guessed_format()
@@ -186,40 +217,73 @@ impl ImageProcessor {
             let mut image = image::DynamicImage::from_decoder(decoder)
                 .map_err(|error| format!("image decode failed: {error}"))?;
             image.apply_orientation(orientation);
-            let (height, width_pixels) =
-                self.resized_size(image.height() as usize, image.width() as usize)?;
-            u32::try_from(height).map_err(|_| "resized image height exceeds decoder domain")?;
-            u32::try_from(width_pixels)
-                .map_err(|_| "resized image width exceeds decoder domain")?;
             let source = image.to_rgb32f();
-            let grid_height = height / self.config.patch;
-            let grid_width = width_pixels / self.config.patch;
-            rows = rows
-                .checked_add(
-                    grid_height
-                        .checked_mul(grid_width)
-                        .ok_or("image grid overflows")?,
-                )
-                .ok_or("image row count overflows")?;
-            rows.checked_mul(width)
-                .and_then(|values| values.checked_mul(4))
-                .filter(|bytes| *bytes <= MAX_PREPARED_BYTES)
-                .ok_or("prepared image pixels exceed capacity")?;
-            let resized = resize(&source, width_pixels, height, self.config.resampling)?;
-            for value in [1i64, grid_height as i64, grid_width as i64] {
-                grids.extend_from_slice(&value.to_le_bytes());
+            let crops = match self.config.resize {
+                ImageResize::Slices {
+                    resolution,
+                    max_slices,
+                } => {
+                    let (grid, crops) = self.slices(&source, resolution, max_slices, rows)?;
+                    for extent in grid {
+                        slice_grids.extend_from_slice(&(extent as i64).to_le_bytes());
+                    }
+                    crops
+                }
+                _ => {
+                    let (h, w) =
+                        self.resized_size(image.height() as usize, image.width() as usize)?;
+                    self.prepared_rows(rows, h, w)?;
+                    vec![resize(&source, w, h, self.config.resampling)?]
+                }
+            };
+            for crop in crops {
+                let grid_height = crop.height() as usize / self.config.patch;
+                let grid_width = crop.width() as usize / self.config.patch;
+                rows = self.prepared_rows(rows, crop.height() as usize, crop.width() as usize)?;
+                for value in [1i64, grid_height as i64, grid_width as i64] {
+                    grids.extend_from_slice(&value.to_le_bytes());
+                }
+                self.patchify(&crop, grid_height, grid_width, &mut pixels)?;
             }
-            self.patchify(&resized, grid_height, grid_width, &mut pixels)?;
         }
         let pixel_values =
             PreparedTensor::new("pixel_values".into(), DType::F32, vec![rows, width], pixels)?;
         let image_grid_thw = PreparedTensor::new(
             "image_grid_thw".into(),
             DType::I64,
-            vec![encoded_images.len(), 3],
+            vec![grids.len() / 24, 3],
             grids,
         )?;
-        PreparedMedia::new(self.identity.clone(), vec![pixel_values, image_grid_thw])
+        let mut tensors = vec![pixel_values, image_grid_thw];
+        if sliced {
+            tensors.push(PreparedTensor::new(
+                "image_slice_grid".into(),
+                DType::I64,
+                vec![encoded_images.len(), 2],
+                slice_grids,
+            )?);
+        }
+        PreparedMedia::new(self.identity.clone(), tensors)
+    }
+
+    /// Check aggregate patch storage before allocating resized pixels or crops.
+    fn prepared_rows(&self, prior: usize, height: usize, width: usize) -> Result<usize, String> {
+        u32::try_from(height).map_err(|_| "resized image height exceeds decoder domain")?;
+        u32::try_from(width).map_err(|_| "resized image width exceeds decoder domain")?;
+        let patch_width = 3usize
+            .checked_mul(self.config.frames)
+            .and_then(|n| n.checked_mul(self.config.patch))
+            .and_then(|n| n.checked_mul(self.config.patch))
+            .ok_or("image patch width overflows")?;
+        let rows = (height / self.config.patch)
+            .checked_mul(width / self.config.patch)
+            .and_then(|n| prior.checked_add(n))
+            .ok_or("image row count overflows")?;
+        rows.checked_mul(patch_width)
+            .and_then(|n| n.checked_mul(4))
+            .filter(|n| *n <= MAX_PREPARED_BYTES)
+            .ok_or("prepared image pixels exceed capacity")?;
+        Ok(rows)
     }
 
     fn patchify(

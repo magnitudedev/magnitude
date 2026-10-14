@@ -24,6 +24,8 @@ configured artifact; `Best known method` intentionally contains no links.
 | Liquid LFM2.5 2.6B | DSpark | DSpark | Separate file, draft repo | [LFM2.5-2.6B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/LFM2.5-2.6B-DSpark-GGUF/blob/main/LFM2.5-2.6B-DSpark-Q8_0.gguf) |
 | Liquid LFM2.5 8B-A1B | DSpark | DSpark | Separate file, draft repo | [LFM2.5-8B-A1B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/LFM2.5-8B-A1B-DSpark-GGUF/blob/main/LFM2.5-8B-A1B-DSpark-Q8_0.gguf) |
 | MiniCPM5 2B | DSpark | DSpark | Separate file, draft repo | [MiniCPM5-2.6B-DSpark.gguf](https://huggingface.co/magnitudedev/MiniCPM5-2B-DSpark-GGUF/blob/main/MiniCPM5-2.6B-DSpark.gguf) |
+| MiniCPM-V 4.7 1B | DSpark | DSpark | Separate file, draft repo | [MiniCPM-V-4.7-1B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/MiniCPM-V-4.7-1B-DSpark-GGUF/blob/main/MiniCPM-V-4.7-1B-DSpark-Q8_0.gguf) |
+| MiniCPM-V 4.7 35B-A3B | DSpark | DSpark | Separate file, draft repo | [MiniCPM-V-4.7-35B-A3B-DSpark-Q8_0.gguf](https://huggingface.co/magnitudedev/MiniCPM-V-4.7-35B-A3B-DSpark-GGUF/blob/main/MiniCPM-V-4.7-35B-A3B-DSpark-Q8_0.gguf) |
 | Bonsai 8B 1-bit | None known | None | — | — |
 | Gemma 4 12B | MTP | MTP | Separate file, draft repo | [gemma-4-12B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-12B-it-qat-MTP-GGUF/blob/main/gemma-4-12B-it-qat-MTP-Q4_0.gguf) |
 | Gemma 4 26B-A4B | MTP | MTP | Separate file, draft repo | [gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf](https://huggingface.co/magnitudedev/gemma-4-26B-A4B-it-qat-MTP-GGUF/blob/main/gemma-4-26B-A4B-it-qat-MTP-Q4_0.gguf) |

@@ -2003,7 +2003,7 @@ mod tests {
                     query_norm: None,
                     key_norm: None,
                     value_norm: None,
-                    rotary_base: 10000.0,
+                    rotary_base: Some(10000.0),
                     scale: VisionAttentionScale::InverseSqrtWidth,
                     span: VisionAttentionSpan::Full,
                     output: linear("o", 128, 128),

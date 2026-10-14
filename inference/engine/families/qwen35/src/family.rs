@@ -38,6 +38,14 @@ impl ModelFamily for Qwen35Family {
         definition: &ModelDefinition,
         markers: &dyn MarkerTokens,
     ) -> Result<FamilyInputAdapter, FamilyError> {
+        if definition.vision.as_ref().is_some_and(|v| {
+            matches!(
+                v.preprocessing.resize,
+                magnitude_family_contracts::VisionResize::Slices { .. }
+            )
+        }) {
+            return crate::minicpm::inputs::adapter(definition, markers);
+        }
         let image_tokens = definition
             .vision
             .as_ref()
@@ -54,6 +62,15 @@ impl ModelFamily for Qwen35Family {
     }
 
     fn media_placeholder(&self, definition: &ModelDefinition) -> Option<&'static str> {
-        definition.vision.as_ref().map(|_| IMAGE_PLACEHOLDER)
+        definition.vision.as_ref().map(|v| {
+            if matches!(
+                v.preprocessing.resize,
+                magnitude_family_contracts::VisionResize::Slices { .. }
+            ) {
+                "<|image_pad|>"
+            } else {
+                IMAGE_PLACEHOLDER
+            }
+        })
     }
 }

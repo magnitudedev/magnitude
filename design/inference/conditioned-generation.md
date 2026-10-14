@@ -17,7 +17,8 @@ equal image content does not merge distinct positions in the prompt. A span is o
 placement and names its image by content identity; the plan holds each distinct
 image once. Placements of the same image, within one message or across turns,
 share one prepared image and one encoding, and each placement reads those features
-at its own rows and coordinates. Serving owns
+at its own rows and coordinates. Overview and detail crops share encoding by crop
+identity while retaining each source image's distinct canvas placement. Serving owns
 validated source decoding and host preparation; model formulas own numerical
 encoding and projection through the ordinary execution owner.
 

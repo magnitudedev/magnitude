@@ -180,7 +180,7 @@ pub fn describe_projector(directory: &Directory) -> Result<VisionDescription, Er
                 query_norm: None,
                 key_norm: None,
                 value_norm: None,
-                rotary_base: 10_000.0,
+                rotary_base: Some(10_000.0),
                 scale: VisionAttentionScale::InverseSqrtWidth,
                 span: VisionAttentionSpan::Full,
                 output: VisionLinear {

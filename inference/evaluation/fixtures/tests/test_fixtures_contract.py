@@ -18,6 +18,7 @@ from magnitude_fixtures import (
     retrieval,
     tools,
     write_set,
+    vision,
 )
 
 SOURCE = Source(name="test", digest="0" * 64)
@@ -33,6 +34,7 @@ def families(interactions, book, files):
         "prose-repeat": lambda: prose.build(book, SOURCE, "prose-repeat", count=2),
         "prose-shift": lambda: prose.build(book, SOURCE, "prose-shift", count=2),
         "retrieval": lambda: retrieval.build(count=2, queries=2),
+        "vision": lambda: list(vision.fixtures()),
         "code": lambda: code.build(files, SOURCE, count=2),
     }
 
@@ -52,6 +54,9 @@ def test_records_follow_the_contract(families, family):
             assert message["role"] in ("system", "user", "assistant", "tool")
             assert message.get("scored", True) is True
             assert "scored" not in message or message["role"] == "assistant"
+        if family == "vision":
+            assert record["sizing"]["unit"] == "fixed"
+            continue
         assert record["sizing"]["unit"] == "turn"
         head = record["sizing"]["keep_head"]
         assert messages[head]["role"] == "user"

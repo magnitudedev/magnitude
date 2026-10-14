@@ -344,8 +344,13 @@ fn vision_attention[M, H, P, NQ, NV, WS](query: &tensor[M, H, 4 * P] A,
     let mut prepared_value = tensor[M, H, 4 * P] A
     parallel for row in 0..M:
         parallel for head in 0..H:
-            prepared_query[row, head] = vision_rotate[P = P](head_norm(query[row, head], query_norm, epsilon), coordinates[row], log_base)
-            prepared_key[row, head] = vision_rotate[P = P](head_norm(key[row, head], key_norm, epsilon), coordinates[row], log_base)
+            let mut q = head_norm(query[row, head], query_norm, epsilon)
+            let mut k = head_norm(key[row, head], key_norm, epsilon)
+            if log_base != 0.0:
+                q = vision_rotate[P = P](q, coordinates[row], log_base)
+                k = vision_rotate[P = P](k, coordinates[row], log_base)
+            prepared_query[row, head] = q
+            prepared_key[row, head] = k
             prepared_value[row, head] = head_norm(value[row, head], value_norm, epsilon)
     let mut scale = rsqrt(f32(4 * P))
     if unit_scale != 0:

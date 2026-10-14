@@ -47,7 +47,7 @@ kernel void vision_attention_prepare(ATTENTION_ARGUMENTS,
     const bool normed = part < 2 ? SEISMIC_DIM_NQ == 1 : SEISMIC_DIM_NV == 1;
     device const float *norm = part == 0 ? query_norm : part == 1 ? key_norm : nullptr;
     vision::prepare_head<activation, VISION_W, VISION_WP>(from, to, normed, norm,
-        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), part < 2, coordinates + row * 2,
+        as_type<float>(uint(SEISMIC_PARAM_EPSILON)), part < 2 && as_type<float>(uint(SEISMIC_PARAM_LOG_BASE)) != 0.0f, coordinates + row * 2,
         as_type<float>(uint(SEISMIC_PARAM_LOG_BASE)), lane);
 }
 

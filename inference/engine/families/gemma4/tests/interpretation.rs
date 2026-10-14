@@ -378,7 +378,7 @@ fn encoder_projectors_bind_sandwich_blocks_pooling_and_axial_rotary() {
         let width = hidden / heads;
         assert_eq!((attention.heads, attention.width), (heads, width));
         assert_eq!(attention.scale, VisionAttentionScale::Unit);
-        assert_eq!(attention.rotary_base, 100.0);
+        assert_eq!(attention.rotary_base, Some(100.0));
         assert!(attention.value_norm.is_some() && block.attention_post_norm.is_some());
         assert_eq!(attention.query.clamp.is_some(), clipped, "{model}");
         assert!(matches!(block.feedforward.up, VisionUp::Gated { .. }));

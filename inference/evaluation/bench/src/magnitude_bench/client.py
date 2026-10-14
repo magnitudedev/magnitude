@@ -214,19 +214,19 @@ async def measure(
                         raise ValueError(f"unexpected prose finish reason: {finish}")
                 elif finish == "length":
                     outcome, error = "truncated", "engine reached its output or context limit"
-                elif request.family == "retrieval":
+                elif request.family in ("retrieval", "vision"):
                     if finish != "stop" or calls:
                         raise ValueError(
-                            "retrieval response must finish with stop and no tool calls"
+                            f"{request.family} response must finish with stop and no tool calls"
                         )
                     if evidence["usage"]["completion_tokens"] < 1:
-                        raise ValueError("retrieval response must report generated tokens")
+                        raise ValueError(f"{request.family} response must report generated tokens")
                     retrieval = answers.retrieval(request.generation.expected, output)
                     outcome = "valid" if retrieval.exact_match else "invalid"
                     error = (
                         None
                         if retrieval.exact_match
-                        else "retrieval answer does not match expected values"
+                        else f"{request.family} answer does not match expected values"
                     )
                 elif request.family == "tools":
                     if finish not in ("stop", "tool_calls"):
