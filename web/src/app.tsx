@@ -882,14 +882,14 @@ function ReconnectingToMagnitude() {
   return <ErrorNotice className="mt-8" severity="info" title="Reconnecting to Magnitude…"
     description="The connection to the Magnitude service was interrupted, as it is when Magnitude restarts." />
 }
-/** A browser cannot restart the service; after its own retries stop, Reconnect tries once more. */
+/** A browser cannot restart the service; it keeps retrying in the background, and Reconnect tries at once. */
 function CannotReachMagnitude() {
   const attempt = useReconnectAttempt()
   const reconnectAction = useMemo(() => Atom.fn((_: void) => attempt), [attempt])
   const reconnect = useAtomSet(reconnectAction)
   const reconnecting = useAtomValue(reconnectAction)
   return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"
-    description="This page can’t connect to the Magnitude service. Check that Magnitude is running on that computer and that this device can reach it."
+    description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
     actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
 }
 /** Messages raised by Electron main while this window exists, such as a link that couldn't open. */

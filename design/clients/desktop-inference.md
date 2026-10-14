@@ -263,7 +263,10 @@ adds a This browser group with Sign out, and turning network access off, regener
 changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
 AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
 loses the service, it checks whether the service now asks for the key, as after a restart, and
-returns to Sign in instead of showing that the service is unreachable.
+returns to Sign in instead of showing that the service is unreachable. A browser retries every 2
+seconds for 30 seconds, then shows that the service is unreachable with Reconnect and keeps retrying
+with backoff up to once a minute, and at once when the device comes back online or the page regains
+focus or visibility, so it recovers by itself after a reboot, a failed update, or a sleeping laptop.
 Below the harnesses, Connections presents one card for other apps and agents. It states that an
 OpenAI-compatible API runs on this computer that any app or agent can use. The base URL has a copy
 control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
