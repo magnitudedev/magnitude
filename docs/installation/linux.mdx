@@ -17,7 +17,7 @@ Choose **Intel / AMD (x64)** for an x86-64 processor or **ARM64** for an ARM64 p
 
 ## Requirements
 
-Magnitude requires **glibc 2.35 or later**. Ubuntu 22.04 and Debian 12 meet the glibc requirement. An RPM download does not imply compatibility with every Red Hat release: RHEL 9's glibc 2.34 is below this minimum. The desktop window needs a graphical session; `magnitude serve` can run without one, including over SSH.
+Magnitude requires **glibc 2.34 or later**. Ubuntu 22.04, Debian 12 and RHEL 9 (and its rebuilds) meet the glibc requirement. The desktop window needs a graphical session; `magnitude serve` can run without one, including over SSH.
 
 Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
 
@@ -56,4 +56,4 @@ Open **Magnitude** from your applications menu and follow [Quick start](/get-sta
 
 App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → Application updates** for the available actions. A [server](/remote-server) installs its updates by itself.
 
-Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package.
+Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. On a server, run `magnitude server remove` before removing the package; reinstalling the package without it keeps the server set up.

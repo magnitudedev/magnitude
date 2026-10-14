@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
-import { buildLinuxDesktopInstaller, mtreeFileModes, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxPolkitPolicy, validatePacmanMetadataModes } from "./desktop-linux"
+import { buildLinuxDesktopInstaller, mtreeFileModes, preferLightTrashHelper, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxPolkitPolicy, validatePacmanMetadataModes } from "./desktop-linux"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 import { linuxDesktopInstaller } from "../../src/targets"
 
@@ -44,6 +44,18 @@ describe("Linux package publisher-trust protection", () => {
     ["deb", ""], ["rpm", ""], ["pacman", ""],
   ] as const)("rejects unprotected or missing %s payload: %s", async (format, listing) => {
     await expect(Effect.runPromise(validateLinuxPayloadPermissions(format, listing))).rejects.toThrow("root-owned")
+  })
+})
+
+describe("Debian dependencies", () => {
+  it("puts GLib's trash helper before KDE's, so apt never pulls a KDE stack onto a server", async () => {
+    const control = "Package: magnitude-desktop\nDepends: libgtk-3-0, libsecret-1-0, kde-cli-tools | kde-runtime | trash-cli | libglib2.0-bin | gvfs, pkexec\n"
+    expect(await Effect.runPromise(preferLightTrashHelper(control))).toBe(
+      "Package: magnitude-desktop\nDepends: libgtk-3-0, libsecret-1-0, libglib2.0-bin | gvfs | trash-cli | kde-cli-tools | kde-runtime, pkexec\n")
+  })
+
+  it("fails the build when Electron's installer changes its trash helpers", async () => {
+    await expect(Effect.runPromise(preferLightTrashHelper("Depends: libgtk-3-0, trash-cli | gvfs\n"))).rejects.toThrow("trash helpers")
   })
 })
 

@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, open, readdir, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { resolve } from "node:path"
+import { LINUX_GLIBC_MINIMUM, LINUX_GLIBCXX_MAXIMUM } from "../../src/linux-package"
 import type { HostId } from "../../src/targets"
 import { run } from "./common"
 
@@ -76,16 +77,28 @@ const inspectElf = async (host: HostId, path: string): Promise<void> => {
     throw new Error(`${path} uses unexpected interpreter ${interpreter}`)
   }
   for (const version of matches(report, /\bGLIBC_(\d+\.\d+)\b/g)) {
-    if (compareVersion(version, "2.35") > 0) {
-      throw new Error(`${path} requires GLIBC_${version}; maximum is GLIBC_2.35`)
+    if (compareVersion(version, LINUX_GLIBC_MINIMUM) > 0) {
+      throw new Error(`${path} requires GLIBC_${version}; maximum is GLIBC_${LINUX_GLIBC_MINIMUM}`)
     }
   }
   for (const version of matches(report, /\bGLIBCXX_(\d+\.\d+\.\d+)\b/g)) {
-    if (compareVersion(version, "3.4.30") > 0) {
-      throw new Error(`${path} requires GLIBCXX_${version}; maximum is GLIBCXX_3.4.30`)
+    if (compareVersion(version, LINUX_GLIBCXX_MAXIMUM) > 0) {
+      throw new Error(`${path} requires GLIBCXX_${version}; maximum is GLIBCXX_${LINUX_GLIBCXX_MAXIMUM}`)
     }
   }
 }
+
+const inspectElfFiles = async (host: HostId, paths: readonly string[]): Promise<void> => {
+  await Promise.all(
+    (await Promise.all(paths.map(async (path) => ((await isElf(path)) ? path : undefined))))
+      .filter((path): path is string => path !== undefined)
+      .map((path) => inspectElf(host, path))
+  )
+}
+
+/** Validates the ELF compatibility of an assembled Linux application directory. */
+export const verifyLinuxElfDirectory = async (host: HostId, directory: string): Promise<void> =>
+  inspectElfFiles(host, await files(directory))
 
 /** Validates the ELF compatibility of final Linux archives. */
 export const verifyLinuxElfArchives = async (
@@ -106,11 +119,7 @@ export const verifyLinuxElfArchives = async (
     const elfPaths = (await Promise.all(extracted.map(files)))
       .flat()
       .filter((path, index, values) => values.indexOf(path) === index)
-    await Promise.all(
-      (await Promise.all(elfPaths.map(async (path) => ((await isElf(path)) ? path : undefined))))
-        .filter((path): path is string => path !== undefined)
-        .map((path) => inspectElf(host, path))
-    )
+    await inspectElfFiles(host, elfPaths)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

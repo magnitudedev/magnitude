@@ -76,12 +76,29 @@ case "$(uname -s)" in
     printf '%s\n' 'Magnitude was installed. Open it from Applications, or run `magnitude server setup` to run it as a server.'
     ;;
   Linux)
-    for tool in python3 openssl curl timeout; do command -v "$tool" >/dev/null 2>&1 || fail "Install $tool before running this installer."; done
+    # Every package requires this glibc; refuse before asking anything rather than fail in the package manager.
+    glibc_minimum=2.34
+    glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null) || glibc=''
+    case "$glibc" in
+      'glibc '[0-9]*.[0-9]*)
+        glibc=${glibc#glibc }
+        major=${glibc%%.*} minor=${glibc#*.}
+        minor=${minor%%[!0-9]*}
+        [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "${minor:-0}" -ge "${glibc_minimum#2.}" ]; } \
+          || fail "Magnitude needs glibc $glibc_minimum or later, and this system has glibc $glibc. Ubuntu 22.04, Debian 12, RHEL 9 and newer releases are supported." ;;
+      *) fail "Magnitude needs a Linux distribution with glibc $glibc_minimum or later." ;;
+    esac
     if command -v apt-get >/dev/null 2>&1; then package=deb
     elif command -v dnf >/dev/null 2>&1; then package=rpm
     elif command -v pacman >/dev/null 2>&1; then package=pacman
     else fail 'This Linux distribution requires apt, dnf or pacman.'; fi
     [ "$package" != pacman ] || [ "$arch" = x64 ] || fail 'Arch Linux packages are available for x86-64 only.'
+    for tool in python3 openssl curl timeout; do
+      command -v "$tool" >/dev/null 2>&1 && continue
+      # Arch packages python3 as python.
+      [ "$tool:$package" != python3:pacman ] || fail 'Install python (pacman -S python) before running this installer.'
+      fail "Install $tool before running this installer."
+    done
 
     # 1. Ask first, so the person can walk away after answering and authorizing.
     if [ -f "$server_marker" ]; then answer=configured

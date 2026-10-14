@@ -46,4 +46,4 @@ export { SERVER_DATA_DIRECTORY, SERVER_USER, SERVER_PORT, SERVER_MARKER_PATH, SE
 export { TerminalCommand, TerminalCommandFailed, nodeTerminalCommand } from "./terminal-command"
 export { openServerFirewall } from "./server-firewall"
 export { ServerInstallationFailed, installedServerCli, parseServerInstallation, requireInstalledRoot, installLinuxServer, removeLinuxServer, installMacServer, removeMacServer, macServerPlist,
-  classifyServerAccounts, inspectServerAccounts, hasLinuxServerRemnants, systemIdRange } from "./server-installation"
+  restoreLinuxServerGrant, classifyServerAccounts, inspectServerAccounts, hasLinuxServerRemnants, systemIdRange } from "./server-installation"

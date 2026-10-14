@@ -8,10 +8,11 @@ import { spawnSync } from "node:child_process"
 import { describe, expect, it } from "vitest"
 import { signUpdateRelease } from "../../src/hosted-update/release"
 import { renderUnixInstallationScript } from "./installation-scripts"
+import { LINUX_GLIBC_MINIMUM } from "../../src/linux-package"
 
 // The script selects its package manager by availability, so each case sees only its own.
 const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "utf8" }).stdout.trim()
-const systemTools = ["cat", "cp", "cut", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
+const systemTools = ["cat", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
   { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n.*magnitude\.deb\n$/ },
   { manager: "pacman", package: "pacman", receipt: /^-U\n--noconfirm\n.*magnitude\.pacman\n$/ },
@@ -72,7 +73,7 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
       executable("uname", '#!/bin/sh\ncase "$1" in -m) echo aarch64;; *) echo Linux;; esac\n')
       executable("pacman", "#!/bin/sh\nexit 1\n")
       executable("curl", `#!/bin/sh\ntouch ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
-      for (const tool of ["python3", "openssl", "mktemp", "rm", "timeout"]) {
+      for (const tool of ["getconf", "python3", "openssl", "mktemp", "rm", "timeout"]) {
         const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
         if (found) symlinkSync(found, join(bin, tool))
       }
@@ -83,6 +84,46 @@ describe.skipIf(process.platform !== "linux")("Linux installation shell architec
       expect(result.stderr).toContain("x86-64 only")
       expect(existsSync(join(root, "downloaded"))).toBe(false)
     } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+
+  const refusal = (stubs: Readonly<Record<string, string>>, tools: readonly string[]) => {
+    const root = mkdtempSync(join(tmpdir(), "magnitude-shell-refusal-"))
+    try {
+      const bin = join(root, "bin")
+      mkdirSync(bin)
+      const executable = (name: string, contents: string) => writeFileSync(join(bin, name), contents, { mode: 0o700 })
+      for (const [name, contents] of Object.entries(stubs)) executable(name, contents)
+      executable("curl", `#!/bin/sh\n: > ${JSON.stringify(join(root, "downloaded"))}\nexit 1\n`)
+      executable("sudo", `#!/bin/sh\n: > ${JSON.stringify(join(root, "sudo"))}\nexit 1\n`)
+      for (const tool of ["uname", "mktemp", "rm", ...tools]) {
+        const found = spawnSync("/bin/sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim()
+        if (found && !(tool in stubs)) symlinkSync(found, join(bin, tool))
+      }
+      const script = readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8").replace("@MAGNITUDE_INSTALL_ORIGIN@", "https://magnitude.dev")
+      const result = spawnSync(setsid, ["-w", "/bin/sh", "-s"], { input: script, encoding: "utf8", timeout: 15000, env: { PATH: bin } })
+      return { ...result, downloaded: existsSync(join(root, "downloaded")), sudo: existsSync(join(root, "sudo")) }
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }
+
+  it("refuses a glibc below the packages' floor before sudo or downloading", () => {
+    const result = refusal({ getconf: "#!/bin/sh\necho glibc 2.31\n", "apt-get": "#!/bin/sh\nexit 1\n" }, ["python3", "openssl", "timeout"])
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain(`needs glibc ${LINUX_GLIBC_MINIMUM} or later, and this system has glibc 2.31`)
+    expect(result.downloaded || result.sudo).toBe(false)
+  })
+
+  it("admits the packages' glibc floor", () => {
+    expect(readFileSync(join(import.meta.dirname, "../../resources/install.sh"), "utf8")).toContain(`\n    glibc_minimum=${LINUX_GLIBC_MINIMUM}\n`)
+    const result = refusal({ getconf: `#!/bin/sh\necho glibc ${LINUX_GLIBC_MINIMUM}\n`, "apt-get": "#!/bin/sh\nexit 1\n" }, ["id", "python3", "openssl", "timeout"])
+    expect(result.stderr).not.toContain("needs glibc")
+    expect(result.sudo, result.stderr).toBe(true)
+  })
+
+  it("names Arch's python package", () => {
+    if (process.arch !== "x64") return
+    const result = refusal({ getconf: "#!/bin/sh\necho glibc 2.42\n", pacman: "#!/bin/sh\nexit 1\n" }, ["openssl", "timeout"])
+    expect(result.stderr).toContain("pacman -S python")
+    expect(result.downloaded || result.sudo).toBe(false)
   })
 })
 

@@ -186,7 +186,10 @@ inspected with `readelf`; release inputs are never executed through `ldd`.
 Assembly rejects:
 
 - the wrong ELF class, machine architecture, or program interpreter;
-- glibc requirements above 2.35 or GLIBCXX requirements above 3.4.30.
+- glibc requirements above 2.34 or GLIBCXX requirements above 3.4.29.
+
+Desktop packaging applies the same ELF checks to the assembled application payload (Electron,
+its libraries and the native addon) before building each Linux package.
 
 Apple compatibility is validated on the Apple build host, using Apple's own Mach-O tooling against
 the exact files subsequently passed to the deterministic archive builder. Assembly does not

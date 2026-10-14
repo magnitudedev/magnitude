@@ -3,7 +3,7 @@ import { Console, Effect, Either, Option, Schedule, Schema, Stream } from "effec
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
 import { MAC_SERVER_LABEL, MAC_SERVER_PLIST, SERVER_DATA_DIRECTORY, SERVER_MARKER_CONTENT, SERVER_MARKER_PATH, SERVER_SUDOERS_PATH, SERVER_SUDOERS_RULE,
-  SERVER_USER } from "./server-profile"
+  SERVER_USER, isServerProfileActive } from "./server-profile"
 
 export class ServerInstallationFailed extends Schema.TaggedError<ServerInstallationFailed>()("ServerInstallationFailed", {
   message: Schema.String,
@@ -20,13 +20,15 @@ export const installedServerCli = (platform: string) => Option.fromNullable(({
 const UserName = Schema.String.pipe(Schema.pattern(/^[a-z_][a-z0-9_.-]{0,31}$/), Schema.filter(name => name !== "root" && name !== SERVER_USER))
 
 /**
- * The hidden root commands accept exactly `_server-install <user>`, `_server-install` or `_server-remove`.
+ * The hidden root commands accept exactly `_server-install <user>`, `_server-install`, `_server-remove` or
+ * `_server-restore-grant`, which package installation runs.
  * The user must be the account that ran sudo, so the root step cannot be pointed at anyone else. Without
  * a user it is root's own setup, run directly from a root login rather than through sudo.
  */
 export const parseServerInstallation = (argv: readonly string[], environment: Readonly<Record<string, string | undefined>>) => Effect.gen(function* () {
   const [command, ...rest] = argv
   if (command === "_server-remove" && rest.length === 0) return { _tag: "Remove" as const }
+  if (command === "_server-restore-grant" && rest.length === 0) return { _tag: "RestoreGrant" as const }
   if (command === "_server-install" && rest.length === 0) {
     if (environment.SUDO_USER !== undefined || environment.SUDO_UID !== undefined) return yield* failed("Run `magnitude server setup` as yourself; it asks sudo for the root step.")
     return { _tag: "Install" as const, user: Option.none<{ readonly name: string; readonly uid: number }>() }
@@ -260,6 +262,18 @@ export const removeLinuxServer = Effect.gen(function* () {
   const markerDirectory = dirname(SERVER_MARKER_PATH)
   if ((yield* fs.exists(markerDirectory)) && (yield* fs.readDirectory(markerDirectory)).length === 0) yield* fs.remove(markerDirectory, { recursive: true })
 }).pipe(Effect.mapError(error => error instanceof ServerInstallationFailed ? error : failed("Server removal could not finish.")))
+
+/**
+ * Package installation step: removing the package deletes the sudoers rule with the helper it names,
+ * so installing over a configured server writes the current rule again. Only a server setup made,
+ * marker and system account both, gets it; another account named magnitude never does.
+ */
+export const restoreLinuxServerGrant = Effect.gen(function* () {
+  if (!(yield* isServerProfileActive("linux"))) return
+  const accounts = yield* inspectServerAccounts
+  if (accounts.user !== "Ours" || accounts.group !== "Ours") return
+  yield* writeSudoersRule
+}).pipe(Effect.mapError(() => failed("The Magnitude server's update permission could not be restored. Run `magnitude server setup` again.")))
 
 /** Whether anything `server setup` leaves on Linux exists, so `server remove` can finish a partial setup or removal. */
 export const hasLinuxServerRemnants = Effect.gen(function* () {
