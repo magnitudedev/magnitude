@@ -14,5 +14,6 @@
   "failingVariants": {
     "50.8.3": "preinstall",
     "50.8.4": "startup"
-  }
+  },
+  "attempt": 2
 }
