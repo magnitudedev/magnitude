@@ -1,7 +1,7 @@
 import { access, mkdir } from "node:fs/promises"
 import { resolve } from "node:path"
 import { getTargetInfo } from "../../../../scripts/release-target"
-import { run } from "./common"
+import { run, windowsExecutableResources } from "./common"
 import { compileAppleBun, runAppleBuild } from "../apple/compile-bun"
 import { signAppleCode } from "../apple/signing"
 import { signWindowsCode } from "./windows-signing"
@@ -48,6 +48,7 @@ export const buildCliBinary = async (target: string, bootstrapPublisherKey?: str
     "--define",
     `process.arch=${JSON.stringify(info.arch)}`,
     ...(bootstrapPublisherKey === undefined ? [] : ["--define", `MAGNITUDE_BOOTSTRAP_PUBLISHER_KEY=${JSON.stringify(bootstrapPublisherKey)}`]),
+    ...await windowsExecutableResources(info.platform, "Magnitude command"),
   ], { cwd: PROJECT_ROOT })
   if (info.platform === "windows") await Effect.runPromise(signWindowsCode(binary).pipe(Effect.provide(BunContext.layer)))
   return binary

@@ -10,7 +10,7 @@ import {
   bunTargetToRipgrepTarget,
   getTargetInfo,
 } from "../../../../scripts/release-target"
-import { run } from "./common"
+import { run, windowsExecutableResources } from "./common"
 import { ACN_EXECUTABLE_NAME } from "../../src/executables"
 import { compileAppleBun, runAppleBuild } from "../apple/compile-bun"
 
@@ -73,6 +73,7 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
     bunTargetToRipgrepTarget(target),
   )
   if (info.platform === "darwin") return withWebAppEmbed(() => withRipgrepEmbed(false, () => runAppleBuild(compileAppleBun(resolve(PROJECT_ROOT, "packages/acn/src/binary.ts"), binary, target, "acn"))))
+  const resources = await windowsExecutableResources(info.platform, "Magnitude service")
   await withWebAppEmbed(() => withRipgrepEmbed(info.platform === "windows", () =>
     run([
       process.execPath,
@@ -81,6 +82,7 @@ export const buildAcnBinary = async (target: string): Promise<string> => {
       "--compile",
       `--target=${target}`,
       `--outfile=${binary}`,
+      ...resources,
     ], { cwd: PROJECT_ROOT }),
   ))
   return binary
