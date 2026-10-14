@@ -15,7 +15,8 @@ export const runServerRemove = () => report(serverRemove.pipe(Effect.provide(Ser
 /** The hidden root command. It accepts no input beyond the user name and runs only from the installed CLI as root. */
 export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(function* () {
   const request = yield* parseServerInstallation(argv, process.env)
-  const cli = yield* requireInstalledRoot(process.platform, process.execPath)
+  const cli = yield* requireInstalledRoot(process.platform, process.execPath,
+    request._tag === "Remove" ? "magnitude server remove" : "magnitude server setup")
   if (request._tag === "RestoreGrant") {
     if (process.platform !== "linux") return yield* new ServerInstallationFailed({ message: "Only Linux packages restore the server's update permission." })
     return yield* restoreLinuxServerGrant

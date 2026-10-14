@@ -41,13 +41,13 @@ export const parseServerInstallation = (argv: readonly string[], environment: Re
   return { _tag: "Install" as const, user: Option.some({ name: user, uid: Number(environment.SUDO_UID) }) }
 })
 
-/** Refuses unless the process is root and is the installed CLI, reached without symbolic links. */
-export const requireInstalledRoot = (platform: string, executable: string) => Effect.gen(function* () {
+/** Refuses unless the process is root and is the installed CLI, reached without symbolic links; `command` is the public command to run instead. */
+export const requireInstalledRoot = (platform: string, executable: string, command: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const expected = installedServerCli(platform)
-  if (Option.isNone(expected) || process.getuid?.() !== 0) return yield* failed("Run `magnitude server setup`; this step only runs as root from the installed Magnitude.")
+  if (Option.isNone(expected) || process.getuid?.() !== 0) return yield* failed(`Run \`${command}\`; this step only runs as root from the installed Magnitude.`)
   const real = yield* fs.realPath(executable).pipe(Effect.orElseSucceed(() => ""))
-  if (real !== expected.value) return yield* failed("Run `magnitude server setup`; this step only runs as root from the installed Magnitude.")
+  if (real !== expected.value) return yield* failed(`Run \`${command}\`; this step only runs as root from the installed Magnitude.`)
   return expected.value
 })
 

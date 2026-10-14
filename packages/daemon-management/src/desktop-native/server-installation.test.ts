@@ -56,11 +56,12 @@ describe("hidden root command grammar", () => {
 describe("root step admission", () => {
   afterEach(() => vi.restoreAllMocks())
   const fs = (real: string) => FileSystem.makeNoop({ realPath: () => Effect.succeed(real) })
-  const admit = (platform: string, real: string) => Effect.runPromise(Effect.either(requireInstalledRoot(platform, "/usr/bin/magnitude").pipe(
+  const admit = (platform: string, real: string) => Effect.runPromise(Effect.either(requireInstalledRoot(platform, "/usr/bin/magnitude", "magnitude server remove").pipe(
     Effect.provideService(FileSystem.FileSystem, fs(real)))))
   it("refuses an unprivileged caller", async () => {
     vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(1000)
-    expect(Either.isLeft(await admit("linux", "/usr/lib/magnitude-desktop/resources/magnitude"))).toBe(true)
+    const refused = await admit("linux", "/usr/lib/magnitude-desktop/resources/magnitude")
+    expect(Either.isLeft(refused) && refused.left.message).toContain("Run `magnitude server remove`")
   })
   it("refuses a copy outside the installed path, and Windows", async () => {
     vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(0)
