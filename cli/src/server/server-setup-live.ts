@@ -114,10 +114,11 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
       // In this terminal's session, so sudo reuses its ticket (the installer's Yes) or asks here once.
       const code = yield* terminal.run(root ? cli.value : "/usr/bin/sudo", root ? args : ["--", cli.value, ...args], { stdin: "inherit" }).pipe(
         Effect.orElseSucceed(() => -1))
-      // The root step has printed what went wrong, and what it undid.
+      // The root step has printed what went wrong, and what it undid; sudo has said if it refused this account.
+      const administrator = root ? "" : "\nIt needs an administrator account, one that can use sudo. If sudo refused this account above, run it from an administrator account."
       if (code !== 0) return yield* failed(args[0] === "_server-remove"
-        ? "Server removal did not finish. Run `magnitude server remove` again once the problem above is fixed."
-        : "Server setup did not finish.")
+        ? `Server removal did not finish. Run \`magnitude server remove\` again once the problem above is fixed.${administrator}`
+        : `Server setup did not finish.${administrator}`)
     }),
     servicePort,
     serviceRuns: (platform === "darwin"

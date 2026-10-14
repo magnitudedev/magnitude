@@ -162,7 +162,7 @@ export const serverSetup = Effect.gen(function* () {
     : "Stop `magnitude serve` first. It and the server can't run at the same time.")
   // Whatever answers on the port receives setup's requests: another account's Magnitude would be configured and its key printed.
   if ((yield* settledPort(host)) === "Other") return yield* failed(`${portTaken} Nothing was changed.`)
-  if (!host.isRoot && !(yield* host.sudoWithoutPrompt) && !(yield* host.hasTerminal)) return yield* failed("Server setup needs your password; run it in a terminal.")
+  if (!host.isRoot && !(yield* host.sudoWithoutPrompt) && !(yield* host.hasTerminal)) return yield* failed("Server setup needs an administrator account (one that can use sudo) and its password; run it in a terminal.")
   // Through sudo the root step names the person who ran it, whom the macOS server serves as; a root login names no one.
   yield* host.runRootStep(host.isRoot ? ["_server-install"] : ["_server-install", host.user])
   yield* host.write("Waiting for the Magnitude server to start…\n")

@@ -108,7 +108,7 @@ describe("magnitude server setup", () => {
   it("fails at once without a terminal or passwordless sudo, instead of waiting at a prompt", async () => {
     const h = harness({ hasTerminal: Effect.succeed(false) })
     const result = await h.run(serverSetup)
-    expect(Either.isLeft(result) && result.left.message).toBe("Server setup needs your password; run it in a terminal.")
+    expect(Either.isLeft(result) && result.left.message).toBe("Server setup needs an administrator account (one that can use sudo) and its password; run it in a terminal.")
     expect(h.events).toEqual([])
   })
   it("needs no terminal when sudo can run without asking, as after the install script's sudo -v", async () => {
