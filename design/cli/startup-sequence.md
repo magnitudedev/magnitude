@@ -70,8 +70,17 @@ not change whether startup launches a source checkout or an installed applicatio
 ## Passive status
 
 `status` observes application lifecycle without starting it. Absence is a successful Stopped result.
-The owner is Desktop or Headless when present; tray and login-startup observations appear only for
-Desktop. Model observations are separate from service readiness, and unavailable model evidence must
+The owner is Desktop or Headless when present, shown as Server where the system service is set up;
+tray and login-startup observations appear only for Desktop. Where the service is set up and not
+answering, the guidance is how to start the service and read its log, never the desktop app or `serve`
+(on macOS, kickstart when launchd has the daemon loaded and bootstrap its plist when it was booted out);
+a Linux service that systemd keeps restarting or that failed instead says it keeps failing to start,
+quotes the service's own last error when the journal is readable, and names the log. When this
+account has no application of its own but a service answers health on the default profile's port,
+status reports that service's state and version, never as stopped: as another account's only when the
+system names that account (the macOS server plist, or the Linux socket table's owner of the listening
+socket), and otherwise as outside this profile. Isolated profiles never probe, and a service this
+account runs is not reported as elsewhere. Model observations are separate from service readiness, and unavailable model evidence must
 not be presented as no loaded model. A ready service also shows how to reach it: this computer's
 address, each address other devices can use when network access is on, or how to turn it on with
 the profile's real configuration path. Status never shows the network access key. Login
