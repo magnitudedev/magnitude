@@ -75,22 +75,26 @@ const SERVICE_MANAGER_LINE = /^(magnitude\.service: |(Started|Starting|Stopped|S
 const LOG_ENTRY = /^(\[\d[\d:.]*\] [A-Z]+ \(#\d+\):|timestamp=|\s|")/
 const ERROR_ENTRY = /^\[\d[\d:.]*\] (?:ERROR|FATAL) \(#\d+\):\s*(\S.*)$/
 
-/**
- * The lines of a service log that say what went wrong. The service's own last plain line is its
- * final word on why it stopped; failing that, its last logged error; failing that, the tail of
- * its log, without the service manager's lines, stack frames, blank lines or repeats.
- */
-export const explainServiceLog = (lines: readonly string[]) => {
-  const service = lines
-    .map(line => line.trimEnd())
-    .filter(line => line.trim() !== "" && !SERVICE_MANAGER_LINE.test(line) && !/^\s*at\s/.test(line) && !line.includes("/$bunfs/"))
-  const finalWord = service.findLast(line => !LOG_ENTRY.test(line))
-  const lastError = service.map(line => ERROR_ENTRY.exec(line)?.[1]).findLast(message => message !== undefined)
-  return (finalWord !== undefined ? [finalWord] : lastError !== undefined ? [lastError] : service
-    .filter((line, index, all) => all.lastIndexOf(line) === index)
-    .slice(-6))
-    .map(line => line.length > 240 ? `${line.slice(0, 239)}…` : line)
+const serviceLines = (lines: readonly string[]) => lines
+  .map(line => line.trimEnd())
+  .filter(line => line.trim() !== "" && !SERVICE_MANAGER_LINE.test(line) && !/^\s*at\s/.test(line) && !line.includes("/$bunfs/"))
+const clip = (line: string) => line.length > 240 ? `${line.slice(0, 239)}…` : line
+
+/** The service's own account of why it stopped: its final plain line, or else its last logged error. */
+export const serviceFailureLine = (lines: readonly string[]): Option.Option<string> => {
+  const service = serviceLines(lines)
+  return Option.orElse(Option.fromNullable(service.findLast(line => !LOG_ENTRY.test(line))),
+    () => Option.fromNullable(service.map(line => ERROR_ENTRY.exec(line)?.[1]).findLast(message => message !== undefined))).pipe(Option.map(clip))
 }
+
+/**
+ * The lines of a service log that say what went wrong: the service's own account of why it stopped
+ * or, without one, the tail of its log, never the service manager's lines, stack frames, blank lines or repeats.
+ */
+export const explainServiceLog = (lines: readonly string[]) => Option.match(serviceFailureLine(lines), {
+  onSome: line => [line],
+  onNone: () => serviceLines(lines).filter((line, index, all) => all.lastIndexOf(line) === index).slice(-6).map(clip),
+})
 
 const startFailed = (host: ServerSetupHost, problem: string) => host.serviceLog.pipe(Effect.flatMap(log => {
   const lines = explainServiceLog(log)

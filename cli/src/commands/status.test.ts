@@ -17,7 +17,7 @@ describe("Magnitude service definitions", () => {
       version: Option.some("0.0.2"),
       startsAutomaticallyOnLogin: Option.some(true),
       activeModel: { _tag: "Observed", model: Option.none() },
-      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Registered" } }), reach: Option.none(), server: false,
+      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Registered" } }), reach: Option.none(), server: false, failing: Option.none(),
     })).toBe([
       "Magnitude service",
       "  Runtime         Ready",
@@ -34,7 +34,7 @@ describe("Magnitude service definitions", () => {
     const output = renderStatus({
       status: "Ready", address: "127.0.0.1:11101", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" },
-      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Unavailable", message: "Desktop panel is unavailable" } }), reach: Option.none(), server: false,
+      owner: Option.some({ _tag: "Desktop", tray: { _tag: "Unavailable", message: "Desktop panel is unavailable" } }), reach: Option.none(), server: false, failing: Option.none(),
     })
     expect(output).toContain("Active model    Unavailable")
     expect(output).not.toContain("Active model    None")
@@ -45,7 +45,7 @@ describe("Magnitude service definitions", () => {
     const output = renderStatus({
       status, address: "127.0.0.1:11101", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" },
-      owner: Option.some({ _tag: "Headless" }), reach: Option.none(), server: false,
+      owner: Option.some({ _tag: "Headless" }), reach: Option.none(), server: false, failing: Option.none(),
     })
     expect(output).toContain(`Runtime         ${status}`)
     expect(output).toContain("Owner           Headless")
@@ -55,7 +55,7 @@ describe("Magnitude service definitions", () => {
 
   it("reports absence with actionable startup guidance and no desktop fields", () => {
     const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
-      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), server: false })
+      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), server: false, failing: Option.none() })
     expect(output).toContain("Not running\nOpen the Magnitude desktop app or run `magnitude serve`.\n")
     expect(output).not.toMatch(/Tray|Starts at login|Active model/)
   })
@@ -65,9 +65,18 @@ describe("Magnitude service definitions", () => {
     ["darwin", "`sudo launchctl kickstart system/dev.magnitude.server`, and see its log: ~/.magnitude/logs/server.log"],
   ] as const)("points a stopped %s server at its service, not the desktop app or serve", (platform, advice) => {
     const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
-      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), server: true }, platform)
+      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), server: true, failing: Option.none() }, platform)
     expect(output).toContain(`Not running\nThe Magnitude server isn't running. Start it with ${advice}\n`)
     expect(output).not.toMatch(/desktop app|magnitude serve/)
+  })
+
+  it("says a server systemd keeps restarting keeps failing, with its last error and log, instead of how to start it", () => {
+    const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
+      startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), server: true,
+      failing: Option.some({ restarts: 4, lastError: Option.some("Magnitude couldn't download its inference engine (HTTP 404 from github.com).") }) }, "linux")
+    expect(output).toContain("Keeps failing to start\nThe Magnitude server keeps stopping as it starts (restarted 4 times).\n"
+      + "Its last error: Magnitude couldn't download its inference engine (HTTP 404 from github.com).\nSee its log: journalctl -u magnitude\n")
+    expect(output).not.toContain("systemctl start")
   })
 
   it("shows how to reach a ready server, without the key", () => {
@@ -77,7 +86,7 @@ describe("Magnitude service definitions", () => {
       owner: Option.some({ _tag: "Headless" }),
       reach: Option.some({ endpoint: "http://127.0.0.1:10100", configPath: "/var/lib/magnitude/config.json", service: true,
         network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
-      server: true,
+      server: true, failing: Option.none(),
     })
     expect(output).toContain("Address         0.0.0.0:10100 (all interfaces)")
     expect(output).toContain("Owner           Server")

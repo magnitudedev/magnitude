@@ -1,9 +1,11 @@
 import { applicationDataDirectory, desktopApplication, desktopServiceOrigin, readDesktopLoginStartup } from "../server/application"
 import { isServerSetUp } from "../server/serve-owner"
-import { serverNotRunning } from "../server/server-setup"
+import { serverLogs, serverNotRunning, serviceFailureLine } from "../server/server-setup"
 import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
+import { Command, CommandExecutor } from "@effect/platform"
+import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
 import { isIP } from "node:net"
 import { existingAcnConnection } from "../server/acn-connection"
@@ -23,7 +25,28 @@ interface ServiceStatusPresentation {
   readonly owner: Option.Option<ApplicationOwner>
   readonly reach: Option.Option<ServerReach>
   readonly server: boolean
+  readonly failing: Option.Option<ServerFailing>
 }
+
+/** A system service that systemd keeps restarting, with the service's own last error when the journal is readable. */
+interface ServerFailing {
+  readonly restarts: number
+  readonly lastError: Option.Option<string>
+}
+
+const readServerFailing = Effect.gen(function* () {
+  const executor = yield* CommandExecutor.CommandExecutor
+  const output = (command: string, ...args: string[]) => executor.string(Command.make(command, ...args)).pipe(
+    Effect.timeout("3 seconds"), Effect.orElseSucceed(() => ""))
+  const unit = new Map((yield* output("/usr/bin/systemctl", "show", "magnitude.service", "--property=NRestarts,Result,ActiveState"))
+    .split("\n").map(line => line.split("=", 2) as [string, string | undefined]))
+  const restarts = Number(unit.get("NRestarts"))
+  // An administrator's stop leaves the restart count but a successful result.
+  const failed = (unit.get("Result") ?? "success") !== "success" || (restarts > 0 && unit.get("ActiveState") !== "inactive")
+  if (!Number.isInteger(restarts) || !failed) return Option.none<ServerFailing>()
+  const journal = yield* output("/usr/bin/journalctl", "-u", "magnitude.service", "-n", "300", "-o", "cat", "--no-pager", "--quiet")
+  return Option.some({ restarts, lastError: serviceFailureLine(journal.split("\n")) })
+}).pipe(Effect.provide(BunContext.layer))
 
 const serviceAddress = new URL(desktopServiceOrigin).host
 
@@ -64,11 +87,12 @@ const publicServiceStatus = desktopApplication.observe.pipe(
     const reach = state?._tag === "Ready" ? Effect.all([applicationDataDirectory, isServerSetUp]).pipe(
       Effect.flatMap(([dataDirectory, service]) => readServerReach({ endpoint: desktopServiceOrigin, dataDirectory, service })), Effect.option)
       : Effect.succeed(Option.none<ServerReach>())
-    return Effect.all({ model: activeModel, reach, server: isServerSetUp, login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, server }): ServiceStatusPresentation => ({
+    const failing = (server: boolean) => server && process.platform === "linux" && state?._tag !== "Ready" ? readServerFailing : Effect.succeed(Option.none<ServerFailing>())
+    return Effect.all({ model: activeModel, reach, server: isServerSetUp.pipe(Effect.flatMap(server => failing(server).pipe(Effect.map(failing => ({ server, failing }))))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, server: { server, failing } }): ServiceStatusPresentation => ({
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      owner: Option.map(snapshot, value => value.owner), reach, server,
+      owner: Option.map(snapshot, value => value.owner), reach, server, failing,
     })))
   }),
 )
@@ -105,9 +129,15 @@ export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.
       : `${model.displayName} - ${model.status}`,
   })}`] : []),
   ...Option.match(status.reach, { onNone: () => [], onSome: reach => ["", ...renderServerReach(reach).map(line => `  ${line}`)] }),
-  ...(Option.isNone(status.owner) ? [
-    "", "Not running", status.server ? serverNotRunning(platform) : "Open the Magnitude desktop app or run `magnitude serve`.",
-  ] : []),
+  ...Option.match(status.failing, {
+    onSome: failing => ["", "Keeps failing to start",
+      `The Magnitude server keeps stopping as it starts (restarted ${failing.restarts} ${failing.restarts === 1 ? "time" : "times"}).`,
+      ...Option.match(failing.lastError, { onNone: () => [], onSome: line => [`Its last error: ${line}`] }),
+      `See its log: ${serverLogs(platform)}`],
+    onNone: () => Option.isNone(status.owner) ? [
+      "", "Not running", status.server ? serverNotRunning(platform) : "Open the Magnitude desktop app or run `magnitude serve`.",
+    ] : [],
+  }),
   "",
 ].join("\n")
 
