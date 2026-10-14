@@ -1,6 +1,6 @@
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
-import { ServerInstallationFailed, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, removeLinuxServer,
+import { ServerInstallationFailed, installLinuxServer, installMacServer, openServerFirewall, parseServerInstallation, removeLinuxServer, restoreLinuxServerGrant,
   removeMacServer, requireInstalledRoot } from "@magnitudedev/daemon-management/desktop-native"
 import { ServerSetupHostLive } from "../server/server-setup-live"
 import { serverRemove, serverSetup } from "../server/server-setup"
@@ -15,7 +15,12 @@ export const runServerRemove = () => report(serverRemove.pipe(Effect.provide(Ser
 /** The hidden root command. It accepts no input beyond the user name and runs only from the installed CLI as root. */
 export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(function* () {
   const request = yield* parseServerInstallation(argv, process.env)
-  const cli = yield* requireInstalledRoot(process.platform, process.execPath)
+  const cli = yield* requireInstalledRoot(process.platform, process.execPath,
+    request._tag === "Remove" ? "magnitude server remove" : "magnitude server setup")
+  if (request._tag === "RestoreGrant") {
+    if (process.platform !== "linux") return yield* new ServerInstallationFailed({ message: "Only Linux packages restore the server's update permission." })
+    return yield* restoreLinuxServerGrant
+  }
   if (process.platform === "darwin") {
     if (request._tag === "Remove") return yield* removeMacServer
     // The LaunchDaemon serves as a person; macOS has no root-login server.

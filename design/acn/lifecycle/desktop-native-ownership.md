@@ -147,7 +147,8 @@ loss before release packaging enables this entry point. Finite commands retain t
 process lifetime and may launch an independent desktop: completing `app open` cannot retire it.
 The launcher classifies the root serving command and advertises its continuation protocol only to
 that contained child. Serving admission must independently verify native containment; environment
-values alone cannot authorize an uncontained server. Finite commands cannot request continuation.
+values alone cannot authorize an uncontained server; refusing one names the launcher on PATH, which
+service wrappers must start instead of the payload executable. Finite commands cannot request continuation.
 Windows named pipes install a protected current-user DACL at creation and reject remote clients.
 The first instance refuses an existing endpoint. Native client PID observation fences child admission.
 Pending accept/read/write operations retain their buffers through confirmed cancellation; close cannot
@@ -235,7 +236,9 @@ without forwarding them to the terminal. Foreground ownership additionally forwa
 stderr, with at most one 16 KiB write outstanding. Slow terminals may lose live output; diagnostic
 collection continues independently. Terminal errors disable forwarding and cannot fail service
 admission, prevent process-tree retirement, or make shutdown wait for the terminal. Child ownership
-never closes the parent's terminal stream.
+never closes the parent's terminal stream. A failed attempt logs its retained output only when
+that output was not already forwarded, and the supervisor logs the cause of a failure only when it
+is a defect; an expected failure's message travels in the Failed state.
 
 On macOS and Linux, production startup automatically retires a verified previous standalone Magnitude installation
 before spawning its bundled service, while holding the application lock. This bounded upgrade is
@@ -253,7 +256,9 @@ cannot block a successful startup or remove an unverified path.
 
 Upgrade runs within supervised startup with bounded deadlines and responsive application control.
 The existing port preflight still rejects unrelated incumbents, and the service bind remains
-authoritative against races. Acceptance covers real old-package upgrades, dormant registrations,
+authoritative against races. A rejected incumbent that answers health as Magnitude, such as another
+account's wrapped `magnitude serve`, is named as another Magnitude server; Windows reports another
+account's exclusive bind as access denied, which the preflight treats as occupied. Acceptance covers real old-package upgrades, dormant registrations,
 manual services, inference descendants, interrupted/repeated launches and data/model reuse.
 
 Linux tray-host observation belongs to the application scope, independently of service and renderer
@@ -299,7 +304,7 @@ take effect.
 `magnitude server setup` registers the foreground serving host as a system service. It runs as the
 person, and only its root step runs through sudo, as a hidden command of the installed CLI invoked
 by full path. That command accepts exactly the invoking user's name (sudo's own, never another
-account), or no arguments for a root login, or removal; it refuses unless running as root from the
+account), or no arguments for a root login, or removal, or the package installation's grant restoration; it refuses unless running as root from the
 installed path, and writes only Magnitude's fixed files. Interactive sudo, here and for a foreground
 `magnitude update install`, runs in the caller's own terminal session, so it reuses that terminal's
 ticket (the installer's earlier authorization) or asks there once; a child in a new session could do
@@ -315,7 +320,8 @@ person's, makes setup refuse before changing anything, and removal never deletes
 step undoes what that run created, so no marker points the CLI at a server that was never enabled;
 re-running setup over a complete or partial setup finishes the remaining steps. When firewalld is running, the root step also opens the server's TCP port 10100 in its default
 zone, at runtime and permanently, and says so; if that fails it prints the `firewall-cmd` command
-instead and setup continues. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
+instead and setup continues. An active ufw that doesn't allow the port is left as it is, and setup
+prints the `ufw allow` command for it. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
 that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
 The desktop app always uses the person's own profile. Every local account reaches the server's
 owner control, as loopback HTTP already admits them, with no group membership or new login: the data
@@ -336,8 +342,14 @@ unit is distinct from the per-user unit that previous-installation retirement in
 group and marker, the marker last, so a removal that fails part way is still visible and can be run
 again; it cleans up whatever of these exists, with or without the marker. The data directory is
 kept, handed to root (mode 0700) since no account owns it any more, until setup gives it back to a
-new service account. Setup waits a bounded two minutes for the service to answer, then fails naming
-its log (the journal on Linux, `~/.magnitude/logs/server.log`, private to the person, on macOS);
+new service account. Setup only ever configures the registered service: before its root step it refuses,
+changing nothing, while anything else answers on port 10100 (another account's Magnitude or another
+program), and afterwards it sends no request until the instance answering on the port is the one the
+service's owner reports. It waits a bounded two minutes for the service to answer, and fails sooner
+when the service manager keeps restarting the service or another program keeps the port; each failure
+quotes the service's own account of why it stopped, its final plain line or else its last logged
+error, never the service manager's lines or stack frames, and names the log (the journal on Linux,
+`~/.magnitude/logs/server.log`, private to the person, on macOS);
 on macOS, where the service serves in the person's own profile, a re-run treats the Headless owner
 of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
@@ -345,6 +357,8 @@ it runs, the whole window is one screen offering to keep the server, which opens
 and quits, or to stop it and continue. On Linux, stopping runs pkexec of the packaged removal
 wrapper, which Polkit admits without a password for the active local session; macOS asks for an
 administrator. A background launch leaves
-a running server alone, and a server that stops lets the app continue. Windows has no server
+a running server alone, and a server that stops lets the app continue. A quit request (Cmd-Q,
+logout, SIGTERM) on that screen quits like closing it. When the screen or a background launch quits
+in favour of the macOS server, the desktop turns off its own launch at login. Windows has no server
 mode; its command launcher ignores logoff, which Windows sends only to services, so a third-party
 service wrapper keeps serving.

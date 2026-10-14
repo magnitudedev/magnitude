@@ -1,14 +1,16 @@
-import { Command, CommandExecutor, FileSystem } from "@effect/platform"
+import { Command, CommandExecutor, FetchHttpClient, FileSystem, HttpClient, HttpClientResponse } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Duration, Effect, Layer, Option, Schedule } from "effect"
+import { Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { open } from "node:fs/promises"
+import { connect } from "node:net"
 import { join } from "node:path"
 import { userInfo } from "node:os"
 import { MagnitudeClient } from "@magnitudedev/sdk"
-import { applicationStateDirectory, hasLinuxServerRemnants, installedServerCli, requestApplication, TerminalCommand, nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
+import { applicationStateDirectory, hasLinuxServerRemnants, installedServerCli, MAC_SERVER_LABEL, requestApplication, TerminalCommand,
+  nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { isServerSetUp } from "./serve-owner"
-import { desktopDataDirectory, desktopServiceOrigin } from "./application"
-import { ServerSetupFailed, ServerSetupHost, type ServerAccess } from "./server-setup"
+import { desktopApplication, desktopDataDirectory, desktopServiceOrigin } from "./application"
+import { ServerSetupFailed, ServerSetupHost, type ServerAccess, type ServicePort } from "./server-setup"
 import { withLocalService } from "./server-reach"
 
 const failed = (message: string) => new ServerSetupFailed({ message })
@@ -33,6 +35,32 @@ const readNetworkAccess = (settled: boolean) => withService(client => client.con
   Effect.retry(Schedule.spaced(Duration.seconds(1))),
   Effect.mapError(() => failed("The Magnitude server did not start.")))
 
+const serviceUrl = new URL(desktopServiceOrigin)
+
+const portAccepts = Effect.async<boolean>(resume => {
+  const socket = connect({ host: serviceUrl.hostname, port: Number(serviceUrl.port) })
+  const settle = (accepted: boolean) => { socket.destroy(); resume(Effect.succeed(accepted)) }
+  socket.setTimeout(2000, () => settle(true))
+  socket.once("connect", () => settle(true))
+  socket.once("error", () => settle(false))
+})
+
+const answeringInstance = HttpClient.get(`${desktopServiceOrigin}/health`).pipe(
+  Effect.flatMap(HttpClientResponse.schemaBodyJson(Schema.Struct({ id: Schema.String }))),
+  Effect.map(health => health.id), Effect.scoped, Effect.timeout("3 seconds"), Effect.provide(FetchHttpClient.layer), Effect.option)
+
+/** The instance the registered service's owner runs: the server profile's on Linux, the person's own on macOS. */
+const serviceInstance = desktopApplication.observe.pipe(
+  Effect.map(snapshot => snapshot.service._tag === "Ready" ? Option.some(snapshot.service.health.id)
+    : snapshot.service._tag === "Starting" ? Option.map(snapshot.service.health, health => health.id) : Option.none<string>()),
+  Effect.orElseSucceed(() => Option.none<string>()))
+
+const servicePort: Effect.Effect<ServicePort> = Effect.gen(function* () {
+  if (!(yield* portAccepts)) return "Free"
+  const [answering, service] = yield* Effect.all([answeringInstance, serviceInstance], { concurrency: "unbounded" })
+  return Option.isSome(answering) && Option.isSome(service) && answering.value === service.value ? "Service" : "Other"
+})
+
 const enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed> = Effect.gen(function* () {
   const current = yield* readNetworkAccess(false)
   if (!current.enabled || !current.requireApiKey) {
@@ -56,6 +84,10 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
   const executor = yield* CommandExecutor.CommandExecutor
   const terminal = yield* TerminalCommand
   const platform = process.platform
+  const started = Math.floor(Date.now() / 1000)
+  const output = (command: string, ...args: string[]) => executor.string(Command.make(command, ...args)).pipe(
+    Effect.timeout("5 seconds"), Effect.orElseSucceed(() => ""))
+  const journal = ["-u", "magnitude.service", `--since=@${started}`, "-n", "300", "-o", "cat", "--no-pager", "--quiet"]
   return ServerSetupHost.of({
     platform,
     user: userInfo().username,
@@ -82,11 +114,23 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
       // In this terminal's session, so sudo reuses its ticket (the installer's Yes) or asks here once.
       const code = yield* terminal.run(root ? cli.value : "/usr/bin/sudo", root ? args : ["--", cli.value, ...args], { stdin: "inherit" }).pipe(
         Effect.orElseSucceed(() => -1))
-      // The root step has printed what went wrong, and what it undid.
+      // The root step has printed what went wrong, and what it undid; sudo has said if it refused this account.
+      const administrator = root ? "" : "\nIt needs an administrator account, one that can use sudo. If sudo refused this account above, run it from an administrator account."
       if (code !== 0) return yield* failed(args[0] === "_server-remove"
-        ? "Server removal did not finish. Run `magnitude server remove` again once the problem above is fixed."
-        : "Server setup did not finish.")
+        ? `Server removal did not finish. Run \`magnitude server remove\` again once the problem above is fixed.${administrator}`
+        : `Server setup did not finish.${administrator}`)
     }),
+    servicePort,
+    serviceRuns: (platform === "darwin"
+      ? output("/bin/launchctl", "print", `system/${MAC_SERVER_LABEL}`).pipe(Effect.map(text => /^\s*runs = (\d+)$/m.exec(text)?.[1]))
+      : output("/usr/bin/systemctl", "show", "magnitude.service", "--property=NRestarts", "--value").pipe(Effect.map(text => text.trim()))).pipe(
+      Effect.map(value => value !== undefined && /^\d+$/.test(value) ? Option.some(Number(value)) : Option.none())),
+    // Reading the system journal needs the adm group or root; sudo still holds setup's authorization.
+    serviceLog: (platform === "darwin"
+      ? fs.readFileString(join(desktopDataDirectory, "logs", "server.log")).pipe(Effect.map(text => text.split("\n").slice(-300)), Effect.orElseSucceed(() => []))
+      : output("/usr/bin/journalctl", ...journal).pipe(
+        Effect.flatMap(text => text.trim() !== "" || process.getuid?.() === 0 ? Effect.succeed(text) : output("/usr/bin/sudo", "-n", "--", "/usr/bin/journalctl", ...journal)),
+        Effect.map(text => text.split("\n")))),
     enableNetworkAccess,
     write: text => Effect.sync(() => { process.stdout.write(text) }),
   })
