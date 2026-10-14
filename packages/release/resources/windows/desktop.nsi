@@ -19,13 +19,13 @@ Var PreviousVersion
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 !define REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\MagnitudeDesktop"
-!macro Lease
+!macro Lease Retry
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=MagnitudeInstallGuard.dll "MagnitudeInstallGuard.dll"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::HoldOwnership() i .r0'
   ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONSTOP "Close Magnitude using Quit from its tray menu, then run setup again. Installation access could not be acquired (code $0)." /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "Close Magnitude using Quit from its tray menu, then ${Retry} again." /SD IDOK
     SetErrorLevel 1
     Abort
   ${EndIf}
@@ -33,7 +33,7 @@ Var PreviousVersion
 Function .onInit
   SetShellVarContext current
   StrCpy $INSTDIR "$LOCALAPPDATA\Programs\Magnitude"
-  !insertmacro Lease
+  !insertmacro Lease "run setup"
   StrCpy $PreviousVersion ""
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ReadInstallationVersion(w "$INSTDIR", w "${REGKEY}", w .r8, i 1024) i .r0'
   ${If} $0 == 0
@@ -206,7 +206,7 @@ SectionEnd
 Function un.onInit
   SetShellVarContext current
   StrCpy $INSTDIR "$LOCALAPPDATA\Programs\Magnitude"
-  !insertmacro Lease
+  !insertmacro Lease "uninstall"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::AcquireRemovalExecutable(w "$INSTDIR\Uninstall Magnitude.exe") i .r0'
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "The installed uninstaller does not match this copy or is in use (code $0). Close applications using these files and retry. Application files were preserved." /SD IDOK
