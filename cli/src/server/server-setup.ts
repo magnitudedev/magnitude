@@ -1,5 +1,5 @@
 import { Context, Duration, Effect, Option, Schema } from "effect"
-import { SERVER_DATA_DIRECTORY } from "@magnitudedev/daemon-management/desktop-native"
+import { MAC_SERVER_LABEL, SERVER_DATA_DIRECTORY } from "@magnitudedev/daemon-management/desktop-native"
 
 export const WINDOWS_SERVER_MESSAGE = "Server mode isn't available on Windows. To run Magnitude as a service, see https://docs.magnitude.dev/remote-server#windows"
 
@@ -44,6 +44,11 @@ export const ServerSetupHost = Context.GenericTag<ServerSetupHost>("@magnitudede
 
 /** Where the service's output goes: the journal on Linux, the person's log file on macOS. */
 export const serverLogs = (platform: NodeJS.Platform) => platform === "darwin" ? "~/.magnitude/logs/server.log" : "journalctl -u magnitude"
+
+/** What to do when the registered service isn't answering; a server has no desktop app and refuses `serve`. */
+export const serverNotRunning = (platform: NodeJS.Platform) => platform === "darwin"
+  ? `The Magnitude server isn't running. Start it with \`sudo launchctl kickstart system/${MAC_SERVER_LABEL}\`, and see its log: ${serverLogs(platform)}`
+  : `The Magnitude server isn't running. Start it with \`sudo systemctl start magnitude\`, and see its log: ${serverLogs(platform)}`
 
 export const SERVER_START_TIMEOUT = Duration.minutes(2)
 
