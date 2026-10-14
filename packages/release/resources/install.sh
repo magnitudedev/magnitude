@@ -163,6 +163,10 @@ PY
     [ "$actual_bytes" = "$bytes" ] || fail 'The application download is incomplete.'
     actual_digest=$(sha256sum "$scratch/magnitude.$package" | cut -d ' ' -f 1)
     [ "$actual_digest" = "$(cat "$scratch/digest")" ] || fail 'The application checksum does not match.'
+    # Fresh cloud images ship without apt's package lists, so the package's dependencies would not resolve.
+    if [ "$package" = deb ]; then
+      $privilege apt-get update || printf '%s\n' 'Could not refresh the package lists; installing anyway.' >&2
+    fi
     # A running server holds the installation lock the package checks, so upgrade it stopped.
     if [ "$answer" = configured ] && systemctl is-active --quiet magnitude.service; then
       stopped_server=1
