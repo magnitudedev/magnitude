@@ -29,7 +29,9 @@ must be resolved explicitly; uninstall removes only registration owned by that i
 
 ## Headless control
 
-`magnitude update` and `magnitude update check` request a fresh check from the application owner.
+`magnitude update` and `magnitude update check` request a fresh check from the application owner
+and wait (up to two minutes) for it to finish, so they print its result. While a check runs, its
+state supersedes the previous check's offer.
 `magnitude update status` observes current update state without starting the application.
 `magnitude update download` explicitly admits a download of the selected offer. It acknowledges
 admission and directs the caller to status; download completion belongs to the owner. While a
