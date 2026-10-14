@@ -2,24 +2,24 @@
 <rect width="800" height="240" rx="12" fill="#ffffff"/>
 <text x="28" y="42" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#0f1826">Mac</text>
 <text x="73" y="42" font-size="14" fill="#64748b">M4 Pro 48 GB</text>
-<text x="28" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">32%</text>
+<text x="28" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">1.32x</text>
 <text x="28" y="126" font-size="15" fill="#334155">faster prefill</text>
 <rect x="28" y="144" width="121" height="7" rx="3.5" fill="#cbd5e1"/>
 <rect x="28" y="156" width="160" height="7" rx="3.5" fill="#0ea5e9"/>
 <text x="28" y="186" font-size="14" fill="#64748b">vs Ollama (MLX)</text>
-<text x="220" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">119%</text>
+<text x="220" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">2.19x</text>
 <text x="220" y="126" font-size="15" fill="#334155">faster decode</text>
 <rect x="220" y="144" width="73" height="7" rx="3.5" fill="#cbd5e1"/>
 <rect x="220" y="156" width="160" height="7" rx="3.5" fill="#0ea5e9"/>
 <text x="220" y="186" font-size="14" fill="#64748b">vs Ollama (MLX)</text>
 <text x="428" y="42" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="15" font-weight="600" fill="#0f1826">NVIDIA</text>
 <text x="500" y="42" font-size="14" fill="#64748b">DGX Spark</text>
-<text x="428" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">34%</text>
+<text x="428" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">1.34x</text>
 <text x="428" y="126" font-size="15" fill="#334155">faster prefill</text>
 <rect x="428" y="144" width="119" height="7" rx="3.5" fill="#cbd5e1"/>
 <rect x="428" y="156" width="160" height="7" rx="3.5" fill="#0ea5e9"/>
 <text x="428" y="186" font-size="14" fill="#64748b">vs Ollama (llama.cpp)</text>
-<text x="620" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">117%</text>
+<text x="620" y="100" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="40" font-weight="700" letter-spacing="-1.5" fill="#0f1826">2.17x</text>
 <text x="620" y="126" font-size="15" fill="#334155">faster decode</text>
 <rect x="620" y="144" width="74" height="7" rx="3.5" fill="#cbd5e1"/>
 <rect x="620" y="156" width="160" height="7" rx="3.5" fill="#0ea5e9"/>

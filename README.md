@@ -59,7 +59,7 @@ On Linux and macOS, `magnitude server setup` runs Magnitude as a service that st
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks/ollama-dark.svg">
-  <img alt="Magnitude vs Ollama, average of 11 popular local models: 32% faster prefill and 119% faster decode on Mac, 34% faster prefill and 117% faster decode on NVIDIA" src="assets/benchmarks/ollama-light.svg" width="800">
+  <img alt="Magnitude vs Ollama, average of 11 popular local models: 1.32x faster prefill and 2.19x faster decode on Mac, 1.34x faster prefill and 2.17x faster decode on NVIDIA" src="assets/benchmarks/ollama-light.svg" width="800">
 </picture>
 
 ## FAQ
