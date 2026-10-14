@@ -165,7 +165,8 @@ describe("install when idle", () => {
     const h = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 0 } })
     let reports = 0
     const report = Effect.sync(() => { reports += 1 })
-    const updates = updatesIn({ _tag: "Downloading", version: "99.0.0", completed: 0, total: 1 }, { _tag: "Ready", version: "99.0.0" })
+    const updates = updatesIn({ _tag: "Available", version: "99.0.0", bytes: 1, failed: Option.none() },
+      { _tag: "Downloading", version: "99.0.0", completed: 0, total: 1 }, { _tag: "Ready", version: "99.0.0" })
     expect(await h.run(machine => machine.startupFailed(report, updates))).toBe(true)
     expect(reports).toBe(1)
     expect(h.hold()).toEqual(Option.some({ version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 3_600_000 }))
@@ -179,6 +180,9 @@ describe("install when idle", () => {
     const later = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 0 } })
     expect(await later.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Idle" })))).toBe(false)
     expect(reports).toBe(1)
+    const offered = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 0 } })
+    expect(await offered.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Available", version: CLI_VERSION, bytes: 1, failed: Option.some("startup") })))).toBe(false)
+    expect(reports).toBe(2)
   })
   it("leaves other outcomes alone when a start fails", async () => {
     const h = harness({ outcome: { outcome: "applied", version: "0.0.1", from: Option.some("0.0.0"), reason: Option.none() } })

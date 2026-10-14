@@ -173,8 +173,11 @@ export const makeIdleInstallation = Effect.gen(function* () {
     }
     yield* report
     if (!(yield* system.canInstallUnattended)) return false
-    const settled = yield* updates.changes.pipe(Stream.map(state => state.transfer),
-      Stream.filter(transfer => transfer._tag !== "Downloading" && transfer._tag !== "Staging" && transfer._tag !== "Cancelling"),
+    // An offer that downloads automatically is about to start downloading, so it is not settled yet.
+    const settled = yield* updates.changes.pipe(Stream.filter(state => state.transfer._tag === "Available"
+      ? Option.isSome(state.transfer.failed) || !(state.preference._tag === "Known" && state.preference.autoDownload)
+      : state.transfer._tag !== "Downloading" && state.transfer._tag !== "Staging" && state.transfer._tag !== "Cancelling"),
+      Stream.map(state => state.transfer),
       Stream.runHead, Effect.timeout(replacementDownload))
     return Option.exists(settled, transfer => transfer._tag === "Ready")
   })), Effect.orElseSucceed(() => false))
