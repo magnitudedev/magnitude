@@ -50,6 +50,9 @@ the authorizing user's identity and installed publisher trust. Success requires 
 package installation and the replacement CLI reporting the prepared version before retained state
 is removed. Cancellation retires privileged installation descendants, cannot report success or clear
 an attempted installation, and preserves package-manager repair state when replacement was interrupted.
+apt waits up to five minutes for a dpkg lock held by another package run (such as unattended-upgrades),
+as install.sh does, and dnf waits for its own lock, so routine contention delays an installation
+rather than failing it.
 No owner installs a prepared update at startup. Desktop launch and Headless `serve` start
 normally with the update retained; Desktop offers Restart and a terminal owner prints the install
 command. Startup only completes an interrupted macOS transaction from its receipt. Failed or

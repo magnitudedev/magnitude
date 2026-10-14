@@ -22,6 +22,11 @@ export const linuxPackageUpdateExitCode = { verify: 3, install: 4 } as const
 export const linuxUpdateFailureReason = (code: number): Exclude<UpdateFailureReason, "startup"> =>
   code === linuxPackageUpdateExitCode.verify ? "verify" : code === linuxPackageUpdateExitCode.install ? "install"
   : code === 1 || code === 126 || code === 127 ? "authorization" : "install"
+/**
+ * How long apt waits for the dpkg lock that unattended-upgrades or another package run holds, so
+ * routine contention delays an update instead of failing it. dnf waits for its lock by itself.
+ */
+const aptLockTimeoutSeconds = 300
 export interface LinuxPackageInstaller {
   readonly install: (request: typeof LinuxPackageUpdate.Type) => Effect.Effect<void, LinuxPackageUpdateFailed>
 }
@@ -85,7 +90,7 @@ export const makeLinuxPackageInstaller = (options: {
     }
     const environment = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
     const result = yield* (target.package === "deb"
-      ? guarded.run("/usr/bin/apt-get", ["install", "--yes", "--no-remove", "--", archive], { ...environment, DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "l" })
+      ? guarded.run("/usr/bin/apt-get", ["install", "--yes", "--no-remove", "-o", `DPkg::Lock::Timeout=${aptLockTimeoutSeconds}`, "--", archive], { ...environment, DEBIAN_FRONTEND: "noninteractive", NEEDRESTART_MODE: "l" })
       : target.package === "rpm" ? guarded.run("/usr/bin/dnf", ["--assumeyes", "install", archive], environment)
       : guarded.run("/usr/bin/pacman", ["--upgrade", "--noconfirm", "--", archive], environment))
     yield* Effect.sync(() => { process.stdout.write(result.stdout); process.stderr.write(result.stderr) })

@@ -172,7 +172,7 @@ PY
       stopped_server=1
       $privilege systemctl stop magnitude.service
     fi
-    if [ "$package" = deb ]; then $privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y "$scratch/magnitude.deb"
+    if [ "$package" = deb ]; then $privilege env DEBIAN_FRONTEND=noninteractive apt-get install -y -o DPkg::Lock::Timeout=300 "$scratch/magnitude.deb"
     elif [ "$package" = rpm ]; then $privilege dnf install -y "$scratch/magnitude.rpm"
     else $privilege pacman -U --noconfirm "$scratch/magnitude.pacman"
     fi || fail 'The Magnitude package could not be installed; see the package manager output above.'
