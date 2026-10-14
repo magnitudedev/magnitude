@@ -147,7 +147,8 @@ loss before release packaging enables this entry point. Finite commands retain t
 process lifetime and may launch an independent desktop: completing `app open` cannot retire it.
 The launcher classifies the root serving command and advertises its continuation protocol only to
 that contained child. Serving admission must independently verify native containment; environment
-values alone cannot authorize an uncontained server. Finite commands cannot request continuation.
+values alone cannot authorize an uncontained server; refusing one names the launcher on PATH, which
+service wrappers must start instead of the payload executable. Finite commands cannot request continuation.
 Windows named pipes install a protected current-user DACL at creation and reject remote clients.
 The first instance refuses an existing endpoint. Native client PID observation fences child admission.
 Pending accept/read/write operations retain their buffers through confirmed cancellation; close cannot
