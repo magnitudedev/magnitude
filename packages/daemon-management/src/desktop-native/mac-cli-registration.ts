@@ -1,7 +1,7 @@
 import { Effect, Option } from "effect"
 import { join } from "node:path"
 import { type CliLinkFailed, makeMacCliLink } from "./mac-cli-link"
-import { MAC_CLI_DIRECTORY, makeMacCliPath } from "./mac-cli-path"
+import { type CliPathFailed, MAC_CLI_DIRECTORY, makeMacCliPath } from "./mac-cli-path"
 
 /** Desktop and installation share command placement and ownership of shell PATH edits. */
 export const makeMacCliRegistration = (options: {
@@ -24,8 +24,9 @@ export const makeMacCliRegistration = (options: {
 })
 
 /** Installation is complete without the terminal command, so a failed registration becomes a warning saying how to finish it. */
-export const macCliRegistrationWarning = (install: Effect.Effect<void, CliLinkFailed>) => install.pipe(
+export const macCliRegistrationWarning = (install: Effect.Effect<void, CliLinkFailed | CliPathFailed>) => install.pipe(
   Effect.as(Option.none<string>()),
-  Effect.catchAll(error => Effect.succeed(Option.some(
-    `Warning: ${error.message}\nTo use the magnitude command in a terminal, add ~/${MAC_CLI_DIRECTORY} to your PATH.`))),
+  Effect.catchAll(error => Effect.succeed(Option.some(`Warning: ${error.message}\n${error._tag === "CliPathFailed"
+    ? `To use the magnitude command in shells that read ${error.paths.length === 1 ? "that file" : "those files"}, add ~/${MAC_CLI_DIRECTORY} to PATH there yourself.`
+    : `To use the magnitude command in a terminal, add ~/${MAC_CLI_DIRECTORY} to your PATH.`}`))),
 )
