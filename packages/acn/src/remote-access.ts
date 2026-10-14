@@ -1,6 +1,6 @@
-import { HttpLayerRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform"
+import { FileSystem, HttpLayerRouter, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Clock, Duration, Effect, Option, Ref, Schema } from "effect"
-import { randomBytes, timingSafeEqual } from "node:crypto"
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
 import {
   REMOTE_ACCESS_SESSION_PATH,
   REMOTE_ACCESS_SIGN_OUT_PATH,
@@ -10,13 +10,15 @@ import {
   SignInRequest,
   SignInThrottled,
 } from "@magnitudedev/acn-protocol"
-import { isLoopbackAddress, type NetworkAccess } from "@magnitudedev/storage"
+import { isLoopbackAddress, readStructuredFile, writeStructuredFileAtomic, type NetworkAccess } from "@magnitudedev/storage"
 
 export const SESSION_COOKIE = "magnitude_session"
 export const SESSION_IDLE_LIMIT = Duration.days(30)
+export const REMOTE_SESSIONS_FILE = "remote-sessions.json"
 const FREE_FAILURES = 5
 const FIRST_WAIT = Duration.seconds(1)
 const LONGEST_WAIT = Duration.minutes(1)
+const LAST_USE_SAVE_INTERVAL = Duration.hours(1)
 
 /** Who is calling: this machine, a browser that signed in with the key, or anyone else. */
 export type CallerAccess = "Local" | "SignedIn" | "Anonymous"
@@ -28,8 +30,9 @@ interface Throttle {
 }
 
 /**
- * Remote browser sessions for one ACN process. They live only in memory, so a restart, which is
- * also what applies a regenerated key or disabled Network access, signs every browser out.
+ * Remote browser sessions, keyed by a digest of their token. They outlive a restart through the
+ * session store, which drops them when the key changes, so regenerating the key still signs every
+ * browser out once it applies.
  */
 export interface RemoteAccessApi {
   readonly network: NetworkAccess
@@ -63,25 +66,74 @@ const keyMatches = (presented: string, expected: string) => {
 }
 
 const sessionToken = (request: HttpServerRequest.HttpServerRequest) => Option.fromNullable(request.cookies[SESSION_COOKIE])
+const digest = (value: string) => createHash("sha256").update(value).digest("base64url")
 
-export const makeRemoteAccess = (network: NetworkAccess) => Effect.gen(function* () {
-  const sessions = yield* Ref.make(new Map<string, number>())
+/** Signed-in sessions kept across restarts: token digests and when each was last used. */
+export interface RemoteSessionStore {
+  readonly load: Effect.Effect<ReadonlyMap<string, number>>
+  readonly save: (sessions: ReadonlyMap<string, number>) => Effect.Effect<void>
+}
+
+export const memorySessionStore: RemoteSessionStore = { load: Effect.succeed(new Map()), save: () => Effect.void }
+
+const PersistedSessions = Schema.Struct({
+  keyDigest: Schema.String,
+  sessions: Schema.Array(Schema.Struct({ tokenDigest: Schema.String, lastUsed: Schema.Number })),
+})
+
+/** Sessions in a private file, valid only while the Network access key they signed in with is. */
+export const fileSessionStore = (path: string, network: NetworkAccess) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  if (Option.isNone(network.apiKey)) return memorySessionStore
+  const keyDigest = digest(network.apiKey.value)
+  const writes = yield* Effect.makeSemaphore(1)
+  return {
+    load: readStructuredFile(path, PersistedSessions).pipe(
+      Effect.map(result => result._tag === "Present" && result.value.keyDigest === keyDigest
+        ? new Map(result.value.sessions.map(session => [session.tokenDigest, session.lastUsed] as const))
+        : new Map<string, number>()),
+      Effect.tapError(error => Effect.logWarning("Signed-in browser sessions could not be read").pipe(Effect.annotateLogs({ cause: error.message }))),
+      Effect.orElseSucceed(() => new Map<string, number>()),
+      Effect.provideService(FileSystem.FileSystem, fs),
+    ),
+    save: sessions => writes.withPermits(1)(writeStructuredFileAtomic(path, PersistedSessions, {
+      keyDigest,
+      sessions: [...sessions].map(([tokenDigest, lastUsed]) => ({ tokenDigest, lastUsed })),
+    }, { mode: 0o600 })).pipe(
+      Effect.catchAll(error => Effect.logWarning("Signed-in browser sessions could not be saved").pipe(Effect.annotateLogs({ cause: error.message }))),
+      Effect.provideService(FileSystem.FileSystem, fs),
+    ),
+  } satisfies RemoteSessionStore
+})
+
+export const makeRemoteAccess = (network: NetworkAccess, store: RemoteSessionStore = memorySessionStore) => Effect.gen(function* () {
+  const started = yield* Clock.currentTimeMillis
+  const sessions = yield* Ref.make(new Map([...yield* store.load].filter(([, lastUsed]) => started - lastUsed <= Duration.toMillis(SESSION_IDLE_LIMIT))))
+  const savedAt = yield* Ref.make(started)
   const throttles = yield* Ref.make(new Map<string, Throttle>())
+  const save = Effect.gen(function* () {
+    yield* Ref.set(savedAt, yield* Clock.currentTimeMillis)
+    yield* store.save(yield* Ref.get(sessions))
+  })
 
   const verify = (token: Option.Option<string>) => Effect.gen(function* () {
     if (Option.isNone(token)) return false
+    const key = digest(token.value)
     const now = yield* Clock.currentTimeMillis
-    return yield* Ref.modify(sessions, current => {
-      const lastUsed = current.get(token.value)
+    const valid = yield* Ref.modify(sessions, current => {
+      const lastUsed = current.get(key)
       if (lastUsed === undefined) return [false, current]
       const next = new Map(current)
       if (now - lastUsed > Duration.toMillis(SESSION_IDLE_LIMIT)) {
-        next.delete(token.value)
+        next.delete(key)
         return [false, next]
       }
-      next.set(token.value, now)
+      next.set(key, now)
       return [true, next]
     })
+    // Last use only needs to survive a restart roughly, so it is saved at most hourly.
+    if (now - (yield* Ref.get(savedAt)) > Duration.toMillis(LAST_USE_SAVE_INTERVAL)) yield* save
+    return valid
   })
 
   const recordFailure = (address: string, now: number) => Ref.update(throttles, current => {
@@ -115,16 +167,17 @@ export const makeRemoteAccess = (network: NetworkAccess) => Effect.gen(function*
         return next
       })
       const token = randomBytes(32).toString("base64url")
-      yield* Ref.update(sessions, current => new Map(current).set(token, now))
+      yield* Ref.update(sessions, current => new Map(current).set(digest(token), now))
+      yield* save
       return token
     }),
     signOut: token => Option.match(token, {
       onNone: () => Effect.void,
       onSome: value => Ref.update(sessions, current => {
         const next = new Map(current)
-        next.delete(value)
+        next.delete(digest(value))
         return next
-      }),
+      }).pipe(Effect.zipRight(save)),
     }),
   } satisfies RemoteAccessApi
 })

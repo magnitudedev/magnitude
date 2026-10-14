@@ -234,7 +234,8 @@ The version is the running service's, from its health.
 Model storage is persisted as `modelsDirectory` in the canonical `config.json` that the service reads
 when it spawns the engine; ACN reads and writes it. The row shows the current path, marks the
 default, offers the app's own folder picker over the folders of the machine running Magnitude and a
-return to the default, rejects relative paths, and re-reads the file whenever Settings opens so hand
+return to the default, rejects relative paths and folders the service cannot create or write a file
+in, and re-reads the file whenever Settings opens so hand
 edits appear. ACN records the folder its engine started with; while the saved folder
 differs, a persistent toast in the window's bottom-right corner on every page states that a restart
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
@@ -262,13 +263,17 @@ adds a This browser group with Sign out, and turning network access off, regener
 changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
 AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
 loses the service, it checks whether the service now asks for the key, as after a restart, and
-returns to Sign in instead of showing that the service is unreachable.
+returns to Sign in instead of showing that the service is unreachable. A browser retries every 2
+seconds for 30 seconds, then shows that the service is unreachable with Reconnect and keeps retrying
+with backoff up to once a minute, and at once when the device comes back online or the page regains
+focus or visibility, so it recovers by itself after a reboot, a failed update, or a sleeping laptop.
 Below the harnesses, Connections presents one card for other apps and agents. It states that an
 OpenAI-compatible API runs on this computer that any app or agent can use. The base URL has a copy
 control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
 request toggle pinned right on the note's row, wrapping beneath it in narrow windows, reveals a request for the active or best downloaded model in the
 user's shell. A divided footer links to Settings for network
-access. Network addresses and controls stay in Settings. Viewed from another device, the card
+access, asking to turn it on while it is off and pointing to its address and key once it is on.
+Network addresses and controls stay in Settings. Viewed from another device, the card
 describes the server's API at the address the browser used: the caption asks for the Network access
 key, the example request is in the viewer's shell and sends the key as a placeholder Bearer header,
 and the footer points to the key in Settings. In a browser, local or remote, the harness rows have no

@@ -1,6 +1,6 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react"
 import { Atom, Result, useAtomValue } from "@effect-atom/atom-react"
-import { Effect, Option, Schedule, Stream, SubscriptionRef } from "effect"
+import { Duration, Effect, Option, Schedule, Stream, SubscriptionRef } from "effect"
 import type { MagnitudeConnection } from "@magnitudedev/sdk"
 import type { TrayRegistration } from "@magnitudedev/sdk/desktop-host"
 import { useSession } from "./session"
@@ -39,13 +39,25 @@ export const useServiceConnection = (): MagnitudeConnection => {
 
 type Reachability = "Connected" | "Reconnecting" | "Unreachable"
 
+/** Moments worth trying again at once: the device is back online, or someone is looking at the page. */
+const wakeUps = Stream.merge(
+  Stream.merge(Stream.fromEventListener(window, "online"), Stream.fromEventListener(window, "focus")),
+  Stream.fromEventListener(document, "visibilitychange").pipe(Stream.filter(() => document.visibilityState === "visible")),
+)
+
 /**
- * A browser loses its connection whenever the service restarts. It retries on its own for 30 seconds,
- * which covers a restart, then gives up until someone presses Reconnect. Each attempt first asks
- * whether the service now wants this browser to sign in, as it does after any restart.
+ * A browser loses its connection whenever the service restarts. It retries every 2 seconds for 30
+ * seconds, which covers a restart, then reports the service unreachable and keeps trying with
+ * backoff up to once a minute, and at once when the device comes back online or the page regains
+ * focus, so it recovers from a reboot, a failed update or a laptop sleep by itself. Each attempt
+ * first asks whether the service now wants this browser to sign in.
  */
 const browserReachability = (connection: MagnitudeConnection, attempt: Effect.Effect<void, unknown>) => Stream.unwrapScoped(Effect.gen(function* () {
   const reachability = yield* SubscriptionRef.make<Reachability>("Connected")
+  const keepTrying = (delay: Duration.Duration): Effect.Effect<void> => attempt.pipe(Effect.catchAll(() =>
+    Effect.raceFirst(Effect.sleep(delay), Stream.runHead(wakeUps)).pipe(
+      Effect.zipRight(Effect.suspend(() => keepTrying(Duration.min(Duration.times(delay, 2), Duration.minutes(1))))),
+    )))
   yield* connection.changes.pipe(Stream.runForEach(state => Effect.gen(function* () {
     if (state._tag === "Ready") return yield* SubscriptionRef.set(reachability, "Connected")
     if (state._tag !== "Failed" && state._tag !== "Closed") return
@@ -53,7 +65,9 @@ const browserReachability = (connection: MagnitudeConnection, attempt: Effect.Ef
     yield* SubscriptionRef.set(reachability, "Reconnecting")
     yield* attempt.pipe(
       Effect.retry(Schedule.spaced("2 seconds").pipe(Schedule.upTo("30 seconds"))),
-      Effect.catchAll(() => SubscriptionRef.update(reachability, current => current === "Reconnecting" ? "Unreachable" : current)),
+      Effect.catchAll(() => SubscriptionRef.update(reachability, current => current === "Reconnecting" ? "Unreachable" : current).pipe(
+        Effect.zipRight(keepTrying(Duration.seconds(5))),
+      )),
       Effect.forkScoped,
     )
   })), Effect.forkScoped)

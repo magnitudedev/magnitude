@@ -1,6 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -39,6 +40,7 @@ const SOURCE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct DownloadOperation {
     sender: watch::Sender<ModelDownloadEvent>,
     control: TransferControl,
+    discard_partial: AtomicBool,
 }
 
 impl DownloadOperation {
@@ -46,6 +48,7 @@ impl DownloadOperation {
         Self {
             sender: watch::channel(initial).0,
             control: TransferControl::new(SOURCE_STALL_TIMEOUT),
+            discard_partial: AtomicBool::new(false),
         }
     }
 
@@ -410,20 +413,34 @@ impl ManagedModelStore {
             operations.insert(key, operation);
         }
         drop(operations);
-        for (key, operation_id, package, operation) in admitted {
+        // Packages admitted together, such as a model and its separate draft, need disk space
+        // together, so each checks against their combined need and reports the same shortfall.
+        let mut outstanding = Vec::with_capacity(admitted.len());
+        for (_, _, package, _) in &admitted {
+            outstanding.push(self.outstanding_bytes(package).await);
+        }
+        let admitted_bytes = outstanding
+            .iter()
+            .fold(0_u64, |sum, bytes| sum.saturating_add(*bytes));
+        for ((key, operation_id, package, operation), own) in admitted.into_iter().zip(outstanding)
+        {
+            let companion_bytes = admitted_bytes.saturating_sub(own);
             let manager = self.clone();
             tokio::spawn(async move {
                 manager
-                    .run_download(key, operation_id, package, operation)
+                    .run_download(key, operation_id, package, operation, companion_bytes)
                     .await;
             });
         }
         Ok(streams)
     }
 
+    /// Stops a package download. A user's cancellation also discards its partial files; work
+    /// stopped because a sibling package failed keeps them so a retry resumes.
     pub(crate) async fn cancel_package_download(
         &self,
         package: &ModelPackage,
+        discard_partial: bool,
     ) -> Result<(), InventoryError> {
         ValidatedDownloadPackage::new(package.clone())?;
         let key = package_download_key(package);
@@ -434,8 +451,21 @@ impl ManagedModelStore {
             .get(&key)
             .cloned()
             .ok_or_else(|| InventoryError::NotFound("active download".to_owned()))?;
+        if discard_partial {
+            operation.discard_partial.store(true, Ordering::Release);
+        }
         operation.cancel();
         Ok(())
+    }
+
+    /// Bytes a package still has to write into this store, after what is already on disk.
+    async fn outstanding_bytes(&self, package: &ValidatedDownloadPackage) -> u64 {
+        let (repository, _) = package.repository_revision();
+        let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
+        let total_bytes = package.components().iter().fold(0_u64, |sum, component| {
+            sum.saturating_add(component.size_bytes)
+        });
+        total_bytes.saturating_sub(resumable_bytes(&repo_root, package.components()).await)
     }
 
     async fn run_download(
@@ -444,9 +474,10 @@ impl ManagedModelStore {
         operation_id: String,
         package: ValidatedDownloadPackage,
         operation: Arc<DownloadOperation>,
+        companion_bytes: u64,
     ) {
         let result = self
-            .run_download_inner(&operation_id, package, &operation)
+            .run_download_locked(&operation_id, package, &operation, companion_bytes)
             .await;
         if let Err(failure) = result {
             let model_id = current_model_id(&operation.sender.borrow());
@@ -511,11 +542,41 @@ impl ManagedModelStore {
         }
     }
 
+    /// Runs one package download under its repository lock, and discards a cancelled download's
+    /// partial files while still holding it, so no other download can be resuming from them.
+    async fn run_download_locked(
+        &self,
+        operation_id: &str,
+        package: ValidatedDownloadPackage,
+        operation: &DownloadOperation,
+        companion_bytes: u64,
+    ) -> Result<(), DownloadError> {
+        operation.ensure_active()?;
+        let (repository, _) = package.repository_revision();
+        let repo_root = self.config.root.join("hub").join(hf_repo_dir(repository));
+        let repository_lock =
+            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
+        let components = package.components().to_vec();
+        let result = self
+            .run_download_inner(operation_id, package, operation, companion_bytes)
+            .await;
+        if result
+            .as_ref()
+            .is_err_and(|error| matches!(error.kind, DownloadErrorKind::Cancelled))
+            && operation.discard_partial.load(Ordering::Acquire)
+        {
+            discard_partial_components(&repo_root, &components).await;
+        }
+        drop(repository_lock);
+        result
+    }
+
     async fn run_download_inner(
         &self,
         operation_id: &str,
         package: ValidatedDownloadPackage,
         operation: &DownloadOperation,
+        companion_bytes: u64,
     ) -> Result<(), DownloadError> {
         operation.ensure_active()?;
         let (repository, revision) = package.repository_revision();
@@ -525,8 +586,6 @@ impl ManagedModelStore {
             retryable: false,
             resumable: false,
         })?;
-        let repository_lock =
-            acquire_lock(repository_lock_path(&self.config.root, repository)).await?;
         let required = package.components();
         let control = &operation.control;
         let (repo, commit) = resolve_with_credential_fallback(
@@ -572,6 +631,9 @@ impl ManagedModelStore {
 
         let completed_bytes = resumable_bytes(&repo_root, &components).await;
         let missing_bytes = total_bytes.saturating_sub(completed_bytes);
+        let required_bytes = missing_bytes
+            .saturating_add(companion_bytes)
+            .saturating_add(self.config.disk_reserve_bytes);
         let available_bytes =
             fs2::available_space(&self.config.root).map_err(|error| DownloadError {
                 kind: DownloadErrorKind::FileSystem,
@@ -584,12 +646,11 @@ impl ManagedModelStore {
             .send_replace(ModelDownloadEvent::CheckingSpace {
                 operation_id: operation_id.to_owned(),
                 model_id: model_id.clone(),
-                required_bytes: missing_bytes.saturating_add(self.config.disk_reserve_bytes),
+                required_bytes,
                 available_bytes,
                 completed_bytes,
                 total_bytes,
             });
-        let required_bytes = missing_bytes.saturating_add(self.config.disk_reserve_bytes);
         if required_bytes > available_bytes {
             return Err(DownloadError {
                 kind: DownloadErrorKind::InsufficientDiskSpace {
@@ -828,7 +889,6 @@ impl ManagedModelStore {
             operation_id: operation_id.to_owned(),
             model: Box::new(ready),
         });
-        drop(repository_lock);
         Ok(())
     }
 }
@@ -1152,6 +1212,25 @@ async fn discard_component_files(paths: &DownloadComponentPaths) -> Result<(), D
         }
     }
     Ok(())
+}
+
+/// Removes the partial file and checkpoint of every component whose blob is not complete. A
+/// complete blob may already be published by another snapshot, so it is kept.
+async fn discard_partial_components(repo_root: &Path, components: &[ModelComponent]) {
+    let blobs = repo_root.join("blobs");
+    for component in components {
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        if regular_file_len(&paths.blob).await.is_some() {
+            continue;
+        }
+        for path in [&paths.partial, &paths.checkpoint] {
+            if regular_file_len(path).await.is_some()
+                && let Err(error) = tokio::fs::remove_file(path).await
+            {
+                tracing::warn!(path = %path.display(), %error, "cancelled download file was not removed");
+            }
+        }
+    }
 }
 
 fn invalid_checkpoint(component: &ModelComponent) -> DownloadError {
@@ -2244,6 +2323,62 @@ mod tests {
         );
         assert!(!retried.is_cancelled());
         drop(repository_lock);
+    }
+
+    #[tokio::test]
+    async fn a_user_cancellation_discards_partial_files_and_a_stopped_sibling_keeps_them() {
+        for discard_partial in [true, false] {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let config = InventoryConfig::with_roots(
+                directory.path().join("models"),
+                directory.path().join("cache"),
+            )
+            .expect("inventory config");
+            let manager = ManagedModelStore::open(config)
+                .await
+                .expect("model manager");
+            let package = exact_package("model.gguf", b"model");
+            let blobs = manager
+                .config
+                .root
+                .join("hub")
+                .join(hf_repo_dir("owner/repository"))
+                .join("blobs");
+            let paths =
+                DownloadComponentPaths::new(&blobs, &blob_key(&model_component(b"model").content));
+            tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+            tokio::fs::write(&paths.partial, b"mo")
+                .await
+                .expect("partial");
+            tokio::fs::write(&paths.checkpoint, b"{}")
+                .await
+                .expect("checkpoint");
+            // The operation waits on the repository lock, so it is cancelled before any transfer.
+            let repository_lock = acquire_exclusive_lock(&repository_lock_path(
+                &manager.config.root,
+                "owner/repository",
+            ))
+            .expect("repository lock");
+            let mut stream = manager
+                .start_target_downloads(vec![package.clone()])
+                .await
+                .expect("admission")
+                .pop()
+                .expect("download stream");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            manager
+                .cancel_package_download(&package, discard_partial)
+                .await
+                .expect("cancel");
+            drop(repository_lock);
+            while let Some(event) = stream.next().await {
+                if matches!(event, ModelDownloadEvent::Cancelled { .. }) {
+                    break;
+                }
+            }
+            assert_eq!(paths.partial.exists(), !discard_partial);
+            assert_eq!(paths.checkpoint.exists(), !discard_partial);
+        }
     }
 
     #[tokio::test]

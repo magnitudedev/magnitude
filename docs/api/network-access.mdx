@@ -35,7 +35,7 @@ Select that address in Settings or use it as `network.bind`. Use `http://ADDRESS
 With network access on, open `http://ADDRESS:10100` in a browser on the other device, using the same address as the base URL. Sign in with the **API key**. The app works as it does on the server: download and load models, watch usage, and change Settings. In a browser, **Connections** doesn't change any computer's agents itself: each agent has **Copy setup prompt**, which you paste into that agent, or any coding agent, on the computer you're using.
 
 - A browser stays signed in until it goes 30 days unused. **Settings → This browser → Sign out** ends it sooner.
-- Restarting Magnitude signs every browser out. Changes to network settings apply when Magnitude restarts, so a regenerated key also takes effect then.
+- Browsers stay signed in when Magnitude restarts or updates. Changes to network settings apply when Magnitude restarts, so a regenerated key takes effect then and signs every browser out.
 - Turning network access off, regenerating the key, changing the address, or restarting from that browser asks first, because it disconnects the browser.
 - After five wrong keys, each further attempt waits longer, up to one minute.
 
@@ -100,5 +100,5 @@ Magnitude accepts requests addressed to its IP addresses, `localhost`, `host.doc
 | Connection timed out | Check that the server is reachable and its firewall allows TCP port `10100`. |
 | `401` | The request did not include the API key, or the key changed. Check the key in Settings or the server configuration. |
 | Sign in says no key is set | Network access has no API key. On the server, choose **Regenerate** in Settings, or set `network.apiKey`, then restart Magnitude. |
-| Asked to sign in again | Magnitude restarted, or this browser went 30 days unused. |
+| Asked to sign in again | The key was regenerated, or this browser went 30 days unused. |
 | `421 Invalid Host header` | The request used a hostname Magnitude does not accept. Use an IP address or add the name to `network.allowedHosts`. |

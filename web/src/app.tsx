@@ -112,7 +112,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
 /** A catalog model's download and the one-time optimization that follows it. */
 const acquiring = (acquisition: CatalogLocalModel["acquisitionState"]) =>
   acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
-const minutesRemaining = (seconds: number) => `About ${Math.max(1, Math.ceil(seconds / 60))} min`
+const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
   const baseline = useRef<{ at: number; completed: number } | null>(null)
@@ -467,6 +467,8 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
     : Option.some(window.location.origin)
   const platform = useServerPlatform()
   const { remote } = useRemoteAccess()
+  const client = useAgentClient()
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const available = Result.isSuccess(models) ? models.value.models.filter(model => Option.isSome(localModelProviderModelId(model))) : []
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value))?.model.modelId : undefined
   const ranked = Result.isSuccess(hardware) ? rankedLocalModelOptions(available.map(model => ({ id: model.modelId, kind: "stored" as const, model })), { fastToSmart: 0.5, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, available.length).map(option => option.model) : available
@@ -478,7 +480,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
-    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} onOpenSettings={() => navigate("settings")} />}
+    {Option.isSome(apiOrigin) && <OtherApps origin={apiOrigin.value} model={defaultModel} platform={remote ? viewerPlatform() : platform} remote={remote} networkAccess={Result.isSuccess(network) && network.value.enabled} onOpenSettings={() => navigate("settings")} />}
   </>
 }
 /** One-click connections, for the desktop app only: it runs where the agents run. */
@@ -885,14 +887,14 @@ function ReconnectingToMagnitude() {
   return <ErrorNotice className="mt-8" severity="info" title="Reconnecting to Magnitude…"
     description="The connection to the Magnitude service was interrupted, as it is when Magnitude restarts." />
 }
-/** A browser cannot restart the service; after its own retries stop, Reconnect tries once more. */
+/** A browser cannot restart the service; it keeps retrying in the background, and Reconnect tries at once. */
 function CannotReachMagnitude() {
   const attempt = useReconnectAttempt()
   const reconnectAction = useMemo(() => Atom.fn((_: void) => attempt), [attempt])
   const reconnect = useAtomSet(reconnectAction)
   const reconnecting = useAtomValue(reconnectAction)
   return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"
-    description="This page can’t connect to the Magnitude service. Check that Magnitude is running on that computer and that this device can reach it."
+    description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
     actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
 }
 /** Messages raised by Electron main while this window exists, such as a link that couldn't open. */

@@ -1,7 +1,11 @@
 import { Duration, Effect, Either, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import { LOOPBACK_ONLY, type NetworkAccess } from "@magnitudedev/storage"
-import { makeRemoteAccess, SESSION_IDLE_LIMIT } from "./remote-access"
+import { BunFileSystem } from "@effect/platform-bun"
+import { mkdtempSync, readFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { fileSessionStore, makeRemoteAccess, SESSION_IDLE_LIMIT } from "./remote-access"
 
 const network: NetworkAccess = {
   enabled: true, bind: "0.0.0.0", apiKey: Option.some("mag-key"), requireApiKey: true, allowedHosts: [], warning: Option.none(),
@@ -73,6 +77,22 @@ describe("remote sign-in", () => {
       return [yield* remote.access(remoteRequest(first)), yield* remote.access(remoteRequest(second)), yield* restarted.access(remoteRequest(second))]
     }))
     expect(results).toEqual(["Anonymous", "SignedIn", "Anonymous"])
+  })
+
+  it("keeps sessions across a restart until the key changes, and never stores the token", async () => {
+    const path = join(mkdtempSync(join(tmpdir(), "magnitude-remote-sessions-")), "remote-sessions.json")
+    const results = await Effect.runPromise(Effect.gen(function* () {
+      const remote = yield* makeRemoteAccess(network, yield* fileSessionStore(path, network))
+      const kept = yield* remote.signIn("10.0.0.2", "mag-key")
+      const ended = yield* remote.signIn("10.0.0.2", "mag-key")
+      yield* remote.signOut(Option.some(ended))
+      const restarted = yield* makeRemoteAccess(network, yield* fileSessionStore(path, network))
+      const rekeyed = { ...network, apiKey: Option.some("mag-new") }
+      const afterNewKey = yield* makeRemoteAccess(rekeyed, yield* fileSessionStore(path, rekeyed))
+      return { kept, steps: [yield* restarted.access(remoteRequest(kept)), yield* restarted.access(remoteRequest(ended)), yield* afterNewKey.access(remoteRequest(kept))] }
+    }).pipe(Effect.provide(BunFileSystem.layer)))
+    expect(results.steps).toEqual(["SignedIn", "Anonymous", "Anonymous"])
+    expect(readFileSync(path, "utf8")).not.toContain(results.kept)
   })
 
   it("treats loopback callers as local without a session", async () => {

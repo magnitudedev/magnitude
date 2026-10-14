@@ -7,7 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
 import { Duration, Effect, Layer, Option, Ref, Schema } from "effect";
-import { MagnitudeStorage, resolveModelStoreLocation } from "@magnitudedev/storage";
+import { MagnitudeStorage, resolveUsableModelStoreLocation } from "@magnitudedev/storage";
 import {
   type AcnInstallationPlan,
   type AcnStartupProgress,
@@ -117,7 +117,7 @@ const resolveModelStore = (dataDir: string) =>
       ),
       Effect.orElseSucceed(() => Option.none<string>())
     );
-    const location = yield* resolveModelStoreLocation(dataDir, configured);
+    const location = yield* resolveUsableModelStoreLocation(dataDir, configured);
     if (Option.isSome(location.warning)) yield* Effect.logWarning(location.warning.value);
     yield* Effect.logInfo("Model store resolved").pipe(
       Effect.annotateLogs({ root: location.root, source: location.source })

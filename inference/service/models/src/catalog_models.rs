@@ -279,6 +279,13 @@ impl ModelDomainResolver {
             })
             .map(|record| record.installed.package.id.clone())
             .collect::<BTreeSet<_>>();
+        // Another catalog model shares a package only while that model is installed; a draft
+        // declared by an uninstalled variant would otherwise outlive every model that uses it.
+        let present = installed
+            .packages
+            .iter()
+            .map(|entry| &entry.package.id)
+            .collect::<BTreeSet<_>>();
         let shared_ids = ids
             .iter()
             .filter(|package_id| {
@@ -288,6 +295,7 @@ impl ModelDomainResolver {
                             || affiliation.variant_id != definition.variant_id)
                 }) || self.catalog.models.iter().any(|candidate| {
                     catalog_id(candidate) != *id
+                        && present.contains(&catalog_target(candidate).id)
                         && catalog_packages(candidate)
                             .any(|(package, _)| package.id == **package_id)
                 })
