@@ -44,6 +44,16 @@ const pacmanDepends = ["alsa-lib", "at-spi2-core", "cairo", "dbus", "expat", "gl
   "libgcc", "libnotify", "libsecret", "libx11", "libxcb", "libxcomposite", "libxdamage", "libxext", "libxfixes", "libxkbcommon",
   "libxrandr", "mesa", "nspr", "nss", "pango", "polkit", "systemd-libs", "util-linux", "xdg-utils"]
 
+const electronTrashHelpers = "kde-cli-tools | kde-runtime | trash-cli | libglib2.0-bin | gvfs"
+
+/**
+ * Electron's installer lists KDE's trash helper first among equivalent alternatives, and apt installs
+ * the first one, pulling a KDE stack onto headless servers. GLib's `gio` is the lightest, so it goes first.
+ */
+export const preferLightTrashHelper = (control: string) => control.includes(`, ${electronTrashHelpers}`)
+  ? Effect.succeed(control.replace(`, ${electronTrashHelpers}`, ", libglib2.0-bin | gvfs | trash-cli | kde-cli-tools | kde-runtime"))
+  : Effect.fail(new DesktopBuildFailed({ message: "Debian package metadata no longer lists Electron's trash helpers as expected" }))
+
 /** Directory modes are explicit so the builder's umask never reaches the package. */
 const installLinuxSystemFiles = (tree: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -266,6 +276,8 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
     const contents = join(stage, "debian-contents")
     const extracted = yield* Command.make("dpkg-deb", "--raw-extract", candidate, contents).pipe(Command.exitCode)
     if (extracted !== 0) return yield* new DesktopBuildFailed({ message: "Could not prepare the bundled CLI package entry" })
+    const control = join(contents, "DEBIAN/control")
+    yield* fs.writeFileString(control, yield* preferLightTrashHelper(yield* fs.readFileString(control)))
     yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/resources/magnitude`, join(contents, "usr/bin/magnitude"))
     yield* installLinuxSystemFiles(contents)
     // Copied Electron directories can retain the builder's group-writable mode.
