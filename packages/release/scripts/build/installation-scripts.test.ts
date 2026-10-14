@@ -42,7 +42,8 @@ describe("installation script generation", () => {
       const script = await Effect.runPromise(render())
       const result = spawnSync("/bin/sh", ["-s"], { input: script, encoding: "utf8", timeout: 15000,
         env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, TMPDIR: `${alias}/`, TEST_CURL_ARGUMENTS: receipt } })
-      expect(result.status, result.stderr).toBe(73)
+      expect(result.status, result.stderr).toBe(1)
+      expect(result.stderr).toContain("Check the network connection")
       const args = readFileSync(receipt, "utf8").trimEnd().split("\n")
       const output = args[args.indexOf("--output") + 1]!
       expect(output).toBe(resolve(output))
