@@ -235,8 +235,9 @@ Model storage is persisted as `modelsDirectory` in the canonical `config.json` t
 when it spawns the engine; ACN reads and writes it. The row shows the current path, marks the
 default, offers the app's own folder picker over the folders of the machine running Magnitude and a
 return to the default, rejects relative paths and folders the service cannot create or write a file
-in, and re-reads the file whenever Settings opens so hand
-edits appear. ACN records the folder its engine started with; while the saved folder
+in with the service's own reason, and re-reads the file whenever Settings opens so hand
+edits appear. A saved folder the service cannot use shows the default folder actually in use, with a
+warning that the saved one was ignored and a return to the default. ACN records the folder its engine started with; while the saved folder
 differs, a persistent toast in the window's bottom-right corner on every page states that a restart
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
 path, and shows a copyable platform-specific command that moves the previous store into the new

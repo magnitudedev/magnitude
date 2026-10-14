@@ -84,14 +84,13 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.flatMap(result => result._tag === "Invalid" ? Effect.fail(result.error) : Effect.succeed(result._tag === "Missing" ? Option.none<string>() : result.value.modelsDirectory)),
   )
-  const location = (configured: Option.Option<string>) => resolveModelStoreLocation(host.dataDir, configured).pipe(Effect.provideService(FileSystem.FileSystem, fs))
   // The engine received its store at spawn, from the configuration as it stood when this service started.
   const active = yield* readModelsDirectory.pipe(
     Effect.orElseSucceed(() => Option.none<string>()),
     Effect.flatMap(configured => resolveUsableModelStoreLocation(host.dataDir, configured)),
     Effect.provideService(FileSystem.FileSystem, fs),
   )
-  const defaultPath = (yield* location(Option.none())).path
+  const defaultPath = (yield* resolveModelStoreLocation(host.dataDir, Option.none()).pipe(Effect.provideService(FileSystem.FileSystem, fs))).path
 
   const readNetwork = readStructuredFile(storage.paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
@@ -111,7 +110,7 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
 
   return ServerSettings.of({
     modelStorage: readModelsDirectory.pipe(
-      Effect.flatMap(location),
+      Effect.flatMap(configured => resolveUsableModelStoreLocation(host.dataDir, configured).pipe(Effect.provideService(FileSystem.FileSystem, fs))),
       Effect.map((current): ModelStorageSettings => ({ active: active.path, path: current.path, source: current.source, defaultPath, warning: current.warning })),
       Effect.mapError(() => new ServerSettingsFailed({ message: "The saved model storage location could not be read. Using the default folder." })),
     ),
