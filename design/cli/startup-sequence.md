@@ -72,7 +72,8 @@ not change whether startup launches a source checkout or an installed applicatio
 `status` observes application lifecycle without starting it. Absence is a successful Stopped result.
 The owner is Desktop or Headless when present, shown as Server where the system service is set up;
 tray and login-startup observations appear only for Desktop. Where the service is set up and not
-answering, the guidance is how to start the service and read its log, never the desktop app or `serve`;
+answering, the guidance is how to start the service and read its log, never the desktop app or `serve`
+(on macOS, kickstart when launchd has the daemon loaded and bootstrap its plist when it was booted out);
 a Linux service that systemd keeps restarting or that failed instead says it keeps failing to start,
 quotes the service's own last error when the journal is readable, and names the log. Model observations are separate from service readiness, and unavailable model evidence must
 not be presented as no loaded model. A ready service also shows how to reach it: this computer's
