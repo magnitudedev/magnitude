@@ -11,6 +11,7 @@ import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource, hostedUpdateSource, startMacForegroundInstallation, macStartupUpdateOperation } from "@magnitudedev/daemon-management/application-update"
 import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, UpdateHardwareSource, updateHardwareFromService, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
 import { isNewerVersion } from "@magnitudedev/release"
+import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
@@ -467,7 +468,9 @@ Effect.runPromiseExit(program.pipe(
       // The renderer dev server dies with this process; its supervising script performs the relaunch.
       if (rendererServedByDevServer(process.env)) { app.exit(developmentRelaunchExitCode({ showWindow: reopenAfterUpdate })); return }
       // `args` replaces the argument list, so keep the original ones (the app directory in development).
-      app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
+      // The packaged Linux app must start through its launcher, which passes the installation admission it adopts.
+      app.relaunch({ ...(process.platform === "linux" && app.isPackaged ? { execPath: LINUX_DESKTOP_EXECUTABLE_PATH } : {}),
+        args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
     }
     if (intent === "InstallMacUpdate") {
       const install = Effect.scoped(Effect.gen(function* () {
