@@ -47,7 +47,7 @@ const failureMessage = (failure: Option.Option<SignInError>) => {
   if (value?._tag === "SignInThrottled") return { title: "Too many attempts", description: `Wait ${value.retryAfterSeconds === 1 ? "a second" : `${value.retryAfterSeconds} seconds`}, then try again.` }
   if (value?._tag !== "SignInRefused") return { title: "Can’t reach Magnitude", description: "Check that Magnitude is running on that computer and that this device can reach it." }
   switch (value.reason) {
-    case "WrongKey": return { title: "That key didn’t work", description: "Copy the key again from Settings → Network access on the computer running Magnitude." }
+    case "WrongKey": return { title: "That key didn’t work", description: "Copy the key again from Settings → Network access on the computer running Magnitude. On a server, run `magnitude server setup` to print it." }
     case "NoKey": return { title: "No key is set", description: "On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one." }
     case "NetworkAccessOff": return { title: "Network access is off", description: "Turn on Network access in Settings on the computer running Magnitude." }
     case "CrossOrigin": return { title: "Couldn’t sign in", description: "Open Magnitude using its own address, then try again." }
