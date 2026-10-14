@@ -74,8 +74,9 @@ The privileged Linux helper reports its class through a distinct exit status, se
 statuses sudo and pkexec use for authorization. `deferred` records an idle installation postponed
 because another Magnitude held the installation lock; the service reports it with an immediate
 check. A `startup` failure is sent by the failing owner with an immediate check it awaits before
-exiting, since an owner that never becomes ready makes no scheduled check. Other outcomes are sent
-once with the next check.
+exiting, since an owner that never becomes ready makes no scheduled check; Desktop, which keeps
+running, starts its checks only once its service is first Ready or Failed, so it records `startup`
+before reporting. Other outcomes are sent once with the next check.
 
 Each outcome also carries `outcome_from`, the version that was running when the attempted release
 was prepared, recorded with the preparation. An `applied` outcome is reported by the new version,
