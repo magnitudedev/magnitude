@@ -7,10 +7,14 @@ export const checkServicePort = (port: number, executable: string) => Effect.sco
   const server = yield* Effect.acquireRelease(Effect.sync(() => createServer(socket => socket.destroy())),
     server => Effect.async<void>(resume => { server.close(() => resume(Effect.void)) }))
   yield* Effect.async<void, OwnedChildSpawnFailed>(resume => {
+    const code = (error: unknown) => typeof error === "object" && error !== null && "code" in error ? error.code : undefined
+    // Windows refuses a port another account holds exclusively with EACCES rather than EADDRINUSE.
+    const inUse = (error: unknown) => code(error) === "EADDRINUSE" || (code(error) === "EACCES" && port >= 1024)
     const failed = (error: unknown) => resume(Effect.fail(new OwnedChildSpawnFailed({
       executable,
-      message: typeof error === "object" && error !== null && "code" in error && error.code === "EADDRINUSE"
-        ? `Port ${port} is already in use. Stop the other service, then retry. If upgrading Magnitude, quit the old app and disable its service startup first.`
+      message: inUse(error)
+        ? `Port ${port} is already in use, by Magnitude running for another account on this computer or by another program. `
+          + "Stop it, then retry. If upgrading Magnitude, quit the old app and disable its service startup first."
         : `Magnitude could not open its local service port (${port}). Check local network permissions, then retry.`,
     })))
     server.once("error", failed)
