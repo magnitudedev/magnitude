@@ -9,6 +9,7 @@ InstallDir "$LOCALAPPDATA\Programs\Magnitude"
 SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 Var Stage
 Var PreviousVersion
 !define MUI_ABORTWARNING
@@ -178,6 +179,9 @@ stageFailed:
   SetErrorLevel 1
   Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
+  WriteRegStr HKCU "${REGKEY}" "DisplayIcon" "$INSTDIR\Magnitude.exe"
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  WriteRegDWORD HKCU "${REGKEY}" "EstimatedSize" "$0"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::InstallCliLauncher(w "$INSTDIR\resources\magnitude-launcher.exe", w "$LOCALAPPDATA\Programs\Magnitude CLI") i .r0'
   ${If} $0 != 0
     SetErrorLevel 1
