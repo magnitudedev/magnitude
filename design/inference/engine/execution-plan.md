@@ -673,8 +673,10 @@ the launch bound); an image runs in the class covering its cells, its patch rows
 class's padding rows after. Every vision attention reads its keys as a span per row, its window's
 rows or its image's, so no image row reads a padding row; padding inputs are zero and the published
 features are the image's leading cell rows. The tower is one program of vision operators the projector description
-composes (patch stem, row norms, projections with their epilogues, rotary attention, cell pooling
-or concatenation); a form a backend's operators do not run is refused when the program is
+composes (patch stem, row norms, projections with their epilogues, attention with optional rotary,
+cell pooling or concatenation). A tower post-norm applies per patch before concatenation;
+a projection norm then applies over the complete concatenated cell. Learned position tables
+do not imply rotary attention. A form a backend's operators do not run is refused when the program is
 prepared, never approximated. Seismic's recurrent workflow derives
 the exact window and delta state contracts from its checked entries. Each recurrent block binds
 the store's bank slabs and, per run, bank tables for its exact active request slots: each entry

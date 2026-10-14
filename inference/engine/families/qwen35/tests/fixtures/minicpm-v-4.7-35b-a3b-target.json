@@ -1,0 +1,5913 @@
+{
+  "repository": "openbmb/MiniCPM-V-4.7-35B-A3B-gguf",
+  "revision": "3c3f7e84f14a760ff26d17ab5932d4aa996227c0",
+  "path": "MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf",
+  "metadata": {
+    "general.architecture": "qwen35moe",
+    "general.type": "model",
+    "general.sampling.top_k": 20,
+    "general.sampling.top_p": 0.949999988079071,
+    "general.sampling.temp": 1.0,
+    "general.name": "35a3_hf_v47_0923",
+    "general.finetune": "35a3_hf_v47_0923",
+    "general.size_label": "256x2.6B",
+    "qwen35moe.block_count": 40,
+    "qwen35moe.context_length": 262144,
+    "qwen35moe.embedding_length": 2048,
+    "qwen35moe.attention.head_count": 16,
+    "qwen35moe.attention.head_count_kv": 2,
+    "qwen35moe.rope.dimension_sections": [
+      11,
+      11,
+      10,
+      0
+    ],
+    "qwen35moe.rope.freq_base": 10000000.0,
+    "qwen35moe.attention.layer_norm_rms_epsilon": 9.999999974752427e-07,
+    "qwen35moe.expert_count": 256,
+    "qwen35moe.expert_used_count": 8,
+    "qwen35moe.attention.key_length": 256,
+    "qwen35moe.attention.value_length": 256,
+    "qwen35moe.expert_feed_forward_length": 512,
+    "qwen35moe.expert_shared_feed_forward_length": 512,
+    "qwen35moe.ssm.conv_kernel": 4,
+    "qwen35moe.ssm.state_size": 128,
+    "qwen35moe.ssm.group_count": 16,
+    "qwen35moe.ssm.time_step_rank": 32,
+    "qwen35moe.ssm.inner_size": 4096,
+    "qwen35moe.attention.recurrent_layers": [
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      false
+    ],
+    "qwen35moe.full_attention_interval": 4,
+    "qwen35moe.rope.dimension_count": 64,
+    "qwen35moe.rope.section_order": "zyxt",
+    "tokenizer.ggml.model": "gpt2",
+    "tokenizer.ggml.pre": "qwen35",
+    "tokenizer.ggml.tokens": {
+      "length": 248144,
+      "head": [
+        "!",
+        "\"",
+        "#",
+        "$",
+        "%",
+        "&",
+        "'",
+        "(",
+        ")",
+        "*",
+        "+",
+        ",",
+        "-",
+        ".",
+        "/",
+        "0"
+      ]
+    },
+    "tokenizer.ggml.token_type": {
+      "length": 248144,
+      "head": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "tokenizer.ggml.merges": {
+      "length": 247587,
+      "head": [
+        "\u0120 \u0120",
+        "\u0120\u0120 \u0120\u0120",
+        "i n",
+        "\u0120 t",
+        "\u0120\u0120\u0120\u0120 \u0120\u0120\u0120\u0120",
+        "e r",
+        "\u0120\u0120 \u0120",
+        "o n",
+        "\u0120 a",
+        "r e",
+        "a t",
+        "s t",
+        "e n",
+        "o r",
+        "\u0120t h",
+        "\u010a \u010a"
+      ]
+    },
+    "tokenizer.ggml.bos_token_id": 248045,
+    "tokenizer.ggml.eos_token_id": 248046,
+    "tokenizer.ggml.unknown_token_id": 248077,
+    "tokenizer.ggml.padding_token_id": 248044,
+    "tokenizer.ggml.add_bos_token": false,
+    "tokenizer.ggml.add_eos_token": false,
+    "tokenizer.chat_template": "{%- macro render_content(content, is_system_content=false) -%}\n    {%- if content is string -%}\n        {{- content -}}\n    {%- elif content is iterable and content is not mapping -%}\n        {%- set ns = namespace(parts=[]) -%}\n        {%- for item in content -%}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' -%}\n                {%- if is_system_content -%}\n                    {{- raise_exception('System message cannot contain images.') -}}\n                {%- endif -%}\n                {%- set ns.parts = ns.parts + ['<|image_pad|>'] -%}\n            {%- elif 'video' in item or item.type == 'video' -%}\n                {%- if is_system_content -%}\n                    {{- raise_exception('System message cannot contain videos.') -}}\n                {%- endif -%}\n                {%- set ns.parts = ns.parts + ['<|video_pad|>'] -%}\n            {%- elif 'text' in item -%}\n                {%- set ns.parts = ns.parts + [item.text] -%}\n            {%- else -%}\n                {{- raise_exception('Unexpected item type in content.') -}}\n            {%- endif -%}\n        {%- endfor -%}\n        {{- ns.parts | join('\\n') -}}\n    {%- elif content is none or content is undefined -%}\n        {{- '' -}}\n    {%- else -%}\n        {{- raise_exception('Unexpected content type.') -}}\n    {%- endif -%}\n{%- endmacro -%}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index and reasoning_content %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n\\n</think>\\n\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is defined %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- else %}\n        {{- '<think>\\n' }}\n    {%- endif %}\n{%- endif %}\n",
+    "general.quantization_version": 2,
+    "general.file_type": 15
+  },
+  "tensors": [
+    {
+      "name": "output.weight",
+      "shape": [
+        2048,
+        248144
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "output_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "token_embd.weight",
+      "shape": [
+        2048,
+        248144
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.0.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.0.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.0.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.0.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.0.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.1.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.1.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.1.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.1.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.1.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.2.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.2.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.2.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.2.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.2.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.3.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.3.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.3.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.3.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.3.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.3.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.3.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.3.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.3.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.4.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.4.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.4.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.4.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.4.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.5.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.5.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.6.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.6.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.7.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.7.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.7.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.7.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.7.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.7.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.7.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.7.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.7.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.8.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.8.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.9.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.9.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.10.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.10.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.10.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.10.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.10.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.11.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.11.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.11.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.11.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.11.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.11.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.12.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.12.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.13.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.13.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.13.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.13.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.13.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.14.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.14.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.15.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.15.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.15.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.15.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.15.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.15.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.16.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.16.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.16.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.16.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.16.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.17.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.17.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.18.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.18.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.19.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.19.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.19.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.19.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.19.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.19.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.19.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.19.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.19.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.20.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.20.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.21.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.21.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.22.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.22.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.22.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.22.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.22.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.23.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.23.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.23.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.23.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.23.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.23.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.24.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.24.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.25.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.25.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.25.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.25.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.25.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.26.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.26.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.27.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.27.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.27.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.27.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.27.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.27.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.28.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.28.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.28.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.28.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.28.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.29.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.29.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.30.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.30.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.31.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.31.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.31.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.31.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.31.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.31.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.31.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.31.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.31.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.32.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.32.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.33.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.33.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.34.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.34.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.34.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.34.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.34.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.35.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.35.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.35.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.35.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.35.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.35.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.35.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.35.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.35.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.36.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.36.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.36.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.36.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.36.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.37.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.37.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.37.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.37.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.37.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.attn_gate.weight",
+      "shape": [
+        2048,
+        4096
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.attn_qkv.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.38.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.38.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.38.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ssm_a",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ssm_alpha.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.ssm_beta.weight",
+      "shape": [
+        2048,
+        32
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.38.ssm_conv1d.weight",
+      "shape": [
+        4,
+        8192
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ssm_dt.bias",
+      "shape": [
+        32
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ssm_norm.weight",
+      "shape": [
+        128
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.38.ssm_out.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.attn_k.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.attn_k_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.39.attn_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.39.attn_output.weight",
+      "shape": [
+        4096,
+        2048
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.attn_q.weight",
+      "shape": [
+        2048,
+        8192
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.attn_q_norm.weight",
+      "shape": [
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.39.attn_v.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.39.ffn_down_exps.weight",
+      "shape": [
+        512,
+        2048,
+        256
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.39.ffn_down_shexp.weight",
+      "shape": [
+        512,
+        2048
+      ],
+      "type": "Q6_K"
+    },
+    {
+      "name": "blk.39.ffn_gate_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.ffn_gate_inp.weight",
+      "shape": [
+        2048,
+        256
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.39.ffn_gate_inp_shexp.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    },
+    {
+      "name": "blk.39.ffn_gate_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.ffn_up_exps.weight",
+      "shape": [
+        2048,
+        512,
+        256
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.ffn_up_shexp.weight",
+      "shape": [
+        2048,
+        512
+      ],
+      "type": "Q4_K"
+    },
+    {
+      "name": "blk.39.post_attention_norm.weight",
+      "shape": [
+        2048
+      ],
+      "type": "F32"
+    }
+  ]
+}

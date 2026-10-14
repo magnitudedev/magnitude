@@ -284,6 +284,38 @@
       }
     },
     {
+      "id": "lfm2.5-24b-a2b",
+      "displayName": "Liquid LFM2.5 24B-A2B",
+      "description": "Reasoning MoE for fast on-device agents, coding, and tool use.",
+      "releaseDate": "2026-10-13",
+      "parameterization": {
+        "architecture": "mixtureOfExperts",
+        "totalParameters": 23971585280,
+        "activeParameters": 2450000000
+      },
+      "support": {
+        "level": "supported"
+      },
+      "repository": "LiquidAI/LFM2.5-24B-A2B-GGUF",
+      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "license": "lfm1.0",
+      "artificialAnalysis": {
+        "score": 15.6,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-13",
+          "methodology": "Scaled two measured anchors, Qwen3.6 35B-A3B (18.2) and Nemotron 3.5 Lightning (12.9), by the geometric mean of LFM2.5 24B-A2B benchmark ratios against each on GPQA Diamond, HLE, IFBench, SciCode, tau3-Bench Banking and SWE-Bench Verified (OpenCode), from Liquid AI's release comparison. The scaled estimates are approximately 17.2 and 14.2; their geometric mean rounds to 15.6. This is an estimated Intelligence Index, not a measured score.",
+          "evidenceUrls": [
+            "https://www.liquid.ai/blog/lfm2-5-24b-a2b",
+            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
+            "https://artificialanalysis.ai/models/nemotron-3-5-lightning"
+          ]
+        }
+      }
+    },
+    {
       "id": "minicpm5-1b",
       "displayName": "MiniCPM5 1B",
       "description": "Compact dense model for on-device reasoning and tool use.",
@@ -325,6 +357,74 @@
           "methodologyVersion": "4.3.2",
           "asOfDate": "2026-09-29",
           "url": "https://artificialanalysis.ai/models/minicpm5-2b"
+        }
+      }
+    },
+    {
+      "id": "minicpm-v-4.7-1b",
+      "displayName": "MiniCPM-V 4.7 1B",
+      "description": "Compact multimodal model for on-device image, document, and video understanding.",
+      "releaseDate": "2026-10-12",
+      "parameterization": {"architecture": "dense", "totalParameters": 1006209856},
+      "support": {"level": "supported"},
+      "repository": "openbmb/MiniCPM-V-4.7-1B-gguf",
+      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "projector": {"path": "mmproj-model-f16-4x.gguf"},
+      "speculativeDecoding": {
+        "method": "dspark",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/MiniCPM-V-4.7-1B-DSpark-GGUF",
+          "path": "MiniCPM-V-4.7-1B-DSpark-Q8_0.gguf"
+        }
+      },
+      "license": "apache-2.0",
+      "artificialAnalysis": {
+        "score": 5.9,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-13",
+          "methodology": "Scaled MiniCPM-V 4.6 1.3B's Artificial Analysis estimated score of 5.69026588282761 by the geometric mean (1.0412483709715992) of MiniCPM-V 4.7 1B's ratios on all 25 benchmarks in OpenBMB's Instruct-mode 4x visual-compression comparison, inverting the lower-is-better MMHal-Hallrate ratio; rounded 5.924980080889518 to 5.9. The published 1B table contains multimodal benchmarks, not the language benchmarks used for the 35B estimate, so this is a multimodal proxy for the Intelligence Index, not a measured language score.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/minicpm-v4-6-1-3b",
+            "https://github.com/OpenBMB/MiniCPM-V/blob/main/assets/minicpmv4.7/overall_performance_1b_instruct.png"
+          ]
+        }
+      }
+    },
+    {
+      "id": "minicpm-v-4.7-35b-a3b",
+      "displayName": "MiniCPM-V 4.7 35B-A3B",
+      "description": "Multimodal MoE with a large knowledge footprint and low active compute for image, document, and video understanding.",
+      "releaseDate": "2026-10-12",
+      "parameterization": {"architecture": "mixtureOfExperts", "totalParameters": 34659889792, "activeParameters": 3000000000},
+      "support": {"level": "supported"},
+      "repository": "openbmb/MiniCPM-V-4.7-35B-A3B-gguf",
+      "variants": [{"variantId": "gguf:q4", "format": "Q4_K_M", "variantLabel": "Q4", "fidelityRank": 40, "quantizationAware": false}, {"variantId": "gguf:q5", "format": "Q5_K_M", "variantLabel": "Q5", "fidelityRank": 50, "quantizationAware": false}, {"variantId": "gguf:q6", "format": "Q6_K", "variantLabel": "Q6", "fidelityRank": 60, "quantizationAware": false}, {"variantId": "gguf:q8", "format": "Q8_0", "variantLabel": "Q8", "fidelityRank": 80, "quantizationAware": false}],
+      "projector": {"path": "mmproj-model-f16-4x.gguf"},
+      "speculativeDecoding": {
+        "method": "dspark",
+        "draft": {
+          "type": "file",
+          "repository": "magnitudedev/MiniCPM-V-4.7-35B-A3B-DSpark-GGUF",
+          "path": "MiniCPM-V-4.7-35B-A3B-DSpark-Q8_0.gguf"
+        }
+      },
+      "license": "apache-2.0",
+      "artificialAnalysis": {
+        "score": 19.1,
+        "provenance": {
+          "kind": "estimate",
+          "target": "artificialAnalysisIntelligenceIndex",
+          "methodologyVersion": "4.3.2",
+          "asOfDate": "2026-10-13",
+          "methodology": "Scaled the measured Qwen3.6 35B-A3B Intelligence Index score of 18.2 by the geometric mean of MiniCPM-V 4.7 35B-A3B's ratios against that language backbone on OpenBMB's eight Instruct-mode benchmarks: CMMLU, MMLU-Pro, SuperGPQA, IFBench, AIME26, LiveCodeBench v6, BFCL-V4 and tau2-Bench; rounded to 19.1.",
+          "evidenceUrls": [
+            "https://artificialanalysis.ai/models/qwen3-6-35b-a3b",
+            "https://github.com/OpenBMB/MiniCPM-V/blob/main/assets/minicpmv4.7/overall_performance_35ba3b_language.png"
+          ]
         }
       }
     },

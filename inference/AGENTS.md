@@ -20,6 +20,19 @@ confirm that, for example, a commit is ready. Longer validations and benchmarks 
 condition. They are expensive and take a long time, and a run that is not necessary buys nothing
 for that cost.
 
+## Validation
+
+**Run every validation in the minimum time needed to obtain its information.** The information
+dictates the length, not you. If you could break it up or run it shorter, it is too long.
+
+**Spend time only on information you need to implement further.** Obtain exactly that. Collect
+anything more only when it costs you no additional time; never spend time on information you do not
+need to continue.
+
+You can check your results and decide your next step from them, so validate in short runs that each
+answer what you need now. A sweep or matrix pays up front for answers to questions you do not yet
+know you have, and blocks you and every other agent on the machine while it runs.
+
 ## Machines
 
 **Use every machine available.** Builds, tests and device runs go on the remote machines, spread
@@ -30,6 +43,11 @@ Keep expensive work off the local machine.
 never over ssh directly, and name a pool rather than one host unless the work needs that specific
 machine. A pool run takes whichever member frees first. `magnitude-remote status` shows who holds
 and who waits on each host: the agent session, its checkout, and its run.
+
+**Hold a machine only while it is doing work you need.** Every other agent waits while you hold it.
+Know how long each of your runs should take, and set its maximum hold to that. A run that goes
+past it is broken: stop it and find the cause. You are responsible for every run you have
+started, including ones whose results you no longer need; stop those at once.
 
 ## Autonomy
 

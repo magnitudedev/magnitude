@@ -106,15 +106,26 @@ class Native(Adapter):
         magnitude = self.magnitude
         arguments = [
             str(magnitude.binary),
-            "--model", str(self.artifact.path),
-            "--no-projector",
-            "--host", "127.0.0.1",
-            "--port", str(port),
-            "--served-model", self.served_model(),
-            "--context-tokens", str(context),
-            "--device", magnitude.device,
+            "--model",
+            str(self.artifact.path),
+            *(
+                ["--projector", str(self.acquisition.projector.path)]
+                if self.options.vision and self.acquisition.projector is not None
+                else ["--no-projector"]
+            ),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--served-model",
+            self.served_model(),
+            "--context-tokens",
+            str(context),
+            "--device",
+            magnitude.device,
             *(["--cache-dir", str(self.kernel_cache)] if self.kernel_cache is not None else []),
-            "--output-capacity", str(OUTPUT_CAPACITY),
+            "--output-capacity",
+            str(OUTPUT_CAPACITY),
             *(
                 ["--prefill-tokens", str(magnitude.prefill_tokens)]
                 if magnitude.prefill_tokens is not None

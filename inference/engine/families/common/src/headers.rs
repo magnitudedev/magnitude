@@ -99,6 +99,15 @@ pub fn directory(file: &str) -> Directory {
         &std::fs::read(&path).unwrap_or_else(|error| panic!("{path:?}: {error}")),
     )
     .unwrap();
+    directory_from_json(&header)
+}
+
+/// A header fixture supplied by a family test, without a global catalog dump.
+pub fn directory_from_bytes(bytes: &[u8]) -> Directory {
+    directory_from_json(&serde_json::from_slice(bytes).unwrap())
+}
+
+fn directory_from_json(header: &Json) -> Directory {
     let metadata = header["metadata"]
         .as_object()
         .unwrap()

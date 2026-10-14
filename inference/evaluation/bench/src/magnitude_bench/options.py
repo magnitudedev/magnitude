@@ -142,6 +142,8 @@ class Schedule(Record):
 class EngineOptions(Record):
     #: Serve with the catalog drafter where the engine supports its method.
     drafting: bool = True
+    #: Bind the catalog projector for image-bearing fixture requests.
+    vision: bool = False
     magnitude: MagnitudeOptions = Field(default_factory=MagnitudeOptions)
     llama: LlamaOptions = Field(default_factory=LlamaOptions)
     ollama: OllamaOptions = Field(default_factory=OllamaOptions)

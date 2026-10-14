@@ -12,8 +12,8 @@
 //! biases and head norms) at import.
 
 use crate::{
-    checked_product, expect_shape, ActivationDType, DefinitionError, RmsNorm, UnweightedRms,
-    WeightDescriptor, WeightKind, WeightRole, WeightScope,
+    ActivationDType, DefinitionError, RmsNorm, UnweightedRms, WeightDescriptor, WeightKind,
+    WeightRole, WeightScope, checked_product, expect_shape,
 };
 use magnitude_artifacts::{ImageProcessorConfig, ImageResize, Resampling};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,8 @@ pub enum VisionActivation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VisionResize {
+    /// One overview and a bounded grid of detail crops, each near the given pixel resolution.
+    Slices { resolution: u64, max_slices: u64 },
     /// Sides rounded half to even to multiples of patch · merge, then scaled
     /// into the pixel bounds (Qwen3-VL).
     PixelBounds { min_pixels: u64, max_pixels: u64 },
@@ -55,6 +57,12 @@ impl VisionResize {
             return Err(DefinitionError::new("a vision cell holds no pixels"));
         }
         Ok(match self {
+            Self::Slices { resolution, .. } => {
+                // Four-patch alignment adds at most two patches to each side.
+                // At the processor's aspect limit of 200, this square bound
+                // covers that added area, including very thin overviews.
+                checked_product(&[resolution / patch + 16, resolution / patch + 16])? / cell_rows
+            }
             Self::PixelBounds { max_pixels, .. } => max_pixels / cell_pixels,
             Self::PatchBudget { max_patches } => max_patches / cell_rows,
             Self::CellBudget { max_cells } => max_cells,
@@ -68,8 +76,23 @@ impl VisionResize {
         patch: u64,
         merge: u64,
     ) -> Result<Self, DefinitionError> {
+        let cell_rows = checked_product(&[merge, merge])?;
         let patches = checked_product(&[cells, merge, merge])?;
         Ok(match self {
+            Self::Slices {
+                resolution,
+                max_slices,
+            } => {
+                let side = (cells as f64 * cell_rows as f64).sqrt() as u64;
+                let resolution = resolution.min(side.saturating_sub(16) * patch);
+                if resolution < 4 * patch {
+                    return Err(DefinitionError::new("image budget cannot hold a slice"));
+                }
+                Self::Slices {
+                    resolution,
+                    max_slices,
+                }
+            }
             Self::PixelBounds {
                 min_pixels,
                 max_pixels,
@@ -116,6 +139,8 @@ pub struct VisionPreprocessing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PositionSampling {
+    /// Each patch selects its fractional-position bucket in a square learned table (NaViT).
+    Buckets { side: u64 },
     /// A square table of `side`² rows, bilinearly resampled to the patch grid
     /// with aligned corners (Qwen3-VL).
     AlignedCorners { side: u64 },
@@ -139,16 +164,18 @@ impl VisionPositions {
     /// Rows of the table as the stem addresses them.
     pub fn rows(&self) -> u64 {
         match self.sampling {
-            PositionSampling::AlignedCorners { side } | PositionSampling::PixelCenters { side } => {
-                side * side
-            }
+            PositionSampling::Buckets { side }
+            | PositionSampling::AlignedCorners { side }
+            | PositionSampling::PixelCenters { side } => side * side,
             PositionSampling::Axes { length } => 2 * length,
         }
     }
 
     fn validate(&self, hidden: u64) -> Result<(), DefinitionError> {
         match self.sampling {
-            PositionSampling::AlignedCorners { side } | PositionSampling::PixelCenters { side } => {
+            PositionSampling::Buckets { side }
+            | PositionSampling::AlignedCorners { side }
+            | PositionSampling::PixelCenters { side } => {
                 if side == 0 {
                     return Err(DefinitionError::new("vision position table has no rows"));
                 }
@@ -352,7 +379,8 @@ pub struct VisionAttention {
     pub key_norm: Option<RmsNorm>,
     /// Weightless RMS norm of each value head.
     pub value_norm: Option<UnweightedRms>,
-    pub rotary_base: f64,
+    /// Absent for learned-position-only towers such as SigLIP.
+    pub rotary_base: Option<f64>,
     pub scale: VisionAttentionScale,
     pub span: VisionAttentionSpan,
     pub output: VisionLinear,
@@ -362,7 +390,10 @@ pub struct VisionAttention {
 pub enum VisionUp {
     Plain(VisionLinear),
     /// `activation(gate(x)) ⊙ up(x)`.
-    Gated { gate: VisionLinear, up: VisionLinear },
+    Gated {
+        gate: VisionLinear,
+        up: VisionLinear,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -570,6 +601,13 @@ impl VisionDescription {
                 .map_err(|_| DefinitionError::new(format!("image {what} exceeds host domain")))
         };
         let resize = match p.resize {
+            VisionResize::Slices {
+                resolution,
+                max_slices,
+            } => ImageResize::Slices {
+                resolution: size(resolution, "slice resolution")?,
+                max_slices: size(max_slices, "slice limit")?,
+            },
             VisionResize::PixelBounds {
                 min_pixels,
                 max_pixels,
@@ -608,8 +646,14 @@ impl VisionDescription {
             || p.patch == 0
             || p.merge == 0
             || p.mean.iter().any(|value| !value.is_finite())
-            || p.std.iter().any(|value| !value.is_finite() || *value <= 0.0)
+            || p.std
+                .iter()
+                .any(|value| !value.is_finite() || *value <= 0.0)
             || match p.resize {
+                VisionResize::Slices {
+                    resolution,
+                    max_slices,
+                } => resolution < 4 * p.patch || max_slices == 0 || max_slices > 9,
                 VisionResize::PixelBounds {
                     min_pixels,
                     max_pixels,
@@ -716,8 +760,9 @@ impl VisionDescription {
         if attention.heads == 0
             || attention.width == 0
             || attention.width % 4 != 0
-            || !attention.rotary_base.is_finite()
-            || attention.rotary_base <= 1.0
+            || attention
+                .rotary_base
+                .is_some_and(|base| !base.is_finite() || base <= 1.0)
             || attention.query_norm.is_some() != attention.key_norm.is_some()
             || (attention.span == VisionAttentionSpan::Window && self.window.is_none())
         {
@@ -826,7 +871,9 @@ impl VisionDescription {
             attention
                 .query
                 .weights(scope, VisionLinearSite::Query, &mut out);
-            attention.key.weights(scope, VisionLinearSite::Key, &mut out);
+            attention
+                .key
+                .weights(scope, VisionLinearSite::Key, &mut out);
             attention
                 .value
                 .weights(scope, VisionLinearSite::Value, &mut out);
@@ -865,8 +912,14 @@ impl VisionDescription {
             norm.weights(vision, VisionNormSite::Merger, &mut out);
         }
         if let Some(standardize) = &merger.standardize {
-            out.push((role(vision, VisionWeight::StandardizeBias), &standardize.bias));
-            out.push((role(vision, VisionWeight::StandardizeScale), &standardize.scale));
+            out.push((
+                role(vision, VisionWeight::StandardizeBias),
+                &standardize.bias,
+            ));
+            out.push((
+                role(vision, VisionWeight::StandardizeScale),
+                &standardize.scale,
+            ));
         }
         if let Some(norm) = &merger.projection_norm {
             norm.weights(vision, VisionNormSite::MergerProjection, &mut out);

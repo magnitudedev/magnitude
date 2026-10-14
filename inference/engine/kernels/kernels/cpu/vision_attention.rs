@@ -33,7 +33,13 @@ fn vision_attention_prepare<L: Isa, E: Elements>(_l: L, cx: &Context<'_, E>, gro
             } else {
                 target.copy_from_slice(source);
             }
-            vision::rotate::<E::A>(target, coordinates, p, cx.arg_log_base());
+            if cx.arg_log_base() != 0.0 {
+                vision::rotate::<E::A>(target, coordinates, p, cx.arg_log_base());
+            } else {
+                for element in target.iter_mut() {
+                    *element = activation::publish::<E::A>(*element);
+                }
+            }
         }
         let value = &mut values[head * w..][..w];
         seismic::cpu::tensor::widen_row::<E::A>(cx.arg_value().row([row, head, 0]), source);

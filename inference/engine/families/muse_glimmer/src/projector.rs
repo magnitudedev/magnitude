@@ -162,7 +162,7 @@ pub fn describe_projector(
                 query_norm: None,
                 key_norm: None,
                 value_norm: None,
-                rotary_base: ROTARY_BASE,
+                rotary_base: Some(ROTARY_BASE),
                 scale: VisionAttentionScale::InverseSqrtWidth,
                 span: if global {
                     VisionAttentionSpan::Full

@@ -38,7 +38,7 @@ void vision_attention_prepare() {
         : plane == 1u ? SEISMIC_PTR(SEISMIC_BUFFER_KEY_NORM) : 0ul;
     const bool normed = plane < 2u ? SEISMIC_DIM_NQ == 1 : SEISMIC_DIM_NV == 1;
     vision_prepare_head(ELEMENT_ACT, source + (uint64_t(row) * VISION_H + head) * VISION_W * 2ul, target, normed,
-        norm, element_word_f32(SEISMIC_PARAM_EPSILON), plane < 2u,
+        norm, element_word_f32(SEISMIC_PARAM_EPSILON), plane < 2u && element_word_f32(SEISMIC_PARAM_LOG_BASE) != 0.0,
         SEISMIC_PTR(SEISMIC_BUFFER_COORDINATES) + uint64_t(row) * 8ul, element_word_f32(SEISMIC_PARAM_LOG_BASE),
         VISION_W, VISION_WP);
 }

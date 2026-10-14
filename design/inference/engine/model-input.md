@@ -26,7 +26,14 @@ position-table interpolation. A family adapter consumes
 the model definition, token plan, and generic prepared media to create one closed numerical input
 contract. The contract contains the final token coordinates, media spans, patch order, attention
 coordinates, attention window ranges, and position-encoding interpolation indices and coefficients
-needed by execution.
+needed by execution. An overview/detail image processor publishes crops and their
+source-image slice grids without assigning numerical positions. The MiniCPM-V 4.7
+4× adapter places these crops on a shared canvas: the overview spans the full canvas,
+detail rows retain their tile offsets, delimiters use the canvas edges, and following
+text resumes beyond its largest coordinate. Its SigLIP tower uses learned fractional
+position buckets and full attention without rotary; per-patch normalization precedes
+2×2 concatenation and a second normalization over each concatenated cell. Intra-tower
+16× compression is a different graph and is rejected rather than executed as 4×.
 The adapter is configured with tokenizer-derived family marker identities before it prepares a
 request; the model definition and media alone cannot identify those tokens.
 For text-only input, the same closed contract records the family-supplied coordinates directly;

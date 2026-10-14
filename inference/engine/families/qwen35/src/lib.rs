@@ -6,6 +6,7 @@
 //! builders the Qwen families share.
 
 mod family;
+pub mod minicpm;
 
 pub use family::Qwen35Family;
 
@@ -21,8 +22,7 @@ use magnitude_family_contracts::{
     VocabularyProjection, WeightDescriptor,
 };
 use magnitude_family_qwen::{
-    Geometry, Metadata, MixerKind, Weight, check_projector_base, describe_projector, mixer_kinds,
-    product,
+    Geometry, Metadata, MixerKind, Weight, check_projector_base, mixer_kinds, product,
 };
 
 pub use magnitude_family_qwen::Error;
@@ -217,7 +217,19 @@ pub fn inspect_components(
     if let Some(projector) = projector {
         check_projector_base(directory, projector)?;
     }
-    let vision = projector.map(describe_projector).transpose()?;
+    let vision = projector
+        .map(|projector| {
+            if projector
+                .value("clip.projector_type")
+                .and_then(Value::string)
+                == Some("minicpmv4_7")
+            {
+                minicpm::describe_projector(projector)
+            } else {
+                magnitude_family_qwen::describe_projector(projector)
+            }
+        })
+        .transpose()?;
     let definition = ModelDefinition {
         family: FamilyId(family_id.into()),
         artifact_identity: identity,
