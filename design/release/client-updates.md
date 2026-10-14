@@ -66,7 +66,9 @@ the running version is the held one, a restart checks again once the hour's wait
 then holds for another hour), so restarts never storm the update server yet a fixed release still
 arrives: when that check leaves a newer download ready, the owner installs it in place of the
 version that cannot start instead of exiting. There is no rollback; withdrawing the release stops
-it being offered.
+it being offered. Desktop likewise starts its scheduled checks only once its service is first Ready or Failed; a
+service that fails before Ready records `failed`/`startup` and holds that version back the same way,
+and the app, which keeps running, goes on checking hourly.
 
 Update commands never launch Desktop. With no owner, status observes persisted preparation without
 creating state; finite check, download and discard retain maintenance ownership. A finite download
