@@ -299,7 +299,7 @@ take effect.
 `magnitude server setup` registers the foreground serving host as a system service. It runs as the
 person, and only its root step runs through sudo, as a hidden command of the installed CLI invoked
 by full path. That command accepts exactly the invoking user's name (sudo's own, never another
-account), or no arguments for a root login, or removal; it refuses unless running as root from the
+account), or no arguments for a root login, or removal, or the package installation's grant restoration; it refuses unless running as root from the
 installed path, and writes only Magnitude's fixed files. Interactive sudo, here and for a foreground
 `magnitude update install`, runs in the caller's own terminal session, so it reuses that terminal's
 ticket (the installer's earlier authorization) or asks there once; a child in a new session could do

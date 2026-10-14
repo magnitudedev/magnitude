@@ -56,4 +56,4 @@ Open **Magnitude** from your applications menu and follow [Quick start](/get-sta
 
 App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → Application updates** for the available actions. A [server](/remote-server) installs its updates by itself.
 
-Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package.
+Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. On a server, run `magnitude server remove` before removing the package; reinstalling the package without it keeps the server set up.

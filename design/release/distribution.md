@@ -109,7 +109,16 @@ such account or service. No package ships a sudoers rule, and build validation r
 installing the package must never grant anything to an existing account that happens to be named
 `magnitude`. Setup writes `/etc/sudoers.d/magnitude` (root, 0440, checked with `visudo -cf` before it
 is moved into place) only for the system account it created or verified; `server remove` and package
-removal (not upgrade) delete it. The unit starts the CLI through a `bin_t` program, so on SELinux systems
+removal (not upgrade) delete it. Every package installation and upgrade runs the installed CLI's
+hidden `_server-restore-grant` step, which writes the current rule the same way, and only when the
+root-owned server marker and Magnitude's own system account (by setup's criteria) both exist: a
+reinstall over a configured server keeps it updating itself, and no other account named `magnitude`
+is ever granted anything. Purging the Debian package also forgets the server (the marker and the
+enabled-unit link), so a later installation asks again; the account and data directory stay, and
+setup reuses them. RPM and pacman removal cannot be told from an interrupted reinstall, so they keep
+the marker. Installation, upgrade and removal reload systemd so the packaged unit is current. While
+the server holds the installation lock, the package refusal names `magnitude server remove` or
+stopping the service instead of quitting the app. The unit starts the CLI through a `bin_t` program, so on SELinux systems
 the service runs as `unconfined_service_t` like any packaged daemon; the `lib_t` CLI started
 directly would stay in confined `init_t`, which cannot reach its own engine over loopback.
 The sudoers rule lets only that account run the installed update helper
