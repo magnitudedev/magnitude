@@ -220,7 +220,8 @@ beneath the model store. The store root defaults to `.magnitude/models`; `models
 `config.json` names another absolute directory. ACN reads that setting once when it spawns ICN, so a
 change applies at the next service start, and it resolves a symbolically linked root to its real
 directory before spawning because ICN refuses a linked root. A relative value, or a path that exists
-but is not a directory, is logged and the default applies. Changing the root never moves artifacts;
+but is not a directory, or a directory the service cannot create or write a file in, is logged and the
+default applies, so an unusable folder never stops the service from starting. Changing the root never moves artifacts;
 the previous store remains intact on disk. ICN's managed Hugging Face hub lives beneath the model store, and ICN does not
 implicitly discover or adopt a host user's global Hugging Face cache.
 External caches or directories participate only when they are supplied explicitly as read-only
@@ -269,7 +270,12 @@ declaration `{schemaVersion, nativeBuild}` written by the installer or the local
 no `backends/` directory and no declared backend. Validation proves the executable's
 `version --json` identity reports the release's native build and the declaration names the same
 native build; `nativeBuild` is the engine build identity (engine version plus kernel bundle
-identity).
+identity). A release installation whose download fails says, in one line and without stack frames,
+that Magnitude couldn't download its inference engine, the HTTP status or failure and the host, and
+what to do for that cause: a release the host doesn't have (HTTP 404 or 410) isn't available for
+download, while a network failure asks to check the connection. ACN's startup failure carries that
+line to `serve`, the service log and `server setup`; neither ACN's exit nor its supervisor repeats it
+with stack frames or a copy of output that already reached the log.
 
 `bun dev` prepares the same fixed layout at
 `inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`

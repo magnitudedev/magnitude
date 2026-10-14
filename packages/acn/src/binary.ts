@@ -2,8 +2,8 @@ import { Command, Options } from "@effect/cli"
 import * as PlatformCommand from "@effect/platform/Command"
 import { BunContext, BunRuntime } from "@effect/platform-bun"
 import { FetchHttpClient } from "@effect/platform"
-import { Console, Data, Effect, Layer } from "effect"
-import { launchAcnServer } from "./server"
+import { Cause, Console, Data, Effect, Layer, Option } from "effect"
+import { AcnRestartRequired, launchAcnServer } from "./server"
 import { installOwnerGuard, makeAcnOwnerControl } from "./owned-control"
 import { ACN_REVISION, ACN_VERSION } from "./version"
 import { resolveRgPath } from "@magnitudedev/ripgrep"
@@ -85,7 +85,14 @@ const cli = Command.run(acn, {
   version: ACN_VERSION,
 })
 
+/** A restart request was logged when ACN stopped, so exiting for it adds no second report. */
+const reportFailure = (cause: Cause.Cause<unknown>) => Option.match(Cause.failureOption(cause), {
+  onSome: failure => failure instanceof AcnRestartRequired ? Effect.void : Effect.logError(cause),
+  onNone: () => Cause.isInterruptedOnly(cause) ? Effect.void : Effect.logError(cause),
+})
+
 const program = cli(process.argv).pipe(
+  Effect.tapErrorCause(reportFailure),
   Effect.provide(Layer.merge(BunContext.layer, FetchHttpClient.layer)),
 )
-BunRuntime.runMain(program)
+BunRuntime.runMain(program, { disableErrorReporting: true })

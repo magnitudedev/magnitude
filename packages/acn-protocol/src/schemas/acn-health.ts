@@ -93,9 +93,14 @@ export class AcnReady extends Schema.TaggedClass<AcnReady>()("Ready", {
   hardware: Schema.optionalWith(AcnHardwareSummarySchema, { as: "Option", exact: true }),
 }) {}
 
+/** `permanent` marks a stop that starting again cannot fix, such as an engine release the host doesn't have. */
 export class AcnStopping extends Schema.TaggedClass<AcnStopping>()("Stopping", {
   reason: AcnStoppingReasonSchema,
   safeDetail: Schema.optionalWith(NonEmptyString, {
+    as: "Option",
+    exact: true,
+  }),
+  permanent: Schema.optionalWith(Schema.Boolean, {
     as: "Option",
     exact: true,
   }),

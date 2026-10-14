@@ -16,6 +16,7 @@ import {
   inferenceRequiredPaths,
   type HostId,
   NodeArchiveExtractor,
+  type ReleaseAcquisitionError,
   releaseBundleSizes,
   selectArtifact,
   type ReleaseArtifact,
@@ -29,6 +30,7 @@ export class ReleaseIcnInstallationError extends Data.TaggedError(
 )<{
   readonly stage: "acquire" | "probe" | "declare" | "verify"
   readonly message: string
+  readonly permanent: boolean
 }> {}
 
 export interface ReleaseIcnInstallation {
@@ -39,8 +41,24 @@ export interface ReleaseIcnInstallation {
 
 const installationError = (
   stage: ReleaseIcnInstallationError["stage"],
-  message: string
-) => new ReleaseIcnInstallationError({ stage, message })
+  message: string,
+  permanent = false
+) => new ReleaseIcnInstallationError({ stage, message, permanent })
+
+/**
+ * A failed download is the person's network or the release host, not something in Magnitude to
+ * debug, so it says what was being downloaded, from where, and what to do about that cause.
+ */
+export const acquisitionError = (baseUrl: string) => (cause: ReleaseAcquisitionError) => {
+  if (cause.stage !== "download") return installationError("acquire", cause.message)
+  const detail = cause.message.replace(/^release endpoint returned /, "").replace(/^release /, "")
+  const host = URL.canParse(baseUrl) ? ` from ${new URL(baseUrl).host}` : ""
+  const advice = /^HTTP (404|410)$/.test(detail) ? "This release isn't available for download. Update Magnitude, or try again later."
+    : cause.transient ? "Check your internet connection and try again."
+    : "The release host refused the download. Try again later."
+  // The download already retried what was transient; what remains won't change on a restart.
+  return installationError("acquire", `Magnitude couldn't download its inference engine (${detail}${host}). ${advice}`, !cause.transient)
+}
 
 const executableName = () =>
   `${ICN_EXECUTABLE_NAME}${process.platform === "win32" ? ".exe" : ""}`
@@ -162,7 +180,7 @@ const ensureArtifact = (
         }),
       }).pipe(
         Effect.provide(NodeArchiveExtractor),
-        Effect.mapError((cause) => installationError("acquire", cause.message))
+        Effect.mapError(acquisitionError(baseUrl))
       )
     }
     if (!(yield* isCompleteArtifact(destination, host))) {
@@ -280,7 +298,7 @@ export const resolveReleaseIcnInstallation = (
       version,
       path.join(releaseRoot, "manifests", version)
     ).pipe(
-      Effect.mapError((cause) => installationError("acquire", cause.message))
+      Effect.mapError(acquisitionError(baseUrl))
     )
     const bundleSizes = yield* releaseBundleSizes(
       release.manifest,
