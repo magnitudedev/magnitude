@@ -74,8 +74,11 @@ export const buildDesktopApplication = (options: {
   return yield* Effect.tryPromise({ try: () => packager({
     dir: app, out: options.outputDirectory, name: "Magnitude", executableName: platform === "linux" ? "magnitude" : "Magnitude",
     platform, arch, electronVersion: electron.version,
-    appBundleId: "dev.magnitude.desktop", appVersion: options.version, buildVersion: String(options.revision),
-    ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"), win32metadata: { CompanyName: "Magnitude" } } : {}),
+    appBundleId: "dev.magnitude.desktop", appVersion: options.version, appCopyright: "Copyright Magnitude",
+    // Windows shows buildVersion as the executable's file version; macOS keeps the revision as its bundle version.
+    buildVersion: platform === "win32" ? `${options.version.split(/[+-]/)[0]}.${options.revision}` : String(options.revision),
+    ...(platform === "win32" ? { icon: join(root, "packages/release/resources/windows/Magnitude.ico"),
+      win32metadata: { CompanyName: "Magnitude", ProductName: "Magnitude", FileDescription: "Magnitude", InternalName: "Magnitude", OriginalFilename: "Magnitude.exe" } } : {}),
     ...(platform === "darwin" ? { icon: join(root, "packages/release/resources/macos/Magnitude.icns"), extendInfo: { LSMinimumSystemVersion: MACOS_DEPLOYMENT_TARGET } } : {}),
     asar: true, prune: false, overwrite: true,
     extraResource: [service, cli, addon, tray, ...windowsTrayIcons, icon, license, updateTrust, updateConfiguration,
