@@ -22,6 +22,10 @@ import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/n
 
 export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplicationFailed>()("HeadlessApplicationFailed", { message: Schema.String }) {}
 
+const windowsUncontainedServe = "On Windows, start `magnitude serve` with the Magnitude command, "
+  + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, not the app's resources\\magnitude.exe. "
+  + "Service wrappers such as NSSM and scheduled tasks must start that command too."
+
 /**
  * Why a Headless owner ended. `Restart` asks the caller to admit a new owner with the same invocation;
  * `InstallUpdate` asks it to install the downloaded update now that the service is idle and stopped.
@@ -58,7 +62,8 @@ export const runHeadlessApplication = (options: {
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
   const native = yield* NativeHost
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
-  if (process.platform === "win32") yield* native.guardParent(0)
+  // Only the Magnitude command launcher contains a Windows server's process tree.
+  if (process.platform === "win32") yield* native.guardParent(0).pipe(Effect.mapError(() => new HeadlessApplicationFailed({ message: windowsUncontainedServe })))
   const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" }, options.profile.sharedControl)
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })

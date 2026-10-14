@@ -240,7 +240,9 @@ edits appear. ACN records the folder its engine started with; while the saved fo
 differs, a persistent toast in the window's bottom-right corner on every page states that a restart
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
 path, and shows a copyable platform-specific command that moves the previous store into the new
-folder. Magnitude never moves model files itself.
+folder. Magnitude never moves model files itself. The packaged Linux app relaunches through its
+installed launcher, never its Electron executable directly, so the relaunched app receives the
+installation admission it must adopt.
 
 When the renderer is served by the `electron-vite` dev server, Electron cannot relaunch itself:
 that server belongs to the parent process and exits with the application, so a self-relaunch would

@@ -104,6 +104,8 @@ loads from the installation's runtime directory, and exercises generation, strea
 cancellation, concurrent admission, model reload, and worker cleanup.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
+Windows executables carry Magnitude's own version resources (product, publisher, description and
+the release version), never Bun's or Electron's defaults; Bun writes them only on a Windows build host.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,
 the native CLI launcher, the embedded uninstaller, and the final installer are signed and timestamped before checksums are
 recorded. Publisher and signature validation fail the build; missing credentials cannot produce a

@@ -136,7 +136,10 @@ they neither acquire installation exclusion nor authorize mutation on their own.
 
 macOS installation admission uses a shared kernel lease outside the replaceable application bundle.
 The stable adjacent lock is owned by the installation owner, readable by other users, and never
-unlinked or rewritten. Running owners retain shared admission; an installer requires exclusive
+rewritten. The one exception: when another account reinstalled the bundle, its owner replaces a
+well-formed lock owned by the previous owner, only while holding it exclusively, by unlinking it and
+creating its own; a process that opened the old lock fails revalidation. Update staging owned by
+another account is reported with the exact administrator command that removes it. Running owners retain shared admission; an installer requires exclusive
 admission and revalidates the retained lock and parent identities before mutation. First installation
 may acquire exclusive admission for an absent bundle using the installing user's lock ownership;
 shared owner admission still requires an installed bundle. Publication retains that lock for later

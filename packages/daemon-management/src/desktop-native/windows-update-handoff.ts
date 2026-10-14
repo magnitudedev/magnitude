@@ -73,8 +73,9 @@ export const relaunchWindowsAfterUpdate = (request: WindowsUpdateHandoffRequest)
   const continuation = request.continuation
   if (continuation._tag === "Caller") return Effect.void
   return Effect.async<void, WindowsUpdateHandoffFailed>(resume => {
+    // Not windowsHide: Windows applies a hidden start to the app's first shown window, leaving it tray-only.
     const application = spawn(request.applicationPath, continuation.showWindow ? [] : ["--background"], {
-      cwd: win32.dirname(request.applicationPath), detached: true, windowsHide: true, stdio: "ignore",
+      cwd: win32.dirname(request.applicationPath), detached: true, stdio: "ignore",
     })
     application.once("error", () => resume(Effect.fail(failed())))
     application.once("spawn", () => { application.unref(); resume(Effect.void) })

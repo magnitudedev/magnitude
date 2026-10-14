@@ -51,12 +51,14 @@ const removeServer = Effect.gen(function* () {
 /**
  * While the server runs, the whole window is this one screen. Keep opens the server in the browser
  * and quits; Stop removes the server, then the app starts. If the server stops, the app continues.
+ * A quit request (Cmd-Q, logout, SIGTERM) quits, like closing the window.
  */
 export const resolveServerConflict = (options: {
   readonly personalStateDirectory: string
   readonly pageUrl: string
   readonly preload: string
   readonly icon: string
+  readonly quitRequested: Effect.Effect<void>
 }) => Effect.gen(function* () {
   const running = isServerRunning(options.personalStateDirectory)
   if (!(yield* running)) return "Proceed" as const
@@ -80,6 +82,7 @@ export const resolveServerConflict = (options: {
       Effect.zipRight(Deferred.succeed(decision, "Proceed")), Effect.as({ ok: true as const }),
       Effect.catchAll(error => Effect.succeed({ ok: false as const, message: error.message })))))
   }), () => Effect.sync(() => { ipcMain.removeHandler("server-conflict:keep"); ipcMain.removeHandler("server-conflict:stop") }))
+  yield* options.quitRequested.pipe(Effect.zipRight(Deferred.succeed(decision, "Quit")), Effect.forkScoped)
   // The server stopping by itself also lets the app continue.
   yield* running.pipe(Effect.repeat({ until: value => !value, schedule: Schedule.spaced(Duration.seconds(2)) }),
     Effect.zipRight(Deferred.succeed(decision, "Proceed")), Effect.forkScoped)

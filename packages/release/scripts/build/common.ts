@@ -47,6 +47,20 @@ export const fileSha256 = async (file: string): Promise<string> => {
 
 class BuildCommandFailed extends Schema.TaggedError<BuildCommandFailed>()("BuildCommandFailed", { message: Schema.String }) {}
 
+/**
+ * Bun arguments that name a Windows executable as Magnitude's instead of Bun's. Bun writes version
+ * resources only when compiling on Windows. The version is read when compiling because release
+ * builds stamp the generated version file after this module loads.
+ */
+export const windowsExecutableResources = async (platform: string, description: string): Promise<ReadonlyArray<string>> => {
+  if (platform !== "windows" || process.platform !== "win32") return []
+  const generated = await Bun.file(new URL("../../../version/src/version.generated.ts", import.meta.url)).text()
+  const version = /export const MAGNITUDE_VERSION = "([0-9]+)\.([0-9]+)\.([0-9]+)/.exec(generated)
+  if (!version) throw new Error("The generated Magnitude version has no numeric release version")
+  return ["--windows-title=Magnitude", "--windows-publisher=Magnitude", `--windows-description=${description}`,
+    `--windows-version=${version.slice(1, 4).join(".")}.0`, "--windows-copyright=Copyright Magnitude"]
+}
+
 export const run = (
   command: readonly string[],
   options: {
