@@ -2201,6 +2201,7 @@ describe("read-only connection inspection", () => {
       const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-inspection-optional-skill-" })
       const paths = fixturePaths(root)
       const service = yield* installedService(paths)
+      expect((yield* service.inspect).find((row) => row.id === "opencode")?.inspection).toEqual({ _tag: "Disconnected", reason: "Not connected" })
       yield* service.connect(HarnessIdSchema.make("opencode"), { model: Option.none(), installSkill: true })
       expect((yield* service.inspect).find((row) => row.id === "opencode")?.inspection._tag).toBe("Connected")
       yield* fs.remove(paths.skillInstallations["shared-agents"].skillFile)

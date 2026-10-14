@@ -46,8 +46,11 @@ export const inspectHarnessConnection = (
       catch: (): ConnectionInspection => ({ _tag: "Unavailable", reason: `Fix invalid configuration in ${path} before reconnecting or disconnecting` }),
     })),
   )
+  // Whether Magnitude's own entry exists at all: absent means never connected, present but different means changed.
+  let present = false
+  const owned = (value: unknown) => { present ||= value !== undefined; return value }
   const provider = (path: string, segments: ReadonlyArray<string>, expected: unknown, format: "json" | "json5" | "yaml" = "json") =>
-    read(path, format).pipe(Effect.map((document) => includesFields(valueAt(document, segments), expected)))
+    read(path, format).pipe(Effect.map((document) => includesFields(owned(valueAt(document, segments)), expected)))
   let valid = false
   switch (connector.id) {
     case "pi": valid = yield* provider(paths.piModels, ["providers", "magnitude"], piProviderConfig(models, endpoints.openai)); break
@@ -55,7 +58,7 @@ export const inspectHarnessConnection = (
       const document = yield* readOpenCodeConfiguration(paths).pipe(
         Effect.catchTag("UnknownException", () => Effect.fail<ConnectionInspection>({ _tag: "Unavailable", reason: "Fix invalid OpenCode configuration before reconnecting or disconnecting" })),
       )
-      valid = includesFields(valueAt(document, ["provider", "magnitude"]), openCodeProviderConfig(models, endpoints.openai))
+      valid = includesFields(owned(valueAt(document, ["provider", "magnitude"])), openCodeProviderConfig(models, endpoints.openai))
       break
     }
     case "hermes": valid = yield* provider(paths.hermes, ["providers", "magnitude"], hermesProviderConfig(endpoints.openai), "yaml"); break
@@ -63,6 +66,7 @@ export const inspectHarnessConnection = (
     case "oh-my-pi": valid = yield* provider(paths.ompModels, ["providers", "magnitude"], ohMyPiProviderConfig(models, endpoints.openai), "yaml"); break
     case "claude-code": {
       const settings = yield* read(paths.claude)
+      owned(valueAt(settings, ["env", "ANTHROPIC_BASE_URL"]) === endpoints.anthropic ? true : undefined)
       valid = includesFields(valueAt(settings, ["env"]), {
         ANTHROPIC_BASE_URL: endpoints.anthropic, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
       }) && (valueAt(settings, ["env", "ANTHROPIC_AUTH_TOKEN"]) === CLAUDE_AUTH_TOKEN_PLACEHOLDER
@@ -75,7 +79,7 @@ export const inspectHarnessConnection = (
       break
     case "codex": {
       const document = yield* read(paths.codexUser, "toml")
-      valid = includesFields(valueAt(document, ["model_providers", "magnitude"]), {
+      valid = includesFields(owned(valueAt(document, ["model_providers", "magnitude"])), {
         base_url: endpoints.codex, wire_api: "responses", requires_openai_auth: true, supports_websockets: true,
       }) && valueAt(document, ["model_catalog_json"]) === paths.codexModels
       if (valid) {
@@ -86,7 +90,7 @@ export const inspectHarnessConnection = (
       break
     }
   }
-  if (!valid) return disconnected("Magnitude configuration is missing or has changed")
+  if (!valid) return disconnected(present ? "Magnitude configuration has changed" : "Not connected")
   if (Option.isSome(requiredSkill)) {
     const path = paths.skillInstallations[connector.skillInstallationTarget].skillFile
     if ((yield* readOr(path, "")) !== requiredSkill.value) return disconnected("Magnitude skill is missing or has changed")
