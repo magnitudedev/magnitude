@@ -311,22 +311,57 @@ fn drain_diagnostics(
         .name(format!("inference-worker-stderr-{pid}"))
         .spawn(move || {
             let mut buffer = [0_u8; 4096];
+            let mut lines = DiagnosticLines::default();
+            let log = |line: &[u8]| {
+                let text = String::from_utf8_lossy(line);
+                let text = text.trim_end();
+                if !text.is_empty() {
+                    tracing::warn!(worker.pid = pid, message = %text, "inference worker");
+                }
+            };
             loop {
                 match stderr.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(length) => {
                         let bytes = &buffer[..length];
-                        tracing::warn!(
-                            worker.pid = pid,
-                            message = %String::from_utf8_lossy(bytes).trim_end(),
-                            "inference worker"
-                        );
+                        lines.push(bytes, log);
                         tail.lock().expect("diagnostic tail lock").append(bytes);
                     }
                 }
             }
+            lines.finish(log);
         })
         .map(drop)
+}
+
+/// The longest diagnostic line logged as one record; longer output is logged in pieces.
+const DIAGNOSTIC_LINE_BYTES: usize = 4096;
+
+/// Splits worker stderr into whole lines, so a line written in many small pieces is one record.
+#[derive(Default)]
+struct DiagnosticLines(Vec<u8>);
+
+impl DiagnosticLines {
+    fn push(&mut self, bytes: &[u8], mut emit: impl FnMut(&[u8])) {
+        for &byte in bytes {
+            if byte == b'\n' {
+                emit(&self.0);
+                self.0.clear();
+            } else {
+                self.0.push(byte);
+                if self.0.len() >= DIAGNOSTIC_LINE_BYTES {
+                    emit(&self.0);
+                    self.0.clear();
+                }
+            }
+        }
+    }
+
+    fn finish(self, mut emit: impl FnMut(&[u8])) {
+        if !self.0.is_empty() {
+            emit(&self.0);
+        }
+    }
 }
 
 fn process_id(process: &BlockingProcess) -> u32 {
@@ -368,6 +403,23 @@ mod tests {
         let text = tail.text();
         assert_eq!(text.len(), DIAGNOSTIC_TAIL_BYTES);
         assert!(text.ends_with("last line"));
+    }
+
+    #[test]
+    fn diagnostic_lines_join_pieces_into_whole_lines() {
+        let mut lines = DiagnosticLines::default();
+        let mut seen = Vec::new();
+        for piece in [&b"load"[..], b"ing ", b"model\nsecond", b" line\n", b"partial"] {
+            lines.push(piece, |line| seen.push(line.to_vec()));
+        }
+        lines.push(&vec![b'x'; DIAGNOSTIC_LINE_BYTES], |line| seen.push(line.to_vec()));
+        lines.finish(|line| seen.push(line.to_vec()));
+        assert_eq!(seen[0], b"loading model");
+        assert_eq!(seen[1], b"second line");
+        assert_eq!(seen[2].len(), DIAGNOSTIC_LINE_BYTES);
+        assert!(seen[2].starts_with(b"partial"));
+        assert_eq!(seen[3], vec![b'x'; 7]);
+        assert_eq!(seen.len(), 4);
     }
 
     #[test]

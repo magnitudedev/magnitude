@@ -224,7 +224,11 @@ impl ManagedModelDownloads {
                 .collect::<Vec<_>>()
         };
         for (attempt_id, record) in siblings {
-            match self.manager.cancel_package_download(&record.package).await {
+            match self
+                .manager
+                .cancel_package_download(&record.package, false)
+                .await
+            {
                 Ok(()) => {
                     let (completed_bytes, total_bytes) = attempt_progress(&record.attempt);
                     self.update(
@@ -726,7 +730,11 @@ impl ModelDownloads for ManagedModelDownloads {
                 ) {
                     continue;
                 }
-                match self.manager.cancel_package_download(&attempt.package).await {
+                match self
+                    .manager
+                    .cancel_package_download(&attempt.package, true)
+                    .await
+                {
                     Ok(()) => {
                         let (completed_bytes, total_bytes) = attempt_progress(&attempt.attempt);
                         self.update(
