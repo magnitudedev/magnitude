@@ -29,7 +29,7 @@ const contains = (parent: string, child: string) => {
   return path !== ".." && !path.startsWith("../") && !isAbsolute(path)
 }
 
-/** The shell verifies the extracted bootstrap bundle before invoking this finite entry point. */
+/** The shell verifies the extracted bootstrap bundle before invoking this finite entry point, and reports the result itself. */
 export const runMacArchiveInstallerCommand = (payload: string, stateDirectory: string, version: string) => Effect.gen(function* () {
   if (process.platform !== "darwin") return yield* new ApplicationUpdateFailed({ message: "This installer requires macOS." })
   const request = yield* decodeMacArchiveInstallerRequest(payload)
@@ -62,5 +62,4 @@ export const runMacArchiveInstallerCommand = (payload: string, stateDirectory: s
     if (Option.isSome(warning)) yield* Effect.sync(() => { process.stderr.write(`${warning.value}\n`) })
   }).pipe(Effect.provide([nativeHostLayer(addon), nativeMacUpdateAdmission(addon), nativeMacUpdateFilesystem(addon),
     nativeMacBundleVerifier(addon), NativeMacApplicationInstallation, guardedCommandLayer(join(resources, "magnitude-command"))])))
-  yield* Effect.sync(() => { process.stdout.write("Magnitude was installed. Run magnitude serve to start the server.\n") })
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
