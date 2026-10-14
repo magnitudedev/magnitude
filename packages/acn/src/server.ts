@@ -5,6 +5,7 @@ import {
   BunCommandExecutor,
 } from "@effect/platform-bun"
 import { FetchHttpClient, FileSystem, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
+import { join } from "node:path"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
@@ -108,7 +109,7 @@ import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
 import { resolveWebAppSource, serveWebApp } from "./web-app"
-import { installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, type RemoteAccessApi } from "./remote-access"
+import { fileSessionStore, installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
 import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
@@ -761,7 +762,8 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     )
     const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
     const server = Context.get(infrastructure, HttpServer.HttpServer)
-    const remote = yield* makeRemoteAccess(network)
+    const sessions = yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    const remote = yield* makeRemoteAccess(network, sessions)
     yield* installAcnHealthRoutes(router, lifecycle, remote).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
     if (network.enabled && network.bind !== primaryBind) {

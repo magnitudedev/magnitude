@@ -83,9 +83,11 @@ whether the caller is local, signed in, or must sign in, and whether a key exist
 `/rpc` admits loopback callers and signed-in callers whose `Origin` matches their `Host`; anonymous
 remote callers get 401. `/health` returns the instance identity only to loopback and signed-in
 callers, so the SDK's admission works unchanged in a signed-in browser; anyone else learns readiness
-only. Sessions live in ACN memory, expire after 30 days unused, and end with `POST /auth/session/end`
-or when ACN restarts. Because every network change, including a regenerated key or disabling
-network access, applies only when ACN restarts, that restart is also what signs every browser out.
+only. Sessions expire after 30 days unused and end with `POST /auth/session/end`. ACN keeps them in
+`remote-sessions.json` in its data directory (owner-only), as token digests with their last use, tied
+to a digest of the key they signed in with, so a restart or update keeps browsers signed in. Because
+every network change applies only when ACN restarts, the restart that applies a regenerated key
+discards every session; one that applies disabled network access refuses every remote caller.
 Failed sign-ins are throttled per remote address: after five, each attempt waits twice as long as
 the last, up to one minute; a success clears the count. With no key configured, nobody can sign in.
 Inference routes require the generated API key as a Bearer token or `x-api-key` from remote callers

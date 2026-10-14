@@ -106,7 +106,7 @@ const warnings: Record<DisconnectWarning, { title: string; description: string; 
   },
   Restart: {
     title: "Restart Magnitude?",
-    description: "This browser will be disconnected while Magnitude restarts, and you’ll need to sign in again.",
+    description: "This browser will be disconnected while Magnitude restarts, then reconnects on its own.",
     confirmLabel: "Restart",
   },
 }
