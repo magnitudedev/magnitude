@@ -25,6 +25,11 @@ Desktop for Caller intent. Handoff admission is distinct from completed installa
 must verify replacement before continuing startup.
 
 One schedule belongs to each owner. Manual checks reset its deadline; resume wakes the same timer.
+A deadline further away than one interval means the wall clock moved back since it was set (a
+skewed clock corrected), so the timer checks at once instead of waiting out the correction. Checks
+are signed with the current time and the server refuses one more than five minutes from its own;
+when a refusal's `Date` header shows that skew, the check fails saying the clock is off, logs the
+same warning, and status shows that failure above any earlier offer.
 Automatic-download preference changes are persisted before they affect transfers. Disabling automatic
 downloads cancels an automatic transfer and waits for scoped scratch cleanup before another transfer
 can begin. A retained prepared update survives owner exit; a recorded failed attempt remains failed

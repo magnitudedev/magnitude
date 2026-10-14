@@ -1,10 +1,17 @@
 import { Clock, Duration, Effect, Queue, Random, Ref } from "effect"
 import type { UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 
+const interval = 3_600_000
+const maxJitter = 60_000
+/** Room for small clock corrections before a far deadline counts as the clock having moved back. */
+const correctionAllowance = 300_000
+
 /**
  * One application-owned timer. Resume only wakes it to re-evaluate the deadline. The first check
  * runs 3 seconds after `start` completes, so an owner can wait until its service is ready before
- * reporting the previous update's outcome.
+ * reporting the previous update's outcome. Deadlines are wall-clock times, so a clock that moves
+ * forward only brings a check sooner; one further away than a whole interval means the clock moved
+ * back since it was set (a skewed clock corrected), and is replaced by an immediate check.
  */
 export const makeUpdateSchedule = <E>(check: (reason: UpdateCheckReason) => Effect.Effect<void, E>, start: Effect.Effect<void> = Effect.void) => Effect.gen(function* () {
   const wakeups = yield* Queue.sliding<void>(1)
@@ -14,14 +21,19 @@ export const makeUpdateSchedule = <E>(check: (reason: UpdateCheckReason) => Effe
   const gate = yield* Effect.makeSemaphore(1)
   const runCheck = (reason: UpdateCheckReason) => Effect.gen(function* () {
     const now = yield* Clock.currentTimeMillis
-    const jitter = yield* Random.nextIntBetween(0, 60_001)
-    yield* Ref.set(deadline, now + 3_600_000 + jitter)
+    const jitter = yield* Random.nextIntBetween(0, maxJitter + 1)
+    yield* Ref.set(deadline, now + interval + jitter)
     yield* Queue.offer(wakeups, undefined)
     yield* check(reason)
   })
   const attempt = gate.withPermits(1)(runCheck("manual"))
   const tick = Effect.gen(function* () {
-    const remaining = (yield* Ref.get(deadline)) - (yield* Clock.currentTimeMillis)
+    const now = yield* Clock.currentTimeMillis
+    const remaining = (yield* Ref.get(deadline)) - now
+    if (remaining > interval + maxJitter + correctionAllowance) {
+      yield* Ref.set(deadline, now)
+      return
+    }
     if (remaining > 0) {
       yield* Effect.race(Effect.sleep(Duration.millis(remaining)), Queue.take(wakeups))
       return

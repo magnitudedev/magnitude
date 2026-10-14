@@ -25,6 +25,8 @@ describe("headless application update output", () => {
     expect(renderApplicationUpdate(state({ _tag: "Idle" }, { _tag: "Idle" }))).toContain("No update check has completed")
     expect(renderApplicationUpdate(state({ _tag: "Idle" }, { _tag: "Failed", message: "Network unavailable" }))).toBe("Network unavailable\n")
     expect(renderApplicationUpdate(state({ _tag: "Unavailable", message: "Install manually" }))).toBe("Install manually\n")
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100, failed: Option.none() }, { _tag: "Failed", message: "Clock is off." })))
+      .toBe("Clock is off.\nMagnitude 2.0.0 is available (100 B).\nDownload: magnitude update download\n")
   })
   it("shows a new check instead of the previous download error without hiding an active download", () => {
     expect(renderApplicationUpdate(state({ _tag: "Failed", message: "Previous transfer failed" }, { _tag: "Checking" })))

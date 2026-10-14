@@ -15,7 +15,8 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
   switch (state.transfer._tag) {
     case "Unavailable": case "Failed": return `${state.transfer.message}\n`
     case "Available": {
-      const offer = `Magnitude ${state.transfer.version} is available (${formatStorageSize(state.transfer.bytes)})`
+      // The offer is from an earlier check; say when the latest one failed rather than presenting it as fresh.
+      const offer = `${state.check._tag === "Failed" ? `${state.check.message}\n` : ""}Magnitude ${state.transfer.version} is available (${formatStorageSize(state.transfer.bytes)})`
       return Option.match(state.transfer.failed, {
         onNone: () => `${offer}.\nDownload: magnitude update download\n`,
         onSome: failed => `${offer}, but it ${failedPhrase[failed]} on this machine, so it is not downloaded automatically.\n`
