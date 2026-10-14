@@ -315,7 +315,8 @@ person's, makes setup refuse before changing anything, and removal never deletes
 step undoes what that run created, so no marker points the CLI at a server that was never enabled;
 re-running setup over a complete or partial setup finishes the remaining steps. When firewalld is running, the root step also opens the server's TCP port 10100 in its default
 zone, at runtime and permanently, and says so; if that fails it prints the `firewall-cmd` command
-instead and setup continues. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
+instead and setup continues. An active ufw that doesn't allow the port is left as it is, and setup
+prints the `ufw allow` command for it. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
 that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
 The desktop app always uses the person's own profile. Every local account reaches the server's
 owner control, as loopback HTTP already admits them, with no group membership or new login: the data
