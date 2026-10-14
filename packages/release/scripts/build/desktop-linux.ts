@@ -7,9 +7,10 @@ import { DesktopBuildFailed } from "./desktop"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
-import { LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
+import { LINUX_GLIBC_MINIMUM, LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
 import { linuxDesktopInstaller } from "../../src/targets"
 import { removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript } from "./linux-maintainer-scripts"
+import { verifyLinuxElfDirectory } from "./linux-elf"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
@@ -39,7 +40,7 @@ const applicationIcon = join(root, "assets/brand/application-icon.png")
 const pacmanHookPath = "usr/share/libalpm/hooks/zz-magnitude-desktop.hook"
 const pacmanBeginScriptPath = `usr/share/libalpm/scripts/${LINUX_DESKTOP_PACKAGE_NAME}-installation-begin`
 // Libraries the payload links against, plus flock, pkexec, xdg-open and the updater's bsdtar.
-const pacmanDepends = ["alsa-lib", "at-spi2-core", "cairo", "dbus", "expat", "glib2", "glibc", "gtk3", "libarchive", "libcups",
+const pacmanDepends = ["alsa-lib", "at-spi2-core", "cairo", "dbus", "expat", "glib2", `glibc>=${LINUX_GLIBC_MINIMUM}`, "gtk3", "libarchive", "libcups",
   "libgcc", "libnotify", "libsecret", "libx11", "libxcb", "libxcomposite", "libxdamage", "libxext", "libxfixes", "libxkbcommon",
   "libxrandr", "mesa", "nspr", "nss", "pango", "polkit", "systemd-libs", "util-linux", "xdg-utils"]
 
@@ -240,8 +241,8 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
     version: linuxPackageVersion(options.format, options.version),
   } as const
   yield* fs.writeFileString(config, options.format === "deb"
-    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, compression: "none", depends: ["libc6 (>= 2.35)", "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
-    : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: ["glibc >= 2.35", "alsa-lib", "util-linux", "polkit"], license: "Apache-2.0", specTemplate } }))
+    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, compression: "none", depends: [`libc6 (>= ${LINUX_GLIBC_MINIMUM})`, "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
+    : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: [`glibc >= ${LINUX_GLIBC_MINIMUM}`, "alsa-lib", "util-linux", "polkit"], license: "Apache-2.0", specTemplate } }))
   const destination = join(stage, "packages")
   const tool = options.format === "deb" ? "electron-installer-debian" : "electron-installer-redhat"
   const cli = join(dirname(fileURLToPath(import.meta.resolve(tool))), "cli.js")
@@ -345,6 +346,8 @@ export const buildLinuxDesktopInstaller = (options: LinuxInstallerOptions) => Ef
   const stage = yield* fs.makeTempDirectoryScoped({ prefix: `magnitude-desktop-${options.format}-` })
   const payload = join(stage, "application")
   yield* fs.copy(resolve(options.app), payload)
+  // The package's glibc floor holds only while no payload binary needs a newer symbol version.
+  yield* Effect.tryPromise(() => verifyLinuxElfDirectory(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", payload))
   yield* fs.writeFileString(join(payload, "resources/update-package.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ format: LinuxPackageFormat })))({ format: options.format }))
   yield* fs.copyFile(join(root, "packages/release/resources/linux/launch.sh"), join(payload, "launch"))
   yield* fs.chmod(join(payload, "launch"), 0o755)

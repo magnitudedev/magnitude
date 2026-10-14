@@ -72,15 +72,16 @@ backend packs and no accelerator modules.
 
 ## GNU Linux contract
 
-Both `linux-x64-gnu` and `linux-arm64-gnu` target Ubuntu 22.04-compatible userspace.
+Both `linux-x64-gnu` and `linux-arm64-gnu` target Ubuntu 22.04-compatible userspace, and also RHEL 9
+(glibc 2.34, libstdc++ from GCC 11). Every Linux package declares glibc 2.34 as its minimum.
 
 | Property | x64 | arm64 |
 | --- | --- | --- |
 | ELF class | ELF64 | ELF64 |
 | Machine | x86-64 | AArch64 |
 | Interpreter | `/lib64/ld-linux-x86-64.so.2` | `/lib/ld-linux-aarch64.so.1` |
-| Maximum glibc requirement | `GLIBC_2.35` | `GLIBC_2.35` |
-| Maximum libstdc++ requirement | `GLIBCXX_3.4.30` | `GLIBCXX_3.4.30` |
+| Maximum glibc requirement | `GLIBC_2.34` | `GLIBC_2.34` |
+| Maximum libstdc++ requirement | `GLIBCXX_3.4.29` | `GLIBCXX_3.4.29` |
 
 Linux artifacts may dynamically require their architecture's interpreter listed above and only
 these platform libraries:
