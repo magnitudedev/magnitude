@@ -86,7 +86,7 @@ export function useSignInRecheck(): Effect.Effect<boolean> {
     : Effect.succeed(false), [access])
 }
 
-export type DisconnectWarning = "TurnOffNetworkAccess" | "RegenerateKey" | "ChangeAddress" | "Restart"
+export type DisconnectWarning = "TurnOffNetworkAccess" | "RegenerateKey" | "StopRequiringKey" | "ChangeAddress" | "Restart"
 
 const warnings: Record<DisconnectWarning, { title: string; description: string; confirmLabel: string }> = {
   TurnOffNetworkAccess: {
@@ -98,6 +98,11 @@ const warnings: Record<DisconnectWarning, { title: string; description: string; 
     title: "Regenerate the key?",
     description: "When Magnitude restarts, the current key stops working. This browser will be signed out, and you’ll need the new key to sign in again.",
     confirmLabel: "Regenerate",
+  },
+  StopRequiringKey: {
+    title: "Stop requiring the key?",
+    description: "When Magnitude restarts, any device that can reach this computer can use it for inference without a key. Only do this on a network you trust. This browser still needs the key to sign in.",
+    confirmLabel: "Stop requiring",
   },
   ChangeAddress: {
     title: "Change the address?",

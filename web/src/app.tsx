@@ -703,20 +703,23 @@ function ModelStorageRow() {
       </>} />
   </>
 }
+function useRestartPending() {
+  const client = useAgentClient()
+  const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
+  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
+  const storageValue = Result.isSuccess(storage) ? storage.value : null
+  return { storageValue, storagePending: storageValue !== null && storageValue.path !== storageValue.active, networkPending: Result.isSuccess(network) && network.value.pending }
+}
 function RestartRequiredToast() {
   const session = useSession()
   const client = useAgentClient()
   const platform = useServerPlatform()
-  const storage = useAtomValue(client.Configuration.GetModelStorage({})).result
-  const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
+  const { storageValue, storagePending, networkPending } = useRestartPending()
   const { supports } = useApplicationOwner()
   const restartApplication = useAtomSet(client.Application.RestartApplication)
   const disconnect = useDisconnectWarning()
   const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
   const relaunching = useAtomValue(client.Application.RestartApplication)
-  const storageValue = Result.isSuccess(storage) ? storage.value : null
-  const storagePending = storageValue !== null && storageValue.path !== storageValue.active
-  const networkPending = Result.isSuccess(network) && network.value.pending
   if (!storagePending && !networkPending) return null
   const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
     : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
@@ -756,12 +759,12 @@ function NetworkAccessRows() {
     {current?.enabled && <>
       <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
         control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
-          value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>(value === ALL_INTERFACES || value === null ? { _tag: "AllInterfaces" } : { _tag: "Address", address: String(value) }) }))}>
+          value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => value === ALL_INTERFACES || value === null ? update({ bind: Option.some<NetworkBind>({ _tag: "AllInterfaces" }) }) : disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>({ _tag: "Address", address: String(value) }) }))}>
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
           <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
       <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
-        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}>Regenerate</Button><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => update({ requireApiKey: Option.some(checked) })} /></>}>
+        control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}>Regenerate</Button><span className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400"><span aria-hidden="true">Require</span><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => checked ? update({ requireApiKey: Option.some(true) }) : disconnect.warn("StopRequiringKey", () => update({ requireApiKey: Option.some(false) }))} /></span></>}>
         {Option.isSome(current.apiKey) && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey.value} label="Copy API key" /></div>}
       </SettingsRow>
       {reachable && <SettingsRow nested label="Reachable at" hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
@@ -856,11 +859,13 @@ function SettingsPage() {
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
   const { remote } = useRemoteAccess()
+  const { storagePending, networkPending } = useRestartPending()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({}))], { discard: true })), [client]))
   return <>
     <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
     {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
+    {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
   </>
 }
 export function App() {
