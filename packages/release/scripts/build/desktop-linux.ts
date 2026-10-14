@@ -7,9 +7,10 @@ import { DesktopBuildFailed } from "./desktop"
 import { LINUX_DESKTOP_PACKAGE_NAME } from "../../src/executables"
 import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
-import { LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
+import { LINUX_GLIBC_MINIMUM, LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
 import { linuxDesktopInstaller } from "../../src/targets"
-import { removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript } from "./linux-maintainer-scripts"
+import { reloadSystemd, removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript, restoreServerGrant } from "./linux-maintainer-scripts"
+import { verifyLinuxElfDirectory } from "./linux-elf"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../../../..")
@@ -39,9 +40,19 @@ const applicationIcon = join(root, "assets/brand/application-icon.png")
 const pacmanHookPath = "usr/share/libalpm/hooks/zz-magnitude-desktop.hook"
 const pacmanBeginScriptPath = `usr/share/libalpm/scripts/${LINUX_DESKTOP_PACKAGE_NAME}-installation-begin`
 // Libraries the payload links against, plus flock, pkexec, xdg-open and the updater's bsdtar.
-const pacmanDepends = ["alsa-lib", "at-spi2-core", "cairo", "dbus", "expat", "glib2", "glibc", "gtk3", "libarchive", "libcups",
+const pacmanDepends = ["alsa-lib", "at-spi2-core", "cairo", "dbus", "expat", "glib2", `glibc>=${LINUX_GLIBC_MINIMUM}`, "gtk3", "libarchive", "libcups",
   "libgcc", "libnotify", "libsecret", "libx11", "libxcb", "libxcomposite", "libxdamage", "libxext", "libxfixes", "libxkbcommon",
   "libxrandr", "mesa", "nspr", "nss", "pango", "polkit", "systemd-libs", "util-linux", "xdg-utils"]
+
+const electronTrashHelpers = "kde-cli-tools | kde-runtime | trash-cli | libglib2.0-bin | gvfs"
+
+/**
+ * Electron's installer lists KDE's trash helper first among equivalent alternatives, and apt installs
+ * the first one, pulling a KDE stack onto headless servers. GLib's `gio` is the lightest, so it goes first.
+ */
+export const preferLightTrashHelper = (control: string) => control.includes(`, ${electronTrashHelpers}`)
+  ? Effect.succeed(control.replace(`, ${electronTrashHelpers}`, ", libglib2.0-bin | gvfs | trash-cli | kde-cli-tools | kde-runtime"))
+  : Effect.fail(new DesktopBuildFailed({ message: "Debian package metadata no longer lists Electron's trash helpers as expected" }))
 
 /** Directory modes are explicit so the builder's umask never reaches the package. */
 const installLinuxSystemFiles = (tree: string) => Effect.gen(function* () {
@@ -225,6 +236,7 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
   const specTemplate = join(stage, "desktop.spec.ejs")
   const spec = yield* fs.readFileString(join(root, "packages/release/resources/linux/desktop.spec.ejs"))
   yield* fs.writeFileString(specTemplate, spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end).replaceAll("@MAGNITUDE_REMOVE_SERVER_GRANT@", removeServerGrant)
+    .replaceAll("@MAGNITUDE_RESTORE_SERVER_GRANT@", restoreServerGrant).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd)
     .replaceAll("@MAGNITUDE_SYSTEM_INSTALL@", linuxSystemFiles.map(file => `install -D -m ${file.mode.toString(8).padStart(4, "0")} '${file.source}' '%{buildroot}/${file.path}'`).join("\n"))
     .replaceAll("@MAGNITUDE_SYSTEM_FILES@", linuxSystemFiles.map(file => `%attr(${file.mode.toString(8).padStart(4, "0")},root,root) /${file.path}`).join("\n")))
   const desktopTemplate = join(stage, "magnitude.desktop.ejs")
@@ -240,8 +252,8 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
     version: linuxPackageVersion(options.format, options.version),
   } as const
   yield* fs.writeFileString(config, options.format === "deb"
-    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, compression: "none", depends: ["libc6 (>= 2.35)", "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
-    : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: ["glibc >= 2.35", "alsa-lib", "util-linux", "polkit"], license: "Apache-2.0", specTemplate } }))
+    ? yield* Schema.encode(Schema.parseJson(DebianOptions))({ options: { ...metadata, compression: "none", depends: [`libc6 (>= ${LINUX_GLIBC_MINIMUM})`, "libasound2t64 | libasound2", "util-linux", "pkexec"], scripts } })
+    : yield* Schema.encode(Schema.parseJson(RpmOptions))({ options: { ...metadata, requires: [`glibc >= ${LINUX_GLIBC_MINIMUM}`, "alsa-lib", "util-linux", "polkit"], license: "Apache-2.0", specTemplate } }))
   const destination = join(stage, "packages")
   const tool = options.format === "deb" ? "electron-installer-debian" : "electron-installer-redhat"
   const cli = join(dirname(fileURLToPath(import.meta.resolve(tool))), "cli.js")
@@ -265,6 +277,8 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
     const contents = join(stage, "debian-contents")
     const extracted = yield* Command.make("dpkg-deb", "--raw-extract", candidate, contents).pipe(Command.exitCode)
     if (extracted !== 0) return yield* new DesktopBuildFailed({ message: "Could not prepare the bundled CLI package entry" })
+    const control = join(contents, "DEBIAN/control")
+    yield* fs.writeFileString(control, yield* preferLightTrashHelper(yield* fs.readFileString(control)))
     yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/resources/magnitude`, join(contents, "usr/bin/magnitude"))
     yield* installLinuxSystemFiles(contents)
     // Copied Electron directories can retain the builder's group-writable mode.
@@ -345,6 +359,8 @@ export const buildLinuxDesktopInstaller = (options: LinuxInstallerOptions) => Ef
   const stage = yield* fs.makeTempDirectoryScoped({ prefix: `magnitude-desktop-${options.format}-` })
   const payload = join(stage, "application")
   yield* fs.copy(resolve(options.app), payload)
+  // The package's glibc floor holds only while no payload binary needs a newer symbol version.
+  yield* Effect.tryPromise(() => verifyLinuxElfDirectory(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", payload))
   yield* fs.writeFileString(join(payload, "resources/update-package.json"), yield* Schema.encode(Schema.parseJson(Schema.Struct({ format: LinuxPackageFormat })))({ format: options.format }))
   yield* fs.copyFile(join(root, "packages/release/resources/linux/launch.sh"), join(payload, "launch"))
   yield* fs.chmod(join(payload, "launch"), 0o755)

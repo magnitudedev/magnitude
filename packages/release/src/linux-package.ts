@@ -1,5 +1,12 @@
 import { Schema } from "effect"
 
+/**
+ * Newest glibc and libstdc++ symbol versions any shipped Linux binary may require, so RHEL 9
+ * (glibc 2.34, GLIBCXX_3.4.29) runs them. Every package declares the glibc version as its floor.
+ */
+export const LINUX_GLIBC_MINIMUM = "2.34"
+export const LINUX_GLIBCXX_MAXIMUM = "3.4.29"
+
 export const LinuxPackageFormat = Schema.Literal("deb", "rpm", "pacman")
 export type LinuxPackageFormat = typeof LinuxPackageFormat.Type
 export type LinuxPackageArch = "arm64" | "x64"

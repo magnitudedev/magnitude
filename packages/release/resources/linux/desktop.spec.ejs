@@ -40,7 +40,7 @@ set -eu
 
 %post
 set -eu
-@MAGNITUDE_INSTALL_END@
+@MAGNITUDE_RESTORE_SERVER_GRANT@@MAGNITUDE_RELOAD_SYSTEMD@@MAGNITUDE_INSTALL_END@
 
 %preun
 set -eu
@@ -50,11 +50,16 @@ if ! (
 ); then
   # DNF can remove automatic dependencies even when this package's removal fails.
   touch /var/lib/magnitude-desktop/installing
-  echo 'Package removal was interrupted. Quit Magnitude, then reinstall its package before starting it again.' >&2
+  # The refusal above already said why; this only says what the retained gate means.
+  if systemctl is-active --quiet magnitude.service 2>/dev/null; then
+    echo 'Magnitude was not removed, and its server keeps running. DNF may still remove packages it depends on in this transaction, so before the server starts again, reinstall its package (run the install script again, or `sudo dnf reinstall magnitude-desktop`).' >&2
+  else
+    echo 'Magnitude was not removed. DNF may still remove packages it depends on in this transaction, so before starting Magnitude again, reinstall its package (run the install script again, or `sudo dnf reinstall magnitude-desktop`).' >&2
+  fi
   exit 1
 fi
 
 %postun
 set -eu
 [ "$1" -eq 0 ] || exit 0
-@MAGNITUDE_REMOVE_SERVER_GRANT@@MAGNITUDE_INSTALL_END@
+@MAGNITUDE_REMOVE_SERVER_GRANT@@MAGNITUDE_RELOAD_SYSTEMD@@MAGNITUDE_INSTALL_END@

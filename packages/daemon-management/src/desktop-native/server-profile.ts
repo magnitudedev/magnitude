@@ -13,8 +13,8 @@ export const SERVER_MARKER_CONTENT = "Magnitude runs as the system service on th
 /**
  * Lets only the service account run the installed update helper as root, with the exact arguments the
  * service passes: sudo-rs (the default sudo from Ubuntu 25.10) refuses rules with argument wildcards.
- * Setup writes it once that system account exists, and removal (or removing the package) deletes it;
- * no package ships it.
+ * Setup writes it once that system account exists, package installation writes it again for that account,
+ * and removal (or removing the package) deletes it; no package ships it.
  */
 export const SERVER_SUDOERS_PATH = "/etc/sudoers.d/magnitude"
 export const SERVER_SUDOERS_RULE = `# Lets the Magnitude server service install verified Magnitude updates. Written by \`magnitude server setup\`.

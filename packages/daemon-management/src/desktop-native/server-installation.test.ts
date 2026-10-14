@@ -6,7 +6,7 @@ import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { classifyServerAccounts, hasLinuxServerRemnants, installLinuxServer, installMacServer, macServerPlist, parseServerInstallation, removeLinuxServer, requireInstalledRoot,
+import { classifyServerAccounts, hasLinuxServerRemnants, installLinuxServer, installMacServer, macServerPlist, parseServerInstallation, removeLinuxServer, requireInstalledRoot, restoreLinuxServerGrant,
   systemIdRange } from "./server-installation"
 import { SERVER_SUDOERS_RULE } from "./server-profile"
 
@@ -18,6 +18,7 @@ describe("hidden root command grammar", () => {
   it("accepts exactly the user that ran sudo, or removal without arguments", async () => {
     expect(await parse(["_server-install", "ada"])).toEqual(Either.right({ _tag: "Install", user: Option.some({ name: "ada", uid: 1000 }) }))
     expect(await parse(["_server-remove"])).toEqual(Either.right({ _tag: "Remove" }))
+    expect(await parse(["_server-restore-grant"], {})).toEqual(Either.right({ _tag: "RestoreGrant" }))
   })
   it.each([
     ["an extra argument", ["_server-install", "ada", "extra"]],
@@ -25,6 +26,7 @@ describe("hidden root command grammar", () => {
     ["an option after the user", ["_server-install", "ada", "--force"]],
     ["a leading program option", ["-v", "_server-install", "ada"]],
     ["arguments to removal", ["_server-remove", "ada"]],
+    ["arguments to the grant restoration", ["_server-restore-grant", "ada"]],
     ["another user", ["_server-install", "grace"]],
     ["root", ["_server-install", "root"]],
     ["the service account", ["_server-install", "magnitude"]],
@@ -54,11 +56,12 @@ describe("hidden root command grammar", () => {
 describe("root step admission", () => {
   afterEach(() => vi.restoreAllMocks())
   const fs = (real: string) => FileSystem.makeNoop({ realPath: () => Effect.succeed(real) })
-  const admit = (platform: string, real: string) => Effect.runPromise(Effect.either(requireInstalledRoot(platform, "/usr/bin/magnitude").pipe(
+  const admit = (platform: string, real: string) => Effect.runPromise(Effect.either(requireInstalledRoot(platform, "/usr/bin/magnitude", "magnitude server remove").pipe(
     Effect.provideService(FileSystem.FileSystem, fs(real)))))
   it("refuses an unprivileged caller", async () => {
     vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(1000)
-    expect(Either.isLeft(await admit("linux", "/usr/lib/magnitude-desktop/resources/magnitude"))).toBe(true)
+    const refused = await admit("linux", "/usr/lib/magnitude-desktop/resources/magnitude")
+    expect(Either.isLeft(refused) && refused.left.message).toContain("Run `magnitude server remove`")
   })
   it("refuses a copy outside the installed path, and Windows", async () => {
     vi.spyOn(process as { getuid: () => number }, "getuid").mockReturnValue(0)
@@ -144,7 +147,9 @@ describe("Linux root step", () => {
     ])
     const fs = FileSystem.makeNoop({
       exists: path => Effect.succeed(files.has(path)),
-      stat: path => Effect.succeed({ type: files.get(path)!.type, uid: Option.some(files.get(path)!.uid), mode: 0 } as FileSystem.File.Info),
+      stat: path => files.has(path)
+        ? Effect.succeed({ type: files.get(path)!.type, uid: Option.some(files.get(path)!.uid), mode: 0 } as FileSystem.File.Info)
+        : Effect.fail(new SystemError({ reason: "NotFound", module: "FileSystem", method: "stat", pathOrDescriptor: path })),
       realPath: path => Effect.succeed(path),
       readFileString: path => path === "/etc/login.defs" ? Effect.succeed(debianDefinitions) : Effect.die(path),
       makeDirectory: path => Effect.sync(() => { files.set(path, { type: "Directory", uid: 0 }); written.push(`mkdir ${path}`) }),
@@ -292,6 +297,23 @@ describe("Linux root step", () => {
     const m = machine()
     expect(Either.isRight(await m.run(removeLinuxServer))).toBe(true)
     expect(m.changes()).toEqual(["/usr/bin/systemctl disable --now magnitude.service"])
+    expect(m.written).toEqual([])
+  })
+  it("restores the validated sudoers rule for a configured server after package reinstallation", async () => {
+    const m = machine({ setUp: true })
+    m.files.delete("/etc/sudoers.d/magnitude")
+    expect(Either.isRight(await m.run(restoreLinuxServerGrant))).toBe(true)
+    expect(m.changes()).toEqual(["/usr/sbin/visudo -cf /etc/sudoers.d/<tmp>"])
+    expect(m.written).toEqual(["write 440 /etc/sudoers.d/<tmp>", "chown 0:0 /etc/sudoers.d/<tmp>", "chmod 440 /etc/sudoers.d/<tmp>", "rename /etc/sudoers.d/magnitude"])
+  })
+  it.each([
+    ["a machine without a server", {}],
+    ["the system account without the marker", { accounts: ours }],
+    ["a person's account named magnitude, even with the marker", { setUp: true, accounts: human }],
+  ] as const)("grants nothing to %s", async (_, options) => {
+    const m = machine(options)
+    expect(Either.isRight(await m.run(restoreLinuxServerGrant))).toBe(true)
+    expect(m.changes()).toEqual([])
     expect(m.written).toEqual([])
   })
   it("finds a partial setup's remnants without the marker", async () => {
