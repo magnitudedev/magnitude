@@ -1,6 +1,7 @@
 import { createServer } from "node:net"
 import { Effect, Option } from "effect"
 import { OwnedChildSpawner, OwnedChildSpawnFailed } from "./owned-child"
+import { MAC_SERVER_LABEL } from "./server-profile"
 
 const errorCode = (error: unknown) =>
   typeof error === "object" && error !== null && "code" in error && typeof error.code === "string" ? Option.some(error.code) : Option.none()
@@ -13,9 +14,15 @@ const servedByMagnitude = (port: number) => Effect.tryPromise(signal =>
   Effect.map(body => typeof body === "object" && body !== null && "service" in body && body.service === "magnitude-acn"),
   Effect.timeout("2 seconds"), Effect.orElseSucceed(() => false))
 
-const occupiedMessage = (port: number, magnitude: boolean) => magnitude
-  ? `Another Magnitude server is already running on this computer on port ${port}, for example for another account or under a service such as NSSM. `
-    + "Stop it (for an NSSM service, run `nssm stop Magnitude` as an administrator), then retry."
+/** Where another Magnitude server on this computer usually comes from, and how its owner stops it, per platform. */
+const otherMagnitude = (platform: NodeJS.Platform) => platform === "win32"
+  ? "for example for another account or under a service such as NSSM. Stop it (for an NSSM service, run `nssm stop Magnitude` as an administrator), then retry."
+  : platform === "darwin"
+    ? `run by another account or as the Magnitude server (the ${MAC_SERVER_LABEL} LaunchDaemon). Ask the account that runs it to quit Magnitude, or to remove the server with \`magnitude server remove\`, then retry.`
+    : "run by another account or as the Magnitude server. Stop the server with `sudo systemctl stop magnitude`, or ask the account that runs Magnitude to quit it, then retry."
+
+export const occupiedMessage = (port: number, magnitude: boolean, platform: NodeJS.Platform = process.platform) => magnitude
+  ? `Another Magnitude server is already running on this computer on port ${port}, ${otherMagnitude(platform)}`
   : `Port ${port} is already in use by another program. Stop it, then retry. If upgrading Magnitude, quit the old app and disable its service startup first.`
 
 /** A diagnostic preflight, not ownership: the service's own bind remains authoritative. */
