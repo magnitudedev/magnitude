@@ -125,6 +125,8 @@ struct CatalogModel {
 struct CatalogVariant {
     variant_id: String,
     format: String,
+    #[serde(default)]
+    path: Option<PathBuf>,
     variant_label: String,
     fidelity_rank: u32,
     quantization_aware: bool,
@@ -299,6 +301,10 @@ fn catalog_source() -> Result<CatalogSource, InventoryError> {
                 !valid_variant_id(&variant.variant_id)
                     || variant.format.is_empty()
                     || variant.format.trim() != variant.format.as_str()
+                    || variant
+                        .path
+                        .as_ref()
+                        .is_some_and(|path| path.as_os_str().is_empty())
                     || variant.variant_label.is_empty()
                     || variant.variant_label.trim() != variant.variant_label.as_str()
                     || variant.variant_label.contains('(')
@@ -1483,7 +1489,10 @@ impl ResolvingRecommendableCatalog {
                 declaration.repository
             ))
         })?;
-        let primary = select_primary_gguf(snapshot, &variant.format)?;
+        let primary = match &variant.path {
+            Some(path) => declared_primary_gguf(snapshot, path)?,
+            None => select_primary_gguf(snapshot, &variant.format)?,
+        };
         let projector = resolve_projector_path(declaration, snapshot)?;
         let additional_components = projector
             .map(|path| ModelPreviewComponentSource {
@@ -1664,6 +1673,29 @@ fn select_primary_gguf<'a>(
             matches.len()
         ))),
     }
+}
+
+/// A declared primary GGUF: an exact repository file that is unsharded or a first shard.
+fn declared_primary_gguf<'a>(
+    snapshot: &'a HuggingFaceRepositorySnapshot,
+    path: &Path,
+) -> Result<&'a HuggingFaceRepositoryFile, InventoryError> {
+    let basename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    snapshot
+        .gguf_files
+        .iter()
+        .find(|file| file.path == path)
+        .filter(|_| !is_projector_path(path) && !is_later_shard(basename))
+        .ok_or_else(|| {
+            InventoryError::Integrity(format!(
+                "{} declared primary {} is not a repository GGUF or first shard",
+                snapshot.repository,
+                path.display()
+            ))
+        })
 }
 
 fn merge_content_map(
@@ -2412,5 +2444,28 @@ mod tests {
         );
         assert!(select_primary_gguf(&snapshot, "Q6_K").is_err());
         assert!(select_primary_gguf(&snapshot, "UD-Q").is_err());
+    }
+
+    #[test]
+    fn declared_primary_gguf_is_an_exact_repository_file_or_first_shard() {
+        let snapshot = repository_snapshot(&[
+            "Q8_0/Model-Q8_0-00001-of-00002.gguf",
+            "Q8_0/Model-Q8_0-00002-of-00002.gguf",
+            "MTP/mtp-Model-Q8_0.gguf",
+            "mmproj-BF16.gguf",
+        ]);
+        assert!(select_primary_gguf(&snapshot, "Q8_0").is_err());
+        assert_eq!(
+            declared_primary_gguf(&snapshot, Path::new("Q8_0/Model-Q8_0-00001-of-00002.gguf"))
+                .unwrap()
+                .path,
+            Path::new("Q8_0/Model-Q8_0-00001-of-00002.gguf")
+        );
+        assert!(
+            declared_primary_gguf(&snapshot, Path::new("Q8_0/Model-Q8_0-00002-of-00002.gguf"))
+                .is_err()
+        );
+        assert!(declared_primary_gguf(&snapshot, Path::new("mmproj-BF16.gguf")).is_err());
+        assert!(declared_primary_gguf(&snapshot, Path::new("Q8_0/Missing.gguf")).is_err());
     }
 }

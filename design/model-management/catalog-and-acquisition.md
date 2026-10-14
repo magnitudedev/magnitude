@@ -45,7 +45,8 @@ Catalog attribution across exact artifact or drafter changes follows
 
 The release catalog is immutable release data. Human-reviewed declarations identify each artifact
 variant by its stable format-qualified variant ID, exact upstream format selector, short variant label, fidelity rank, and
-quantization-aware-training fact. Each model declaration records the calendar date on which the
+quantization-aware-training fact. The format selector must match exactly one primary GGUF; a variant whose repository
+holds other files carrying the same format declares its exact primary path instead. Each model declaration records the calendar date on which the
 represented upstream model or material named revision was first publicly released. Artifact
 conversions, quantizations, quantization-aware packaging, and provider publication do not change
 that date; every artifact variant inherits the model declaration's date. Each entry publishes one exact default

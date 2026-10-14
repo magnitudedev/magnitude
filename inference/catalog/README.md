@@ -9,6 +9,10 @@ projector during generation: a sole repository `mmproj` is selected automaticall
 repositories with multiple candidates require an exact `projector.path` declaration. The
 projector is locked as a related component of the target package.
 
+Each variant's primary GGUF is the one file (or first shard) whose path contains its `format`.
+When other repository files also contain that format, such as MTP heads, the variant declares its
+exact `path` instead.
+
 A catalog entry declares no context length. Its serving profile is the target's supported maximum
 context from its GGUF metadata, which is the context the engine resolves, serves and assesses.
 
