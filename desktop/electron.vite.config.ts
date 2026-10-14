@@ -54,7 +54,7 @@ export default defineConfig({
       "process.env.WS_NO_BUFFER_UTIL": "true",
       "process.env.WS_NO_UTF_8_VALIDATE": "true",
       __MAGNITUDE_UPDATE_CONFIGURATION__: JSON.stringify(updateConfiguration),
-      __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig)),
+      __MAGNITUDE_UPDATE_ACCEPTANCE__: JSON.stringify(Boolean(acceptanceConfig) && process.env.MAGNITUDE_ACCEPTANCE_STANDARD_PROFILE !== "true"),
       MAGNITUDE_APPLE_TEAM_ID: JSON.stringify(Option.getOrElse(distribution.appleTeam, () => "")),
     },
     plugins: [bundledRuntime(), { name: "harness-skill-text", load(id) { if (id.endsWith(".md")) return `export default ${JSON.stringify(readFileSync(id, "utf8"))}` } }, {
