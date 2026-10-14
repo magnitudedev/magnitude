@@ -876,6 +876,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: acnStartupFailureDetail(cause),
+        permanent: Option.exists(Cause.failureOption(cause), failure => failure instanceof ReleaseIcnInstallationError && failure.permanent),
       }).pipe(Effect.zipRight(logStartupFailure(cause)))),
     )
     const started = yield* Effect.raceFirst(

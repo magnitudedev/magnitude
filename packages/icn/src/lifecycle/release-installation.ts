@@ -30,6 +30,7 @@ export class ReleaseIcnInstallationError extends Data.TaggedError(
 )<{
   readonly stage: "acquire" | "probe" | "declare" | "verify"
   readonly message: string
+  readonly permanent: boolean
 }> {}
 
 export interface ReleaseIcnInstallation {
@@ -40,8 +41,9 @@ export interface ReleaseIcnInstallation {
 
 const installationError = (
   stage: ReleaseIcnInstallationError["stage"],
-  message: string
-) => new ReleaseIcnInstallationError({ stage, message })
+  message: string,
+  permanent = false
+) => new ReleaseIcnInstallationError({ stage, message, permanent })
 
 /**
  * A failed download is the person's network or the release host, not something in Magnitude to
@@ -54,7 +56,8 @@ export const acquisitionError = (baseUrl: string) => (cause: ReleaseAcquisitionE
   const advice = /^HTTP (404|410)$/.test(detail) ? "This release isn't available for download. Update Magnitude, or try again later."
     : cause.transient ? "Check your internet connection and try again."
     : "The release host refused the download. Try again later."
-  return installationError("acquire", `Magnitude couldn't download its inference engine (${detail}${host}). ${advice}`)
+  // The download already retried what was transient; what remains won't change on a restart.
+  return installationError("acquire", `Magnitude couldn't download its inference engine (${detail}${host}). ${advice}`, !cause.transient)
 }
 
 const executableName = () =>

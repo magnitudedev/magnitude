@@ -21,6 +21,10 @@ export class ServiceChildExited extends Schema.TaggedError<ServiceChildExited>()
 export class ServiceChildProtocolFailed extends Schema.TaggedError<ServiceChildProtocolFailed>()("ServiceChildProtocolFailed", {
   message: Schema.String,
 }) {}
+/** The service stopped for a reason starting it again cannot fix, so it is not restarted. */
+export class ServiceStartupRefused extends Schema.TaggedError<ServiceStartupRefused>()("ServiceStartupRefused", {
+  message: Schema.String,
+}) {}
 export class ServiceStartupTimedOut extends Schema.TaggedError<ServiceStartupTimedOut>()("ServiceStartupTimedOut", {}) {
   override get message() { return "Service startup timed out" }
 }
@@ -59,6 +63,7 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
     const instance = yield* Ref.make(Option.none<string>())
     const ready = yield* Deferred.make<void>()
     const stoppingDetail = yield* Ref.make(Option.none<string>())
+    const permanentFailure = yield* Ref.make(false)
     const observe = child.events.pipe(Stream.runForEach(event => Effect.gen(function* () {
       if (event._tag === "Booted") {
         if (event.pid !== child.identity.pid || (yield* Ref.get(admitted))) {
@@ -99,7 +104,9 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
         // Retain the observed result before acknowledgement permits child exit.
         yield* Ref.set(stoppingDetail, Option.some(message))
         yield* child.send({ _tag: "StoppingObserved" }).pipe(Effect.ignore)
-        return yield* new ServiceChildProtocolFailed({ message })
+        const permanent = Option.getOrElse(stopping.permanent, () => false)
+        yield* Ref.set(permanentFailure, permanent)
+        return yield* permanent ? new ServiceStartupRefused({ message }) : new ServiceChildProtocolFailed({ message })
       } else if (health.state._tag === "Starting") {
         yield* change(state => state._tag === "Starting" ? machine.hold(state, { attempt: number, health: Option.some(health) }) : state)
       }
@@ -111,7 +118,8 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
     return yield* Effect.raceFirst(observe, Effect.raceFirst(
       child.exit.pipe(Effect.flatMap(code => Effect.gen(function* () {
         const detail = yield* Ref.get(stoppingDetail)
-        if (Option.isSome(detail)) return yield* new ServiceChildProtocolFailed({ message: detail.value })
+        if (Option.isSome(detail)) return yield* (yield* Ref.get(permanentFailure))
+          ? new ServiceStartupRefused({ message: detail.value }) : new ServiceChildProtocolFailed({ message: detail.value })
         return yield* new ServiceChildExited({ code, diagnostic: yield* child.diagnosticTail })
       }))),
       startupDeadline,
@@ -134,7 +142,8 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
       const now = yield* Clock.currentTimeMillis
       const lastReady = yield* Ref.get(readyAt)
       if (Option.isSome(lastReady) && now - lastReady.value >= 30_000) failures = 0
-      if (failures >= 3) {
+      const refused = Exit.isFailure(result) && Option.exists(Cause.failureOption(result.cause), failure => failure instanceof ServiceStartupRefused)
+      if (failures >= 3 || refused) {
         const failure = Exit.isFailure(result) ? Cause.failureOption(result.cause) : Option.none()
         // An expected failure's message is the Failed state's; only a defect needs its cause logged.
         if (Exit.isFailure(result) && Option.isNone(failure)) yield* Effect.logError(result.cause)

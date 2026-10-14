@@ -22,6 +22,7 @@ export type AcnRpcApplication = Effect.Effect<
 export interface AcnStopRequest {
   readonly reason: AcnStoppingReason
   readonly detail?: string
+  readonly permanent?: boolean
 }
 
 interface AcnRuntimeState {
@@ -84,6 +85,7 @@ export const makeAcnServiceLifecycle = (): Effect.Effect<AcnServiceLifecycleApi,
           safeDetail: Option.fromNullable(request.detail).pipe(
             Option.filter((detail) => detail.length > 0),
           ),
+          permanent: request.permanent ? Option.some(true) : Option.none(),
         },
       )
       yield* replaceState({

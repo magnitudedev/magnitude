@@ -148,4 +148,18 @@ describe("desktop-owned service supervision", () => {
     yield* f.service.shutdown
   })))
 
+  it("does not restart a service that stopped for a reason a restart cannot fix", async () => run(Effect.gen(function* () {
+    const f = yield* setup
+    yield* Queue.offer(f.events, { _tag: "Booted", pid: 42 })
+    yield* Queue.offer(f.events, { _tag: "Health", health: Schema.decodeUnknownSync(MagnitudeHealthResponseSchema)({
+      ...health, state: { _tag: "Stopping", reason: "startup-failed", safeDetail: "Magnitude couldn't download its inference engine (HTTP 404).", permanent: true },
+    }) })
+    yield* TestClock.adjust("1 minute")
+    const state = yield* f.service.state
+    expect(state._tag).toBe("Failed")
+    if (state._tag === "Failed") expect(state.message).toBe("Magnitude couldn't download its inference engine (HTTP 404).")
+    expect(yield* Ref.get(f.launches)).toBe(1)
+    yield* f.service.shutdown
+  })))
+
 })

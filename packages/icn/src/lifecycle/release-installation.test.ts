@@ -22,6 +22,8 @@ it("says plainly that the inference engine couldn't be downloaded, from where, a
     .toBe("Magnitude couldn't download its inference engine (HTTP 403 from releases.magnitude.dev). The release host refused the download. Try again later.")
   expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release request failed", transient: true })).message)
     .toBe("Magnitude couldn't download its inference engine (request failed from releases.magnitude.dev). Check your internet connection and try again.")
+  expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release endpoint returned HTTP 404", transient: false })).permanent).toBe(true)
+  expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release request failed", transient: true })).permanent).toBe(false)
   expect(explain(new ReleaseAcquisitionError({ stage: "verify", message: "artifact digest mismatch", transient: false })).message)
     .toBe("artifact digest mismatch")
 })

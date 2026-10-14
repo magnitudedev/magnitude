@@ -38,7 +38,10 @@ normal serving. A missing owner channel fails startup.
 
 The parent lifetime channel remains open after readiness. Owner loss terminates the owned service
 tree; native protection does not depend on the JavaScript event loop. Only the application supervisor
-may restart a failed service, after predecessor cleanup. Domain failures remain in their domains.
+may restart a failed service, after predecessor cleanup, and it does not when the service's Stopping
+health marks the stop permanent, as for an engine download that failed for a reason other than a
+transient one (its download already retried those); that failure goes straight to Failed with its
+message. Domain failures remain in their domains.
 
 ## Readiness and admission
 
