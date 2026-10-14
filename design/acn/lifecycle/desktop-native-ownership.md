@@ -254,7 +254,9 @@ cannot block a successful startup or remove an unverified path.
 
 Upgrade runs within supervised startup with bounded deadlines and responsive application control.
 The existing port preflight still rejects unrelated incumbents, and the service bind remains
-authoritative against races. Acceptance covers real old-package upgrades, dormant registrations,
+authoritative against races. A rejected incumbent that answers health as Magnitude, such as another
+account's wrapped `magnitude serve`, is named as another Magnitude server; Windows reports another
+account's exclusive bind as access denied, which the preflight treats as occupied. Acceptance covers real old-package upgrades, dormant registrations,
 manual services, inference descendants, interrupted/repeated launches and data/model reuse.
 
 Linux tray-host observation belongs to the application scope, independently of service and renderer
