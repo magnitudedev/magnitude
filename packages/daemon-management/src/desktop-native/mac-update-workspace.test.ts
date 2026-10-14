@@ -8,7 +8,7 @@ import { MacUpdateAdmission, nativeMacUpdateAdmission } from "./mac-update-lease
 import { MacUpdateFilesystem, nativeMacUpdateFilesystem } from "./mac-update-filesystem"
 import { MacBundleVerifier, MacBundleVerificationFailed } from "./mac-update-validation"
 import { exchangeMacUpdate } from "./mac-update-transaction"
-import { openMacUpdateWorkspace } from "./mac-update-workspace"
+import { MacUpdateForeignBundle, openMacUpdateWorkspace } from "./mac-update-workspace"
 const addon = fileURLToPath(new URL(`../../dist/native/darwin-${process.arch}/desktop-host.node`, import.meta.url))
 const run = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | MacUpdateFilesystem | MacUpdateAdmission | Scope.Scope>) =>
   Effect.runPromise(effect.pipe(Effect.scoped, Effect.provide([BunContext.layer, nativeMacUpdateFilesystem(addon), nativeMacUpdateAdmission(addon)])))
@@ -114,4 +114,9 @@ describe.skipIf(process.platform !== "darwin")("macOS installation transaction d
     expect(yield* fs.readFileString(join(bundle, "version"))).toBe("0.1.5")
     expect((yield* fs.readDirectory(root)).includes(".Magnitude.app.update")).toBe(true)
   })))
+})
+
+it("says whose application blocks an update and who can update it", () => {
+  expect(new MacUpdateForeignBundle({ bundle: "/Applications/Magnitude.app", owner: Option.some("ada") }).message)
+    .toBe("Magnitude at /Applications/Magnitude.app belongs to another macOS account (ada), so this account can't update it. Ask ada to update Magnitude.")
 })

@@ -1,6 +1,8 @@
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
+import { execFile } from "node:child_process"
 import { basename, dirname, join, resolve } from "node:path"
+import { promisify } from "node:util"
 import { exchangeMacUpdate, publishMacInstallation, type MacUpdateVersions } from "./mac-update-transaction"
 import type { MacBundleExpectation } from "./mac-update-validation"
 import { MacUpdateAdmission, type MacExclusiveInstallationLease } from "./mac-update-lease"
@@ -10,6 +12,48 @@ import { MacUpdateRepairRequired, recoverMacUpdateTransaction, retireMacUpdateBu
 export class MacUpdateInstallationBusy extends Schema.TaggedError<MacUpdateInstallationBusy>()("MacUpdateInstallationBusy", {}) {
   override get message() { return "Magnitude is using this installation. Stop the running application before installing an update." }
 }
+
+/** Staging left by another account can't be recovered or removed by this one; only an administrator can remove it. */
+export class MacUpdateForeignStaging extends Schema.TaggedError<MacUpdateForeignStaging>()("MacUpdateForeignStaging", { staging: Schema.String }) {
+  override get message() {
+    return `Another macOS account left an unfinished Magnitude update at ${this.staging}. `
+      + `When nobody is installing Magnitude, an administrator can remove it with: sudo rm -rf '${this.staging}'`
+  }
+}
+
+export const foreignStaging = (staging: string) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const info = yield* fs.stat(staging).pipe(Effect.option)
+  const user = process.getuid?.()
+  if (user !== 0 && Option.isSome(info) && Option.isSome(info.value.uid) && info.value.uid.value !== user) {
+    return yield* new MacUpdateForeignStaging({ staging })
+  }
+})
+
+/** An application another account installed can only be replaced by that account or an administrator. */
+export class MacUpdateForeignBundle extends Schema.TaggedError<MacUpdateForeignBundle>()("MacUpdateForeignBundle", {
+  bundle: Schema.String, owner: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+}) {
+  override get message() {
+    const owner = Option.match(this.owner, { onNone: () => "another macOS account", onSome: name => `another macOS account (${name})` })
+    const who = Option.getOrElse(this.owner, () => "that account")
+    return `Magnitude at ${this.bundle} belongs to ${owner}, so this account can't update it. Ask ${who} to update Magnitude.`
+  }
+}
+
+const accountName = (uid: number) => Effect.tryPromise(() => promisify(execFile)("/usr/bin/id", ["-un", String(uid)])).pipe(
+  Effect.map(({ stdout }) => Option.some(stdout.trim()).pipe(Option.filter(name => name.length > 0))),
+  Effect.orElseSucceed(() => Option.none<string>()))
+
+export const foreignBundle = (bundle: string) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const info = yield* fs.stat(bundle).pipe(Effect.option)
+  const user = process.getuid?.()
+  const owner = Option.flatMap(info, value => value.uid)
+  if (user !== 0 && Option.isSome(owner) && owner.value !== 0 && owner.value !== user) {
+    return yield* new MacUpdateForeignBundle({ bundle, owner: yield* accountName(owner.value) })
+  }
+})
 
 /** Stable discovery is installation-relative; every access retains exclusive installation admission. */
 export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained?: MacExclusiveInstallationLease) => Effect.gen(function* () {
@@ -25,6 +69,8 @@ export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained
   const installed = yield* native.open(dirname(bundle), false)
   const stagingName = `.${installedName}.update`
   const stagingPath = join(installed.path, stagingName)
+  if (create) yield* foreignBundle(bundle)
+  yield* foreignStaging(stagingPath)
   const existing = yield* native.inspect(installed, stagingName)
   if (Option.isNone(existing)) {
     if (!create) return Option.none()
@@ -63,4 +109,4 @@ export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained
     Effect.zipRight(publishMacInstallation(installed, installedName, staging, expected)),
     Effect.provideService(MacUpdateFilesystem, protectedFilesystem))
   return Option.some({ installed, installedName, staging, validate, recover, retire, exchange, publish, clearUnpublishedStaging })
-}).pipe(Effect.mapError(error => error._tag === "MacUpdateInstallationBusy" ? error : new MacUpdateRepairRequired()))
+}).pipe(Effect.mapError(error => error._tag === "MacUpdateInstallationBusy" || error._tag === "MacUpdateForeignStaging" ? error : new MacUpdateRepairRequired()))
