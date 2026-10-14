@@ -291,7 +291,9 @@ unavailable network, local storage failure, and corrupt content. A source that d
 a bounded interval is unavailable network, never an indefinite wait: the attempt keeps its
 checkpoint, bounded retries resume from it, and exhausting them fails the occurrence as resumable. Cancellation is a separate
 terminal result. Structured facts, including required and available byte counts, cross boundaries
-without parsing diagnostic prose.
+without parsing diagnostic prose. Packages admitted together, such as a target and its separate draft,
+check disk space against their combined outstanding bytes plus the reserve, so each reports the same
+shortfall and freeing it is enough for the whole download.
 
 Failure acknowledgement is process-local presentation state on the exact catalog installation
 occurrence. ACN resolves a model-addressed user command to the current occurrence; raw download
