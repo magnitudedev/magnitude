@@ -25,10 +25,13 @@ export const ApplicationRouterMemory = Layer.effect(ApplicationRouter, Effect.ge
   return { page, navigate: value => Effect.sync(() => registry.set(page, value)) }
 }))
 
-/** Browser navigation: the page is the URL path, so reload, back, forward and links work. */
+/** Browser navigation: the page is the URL path, so reload, back, forward and links work. An unknown path is replaced with the default page's. */
 export const ApplicationRouterLocation = Layer.scoped(ApplicationRouter, Effect.gen(function* () {
   const registry = yield* Registry.AtomRegistry
-  const current = () => Option.getOrElse(pageFromPath(window.location.pathname), () => DEFAULT_PAGE)
+  const current = () => Option.getOrElse(pageFromPath(window.location.pathname), () => {
+    window.history.replaceState(null, "", pagePath(DEFAULT_PAGE))
+    return DEFAULT_PAGE
+  })
   const page = Atom.keepAlive(Atom.make<ApplicationPage>(current()))
   const onPopState = () => registry.set(page, current())
   yield* Effect.acquireRelease(

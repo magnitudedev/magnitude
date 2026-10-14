@@ -225,4 +225,4 @@ as added by this installer. Other user configuration is preserved. New terminals
 changes; existing terminals may retain their old environment. macOS Finder deletion has no uninstall
 callback, so the app provides explicit command-link removal. Successful registration is silent. The
 macOS installation script's registration failing (an unwritable shell profile, for instance) does
-not fail the installation: it warns and says which directory to add to PATH.
+not fail the installation: every other profile is still written, and the warning names the profiles that failed and which directory to add to PATH in them.

@@ -1,7 +1,12 @@
 import { FileSystem } from "@effect/platform"
-import { Effect } from "effect"
+import { Array, Effect, Option, Schema } from "effect"
 import { dirname, join } from "node:path"
-import { CliLinkFailed } from "./mac-cli-link"
+
+/** Shell profiles that could not be changed; every other profile was. */
+export class CliPathFailed extends Schema.TaggedError<CliPathFailed>()("CliPathFailed", {
+  message: Schema.String,
+  paths: Schema.NonEmptyArray(Schema.String),
+}) {}
 
 const begin = "# >>> Magnitude CLI PATH >>>"
 const end = "# <<< Magnitude CLI PATH <<<"
@@ -41,22 +46,28 @@ export const makeMacCliPath = (home: string, environment: Readonly<Record<string
       ? [...profiles, ...[".bash_profile", ".bash_login", ".profile"].map(name => ({ path: join(home, name), block: posixBlock }))]
       : profiles
     const unique = [...new Map(selected.map(profile => [profile.path, profile])).values()]
-    const edits = yield* Effect.forEach(unique, ({ path, block }) => Effect.gen(function* () {
+    // Each profile is independent, so an unwritable or edited one leaves the others correct.
+    const outcomes = yield* Effect.forEach(unique, ({ path, block }) => Effect.gen(function* () {
       const current = yield* read(path)
       // Edited or incomplete blocks belong to the user; never guess what to delete.
-      if (current.includes(begin) && !current.includes(block)) {
-        return yield* new CliLinkFailed({ message: `Magnitude's PATH entry in ${path} was edited; it was left unchanged.` })
-      }
+      if (current.includes(begin) && !current.includes(block)) return Option.some(`${path}: its Magnitude PATH entry was edited, so it was left unchanged`)
       const next = remove ? current.replace(block, "") : current.includes(block) ? current : current + block
-      return { path, current, next }
-    }))
-    // Validate every managed block before changing any profile.
-    yield* Effect.forEach(edits, ({ path, current, next }) => Effect.gen(function* () {
-      if (next === current) return
-      yield* fs.makeDirectory(dirname(path), { recursive: true })
-      yield* fs.writeFileString(path, next)
-    }), { discard: true })
-  }).pipe(Effect.mapError(error => error._tag === "CliLinkFailed" ? error
-    : new CliLinkFailed({ message: `Could not update shell PATH: ${error.message}` })))
+      if (next !== current) {
+        yield* fs.makeDirectory(dirname(path), { recursive: true })
+        yield* fs.writeFileString(path, next)
+      }
+      return Option.none<string>()
+    }).pipe(
+      Effect.catchAll(error => Effect.succeed(Option.some(error._tag === "SystemError" && error.reason === "PermissionDenied"
+        ? `${path} isn't writable` : `${path}: ${error.message}`))),
+      Effect.map(reason => Option.map(reason, reason => ({ path, reason }))),
+    ))
+    const failed = Array.getSomes(outcomes)
+    if (!Array.isNonEmptyArray(failed)) return
+    return yield* new CliPathFailed({
+      message: `Could not ${remove ? "remove Magnitude's PATH entry from" : "add Magnitude's PATH entry to"} ${failed.length === 1 ? "a shell profile" : "some shell profiles"}. ${failed.map(failure => failure.reason).join(". ")}.`,
+      paths: Array.map(failed, failure => failure.path),
+    })
+  })
   return { install: change(false), remove: change(true) }
 })

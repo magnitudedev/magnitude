@@ -9,6 +9,7 @@ InstallDir "$LOCALAPPDATA\Programs\Magnitude"
 SetCompressor /SOLID lzma
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 Var Stage
 Var PreviousVersion
 !define MUI_ABORTWARNING
@@ -19,13 +20,13 @@ Var PreviousVersion
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
 !define REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\MagnitudeDesktop"
-!macro Lease
+!macro Lease Retry
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
   File /oname=MagnitudeInstallGuard.dll "MagnitudeInstallGuard.dll"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::HoldOwnership() i .r0'
   ${If} $0 != 0
-    MessageBox MB_OK|MB_ICONSTOP "Close Magnitude using Quit from its tray menu, then run setup again. Installation access could not be acquired (code $0)." /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "Close Magnitude using Quit from its tray menu, then ${Retry} again." /SD IDOK
     SetErrorLevel 1
     Abort
   ${EndIf}
@@ -33,7 +34,7 @@ Var PreviousVersion
 Function .onInit
   SetShellVarContext current
   StrCpy $INSTDIR "$LOCALAPPDATA\Programs\Magnitude"
-  !insertmacro Lease
+  !insertmacro Lease "run setup"
   StrCpy $PreviousVersion ""
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ReadInstallationVersion(w "$INSTDIR", w "${REGKEY}", w .r8, i 1024) i .r0'
   ${If} $0 == 0
@@ -178,6 +179,9 @@ stageFailed:
   SetErrorLevel 1
   Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
+  WriteRegStr HKCU "${REGKEY}" "DisplayIcon" "$INSTDIR\Magnitude.exe"
+  ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
+  WriteRegDWORD HKCU "${REGKEY}" "EstimatedSize" "$0"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::InstallCliLauncher(w "$INSTDIR\resources\magnitude-launcher.exe", w "$LOCALAPPDATA\Programs\Magnitude CLI") i .r0'
   ${If} $0 != 0
     SetErrorLevel 1
@@ -206,7 +210,7 @@ SectionEnd
 Function un.onInit
   SetShellVarContext current
   StrCpy $INSTDIR "$LOCALAPPDATA\Programs\Magnitude"
-  !insertmacro Lease
+  !insertmacro Lease "uninstall"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::AcquireRemovalExecutable(w "$INSTDIR\Uninstall Magnitude.exe") i .r0'
   ${If} $0 != 0
     MessageBox MB_OK|MB_ICONSTOP "The installed uninstaller does not match this copy or is in use (code $0). Close applications using these files and retry. Application files were preserved." /SD IDOK

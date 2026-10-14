@@ -92,8 +92,10 @@ describe("user-owned Mac command PATH", () => {
     yield* fs.chmod(zshrc, 0o444)
     const registration = yield* makeMacCliRegistration({ home, resourcesDirectory: join(home, "Magnitude.app/Contents/Resources"), environment: {} })
     const warning = yield* macCliRegistrationWarning(registration.install)
-    expect(Option.getOrThrow(warning)).toMatch(/^Warning: Could not update shell PATH: .*\nTo use the magnitude command in a terminal, add ~\/\.magnitude\/bin to your PATH\.$/s)
+    expect(Option.getOrThrow(warning)).toBe(`Warning: Could not add Magnitude's PATH entry to a shell profile. ${zshrc} isn't writable.\n`
+      + "To use the magnitude command in shells that read that file, add ~/.magnitude/bin to PATH there yourself.")
     expect(yield* fs.readFileString(zshrc)).toBe("# managed elsewhere\n")
+    for (const profile of [".zprofile", ".bash_profile", ".bashrc"]) expect(yield* fs.readFileString(join(home, profile))).toContain(".magnitude/bin")
     expect(Option.isNone(yield* macCliRegistrationWarning(Effect.void))).toBe(true)
   })))
 })

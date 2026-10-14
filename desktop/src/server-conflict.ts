@@ -45,7 +45,7 @@ const removeServer = Effect.gen(function* () {
     // Any Polkit prompt, for a session that isn't the active one, comes from the desktop's own authentication agent only.
     : Command.make("/usr/bin/pkexec", "--disable-internal-agent", LINUX_SERVER_REMOVER_PATH)
   const code = yield* executor.exitCode(command).pipe(Effect.orElseSucceed(() => -1))
-  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Try again, or run `magnitude server remove` in a terminal." })
+  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Stopping it needs an administrator of this computer: try again as one, or ask one to run `magnitude server remove`." })
 }).pipe(Effect.provide(NodeContext.layer))
 
 /**
@@ -69,6 +69,8 @@ export const resolveServerConflict = (options: {
     const value = new BrowserWindow({ ...windowChrome(process.platform, dark), width: 720, height: 520, resizable: false, show: false,
       title: "Magnitude", icon: options.icon, backgroundColor: dark ? slate[925] : slate[50],
       webPreferences: { preload: options.preload, contextIsolation: true, nodeIntegration: false, sandbox: false } })
+    // A single-choice screen has nothing for the application menu bar to act on.
+    if (process.platform !== "darwin") value.removeMenu()
     value.once("ready-to-show", () => value.show())
     value.on("closed", () => { Runtime.runFork(runtime)(Deferred.succeed(decision, "Quit")) })
     void value.loadURL(options.pageUrl)
