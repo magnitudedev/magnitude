@@ -1,23 +1,16 @@
 {
   "origin": "https://magnitude-updates-976f4c77.westus2.cloudapp.azure.com",
   "linuxVersions": [
-    "50.8.5",
-    "50.8.6"
+    "50.8.13",
+    "50.8.14",
+    "50.8.15"
   ],
-<<<<<<< HEAD
   "appleVersions": [
-    "50.8.1",
-    "50.8.2"
+    "50.8.13",
+    "50.8.14"
   ],
-  "windowsVersions": "50.8.1,50.8.2",
+  "windowsVersions": "50.8.13,50.8.14",
   "failingVariants": {
-    "50.8.3": "preinstall",
-    "50.8.4": "startup"
+    "50.8.14": "startup"
   }
-=======
-  "appleVersions": [],
-  "windowsVersions": "50.8.5,50.8.6",
-  "failingVariants": {},
-  "attempt": 2
->>>>>>> 0f2ef675 (Build the release-blocker fix test versions 50.8.5 and 50.8.6 for Linux x64 and Windows)
 }
