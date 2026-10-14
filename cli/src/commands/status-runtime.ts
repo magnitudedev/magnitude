@@ -4,11 +4,13 @@ import { serverLogs, serverNotRunning, serviceFailureLine } from "../server/serv
 import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
-import { Command, CommandExecutor } from "@effect/platform"
+import { Command, CommandExecutor, FetchHttpClient, FileSystem, HttpClient, HttpClientResponse } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
 import { Effect, Option } from "effect"
-import { MAC_SERVER_LABEL } from "@magnitudedev/daemon-management/desktop-native"
+import { MAC_SERVER_LABEL, MAC_SERVER_PLIST } from "@magnitudedev/daemon-management/desktop-native"
+import { AcnHealthResponseSchema } from "@magnitudedev/sdk"
 import { isIP } from "node:net"
+import { userInfo } from "node:os"
 import { existingAcnConnection } from "../server/acn-connection"
 import { runCommand } from "./output"
 
@@ -28,6 +30,12 @@ interface ServiceStatusPresentation {
   readonly server: boolean
   readonly failing: Option.Option<ServerFailing>
   readonly loaded: Option.Option<boolean>
+  readonly elsewhere: Option.Option<OtherAccount>
+}
+
+/** A service this account can't observe or control, answering on the port for another account. */
+interface OtherAccount {
+  readonly account: Option.Option<string>
 }
 
 /** A system service that systemd keeps restarting, with the service's own last error when the journal is readable. */
@@ -49,6 +57,20 @@ const readServerFailing = Effect.gen(function* () {
   const journal = yield* output("/usr/bin/journalctl", "-u", "magnitude.service", "-n", "300", "-o", "cat", "--no-pager", "--quiet")
   return Option.some({ restarts, lastError: serviceFailureLine(journal.split("\n")) })
 }).pipe(Effect.provide(BunContext.layer))
+
+/**
+ * The service answering on this computer's port when this account has no application of its own:
+ * another account's app, `serve` or server. On macOS the server's plist names the account it runs as.
+ */
+const readOtherAccount = Effect.gen(function* () {
+  const response = yield* HttpClient.get(`${desktopServiceOrigin}/health`)
+  const health = yield* HttpClientResponse.schemaBodyJson(AcnHealthResponseSchema)(response)
+  const plist = process.platform === "darwin"
+    ? yield* Effect.flatMap(FileSystem.FileSystem, fs => fs.readFileString(MAC_SERVER_PLIST)).pipe(Effect.orElseSucceed(() => ""))
+    : ""
+  const account = Option.fromNullable(/<key>UserName<\/key>\s*<string>([^<]+)<\/string>/.exec(plist)?.[1])
+  return { health, account }
+}).pipe(Effect.scoped, Effect.timeout("2 seconds"), Effect.option, Effect.provide([FetchHttpClient.layer, BunContext.layer]))
 
 /** Whether launchd has the macOS server daemon loaded, which decides how it is started again. */
 const readMacServerLoaded = Effect.flatMap(CommandExecutor.CommandExecutor, executor =>
@@ -83,7 +105,7 @@ const readActiveModel = Effect.scoped(Effect.gen(function* () {
   return { _tag: "Observed", model: Option.none<ActiveModel>() } as const
 }))
 
-const publicServiceStatus = desktopApplication.observe.pipe(
+const ownStatus = desktopApplication.observe.pipe(
   Effect.map(Option.some),
   Effect.catchTag("ApplicationControlUnavailable", () => Effect.succeed(Option.none())),
   Effect.flatMap((snapshot) => {
@@ -101,14 +123,24 @@ const publicServiceStatus = desktopApplication.observe.pipe(
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded,
+      owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded, elsewhere: Option.none(),
     })))
   }),
 )
 
+const publicServiceStatus = ownStatus.pipe(Effect.flatMap(status => Option.isSome(status.owner) ? Effect.succeed(status)
+  : readOtherAccount.pipe(Effect.map(Option.match({
+    onNone: () => status,
+    onSome: ({ health, account }): ServiceStatusPresentation => ({
+      ...status, status: health.state._tag, version: Option.some(String(health.version)), failing: Option.none(),
+      elsewhere: Option.some({ account: Option.filter(account, name => name !== userInfo().username) }),
+    }),
+  })))))
+
 /** Where the system service is set up, a Headless owner is that service rather than someone's `serve`. */
 const ownerName = (status: ServiceStatusPresentation) => Option.match(status.owner, {
-  onNone: () => "None", onSome: owner => owner._tag === "Headless" && status.server ? "Server" : owner._tag })
+  onNone: () => Option.match(status.elsewhere, { onNone: () => "None", onSome: other => Option.match(other.account, {
+    onNone: () => "Another account", onSome: account => `Another account (${account})` }) }), onSome: owner => owner._tag === "Headless" && status.server ? "Server" : owner._tag })
 
 /** With network access active the service also listens on all interfaces or its configured address, as ACN resolves it. */
 const listeningAddress = (status: ServiceStatusPresentation) => {
@@ -138,12 +170,15 @@ export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.
       : `${model.displayName} - ${model.status}`,
   })}`] : []),
   ...Option.match(status.reach, { onNone: () => [], onSome: reach => ["", ...renderServerReach(reach).map(line => `  ${line}`)] }),
+  ...Option.match(status.elsewhere, { onNone: () => [], onSome: () => ["",
+    "Magnitude is running on this computer for another account. This account can't see or control it;",
+    status.server ? "the account that runs it can stop it, or remove the server with `magnitude server remove`." : "the account that runs it can quit it."] }),
   ...Option.match(status.failing, {
     onSome: failing => ["", "Keeps failing to start",
       `The Magnitude server keeps stopping as it starts (restarted ${failing.restarts} ${failing.restarts === 1 ? "time" : "times"}).`,
       ...Option.match(failing.lastError, { onNone: () => [], onSome: line => [`Its last error: ${line}`] }),
       `See its log: ${serverLogs(platform)}`],
-    onNone: () => Option.isNone(status.owner) ? [
+    onNone: () => Option.isNone(status.owner) && Option.isNone(status.elsewhere) ? [
       "", "Not running", status.server ? serverNotRunning(platform, status.loaded) : "Open the Magnitude desktop app or run `magnitude serve`.",
     ] : [],
   }),

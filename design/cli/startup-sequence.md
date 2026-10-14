@@ -75,7 +75,10 @@ tray and login-startup observations appear only for Desktop. Where the service i
 answering, the guidance is how to start the service and read its log, never the desktop app or `serve`
 (on macOS, kickstart when launchd has the daemon loaded and bootstrap its plist when it was booted out);
 a Linux service that systemd keeps restarting or that failed instead says it keeps failing to start,
-quotes the service's own last error when the journal is readable, and names the log. Model observations are separate from service readiness, and unavailable model evidence must
+quotes the service's own last error when the journal is readable, and names the log. When this
+account has no application of its own but a service answers health on the local port, status reports
+that service's state and version as owned by another account (named from the macOS server plist when
+it can be), never as stopped. Model observations are separate from service readiness, and unavailable model evidence must
 not be presented as no loaded model. A ready service also shows how to reach it: this computer's
 address, each address other devices can use when network access is on, or how to turn it on with
 the profile's real configuration path. Status never shows the network access key. Login
