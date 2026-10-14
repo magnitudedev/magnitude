@@ -2,7 +2,7 @@ import { createServer } from "node:http"
 import { Effect, Either, Option } from "effect"
 import { expect, it } from "vitest"
 import { OwnedChildSpawner, OwnedChildSpawnFailed } from "./owned-child"
-import { requireServicePort } from "./service-port"
+import { occupiedMessage, requireServicePort } from "./service-port"
 
 const command = { output: "DiagnosticTail" as const, logFile: Option.none(), executable: "test-service", arguments: [], environment: {} }
 const reachedChild = new OwnedChildSpawnFailed({ executable: command.executable, message: "Reached child creation" })
@@ -40,6 +40,25 @@ it("leaves an occupied port untouched and releases its probe before retrying chi
   })))
 })
 
+it("names another Magnitude server that holds the port", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const incumbent = yield* Effect.acquireRelease(
+      Effect.async<ReturnType<typeof createServer>>(resume => {
+        const server = createServer((_request, response) => response.end(JSON.stringify({ service: "magnitude-acn" })))
+        server.listen(0, "127.0.0.1", () => resume(Effect.succeed(server)))
+      }),
+      server => Effect.async<void>(resume => { server.close(() => resume(Effect.void)) }),
+    )
+    const address = incumbent.address()
+    if (!address || typeof address === "string") throw new Error("Expected TCP address")
+    const spawner = yield* requireServicePort(address.port).pipe(Effect.provideService(OwnedChildSpawner, {
+      spawn: () => Effect.die("An occupied port must not reach child creation"),
+    }))
+    const result = yield* Effect.either(spawner.spawn(command))
+    expect(Either.isLeft(result) && result.left.message).toContain("Another Magnitude server is already running")
+  })))
+})
+
 it("reports invalid port admission without starting a child", async () => {
   await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     const spawner = yield* requireServicePort(-1).pipe(Effect.provideService(OwnedChildSpawner, {
@@ -48,4 +67,12 @@ it("reports invalid port admission without starting a child", async () => {
     const result = yield* Effect.either(spawner.spawn(command))
     expect(Either.isLeft(result) && result.left.message).toContain("could not open its local service port")
   })))
+})
+
+it("words another Magnitude server's advice for the platform", () => {
+  expect(occupiedMessage(10100, true, "win32")).toContain("nssm stop Magnitude")
+  expect(occupiedMessage(10100, true, "linux")).toContain("sudo systemctl stop magnitude")
+  expect(occupiedMessage(10100, true, "linux")).not.toContain("NSSM")
+  expect(occupiedMessage(10100, true, "darwin")).toContain("magnitude server remove")
+  expect(occupiedMessage(10100, true, "darwin")).not.toContain("NSSM")
 })
