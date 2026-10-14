@@ -112,7 +112,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
 /** A catalog model's download and the one-time optimization that follows it. */
 const acquiring = (acquisition: CatalogLocalModel["acquisitionState"]) =>
   acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
-const minutesRemaining = (seconds: number) => `About ${Math.max(1, Math.ceil(seconds / 60))} min`
+const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" : `About ${Math.ceil(seconds / 60)} min`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
   const baseline = useRef<{ at: number; completed: number } | null>(null)
