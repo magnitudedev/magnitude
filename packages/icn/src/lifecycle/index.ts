@@ -63,6 +63,7 @@ import {
 
 export * from "./preparation.js";
 export * from "./errors.js";
+export { ReleaseIcnInstallationError } from "./release-installation.js";
 
 const PositiveInt = Schema.Int.pipe(Schema.greaterThan(0));
 const NonEmpty = Schema.String.pipe(Schema.minLength(1));

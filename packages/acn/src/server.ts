@@ -49,7 +49,7 @@ import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channe
 import {
   MagnitudeHealthResponseSchema,
   AcnRpcGroup, } from "@magnitudedev/acn-protocol"
-import { IcnHardware, IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
+import { IcnHardware, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
@@ -174,6 +174,14 @@ export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => 
   }
   return "Magnitude service could not start. See diagnostics for details."
 }
+
+/** A failed engine download says everything in its message; its stack frames would only bury it. */
+const logStartupFailure = (cause: Cause.Cause<unknown>) => Option.match(Cause.failureOption(cause), {
+  onSome: failure => failure instanceof ReleaseIcnInstallationError && failure.stage === "acquire"
+    ? Effect.logError(`ACN application startup failed: ${failure.message}`)
+    : Effect.logError("ACN application startup failed", cause),
+  onNone: () => Effect.logError("ACN application startup failed", cause),
+})
 
 const DESKTOP_APP_ORIGIN = "magnitude://app"
 
@@ -865,7 +873,7 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: acnStartupFailureDetail(cause),
-      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", cause)))),
+      }).pipe(Effect.zipRight(logStartupFailure(cause)))),
     )
     const started = yield* Effect.raceFirst(
       startup.pipe(Effect.disconnect, Effect.map(Option.some)),
