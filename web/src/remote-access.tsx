@@ -91,7 +91,7 @@ export type DisconnectWarning = "TurnOffNetworkAccess" | "RegenerateKey" | "Chan
 const warnings: Record<DisconnectWarning, { title: string; description: string; confirmLabel: string }> = {
   TurnOffNetworkAccess: {
     title: "Turn off network access?",
-    description: "This browser is connected over the network. When Magnitude restarts, it stops accepting other devices, and this browser will be disconnected.",
+    description: "This browser is connected over the network. The next time Magnitude restarts, including for an automatic update, remote access stops: this browser and every other device, app and agent lose access, and only someone on the computer running Magnitude can turn it back on.",
     confirmLabel: "Turn off",
   },
   RegenerateKey: {
