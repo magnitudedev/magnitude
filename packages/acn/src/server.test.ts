@@ -14,7 +14,7 @@ import { describe, expect, it, vi } from "vitest"
 import { ACN_INSTANCE_ID } from "./identity"
 import { makeAcnServiceLifecycle } from "./service-lifecycle"
 import { makeRemoteAccess } from "./remote-access"
-import { ACN_PUBLIC_PORT, acnStartupFailureDetail, installAcnHealthRoutes, installAcnPublicRoutes, launchAcnServer } from "./server"
+import { ACN_PUBLIC_PORT, acnStartupFailureDetail, installAcnHealthRoutes, installAcnPublicRoutes, launchAcnServer, readNetworkAccess } from "./server"
 
 describe("ACN startup failure presentation", () => {
   it("finishes a delayed stopping report after application acquisition fails", async () => {
@@ -278,4 +278,35 @@ describe("ACN network access", () => {
       expect((yield* get({ host: "localhost:1" })).status).toBe(503)
     })).pipe(Effect.provide(Layer.merge(FetchHttpClient.layer, BunContext.layer))))
   })
+})
+
+describe("network access read at startup", () => {
+  const withDataDir = async (config: unknown, use: (dataDir: string) => Promise<void>) => {
+    const dataDir = await mkdtemp(join(tmpdir(), "magnitude-network-key-"))
+    try {
+      await Bun.write(join(dataDir, "config.json"), JSON.stringify(config))
+      await use(dataDir)
+    } finally {
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  }
+  const read = (dataDir: string) => Effect.runPromise(readNetworkAccess(dataDir).pipe(Effect.provide(BunContext.layer)))
+  const saved = (dataDir: string) => Bun.file(join(dataDir, "config.json")).json()
+
+  it("makes and saves a key for network access turned on by hand, keeping the rest of config.json", () =>
+    withDataDir({ network: { enabled: true }, unknownSetting: 1 }, async dataDir => {
+      const network = await read(dataDir)
+      expect(network.enabled).toBe(true)
+      expect(Option.getOrThrow(network.apiKey)).toMatch(/^mag-/)
+      const config = await saved(dataDir)
+      expect(config.network.apiKey).toBe(Option.getOrThrow(network.apiKey))
+      expect(config.network.enabled).toBe(true)
+      expect(config.unknownSetting).toBe(1)
+      expect((await read(dataDir)).apiKey).toEqual(network.apiKey)
+    }))
+  it("leaves loopback-only access without a key", () =>
+    withDataDir({ network: { enabled: false } }, async dataDir => {
+      expect(await read(dataDir)).toEqual(LOOPBACK_ONLY)
+      expect((await saved(dataDir)).network.apiKey).toBeUndefined()
+    }))
 })

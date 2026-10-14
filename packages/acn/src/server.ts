@@ -5,6 +5,7 @@ import {
   BunCommandExecutor,
 } from "@effect/platform-bun"
 import { FetchHttpClient, FileSystem, HttpServerResponse, Socket as PlatformSocket } from "@effect/platform"
+import { join } from "node:path"
 import * as HttpLayerRouter from "@effect/platform/HttpLayerRouter"
 import * as HttpServer from "@effect/platform/HttpServer"
 import * as HttpServerRequest from "@effect/platform/HttpServerRequest"
@@ -37,6 +38,8 @@ import {
   MagnitudeConfigSchema,
   readStructuredFile,
   resolveNetworkAccess,
+  generateApiKey,
+  makeConfigStorage,
   isAllowedHostHeader,
   authorizesRemoteInference,
   LOOPBACK_ONLY,
@@ -47,7 +50,7 @@ import type { JsonLineChannelFailed } from "@magnitudedev/utils/json-line-channe
 import {
   MagnitudeHealthResponseSchema,
   AcnRpcGroup, } from "@magnitudedev/acn-protocol"
-import { IcnHardware, IcnProcess, makeIcnProvider } from "@magnitudedev/icn"
+import { IcnHardware, IcnProcess, makeIcnProvider, ReleaseIcnInstallationError } from "@magnitudedev/icn"
 import { AcnBoundaryLive } from "./boundary/acn"
 import { defaultDataDir } from "./data-dir"
 import { AgentFactoryLive } from "./agent-factory"
@@ -108,7 +111,7 @@ import { AcnHost, ServerSettingsLive, type AcnHostApi } from "./server-settings"
 import { AcnHarnessConnectionsLive } from "./harness-connections"
 import { AcnOwner } from "./application-owner"
 import { resolveWebAppSource, serveWebApp } from "./web-app"
-import { installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, type RemoteAccessApi } from "./remote-access"
+import { fileSessionStore, installRemoteAccessRoutes, isLocalCaller, isSameOrigin, makeRemoteAccess, REMOTE_SESSIONS_FILE, type RemoteAccessApi } from "./remote-access"
 import { AcnChangesLive, AcnStorageChangesLive } from "./changes"
 import { AcnSubscriptions, AcnSubscriptionsLive } from "./acn-subscriptions"
 import { makeAcnSubscriptionProtocol } from "./acn-subscription-protocol"
@@ -138,7 +141,8 @@ class InferenceProxyFailed extends Data.TaggedError("InferenceProxyFailed")<{
   readonly cause: unknown
 }> {}
 
-class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
+/** ACN stopped for a reason it has already logged; its supervisor restarts it. */
+export class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
   readonly reason: "fatal" | "icn-exited" | "startup-failed"
   readonly message: string
 }> {}
@@ -172,6 +176,14 @@ export const acnStartupFailureDetail = (cause: Cause.Cause<unknown>): string => 
   }
   return "Magnitude service could not start. See diagnostics for details."
 }
+
+/** A failed engine download says everything in its message; its stack frames would only bury it. */
+const logStartupFailure = (cause: Cause.Cause<unknown>) => Option.match(Cause.failureOption(cause), {
+  onSome: failure => failure instanceof ReleaseIcnInstallationError && failure.stage === "acquire"
+    ? Effect.logError(`ACN application startup failed: ${failure.message}`)
+    : Effect.logError("ACN application startup failed", cause),
+  onNone: () => Effect.logError("ACN application startup failed", cause),
+})
 
 const DESKTOP_APP_ORIGIN = "magnitude://app"
 
@@ -430,6 +442,27 @@ const withServerOwnedServices = <A, E, R>(base: Layer.Layer<A, E, R>, host: AcnH
     Layer.provide(Layer.succeed(AcnHost, host)),
   )
 
+/**
+ * Network access turned on in config.json by hand has no key, and without one every remote request is
+ * refused. The service makes the key then, as Settings does, and says where it is without printing it.
+ */
+const ensureNetworkKey = (dataDir: string, network: NetworkAccess) => {
+  if (!network.enabled || !network.requireApiKey || Option.isSome(network.apiKey)) return Effect.succeed(network)
+  const storage = makeGlobalStorage({ root: dataDir })
+  const apiKey = generateApiKey()
+  return makeConfigStorage().pipe(
+    Effect.provideService(GlobalStorage, storage), Effect.provide(BunPath.layer),
+    Effect.flatMap(config => config.update(current => ({ ...current,
+      network: Option.map(current.network, saved => ({ ...saved, apiKey: saved.apiKey ?? apiKey })) }))),
+    Effect.as({ ...network, apiKey: Option.some(apiKey) }),
+    Effect.tap(() => Effect.logWarning(`Network access was on without a key, so Magnitude made one and saved it as network.apiKey in ${storage.paths.configFile}. `
+      + "Other computers need it: find it in Settings → Network access in the app on this computer, or run `magnitude server setup` again on a server.")),
+    Effect.catchAll(error => Effect.logWarning("Network access is on without a key, and a key could not be saved, so other computers can't connect. "
+      + "Turn network access on in Settings → Network access, or add a network.apiKey to config.json.").pipe(
+      Effect.annotateLogs({ cause: String(error) }), Effect.as(network))),
+  )
+}
+
 export const readNetworkAccess = (dataDir: string) =>
   readStructuredFile(makeGlobalStorage({ root: dataDir }).paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
     Effect.map((result) => result._tag === "Invalid" || result._tag === "Missing" ? LOOPBACK_ONLY : resolveNetworkAccess(result.value.network)),
@@ -437,6 +470,7 @@ export const readNetworkAccess = (dataDir: string) =>
       Effect.annotateLogs({ cause: error.message }),
     )),
     Effect.orElseSucceed(() => LOOPBACK_ONLY),
+    Effect.flatMap((network) => ensureNetworkKey(dataDir, network)),
     Effect.tap((network) => Option.isSome(network.warning) ? Effect.logWarning(network.warning.value) : Effect.void),
     Effect.tap((network) => Effect.logInfo("Network access resolved").pipe(
       Effect.annotateLogs({ bind: network.bind, requireApiKey: network.requireApiKey }),
@@ -761,7 +795,8 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
     )
     const router = Context.get(infrastructure, HttpLayerRouter.HttpRouter)
     const server = Context.get(infrastructure, HttpServer.HttpServer)
-    const remote = yield* makeRemoteAccess(network)
+    const sessions = yield* fileSessionStore(join(dataDir, REMOTE_SESSIONS_FILE), network).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
+    const remote = yield* makeRemoteAccess(network, sessions)
     yield* installAcnHealthRoutes(router, lifecycle, remote).pipe(Effect.provideService(FileSystem.FileSystem, Context.get(infrastructure, FileSystem.FileSystem)))
     yield* server.serve(router.asHttpEffect()).pipe(Effect.provide(infrastructure))
     if (network.enabled && network.bind !== primaryBind) {
@@ -841,7 +876,8 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       Effect.tapErrorCause((cause) => lifecycle.beginStopping({
         reason: "startup-failed",
         detail: acnStartupFailureDetail(cause),
-      }).pipe(Effect.zipRight(Effect.logError("ACN application startup failed", cause)))),
+        permanent: Option.exists(Cause.failureOption(cause), failure => failure instanceof ReleaseIcnInstallationError && failure.permanent),
+      }).pipe(Effect.zipRight(logStartupFailure(cause)))),
     )
     const started = yield* Effect.raceFirst(
       startup.pipe(Effect.disconnect, Effect.map(Option.some)),

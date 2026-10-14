@@ -22,8 +22,10 @@ import {
   makeConfigStorage,
   makeGlobalStorage,
   readStructuredFile,
+  canWriteModelStore,
   resolveModelStoreLocation,
   resolveNetworkAccess,
+  resolveUsableModelStoreLocation,
   type NetworkAccess,
   type NetworkAccessConfig,
 } from "@magnitudedev/storage"
@@ -82,10 +84,13 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
     Effect.provideService(FileSystem.FileSystem, fs),
     Effect.flatMap(result => result._tag === "Invalid" ? Effect.fail(result.error) : Effect.succeed(result._tag === "Missing" ? Option.none<string>() : result.value.modelsDirectory)),
   )
-  const location = (configured: Option.Option<string>) => resolveModelStoreLocation(host.dataDir, configured).pipe(Effect.provideService(FileSystem.FileSystem, fs))
   // The engine received its store at spawn, from the configuration as it stood when this service started.
-  const active = yield* readModelsDirectory.pipe(Effect.orElseSucceed(() => Option.none<string>()), Effect.flatMap(location))
-  const defaultPath = (yield* location(Option.none())).path
+  const active = yield* readModelsDirectory.pipe(
+    Effect.orElseSucceed(() => Option.none<string>()),
+    Effect.flatMap(configured => resolveUsableModelStoreLocation(host.dataDir, configured)),
+    Effect.provideService(FileSystem.FileSystem, fs),
+  )
+  const defaultPath = (yield* resolveModelStoreLocation(host.dataDir, Option.none()).pipe(Effect.provideService(FileSystem.FileSystem, fs))).path
 
   const readNetwork = readStructuredFile(storage.paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
     Effect.provideService(FileSystem.FileSystem, fs),
@@ -105,7 +110,7 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
 
   return ServerSettings.of({
     modelStorage: readModelsDirectory.pipe(
-      Effect.flatMap(location),
+      Effect.flatMap(configured => resolveUsableModelStoreLocation(host.dataDir, configured).pipe(Effect.provideService(FileSystem.FileSystem, fs))),
       Effect.map((current): ModelStorageSettings => ({ active: active.path, path: current.path, source: current.source, defaultPath, warning: current.warning })),
       Effect.mapError(() => new ServerSettingsFailed({ message: "The saved model storage location could not be read. Using the default folder." })),
     ),
@@ -113,6 +118,9 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
       const trimmed = Option.map(path, value => value.trim())
       if (Option.isSome(trimmed) && (trimmed.value.length === 0 || !isAbsolute(trimmed.value))) {
         return yield* new ServerSettingsFailed({ message: "Choose a full folder path for model storage." })
+      }
+      if (Option.isSome(trimmed) && !(yield* canWriteModelStore(normalize(trimmed.value)).pipe(Effect.provideService(FileSystem.FileSystem, fs)))) {
+        return yield* new ServerSettingsFailed({ message: `Magnitude can't create or write files in ${trimmed.value}. Choose a folder the Magnitude service can write to.` })
       }
       yield* writes.withPermits(1)(config.update(current => ({ ...current, modelsDirectory: trimmed }))).pipe(
         Effect.mapError(() => new ServerSettingsFailed({ message: "The model storage location could not be saved. Check access to the Magnitude configuration and try again." })),

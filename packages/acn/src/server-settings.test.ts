@@ -29,6 +29,25 @@ describe("model storage", () => {
     expect(result._tag).toBe("Left")
   })
 
+  it("rejects a folder the service cannot write to", async () => {
+    const dataDir = fresh()
+    const locked = join(dataDir, "locked")
+    mkdirSync(locked, { mode: 0o500 })
+    const result = await run(dataDir, Effect.flatMap(ServerSettings, service => service.setModelStorage(Option.some(join(locked, "models")))).pipe(Effect.either))
+    expect(result._tag).toBe("Left")
+    if (result._tag === "Left") expect(result.left.message).toContain("can't create or write files")
+  })
+
+  it("reports the folder in use when the saved one can't be written", async () => {
+    const dataDir = fresh()
+    const locked = join(dataDir, "locked")
+    mkdirSync(locked, { mode: 0o500 })
+    writeFileSync(join(dataDir, "config.json"), JSON.stringify({ modelsDirectory: locked }))
+    const settings = await run(dataDir, Effect.flatMap(ServerSettings, service => service.modelStorage))
+    expect(settings).toMatchObject({ path: join(dataDir, "models"), active: join(dataDir, "models"), source: "Default" })
+    expect(Option.isSome(settings.warning)).toBe(true)
+  })
+
   it("saves a folder for the next start while the running engine keeps its folder", async () => {
     const dataDir = fresh()
     const next = join(dataDir, "elsewhere")
