@@ -5,6 +5,7 @@ import { readServerReach, renderServerReach, type ServerReach } from "../server/
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
 import { Effect, Option } from "effect"
+import { isIP } from "node:net"
 import { existingAcnConnection } from "../server/acn-connection"
 import { runCommand } from "./output"
 
@@ -76,7 +77,16 @@ const publicServiceStatus = desktopApplication.observe.pipe(
 const ownerName = (status: ServiceStatusPresentation) => Option.match(status.owner, {
   onNone: () => "None", onSome: owner => owner._tag === "Headless" && status.server ? "Server" : owner._tag })
 
-export const renderStatus = (status: ServiceStatusPresentation, platform: NodeJS.Platform = process.platform): string => [
+/** With network access active the service also listens on all interfaces or its configured address, as ACN resolves it. */
+const listeningAddress = (status: ServiceStatusPresentation) => {
+  const network = Option.getOrUndefined(Option.flatMap(status.reach, reach => reach.network))
+  if (!network?.enabled || network.pending) return status.address
+  const configured = Option.getOrUndefined(network.bind)?.trim()
+  if (configured === undefined || isIP(configured) === 0 || configured === "0.0.0.0") return `0.0.0.0:${network.port} (all interfaces)`
+  return `${status.address}, ${isIP(configured) === 6 ? `[${configured}]` : configured}:${network.port}`
+}
+
+export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.Platform = process.platform): string => [
   "Magnitude service",
   `  Runtime         ${status.status}`,
   `  Owner           ${ownerName(status)}`,
@@ -86,7 +96,7 @@ export const renderStatus = (status: ServiceStatusPresentation, platform: NodeJS
   ] : []),
   ...(Option.isSome(status.version) ? [
     `  Version         ${status.version.value}`,
-    `  Address         ${status.address}`,
+    `  Address         ${listeningAddress(status)}`,
   ] : []),
   ...(status.status === "Ready" ? [`  Active model    ${status.activeModel._tag === "Unavailable" ? "Unavailable" : Option.match(status.activeModel.model, {
     onNone: () => "None",

@@ -15,7 +15,7 @@ export const withLocalService = <A, E>(origin: string, use: (client: MagnitudeCl
 
 export interface ServerReach {
   readonly endpoint: string
-  readonly network: Option.Option<Pick<NetworkAccessSettings, "enabled" | "interfaces" | "port" | "pending">>
+  readonly network: Option.Option<Pick<NetworkAccessSettings, "enabled" | "bind" | "interfaces" | "port" | "pending">>
   readonly configPath: string
   /** Running as the system service: stopping it means removing the server, not Ctrl+C. */
   readonly service: boolean

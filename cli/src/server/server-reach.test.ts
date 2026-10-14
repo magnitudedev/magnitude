@@ -4,7 +4,7 @@ import { renderServeReady, type ServerReach } from "./server-reach"
 
 const reach = (overrides: Partial<ServerReach> = {}): ServerReach => ({
   endpoint: "http://127.0.0.1:10100", configPath: "/home/ada/.magnitude/config.json", service: false,
-  network: Option.some({ enabled: true, port: 10100, pending: false, interfaces: [
+  network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, interfaces: [
     { name: "eth0", address: "192.168.1.5", kind: "lan" },
     { name: "tailscale0", address: "100.64.0.3", kind: "tailscale" },
     { name: "docker0", address: "172.17.0.1", kind: "virtual" },
@@ -24,7 +24,7 @@ describe("serve ready output", () => {
     expect(output).toContain("Press Ctrl+C to stop.")
   })
   it("explains how to turn network access on with the profile's real config path, and the SSH tunnel", () => {
-    const off = Option.some({ enabled: false, port: 10100, pending: false, interfaces: [] })
+    const off = Option.some({ enabled: false, bind: Option.none(), port: 10100, pending: false, interfaces: [] })
     const server = renderServeReady(reach({ network: off, configPath: "/var/lib/magnitude/config.json", service: true }))
     expect(server).toContain("Only this computer can reach it.")
     expect(server).toContain("/var/lib/magnitude/config.json")
@@ -37,11 +37,11 @@ describe("serve ready output", () => {
     expect(output).toContain("magnitude server remove")
   })
   it("never prints the network access key", () => {
-    const settings = { enabled: true, port: 10100, pending: false, interfaces: [], apiKey: Option.some("secret-key"), requireApiKey: true }
+    const settings = { enabled: true, bind: Option.none(), port: 10100, pending: false, interfaces: [], apiKey: Option.some("secret-key"), requireApiKey: true }
     expect(renderServeReady(reach({ network: Option.some(settings) }))).not.toContain("secret-key")
   })
   it("notes a network access change that waits for a restart", () => {
-    expect(renderServeReady(reach({ network: Option.some({ enabled: false, port: 10100, pending: true, interfaces: [] }) })))
+    expect(renderServeReady(reach({ network: Option.some({ enabled: false, bind: Option.none(), port: 10100, pending: true, interfaces: [] }) })))
       .toContain("applies when Magnitude restarts")
   })
 })

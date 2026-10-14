@@ -76,9 +76,10 @@ describe("Magnitude service definitions", () => {
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Observed", model: Option.none() },
       owner: Option.some({ _tag: "Headless" }),
       reach: Option.some({ endpoint: "http://127.0.0.1:10100", configPath: "/var/lib/magnitude/config.json", service: true,
-        network: Option.some({ enabled: true, port: 10100, pending: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
+        network: Option.some({ enabled: true, bind: Option.none(), port: 10100, pending: false, interfaces: [{ name: "eth0", address: "10.0.0.4", kind: "lan" }] }) }),
       server: true,
     })
+    expect(output).toContain("Address         0.0.0.0:10100 (all interfaces)")
     expect(output).toContain("Owner           Server")
     expect(output).toContain("On this computer:   http://127.0.0.1:10100")
     expect(output).toContain("http://10.0.0.4:10100")
