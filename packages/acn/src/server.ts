@@ -141,7 +141,8 @@ class InferenceProxyFailed extends Data.TaggedError("InferenceProxyFailed")<{
   readonly cause: unknown
 }> {}
 
-class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
+/** ACN stopped for a reason it has already logged; its supervisor restarts it. */
+export class AcnRestartRequired extends Data.TaggedError("AcnRestartRequired")<{
   readonly reason: "fatal" | "icn-exited" | "startup-failed"
   readonly message: string
 }> {}

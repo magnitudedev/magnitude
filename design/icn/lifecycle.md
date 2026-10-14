@@ -272,8 +272,10 @@ no `backends/` directory and no declared backend. Validation proves the executab
 native build; `nativeBuild` is the engine build identity (engine version plus kernel bundle
 identity). A release installation whose download fails says, in one line and without stack frames,
 that Magnitude couldn't download its inference engine, the HTTP status or failure and the host, and
-to check the connection; ACN's startup failure carries that line to `serve`, the service log and
-`server setup`.
+what to do for that cause: a release the host doesn't have (HTTP 404 or 410) isn't available for
+download, while a network failure asks to check the connection. ACN's startup failure carries that
+line to `serve`, the service log and `server setup`; neither ACN's exit nor its supervisor repeats it
+with stack frames or a copy of output that already reached the log.
 
 `bun dev` prepares the same fixed layout at
 `inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`

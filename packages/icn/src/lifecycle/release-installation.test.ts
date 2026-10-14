@@ -14,10 +14,12 @@ afterEach(async () => {
   directory = undefined
 })
 
-it("says plainly that the inference engine couldn't be downloaded, from where, and what to do", () => {
+it("says plainly that the inference engine couldn't be downloaded, from where, and what to do about the cause", () => {
   const explain = acquisitionError("https://releases.magnitude.dev/engine")
   expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release endpoint returned HTTP 404", transient: false })).message)
-    .toBe("Magnitude couldn't download its inference engine (HTTP 404 from releases.magnitude.dev). Check your internet connection and try again.")
+    .toBe("Magnitude couldn't download its inference engine (HTTP 404 from releases.magnitude.dev). This release isn't available for download. Update Magnitude, or try again later.")
+  expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release endpoint returned HTTP 403", transient: false })).message)
+    .toBe("Magnitude couldn't download its inference engine (HTTP 403 from releases.magnitude.dev). The release host refused the download. Try again later.")
   expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release request failed", transient: true })).message)
     .toBe("Magnitude couldn't download its inference engine (request failed from releases.magnitude.dev). Check your internet connection and try again.")
   expect(explain(new ReleaseAcquisitionError({ stage: "verify", message: "artifact digest mismatch", transient: false })).message)

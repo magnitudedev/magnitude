@@ -45,14 +45,16 @@ const installationError = (
 
 /**
  * A failed download is the person's network or the release host, not something in Magnitude to
- * debug, so it says what was being downloaded, from where, and what to do.
+ * debug, so it says what was being downloaded, from where, and what to do about that cause.
  */
 export const acquisitionError = (baseUrl: string) => (cause: ReleaseAcquisitionError) => {
   if (cause.stage !== "download") return installationError("acquire", cause.message)
   const detail = cause.message.replace(/^release endpoint returned /, "").replace(/^release /, "")
   const host = URL.canParse(baseUrl) ? ` from ${new URL(baseUrl).host}` : ""
-  return installationError("acquire",
-    `Magnitude couldn't download its inference engine (${detail}${host}). Check your internet connection and try again.`)
+  const advice = /^HTTP (404|410)$/.test(detail) ? "This release isn't available for download. Update Magnitude, or try again later."
+    : cause.transient ? "Check your internet connection and try again."
+    : "The release host refused the download. Try again later."
+  return installationError("acquire", `Magnitude couldn't download its inference engine (${detail}${host}). ${advice}`)
 }
 
 const executableName = () =>

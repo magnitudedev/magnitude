@@ -1,6 +1,6 @@
 import { Duration, Effect, Either, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { portTaken, SERVER_START_TIMEOUT, type ServerSetupFailed, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
+import { explainServiceLog, portTaken, SERVER_START_TIMEOUT, type ServerSetupFailed, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
 
 const harness = (overrides: Partial<ServerSetupHost> = {}) => {
   const events: string[] = []
@@ -88,7 +88,7 @@ describe("magnitude server setup", () => {
       yield* TestClock.adjust(Duration.seconds(30))
       return yield* Fiber.join(fiber)
     }).pipe(Effect.provide(TestContext.TestContext)))
-    expect(Either.isLeft(result) && result.left.message).toBe([portTaken, "Its log ends with:", "  Started magnitude.service.",
+    expect(Either.isLeft(result) && result.left.message).toBe([portTaken, "Its log ends with:",
       "  Error: Port 10100 is already in use.", "See its log: journalctl -u magnitude",
       "Once it's fixed, run `magnitude server setup` again to finish, or `magnitude server remove` to undo setup."].join("\n"))
     expect(h.events).toEqual(["root _server-install ada"])
@@ -141,6 +141,27 @@ describe("magnitude server setup", () => {
     const h = harness({ runRootStep: () => Effect.fail({ _tag: "ServerSetupFailed", message: "denied" } as never) })
     expect(Either.isLeft(await h.run(serverSetup))).toBe(true)
     expect(h.events).toEqual([])
+  })
+})
+
+describe("explainServiceLog", () => {
+  const engine = "Magnitude couldn't download its inference engine (HTTP 404 from github.com). This release isn't available for download. Update Magnitude, or try again later."
+  it("quotes the service's final word rather than the service manager's lines", () => {
+    expect(explainServiceLog([
+      "[15:02:44.838] INFO (#12): Network access resolved", "  bind: 127.0.0.1",
+      `[15:02:44.968] ERROR (#61): ACN application startup failed: ${engine}`,
+      engine,
+      "magnitude.service: Main process exited, code=exited, status=1/FAILURE",
+      "magnitude.service: Failed with result 'exit-code'.",
+      "magnitude.service: Scheduled restart job, restart counter is at 3.",
+      "Stopped magnitude.service - Magnitude server.",
+      "Started magnitude.service - Magnitude server.",
+      "[15:02:49.240] INFO (#12): Network access resolved", "  bind: 127.0.0.1",
+    ])).toEqual([engine])
+  })
+  it("falls back to the service's last logged error", () => {
+    expect(explainServiceLog([`[15:02:44.968] ERROR (#61): ACN application startup failed: ${engine}`, "  source: Default",
+      "magnitude.service: Main process exited, code=exited, status=1/FAILURE"])).toEqual([`ACN application startup failed: ${engine}`])
   })
 })
 

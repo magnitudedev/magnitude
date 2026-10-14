@@ -115,7 +115,7 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
         return yield* new ServiceChildExited({ code, diagnostic: yield* child.diagnosticTail })
       }))),
       startupDeadline,
-    )).pipe(Effect.tapErrorCause(cause => Cause.isInterruptedOnly(cause) ? Effect.void :
+    )).pipe(Effect.tapErrorCause(cause => Cause.isInterruptedOnly(cause) || command.output === "Foreground" ? Effect.void :
       child.diagnosticTail.pipe(Effect.flatMap(diagnostic => diagnostic
         ? Effect.logError("Magnitude service diagnostics", diagnostic) : Effect.void))))
   }))
@@ -135,8 +135,9 @@ export const makeOwnedService = (command: OwnedChildCommand, rpcVersion: number,
       const lastReady = yield* Ref.get(readyAt)
       if (Option.isSome(lastReady) && now - lastReady.value >= 30_000) failures = 0
       if (failures >= 3) {
-        if (Exit.isFailure(result)) yield* Effect.logError(result.cause)
         const failure = Exit.isFailure(result) ? Cause.failureOption(result.cause) : Option.none()
+        // An expected failure's message is the Failed state's; only a defect needs its cause logged.
+        if (Exit.isFailure(result) && Option.isNone(failure)) yield* Effect.logError(result.cause)
         const message = Option.isSome(failure) && failure.value.message
           ? failure.value.message : "Magnitude service stopped unexpectedly."
         yield* change(state => terminal(state) ? state : machine.transition(state, "Failed", { message }))

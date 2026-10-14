@@ -236,7 +236,9 @@ without forwarding them to the terminal. Foreground ownership additionally forwa
 stderr, with at most one 16 KiB write outstanding. Slow terminals may lose live output; diagnostic
 collection continues independently. Terminal errors disable forwarding and cannot fail service
 admission, prevent process-tree retirement, or make shutdown wait for the terminal. Child ownership
-never closes the parent's terminal stream.
+never closes the parent's terminal stream. A failed attempt logs its retained output only when
+that output was not already forwarded, and the supervisor logs the cause of a failure only when it
+is a defect; an expected failure's message travels in the Failed state.
 
 On macOS and Linux, production startup automatically retires a verified previous standalone Magnitude installation
 before spawning its bundled service, while holding the application lock. This bounded upgrade is
@@ -346,7 +348,8 @@ changing nothing, while anything else answers on port 10100 (another account's M
 program), and afterwards it sends no request until the instance answering on the port is the one the
 service's owner reports. It waits a bounded two minutes for the service to answer, and fails sooner
 when the service manager keeps restarting the service or another program keeps the port; each failure
-quotes the service log's recent lines without stack frames and names the log (the journal on Linux,
+quotes the service's own account of why it stopped, its final plain line or else its last logged
+error, never the service manager's lines or stack frames, and names the log (the journal on Linux,
 `~/.magnitude/logs/server.log`, private to the person, on macOS);
 on macOS, where the service serves in the person's own profile, a re-run treats the Headless owner
 of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
