@@ -16,6 +16,9 @@ Restart=always
 RestartSec=3
 KillMode=control-group
 UMask=0007
+# Scratch files (catalog preparation, update packages) live in a /tmp systemd removes when the
+# service stops; the update installer runs inside the service, so it shares this /tmp.
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

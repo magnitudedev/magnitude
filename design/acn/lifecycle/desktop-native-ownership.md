@@ -325,7 +325,8 @@ The desktop app always uses the person's own profile. Every local account reache
 owner control, as loopback HTTP already admits them, with no group membership or new login: the data
 directory (0711) and the ownership directory (0711) are traversable but not listable, and the control
 socket is 0666. The lock stays 0600, and the unit's `UMask=0007` keeps the data, configuration and
-keys inside private to the service account. Setup adds no one to the `magnitude` group, which is
+keys inside private to the service account. The unit's `PrivateTmp=true` gives the service, and the update installer it
+runs, its own /tmp, which systemd removes when the service stops. Setup adds no one to the `magnitude` group, which is
 only the service's primary group. Anyone else running
 `serve` while the profile is active is refused, since the service already serves.
 
