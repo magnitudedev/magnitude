@@ -13,7 +13,7 @@ import { renderUnixInstallationScript } from "./installation-scripts"
 const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "utf8" }).stdout.trim()
 const systemTools = ["cat", "cp", "cut", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
-  { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n.*magnitude\.deb\n$/ },
+  { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n-o\nDPkg::Lock::Timeout=300\n.*magnitude\.deb\n$/ },
   { manager: "pacman", package: "pacman", receipt: /^-U\n--noconfirm\n.*magnitude\.pacman\n$/ },
 ] as const
 
