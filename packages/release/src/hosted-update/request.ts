@@ -15,9 +15,14 @@ export const UpdateOutcomeKind = Schema.Literal("applied", "failed", "deferred")
 /** Which application owner made the request: the desktop app, `serve` run by hand, or the system service. */
 export const UpdateOwner = Schema.Literal("desktop", "headless", "service")
 export type UpdateOwner = typeof UpdateOwner.Type
+/**
+ * An installation attempt's result. `version` is the release attempted and `from` the version that
+ * was running when it was prepared; `from` is absent only for preparations recorded by older clients.
+ */
 export const UpdateOutcome = Schema.Struct({
   outcome: UpdateOutcomeKind,
   version: Version,
+  from: Schema.optionalWith(Version, { as: "Option", exact: true }),
   reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
 }).pipe(Schema.filter(outcome => (outcome.outcome === "failed") === Option.isSome(outcome.reason)))
 export type UpdateOutcome = typeof UpdateOutcome.Type
@@ -39,9 +44,10 @@ export const UpdateRequestFields = Schema.Struct({
   outcome: Schema.optionalWith(UpdateOutcomeKind, { as: "Option", exact: true }),
   outcome_version: Schema.optionalWith(Version, { as: "Option", exact: true }),
   outcome_reason: Schema.optionalWith(UpdateOutcomeReason, { as: "Option", exact: true }),
+  outcome_from: Schema.optionalWith(Version, { as: "Option", exact: true }),
 })
 export const UpdateRequest = UpdateRequestFields.pipe(Schema.filter(request => Option.isNone(request.outcome)
-  ? Option.isNone(request.outcome_version) && Option.isNone(request.outcome_reason)
+  ? Option.isNone(request.outcome_version) && Option.isNone(request.outcome_reason) && Option.isNone(request.outcome_from)
   : Option.isSome(request.outcome_version) && (request.outcome.value === "failed") === Option.isSome(request.outcome_reason)))
 export type UpdateRequest = typeof UpdateRequest.Type
 export class InvalidUpdateRequest extends Schema.TaggedError<InvalidUpdateRequest>()("InvalidUpdateRequest", {}) {}

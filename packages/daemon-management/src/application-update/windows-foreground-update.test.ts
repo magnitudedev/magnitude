@@ -37,7 +37,7 @@ const run = async (options: { attempted?: boolean; installerCode?: number; versi
   }))
   const step = (event: string) => Effect.sync(() => { events.push(event) })
   const store = PreparedUpdateStore.of({
-    read: Effect.succeed(Option.some({ release, installation: options.attempted ? { _tag: "Attempted" } : { _tag: "Unattempted" } })),
+    read: Effect.succeed(Option.some({ release, from: Option.none(), installation: options.attempted ? { _tag: "Attempted" } : { _tag: "Unattempted" } })),
     verify: () => step("verify").pipe(Effect.as("installer.exe")), recordAttempt: () => step("attempt"),
     recordFailure: () => step("failure"), complete: () => step("complete"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     prepare: () => Effect.die("Unexpected download"),

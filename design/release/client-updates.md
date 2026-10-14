@@ -104,3 +104,5 @@ installation.
 - A failed unattended installation is never retried in a loop: the failed version is not downloaded
   or installed unattended again, and no unattended attempt starts within an hour, across restarts.
 - Packaged CLI and service versions match the application version.
+- The update server accepts every request field a release sends (such as `owner` and
+  `outcome_from`) before that release is published, since it rejects unknown fields.

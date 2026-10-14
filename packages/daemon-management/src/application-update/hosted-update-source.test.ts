@@ -39,7 +39,7 @@ const options = { origin: "https://example.com", metadata, dataDirectory: "/unus
 describe("hosted update checks", () => {
   it("sends a pending outcome with the check and marks it reported only after the server answers", async () => {
     checks.length = 0
-    const outcome: UpdateOutcome = { outcome: "failed", version: "1.0.1", reason: Option.some("install") }
+    const outcome: UpdateOutcome = { outcome: "failed", version: "1.0.1", from: Option.some("1.0.0"), reason: Option.some("install") }
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const reported = yield* Ref.make(0)
       const source = yield* hostedUpdateSource(options, () => Effect.void).pipe(Effect.provideService(PreparedUpdateStore, store(Option.some(outcome), reported)))

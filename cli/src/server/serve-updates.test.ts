@@ -19,14 +19,14 @@ const harness = (options: {
   const notices: string[] = []
   let outcome = Option.fromNullable(options.outcome)
   let hold = Option.fromNullable(options.hold)
-  let pending = Option.some<PreparedUpdate>({ release, installation: { _tag: "Unattempted" } })
+  let pending = Option.some<PreparedUpdate>({ release, from: Option.some("0.0.9"), installation: { _tag: "Unattempted" } })
   const idle = [...(options.idle ?? [true])]
   const lockFree = [...(options.lockFree ?? [true])]
   const store = {
     read: Effect.sync(() => pending),
     outcome: Effect.sync(() => outcome),
     recordOutcome: (value: UpdateOutcome) => Effect.sync(() => { outcome = Option.some(value); events.push(`outcome ${value.outcome}${Option.match(value.reason, { onNone: () => "", onSome: reason => `/${reason}` })}`) }),
-    complete: () => Effect.sync(() => { outcome = Option.some({ outcome: "applied", version: release.version, reason: Option.none() }); pending = Option.none(); events.push("outcome applied") }),
+    complete: () => Effect.sync(() => { outcome = Option.some({ outcome: "applied", version: release.version, from: Option.some("0.0.9"), reason: Option.none() }); pending = Option.none(); events.push("outcome applied") }),
     recordFailure: (_: unknown, kind: string) => Effect.sync(() => { events.push(`failed/${kind}`) }),
     discard: Effect.sync(() => { pending = Option.none(); events.push("discard") }),
     hold: Effect.sync(() => hold),
@@ -104,6 +104,7 @@ describe("install when idle", () => {
       expect(yield* machine.installWhenIdle(release.version)).toBe(true)
       yield* machine.install
       expect(h.events).toEqual(["idle", "outcome deferred", "hold - 900000"])
+      expect(h.outcome()).toEqual(Option.some({ outcome: "deferred", version: release.version, from: Option.some("0.0.9"), reason: Option.none() }))
       const retry = yield* machine.installWhenIdle(release.version).pipe(Effect.fork)
       yield* TestClock.adjust(Duration.minutes(15))
       expect(yield* Fiber.join(retry)).toBe(true)
@@ -115,6 +116,7 @@ describe("install when idle", () => {
     await h.run(machine => machine.install)
     // The failed download is dropped so a newer release can be fetched; its outcome stays to be reported.
     expect(h.events).toEqual(["install", "failed/install", `hold ${release.version} 3600000`, "outcome failed/install", "discard"])
+    expect(h.outcome()).toEqual(Option.some({ outcome: "failed", version: release.version, from: Option.some("0.0.9"), reason: Option.some("install") }))
     expect(h.notices.at(-1)).toContain("Serving the current version.")
   })
   it("waits out the hold after a failed install, even in a restarted owner, instead of trying again at once", async () => {
@@ -139,21 +141,21 @@ describe("install when idle", () => {
     expect(h.hold()).toEqual(Option.some({ version: Option.some("98.0.0"), until: 3_600_000 }))
   })
   it("turns an unreported applied outcome into failed/startup and reports it before exiting", async () => {
-    const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, reason: Option.none() } })
+    const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, from: Option.some("0.0.9"), reason: Option.none() } })
     const reports: Array<Option.Option<UpdateOutcome>> = []
     const report = Effect.sync(() => { reports.push(h.outcome()) })
     await h.run(machine => machine.startupFailed(report))
-    expect(reports).toEqual([Option.some({ outcome: "failed", version: CLI_VERSION, reason: Option.some("startup") })])
+    expect(reports).toEqual([Option.some({ outcome: "failed", version: CLI_VERSION, from: Option.some("0.0.9"), reason: Option.some("startup") })])
   })
   it("reports a startup failure once: restarts after it was sent make no request", async () => {
-    const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, reason: Option.none() } })
+    const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, from: Option.some("0.0.9"), reason: Option.none() } })
     let reports = 0
     const report = Effect.sync(() => { reports += 1 }).pipe(Effect.zipRight(h.markReported))
     for (let restart = 0; restart < 3; restart++) await h.run(machine => machine.startupFailed(report))
     expect(reports).toBe(1)
   })
   it("leaves other outcomes alone when a start fails", async () => {
-    const h = harness({ outcome: { outcome: "applied", version: "0.0.1", reason: Option.none() } })
+    const h = harness({ outcome: { outcome: "applied", version: "0.0.1", from: Option.some("0.0.0"), reason: Option.none() } })
     await h.run(machine => machine.startupFailed(Effect.void))
     expect(h.events).toEqual([])
   })

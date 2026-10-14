@@ -38,7 +38,7 @@ describe("Linux prepared update", () => {
       expect(await readFile(join(directory, "updates", "magnitude.deb"))).toEqual(bytes)
       const pending = await Effect.runPromise(makePreparedUpdateStore(options).pipe(Effect.flatMap(store => store.read),
         Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer)))))
-      expect(Option.getOrThrow(pending)).toEqual({ release, installation: { _tag: "Unattempted" } })
+      expect(Option.getOrThrow(pending)).toEqual({ release, from: Option.some("1.0.0"), installation: { _tag: "Unattempted" } })
     } finally { await rm(directory, { recursive: true, force: true }) }
   })
 })

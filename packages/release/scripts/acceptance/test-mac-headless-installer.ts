@@ -85,7 +85,7 @@ const run = Effect.gen(function* () {
     yield* fs.copyFile(archive, transfer)
     yield* Effect.gen(function* () {
       const store = yield* makePreparedUpdateStore({ dataDirectory, target: { os: "darwin", arch: "arm64", package: "mac-zip" }, trustedPublishers: new Map([["isolated", keys.publicKey]]) })
-      yield* store.prepare(transfer, release)
+      yield* store.prepare(transfer, release, previous)
     }).pipe(Effect.provide(unixPrivateFilePermissions))
     if (previous === versions[0]) yield* command(join(resources, "magnitude"), ["update", "install"], environment)
     else yield* Effect.scoped(Effect.gen(function* () {

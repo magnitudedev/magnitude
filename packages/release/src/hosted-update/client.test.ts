@@ -49,11 +49,13 @@ describe("hosted update client", () => {
       expect(Option.isSome(await Effect.runPromise(Effect.option(decodeUpdateRequest(url, Math.floor(Date.now() / 1000)))))).toBe(true)
       return new Response(null, { status: 204 })
     }
-    await Effect.runPromise(check(fetch, { reason: "launch", outcome: Option.some({ outcome: "failed", version: "1.0.1", reason: Option.some("verify") }) }))
-    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", reason: Option.none() }) }))
+    await Effect.runPromise(check(fetch, { reason: "launch", outcome: Option.some({ outcome: "failed", version: "1.0.1", from: Option.some("1.0.0"), reason: Option.some("verify") }) }))
+    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.some("0.9.0"), reason: Option.none() }) }))
+    await Effect.runPromise(check(fetch, { reason: "scheduled", outcome: Option.some({ outcome: "applied", version: "1.0.0", from: Option.none(), reason: Option.none() }) }))
     await Effect.runPromise(check(fetch, { reason: "manual", outcome: Option.none() }))
-    expect(seen.map(url => [url.searchParams.get("reason"), url.searchParams.get("outcome"), url.searchParams.get("outcome_version"), url.searchParams.get("outcome_reason")])).toEqual([
-      ["launch", "failed", "1.0.1", "verify"], ["scheduled", "applied", "1.0.0", null], ["manual", null, null, null],
+    expect(seen.map(url => [url.searchParams.get("reason"), url.searchParams.get("outcome"), url.searchParams.get("outcome_version"), url.searchParams.get("outcome_reason"), url.searchParams.get("outcome_from")])).toEqual([
+      ["launch", "failed", "1.0.1", "verify", "1.0.0"], ["scheduled", "applied", "1.0.0", null, "0.9.0"],
+      ["scheduled", "applied", "1.0.0", null, null], ["manual", null, null, null, null],
     ])
   })
   it("sends a verifiable complete request and accepts 204 without a body", async () => {

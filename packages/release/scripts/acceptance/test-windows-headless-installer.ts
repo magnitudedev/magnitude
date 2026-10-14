@@ -53,14 +53,14 @@ const run = Effect.gen(function* () {
     yield* fs.writeFileString(join(output, replacement, "prepared-release.json"), yield* Schema.encode(Schema.parseJson(UpdateRelease))(release))
   }
   yield* command(join(output, versions[0], "artifacts", windowsDesktopInstaller(versions[0])), ["/S"])
-  for (const replacement of [versions[1], versions[2]]) {
+  for (const [previous, replacement] of [[versions[0], versions[1]], [versions[1], versions[2]]] as const) {
     const archive = join(output, replacement, "artifacts", windowsDesktopInstaller(replacement))
     const release = yield* Schema.decodeUnknown(Schema.parseJson(UpdateRelease))(yield* fs.readFileString(join(output, replacement, "prepared-release.json")))
     const transfer = join(output, "transfer.exe")
     yield* fs.copyFile(archive, transfer)
     yield* Effect.gen(function* () {
       const store = yield* makePreparedUpdateStore({ dataDirectory, target: { os: "windows", arch: "x64", package: "windows-exe" }, trustedPublishers: new Map([["isolated", keys.publicKey]]) })
-      yield* store.prepare(transfer, release)
+      yield* store.prepare(transfer, release, previous)
     }).pipe(Effect.provide(windowsPrivateFilePermissions(nativeAddon)))
     if (replacement === versions[1]) yield* command(launcher, ["update", "install"])
     else yield* Effect.scoped(Effect.gen(function* () {

@@ -7,7 +7,7 @@ import { UpdateRequest, UpdateRequestFields, type UpdateCheckReason, type Update
 import { acceptsUpdateRelease, verifyUpdateRelease, UpdateRelease, ReleaseTarget } from "./release"
 import { releaseChannelOf } from "../client-update/release-channels"
 
-export const UpdateClientMetadata = UpdateRequestFields.pipe(Schema.omit("protocol", "product", "channel", "ts", "nonce", "reason", "outcome", "outcome_version", "outcome_reason"))
+export const UpdateClientMetadata = UpdateRequestFields.pipe(Schema.omit("protocol", "product", "channel", "ts", "nonce", "reason", "outcome", "outcome_version", "outcome_reason", "outcome_from"))
 export type UpdateClientMetadata = typeof UpdateClientMetadata.Type
 export interface UpdateCheck {
   readonly reason: UpdateCheckReason
@@ -34,6 +34,7 @@ const signedRequest = (options: HostedUpdateConnection, path: string, check: Opt
     outcome: Option.map(outcome, outcome => outcome.outcome),
     outcome_version: Option.map(outcome, outcome => outcome.version),
     outcome_reason: Option.flatMap(outcome, outcome => outcome.reason),
+    outcome_from: Option.flatMap(outcome, outcome => outcome.from),
   }).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "request" })))
   const encoded = yield* Schema.encode(UpdateRequest)(fields).pipe(Effect.mapError(() => new HostedUpdateCheckFailed({ reason: "request" })))
   const url = yield* Effect.try({ try: () => {

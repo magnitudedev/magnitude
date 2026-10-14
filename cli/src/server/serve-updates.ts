@@ -100,7 +100,8 @@ export const makeIdleInstallation = Effect.gen(function* () {
 
   const defer = (version: string) => Effect.gen(function* () {
     const store = yield* system.store
-    yield* store.recordOutcome({ outcome: "deferred", version, reason: Option.none() })
+    const from = yield* store.read.pipe(Effect.map(Option.flatMap(pending => pending.from)), Effect.orElseSucceed(() => Option.none()))
+    yield* store.recordOutcome({ outcome: "deferred", version, from, reason: Option.none() })
     yield* holdFor(deferredRetry, Option.none())
     yield* system.notify(`Magnitude ${version} is waiting for another Magnitude to quit; trying again later.`)
   })
@@ -143,7 +144,7 @@ export const makeIdleInstallation = Effect.gen(function* () {
     const failed = Option.filter(pending, update => update.installation._tag === "Failed")
     yield* holdFor(failureBackoff, Option.map(failed, update => update.release.version))
     if (Option.isSome(failed) && failed.value.installation._tag === "Failed") {
-      yield* store.recordOutcome({ outcome: "failed", version: failed.value.release.version, reason: Option.some(failed.value.installation.kind) })
+      yield* store.recordOutcome({ outcome: "failed", version: failed.value.release.version, from: failed.value.from, reason: Option.some(failed.value.installation.kind) })
       yield* store.discard
     }
   }).pipe(Effect.ignore, Effect.zipRight(system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))))
@@ -153,7 +154,7 @@ export const makeIdleInstallation = Effect.gen(function* () {
     const outcome = yield* store.outcome
     if (Option.isNone(outcome)) return
     if (outcome.value.outcome === "applied" && outcome.value.version === CLI_VERSION) {
-      yield* store.recordOutcome({ outcome: "failed", version: CLI_VERSION, reason: Option.some("startup") })
+      yield* store.recordOutcome({ ...outcome.value, outcome: "failed", reason: Option.some("startup") })
     }
     yield* report
   })), Effect.ignore)

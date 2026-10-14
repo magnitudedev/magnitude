@@ -29,12 +29,12 @@ const fixture = Effect.gen(function* () {
   yield* fs.writeFileString(join(bundle, "version"), "0.1.5")
   const events: string[] = []
   const step = (name: string) => Effect.sync(() => { events.push(name) })
-  const prepared = yield* Ref.make<Option.Option<PreparedUpdate>>(Option.some({ release, installation: { _tag: "Unattempted" } }))
+  const prepared = yield* Ref.make<Option.Option<PreparedUpdate>>(Option.some({ release, from: Option.none(), installation: { _tag: "Unattempted" } }))
   const store = PreparedUpdateStore.of({
     read: Ref.get(prepared),
     verify: () => step("verify").pipe(Effect.as("archive")),
-    recordAttempt: () => step("attempt").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Attempted" } })))),
-    recordFailure: (_, kind, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, installation: { _tag: "Failed", kind, reason } })))),
+    recordAttempt: () => step("attempt").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, from: Option.none(), installation: { _tag: "Attempted" } })))),
+    recordFailure: (_, kind, reason) => step("failure").pipe(Effect.zipRight(Ref.set(prepared, Option.some({ release, from: Option.none(), installation: { _tag: "Failed", kind, reason } })))),
     discard: step("discard").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))),
     complete: () => step("complete").pipe(Effect.zipRight(Ref.set(prepared, Option.none()))), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
     prepare: () => Effect.die("Unexpected download"),

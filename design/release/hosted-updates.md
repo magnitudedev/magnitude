@@ -74,8 +74,17 @@ check. A `startup` failure is sent by the failing owner with an immediate check 
 exiting, since an owner that never becomes ready makes no scheduled check. Other outcomes are sent
 once with the next check.
 
+Each outcome also carries `outcome_from`, the version that was running when the attempted release
+was prepared, recorded with the preparation. An `applied` outcome is reported by the new version,
+so the request's own `version` is the installed one and the update server must take the starting
+version from `outcome_from`. A `startup` failure is likewise reported by the version that failed to
+start. `failed` and `deferred` outcomes send it too, so every outcome follows one rule. Preparations recorded by clients older than this field have no
+starting version, and their outcomes omit it. The server rejects `outcome_from` without an outcome.
+
 Every request names its `owner`: `desktop`, `headless` (`serve` run by hand, or a finite CLI
-command), or `service` (the system service). Requests from older clients have no owner. The
+command), or `service` (the system service). Requests from older clients have no owner. The update
+server rejects unknown request fields, so it must accept a new field such as `owner` or
+`outcome_from` before any application release that sends it is published. The
 privileged Linux helper accepts exactly its request path and an optional `--parent-stdin`, since
 sudo and Polkit admit any arguments after its name; anything else is refused before work starts,
 by both the Polkit wrapper and the helper itself.

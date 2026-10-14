@@ -26,12 +26,12 @@ export const preparedUpdateFailure = (record: PreparedUpdate): Option.Option<str
 }
 
 const outcomeOf = (record: PreparedUpdate, applied: boolean): Option.Option<UpdateOutcome> => {
-  const version = record.release.version
-  if (applied) return Option.some({ outcome: "applied", version, reason: Option.none() })
+  const attempt = { version: record.release.version, from: record.from }
+  if (applied) return Option.some({ ...attempt, outcome: "applied", reason: Option.none() })
   switch (record.installation._tag) {
     case "Unattempted": return Option.none()
-    case "Attempted": return Option.some({ outcome: "failed", version, reason: Option.some("incomplete") })
-    case "Failed": return Option.some({ outcome: "failed", version, reason: Option.some(record.installation.kind) })
+    case "Attempted": return Option.some({ ...attempt, outcome: "failed", reason: Option.some("incomplete") })
+    case "Failed": return Option.some({ ...attempt, outcome: "failed", reason: Option.some(record.installation.kind) })
   }
 }
 

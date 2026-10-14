@@ -1,6 +1,6 @@
 import { CommandExecutor } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { EventEmitter } from "node:events"
 import { spawn } from "node:child_process"
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises"
@@ -61,7 +61,7 @@ describe("Linux update handoff", () => {
     const directory = await mkdtemp(join(tmpdir(), "linux-handoff-"))
     const input = request(directory)
     await mkdir(join(directory, "updates"))
-    await writeFile(join(directory, "updates", "update.json"), Schema.encodeSync(Schema.parseJson(PreparedUpdate))({ release: input.release, installation: { _tag: "Attempted" } }))
+    await writeFile(join(directory, "updates", "update.json"), Schema.encodeSync(Schema.parseJson(PreparedUpdate))({ release: input.release, from: Option.none(), installation: { _tag: "Attempted" } }))
     vi.mocked(spawn).mockImplementation(() => {
       const child = Object.assign(new EventEmitter(), { unref: vi.fn() })
       queueMicrotask(() => child.emit("spawn"))

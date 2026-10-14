@@ -1,5 +1,5 @@
 import { CommandExecutor } from "@effect/platform"
-import { Effect, Layer, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { EventEmitter } from "node:events"
 import { spawn } from "node:child_process"
 import { PassThrough, Writable } from "node:stream"
@@ -71,7 +71,7 @@ describe("Windows update handoff", () => {
     const directory = await mkdtemp(join(tmpdir(), "windows-update-result-"))
     const attempt = { ...request, dataDirectory: directory }
     await mkdir(join(directory, "updates"))
-    await writeFile(join(directory, "updates", "update.json"), Schema.encodeSync(Schema.parseJson(PreparedUpdate))({ release: request.release, installation: { _tag: "Attempted" } }))
+    await writeFile(join(directory, "updates", "update.json"), Schema.encodeSync(Schema.parseJson(PreparedUpdate))({ release: request.release, from: Option.none(), installation: { _tag: "Attempted" } }))
     vi.stubGlobal("process", { ...process, platform: "win32", execPath: `${request.helperDirectory}\\magnitude.exe` })
     const events: string[] = []
     vi.mocked(spawn).mockImplementation(() => {

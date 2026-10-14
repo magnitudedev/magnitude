@@ -27,7 +27,7 @@ export const makeWindowsUpdateSource = (options: HostedUpdateSourceOptions & {
   }
   return {
     source: yield* hostedUpdateSource(options, (archive, release) => verifier.verify(archive).pipe(
-      Effect.zipRight(store.prepare(archive, release)),
+      Effect.zipRight(store.prepare(archive, release, options.metadata.version)),
       Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })),
     )),
     installer: PreparedUpdateInstaller.of({

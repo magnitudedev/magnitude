@@ -42,7 +42,7 @@ export const makeInstalledUpdatePreparation = (options: {
         yield* Effect.flatMap(WindowsInstallerVerifier, verifier => verifier.verify(archive)).pipe(
           Effect.provide(nativeWindowsInstallerVerifier(options.addonPath, configuration.windowsPublisher.value)))
       }
-      yield* store.prepare(archive, release)
+      yield* store.prepare(archive, release, metadata.version)
     }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
     return yield* hostedUpdateSource({ ...configuration, metadata, sign: identity.sign,
       dataDirectory: options.dataDirectory, userAgent: `Magnitude/${options.version} ${options.architecture} ${metadata.os}/${options.osVersion}` }, stage).pipe(

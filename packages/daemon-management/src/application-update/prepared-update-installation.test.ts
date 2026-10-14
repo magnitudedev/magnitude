@@ -7,7 +7,7 @@ import { PreparedUpdateInstaller, installPreparedUpdate, reconcilePreparedUpdate
 
 const release = { version: "2.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }
 const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattempted" }) => {
-  let pending = Option.some<PreparedUpdate>({ release, installation })
+  let pending = Option.some<PreparedUpdate>({ release, from: Option.some("1.0.0"), installation })
   const events: string[] = []
   const outcomes: UpdateOutcome[] = []
   const store: PreparedUpdateStore = {
@@ -16,8 +16,8 @@ const harness = (installation: PreparedUpdate["installation"] = { _tag: "Unattem
     read: Effect.sync(() => pending),
     prepare: () => Effect.die("No download belongs in restart recovery"),
     verify: () => Effect.sync(() => { events.push("verify"); return "retained-installer" }),
-    recordAttempt: () => Effect.sync(() => { events.push("attempt"); pending = Option.some({ release, installation: { _tag: "Attempted" } }) }),
-    recordFailure: (_, kind, reason) => Effect.sync(() => { events.push(`failure:${kind}`); pending = Option.some({ release, installation: { _tag: "Failed", kind, reason } }) }),
+    recordAttempt: () => Effect.sync(() => { events.push("attempt"); pending = Option.some({ release, from: Option.some("1.0.0"), installation: { _tag: "Attempted" } }) }),
+    recordFailure: (_, kind, reason) => Effect.sync(() => { events.push(`failure:${kind}`); pending = Option.some({ release, from: Option.some("1.0.0"), installation: { _tag: "Failed", kind, reason } }) }),
     complete: () => Effect.sync(() => { events.push("complete"); pending = Option.none() }),
     discard: Effect.sync(() => { events.push("discard"); pending = Option.none() }),
     removeAbandonedTransfers: Effect.sync(() => { events.push("cleanup"); }),
@@ -52,7 +52,7 @@ describe("prepared update installation", () => {
   it("records the applied outcome once a prepared release is the installed one", async () => {
     const h = harness({ _tag: "Attempted" })
     expect(Option.isNone(await h.run(reconcilePreparedUpdate("2.0.0")))).toBe(true)
-    expect(h.outcomes).toEqual([{ outcome: "applied", version: "2.0.0", reason: Option.none() }])
+    expect(h.outcomes).toEqual([{ outcome: "applied", version: "2.0.0", from: Option.some("1.0.0"), reason: Option.none() }])
   })
   it.each([
     [{ _tag: "Attempted" }, "incomplete"],
@@ -65,12 +65,12 @@ describe("prepared update installation", () => {
   ] as const)("records a still-pending %o as a failed outcome classified %s", async (installation, reason) => {
     const h = harness(installation)
     expect(Option.isSome(await h.run(reconcilePreparedUpdate("1.0.0")))).toBe(true)
-    expect(h.outcomes).toEqual([{ outcome: "failed", version: "2.0.0", reason: Option.some(reason) }])
+    expect(h.outcomes).toEqual([{ outcome: "failed", version: "2.0.0", from: Option.some("1.0.0"), reason: Option.some(reason) }])
   })
   it.each([
     [{ _tag: "Unattempted" }, []],
-    [{ _tag: "Attempted" }, [{ outcome: "failed", version: "2.0.0", reason: Option.some("incomplete") }]],
-    [{ _tag: "Failed", kind: "install", reason: "The package refused." }, [{ outcome: "failed", version: "2.0.0", reason: Option.some("install") }]],
+    [{ _tag: "Attempted" }, [{ outcome: "failed", version: "2.0.0", from: Option.some("1.0.0"), reason: Option.some("incomplete") }]],
+    [{ _tag: "Failed", kind: "install", reason: "The package refused." }, [{ outcome: "failed", version: "2.0.0", from: Option.some("1.0.0"), reason: Option.some("install") }]],
   ] as const)("drops a download superseded by a newer installed version without calling %o applied", async (installation, outcomes) => {
     const h = harness(installation)
     expect(Option.isNone(await h.run(reconcilePreparedUpdate("3.0.0")))).toBe(true)

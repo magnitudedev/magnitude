@@ -60,6 +60,26 @@ describe("Ollama-compatible update authentication", () => {
       expect(Either.isLeft(await decode(fields))).toBe(true)
     }
   })
+  it("admits outcome_from only with an outcome", async () => {
+    const withFields = (fields: Record<string, string>) => { const changed = url(); for (const [key, value] of Object.entries(fields)) changed.searchParams.set(key, value); return changed }
+    const decode = (fields: Record<string, string>) => Effect.runPromise(Effect.either(decodeUpdateRequest(withFields(fields), 1000000)))
+    for (const fields of [
+      { outcome: "applied", outcome_version: "1.2.3", outcome_from: "1.2.2" },
+      { outcome: "failed", outcome_version: "1.2.4", outcome_reason: "install", outcome_from: "1.2.3" },
+      { outcome: "deferred", outcome_version: "1.2.4", outcome_from: "1.2.3" },
+    ] as Record<string, string>[]) {
+      const decoded = await decode(fields)
+      expect(Either.isRight(decoded) && Option.getOrNull(decoded.right.outcome_from)).toBe(fields.outcome_from)
+    }
+    const without = await decode({ outcome: "applied", outcome_version: "1.2.3" })
+    expect(Either.isRight(without) && Option.isNone(without.right.outcome_from)).toBe(true)
+    for (const fields of [
+      { outcome_from: "1.2.2" }, { outcome: "applied", outcome_version: "1.2.3", outcome_from: "bad" },
+      { outcome: "applied", outcome_version: "1.2.3", outcome_from: "" },
+    ] as Record<string, string>[]) {
+      expect(Either.isLeft(await decode(fields))).toBe(true)
+    }
+  })
   it("rejects malformed, noncanonical and oversized authorization", async () => {
     const signed = await Effect.runPromise(signUpdateRequest(pair.privateKey, url()))
     for (const value of ["", "x:y", signed + ":x", signed.replace(":", " :"), "a".repeat(1000)]) {

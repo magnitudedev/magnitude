@@ -16,7 +16,7 @@ const fixture = Effect.gen(function* () {
   const event = (name: string) => Effect.sync(() => { events.push(name) })
   const store = PreparedUpdateStore.of({
     read: event("read").pipe(Effect.zipRight(Ref.get(pending))),
-    prepare: (_archive, candidate) => event("publish").pipe(Effect.zipRight(Ref.set(pending, Option.some({ release: candidate, installation: { _tag: "Unattempted" } })))),
+    prepare: (_archive, candidate) => event("publish").pipe(Effect.zipRight(Ref.set(pending, Option.some({ release: candidate, from: Option.none(), installation: { _tag: "Unattempted" } })))),
     discard: event("discard").pipe(Effect.zipRight(Ref.set(pending, Option.none()))),
     removeAbandonedTransfers: event("scratch-cleanup"),
     outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,
@@ -27,7 +27,7 @@ const fixture = Effect.gen(function* () {
   const source = ApplicationUpdateSource.of({
     check: () => event("check").pipe(Effect.as(Option.some(release))),
     download: () => Effect.acquireRelease(event("download").pipe(Effect.as("archive")), () => event("retire-transfer")),
-    stage: archive => store.prepare(archive, release).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message }))),
+    stage: archive => store.prepare(archive, release, "1.0.0").pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message }))),
   })
   const provide = <A, E, R>(effect: Effect.Effect<A, E, R>) => effect.pipe(Effect.provideService(PreparedUpdateStore, store),
     Effect.provideService(ApplicationUpdateSource, source), Effect.provideService(UpdatePreferences, {
@@ -73,13 +73,13 @@ describe("finite application update preparation", () => {
   })))
   it.each(["Unattempted", "Attempted", "Failed"] as const)("preserves an existing %s installer without redownloading", tag => run(Effect.gen(function* () {
     const { pending, events, provide } = yield* fixture
-    yield* Ref.set(pending, Option.some({ release, installation: tag === "Failed" ? { _tag: tag, kind: "install", reason: "Install failed" } : { _tag: tag } }))
+    yield* Ref.set(pending, Option.some({ release, from: Option.none(), installation: tag === "Failed" ? { _tag: tag, kind: "install", reason: "Install failed" } : { _tag: tag } }))
     expect((yield* provide(runFiniteUpdatePreparation("download"))).transfer._tag).toBe(tag === "Unattempted" ? "Ready" : "InstallationFailed")
     expect(events).toEqual(["read"])
   })))
   it("keeps retained state when discard fails", () => run(Effect.gen(function* () {
     const { pending, provide, store } = yield* fixture
-    yield* Ref.set(pending, Option.some({ release, installation: { _tag: "Unattempted" } }))
+    yield* Ref.set(pending, Option.some({ release, from: Option.none(), installation: { _tag: "Unattempted" } }))
     expect(yield* provide(runFiniteUpdatePreparation("discard").pipe(Effect.provideService(PreparedUpdateStore, {
       ...store, discard: new PreparedUpdateFailed({ message: "Cleanup failed" }),
     }))).pipe(Effect.isFailure)).toBe(true)

@@ -14,7 +14,12 @@ export const UpdateInstallation = Schema.Union(
     kind: Schema.optionalWith(UpdateFailureReason, { default: () => "install", exact: true }),
   }),
 )
-export const PreparedUpdate = Schema.Struct({ release: UpdateRelease, installation: UpdateInstallation })
+/** `from` is the version that prepared the update; preparations recorded by older clients lack it. */
+export const PreparedUpdate = Schema.Struct({
+  release: UpdateRelease,
+  from: Schema.optionalWith(Version, { as: "Option", exact: true }),
+  installation: UpdateInstallation,
+})
 export type PreparedUpdate = typeof PreparedUpdate.Type
 /** Result of the last prepared update. Sent with the next update check and kept so it is reported once. */
 export const UpdateOutcomeRecord = Schema.Struct({ outcome: UpdateOutcome, reported: Schema.Boolean })
@@ -35,7 +40,8 @@ export class PreparedUpdateFailed extends Schema.TaggedError<PreparedUpdateFaile
 
 export interface PreparedUpdateStore {
   readonly read: Effect.Effect<Option.Option<PreparedUpdate>, PreparedUpdateFailed>
-  readonly prepare: (archive: string, release: UpdateRelease) => Effect.Effect<void, PreparedUpdateFailed>
+  /** `from` is the running version, reported with the attempt's outcome. */
+  readonly prepare: (archive: string, release: UpdateRelease, from: string) => Effect.Effect<void, PreparedUpdateFailed>
   readonly verify: (release: UpdateRelease) => Effect.Effect<string, PreparedUpdateFailed>
   readonly recordAttempt: (release: UpdateRelease) => Effect.Effect<void, PreparedUpdateFailed>
   readonly recordFailure: (release: UpdateRelease, kind: UpdateFailureReason, reason: string) => Effect.Effect<void, PreparedUpdateFailed>
@@ -101,7 +107,7 @@ const makePreparedUpdateRecord = (dataDirectory: string) => Effect.gen(function*
   const change = (release: UpdateRelease, installation: PreparedUpdate["installation"]) => Effect.gen(function* () {
     const current = yield* read
     if (Option.isNone(current) || !equalRelease(current.value.release, release)) return yield* failed("The prepared update has changed.")
-    yield* write({ release, installation })
+    yield* write({ ...current.value, installation })
   }).pipe(Effect.uninterruptible)
 
   const outcomes = record("outcome.json", UpdateOutcomeRecord)
@@ -170,8 +176,10 @@ export const makePreparedUpdateStore = (options: {
     verify: release => verifyFile(installer, release),
     recordAttempt: release => change(release, { _tag: "Attempted" }),
     recordFailure: (release, kind, reason) => change(release, failureState(kind, reason)),
-    complete: release => recordOutcome({ outcome: "applied", version: release.version, reason: Option.none() }).pipe(Effect.zipRight(discard)),
-    prepare: (archive, release) => Effect.gen(function* () {
+    complete: release => read.pipe(
+      Effect.flatMap(current => recordOutcome({ outcome: "applied", version: release.version, from: Option.flatMap(current, current => current.from), reason: Option.none() })),
+      Effect.zipRight(discard)),
+    prepare: (archive, release, from) => Effect.gen(function* () {
       yield* verifyUpdateRelease(release, options.target, options.trustedPublishers)
       if (Option.isSome(yield* read)) return yield* failed("An update is already prepared.")
       yield* permissions.prepareDirectory(directory)
@@ -183,7 +191,7 @@ export const makePreparedUpdateStore = (options: {
         yield* Effect.gen(function* () {
           yield* fs.rename(temporary, installer)
           yield* syncDirectory
-          yield* write({ release, installation: { _tag: "Unattempted" } })
+          yield* write({ release, from: Option.some(from), installation: { _tag: "Unattempted" } })
         }).pipe(Effect.uninterruptible)
       }), () => fs.remove(temporary, { force: true }).pipe(Effect.ignore))
     }).pipe(Effect.mapError(error => error instanceof PreparedUpdateFailed ? error : failed("The downloaded update could not be saved."))),

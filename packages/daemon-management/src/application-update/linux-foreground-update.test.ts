@@ -15,7 +15,7 @@ const fixture = (scenario: "success" | "absent" | "verify" | "attempt" | "instal
   const step = (name: string) => Effect.sync(() => { events.push(name) })
   const failed = new PreparedUpdateFailed({ message: "Fixture refused" })
   const store = PreparedUpdateStore.of({
-    read: Effect.succeed(scenario === "absent" ? Option.none() : Option.some({ release, installation: { _tag: "Unattempted" } })),
+    read: Effect.succeed(scenario === "absent" ? Option.none() : Option.some({ release, from: Option.none(), installation: { _tag: "Unattempted" } })),
     verify: () => step("verify").pipe(Effect.zipRight(scenario === "verify" ? failed : Effect.succeed("archive"))),
     recordAttempt: () => step("attempt").pipe(Effect.zipRight(scenario === "attempt" ? failed : Effect.void)),
     recordFailure: (_, kind) => step(`failure:${kind}`), complete: () => step("complete"), discard: step("discard"), removeAbandonedTransfers: Effect.void, outcome: Effect.succeed(Option.none()), recordOutcome: () => Effect.void, markOutcomeReported: Effect.void, hold: Effect.succeed(Option.none()), recordHold: () => Effect.void, releaseHold: Effect.void,

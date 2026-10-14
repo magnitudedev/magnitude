@@ -17,7 +17,7 @@ describe("application-owned updates", () => {
   it.each([false, true])("discards a retained update only after durable cleanup succeeds (failure=%s)", fail => run(Effect.gen(function* () {
     const store = yield* PreparedUpdateStore
     const calls = yield* Ref.make(0)
-    const owner = yield* makeApplicationUpdate(Option.some({ release: candidate, installation: { _tag: "Failed", kind: "verify", reason: "Invalid retained bytes" } })).pipe(
+    const owner = yield* makeApplicationUpdate(Option.some({ release: candidate, from: Option.none(), installation: { _tag: "Failed", kind: "verify", reason: "Invalid retained bytes" } })).pipe(
       Effect.provideService(PreparedUpdateStore, { ...store, discard: Ref.update(calls, n => n + 1).pipe(Effect.zipRight(fail ? new PreparedUpdateFailed({ message: "Cleanup failed" }) : Effect.void)) }),
       Effect.provideService(ApplicationUpdateSource, { check: () => Effect.succeed(Option.some(candidate)), download: () => Effect.die("Discard must not download"), stage: () => Effect.void }),
     )
@@ -32,7 +32,7 @@ describe("application-owned updates", () => {
     }
   })))
   it.each(["Unattempted", "Attempted", "Failed"] as const)("keeps a saved %s update across checks without downloading it again", tag => run(Effect.gen(function* () {
-    const owner = yield* makeApplicationUpdate(Option.some({ release: candidate,
+    const owner = yield* makeApplicationUpdate(Option.some({ release: candidate, from: Option.none(),
       installation: tag === "Failed" ? { _tag: tag, kind: "authorization", reason: "Authorization cancelled" } : { _tag: tag },
     })).pipe(Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }),
       Effect.provideService(ApplicationUpdateSource, {

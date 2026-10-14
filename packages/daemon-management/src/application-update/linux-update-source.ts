@@ -9,7 +9,7 @@ export const makeLinuxUpdateSource = (options: HostedUpdateSourceOptions & {
 }) => Effect.gen(function* () {
   const store = yield* PreparedUpdateStore
   return {
-    source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
+    source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release, options.metadata.version).pipe(
       Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })),
     )),
     installer: PreparedUpdateInstaller.of({

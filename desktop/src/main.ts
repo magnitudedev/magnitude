@@ -169,7 +169,7 @@ const program = Effect.scoped(Effect.gen(function* () {
             cliPath: join(process.resourcesPath, "magnitude.exe"), addonPath }).pipe(
               Effect.provide([nativeWindowsInstallerVerifier(addonPath, publisher.value), privateFiles]))
         }
-        return { source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release).pipe(
+        return { source: yield* hostedUpdateSource(options, (archive, release) => store.prepare(archive, release, metadata.version).pipe(
           Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))), installer: undefined }
       }).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.provide(NodeContext.layer))
       restartPreparedUpdate = platform.installer ? intent => installPreparedUpdate(intent).pipe(
