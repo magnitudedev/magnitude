@@ -336,8 +336,13 @@ unit is distinct from the per-user unit that previous-installation retirement in
 group and marker, the marker last, so a removal that fails part way is still visible and can be run
 again; it cleans up whatever of these exists, with or without the marker. The data directory is
 kept, handed to root (mode 0700) since no account owns it any more, until setup gives it back to a
-new service account. Setup waits a bounded two minutes for the service to answer, then fails naming
-its log (the journal on Linux, `~/.magnitude/logs/server.log`, private to the person, on macOS);
+new service account. Setup only ever configures the registered service: before its root step it refuses,
+changing nothing, while anything else answers on port 10100 (another account's Magnitude or another
+program), and afterwards it sends no request until the instance answering on the port is the one the
+service's owner reports. It waits a bounded two minutes for the service to answer, and fails sooner
+when the service manager keeps restarting the service or another program keeps the port; each failure
+quotes the service log's recent lines without stack frames and names the log (the journal on Linux,
+`~/.magnitude/logs/server.log`, private to the person, on macOS);
 on macOS, where the service serves in the person's own profile, a re-run treats the Headless owner
 of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
