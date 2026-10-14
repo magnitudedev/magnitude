@@ -9,8 +9,9 @@ import { buildTrayMenu, MODEL_STATUS_ITEM } from "./tray-menu"
 import { loadTrayStatusRow } from "./tray-status"
 import { initializeLoginStartup, makeLoginStartup, WINDOWS_APPLICATION_ID } from "./login-startup"
 import { ApplicationUpdateFailed, ApplicationUpdateSource, makeApplicationUpdate, unavailableApplicationUpdate, readLinuxUpdateMetadata, makeUpdateIdentity, makeUpdateSchedule, makeLinuxUpdateSource, makeWindowsUpdateSource, hostedUpdateSource, startMacForegroundInstallation, macStartupUpdateOperation } from "@magnitudedev/daemon-management/application-update"
-import { PreparedUpdateInstaller, reconcilePreparedUpdate, installPreparedUpdate, UpdateHardwareSource, updateHardwareFromService, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
+import { PreparedUpdateInstaller, reconcilePreparedUpdate, recordStartupFailure, installPreparedUpdate, UpdateHardwareSource, updateHardwareFromService, type UpdateInstallationIntent } from "@magnitudedev/daemon-management/application-update"
 import { isNewerVersion } from "@magnitudedev/release"
+import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { ReleaseTarget, UpdateClientMetadata } from "@magnitudedev/release/hosted-update"
 import { makeAppearancePreferences, makeUpdatePreferences, UpdatePreferences } from "@magnitudedev/daemon-management/desktop-native"
 import { readUpdateConfiguration, isUpdateAcceptanceBuild } from "./update-config"
@@ -22,11 +23,12 @@ import { HttpsUrlSchema } from "@magnitudedev/sdk"
 import { slate } from "@magnitudedev/client-common"
 import { DESKTOP_APP_ORIGIN, handleAppProtocol, resolveRendererDir } from "./app-protocol"
 import { developmentRelaunchExitCode, rendererServedByDevServer } from "./development-relaunch"
+import { relaunchLinuxPackage } from "./linux-relaunch"
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, powerMonitor, shell, Tray } from "electron"
 import { join, resolve, dirname } from "node:path"
 import { homedir } from "node:os"
 import { fileURLToPath } from "node:url"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
+import { Cause, Context, Deferred, Duration, Effect, Exit, Fiber, FiberId, Layer, Option, PubSub, Queue, Ref, Runtime, Schema, Schedule, Scope, Stream } from "effect"
 import { RpcServer } from "@effect/rpc"
 import {
   acquireApplicationOwner, applicationStateDirectory, isUpdateInstallationActive, NativeHost, nativeHostLayer,
@@ -77,7 +79,9 @@ let startupMacUpdate = false
 let macUpdateOperation: "Install" | "Recover" = "Install"
 let startupUpdateDeferred = false
 let reopenAfterUpdate = false
-let requestQuit: () => void = () => { earlyQuitRequested = true }
+// Quit before the main runtime starts, including from the server conflict screen.
+const earlyQuit = Deferred.unsafeMake<void>(FiberId.none)
+let requestQuit: () => void = () => { earlyQuitRequested = true; Deferred.unsafeDone(earlyQuit, Exit.void) }
 app.on("before-quit", event => { if (!exiting) { event.preventDefault(); requestQuit() } })
 // OS-requested termination must retire the owned service before Electron exits.
 if (process.platform !== "win32") process.on("SIGTERM", () => requestQuit())
@@ -100,8 +104,14 @@ const program = Effect.scoped(Effect.gen(function* () {
       : yield* resolveServerConflict({ personalStateDirectory: stateDir,
         pageUrl: `${process.env.ELECTRON_RENDERER_URL ?? DESKTOP_APP_ORIGIN}/server-conflict.html`,
         preload: join(here, "../preload/server-conflict-preload.mjs"),
-        icon: join(process.resourcesPath, "application-icon.png") })
-    if (decision === "Quit") return "Quit" as const
+        icon: join(process.resourcesPath, "application-icon.png"),
+        quitRequested: Deferred.await(earlyQuit) })
+    if (decision === "Quit") {
+      // A Mac serving with `magnitude server setup` needs no desktop at login; Settings can turn it back on.
+      if (process.platform === "darwin") yield* makeLoginStartup(isolatedProfile).pipe(Effect.flatMap(startup => startup.set(false)),
+        Effect.catchAll(error => Effect.logWarning(error.message)))
+      return "Quit" as const
+    }
   }
   const owner = yield* acquireApplicationOwner(stateDir, { _tag: "Desktop", intent: background ? "EnsureRunning" : "ShowWindow" })
   if (owner._tag === "Forwarded") { exiting = true; app.quit(); return }
@@ -139,6 +149,7 @@ const program = Effect.scoped(Effect.gen(function* () {
   requestQuit = () => run(Queue.offer(quit, "Quit"))
   if (earlyQuitRequested) yield* Queue.offer(quit, "Quit")
   const updateConfiguration = yield* readUpdateConfiguration.pipe(Effect.option)
+  let startupFailure: Effect.Effect<void> = Effect.void
   const updates = Option.isNone(updateConfiguration) ? unavailableApplicationUpdate("Application update configuration is invalid.")
     : isolatedProfile && !updateConfiguration.value.acceptance ? unavailableApplicationUpdate("Application updates are available in the installed Magnitude app.")
     : !app.isPackaged ? unavailableApplicationUpdate("Application update recovery is unavailable in this build.")
@@ -157,6 +168,7 @@ const program = Effect.scoped(Effect.gen(function* () {
             os_version: process.getSystemVersion(), arch: process.arch, package: process.platform === "win32" ? "windows-exe" : "mac-zip" })
       const target = yield* Schema.decodeUnknown(ReleaseTarget)({ os: metadata.os, arch: metadata.arch, package: metadata.package })
       const store = yield* makePreparedUpdateStore({ dataDirectory: dataDir, target, trustedPublishers }).pipe(Effect.provide(privateFiles))
+      startupFailure = recordStartupFailure(app.getVersion(), Duration.hours(1)).pipe(Effect.provideService(PreparedUpdateStore, store), Effect.ignore)
       const options = { origin, metadata, sign: identity.sign, trustedPublishers,
         userAgent: `Magnitude/${app.getVersion()} ${process.arch} Electron/${process.versions.electron} ${metadata.os}/${process.getSystemVersion()}`,
         dataDirectory: dataDir, stateDirectory: stateDir }
@@ -202,7 +214,10 @@ const program = Effect.scoped(Effect.gen(function* () {
     )
   if (startupUpdateDeferred) return "Quit" as const
   if (startupMacUpdate) return "InstallMacUpdate" as const
-  const updateSchedule = yield* makeUpdateSchedule(updates.check)
+  // Update checks start once the service settles, so a new version reports `applied` only after it
+  // starts; one whose service fails before Ready records `failed`/`startup` first, as a server does.
+  const serviceSettled = yield* Deferred.make<void>()
+  const updateSchedule = yield* makeUpdateSchedule(updates.check, Deferred.await(serviceSettled))
   const resumeUpdates = () => run(updateSchedule.resume)
   powerMonitor.on("resume", resumeUpdates)
   yield* Effect.addFinalizer(() => Effect.sync(() => powerMonitor.removeListener("resume", resumeUpdates)))
@@ -341,6 +356,9 @@ const program = Effect.scoped(Effect.gen(function* () {
   const snapshot = Effect.all({ service: service.state, tray: tray.state }).pipe(Effect.map(value => ({ version: 1 as const, pid: process.pid, endpoint, service: value.service, owner: { _tag: "Desktop" as const, tray: value.tray } })))
   const snapshots = Stream.zipLatest(service.changes, tray.changes).pipe(Stream.map(([service, tray]) => ({ version: 1 as const, pid: process.pid, endpoint, service, owner: { _tag: "Desktop" as const, tray } })))
   yield* service.changes.pipe(Stream.runForEach(current => Ref.set(state, current).pipe(Effect.zipRight(refreshTray))), Effect.forkScoped)
+  yield* service.changes.pipe(Stream.filter(current => current._tag === "Ready" || current._tag === "Failed"), Stream.take(1),
+    Stream.runForEach(current => (current._tag === "Failed" ? startupFailure : Effect.void).pipe(Effect.zipRight(Deferred.succeed(serviceSettled, undefined)))),
+    Effect.forkScoped)
   const control: ApplicationControlOptions = { snapshot, update: action => Effect.gen(function* () {
     if (action === "check") yield* updateSchedule.check
     if (action === "download") yield* updates.download
@@ -467,7 +485,11 @@ Effect.runPromiseExit(program.pipe(
       // The renderer dev server dies with this process; its supervising script performs the relaunch.
       if (rendererServedByDevServer(process.env)) { app.exit(developmentRelaunchExitCode({ showWindow: reopenAfterUpdate })); return }
       // `args` replaces the argument list, so keep the original ones (the app directory in development).
-      app.relaunch({ args: [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])] })
+      const args = [...process.argv.slice(1).filter(argument => argument !== "--background"), ...(reopenAfterUpdate ? [] : ["--background"])]
+      // The packaged Linux app must start through its launcher, which passes the installation admission it adopts,
+      // and without Electron's relauncher, whose no-new-privileges flag leaves Chromium without a sandbox.
+      if (process.platform === "linux" && app.isPackaged) relaunchLinuxPackage(LINUX_DESKTOP_EXECUTABLE_PATH, args)
+      else app.relaunch({ args })
     }
     if (intent === "InstallMacUpdate") {
       const install = Effect.scoped(Effect.gen(function* () {

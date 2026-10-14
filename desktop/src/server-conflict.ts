@@ -45,18 +45,20 @@ const removeServer = Effect.gen(function* () {
     // Any Polkit prompt, for a session that isn't the active one, comes from the desktop's own authentication agent only.
     : Command.make("/usr/bin/pkexec", "--disable-internal-agent", LINUX_SERVER_REMOVER_PATH)
   const code = yield* executor.exitCode(command).pipe(Effect.orElseSucceed(() => -1))
-  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Try again, or run `magnitude server remove` in a terminal." })
+  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Stopping it needs an administrator of this computer: try again as one, or ask one to run `magnitude server remove`." })
 }).pipe(Effect.provide(NodeContext.layer))
 
 /**
  * While the server runs, the whole window is this one screen. Keep opens the server in the browser
  * and quits; Stop removes the server, then the app starts. If the server stops, the app continues.
+ * A quit request (Cmd-Q, logout, SIGTERM) quits, like closing the window.
  */
 export const resolveServerConflict = (options: {
   readonly personalStateDirectory: string
   readonly pageUrl: string
   readonly preload: string
   readonly icon: string
+  readonly quitRequested: Effect.Effect<void>
 }) => Effect.gen(function* () {
   const running = isServerRunning(options.personalStateDirectory)
   if (!(yield* running)) return "Proceed" as const
@@ -67,6 +69,8 @@ export const resolveServerConflict = (options: {
     const value = new BrowserWindow({ ...windowChrome(process.platform, dark), width: 720, height: 520, resizable: false, show: false,
       title: "Magnitude", icon: options.icon, backgroundColor: dark ? slate[925] : slate[50],
       webPreferences: { preload: options.preload, contextIsolation: true, nodeIntegration: false, sandbox: false } })
+    // A single-choice screen has nothing for the application menu bar to act on.
+    if (process.platform !== "darwin") value.removeMenu()
     value.once("ready-to-show", () => value.show())
     value.on("closed", () => { Runtime.runFork(runtime)(Deferred.succeed(decision, "Quit")) })
     void value.loadURL(options.pageUrl)
@@ -80,6 +84,7 @@ export const resolveServerConflict = (options: {
       Effect.zipRight(Deferred.succeed(decision, "Proceed")), Effect.as({ ok: true as const }),
       Effect.catchAll(error => Effect.succeed({ ok: false as const, message: error.message })))))
   }), () => Effect.sync(() => { ipcMain.removeHandler("server-conflict:keep"); ipcMain.removeHandler("server-conflict:stop") }))
+  yield* options.quitRequested.pipe(Effect.zipRight(Deferred.succeed(decision, "Quit")), Effect.forkScoped)
   // The server stopping by itself also lets the app continue.
   yield* running.pipe(Effect.repeat({ until: value => !value, schedule: Schedule.spaced(Duration.seconds(2)) }),
     Effect.zipRight(Deferred.succeed(decision, "Proceed")), Effect.forkScoped)

@@ -234,12 +234,19 @@ The version is the running service's, from its health.
 Model storage is persisted as `modelsDirectory` in the canonical `config.json` that the service reads
 when it spawns the engine; ACN reads and writes it. The row shows the current path, marks the
 default, offers the app's own folder picker over the folders of the machine running Magnitude and a
-return to the default, rejects relative paths, and re-reads the file whenever Settings opens so hand
-edits appear. ACN records the folder its engine started with; while the saved folder
+return to the default, rejects relative paths and folders the service cannot create or write a file
+in with the service's own reason, and re-reads the file whenever Settings opens so hand
+edits appear. A saved folder the service cannot use shows the default folder actually in use, with a
+warning that the saved one was ignored and a return to the default. ACN records the folder its engine started with; while the saved folder
 differs, a persistent toast in the window's bottom-right corner on every page states that a restart
 is required, offers Restart Magnitude, which relaunches the application through the ordinary quit
 path, and shows a copyable platform-specific command that moves the previous store into the new
-folder. Magnitude never moves model files itself.
+folder. Magnitude never moves model files itself. The packaged Linux app relaunches through its
+installed launcher, never its Electron executable directly, so the relaunched app receives the
+installation admission it must adopt. It hands the relaunch to a detached shell that waits for the
+old process to exit, never to Electron's relauncher: that starts the new app with no-new-privileges,
+which defeats the setuid `chrome-sandbox`, and where unprivileged user namespaces are restricted
+(Ubuntu 24.04 AppArmor) Chromium then has no sandbox and aborts.
 
 When the renderer is served by the `electron-vite` dev server, Electron cannot relaunch itself:
 that server belongs to the parent process and exits with the application, so a self-relaunch would
@@ -262,13 +269,17 @@ adds a This browser group with Sign out, and turning network access off, regener
 changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
 AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
 loses the service, it checks whether the service now asks for the key, as after a restart, and
-returns to Sign in instead of showing that the service is unreachable.
+returns to Sign in instead of showing that the service is unreachable. A browser retries every 2
+seconds for 30 seconds, then shows that the service is unreachable with Reconnect and keeps retrying
+with backoff up to once a minute, and at once when the device comes back online or the page regains
+focus or visibility, so it recovers by itself after a reboot, a failed update, or a sleeping laptop.
 Below the harnesses, Connections presents one card for other apps and agents. It states that an
 OpenAI-compatible API runs on this computer that any app or agent can use. The base URL has a copy
 control, captioned that any API key works, with a note for the Anthropic path beneath it. An Example
 request toggle pinned right on the note's row, wrapping beneath it in narrow windows, reveals a request for the active or best downloaded model in the
 user's shell. A divided footer links to Settings for network
-access. Network addresses and controls stay in Settings. Viewed from another device, the card
+access, asking to turn it on while it is off and pointing to its address and key once it is on.
+Network addresses and controls stay in Settings. Viewed from another device, the card
 describes the server's API at the address the browser used: the caption asks for the Network access
 key, the example request is in the viewer's shell and sends the key as a placeholder Bearer header,
 and the footer points to the key in Settings. In a browser, local or remote, the harness rows have no

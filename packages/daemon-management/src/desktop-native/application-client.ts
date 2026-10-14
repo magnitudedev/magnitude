@@ -17,8 +17,9 @@ export const launchApplicationProcess = <A, E, R>(command: ApplicationLaunchComm
   const spawned = yield* Deferred.make<void, ApplicationLaunchFailed>()
   const failed = yield* Deferred.make<never, ApplicationLaunchFailed>()
   yield* Effect.acquireRelease(Effect.sync(() => {
+    // Not windowsHide: Windows applies a hidden start to the desktop's first shown window.
     const child = spawn(command.executable, [...command.arguments], {
-      env: command.environment, detached: true, stdio: "ignore", windowsHide: true,
+      env: command.environment, detached: true, stdio: "ignore",
     })
     const onError = (error: Error) => {
       const failure = Effect.fail(new ApplicationLaunchFailed({ message: `Could not start Magnitude: ${error.message}` }))
