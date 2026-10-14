@@ -3,7 +3,7 @@ import { UpdateRelease } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
-import { ApplicationUpdateFailed, ApplicationUpdateSource } from "./application-update"
+import { ApplicationUpdateFailed, ApplicationUpdateSource, heldUpdateFailure } from "./application-update"
 import { acquireApplicationMaintenance } from "../desktop-native/application-owner"
 import { preparedUpdateFailure } from "./prepared-update-installation"
 
@@ -49,7 +49,7 @@ export const runFiniteUpdatePreparation = (action: "check" | "download" | "disca
   if (initial.transfer._tag !== "Idle") return { ...initial, check }
   if (Option.isNone(candidate)) return { ...initial, check }
   if (action === "check") return { ...initial, check,
-    transfer: { _tag: "Available", version: candidate.value.version, bytes: candidate.value.bytes } } satisfies ApplicationUpdateState
+    transfer: { _tag: "Available", version: candidate.value.version, bytes: candidate.value.bytes, failed: yield* heldUpdateFailure(store, candidate.value.version) } } satisfies ApplicationUpdateState
   yield* store.removeAbandonedTransfers
   const archive = yield* source.download(candidate.value, () => Effect.void)
   yield* source.stage(archive, candidate.value)

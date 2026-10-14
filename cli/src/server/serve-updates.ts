@@ -1,14 +1,14 @@
 import { Command, CommandExecutor, FileSystem } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
-import { Clock, Context, Duration, Effect, Layer, Option, Ref, Schema } from "effect"
+import { Clock, Context, Duration, Effect, Layer, Option, Ref, Schema, Stream } from "effect"
 import { dirname, join } from "node:path"
 import { release } from "node:os"
 import type { UpdateOwner } from "@magnitudedev/release/hosted-update"
-import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, UpdatePreferences, makeUnixProcessContinuation, acquireUpdateInstallationLease,
+import { type ApplicationRuntime, type ApplicationProfile, PreparedUpdateStore, UpdatePreferences, type UnattendedHold, makeUnixProcessContinuation, acquireUpdateInstallationLease,
   acquireApplicationMaintenance, nativeHostLayer, unixPrivateFilePermissions, windowsPrivateFilePermissions, recoverWindowsUpdateDirectory, nodeTerminalCommand, linuxInstallationLockHeldByOthers } from "@magnitudedev/daemon-management/desktop-native"
 import { ApplicationUpdateSource, makeInstalledUpdatePreparation, makeApplicationUpdate,
   reconcilePreparedUpdate, unavailableApplicationUpdate, completeLinuxForegroundUpdate, prepareMacForegroundStartup,
-  startMacForegroundInstallation } from "@magnitudedev/daemon-management/application-update"
+  startMacForegroundInstallation, recordStartupFailure, type ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
 import { CLI_VERSION } from "../version"
 import { withLocalService } from "./server-reach"
 
@@ -19,6 +19,8 @@ const deferredRetry = Duration.minutes(15)
 /** How long a failed unattended installation holds back the next unattended attempt. */
 const failureBackoff = Duration.hours(1)
 const idlePoll = Duration.seconds(10)
+/** How long a version that cannot start waits for a newer download before exiting for its next restart. */
+const replacementDownload = Duration.minutes(30)
 
 const architectureOf = Schema.decodeUnknown(Schema.Literal("arm64", "x64"))
 const osVersion = (platform: "darwin" | "linux" | "win32") => platform === "darwin"
@@ -84,18 +86,19 @@ export const IdleInstallationSystem = Context.GenericTag<IdleInstallationSystem>
 /**
  * Install when idle: a server, the system service or `serve` run by hand, installs a downloaded
  * update only between turns whenever it can without a password. Otherwise it keeps serving and says
- * how to install; a held installation lock defers. A failed attempt
- * holds back unattended installation for `failureBackoff`, and the version that failed is not
- * downloaded or installed unattended again (see `UnattendedHold`), so restarts never loop.
+ * how to install; a held installation lock defers. A failed attempt, or an installed version that
+ * never starts, holds back unattended installation for `failureBackoff`, and the version that failed
+ * is not downloaded or installed unattended again (see `UnattendedHold`), so restarts never loop.
  */
 export const makeIdleInstallation = Effect.gen(function* () {
   const system = yield* IdleInstallationSystem
   const notice = yield* makeDownloadedNotice(system.notify)
 
-  const holdFor = (duration: Duration.Duration, failed: Option.Option<string>) => Effect.gen(function* () {
+  const holdFor = (duration: Duration.Duration, failed: Option.Option<Omit<UnattendedHold, "until">>) => Effect.gen(function* () {
     const store = yield* system.store
-    const previous = yield* store.hold.pipe(Effect.map(Option.flatMap(hold => hold.version)))
-    yield* store.recordHold({ version: Option.orElse(failed, () => previous), until: (yield* Clock.currentTimeMillis) + Duration.toMillis(duration) })
+    const previous: Option.Option<Omit<UnattendedHold, "until">> = yield* store.hold
+    const held = Option.getOrElse(Option.orElse(failed, () => previous), () => ({ version: Option.none(), reason: Option.none() }))
+    yield* store.recordHold({ version: held.version, reason: held.reason, until: (yield* Clock.currentTimeMillis) + Duration.toMillis(duration) })
   })
 
   const defer = (version: string) => Effect.gen(function* () {
@@ -142,22 +145,42 @@ export const makeIdleInstallation = Effect.gen(function* () {
     const store = yield* system.store
     const pending = yield* store.read
     const failed = Option.filter(pending, update => update.installation._tag === "Failed")
-    yield* holdFor(failureBackoff, Option.map(failed, update => update.release.version))
+    yield* holdFor(failureBackoff, Option.map(failed, update => ({ version: Option.some(update.release.version),
+      reason: Option.some(update.installation._tag === "Failed" ? update.installation.kind : "install" as const) })))
     if (Option.isSome(failed) && failed.value.installation._tag === "Failed") {
       yield* store.recordOutcome({ outcome: "failed", version: failed.value.release.version, from: failed.value.from, reason: Option.some(failed.value.installation.kind) })
       yield* store.discard
     }
   }).pipe(Effect.ignore, Effect.zipRight(system.notify(`The update could not be installed: ${error.message} Serving the current version.`)))))
 
-  /** An applied version that never became ready is recorded as `failed`/`startup` and reported once. */
-  const startupFailed = (report: Effect.Effect<void>) => system.store.pipe(Effect.flatMap(store => Effect.gen(function* () {
-    const outcome = yield* store.outcome
-    if (Option.isNone(outcome)) return
-    if (outcome.value.outcome === "applied" && outcome.value.version === CLI_VERSION) {
-      yield* store.recordOutcome({ ...outcome.value, outcome: "failed", reason: Option.some("startup") })
+  /**
+   * An applied version that never became ready is recorded as `failed`/`startup`, held back and
+   * reported once. While the running version is the held one, restarts still check for updates, at
+   * most once per `failureBackoff`, and resolve true once a newer download is ready, so the caller
+   * installs it in place of the version that cannot start.
+   */
+  const startupFailed = (report: Effect.Effect<void>, updates: ApplicationUpdate) => system.store.pipe(Effect.flatMap(store => Effect.gen(function* () {
+    const first = yield* recordStartupFailure(CLI_VERSION, failureBackoff).pipe(Effect.provideService(PreparedUpdateStore, store))
+    const held = Option.filter(yield* store.hold, hold => Option.exists(hold.version, version => version === CLI_VERSION))
+    if (Option.isNone(held)) {
+      if (Option.isSome(yield* store.outcome)) yield* report
+      return false
+    }
+    const now = yield* Clock.currentTimeMillis
+    if (!first) {
+      if (held.value.until > now) return false
+      yield* store.recordHold({ ...held.value, until: now + Duration.toMillis(failureBackoff) })
     }
     yield* report
-  })), Effect.ignore)
+    if (!(yield* system.canInstallUnattended)) return false
+    // An offer that downloads automatically is about to start downloading, so it is not settled yet.
+    const settled = yield* updates.changes.pipe(Stream.filter(state => state.transfer._tag === "Available"
+      ? Option.isSome(state.transfer.failed) || !(state.preference._tag === "Known" && state.preference.autoDownload)
+      : state.transfer._tag !== "Downloading" && state.transfer._tag !== "Staging" && state.transfer._tag !== "Cancelling"),
+      Stream.map(state => state.transfer),
+      Stream.runHead, Effect.timeout(replacementDownload))
+    return Option.exists(settled, transfer => transfer._tag === "Ready")
+  })), Effect.orElseSucceed(() => false))
 
   return { installWhenIdle, install, startupFailed }
 })

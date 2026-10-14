@@ -1,9 +1,17 @@
 import { Schema } from "effect"
 
-/** Application updates belong to the owning application, independently of ACN readiness. */
+/**
+ * Application updates belong to the owning application, independently of ACN readiness. An offer
+ * whose version already failed here (to verify, install, be authorized or start) carries why; it is
+ * held back from unattended download until a person downloads it explicitly.
+ */
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
-  Schema.TaggedStruct("Available", { version: Schema.String, bytes: Schema.Number }),
+  Schema.TaggedStruct("Available", {
+    version: Schema.String,
+    bytes: Schema.Number,
+    failed: Schema.optionalWith(Schema.Literal("verify", "install", "authorization", "startup"), { as: "Option", exact: true }),
+  }),
   Schema.TaggedStruct("Downloading", { version: Schema.String, completed: Schema.Number, total: Schema.Number }),
   Schema.TaggedStruct("Cancelling", {}),
   Schema.TaggedStruct("Staging", { version: Schema.String }),

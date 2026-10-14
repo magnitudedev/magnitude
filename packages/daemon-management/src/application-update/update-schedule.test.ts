@@ -1,4 +1,4 @@
-import { Deferred, Effect, Ref, TestClock, TestContext } from "effect"
+import { Clock, Deferred, Effect, Ref, TestClock, TestContext } from "effect"
 import { expect, it } from "vitest"
 import { makeUpdateSchedule } from "./update-schedule"
 
@@ -58,5 +58,34 @@ it("does not check, or report an outcome, until the owner's service is ready", a
     expect(yield* Ref.get(calls)).toBe(0)
     yield* TestClock.adjust("1 second")
     expect(yield* Ref.get(calls)).toBe(1)
+  })).pipe(Effect.provide(TestContext.TestContext)))
+})
+
+it("checks soon after a skewed clock is corrected backwards instead of waiting out the skew", async () => {
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    const skew = yield* Ref.make(2 * 86_400_000)
+    const test = yield* Effect.clock
+    const skewed: Clock.Clock = {
+      [Clock.ClockTypeId]: Clock.ClockTypeId,
+      unsafeCurrentTimeMillis: () => test.unsafeCurrentTimeMillis(),
+      unsafeCurrentTimeNanos: () => test.unsafeCurrentTimeNanos(),
+      currentTimeMillis: Effect.zipWith(test.currentTimeMillis, Ref.get(skew), (now, offset) => now + offset),
+      currentTimeNanos: test.currentTimeNanos,
+      sleep: duration => test.sleep(duration),
+    }
+    const calls = yield* Ref.make(0)
+    const scheduler = yield* makeUpdateSchedule(() => Ref.update(calls, n => n + 1)).pipe(Effect.withClock(skewed))
+    yield* TestClock.adjust("3 seconds")
+    yield* scheduler.check.pipe(Effect.withClock(skewed))
+    yield* TestClock.adjust("1 second")
+    expect(yield* Ref.get(calls)).toBe(2)
+    // The clock is corrected two days back while the timer waits for the skewed deadline.
+    yield* Ref.set(skew, 0)
+    yield* TestClock.adjust("59 minutes")
+    expect(yield* Ref.get(calls)).toBe(2)
+    yield* TestClock.adjust("2 minutes")
+    expect(yield* Ref.get(calls)).toBe(3)
+    yield* TestClock.adjust("62 minutes")
+    expect(yield* Ref.get(calls)).toBe(4)
   })).pipe(Effect.provide(TestContext.TestContext)))
 })

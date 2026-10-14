@@ -25,6 +25,11 @@ Desktop for Caller intent. Handoff admission is distinct from completed installa
 must verify replacement before continuing startup.
 
 One schedule belongs to each owner. Manual checks reset its deadline; resume wakes the same timer.
+A deadline further away than one interval means the wall clock moved back since it was set (a
+skewed clock corrected), so the timer checks at once instead of waiting out the correction. Checks
+are signed with the current time and the server refuses one more than five minutes from its own;
+when a refusal's `Date` header shows that skew, the check fails saying the clock is off, logs the
+same warning, and status shows that failure above any earlier offer.
 Automatic-download preference changes are persisted before they affect transfers. Disabling automatic
 downloads cancels an automatic transfer and waits for scoped scratch cleanup before another transfer
 can begin. A retained prepared update survives owner exit; a recorded failed attempt remains failed
@@ -50,6 +55,9 @@ the authorizing user's identity and installed publisher trust. Success requires 
 package installation and the replacement CLI reporting the prepared version before retained state
 is removed. Cancellation retires privileged installation descendants, cannot report success or clear
 an attempted installation, and preserves package-manager repair state when replacement was interrupted.
+apt waits up to five minutes for a dpkg lock held by another package run (such as unattended-upgrades),
+as install.sh does, and dnf waits for its own lock, so routine contention delays an installation
+rather than failing it.
 No owner installs a prepared update at startup. Desktop launch and Headless `serve` start
 normally with the update retained; Desktop offers Restart and a terminal owner prints the install
 command. Startup only completes an interrupted macOS transaction from its receipt. Failed or
@@ -71,8 +79,9 @@ The privileged Linux helper reports its class through a distinct exit status, se
 statuses sudo and pkexec use for authorization. `deferred` records an idle installation postponed
 because another Magnitude held the installation lock; the service reports it with an immediate
 check. A `startup` failure is sent by the failing owner with an immediate check it awaits before
-exiting, since an owner that never becomes ready makes no scheduled check. Other outcomes are sent
-once with the next check.
+exiting, since an owner that never becomes ready makes no scheduled check; Desktop, which keeps
+running, starts its checks only once its service is first Ready or Failed, so it records `startup`
+before reporting. Other outcomes are sent once with the next check.
 
 Each outcome also carries `outcome_from`, the version that was running when the attempted release
 was prepared, recorded with the preparation. An `applied` outcome is reported by the new version,

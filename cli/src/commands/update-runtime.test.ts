@@ -1,3 +1,4 @@
+import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { renderApplicationUpdate } from "./update-runtime"
@@ -11,8 +12,11 @@ describe("headless application update output", () => {
     expect(renderApplicationUpdate(ready, "Desktop")).toContain("Install and restart: magnitude update install")
   })
   it("distinguishes available, downloading and prepared updates with exact next commands", () => {
-    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 17800000000 }))).toContain("17.8 GB")
-    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100 }))).toContain("magnitude update download")
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 17800000000, failed: Option.none() }))).toContain("17.8 GB")
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100, failed: Option.none() }))).toContain("magnitude update download")
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100, failed: Option.some("startup") })))
+      .toBe("Magnitude 2.0.0 is available (100 B), but it failed to start on this machine, so it is not downloaded automatically.\n"
+        + "A newer release replaces it when one is published. To try it again anyway: magnitude update download\n")
     expect(renderApplicationUpdate(state({ _tag: "Downloading", version: "2.0.0", completed: 10, total: 100 }))).toContain("magnitude update status")
     expect(renderApplicationUpdate(state({ _tag: "Ready", version: "2.0.0" }))).toContain("magnitude update install")
   })
@@ -21,6 +25,8 @@ describe("headless application update output", () => {
     expect(renderApplicationUpdate(state({ _tag: "Idle" }, { _tag: "Idle" }))).toContain("No update check has completed")
     expect(renderApplicationUpdate(state({ _tag: "Idle" }, { _tag: "Failed", message: "Network unavailable" }))).toBe("Network unavailable\n")
     expect(renderApplicationUpdate(state({ _tag: "Unavailable", message: "Install manually" }))).toBe("Install manually\n")
+    expect(renderApplicationUpdate(state({ _tag: "Available", version: "2.0.0", bytes: 100, failed: Option.none() }, { _tag: "Failed", message: "Clock is off." })))
+      .toBe("Clock is off.\nMagnitude 2.0.0 is available (100 B).\nDownload: magnitude update download\n")
   })
   it("shows a new check instead of the previous download error without hiding an active download", () => {
     expect(renderApplicationUpdate(state({ _tag: "Failed", message: "Previous transfer failed" }, { _tag: "Checking" })))

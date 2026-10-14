@@ -12,6 +12,9 @@ export type HostedUpdateSourceOptions = HostedUpdateConnection & {
   readonly dataDirectory: string
 }
 
+const clockSkewMessage = "Could not check for application updates: this computer's clock is more than 5 minutes off. "
+  + "Correct the system time (for example, turn on network time synchronization), then check again."
+
 /** All native installers consume the same authenticated, checksum-verified transfer. */
 export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: ApplicationUpdateSource["stage"]) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -26,7 +29,10 @@ export const hostedUpdateSource = (options: HostedUpdateSourceOptions, stage: Ap
       if (Option.isSome(outcome)) yield* store.markOutcomeReported.pipe(Effect.ignore)
       return candidate
     }).pipe(
-      Effect.mapError(() => new ApplicationUpdateFailed({ message: "Could not check for application updates." })), Effect.provide(FetchHttpClient.layer),
+      Effect.catchAll(error => error._tag === "HostedUpdateCheckFailed" && error.reason === "clock"
+        ? Effect.logWarning(clockSkewMessage).pipe(Effect.zipRight(new ApplicationUpdateFailed({ message: clockSkewMessage })))
+        : new ApplicationUpdateFailed({ message: "Could not check for application updates." })),
+      Effect.provide(FetchHttpClient.layer),
     ),
     download: (candidate, progress) => Effect.gen(function* () {
       const url = yield* resolveHostedDownload({ ...options, release: candidate })

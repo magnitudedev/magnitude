@@ -1,9 +1,11 @@
-import { Effect, Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { ApplicationUpdateAction, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { updateApplication } from "../server/application"
 import { isServerSetUp } from "../server/serve-owner"
 import { runCommand } from "./output"
+
+const failedPhrase = { verify: "could not be verified", install: "failed to install", authorization: "was not authorized to install", startup: "failed to start" } as const
 
 /** `server` is a Headless owner running as the system service, which installs on its own when idle. */
 export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "Desktop" | "Headless" | "None" = "Desktop", server = false): string => {
@@ -12,7 +14,15 @@ export const renderApplicationUpdate = (state: ApplicationUpdateState, owner: "D
   }
   switch (state.transfer._tag) {
     case "Unavailable": case "Failed": return `${state.transfer.message}\n`
-    case "Available": return `Magnitude ${state.transfer.version} is available (${formatStorageSize(state.transfer.bytes)}).\nDownload: magnitude update download\n`
+    case "Available": {
+      // The offer is from an earlier check; say when the latest one failed rather than presenting it as fresh.
+      const offer = `${state.check._tag === "Failed" ? `${state.check.message}\n` : ""}Magnitude ${state.transfer.version} is available (${formatStorageSize(state.transfer.bytes)})`
+      return Option.match(state.transfer.failed, {
+        onNone: () => `${offer}.\nDownload: magnitude update download\n`,
+        onSome: failed => `${offer}, but it ${failedPhrase[failed]} on this machine, so it is not downloaded automatically.\n`
+          + `A newer release replaces it when one is published. To try it again anyway: magnitude update download\n`,
+      })
+    }
     case "Downloading": return `Downloading Magnitude ${state.transfer.version}: ${formatStorageSize(state.transfer.completed)} of ${formatStorageSize(state.transfer.total)}.\nCheck progress: magnitude update status\n`
     case "Staging": return `Preparing Magnitude ${state.transfer.version}.\nCheck progress: magnitude update status\n`
     case "InstallationFailed": return `${state.transfer.message}\nRetry installation: magnitude update install\nDiscard download: magnitude update discard\n`

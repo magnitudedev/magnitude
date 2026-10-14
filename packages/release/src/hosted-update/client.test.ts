@@ -93,6 +93,13 @@ describe("hosted update client", () => {
     expect(Either.isLeft(result)).toBe(true)
     expect(calls).toBe(1)
   })
+  it("names clock skew when the server refuses a check and its time is more than five minutes from ours", async () => {
+    const refusedAt = async (offset: number) => Effect.runPromise(Effect.flip(check(async () =>
+      new Response(null, { status: 401, headers: { date: new Date(Date.now() + offset).toUTCString() } }))))
+    expect((await refusedAt(2 * 86_400_000)).reason).toBe("clock")
+    expect((await refusedAt(-10 * 60_000)).reason).toBe("clock")
+    expect((await refusedAt(0)).reason).toBe("response")
+  })
   it("bounds the response and rejects malformed JSON", async () => {
     for (const body of ["x".repeat(33000), "not JSON", "{}"]) {
       const result = await Effect.runPromise(Effect.either(check(async () => new Response(body))))

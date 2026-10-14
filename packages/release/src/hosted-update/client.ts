@@ -15,9 +15,13 @@ export interface UpdateCheck {
   readonly outcome: Option.Option<UpdateOutcome>
   readonly hardware: Option.Option<UpdateHardware>
 }
+/** `clock`: the server refused the check and its clock differs from ours by more than signed requests allow. */
 export class HostedUpdateCheckFailed extends Schema.TaggedError<HostedUpdateCheckFailed>()("HostedUpdateCheckFailed", {
-  reason: Schema.Literal("request", "network", "response", "publisher"),
+  reason: Schema.Literal("request", "network", "response", "publisher", "clock"),
 }) {}
+
+/** The server rejects a signed request whose timestamp is further than this from its own clock. */
+const allowedClockSkew = 300_000
 
 export interface HostedUpdateConnection {
   readonly origin: string
@@ -68,7 +72,11 @@ export const checkHostedUpdate = (options: HostedUpdateConnection & {
 }, check: UpdateCheck) => Effect.gen(function* () {
   const { response, fields } = yield* signedRequest(options, "/api/update", Option.some(check))
   if (response.status === 204) return Option.none()
-  if (response.status !== 200) return yield* new HostedUpdateCheckFailed({ reason: "response" })
+  if (response.status !== 200) {
+    const serverTime = Date.parse(response.headers["date"] ?? "")
+    const skewed = Number.isFinite(serverTime) && Math.abs(serverTime - (yield* Clock.currentTimeMillis)) > allowedClockSkew
+    return yield* new HostedUpdateCheckFailed({ reason: skewed ? "clock" : "response" })
+  }
   const bytes = yield* response.stream.pipe(Stream.runFoldEffect({ chunks: [] as Uint8Array[], size: 0 }, (state, chunk) => {
     const size = state.size + chunk.byteLength
     return size > 32 * 1024 ? new HostedUpdateCheckFailed({ reason: "response" })

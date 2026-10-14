@@ -26,11 +26,13 @@ export const UpdateOutcomeRecord = Schema.Struct({ outcome: UpdateOutcome, repor
 export type UpdateOutcomeRecord = typeof UpdateOutcomeRecord.Type
 /**
  * Holds back unattended installation after one fails: no unattended attempt starts before `until`
- * (epoch milliseconds), and `version`, whose installation failed, is never downloaded or installed
- * unattended again. Kept across restarts until a person checks or downloads explicitly.
+ * (epoch milliseconds), and `version`, which failed to install or to start for `reason`, is never
+ * downloaded or installed unattended again. A manual check lifts only the wait; the version stays
+ * held across restarts until a person downloads it explicitly.
  */
 export const UnattendedHold = Schema.Struct({
   version: Schema.optionalWith(Version, { as: "Option", exact: true }),
+  reason: Schema.optionalWith(UpdateFailureReason, { as: "Option", exact: true }),
   until: Schema.Number,
 })
 export type UnattendedHold = typeof UnattendedHold.Type
