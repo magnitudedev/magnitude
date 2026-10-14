@@ -56,8 +56,18 @@ for ((attempt=0; attempt<100; attempt++)); do
 done
 test -f "$root/listening"
 curl --fail --silent --show-error https://localhost:18443/install.sh > "$root/install.sh"
+# Keep the public installer's fixed destination isolated in this test copy.
+python3 - "$root/install.sh" "$bundle" <<'PY'
+import pathlib, shlex, sys
+path = pathlib.Path(sys.argv[1])
+script = path.read_text()
+assignment = 'destination=/Applications/Magnitude.app\n'
+if script.count(assignment) != 1:
+    raise SystemExit('Expected exactly one installer destination assignment')
+path.write_text(script.replace(assignment, 'destination=' + shlex.quote(sys.argv[2]) + '\n', 1))
+PY
 for pass in fresh repeat; do
-  bash "$root/install.sh" --destination "$bundle" > "$root/$pass-install.log" 2>&1
+  bash "$root/install.sh" > "$root/$pass-install.log" 2>&1
   test "$("$HOME/.magnitude/bin/magnitude" --version)" = "$version"
   "$HOME/.magnitude/bin/magnitude" status > "$root/$pass-status.txt"
   grep -Eq 'Runtime[[:space:]]+Stopped' "$root/$pass-status.txt"
@@ -75,7 +85,7 @@ offer = json.loads(path.read_text())
 offer['release']['signature'] = base64.b64encode(bytes(64)).decode()
 path.write_text(json.dumps(offer))
 PY
-if bash "$root/install.sh" --destination "$bundle" > "$root/rejected-install.log" 2>&1; then
+if bash "$root/install.sh" > "$root/rejected-install.log" 2>&1; then
   echo 'Invalid publisher signature was accepted' >&2; exit 1
 fi
 test "$("$HOME/.magnitude/bin/magnitude" --version)" = "$version"
