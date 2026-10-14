@@ -57,7 +57,7 @@ static int current(installation_lease *lease) {
 }
 static napi_value acquire_internal(napi_env env, napi_callback_info info, int adopting) {
   napi_value args[2], result; size_t argc = 2, length; bool exclusive = true; double inherited_number = -1; int inherited = -1;
-  char supplied[PATH_MAX], bundle[NAME_MAX + 1]; struct stat app, opened; int fresh = 0;
+  char supplied[PATH_MAX], bundle[NAME_MAX + 1]; struct stat app, opened; int fresh = 0, replaced = 0;
   if (napi_get_cb_info(env, info, &argc, args, NULL, NULL) != napi_ok || argc != 2 ||
       napi_get_value_string_utf8(env, args[0], NULL, 0, &length) != napi_ok || !length || length >= sizeof(supplied) ||
       napi_get_value_string_utf8(env, args[0], supplied, sizeof(supplied), &length) != napi_ok ||
@@ -89,6 +89,7 @@ static napi_value acquire_internal(napi_env env, napi_callback_info info, int ad
     app.st_uid = geteuid();
   } else if (!S_ISDIR(app.st_mode)) goto failed;
   snprintf(lease->name, sizeof(lease->name), ".%s.installation.lock", bundle);
+open_lock:
   lease->fd = adopting ? fcntl(inherited, F_DUPFD_CLOEXEC, 3)
     : openat(lease->parent, lease->name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
   if (!adopting && lease->fd < 0 && errno == ENOENT && app.st_uid == geteuid()) {
@@ -99,8 +100,22 @@ static napi_value acquire_internal(napi_env env, napi_callback_info info, int ad
       lease->fd = openat(lease->parent, lease->name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     }
   }
-  if (lease->fd < 0 || fstat(lease->fd, &lease->identity) || lease->identity.st_uid != app.st_uid ||
-      !current(lease)) goto failed;
+  if (lease->fd < 0 || fstat(lease->fd, &lease->identity)) goto failed;
+  if (!current(lease)) goto failed;
+  if (lease->identity.st_uid != app.st_uid) {
+    /* A well-formed lock left by the previous owner of a reinstalled bundle is replaced by the bundle's
+       owner once nobody holds it. A holder that opened it first then fails validation. */
+    if (adopting || replaced || app.st_uid != geteuid()) goto failed;
+    if (flock(lease->fd, LOCK_EX | LOCK_NB)) {
+      if (errno != EWOULDBLOCK && errno != EAGAIN) goto failed;
+      release(lease); free(lease); napi_get_null(env, &result); return result;
+    }
+    struct stat named;
+    if (fstatat(lease->parent, lease->name, &named, AT_SYMLINK_NOFOLLOW) || !same(named, lease->identity) ||
+        unlinkat(lease->parent, lease->name, 0) || fsync(lease->parent)) goto failed;
+    close(lease->fd); lease->fd = -1; replaced = 1;
+    goto open_lock;
+  }
   if (flock(lease->fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB)) {
     if (adopting || (errno != EWOULDBLOCK && errno != EAGAIN)) goto failed;
     release(lease); free(lease); napi_get_null(env, &result); return result;
