@@ -1,6 +1,6 @@
 import { Duration, Effect, Either, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { portTaken, SERVER_START_TIMEOUT, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
+import { portTaken, SERVER_START_TIMEOUT, type ServerSetupFailed, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
 
 const harness = (overrides: Partial<ServerSetupHost> = {}) => {
   const events: string[] = []
@@ -22,7 +22,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     write: text => Effect.sync(() => { output.push(text) }),
     ...overrides,
   }
-  const run = (program: typeof serverSetup) => Effect.runPromise(program.pipe(Effect.provideService(ServerSetupHost, host), Effect.either))
+  const run = (program: Effect.Effect<void, ServerSetupFailed, ServerSetupHost>) => Effect.runPromise(program.pipe(Effect.provideService(ServerSetupHost, host), Effect.either))
   return { events, host, output: () => output.join(""), run }
 }
 
@@ -128,11 +128,12 @@ describe("magnitude server setup", () => {
     expect(Either.isLeft(result) && result.left.message).toContain("without sudo")
     expect(h.events).toEqual([])
   })
-  it("prints the Windows message and changes nothing", async () => {
+  it("fails with the Windows message and changes nothing", async () => {
     for (const program of [serverSetup, serverRemove]) {
       const h = harness({ platform: "win32" })
-      expect(Either.isRight(await h.run(program))).toBe(true)
-      expect(h.output()).toBe(`${WINDOWS_SERVER_MESSAGE}\n`)
+      const result = await h.run(program)
+      expect(Either.isLeft(result) && result.left.message).toBe(WINDOWS_SERVER_MESSAGE)
+      expect(h.output()).toBe("")
       expect(h.events).toEqual([])
     }
   })

@@ -150,7 +150,7 @@ const settledPort = (host: ServerSetupHost) => Effect.gen(function* () {
 /** Does everything it can as the person, and only the root step through sudo. */
 export const serverSetup = Effect.gen(function* () {
   const host = yield* ServerSetupHost
-  if (host.platform === "win32") return yield* host.write(`${WINDOWS_SERVER_MESSAGE}\n`)
+  if (host.platform === "win32") return yield* failed(WINDOWS_SERVER_MESSAGE)
   if (host.platform !== "linux" && host.platform !== "darwin") return yield* failed("Server mode is available on Linux and macOS.")
   if (host.isRoot && (host.underSudo || host.platform !== "linux")) return yield* failed("Run `magnitude server setup` as yourself, without sudo. It asks for your password when it needs it.")
   if (!(yield* host.hasServiceManager)) return yield* failed("Server setup needs systemd, which this machine doesn't run. Run `magnitude serve` instead to serve until you stop it.")
@@ -172,7 +172,7 @@ export const serverSetup = Effect.gen(function* () {
 
 export const serverRemove = Effect.gen(function* () {
   const host = yield* ServerSetupHost
-  if (host.platform === "win32") return yield* host.write(`${WINDOWS_SERVER_MESSAGE}\n`)
+  if (host.platform === "win32") return yield* failed(WINDOWS_SERVER_MESSAGE)
   if (host.platform !== "linux" && host.platform !== "darwin") return yield* failed("Server mode is available on Linux and macOS.")
   if (host.isRoot && (host.underSudo || host.platform !== "linux")) return yield* failed("Run `magnitude server remove` as yourself, without sudo. It asks for your password when it needs it.")
   if (!(yield* host.hasRemnants)) return yield* host.write("Magnitude isn't set up as a server on this machine.\n")
