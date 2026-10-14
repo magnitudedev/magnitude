@@ -220,7 +220,8 @@ beneath the model store. The store root defaults to `.magnitude/models`; `models
 `config.json` names another absolute directory. ACN reads that setting once when it spawns ICN, so a
 change applies at the next service start, and it resolves a symbolically linked root to its real
 directory before spawning because ICN refuses a linked root. A relative value, or a path that exists
-but is not a directory, is logged and the default applies. Changing the root never moves artifacts;
+but is not a directory, or a directory the service cannot create or write a file in, is logged and the
+default applies, so an unusable folder never stops the service from starting. Changing the root never moves artifacts;
 the previous store remains intact on disk. ICN's managed Hugging Face hub lives beneath the model store, and ICN does not
 implicitly discover or adopt a host user's global Hugging Face cache.
 External caches or directories participate only when they are supplied explicitly as read-only

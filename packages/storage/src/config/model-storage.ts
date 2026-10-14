@@ -68,3 +68,31 @@ export const resolveModelStoreLocation = (
       root: Option.getOrElse(fallbackRoot, () => fallback),
     }
   })
+
+/** Whether this process can create the folder and write files in it, which the engine needs at startup. */
+export const canWriteModelStore = (path: string): Effect.Effect<boolean, never, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    yield* fs.makeDirectory(path, { recursive: true })
+    const probe = join(path, `.magnitude-write-check-${process.pid}`)
+    yield* fs.writeFileString(probe, '')
+    yield* fs.remove(probe)
+  }).pipe(Effect.as(true), Effect.orElseSucceed(() => false))
+
+/**
+ * The location the engine is started with. A configured folder this process cannot write to
+ * falls back to the default with a warning, so a bad choice never stops the service from starting.
+ */
+export const resolveUsableModelStoreLocation = (
+  dataDir: string,
+  configured: Option.Option<string>,
+): Effect.Effect<ModelStoreLocation, never, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const location = yield* resolveModelStoreLocation(dataDir, configured)
+    if (location.source === 'Default' || (yield* canWriteModelStore(location.root))) return location
+    const fallback = yield* resolveModelStoreLocation(dataDir, Option.none())
+    return {
+      ...fallback,
+      warning: Option.some(`Ignoring modelsDirectory "${location.path}": Magnitude can't write to it. Using ${fallback.path}.`),
+    }
+  })

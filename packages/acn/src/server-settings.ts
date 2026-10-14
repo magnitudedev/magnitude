@@ -22,8 +22,10 @@ import {
   makeConfigStorage,
   makeGlobalStorage,
   readStructuredFile,
+  canWriteModelStore,
   resolveModelStoreLocation,
   resolveNetworkAccess,
+  resolveUsableModelStoreLocation,
   type NetworkAccess,
   type NetworkAccessConfig,
 } from "@magnitudedev/storage"
@@ -84,7 +86,11 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
   )
   const location = (configured: Option.Option<string>) => resolveModelStoreLocation(host.dataDir, configured).pipe(Effect.provideService(FileSystem.FileSystem, fs))
   // The engine received its store at spawn, from the configuration as it stood when this service started.
-  const active = yield* readModelsDirectory.pipe(Effect.orElseSucceed(() => Option.none<string>()), Effect.flatMap(location))
+  const active = yield* readModelsDirectory.pipe(
+    Effect.orElseSucceed(() => Option.none<string>()),
+    Effect.flatMap(configured => resolveUsableModelStoreLocation(host.dataDir, configured)),
+    Effect.provideService(FileSystem.FileSystem, fs),
+  )
   const defaultPath = (yield* location(Option.none())).path
 
   const readNetwork = readStructuredFile(storage.paths.configFile, MagnitudeConfigSchema.pick("network")).pipe(
@@ -113,6 +119,9 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
       const trimmed = Option.map(path, value => value.trim())
       if (Option.isSome(trimmed) && (trimmed.value.length === 0 || !isAbsolute(trimmed.value))) {
         return yield* new ServerSettingsFailed({ message: "Choose a full folder path for model storage." })
+      }
+      if (Option.isSome(trimmed) && !(yield* canWriteModelStore(normalize(trimmed.value)).pipe(Effect.provideService(FileSystem.FileSystem, fs)))) {
+        return yield* new ServerSettingsFailed({ message: `Magnitude can't create or write files in ${trimmed.value}. Choose a folder the Magnitude service can write to.` })
       }
       yield* writes.withPermits(1)(config.update(current => ({ ...current, modelsDirectory: trimmed }))).pipe(
         Effect.mapError(() => new ServerSettingsFailed({ message: "The model storage location could not be saved. Check access to the Magnitude configuration and try again." })),

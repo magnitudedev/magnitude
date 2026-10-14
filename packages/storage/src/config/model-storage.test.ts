@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest"
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { defaultModelStoreRoot, resolveModelStoreLocation, selectModelStorePath } from "./model-storage"
+import { defaultModelStoreRoot, resolveModelStoreLocation, resolveUsableModelStoreLocation, selectModelStorePath } from "./model-storage"
 
 describe("model store selection", () => {
   it("defaults to <dataDir>/models", () => {
@@ -76,6 +76,21 @@ describe("model store resolution", () => {
     expect(location.source).toBe("Default")
     expect(location.root).toBe(join(dataDir, "models"))
     expect(Option.isSome(location.warning)).toBe(true)
+  })
+
+  it("starts with the default when the configured folder cannot be written", async () => {
+    const locked = join(dataDir, "locked")
+    await mkdir(locked, { mode: 0o500 })
+    const location = await Effect.runPromise(resolveUsableModelStoreLocation(dataDir, Option.some(locked)).pipe(Effect.provide(BunFileSystem.layer)))
+    expect(location.source).toBe("Default")
+    expect(location.root).toBe(join(dataDir, "models"))
+    expect(Option.getOrThrow(location.warning)).toContain("can't write")
+  })
+
+  it("starts with a configured folder it can write to", async () => {
+    const target = join(dataDir, "elsewhere")
+    const location = await Effect.runPromise(resolveUsableModelStoreLocation(dataDir, Option.some(target)).pipe(Effect.provide(BunFileSystem.layer)))
+    expect(location).toEqual({ path: target, root: target, source: "Configured", warning: Option.none() })
   })
 
   it("falls back to the default for a relative configured path", async () => {
