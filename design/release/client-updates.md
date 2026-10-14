@@ -32,7 +32,11 @@ must be resolved explicitly; uninstall removes only registration owned by that i
 `magnitude update` and `magnitude update check` request a fresh check from the application owner.
 `magnitude update status` observes current update state without starting the application.
 `magnitude update download` explicitly admits a download of the selected offer. It acknowledges
-admission and directs the caller to status; download completion belongs to the owner.
+admission and directs the caller to status; download completion belongs to the owner. While a
+download is already under way, staging or ready it answers with that state instead of failing.
+An offer whose version is held back because it failed here carries the failure (verify, install,
+authorization or startup), so `update status` and Settings say that version failed and is not
+downloaded automatically, rather than presenting it as an ordinary available update.
 `magnitude update install` requires a prepared update. Desktop may stop its model and service to
 install and restart; a running Headless owner refuses an explicit install, because it installs by
 itself when idle.

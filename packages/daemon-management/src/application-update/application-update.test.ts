@@ -152,11 +152,15 @@ describe("application-owned updates", () => {
     yield* owner.download
     yield* waitFor(owner, "Staging")
     expect((yield* owner.requireReady.pipe(Effect.either))._tag).toBe("Left")
-    expect((yield* owner.download.pipe(Effect.either))._tag).toBe("Left")
+    // Downloading again while one is under way answers with that transfer instead of starting another.
+    yield* owner.download
+    expect((yield* owner.state).transfer._tag).toBe("Staging")
     // All observers above have ended. Their lifetime cannot end staging.
     yield* Deferred.succeed(finishStage, undefined)
     yield* waitFor(owner, "Ready")
     yield* owner.requireReady
+    yield* owner.download
+    expect((yield* owner.state).transfer._tag).toBe("Ready")
     yield* owner.close
     expect(yield* Ref.get(released)).toBe(true)
     expect((yield* owner.state).transfer._tag).toBe("Closed")
@@ -227,7 +231,7 @@ describe("application-owned updates", () => {
         const update = yield* owner(hold, candidate, downloads)
         yield* update.check(reason)
         yield* checked(update)
-        expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: candidate.version, bytes: candidate.bytes })
+        expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: candidate.version, bytes: candidate.bytes, failed: Option.some("install") })
       }
       expect(yield* Ref.get(downloads)).toEqual([])
       expect(Option.isSome(yield* Ref.get(hold))).toBe(true)

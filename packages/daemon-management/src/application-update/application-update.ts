@@ -1,5 +1,5 @@
 import { Clock, Context, Effect, ExecutionStrategy, Exit, Fiber, Option, Schema, Scope, Stream, SubscriptionRef } from "effect"
-import { UpdateRelease, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
+import { UpdateFailureReason, UpdateRelease, type UpdateCheckReason } from "@magnitudedev/release/hosted-update"
 import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { UpdatePreferences } from "../desktop-native/update-preferences"
 import { PreparedUpdateStore, type PreparedUpdate } from "../desktop-native/prepared-update"
@@ -17,7 +17,7 @@ export const ApplicationUpdateSource = Context.GenericTag<ApplicationUpdateSourc
 
 const Transfer = Schema.Union(
   Schema.TaggedStruct("Idle", {}),
-  Schema.TaggedStruct("Available", { candidate: UpdateRelease }),
+  Schema.TaggedStruct("Available", { candidate: UpdateRelease, failed: Schema.OptionFromSelf(UpdateFailureReason) }),
   Schema.TaggedStruct("Downloading", { candidate: UpdateRelease, completed: Schema.Number, automatic: Schema.Boolean }),
   Schema.TaggedStruct("Cancelling", { candidate: UpdateRelease }),
   Schema.TaggedStruct("Staging", { candidate: UpdateRelease }),
@@ -31,7 +31,7 @@ type State = { readonly transfer: Transfer; readonly check: ApplicationUpdateSta
 const present = (state: State): ApplicationUpdateState => {
   const transfer = state.transfer
   switch (transfer._tag) {
-    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.version, bytes: transfer.candidate.bytes } }
+    case "Available": return { ...state, transfer: { _tag: "Available", version: transfer.candidate.version, bytes: transfer.candidate.bytes, failed: transfer.failed } }
     case "Downloading": return { ...state, transfer: { _tag: "Downloading", version: transfer.candidate.version, completed: transfer.completed, total: transfer.candidate.bytes } }
     case "Cancelling": return { ...state, transfer: { _tag: "Cancelling" } }
     case "Staging": return { ...state, transfer: { _tag: "Staging", version: transfer.candidate.version } }
@@ -49,6 +49,11 @@ export interface ApplicationUpdate {
   readonly close: Effect.Effect<void>
 }
 export const ApplicationUpdate = Context.GenericTag<ApplicationUpdate>("@magnitudedev/daemon-management/ApplicationUpdate")
+
+/** Why `version` is held back from unattended updates, if it failed here; holds saved without a reason were failed installs. */
+export const heldUpdateFailure = (store: PreparedUpdateStore, version: string) => store.hold.pipe(
+  Effect.map(Option.filter(hold => Option.exists(hold.version, held => held === version))),
+  Effect.map(Option.map(hold => Option.getOrElse(hold.reason, () => "install" as const))), Effect.orElseSucceed(() => Option.none()))
 
 /** Checks and transfers have independent admission; workers belong to the application owner. */
 export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = Option.none()) => Effect.gen(function* () {
@@ -95,7 +100,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
       Effect.ensuring(gate.withPermits(1)(Effect.gen(function* () {
         const current = yield* SubscriptionRef.get(state)
         if (current.transfer._tag !== "Cancelling") return
-        yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Available", candidate: current.transfer.candidate } })
+        yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Available", candidate: current.transfer.candidate, failed: yield* heldUpdateFailure(store, current.transfer.candidate.version) } })
         if (autoEnabled(current)) yield* startDownload(current.transfer.candidate, true)
       }))),
       Effect.interruptible, Effect.forkIn(owner),
@@ -107,9 +112,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
     yield* Scope.close(owner, Exit.void)
   }).pipe(Effect.uninterruptible)
   yield* Effect.addFinalizer(() => close)
-  // A version whose unattended installation failed is offered, but only a person downloads it again.
-  const held = (candidate: Candidate) => store.hold.pipe(Effect.map(hold => Option.exists(Option.flatMap(hold, hold => hold.version), version => version === candidate.version)),
-    Effect.orElseSucceed(() => false))
+  // A version that failed to install or start here is offered, but only a person downloads it again.
   // Downloading explicitly lifts the hold, so an unattended retry follows without waiting it out.
   const releaseHold = store.releaseHold.pipe(Effect.ignore)
   // A person checking again lifts only the wait; the version that failed stays held until downloaded explicitly.
@@ -126,10 +129,11 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
         const current = yield* SubscriptionRef.get(state)
         if (current.transfer._tag === "Closed") return
         const replaceable = ["Idle", "Available", "Failed"].includes(current.transfer._tag)
+        const failed = Option.isSome(candidate) ? yield* heldUpdateFailure(store, candidate.value.version) : Option.none()
         const next: State = { ...current, check: { _tag: "Succeeded", at: yield* Clock.currentTimeMillis },
-          transfer: replaceable ? Option.isSome(candidate) ? { _tag: "Available", candidate: candidate.value } : { _tag: "Idle" } : current.transfer }
+          transfer: replaceable ? Option.isSome(candidate) ? { _tag: "Available", candidate: candidate.value, failed } : { _tag: "Idle" } : current.transfer }
         yield* SubscriptionRef.set(state, next)
-        if (replaceable && Option.isSome(candidate) && autoEnabled(next) && !(yield* held(candidate.value))) yield* startDownload(candidate.value, true)
+        if (replaceable && Option.isSome(candidate) && autoEnabled(next) && Option.isNone(failed)) yield* startDownload(candidate.value, true)
       }))),
       Effect.catchAll(error => gate.withPermits(1)(SubscriptionRef.update(state, (current): State => current.transfer._tag === "Closed" ? current
         : { ...current, check: { _tag: "Failed", message: error.message } }))),
@@ -152,6 +156,8 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
       : new ApplicationUpdateFailed({ message: "Download the application update before restarting." }))),
     download: gate.withPermits(1)(Effect.gen(function* () {
       const current = yield* SubscriptionRef.get(state)
+      // Already under way or done: the reply's state says so.
+      if (["Downloading", "Staging", "Ready"].includes(current.transfer._tag)) return
       if (current.transfer._tag !== "Available") return yield* new ApplicationUpdateFailed({ message: "Check for an available update before downloading." })
       yield* releaseHold
       yield* startDownload(current.transfer.candidate, false)
@@ -161,7 +167,7 @@ export const makeApplicationUpdate = (pending: Option.Option<PreparedUpdate> = O
       yield* preferences.write(enabled).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
       yield* SubscriptionRef.update(state, (current): State => ({ ...current, preference: { _tag: "Known", autoDownload: enabled } }))
       const current = yield* SubscriptionRef.get(state)
-      if (enabled && current.transfer._tag === "Available" && !(yield* held(current.transfer.candidate))) yield* startDownload(current.transfer.candidate, true)
+      if (enabled && current.transfer._tag === "Available" && Option.isNone(current.transfer.failed)) yield* startDownload(current.transfer.candidate, true)
       if (!enabled && current.transfer._tag === "Downloading" && current.transfer.automatic) {
         yield* SubscriptionRef.set(state, { ...current, transfer: { _tag: "Cancelling", candidate: current.transfer.candidate } })
         if (Option.isSome(transferWorker)) yield* Fiber.interruptFork(transferWorker.value)
