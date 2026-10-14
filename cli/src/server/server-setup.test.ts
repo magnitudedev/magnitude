@@ -1,6 +1,6 @@
-import { Effect, Either, Fiber, Option, TestClock, TestContext } from "effect"
+import { Duration, Effect, Either, Fiber, Option, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { SERVER_START_TIMEOUT, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
+import { portTaken, SERVER_START_TIMEOUT, ServerSetupHost, serverRemove, serverSetup, WINDOWS_SERVER_MESSAGE } from "./server-setup"
 
 const harness = (overrides: Partial<ServerSetupHost> = {}) => {
   const events: string[] = []
@@ -13,6 +13,9 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     hasRemnants: Effect.succeed(true),
     hasTerminal: Effect.succeed(true),
     sudoWithoutPrompt: Effect.succeed(false),
+    servicePort: Effect.succeed("Service"),
+    serviceRuns: Effect.succeed(Option.some(0)),
+    serviceLog: Effect.succeed([]),
     confirm: () => Effect.sync(() => { events.push("confirm"); return true }),
     runRootStep: args => Effect.sync(() => { events.push(`root ${args.join(" ")}`) }),
     enableNetworkAccess: Effect.sync(() => { events.push("network"); return { addresses: ["192.168.1.5"], port: 10100, key: "mag-key" } }),
@@ -64,10 +67,44 @@ describe("magnitude server setup", () => {
         yield* TestClock.adjust(SERVER_START_TIMEOUT)
         return yield* Fiber.join(fiber)
       }).pipe(Effect.provide(TestContext.TestContext)))
-      expect(Either.isLeft(result) && result.left.message).toBe(`The Magnitude server did not become ready within 2 minutes. See its log: ${logs}\n`
+      expect(Either.isLeft(result) && result.left.message).toBe(`The Magnitude server did not become ready within 2 minutes.\nSee its log: ${logs}\n`
         + "Once it's fixed, run `magnitude server setup` again to finish, or `magnitude server remove` to undo setup.")
       expect(h.output()).toBe("Waiting for the Magnitude server to start…\n")
     })
+  it("refuses before changing anything while another account's Magnitude or another program holds the port", async () => {
+    const h = harness({ isSetUp: Effect.succeed(false), servicePort: Effect.succeed("Other") })
+    const result = await h.run(serverSetup)
+    expect(Either.isLeft(result) && result.left.message).toBe(`${portTaken} Nothing was changed.`)
+    expect(h.events).toEqual([])
+  })
+  it("never configures another program that takes the port after the root step, and says what the log says", async () => {
+    let checks = 0
+    const h = harness({
+      servicePort: Effect.sync(() => checks++ === 0 ? "Free" : "Other"),
+      serviceLog: Effect.succeed(["Started magnitude.service.", "Error: Port 10100 is already in use.", "    at listen (/$bunfs/root/magnitude:1:2)", "Error: Port 10100 is already in use."]),
+    })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* Effect.fork(serverSetup.pipe(Effect.provideService(ServerSetupHost, h.host), Effect.either))
+      yield* TestClock.adjust(Duration.seconds(30))
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestContext.TestContext)))
+    expect(Either.isLeft(result) && result.left.message).toBe([portTaken, "Its log ends with:", "  Started magnitude.service.",
+      "  Error: Port 10100 is already in use.", "See its log: journalctl -u magnitude",
+      "Once it's fixed, run `magnitude server setup` again to finish, or `magnitude server remove` to undo setup."].join("\n"))
+    expect(h.events).toEqual(["root _server-install ada"])
+  })
+  it("stops waiting for a service the service manager keeps restarting", async () => {
+    let runs = 4
+    const h = harness({ servicePort: Effect.succeed("Free"), serviceRuns: Effect.sync(() => Option.some(runs++)),
+      serviceLog: Effect.succeed(["Magnitude couldn't download its inference engine (HTTP 404)."]) })
+    const result = await Effect.runPromise(Effect.gen(function* () {
+      const fiber = yield* Effect.fork(serverSetup.pipe(Effect.provideService(ServerSetupHost, h.host), Effect.either))
+      yield* TestClock.adjust(Duration.seconds(10))
+      return yield* Fiber.join(fiber)
+    }).pipe(Effect.provide(TestContext.TestContext)))
+    expect(Either.isLeft(result) && result.left.message).toContain("The Magnitude server keeps stopping as it starts.\nIts log ends with:\n  Magnitude couldn't download its inference engine (HTTP 404).\n")
+    expect(h.events).toEqual(["root _server-install ada"])
+  })
   it("fails at once without a terminal or passwordless sudo, instead of waiting at a prompt", async () => {
     const h = harness({ hasTerminal: Effect.succeed(false) })
     const result = await h.run(serverSetup)

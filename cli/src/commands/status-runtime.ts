@@ -1,5 +1,6 @@
 import { applicationDataDirectory, desktopApplication, desktopServiceOrigin, readDesktopLoginStartup } from "../server/application"
 import { isServerSetUp } from "../server/serve-owner"
+import { serverNotRunning } from "../server/server-setup"
 import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
@@ -20,6 +21,7 @@ interface ServiceStatusPresentation {
   readonly activeModel: { readonly _tag: "Unavailable" } | { readonly _tag: "Observed"; readonly model: Option.Option<ActiveModel> }
   readonly owner: Option.Option<ApplicationOwner>
   readonly reach: Option.Option<ServerReach>
+  readonly server: boolean
 }
 
 const serviceAddress = new URL(desktopServiceOrigin).host
@@ -61,19 +63,23 @@ const publicServiceStatus = desktopApplication.observe.pipe(
     const reach = state?._tag === "Ready" ? Effect.all([applicationDataDirectory, isServerSetUp]).pipe(
       Effect.flatMap(([dataDirectory, service]) => readServerReach({ endpoint: desktopServiceOrigin, dataDirectory, service })), Effect.option)
       : Effect.succeed(Option.none<ServerReach>())
-    return Effect.all({ model: activeModel, reach, login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach }): ServiceStatusPresentation => ({
+    return Effect.all({ model: activeModel, reach, server: isServerSetUp, login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, server }): ServiceStatusPresentation => ({
       status: state?._tag ?? "Stopped", address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
-      owner: Option.map(snapshot, value => value.owner), reach,
+      owner: Option.map(snapshot, value => value.owner), reach, server,
     })))
   }),
 )
 
-export const renderStatus = (status: ServiceStatusPresentation): string => [
+/** Where the system service is set up, a Headless owner is that service rather than someone's `serve`. */
+const ownerName = (status: ServiceStatusPresentation) => Option.match(status.owner, {
+  onNone: () => "None", onSome: owner => owner._tag === "Headless" && status.server ? "Server" : owner._tag })
+
+export const renderStatus = (status: ServiceStatusPresentation, platform: NodeJS.Platform = process.platform): string => [
   "Magnitude service",
   `  Runtime         ${status.status}`,
-  `  Owner           ${Option.match(status.owner, { onNone: () => "None", onSome: owner => owner._tag })}`,
+  `  Owner           ${ownerName(status)}`,
   ...(Option.isSome(status.owner) && status.owner.value._tag === "Desktop" ? [
     `  Tray            ${status.owner.value.tray._tag === "Unavailable" ? `Unavailable · ${status.owner.value.tray.message}` : status.owner.value.tray._tag}`,
     `  Starts at login ${Option.match(status.startsAutomaticallyOnLogin, { onNone: () => "Unavailable", onSome: value => value ? "Yes" : "No" })}`,
@@ -90,12 +96,12 @@ export const renderStatus = (status: ServiceStatusPresentation): string => [
   })}`] : []),
   ...Option.match(status.reach, { onNone: () => [], onSome: reach => ["", ...renderServerReach(reach).map(line => `  ${line}`)] }),
   ...(Option.isNone(status.owner) ? [
-    "", "Not running", "Open the Magnitude desktop app or run `magnitude serve`.",
+    "", "Not running", status.server ? serverNotRunning(platform) : "Open the Magnitude desktop app or run `magnitude serve`.",
   ] : []),
   "",
 ].join("\n")
 
 export const runStatus = () => runCommand({
   effect: publicServiceStatus,
-  render: renderStatus,
+  render: status => renderStatus(status),
 })

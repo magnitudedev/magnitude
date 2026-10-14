@@ -315,7 +315,8 @@ person's, makes setup refuse before changing anything, and removal never deletes
 step undoes what that run created, so no marker points the CLI at a server that was never enabled;
 re-running setup over a complete or partial setup finishes the remaining steps. When firewalld is running, the root step also opens the server's TCP port 10100 in its default
 zone, at runtime and permanently, and says so; if that fails it prints the `firewall-cmd` command
-instead and setup continues. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
+instead and setup continues. An active ufw that doesn't allow the port is left as it is, and setup
+prints the `ufw allow` command for it. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
 that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
 The desktop app always uses the person's own profile. Every local account reaches the server's
 owner control, as loopback HTTP already admits them, with no group membership or new login: the data
@@ -336,8 +337,13 @@ unit is distinct from the per-user unit that previous-installation retirement in
 group and marker, the marker last, so a removal that fails part way is still visible and can be run
 again; it cleans up whatever of these exists, with or without the marker. The data directory is
 kept, handed to root (mode 0700) since no account owns it any more, until setup gives it back to a
-new service account. Setup waits a bounded two minutes for the service to answer, then fails naming
-its log (the journal on Linux, `~/.magnitude/logs/server.log`, private to the person, on macOS);
+new service account. Setup only ever configures the registered service: before its root step it refuses,
+changing nothing, while anything else answers on port 10100 (another account's Magnitude or another
+program), and afterwards it sends no request until the instance answering on the port is the one the
+service's owner reports. It waits a bounded two minutes for the service to answer, and fails sooner
+when the service manager keeps restarting the service or another program keeps the port; each failure
+quotes the service log's recent lines without stack frames and names the log (the journal on Linux,
+`~/.magnitude/logs/server.log`, private to the person, on macOS);
 on macOS, where the service serves in the person's own profile, a re-run treats the Headless owner
 of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While

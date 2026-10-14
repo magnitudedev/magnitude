@@ -269,7 +269,10 @@ declaration `{schemaVersion, nativeBuild}` written by the installer or the local
 no `backends/` directory and no declared backend. Validation proves the executable's
 `version --json` identity reports the release's native build and the declaration names the same
 native build; `nativeBuild` is the engine build identity (engine version plus kernel bundle
-identity).
+identity). A release installation whose download fails says, in one line and without stack frames,
+that Magnitude couldn't download its inference engine, the HTTP status or failure and the host, and
+to check the connection; ACN's startup failure carries that line to `serve`, the service log and
+`server setup`.
 
 `bun dev` prepares the same fixed layout at
 `inference/target/development/installation.json` before starting the client. `MAGNITUDE_ICN_PATH`

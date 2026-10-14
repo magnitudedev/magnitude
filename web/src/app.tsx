@@ -580,7 +580,7 @@ function Status({ observation }: { observation: ServiceObservation }) {
       {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500">Starting the service…</p>}
       {ready && <DownloadActivity />}
       {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"}
-        description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : "Check that another copy of Magnitude isn’t running, then retry the service."}
+        description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : service.message}
         actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>Retry service</NoticeAction> : undefined} />}
       {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
     </section>
