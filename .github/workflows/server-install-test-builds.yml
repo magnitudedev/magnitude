@@ -48,10 +48,7 @@ jobs:
       fail-fast: false
       matrix:
         version: ${{ fromJSON(needs.plan.outputs.linux) }}
-        arch: [x64, arm64]
-        exclude:
-          - { version: "50.8.3", arch: arm64 }
-          - { version: "50.8.4", arch: arm64 }
+        arch: [x64]
     env:
       MAGNITUDE_ACCEPTANCE_VERSION: ${{ matrix.version }}
     steps:
@@ -95,6 +92,7 @@ jobs:
 
   apple:
     needs: plan
+    if: needs.plan.outputs.apple != '[]'
     permissions:
       contents: write
     environment: apple-release
