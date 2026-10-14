@@ -43,7 +43,7 @@ export const runLocalUpdateMaintenance = (options: {
         if (platform === "darwin") return yield* startMacForegroundInstallation({ resources: runtime.resourcesDirectory,
           stateDirectory: options.stateDirectory, dataDirectory: options.dataDirectory, version: CLI_VERSION, architecture,
           operation: "Install", continuation: { _tag: "None" } })
-        yield* completeLinuxForegroundUpdate(options.dataDirectory, Boolean(process.stdin.isTTY && process.stderr.isTTY)).pipe(Effect.provide(nodeTerminalCommand))
+        yield* completeLinuxForegroundUpdate(options.dataDirectory, process.stdin.isTTY && process.stderr.isTTY ? "Terminal" : "Unattended").pipe(Effect.provide(nodeTerminalCommand))
         return yield* readPreparedUpdateState
       }
       if (options.action === "discard") return yield* discardPreparedUpdate

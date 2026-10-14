@@ -22,6 +22,10 @@ import { ProcessGroupControllerLive } from "@magnitudedev/utils/process-groups/n
 
 export class HeadlessApplicationFailed extends Schema.TaggedError<HeadlessApplicationFailed>()("HeadlessApplicationFailed", { message: Schema.String }) {}
 
+const windowsUncontainedServe = "On Windows, start `magnitude serve` with the Magnitude command, "
+  + "%LOCALAPPDATA%\\Programs\\Magnitude CLI\\magnitude.exe, not the app's resources\\magnitude.exe. "
+  + "Service wrappers such as NSSM and scheduled tasks must start that command too."
+
 /**
  * Why a Headless owner ended. `Restart` asks the caller to admit a new owner with the same invocation;
  * `InstallUpdate` asks it to install the downloaded update now that the service is idle and stopped.
@@ -50,14 +54,16 @@ export const runHeadlessApplication = (options: {
   /**
    * Runs when the service fails before its first Ready, before the owner fails. A service that never
    * becomes ready makes no scheduled check, so `report` sends a recorded outcome before it exits.
+   * Answering true stops with `InstallUpdate` instead of failing, to install a download that replaces it.
    */
-  readonly startupFailed?: (report: Effect.Effect<void>) => Effect.Effect<void>
+  readonly startupFailed?: (report: Effect.Effect<void>, updates: ApplicationUpdate) => Effect.Effect<boolean>
 }) => Effect.scoped(Effect.gen(function* () {
   const stop = yield* Deferred.make<HeadlessStop>()
   yield* options.stop.pipe(Effect.zipRight(Deferred.succeed(stop, "Requested")), Effect.forkScoped)
   const native = yield* NativeHost
   const addon = applicationNativeHostPath(options.runtime, process.platform, process.arch)
-  if (process.platform === "win32") yield* native.guardParent(0)
+  // Only the Magnitude command launcher contains a Windows server's process tree.
+  if (process.platform === "win32") yield* native.guardParent(0).pipe(Effect.mapError(() => new HeadlessApplicationFailed({ message: windowsUncontainedServe })))
   const owner = yield* acquireApplicationOwner(options.stateDirectory, { _tag: "Headless" }, options.profile.sharedControl)
   if (owner._tag !== "Owner") return yield* new HeadlessApplicationFailed({ message: "Magnitude is already running." })
   if (yield* isUpdateInstallationActive(options.stateDirectory)) return yield* new HeadlessApplicationFailed({ message: "A Magnitude update is being installed. Run `magnitude serve` when it finishes." })
@@ -132,11 +138,12 @@ export const runHeadlessApplication = (options: {
     Effect.flatMap(state => Option.isSome(state) ? Effect.fail(new HeadlessApplicationFailed({ message: state.value.message })) : Effect.never))
   const result = yield* Effect.raceFirst(Deferred.await(stop), failure).pipe(Effect.exit)
   if (Exit.isSuccess(result) && options.stopping) yield* options.stopping(result.value)
-  if (Exit.isFailure(result) && !(yield* Deferred.isDone(firstReady)) && options.startupFailed) {
-    // An update that installed but never became ready is reported before the owner exits for a retry.
-    yield* options.startupFailed(report("launch"))
-  }
+  // An update that installed but never became ready is reported before the owner exits for a retry.
+  const replace = Exit.isFailure(result) && !(yield* Deferred.isDone(firstReady)) && options.startupFailed
+    ? yield* options.startupFailed(report("launch"), updates) : false
+  if (replace && options.stopping) yield* options.stopping("InstallUpdate")
   yield* service.shutdown
+  if (replace) return "InstallUpdate" as const
   if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause)
   return result.value
 })).pipe(Effect.provideService(ProcessGroupController, ProcessGroupControllerLive))

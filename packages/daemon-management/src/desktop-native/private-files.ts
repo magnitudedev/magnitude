@@ -2,7 +2,9 @@ import { FileSystem } from "@effect/platform"
 import { Context, Effect, Layer, Schema } from "effect"
 import { createRequire } from "node:module"
 
-export class PrivateFilePermissionsFailed extends Schema.TaggedError<PrivateFilePermissionsFailed>()("PrivateFilePermissionsFailed", {}) {}
+export class PrivateFilePermissionsFailed extends Schema.TaggedError<PrivateFilePermissionsFailed>()("PrivateFilePermissionsFailed", {}) {
+  override get message() { return "Magnitude couldn't secure its private update files." }
+}
 export interface PrivateFilePermissions {
   readonly prepareDirectory: (path: string) => Effect.Effect<void, PrivateFilePermissionsFailed>
   readonly createFile: (path: string) => Effect.Effect<void, PrivateFilePermissionsFailed>

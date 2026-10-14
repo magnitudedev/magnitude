@@ -152,11 +152,15 @@ describe("application-owned updates", () => {
     yield* owner.download
     yield* waitFor(owner, "Staging")
     expect((yield* owner.requireReady.pipe(Effect.either))._tag).toBe("Left")
-    expect((yield* owner.download.pipe(Effect.either))._tag).toBe("Left")
+    // Downloading again while one is under way answers with that transfer instead of starting another.
+    yield* owner.download
+    expect((yield* owner.state).transfer._tag).toBe("Staging")
     // All observers above have ended. Their lifetime cannot end staging.
     yield* Deferred.succeed(finishStage, undefined)
     yield* waitFor(owner, "Ready")
     yield* owner.requireReady
+    yield* owner.download
+    expect((yield* owner.state).transfer._tag).toBe("Ready")
     yield* owner.close
     expect(yield* Ref.get(released)).toBe(true)
     expect((yield* owner.state).transfer._tag).toBe("Closed")
@@ -213,7 +217,7 @@ describe("application-owned updates", () => {
     const owner = (hold: Ref.Ref<Option.Option<UnattendedHold>>, offer: typeof candidate, downloads: Ref.Ref<string[]>) => Effect.gen(function* () {
       const store = yield* PreparedUpdateStore
       return yield* makeApplicationUpdate().pipe(
-        Effect.provideService(PreparedUpdateStore, { ...store, hold: Ref.get(hold), releaseHold: Ref.set(hold, Option.none()) }),
+        Effect.provideService(PreparedUpdateStore, { ...store, hold: Ref.get(hold), recordHold: value => Ref.set(hold, Option.some(value)), releaseHold: Ref.set(hold, Option.none()) }),
         Effect.provideService(UpdatePreferences, { read: Effect.succeed(true), write: () => Effect.void }),
         Effect.provideService(ApplicationUpdateSource, { check: () => Effect.succeed(Option.some(offer)),
           download: release => Ref.update(downloads, all => [...all, release.version]).pipe(Effect.as("archive")), stage: () => Effect.void }))
@@ -221,36 +225,36 @@ describe("application-owned updates", () => {
     const checked = (update: ApplicationUpdate) => update.changes.pipe(Stream.filter(state => state.check._tag === "Succeeded"), Stream.take(1), Stream.runDrain)
 
     it.each(["launch", "scheduled"] as const)("does not download the failed version again on a %s check, in any later owner", reason => run(Effect.gen(function* () {
-      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: 0 }))
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), reason: Option.some("install"), until: 0 }))
       const downloads = yield* Ref.make<string[]>([])
       for (let restart = 0; restart < 3; restart++) {
         const update = yield* owner(hold, candidate, downloads)
         yield* update.check(reason)
         yield* checked(update)
-        expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: candidate.version, bytes: candidate.bytes })
+        expect((yield* update.state).transfer).toEqual({ _tag: "Available", version: candidate.version, bytes: candidate.bytes, failed: Option.some("install") })
       }
       expect(yield* Ref.get(downloads)).toEqual([])
       expect(Option.isSome(yield* Ref.get(hold))).toBe(true)
     })))
     it("still downloads a newer version automatically", () => run(Effect.gen(function* () {
-      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: 0 }))
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), reason: Option.some("install"), until: 0 }))
       const downloads = yield* Ref.make<string[]>([])
       const update = yield* owner(hold, { ...candidate, version: "2.1.0" }, downloads)
       yield* update.check("scheduled")
       yield* waitFor(update, "Ready")
       expect(yield* Ref.get(downloads)).toEqual(["2.1.0"])
     })))
-    it("lets a person retry it: a manual check lifts the hold and downloads it", () => run(Effect.gen(function* () {
-      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: Number.MAX_SAFE_INTEGER }))
+    it("lifts only the wait on a manual check: the failed version stays held and is not downloaded", () => run(Effect.gen(function* () {
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), reason: Option.some("startup"), until: Number.MAX_SAFE_INTEGER }))
       const downloads = yield* Ref.make<string[]>([])
       const update = yield* owner(hold, candidate, downloads)
       yield* update.check("manual")
-      yield* waitFor(update, "Ready")
-      expect(yield* Ref.get(downloads)).toEqual([candidate.version])
-      expect(Option.isNone(yield* Ref.get(hold))).toBe(true)
+      yield* checked(update)
+      expect(yield* Ref.get(downloads)).toEqual([])
+      expect(yield* Ref.get(hold)).toEqual(Option.some({ version: Option.some(candidate.version), reason: Option.some("startup"), until: 0 }))
     })))
     it("lets a person download it explicitly, lifting the hold", () => run(Effect.gen(function* () {
-      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), until: Number.MAX_SAFE_INTEGER }))
+      const hold = yield* Ref.make(Option.some<UnattendedHold>({ version: Option.some(candidate.version), reason: Option.some("install"), until: Number.MAX_SAFE_INTEGER }))
       const downloads = yield* Ref.make<string[]>([])
       const update = yield* owner(hold, candidate, downloads)
       yield* update.check("launch")

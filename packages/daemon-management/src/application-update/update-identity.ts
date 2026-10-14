@@ -5,7 +5,9 @@ import { join } from "node:path"
 import { signUpdateRequest, type UpdateSigningFailed } from "@magnitudedev/release/hosted-update"
 import { PrivateFilePermissions } from "../desktop-native/private-files"
 
-export class UpdateIdentityFailed extends Schema.TaggedError<UpdateIdentityFailed>()("UpdateIdentityFailed", {}) {}
+export class UpdateIdentityFailed extends Schema.TaggedError<UpdateIdentityFailed>()("UpdateIdentityFailed", {}) {
+  override get message() { return "Magnitude couldn't identify this installation for updates." }
+}
 export interface UpdateIdentity {
   readonly sign: (url: URL) => Effect.Effect<string, UpdateSigningFailed>
 }

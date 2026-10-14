@@ -42,7 +42,7 @@ const fixture = (scenario: "success" | "absent" | "verify" | "attempt" | "instal
 describe("foreground Linux update completion", () => {
   it.each([false, true])("waits for replacement and verifies its version before clearing state (prompt %s)", async prompt => {
     const f = fixture("success", prompt)
-    expect(await Effect.runPromise(completeLinuxForegroundUpdate("/profile", prompt).pipe(
+    expect(await Effect.runPromise(completeLinuxForegroundUpdate("/profile", prompt ? "Terminal" : "Unattended").pipe(
       Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(CommandExecutor.CommandExecutor, f.executor), Effect.provideService(TerminalCommand, f.terminal)))).toBe("0.1.6")
     expect(f.events).toEqual(["verify", "attempt", "installer", "version", "complete"])
   })
@@ -52,22 +52,28 @@ describe("foreground Linux update completion", () => {
     ["version", ["verify", "attempt", "installer", "version", "failure:install"]],
   ] as const)("retains the preparation after %s failure", async (scenario, events) => {
     const f = fixture(scenario)
-    expect(await Effect.runPromise(completeLinuxForegroundUpdate("/profile", false).pipe(
+    expect(await Effect.runPromise(completeLinuxForegroundUpdate("/profile", "Unattended").pipe(
       Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(CommandExecutor.CommandExecutor, f.executor), Effect.provideService(TerminalCommand, f.terminal), Effect.isFailure))).toBe(true)
     expect(f.events).toEqual(events)
   })
   it.each([[1, "authorization"], [3, "verify"], [4, "install"], [9, "install"]] as const)("classifies installer exit %i as %s", async (code, reason) => {
     const f = fixture("installer", false, code)
-    expect(await Effect.runPromise(completeLinuxForegroundUpdate("/profile", false).pipe(
+    expect(await Effect.runPromise(completeLinuxForegroundUpdate("/profile", "Unattended").pipe(
       Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(CommandExecutor.CommandExecutor, f.executor), Effect.provideService(TerminalCommand, f.terminal), Effect.isFailure))).toBe(true)
     expect(f.events.at(-1)).toBe(`failure:${reason}`)
+  })
+  it.each([["Server", false], ["Unattended", true]] as const)("names `update install` in a %s failure only outside the server: %s", async (invoker, named) => {
+    const f = fixture("installer", false, 4)
+    const error = await Effect.runPromise(completeLinuxForegroundUpdate("/profile", invoker).pipe(
+      Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(CommandExecutor.CommandExecutor, f.executor), Effect.provideService(TerminalCommand, f.terminal), Effect.flip))
+    expect(error.message.includes("magnitude update install")).toBe(named)
   })
   it("does not clear the attempted record or continue after cancellation", async () => {
     const f = fixture("success")
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const entered = yield* Deferred.make<void>()
       const retired = yield* Ref.make(false)
-      const worker = yield* completeLinuxForegroundUpdate("/profile", false).pipe(
+      const worker = yield* completeLinuxForegroundUpdate("/profile", "Unattended").pipe(
         Effect.provideService(PreparedUpdateStore, f.store), Effect.provideService(CommandExecutor.CommandExecutor, f.executor),
         Effect.provideService(TerminalCommand, {
           run: () => Deferred.succeed(entered, undefined).pipe(Effect.zipRight(Effect.never), Effect.ensuring(Ref.set(retired, true))),

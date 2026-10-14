@@ -3,7 +3,9 @@ import { createRequire } from "node:module"
 
 export const MacFileIdentity = Schema.String.pipe(Schema.pattern(/^\d{1,20}:\d{1,20}$/), Schema.brand("MacFileIdentity"))
 export type MacFileIdentity = typeof MacFileIdentity.Type
-export class MacUpdateFilesystemFailed extends Schema.TaggedError<MacUpdateFilesystemFailed>()("MacUpdateFilesystemFailed", {}) {}
+export class MacUpdateFilesystemFailed extends Schema.TaggedError<MacUpdateFilesystemFailed>()("MacUpdateFilesystemFailed", {}) {
+  override get message() { return "Magnitude couldn't access its update files." }
+}
 const handle = Symbol("MacUpdateDirectory")
 export interface MacUpdateDirectory {
   readonly identity: MacFileIdentity

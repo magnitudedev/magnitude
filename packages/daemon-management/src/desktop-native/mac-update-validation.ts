@@ -8,7 +8,9 @@ export const MacBundleExpectation = Schema.Struct({
 })
 export type MacBundleExpectation = typeof MacBundleExpectation.Type
 
-export class MacBundleVerificationFailed extends Schema.TaggedError<MacBundleVerificationFailed>()("MacBundleVerificationFailed", {}) {}
+export class MacBundleVerificationFailed extends Schema.TaggedError<MacBundleVerificationFailed>()("MacBundleVerificationFailed", {}) {
+  override get message() { return "The downloaded update's app bundle didn't verify, so it wasn't installed." }
+}
 export interface MacBundleVerifier {
   readonly verify: (path: string, expected: MacBundleExpectation) => Effect.Effect<void, MacBundleVerificationFailed>
 }

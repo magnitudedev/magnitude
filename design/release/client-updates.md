@@ -29,10 +29,16 @@ must be resolved explicitly; uninstall removes only registration owned by that i
 
 ## Headless control
 
-`magnitude update` and `magnitude update check` request a fresh check from the application owner.
+`magnitude update` and `magnitude update check` request a fresh check from the application owner
+and wait (up to two minutes) for it to finish, so they print its result. While a check runs, its
+state supersedes the previous check's offer.
 `magnitude update status` observes current update state without starting the application.
 `magnitude update download` explicitly admits a download of the selected offer. It acknowledges
-admission and directs the caller to status; download completion belongs to the owner.
+admission and directs the caller to status; download completion belongs to the owner. While a
+download is already under way, staging or ready it answers with that state instead of failing.
+An offer whose version is held back because it failed here carries the failure (verify, install,
+authorization or startup), so `update status` and Settings say that version failed and is not
+downloaded automatically, rather than presenting it as an ordinary available update.
 `magnitude update install` requires a prepared update. Desktop may stop its model and service to
 install and restart; a running Headless owner refuses an explicit install, because it installs by
 itself when idle.
@@ -51,17 +57,24 @@ no unattended attempt starts for an hour, and when the package itself failed it 
 outcome, drops the download and never downloads or installs that version unattended again, so the
 next check can fetch only a newer release. The hold is persisted beside the prepared update, so it
 outlives service restarts and the outcome's report; a failure before the installer ran keeps the
-download for the next attempt after the hour. A person lifts the hold with a manual check or an
-explicit download, which may retry the same version. It checks the installation lock before
+download for the next attempt after the hour. A manual check lifts only the hour's wait; the failed
+version stays held until a person downloads it explicitly, which may retry it. It checks the installation lock before
 stopping anything: if another process holds or awaits it (the service's own shared lease does not
 count, so this reads the kernel's lock table rather than trying the lock), it keeps serving,
 records `deferred`, reports it with an immediate update check, and holds unattended installation
 for 15 minutes. (A started service refuses to run while the lock is held, so stopping first would
 leave it down until the lock frees.) Update checks, scheduled or requested, start only once the
 service is ready, so a new version reports `applied` only after it starts; one that fails before
-Ready records `failed`/`startup`, sends it with an immediate check whose result it awaits, and
-exits non-zero for the service manager to retry. A restart after that report sends nothing more.
-There is no rollback; withdrawing the release stops it being offered.
+Ready records `failed`/`startup`, holds that version back exactly like a failed package (so a
+version installed by hand to recover is not updated straight back to it), sends the outcome with an
+immediate check whose result it awaits, and exits non-zero for the service manager to retry. While
+the running version is the held one, a restart checks again once the hour's wait has passed (and
+then holds for another hour), so restarts never storm the update server yet a fixed release still
+arrives: when that check leaves a newer download ready, the owner installs it in place of the
+version that cannot start instead of exiting. There is no rollback; withdrawing the release stops
+it being offered. Desktop likewise starts its scheduled checks only once its service is first Ready or Failed; a
+service that fails before Ready records `failed`/`startup` and holds that version back the same way,
+and the app, which keeps running, goes on checking hourly.
 
 Update commands never launch Desktop. With no owner, status observes persisted preparation without
 creating state; finite check, download and discard retain maintenance ownership. A finite download
@@ -101,8 +114,10 @@ installation.
 - Install requires Ready and acknowledges before service/application shutdown.
 - No owner installs at startup; a Unix `serve` installs only at an idle point, only without a
   password prompt, and never blocks Ready.
-- A failed unattended installation is never retried in a loop: the failed version is not downloaded
-  or installed unattended again, and no unattended attempt starts within an hour, across restarts.
+- A failed unattended installation, or an installed version that never becomes ready, is never
+  retried in a loop: the failed version is not downloaded or installed unattended again, and no
+  unattended attempt starts within an hour, across restarts.
+- A server whose installed version cannot start still checks hourly and installs a newer release.
 - Packaged CLI and service versions match the application version.
 - The update server accepts every request field a release sends (such as `owner` and
   `outcome_from`) before that release is published, since it rejects unknown fields.

@@ -45,7 +45,7 @@ describe("finite application update preparation", () => {
   })))
   it("checks without starting an automatic download even when the preference is enabled", () => run(Effect.gen(function* () {
     const { events, provide } = yield* fixture
-    expect((yield* provide(runFiniteUpdatePreparation("check"))).transfer).toEqual({ _tag: "Available", version: "0.1.6", bytes: 1 })
+    expect((yield* provide(runFiniteUpdatePreparation("check"))).transfer).toEqual({ _tag: "Available", version: "0.1.6", bytes: 1, failed: Option.none() })
     expect(events).toEqual(["read", "check"])
   })))
   it("returns Ready only after durable publication and transfer retirement", () => run(Effect.gen(function* () {

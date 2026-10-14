@@ -1,7 +1,9 @@
 import { Context, Effect, Layer, Schema } from "effect"
 import { createRequire } from "node:module"
 
-export class WindowsInstallerSignatureFailed extends Schema.TaggedError<WindowsInstallerSignatureFailed>()("WindowsInstallerSignatureFailed", {}) {}
+export class WindowsInstallerSignatureFailed extends Schema.TaggedError<WindowsInstallerSignatureFailed>()("WindowsInstallerSignatureFailed", {}) {
+  override get message() { return "The downloaded update's publisher signature didn't verify, so it wasn't installed." }
+}
 export interface WindowsInstallerVerifier {
   readonly verify: (path: string) => Effect.Effect<void, WindowsInstallerSignatureFailed>
 }

@@ -1,11 +1,16 @@
-import { Duration, Effect, Fiber, Option, TestClock, TestContext } from "effect"
+import { Duration, Effect, Fiber, Option, Stream, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
 import type { PreparedUpdate, PreparedUpdateStore, UnattendedHold } from "@magnitudedev/daemon-management/desktop-native"
 import type { UpdateOutcome } from "@magnitudedev/release/hosted-update"
+import type { ApplicationUpdate } from "@magnitudedev/daemon-management/application-update"
+import type { ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { CLI_VERSION } from "../version"
 import { IdleInstallationSystem, makeDownloadedNotice, makeIdleInstallation } from "./serve-updates"
 
 const release = { version: "99.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }
+const updatesIn = (...transfers: ApplicationUpdateState["transfer"][]) => ({
+  changes: Stream.fromIterable(transfers.map(transfer => ({ transfer, check: { _tag: "Idle" }, preference: { _tag: "Known", autoDownload: true } }) as ApplicationUpdateState)),
+}) as ApplicationUpdate
 
 const harness = (options: {
   readonly authorized?: boolean
@@ -136,27 +141,52 @@ describe("install when idle", () => {
     expect(h.events).toEqual(["install", "hold - 3600000", "idle"])
   })
   it("keeps a held-back version when a later attempt fails without running the package", async () => {
-    const h = harness({ installer: "admission-fails", hold: { version: Option.some("98.0.0"), until: 0 } })
+    const h = harness({ installer: "admission-fails", hold: { version: Option.some("98.0.0"), reason: Option.some("install"), until: 0 } })
     await h.run(machine => machine.install)
-    expect(h.hold()).toEqual(Option.some({ version: Option.some("98.0.0"), until: 3_600_000 }))
+    expect(h.hold()).toEqual(Option.some({ version: Option.some("98.0.0"), reason: Option.some("install"), until: 3_600_000 }))
   })
   it("turns an unreported applied outcome into failed/startup and reports it before exiting", async () => {
     const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, from: Option.some("0.0.9"), reason: Option.none() } })
     const reports: Array<Option.Option<UpdateOutcome>> = []
     const report = Effect.sync(() => { reports.push(h.outcome()) })
-    await h.run(machine => machine.startupFailed(report))
+    expect(await h.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Idle" })))).toBe(false)
     expect(reports).toEqual([Option.some({ outcome: "failed", version: CLI_VERSION, from: Option.some("0.0.9"), reason: Option.some("startup") })])
+    // The version that cannot start is held back, so a manual downgrade is not updated straight back to it.
+    expect(h.hold()).toEqual(Option.some({ version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 3_600_000 }))
   })
   it("reports a startup failure once: restarts after it was sent make no request", async () => {
     const h = harness({ outcome: { outcome: "applied", version: CLI_VERSION, from: Option.some("0.0.9"), reason: Option.none() } })
     let reports = 0
     const report = Effect.sync(() => { reports += 1 }).pipe(Effect.zipRight(h.markReported))
-    for (let restart = 0; restart < 3; restart++) await h.run(machine => machine.startupFailed(report))
+    for (let restart = 0; restart < 3; restart++) await h.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Idle" })))
     expect(reports).toBe(1)
+  })
+  it("checks again once the hold's wait passes while the held version cannot start, and installs a newer download", async () => {
+    const h = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 0 } })
+    let reports = 0
+    const report = Effect.sync(() => { reports += 1 })
+    const updates = updatesIn({ _tag: "Available", version: "99.0.0", bytes: 1, failed: Option.none() },
+      { _tag: "Downloading", version: "99.0.0", completed: 0, total: 1 }, { _tag: "Ready", version: "99.0.0" })
+    expect(await h.run(machine => machine.startupFailed(report, updates))).toBe(true)
+    expect(reports).toBe(1)
+    expect(h.hold()).toEqual(Option.some({ version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 3_600_000 }))
+  })
+  it("keeps exiting without a check while the held version's wait lasts, or when nothing newer is downloaded", async () => {
+    const h = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 1 } })
+    let reports = 0
+    const report = Effect.sync(() => { reports += 1 })
+    expect(await h.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Ready", version: "99.0.0" })))).toBe(false)
+    expect(reports).toBe(0)
+    const later = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 0 } })
+    expect(await later.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Idle" })))).toBe(false)
+    expect(reports).toBe(1)
+    const offered = harness({ hold: { version: Option.some(CLI_VERSION), reason: Option.some("startup"), until: 0 } })
+    expect(await offered.run(machine => machine.startupFailed(report, updatesIn({ _tag: "Available", version: CLI_VERSION, bytes: 1, failed: Option.some("startup") })))).toBe(false)
+    expect(reports).toBe(2)
   })
   it("leaves other outcomes alone when a start fails", async () => {
     const h = harness({ outcome: { outcome: "applied", version: "0.0.1", from: Option.some("0.0.0"), reason: Option.none() } })
-    await h.run(machine => machine.startupFailed(Effect.void))
+    await h.run(machine => machine.startupFailed(Effect.void, updatesIn({ _tag: "Idle" })))
     expect(h.events).toEqual([])
   })
 })

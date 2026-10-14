@@ -1,4 +1,4 @@
-import { Context, Effect, Option, Schema } from "effect"
+import { Clock, Context, Duration, Effect, Option, Schema } from "effect"
 import { isNewerVersion, isValidVersion } from "@magnitudedev/release"
 import type { UpdateOutcome, UpdateRelease } from "@magnitudedev/release/hosted-update"
 import { PreparedUpdateStore, type PreparedUpdate } from "@magnitudedev/daemon-management/desktop-native"
@@ -54,6 +54,22 @@ export const reconcilePreparedUpdate = (installedVersion: string) => Effect.gen(
   }
   return pending
 }).pipe(Effect.mapError(error => new ApplicationUpdateFailed({ message: error.message })))
+
+/**
+ * The running version, applied by an update, failed before its service first became ready: records
+ * `failed`/`startup` for the next check and holds the version back from unattended download and
+ * installation, with no unattended attempt before `backoff` passes. Answers whether it recorded
+ * anything; a version that already failed this way, or was not applied by an update, is left alone.
+ */
+export const recordStartupFailure = (runningVersion: string, backoff: Duration.Duration) => Effect.gen(function* () {
+  const store = yield* PreparedUpdateStore
+  const outcome = yield* store.outcome
+  if (Option.isNone(outcome) || outcome.value.outcome !== "applied" || outcome.value.version !== runningVersion) return false
+  yield* store.recordOutcome({ ...outcome.value, outcome: "failed", reason: Option.some("startup") })
+  yield* store.recordHold({ version: Option.some(outcome.value.version), reason: Option.some("startup"),
+    until: (yield* Clock.currentTimeMillis) + Duration.toMillis(backoff) })
+  return true
+})
 
 /** The startup and explicit-retry paths use this same verification and durable attempt barrier. */
 export const installPreparedUpdate = (intent: UpdateInstallationIntent) => Effect.gen(function* () {

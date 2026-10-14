@@ -50,6 +50,9 @@ the authorizing user's identity and installed publisher trust. Success requires 
 package installation and the replacement CLI reporting the prepared version before retained state
 is removed. Cancellation retires privileged installation descendants, cannot report success or clear
 an attempted installation, and preserves package-manager repair state when replacement was interrupted.
+apt waits up to five minutes for a dpkg lock held by another package run (such as unattended-upgrades),
+as install.sh does, and dnf waits for its own lock, so routine contention delays an installation
+rather than failing it.
 No owner installs a prepared update at startup. Desktop launch and Headless `serve` start
 normally with the update retained; Desktop offers Restart and a terminal owner prints the install
 command. Startup only completes an interrupted macOS transaction from its receipt. Failed or
@@ -71,8 +74,9 @@ The privileged Linux helper reports its class through a distinct exit status, se
 statuses sudo and pkexec use for authorization. `deferred` records an idle installation postponed
 because another Magnitude held the installation lock; the service reports it with an immediate
 check. A `startup` failure is sent by the failing owner with an immediate check it awaits before
-exiting, since an owner that never becomes ready makes no scheduled check. Other outcomes are sent
-once with the next check.
+exiting, since an owner that never becomes ready makes no scheduled check; Desktop, which keeps
+running, starts its checks only once its service is first Ready or Failed, so it records `startup`
+before reporting. Other outcomes are sent once with the next check.
 
 Each outcome also carries `outcome_from`, the version that was running when the attempted release
 was prepared, recorded with the preparation. An `applied` outcome is reported by the new version,
@@ -91,7 +95,9 @@ by both the Polkit wrapper and the helper itself.
 
 Updates must match the application platform and release channel. The client verifies release
 signatures, downloaded file integrity, and applicable native publisher signatures before
-installation. Failed checks or verification must not be reported as successful updates.
+installation. Failed checks or verification must not be reported as successful updates. Every update
+failure carries a human sentence naming what failed (for example a rejected publisher signature), and
+clients show that sentence rather than a generic connection hint.
 
 macOS staged-bundle verification uses the publisher identity compiled into the installed application;
 missing publisher configuration cannot become identifier-only update trust. Native verification checks
@@ -127,7 +133,12 @@ they neither acquire installation exclusion nor authorize mutation on their own.
 
 macOS installation admission uses a shared kernel lease outside the replaceable application bundle.
 The stable adjacent lock is owned by the installation owner, readable by other users, and never
-unlinked or rewritten. Running owners retain shared admission; an installer requires exclusive
+rewritten. The one exception: when another account reinstalled the bundle, its owner replaces a
+well-formed lock owned by the previous owner, only while holding it exclusively, by unlinking it and
+creating its own; a process that opened the old lock fails revalidation. Update staging owned by
+another account is reported with the exact administrator command that removes it, and an installer
+run by a non-root account refuses before staging when the bundle belongs to another non-root account,
+naming that account as the one that can update it. Running owners retain shared admission; an installer requires exclusive
 admission and revalidates the retained lock and parent identities before mutation. First installation
 may acquire exclusive admission for an absent bundle using the installing user's lock ownership;
 shared owner admission still requires an installed bundle. Publication retains that lock for later
