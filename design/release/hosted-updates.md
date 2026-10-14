@@ -139,7 +139,9 @@ The stable adjacent lock is owned by the installation owner, readable by other u
 rewritten. The one exception: when another account reinstalled the bundle, its owner replaces a
 well-formed lock owned by the previous owner, only while holding it exclusively, by unlinking it and
 creating its own; a process that opened the old lock fails revalidation. Update staging owned by
-another account is reported with the exact administrator command that removes it. Running owners retain shared admission; an installer requires exclusive
+another account is reported with the exact administrator command that removes it, and an installer
+run by a non-root account refuses before staging when the bundle belongs to another non-root account,
+naming that account as the one that can update it. Running owners retain shared admission; an installer requires exclusive
 admission and revalidates the retained lock and parent identities before mutation. First installation
 may acquire exclusive admission for an absent bundle using the installing user's lock ownership;
 shared owner admission still requires an installed bundle. Publication retains that lock for later

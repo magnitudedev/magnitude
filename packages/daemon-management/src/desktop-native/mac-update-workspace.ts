@@ -1,6 +1,8 @@
 import { FileSystem } from "@effect/platform"
 import { Effect, Option, Schema } from "effect"
+import { execFile } from "node:child_process"
 import { basename, dirname, join, resolve } from "node:path"
+import { promisify } from "node:util"
 import { exchangeMacUpdate, publishMacInstallation, type MacUpdateVersions } from "./mac-update-transaction"
 import type { MacBundleExpectation } from "./mac-update-validation"
 import { MacUpdateAdmission, type MacExclusiveInstallationLease } from "./mac-update-lease"
@@ -28,6 +30,31 @@ export const foreignStaging = (staging: string) => Effect.gen(function* () {
   }
 })
 
+/** An application another account installed can only be replaced by that account or an administrator. */
+export class MacUpdateForeignBundle extends Schema.TaggedError<MacUpdateForeignBundle>()("MacUpdateForeignBundle", {
+  bundle: Schema.String, owner: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+}) {
+  override get message() {
+    const owner = Option.match(this.owner, { onNone: () => "another macOS account", onSome: name => `another macOS account (${name})` })
+    const who = Option.getOrElse(this.owner, () => "that account")
+    return `Magnitude at ${this.bundle} belongs to ${owner}, so this account can't update it. Ask ${who} to update Magnitude.`
+  }
+}
+
+const accountName = (uid: number) => Effect.tryPromise(() => promisify(execFile)("/usr/bin/id", ["-un", String(uid)])).pipe(
+  Effect.map(({ stdout }) => Option.some(stdout.trim()).pipe(Option.filter(name => name.length > 0))),
+  Effect.orElseSucceed(() => Option.none<string>()))
+
+export const foreignBundle = (bundle: string) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const info = yield* fs.stat(bundle).pipe(Effect.option)
+  const user = process.getuid?.()
+  const owner = Option.flatMap(info, value => value.uid)
+  if (user !== 0 && Option.isSome(owner) && owner.value !== 0 && owner.value !== user) {
+    return yield* new MacUpdateForeignBundle({ bundle, owner: yield* accountName(owner.value) })
+  }
+})
+
 /** Stable discovery is installation-relative; every access retains exclusive installation admission. */
 export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained?: MacExclusiveInstallationLease) => Effect.gen(function* () {
   if (resolve(bundle) !== bundle || !bundle.endsWith(".app") || bundle.includes("\0")) return yield* new MacUpdateRepairRequired()
@@ -42,6 +69,7 @@ export const openMacUpdateWorkspace = (bundle: string, create: boolean, retained
   const installed = yield* native.open(dirname(bundle), false)
   const stagingName = `.${installedName}.update`
   const stagingPath = join(installed.path, stagingName)
+  if (create) yield* foreignBundle(bundle)
   yield* foreignStaging(stagingPath)
   const existing = yield* native.inspect(installed, stagingName)
   if (Option.isNone(existing)) {
