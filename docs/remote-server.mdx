@@ -136,15 +136,26 @@ It runs in the foreground and Ctrl+C stops it. On Linux, `nohup magnitude serve 
 
 ## Windows
 
-Magnitude has no server mode on Windows; `magnitude server setup` explains this and changes nothing. To run Magnitude as a service, wrap `magnitude serve` with [NSSM](https://nssm.cc), as you might for Ollama:
+Magnitude has no server mode on Windows; `magnitude server setup` explains this and changes nothing. To run Magnitude as a service, wrap `magnitude serve` with [NSSM](https://nssm.cc), as you might for Ollama. Download NSSM and use the full path to its `nssm.exe` (for example `C:\nssm\win64\nssm.exe`) wherever these steps say `nssm`, unless you put it on your `PATH`.
 
-1. Install Magnitude for [Windows](/installation/windows) as the account that will run the server, and download a model.
-2. Turn on network access: edit `%USERPROFILE%\.magnitude\config.json` and add the `network` object described in [Network access](/api/network-access), with a key.
-3. From an administrator PowerShell, register the service to run as that account:
+1. Sign in as the account that will run the server and install Magnitude for [Windows](/installation/windows). The service must run as this same account: the installation is private to it, so other accounts, including `LocalSystem`, can't start it.
+2. Turn on network access: create or edit `%USERPROFILE%\.magnitude\config.json` with a `network` object and a long, random key. All fields are in [Configuration file](/reference/configuration-file).
+
+```json
+{
+  "network": {
+    "enabled": true,
+    "apiKey": "YOUR_LONG_RANDOM_KEY"
+  }
+}
+```
+
+3. From an administrator PowerShell signed in as that account, create the log folder and register the service. `magnitude serve` must be started through the Magnitude command in `Magnitude CLI`, as below; the app's own `resources\magnitude.exe` refuses to serve. For a domain account, replace `$env:COMPUTERNAME` with the domain name.
 
 ```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.magnitude\logs"
 nssm install Magnitude "$env:LOCALAPPDATA\Programs\Magnitude CLI\magnitude.exe" serve
-nssm set Magnitude ObjectName "$env:USERDOMAIN\$env:USERNAME" "YOUR_PASSWORD"
+nssm set Magnitude ObjectName "$env:COMPUTERNAME\$env:USERNAME" "YOUR_PASSWORD"
 nssm set Magnitude AppStdout "$env:USERPROFILE\.magnitude\logs\server.log"
 nssm set Magnitude AppStderr "$env:USERPROFILE\.magnitude\logs\server.log"
 nssm set Magnitude AppExit Default Restart
@@ -152,5 +163,11 @@ nssm start Magnitude
 ```
 
 4. Allow inbound TCP port 10100 in Windows Defender Firewall if other computers need to reach it.
+5. Download a model. Models download through the running server, so do this once the service is running: use the commands in [Download a model](#download-a-model) on the server, or the browser app from your laptop.
 
-The service keeps running when you or another user log off. Don't open the desktop app while it runs: the app takes over serving from it. To install an update, stop the service (`nssm stop Magnitude`), run `magnitude update install`, then start it again. To remove the service, run `nssm remove Magnitude confirm`.
+The service keeps running when you or another user log off. Don't open the desktop app while it runs: the app can't serve until you stop the service, and says so. To install an update, stop the service (`nssm stop Magnitude`), run `magnitude update install`, then start it again. To remove the service, stop it first, then remove it; a running service keeps serving, including on the network, until it stops:
+
+```powershell
+nssm stop Magnitude
+nssm remove Magnitude confirm
+```

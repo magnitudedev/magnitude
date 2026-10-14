@@ -19,7 +19,20 @@ For a complete server setup, see [Remote server](/remote-server).
 
 The first time the service listens on a network, macOS or Windows may ask whether to allow incoming connections. Allow them.
 
-Without Desktop, use the [configuration example](/remote-server#configure-network-access). All fields are documented in [Configuration file](/reference/configuration-file).
+### Configuration file
+
+Without Desktop, add a `network` object to `~/.magnitude/config.json` (`%USERPROFILE%\.magnitude\config.json` on Windows) with a long, randomly generated key, then restart Magnitude:
+
+```json
+{
+  "network": {
+    "enabled": true,
+    "apiKey": "YOUR_LONG_RANDOM_KEY"
+  }
+}
+```
+
+A server set up with `magnitude server setup` turns this on itself; see [Remote server](/remote-server). All fields are documented in [Configuration file](/reference/configuration-file).
 
 ## Choose an address
 
