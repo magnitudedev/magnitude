@@ -1,6 +1,6 @@
 import { FileSystem, HttpServerRequest, HttpServerResponse } from "@effect/platform"
 import { Effect, Option } from "effect"
-import { extname, join, normalize, resolve, sep } from "node:path"
+import { extname, join, posix, resolve, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { embeddedWebApp } from "./web-app-embed"
 
@@ -57,7 +57,8 @@ export const webAppFilePath = (pathname: string): Option.Option<string> => {
     return Option.none()
   }
   if (decoded.includes("\0") || decoded.includes("\\")) return Option.none()
-  const relative = normalize(decoded).replace(/^\/+/, "")
+  // URL paths are POSIX on every platform; the native normalize would turn them into Windows paths.
+  const relative = posix.normalize(decoded).replace(/^\/+/, "")
   if (relative.split(/[\\/]/).includes("..")) return Option.none()
   return Option.some(relative === "" || relative === "." ? "index.html" : relative)
 }
