@@ -31,18 +31,18 @@ describe("application bootstrap selection", () => {
   it("preserves production, development and acceptance profile isolation", () => {
     const select = (runtime: ApplicationRuntime, acceptance = false, environment: Record<string, string> = {}) =>
       resolveApplicationProfile({ runtime, acceptance, environment, home: "/home/user", platform: "linux", server: false })
-    expect(select(installed)).toEqual({ dataDirectory: "/home/user/.magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", groupAccess: false })
+    expect(select(installed)).toEqual({ dataDirectory: "/home/user/.magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", sharedControl: false })
     expect(select(development)).toMatchObject({ dataDirectory: "/home/user/.magnitude-desktop-dev", isolated: true, port: 11101 })
     expect(select(installed, true)).toMatchObject({ dataDirectory: "/home/user/.magnitude-update-acceptance", isolated: true, port: 11143 })
     expect(select(installed, false, { MAGNITUDE_DEV_DATA_DIR: "/isolated", MAGNITUDE_DEV_PORT: "12345" }))
-      .toEqual({ dataDirectory: "/isolated", isolated: true, port: 12345, endpoint: "http://127.0.0.1:12345", groupAccess: false })
+      .toEqual({ dataDirectory: "/isolated", isolated: true, port: 12345, endpoint: "http://127.0.0.1:12345", sharedControl: false })
     expect(select(installed, false, { MAGNITUDE_DEV_PORT: "12345" }).port).toBe(10100)
   })
 
   it("selects the shared server profile only for an installed, non-acceptance runtime", () => {
     const select = (runtime: ApplicationRuntime, acceptance = false) =>
       resolveApplicationProfile({ runtime, acceptance, environment: {}, home: "/home/user", platform: "linux", server: true })
-    expect(select(installed)).toEqual({ dataDirectory: "/var/lib/magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", groupAccess: true })
+    expect(select(installed)).toEqual({ dataDirectory: "/var/lib/magnitude", isolated: false, port: 10100, endpoint: "http://127.0.0.1:10100", sharedControl: true })
     expect(select(development).dataDirectory).toBe("/home/user/.magnitude-desktop-dev")
     expect(select(installed, true).dataDirectory).toBe("/home/user/.magnitude-update-acceptance")
   })

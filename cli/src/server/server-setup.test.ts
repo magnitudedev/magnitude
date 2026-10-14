@@ -32,6 +32,7 @@ describe("magnitude server setup", () => {
     expect(h.output()).toContain("Network access key: mag-key")
     expect(h.output()).toContain("journalctl -u magnitude")
     expect(h.output()).toContain("magnitude status")
+    expect(h.output()).not.toMatch(/magnitude group|log out/i)
   })
   it("refuses without systemd and points to `magnitude serve`", async () => {
     const h = harness({ hasServiceManager: Effect.succeed(false) })
@@ -78,11 +79,11 @@ describe("magnitude server setup", () => {
     expect(Either.isRight(await h.run(serverSetup))).toBe(true)
     expect(h.events).toEqual(["root _server-install ada", "network"])
   })
-  it("sets up a root login's service directly, with no group membership to add", async () => {
+  it("sets up a root login's service directly", async () => {
     const h = harness({ isRoot: true, user: "root", hasTerminal: Effect.succeed(false) })
     expect(Either.isRight(await h.run(serverSetup))).toBe(true)
     expect(h.events).toEqual(["root _server-install", "network"])
-    expect(h.output()).toContain("sudo usermod -aG magnitude <account>")
+    expect(h.output()).not.toContain("magnitude group")
   })
   it("refuses to run under sudo", async () => {
     const h = harness({ isRoot: true, underSudo: true })

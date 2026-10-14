@@ -58,7 +58,7 @@ export const withinServerStart = <A>(platform: NodeJS.Platform, wait: Effect.Eff
     "Once it's fixed, run `magnitude server setup` again to finish, or `magnitude server remove` to undo setup.",
   ].join("\n")) }))
 
-export const renderServerReady = (platform: NodeJS.Platform, access: ServerAccess, root = false) => [
+export const renderServerReady = (platform: NodeJS.Platform, access: ServerAccess) => [
   "Magnitude is running as a server on this machine.",
   "",
   "Open it in a browser on another computer:",
@@ -73,9 +73,6 @@ export const renderServerReady = (platform: NodeJS.Platform, access: ServerAcces
   `Status:  magnitude status`,
   `Logs:    ${serverLogs(platform)}`,
   `Stop:    magnitude server remove`,
-  ...(platform === "linux" ? ["", root
-    ? "To let another account use `magnitude status` and `magnitude update`, add it to the magnitude group: sudo usermod -aG magnitude <account>"
-    : "You were added to the magnitude group. Log out and back in before running `magnitude status` or `magnitude update`."] : []),
   "",
 ].join("\n")
 
@@ -93,11 +90,11 @@ export const serverSetup = Effect.gen(function* () {
     ? "Quit the Magnitude desktop app first. The app and the server can't run at the same time."
     : "Stop `magnitude serve` first. It and the server can't run at the same time.")
   if (!host.isRoot && !(yield* host.sudoWithoutPrompt) && !(yield* host.hasTerminal)) return yield* failed("Server setup needs your password; run it in a terminal.")
-  // A root login sets up the service itself; there is no person to add to the group.
+  // Through sudo the root step names the person who ran it, whom the macOS server serves as; a root login names no one.
   yield* host.runRootStep(host.isRoot ? ["_server-install"] : ["_server-install", host.user])
   yield* host.write("Waiting for the Magnitude server to start…\n")
   const access = yield* withinServerStart(host.platform, host.enableNetworkAccess)
-  yield* host.write(renderServerReady(host.platform, access, host.isRoot))
+  yield* host.write(renderServerReady(host.platform, access))
 })
 
 export const serverRemove = Effect.gen(function* () {

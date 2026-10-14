@@ -36,10 +36,10 @@ export const resolveInstalledApplicationRuntime = (executable: string, platform:
   if (!matched) return yield* new ApplicationRuntimeUnavailable({ message: "This command is not inside a complete Magnitude installation. Reinstall Magnitude." })
   return { _tag: "Installed", resourcesDirectory } satisfies ApplicationRuntime
 })
+/** `sharedControl`: the server profile opens its control endpoint to every local account; data stays private. */
 export const ApplicationProfile = Schema.Struct({
   dataDirectory: Schema.String, isolated: Schema.Boolean, port: Schema.Number, endpoint: Schema.String,
-  /** The server profile shares its control endpoint with the `magnitude` group; data stays private. */
-  groupAccess: Schema.Boolean,
+  sharedControl: Schema.Boolean,
 })
 export type ApplicationProfile = typeof ApplicationProfile.Type
 
@@ -55,13 +55,13 @@ export const resolveApplicationProfile = (options: {
 }): ApplicationProfile => {
   const { runtime, environment, acceptance } = options
   if (options.server && runtime._tag === "Installed" && !acceptance) {
-    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: SERVER_PORT, endpoint: `http://127.0.0.1:${SERVER_PORT}`, groupAccess: true }
+    return { dataDirectory: SERVER_DATA_DIRECTORY, isolated: false, port: SERVER_PORT, endpoint: `http://127.0.0.1:${SERVER_PORT}`, sharedControl: true }
   }
   const isolated = acceptance || runtime._tag === "Development" || environment.MAGNITUDE_DEV_DATA_DIR !== undefined
   const dataDirectory = environment.MAGNITUDE_DEV_DATA_DIR ?? paths(options.platform).join(options.home,
     acceptance ? ".magnitude-update-acceptance" : runtime._tag === "Installed" ? ".magnitude" : ".magnitude-desktop-dev")
   const port = isolated ? Number(environment.MAGNITUDE_DEV_PORT ?? (acceptance ? 11143 : 11101)) : 10100
-  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}`, groupAccess: false }
+  return { dataDirectory, isolated, port, endpoint: `http://127.0.0.1:${port}`, sharedControl: false }
 }
 
 export const applicationNativeHostPath = (runtime: ApplicationRuntime, platform: string, architecture: string) =>
@@ -85,7 +85,7 @@ export const applicationServiceCommand = (options: {
       "serve", "--data-dir", profile.dataDirectory, "--port", String(profile.port)],
     environment: { ...environment, MAGNITUDE_NATIVE_HOST: applicationNativeHostPath(runtime, platform, architecture),
       // The server's service account has no harnesses; each person connects theirs from the CLI.
-      ...(profile.groupAccess ? { MAGNITUDE_SERVER_SERVICE: "1" } : {}),
+      ...(profile.sharedControl ? { MAGNITUDE_SERVER_SERVICE: "1" } : {}),
       ...(runtime._tag === "Installed" || environment.MAGNITUDE_ICN_PATH ? {} : {
         MAGNITUDE_ICN_PATH: path.join(runtime.repository, "inference/target/development/installation.json"),
       }) },

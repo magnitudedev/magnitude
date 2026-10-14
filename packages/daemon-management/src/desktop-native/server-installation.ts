@@ -177,18 +177,20 @@ const writeSudoersRule = Effect.gen(function* () {
 })
 
 /**
+ * Every local account may pass through the data directory to the control socket, as loopback HTTP
+ * already admits them; none can list it, and the unit's UMask keeps everything inside it private.
+ */
+const SERVER_DATA_DIRECTORY_MODE = 0o711
+
+/**
  * Linux root step, in an order that leaves nothing half set up: the account, its data directory,
- * group membership, the sudoers rule and the unit, and the marker last, since it switches every CLI
+ * the sudoers rule and the unit, and the marker last, since it switches every CLI
  * command to the server profile. On a failure it undoes what this run created, so running setup
  * again starts clean, and a re-run over a complete or partial setup finishes the remaining steps.
  */
-export const installLinuxServer = (user: Option.Option<{ readonly name: string; readonly uid: number }>) => Effect.gen(function* () {
+export const installLinuxServer = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   if (!(yield* fs.exists(SYSTEMD))) return yield* failed("Server setup needs systemd. Run `magnitude serve` instead.")
-  if (Option.isSome(user)) {
-    const userUid = (yield* commandOutput("/usr/bin/id", "-u", "--", user.value.name).pipe(Effect.orElseSucceed(() => ""))).trim()
-    if (userUid !== String(user.value.uid)) return yield* failed("The account that ran sudo could not be identified.")
-  }
   const accounts = yield* inspectServerAccounts
   if (accounts.user === "Foreign" || accounts.group === "Foreign") return yield* failed(foreignAccount)
   const hadSudoersRule = yield* fs.exists(SERVER_SUDOERS_PATH)
@@ -206,7 +208,7 @@ export const installLinuxServer = (user: Option.Option<{ readonly name: string; 
     }
     const serviceUid = (yield* commandOutput("/usr/bin/id", "-u", "--", SERVER_USER)).trim()
     if (!(yield* fs.exists(SERVER_DATA_DIRECTORY))) {
-      yield* fs.makeDirectory(SERVER_DATA_DIRECTORY, { mode: 0o750 })
+      yield* fs.makeDirectory(SERVER_DATA_DIRECTORY, { mode: SERVER_DATA_DIRECTORY_MODE })
       // Only while still empty; anything the service already wrote stays, given to root.
       undo.push(fs.remove(SERVER_DATA_DIRECTORY).pipe(Effect.ignore))
     }
@@ -219,8 +221,7 @@ export const installLinuxServer = (user: Option.Option<{ readonly name: string; 
       yield* run(`give ${SERVER_DATA_DIRECTORY} to the magnitude user`, "/usr/bin/chown", "-R", "-h", "--", `${SERVER_USER}:${SERVER_USER}`, SERVER_DATA_DIRECTORY)
       undo.push(giveDataToRoot)
     }
-    yield* fs.chmod(SERVER_DATA_DIRECTORY, 0o750)
-    if (Option.isSome(user)) yield* run(`add ${user.value.name} to the magnitude group`, "/usr/sbin/usermod", "-aG", SERVER_USER, "--", user.value.name)
+    yield* fs.chmod(SERVER_DATA_DIRECTORY, SERVER_DATA_DIRECTORY_MODE)
     if (!hadSudoersRule) undo.push(fs.remove(SERVER_SUDOERS_PATH, { force: true }))
     const updates = yield* writeSudoersRule
     yield* run("reload systemd", systemctl, "daemon-reload")

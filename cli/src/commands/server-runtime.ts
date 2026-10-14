@@ -23,7 +23,7 @@ export const runServerRootStep = (argv: readonly string[]) => report(Effect.gen(
     return yield* installMacServer(request.user.value, cli)
   }
   if (request._tag === "Remove") return yield* removeLinuxServer
-  yield* installLinuxServer(request.user)
+  yield* installLinuxServer
   const firewall = yield* openServerFirewall
   if (Option.isSome(firewall)) yield* Effect.sync(() => { process.stdout.write(`${firewall.value}\n`) })
 }).pipe(Effect.provide(BunContext.layer)))

@@ -185,68 +185,57 @@ describe("Linux root step", () => {
       run: <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | CommandExecutor.CommandExecutor>) => Effect.runPromise(Effect.either(
         effect.pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(CommandExecutor.CommandExecutor, executor)))) }
   }
-  const ada = Option.some({ name: "ada", uid: 1000 })
 
-  it("creates the account, data, group membership, validated sudoers rule and unit, and writes the marker last", async () => {
+  it("creates the account, data, validated sudoers rule and unit, adds no one to the group, and writes the marker last", async () => {
     const m = machine()
-    expect(Either.isRight(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isRight(await m.run(installLinuxServer))).toBe(true)
     expect(m.changes()).toEqual([
       "/usr/sbin/groupadd --system magnitude",
       "/usr/sbin/useradd --system --gid magnitude --home-dir /var/lib/magnitude --no-create-home --shell /usr/sbin/nologin --comment Magnitude server magnitude",
       "/usr/bin/chown -R -h -- magnitude:magnitude /var/lib/magnitude",
-      "/usr/sbin/usermod -aG magnitude -- ada",
       "/usr/sbin/visudo -cf /etc/sudoers.d/<tmp>",
       "/usr/bin/systemctl daemon-reload", "/usr/bin/systemctl enable --now magnitude.service",
     ])
+    expect(m.commands.some(line => line.includes("usermod"))).toBe(false)
     expect(m.written).toEqual([
-      "mkdir /var/lib/magnitude", "chmod 750 /var/lib/magnitude",
+      "mkdir /var/lib/magnitude", "chmod 711 /var/lib/magnitude",
       "write 440 /etc/sudoers.d/<tmp>", "chown 0:0 /etc/sudoers.d/<tmp>", "chmod 440 /etc/sudoers.d/<tmp>", "rename /etc/sudoers.d/magnitude",
       "mkdir /etc/magnitude", "chmod 755 /etc/magnitude", "write 644 /etc/magnitude/<tmp>", "chmod 644 /etc/magnitude/<tmp>", "rename /etc/magnitude/server",
     ])
   })
   it("refuses a person's account named magnitude and changes nothing", async () => {
     const m = machine({ accounts: human })
-    const result = await m.run(installLinuxServer(ada))
+    const result = await m.run(installLinuxServer)
     expect(Either.isLeft(result) && result.left.message).toContain("isn't the system account Magnitude creates")
     expect(m.changes()).toEqual([])
     expect(m.written).toEqual([])
   })
   it("refuses a foreign group named magnitude without an account", async () => {
     const m = machine({ accounts: { passwd: "", group: "magnitude:x:1000:" } })
-    expect(Either.isLeft(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isLeft(await m.run(installLinuxServer))).toBe(true)
     expect(m.changes()).toEqual([])
   })
   it("finishes a complete or partial setup without recreating the account or retaking the data", async () => {
     const m = machine({ setUp: true })
-    expect(Either.isRight(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isRight(await m.run(installLinuxServer))).toBe(true)
     expect(m.changes().some(line => /useradd|groupadd|chown/.test(line))).toBe(false)
     expect(m.written.at(-1)).toBe("rename /etc/magnitude/server")
   })
   it("gives root-owned kept data back to the new service account", async () => {
     const m = machine({ dataUid: 0 })
-    expect(Either.isRight(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isRight(await m.run(installLinuxServer))).toBe(true)
     expect(m.changes()).toContain("/usr/bin/chown -R -h -- magnitude:magnitude /var/lib/magnitude")
     expect(m.written).not.toContain("mkdir /var/lib/magnitude")
   })
-  it("adds no one to the group for a root login", async () => {
-    const m = machine()
-    expect(Either.isRight(await m.run(installLinuxServer(Option.none())))).toBe(true)
-    expect(m.commands.some(line => line.includes("usermod") || line.startsWith("/usr/bin/id -u -- ada"))).toBe(false)
-  })
-  it("refuses when the sudo uid does not belong to the named user", async () => {
-    const m = machine()
-    expect(Either.isLeft(await m.run(installLinuxServer(Option.some({ name: "ada", uid: 1001 }))))).toBe(true)
-    expect(m.commands).toEqual(["/usr/bin/id -u -- ada"])
-  })
   it("grants nothing without sudo, says so, and still sets up the service", async () => {
     const m = machine({ sudo: false })
-    expect(Either.isRight(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isRight(await m.run(installLinuxServer))).toBe(true)
     expect(m.written.some(line => line.includes("sudoers"))).toBe(false)
     expect(m.printed.join("\n")).toContain("sudo isn't installed")
   })
   it("undoes everything it created when the service cannot start, and writes no marker", async () => {
     const m = machine({ fail: /enable --now/ })
-    const result = await m.run(installLinuxServer(ada))
+    const result = await m.run(installLinuxServer)
     expect(Either.isLeft(result) && result.left.message).toBe("Could not start magnitude.service.\n/usr/bin/systemctl: refused\nSetup undid the changes it had made. Run `magnitude server setup` again once that's fixed.")
     expect(m.changes().slice(-5)).toEqual([
       "/usr/bin/systemctl enable --now magnitude.service", "/usr/bin/systemctl disable --now magnitude.service",
@@ -259,7 +248,7 @@ describe("Linux root step", () => {
   })
   it("never installs a sudoers rule visudo rejects", async () => {
     const m = machine({ fail: /visudo/ })
-    expect(Either.isLeft(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isLeft(await m.run(installLinuxServer))).toBe(true)
     expect(m.written).not.toContain("rename /etc/sudoers.d/magnitude")
     expect(m.written).toContain("remove /etc/sudoers.d/<tmp>")
     expect(m.changes().some(line => line.includes("enable"))).toBe(false)
@@ -267,7 +256,7 @@ describe("Linux root step", () => {
   })
   it("keeps an earlier complete setup's rule and unit when a re-run fails", async () => {
     const m = machine({ setUp: true, fail: /daemon-reload/ })
-    expect(Either.isLeft(await m.run(installLinuxServer(ada)))).toBe(true)
+    expect(Either.isLeft(await m.run(installLinuxServer))).toBe(true)
     expect(m.changes().some(line => /disable|userdel|groupdel/.test(line))).toBe(false)
     expect(m.files.has("/etc/sudoers.d/magnitude")).toBe(true)
   })

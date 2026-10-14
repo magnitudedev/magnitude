@@ -42,7 +42,7 @@ Save the key; `magnitude status` never shows it. Afterwards it is in **Settings 
 
 <Tabs>
 <Tab title="Linux">
-Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Setup adds you to the `magnitude` group; log out and back in before running `magnitude status` or `magnitude update`.
+Magnitude runs as the `magnitude.service` systemd unit under its own `magnitude` system account. Its models, settings and logs live in `/var/lib/magnitude`, and its configuration in `/var/lib/magnitude/config.json`. Any account on the machine can run `magnitude status`, `magnitude update` and `magnitude models` right away; the models, settings and keys stay readable only by the service.
 
 Setup creates the `magnitude` account as a system account with no login. If the machine already has an account or group named `magnitude` that isn't one, such as a person's account, setup leaves it alone and stops without changing anything.
 

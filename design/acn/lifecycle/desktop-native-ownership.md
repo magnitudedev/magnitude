@@ -307,7 +307,7 @@ neither.
 
 On Linux the service is the package's inert `magnitude.service` unit, running as the `magnitude`
 system account. Setup creates that account and group with home and data directory
-`/var/lib/magnitude`, adds the person to the group, writes the service's sudoers rule, enables the
+`/var/lib/magnitude`, writes the service's sudoers rule, enables the
 unit, and writes a root-owned marker last. An existing `magnitude` account is reused only when it is
 recognizably Magnitude's own: a uid and primary group in the system ranges of `/etc/login.defs`, home
 `/var/lib/magnitude` and no login shell. Any other account or group with that name, such as a
@@ -317,9 +317,12 @@ re-running setup over a complete or partial setup finishes the remaining steps. 
 zone, at runtime and permanently, and says so; if that fails it prints the `firewall-cmd` command
 instead and setup continues. Other firewalls are left alone. The marker selects the server profile for the service and for every CLI command: a marker
 that is missing, writable or reached through a symbolic link leaves the per-user profile in place.
-The desktop app always uses the person's own profile. The server profile's ownership directory is
-group-traversable (0710) and its control socket is group-accessible (0660), so group members reach
-owner control while the lock, data and keys stay private to the service account. Anyone else running
+The desktop app always uses the person's own profile. Every local account reaches the server's
+owner control, as loopback HTTP already admits them, with no group membership or new login: the data
+directory (0711) and the ownership directory (0711) are traversable but not listable, and the control
+socket is 0666. The lock stays 0600, and the unit's `UMask=0007` keeps the data, configuration and
+keys inside private to the service account. Setup adds no one to the `magnitude` group, which is
+only the service's primary group. Anyone else running
 `serve` while the profile is active is refused, since the service already serves.
 
 On macOS the service is the root-owned `dev.magnitude.server` LaunchDaemon in the system domain,

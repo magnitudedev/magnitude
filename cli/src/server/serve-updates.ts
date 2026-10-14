@@ -175,7 +175,7 @@ export const idleInstallationSystem = (options: {
   const store = preparation(options.runtime, options.profile, options.addon, options.owner).pipe(
     Effect.map(prepared => prepared.store), Effect.provide(privateFiles))
   const installLinux = Effect.scoped(Effect.gen(function* () {
-    yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.groupAccess)
+    yield* acquireApplicationMaintenance(options.stateDirectory, options.profile.sharedControl)
     const continuation = yield* makeUnixProcessContinuation(options.addon)
     yield* acquireUpdateInstallationLease(options.stateDirectory)
     const version = yield* completeLinuxForegroundUpdate(options.profile.dataDirectory, false).pipe(Effect.provideServiceEffect(PreparedUpdateStore, store), Effect.provide(nodeTerminalCommand))
