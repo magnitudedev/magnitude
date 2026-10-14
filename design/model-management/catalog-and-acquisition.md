@@ -252,9 +252,11 @@ model identity or operation state.
 Caller interruption detaches that waiter without abandoning admitted work. Cancellation stops
 shared package work only when no other live occurrence depends on it. Package work whose
 cancellation was requested is never joined: a later occurrence admits new work, which waits for the
-cancelled work to release the repository and resumes from its checkpoint. An occurrence fails when any
-of its packages fails; its other package work then stops under the same rule as cancellation, so a
-retry never joins work that belongs to the failed occurrence. A retry creates a new
+cancelled work to release the repository and resumes from its checkpoint. A user's cancellation
+discards the partial files and checkpoints of the package work it stops, under the repository lock,
+keeping any complete blob. An occurrence fails when any of its packages fails; its other package
+work then stops under the same rule as cancellation but keeps its partial files, so a retry resumes
+and never joins work that belongs to the failed occurrence. A retry creates a new
 occurrence. Restart ends all occurrences, attempt history, cancellation state, and failure
 dismissal.
 
@@ -363,7 +365,8 @@ ownership rejects or waits for removal of files used by a live model instance.
 Catalog removal is serialized with installation admission. An installation that is still
 downloading is rejected; one that is optimizing is stopped and removal proceeds.
 Externally owned or shared dependencies are retained while a removable target and other exclusively
-owned material are removed; removal is retained as a whole only when a target itself is external or
+owned material are removed; a dependency is shared only with another catalog model that is installed
+or affiliated with it, never merely declared by an uninstalled one; removal is retained as a whole only when a target itself is external or
 shared, because deleting it would either violate ownership or break another catalog model. Removing
 an eligible package removes every Magnitude-owned inventory occurrence of that package and preserves
 every external Hugging Face cache occurrence.
