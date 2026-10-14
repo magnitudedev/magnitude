@@ -69,6 +69,8 @@ export const resolveServerConflict = (options: {
     const value = new BrowserWindow({ ...windowChrome(process.platform, dark), width: 720, height: 520, resizable: false, show: false,
       title: "Magnitude", icon: options.icon, backgroundColor: dark ? slate[925] : slate[50],
       webPreferences: { preload: options.preload, contextIsolation: true, nodeIntegration: false, sandbox: false } })
+    // A single-choice screen has nothing for the application menu bar to act on.
+    if (process.platform !== "darwin") value.removeMenu()
     value.once("ready-to-show", () => value.show())
     value.on("closed", () => { Runtime.runFork(runtime)(Deferred.succeed(decision, "Quit")) })
     void value.loadURL(options.pageUrl)
