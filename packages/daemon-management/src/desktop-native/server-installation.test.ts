@@ -360,9 +360,9 @@ describe("macOS root step", () => {
 })
 
 describe("sudoers rule", () => {
-  it("grants only the service account the installed update helper", () => {
+  it("grants only the service account the installed update helper, with exact arguments", () => {
     expect(SERVER_SUDOERS_RULE.split("\n").filter(line => line !== "" && !line.startsWith("#")))
-      .toEqual(["magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update *"])
+      .toEqual(["magnitude ALL=(root) NOPASSWD: /usr/lib/magnitude-desktop/resources/magnitude _install-application-update /var/lib/magnitude/updates/update.json --parent-stdin"])
   })
   it("passes visudo", () => {
     const visudo = ["/usr/sbin/visudo", "/usr/bin/visudo"].find(path => spawnSync(path, ["-V"]).status === 0)
