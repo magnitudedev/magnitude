@@ -13,15 +13,18 @@
 use crate::operators::{Join, SublayerInput};
 use crate::programs::graph::{GraphError, draft::GraphDraft};
 use crate::programs::native_constants::GraphConstant;
-use crate::programs::native_target_graph::{WeightPort, weight};
+use crate::programs::native_target_graph::{BankPart, WeightPart, WeightPort, weight, weight_port};
 use crate::{
     ModelLoadPlan, RoutedBinding,
-    native::{RoutedDecodeKernels, RoutedKernels},
+    native::{RoutedDecodeKernels, RoutedKernels, StreamedRoutedKernels},
 };
-use magnitude_family_contracts::{RouteNormalization, RoutedFfn, WeightKind, WeightScope};
+use magnitude_family_contracts::{
+    RouteNormalization, RoutedFfn, SublayerIndex, WeightKind, WeightRole, WeightScope,
+};
 use magnitude_kernels::{
-    routed_combine, routed_expand, routed_experts, routed_gate_up, routed_group, routed_output,
-    routed_route, routed_route_shared,
+    routed_bank_fill, routed_combine, routed_convert_wide, routed_copy, routed_expand, routed_experts,
+    routed_gate_up, routed_group, routed_output, routed_route, routed_route_shared,
+    routed_route_streamed, routed_scratch_request, routed_scratch_wait, routed_step,
 };
 use seismic::{BackendName, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -61,6 +64,35 @@ pub(crate) struct RoutedGraphEntries<'a, G: GraphDraft + 'a> {
     pub group: G::Binding<'a, routed_group::Entry>,
     pub experts: G::Binding<'a, routed_experts::Entry>,
     pub combine: G::Binding<'a, routed_combine::Entry>,
+    /// A streamed layer's bank-served decode entries.
+    pub streamed: Option<StreamedGraphEntries<'a, G>>,
+}
+
+/// A streamed layer's decode entries (`StreamedRoutedKernels`).
+pub(crate) struct StreamedGraphEntries<'a, G: GraphDraft + 'a> {
+    pub step: G::Binding<'a, routed_step::Entry>,
+    pub route: G::Binding<'a, routed_route_streamed::Entry>,
+    pub fill: G::Binding<'a, routed_bank_fill::Entry>,
+    pub scratch_request: G::Binding<'a, routed_scratch_request::Entry>,
+    pub scratch_wait: G::Binding<'a, routed_scratch_wait::Entry>,
+    pub copy: [G::Binding<'a, routed_copy::Entry>; 3],
+    pub convert_wide: [G::Binding<'a, routed_convert_wide::Entry>; 3],
+}
+
+impl<'a> From<&'a StreamedRoutedKernels> for StreamedGraphEntries<'a, NativeGraph> {
+    fn from(kernels: &'a StreamedRoutedKernels) -> Self {
+        let [copy_gate, copy_up, copy_down] = &kernels.copy;
+        let [wide_gate, wide_up, wide_down] = &kernels.convert_wide;
+        Self {
+            step: &kernels.step,
+            route: &kernels.route,
+            fill: &kernels.fill,
+            scratch_request: &kernels.scratch_request,
+            scratch_wait: &kernels.scratch_wait,
+            copy: [copy_gate, copy_up, copy_down],
+            convert_wide: [wide_gate, wide_up, wide_down],
+        }
+    }
 }
 
 /// The decode rows' routing and expansion entries of a [`DecodeForm`].
@@ -93,6 +125,7 @@ impl<'a> From<&'a RoutedKernels> for RoutedGraphEntries<'a, NativeGraph> {
             group: &kernels.group,
             experts: &kernels.experts,
             combine: &kernels.combine,
+            streamed: kernels.streamed.as_ref().map(StreamedGraphEntries::from),
         }
     }
 }
@@ -104,6 +137,14 @@ pub(crate) struct CheckedRoutedEntries {
     group: [(&'static str, Element); 0],
     experts: [(&'static str, Element); 4],
     combine: [(&'static str, Element); 4],
+    streamed: Option<CheckedStreamedEntries>,
+}
+
+struct CheckedStreamedEntries {
+    route: [(&'static str, Element); 5],
+    convert: [[(&'static str, Element); 2]; 3],
+    copy: [[(&'static str, Element); 1]; 3],
+    fill: [(&'static str, Element); 6],
 }
 
 enum CheckedDecodeEntries {
@@ -164,6 +205,28 @@ impl CheckedRoutedEntries {
                 ("SDW", binding.shared_down),
                 ("A", binding.activation),
             ],
+            streamed: binding.bank.map(|bank| {
+                let residents = [binding.expert_gate, binding.expert_up, binding.expert_down];
+                CheckedStreamedEntries {
+                    route: [
+                        ("NW", binding.norm),
+                        ("RW", binding.router),
+                        ("SGW", binding.shared_gate),
+                        ("SUW", binding.shared_up),
+                        ("A", binding.activation),
+                    ],
+                    convert: [0, 1, 2].map(|kind| [("E", bank.sources[kind]), ("U", residents[kind])]),
+                    copy: residents.map(|resident| [("U", resident)]),
+                    fill: [
+                        ("SG", bank.sources[0]),
+                        ("SU", bank.sources[1]),
+                        ("SD", bank.sources[2]),
+                        ("EGW", binding.expert_gate),
+                        ("EUW", binding.expert_up),
+                        ("EDW", binding.expert_down),
+                    ],
+                }
+            }),
         })
     }
 
@@ -183,6 +246,19 @@ impl CheckedRoutedEntries {
             group: &self.group,
             experts: &self.experts,
             combine: &self.combine,
+            streamed: self.streamed.as_ref().map(|streamed| {
+                let [gate, up, down] = &streamed.convert;
+                let [copy_gate, copy_up, copy_down] = &streamed.copy;
+                StreamedGraphEntries {
+                    step: &[][..],
+                    route: &streamed.route[..],
+                    fill: &streamed.fill[..],
+                    scratch_request: &[][..],
+                    scratch_wait: &[][..],
+                    copy: [&copy_gate[..], &copy_up[..], &copy_down[..]],
+                    convert_wide: [&gate[..], &up[..], &down[..]],
+                }
+            }),
         }
     }
 }
@@ -278,9 +354,18 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     };
     let router = weight(graph, load, scope, WeightKind::Router, weights)?;
     let shared_router = weight(graph, load, scope, WeightKind::SharedRouter, weights)?;
-    let expert_gate = weight(graph, load, scope, WeightKind::ExpertGate, weights)?;
-    let expert_up = weight(graph, load, scope, WeightKind::ExpertUp, weights)?;
-    let expert_down = weight(graph, load, scope, WeightKind::ExpertDown, weights)?;
+    // A streamed layer's converts write its expert weights (its banks), so
+    // the expert ports stay at hand.
+    let mut expert_port = |kind| {
+        weight_port(graph, load, WeightRole { scope, kind }, WeightPart::Values, 0, weights)
+    };
+    let expert_ports = [
+        expert_port(WeightKind::ExpertGate)?,
+        expert_port(WeightKind::ExpertUp)?,
+        expert_port(WeightKind::ExpertDown)?,
+    ];
+    let [expert_gate, expert_up, expert_down] =
+        expert_ports.each_ref().map(|port| port.tensor().clone());
     let shared_gate = weight(graph, load, scope, WeightKind::SharedGate, weights)?;
     let shared_up = weight(graph, load, scope, WeightKind::SharedUp, weights)?;
     let shared_down = weight(graph, load, scope, WeightKind::SharedDown, weights)?;
@@ -318,6 +403,44 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     let normalize = i32::from(shape.normalize_selected);
 
     if decodes(rows) {
+        if let Some(bank) = load.expert_bank().filter(|bank| bank.holds(WeightRole {
+            scope,
+            kind: WeightKind::ExpertGate,
+        })) {
+            let streamed = handle
+                .streamed
+                .as_ref()
+                .ok_or("a streamed layer without its bank-served entries")?;
+            let RoutedDecodeEntries::SharedRoute { choices, .. } = handle.decode else {
+                return Err("a streamed layer without the shared-route decode form".into());
+            };
+            let inject = join.inject(graph, rows, constants)?;
+            return streamed_decode(
+                graph,
+                streamed,
+                (choices, handle.output),
+                (&inject, &output_dims),
+                load,
+                bank,
+                scope,
+                weights,
+                residual,
+                [&mut routes, &mut scores],
+                rows,
+                hidden,
+                shape,
+                epsilon,
+                LayerWeights {
+                    norm,
+                    router,
+                    shared_router,
+                    experts: expert_ports,
+                    shared_gate,
+                    shared_up,
+                    shared_down,
+                },
+            );
+        }
         let (expert_product, shared_product, coefficient) = match handle.decode {
             RoutedDecodeEntries::Expand(expand) => {
                 let routed = graph.enqueue(
@@ -434,6 +557,32 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         },
     )?;
     let (normalized, coefficient) = (routed.r0, routed.r1);
+    // A streamed layer's products read its scratch banks, which the graph
+    // fills in parked rounds (spec 4.9); every value is the resident
+    // load's.
+    let [expert_gate, expert_up, expert_down] = match load.expert_bank().filter(|bank| {
+        bank.holds(WeightRole {
+            scope,
+            kind: WeightKind::ExpertGate,
+        })
+    }) {
+        None => [expert_gate, expert_up, expert_down],
+        Some(bank) => fill_scratch(
+            graph,
+            handle
+                .streamed
+                .as_ref()
+                .ok_or("a streamed layer without its scratch fill entries")?,
+            load,
+            bank,
+            scope,
+            weights,
+            routes.tensor(),
+            rows,
+            shape,
+            [&expert_gate, &expert_up, &expert_down],
+        )?,
+    };
     let blocks = grouped_blocks(rows, shape.count, shape.selected)?;
     let tables = [
         ("M", rows),
@@ -506,6 +655,399 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 coefficient: (&coefficient).into(),
                 shared_gate: (&shared_gate).into(),
                 shared_up: (&shared_up).into(),
+                shared_down: (&shared_down).into(),
+            },
+        )?
+        .value)
+}
+
+/// The scratch fill of a scratch-served launch (spec 4.9): the request of
+/// the launch's experts, then `rounds` parks, the first followed by the copy
+/// of the experts in the layer's bank, each followed by the convert of the
+/// round's staged records. Returns the scratch banks, slot `e` holding
+/// expert `e`.
+#[allow(clippy::too_many_arguments)]
+fn fill_scratch<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: &StreamedGraphEntries<'a, G>,
+    load: &ModelLoadPlan,
+    bank: &crate::ExpertBankPlan,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    routes: &WorkflowTensor,
+    rows: u64,
+    shape: &ExpertShape,
+    banks: [&WorkflowTensor; 3],
+) -> Result<[WorkflowTensor; 3], GraphError> {
+    let position = bank
+        .layers
+        .iter()
+        .position(|layer| layer.scope == scope)
+        .ok_or("a streamed layer outside its bank")?;
+    let gate = WeightRole {
+        scope,
+        kind: WeightKind::ExpertGate,
+    };
+    let mut part = |graph: &mut G, part| {
+        weight_port(graph, load, gate, WeightPart::Bank(part), 0, weights)
+    };
+    let mut step = part(graph, BankPart::Step)?;
+    let heartbeat = part(graph, BankPart::Heartbeat)?;
+    let mut control = part(graph, BankPart::ScratchControl)?;
+    let mut flags = part(graph, BankPart::ScratchFlags)?;
+    let mut scratch = [
+        part(graph, BankPart::Scratch { kind: 0 })?,
+        part(graph, BankPart::Scratch { kind: 1 })?,
+        part(graph, BankPart::Scratch { kind: 2 })?,
+    ];
+    let staging = [
+        part(graph, BankPart::Staging { kind: 0 })?,
+        part(graph, BankPart::Staging { kind: 1 })?,
+        part(graph, BankPart::Staging { kind: 2 })?,
+    ];
+    let copy_lists = [
+        part(graph, BankPart::CopyList { kind: 0 })?,
+        part(graph, BankPart::CopyList { kind: 1 })?,
+        part(graph, BankPart::CopyList { kind: 2 })?,
+    ];
+    let rounds = bank.rounds();
+    let mut lists = Vec::with_capacity(rounds as usize);
+    for round in 0..rounds {
+        let round = u8::try_from(round).map_err(|_| "scratch fill rounds exceed u8")?;
+        lists.push([
+            part(graph, BankPart::ScratchList { round, kind: 0 })?,
+            part(graph, BankPart::ScratchList { round, kind: 1 })?,
+            part(graph, BankPart::ScratchList { round, kind: 2 })?,
+        ]);
+    }
+    if position == 0 {
+        graph.enqueue(
+            entries.step,
+            &[],
+            routed_step::WorkflowArgs {
+                step: step.tensor_mut().into(),
+            },
+        )?;
+    }
+    let words = bank.scratch_control_words();
+    graph.enqueue(
+        entries.scratch_request,
+        &[
+            ("M", rows),
+            ("K", shape.selected),
+            ("E", shape.count),
+            ("C", words),
+        ],
+        routed_scratch_request::WorkflowArgs {
+            routes: routes.into(),
+            step: step.tensor().into(),
+            flags: flags.tensor_mut().into(),
+            control: control.tensor_mut().into(),
+            layer: i32::try_from(position).map_err(|_| "streamed layer index exceeds i32")?,
+        },
+    )?;
+    let word = |index: u64| i32::try_from(index).map_err(|_| "scratch control word exceeds i32");
+    for (round, lists) in lists.iter().enumerate() {
+        let round = round as u64;
+        graph.enqueue(
+            entries.scratch_wait,
+            &[("C", words)],
+            routed_scratch_wait::WorkflowArgs {
+                step: step.tensor().into(),
+                control: control.tensor_mut().into(),
+                heartbeat: heartbeat.tensor().into(),
+                acknowledgement: word(4 + round)?,
+                arrival: word(4 + rounds + round)?,
+            },
+        )?;
+        for kind in 0..3 {
+            let region = &bank.scratch[bank.layers[position].tensors[kind].scratch];
+            let matrix = [("N", region.matrix[0]), ("K", region.matrix[1])];
+            if round == 0 {
+                graph.enqueue(
+                    entries.copy[kind],
+                    &[("S", bank.records(scope)?), ("E", shape.count), matrix[0], matrix[1]],
+                    routed_copy::WorkflowArgs {
+                        bank: banks[kind].into(),
+                        list: copy_lists[kind].tensor().into(),
+                        step: step.tensor().into(),
+                        scratch: scratch[kind].tensor_mut().into(),
+                    },
+                )?;
+            }
+            graph.enqueue(
+                entries.convert_wide[kind],
+                &[
+                    ("R", bank.staging_records),
+                    ("S", shape.count),
+                    matrix[0],
+                    matrix[1],
+                ],
+                routed_convert_wide::WorkflowArgs {
+                    source: staging[kind].tensor().into(),
+                    list: lists[kind].tensor().into(),
+                    step: step.tensor().into(),
+                    destination: scratch[kind].tensor_mut().into(),
+                },
+            )?;
+        }
+    }
+    Ok(scratch.map(|port| port.tensor().clone()))
+}
+
+/// A routed layer's weight ports; the experts are its banks.
+struct LayerWeights {
+    norm: WorkflowTensor,
+    router: WorkflowTensor,
+    shared_router: WorkflowTensor,
+    experts: [NativePort; 3],
+    shared_gate: WorkflowTensor,
+    shared_up: WorkflowTensor,
+    shared_down: WorkflowTensor,
+}
+
+/// The decode rows of a streamed layer (spec 4.6–4.8):
+///
+/// ```text
+/// [step] → route with the shared expert, resolve, hints for the layers ahead
+///        → fill: absent choices park, convert into their placed slots, bind
+///        → routed_gate_up → routed_output, the resident entries, over the
+///          bank and the bound slots
+/// ```
+///
+/// The first routed layer of the target advances the step sequence. The
+/// products and the combine are the resident entries themselves, so the
+/// value is the resident load's; a step that requested nothing adds one
+/// small launch to the resident form.
+#[allow(clippy::too_many_arguments)]
+fn streamed_decode<'a, G: GraphDraft + 'a>(
+    graph: &mut G,
+    entries: &StreamedGraphEntries<'a, G>,
+    (choices, output): (G::Binding<'a, routed_gate_up::Entry>, G::Binding<'a, routed_output::Entry>),
+    (inject, output_dims): (&WorkflowTensor, &[(&str, u64)]),
+    load: &ModelLoadPlan,
+    bank: &crate::ExpertBankPlan,
+    scope: WeightScope,
+    weights: &mut Vec<(WeightPort, NativePort)>,
+    residual: &WorkflowTensor,
+    [routes, scores]: [&mut NativePort; 2],
+    rows: u64,
+    hidden: u64,
+    shape: &ExpertShape,
+    epsilon: f32,
+    layer: LayerWeights,
+) -> Result<WorkflowTensor, GraphError> {
+    bank.shared.as_ref().ok_or("slab decode requires an admitted shared plan")?;
+    let LayerWeights {
+        norm,
+        router,
+        shared_router,
+        experts: [mut expert_gate, mut expert_up, mut expert_down],
+        shared_gate,
+        shared_up,
+        shared_down,
+    } = layer;
+    let position = bank
+        .layers
+        .iter()
+        .position(|layer| layer.scope == scope)
+        .ok_or("a streamed layer outside its bank")?;
+    let gate = WeightRole {
+        scope,
+        kind: WeightKind::ExpertGate,
+    };
+    let part = |graph: &mut G, weights: &mut Vec<(WeightPort, NativePort)>, part| {
+        weight_port(graph, load, gate, WeightPart::Bank(part), 0, weights)
+    };
+    let mut step = part(graph, weights, BankPart::Step)?;
+    let mut slot_map = part(graph, weights, BankPart::SlotMap)?;
+    let mut stamps = part(graph, weights, BankPart::Stamps)?;
+    let mut control = part(graph, weights, BankPart::Control)?;
+    let mut near_ring = part(graph, weights, BankPart::Ring { distance: 1 })?;
+    let mut far_ring = part(graph, weights, BankPart::Ring { distance: 2 })?;
+
+    if position == 0 {
+        graph.enqueue(
+            entries.step,
+            &[],
+            routed_step::WorkflowArgs {
+                step: step.tensor_mut().into(),
+            },
+        )?;
+    }
+
+    // The layers ahead (spec 4.7), predicted from this layer's residual
+    // through their own norm and router into this layer's rings. Near the
+    // end of the target fewer layers lie ahead; the route reads none of a
+    // missing distance's tensors, which take this layer's.
+    let WeightScope::TargetSublayer(SublayerIndex { block, .. }) = scope else {
+        return Err("a streamed layer outside the target".into());
+    };
+    let mut ahead = Vec::with_capacity(crate::streaming::layout::DISTANCES.len());
+    for distance in crate::streaming::layout::DISTANCES {
+        let Some(later_layer) = bank.layers.get(position + usize::from(distance)) else {
+            break;
+        };
+        let WeightScope::TargetSublayer(SublayerIndex { block: later, .. }) = later_layer.scope else {
+            return Err("a streamed layer outside the target".into());
+        };
+        let offset = later
+            .checked_sub(block)
+            .ok_or("streamed layers out of decoder order")?;
+        let mut ahead_port = |graph: &mut G, kind, part| {
+            weight_port(
+                graph,
+                load,
+                WeightRole {
+                    scope: later_layer.scope,
+                    kind,
+                },
+                part,
+                offset,
+                weights,
+            )
+        };
+        ahead.push([
+            ahead_port(graph, WeightKind::InputNorm, WeightPart::Values)?.tensor().clone(),
+            ahead_port(graph, WeightKind::Router, WeightPart::Values)?.tensor().clone(),
+            ahead_port(graph, WeightKind::ExpertGate, WeightPart::Bank(BankPart::SlotMap))?
+                .tensor()
+                .clone(),
+        ]);
+    }
+    let predicted = ahead.len();
+    let own = [norm.clone(), router.clone(), slot_map.tensor().clone()];
+    let [near_norm, near_router, near_map] = ahead.first().cloned().unwrap_or_else(|| own.clone());
+    let [far_norm, far_router, far_map] = ahead.get(1).cloned().unwrap_or(own);
+    let routed = graph.enqueue(
+        entries.route,
+        &[
+            ("M", rows),
+            ("H", hidden),
+            // A streamed layer's router input is one normalized stream
+            // (preparation refuses mixed inputs).
+            ("PT", 1),
+            ("NM", hidden),
+            ("E", shape.count),
+            ("K", shape.selected),
+            ("S", shape.shared_intermediate),
+            ("BANK", bank.records(scope)?),
+            ("C", bank.control_words()),
+            ("RING", bank.ring_words()),
+        ],
+        routed_route_streamed::WorkflowArgs {
+            residual: residual.into(),
+            norm: (&norm).into(),
+            router: (&router).into(),
+            shared_router: (&shared_router).into(),
+            shared_gate: (&shared_gate).into(),
+            shared_up: (&shared_up).into(),
+            routes: routes.tensor_mut().into(),
+            scores: scores.tensor_mut().into(),
+            slot_map: slot_map.tensor().into(),
+            stamps: stamps.tensor_mut().into(),
+            step: step.tensor().into(),
+            control: control.tensor_mut().into(),
+            near_norm: (&near_norm).into(),
+            near_router: (&near_router).into(),
+            near_map: (&near_map).into(),
+            far_norm: (&far_norm).into(),
+            far_router: (&far_router).into(),
+            far_map: (&far_map).into(),
+            near_ring: near_ring.tensor_mut().into(),
+            far_ring: far_ring.tensor_mut().into(),
+            eps: epsilon,
+            normalize: i32::from(shape.normalize_selected),
+            ahead: i32::try_from(predicted).map_err(|_| "too many layers ahead")?,
+        },
+    )?;
+    let (normalized, coefficient, shared_product, slots) =
+        (routed.r0, routed.r1, routed.r2, routed.r3);
+    // The resident choices' products while the host serves the absent ones
+    // (4.8); late threadgroups park until acknowledgement, convert their
+    // expert from staging into its placed slot, and compute it in-launch.
+    // The absent choices: parked until the host acknowledges, converted
+    // from staging into the slots it placed them in (4.6).
+    let placement = part(graph, weights, BankPart::Placement)?;
+    let heartbeat = part(graph, weights, BankPart::Heartbeat)?;
+    let staged = [
+        part(graph, weights, BankPart::Staging { kind: 0 })?,
+        part(graph, weights, BankPart::Staging { kind: 1 })?,
+        part(graph, weights, BankPart::Staging { kind: 2 })?,
+    ];
+    let mut commits = part(graph, weights, BankPart::Commits)?;
+    let bound = graph
+        .enqueue(
+            entries.fill,
+            &[
+                ("M", rows),
+                ("H", hidden),
+                ("K", shape.selected),
+                ("F", shape.intermediate),
+                ("BANK", bank.records(scope)?),
+                ("T", bank.staging_records),
+                ("X", bank.experts),
+                ("C", bank.control_words()),
+                ("P", bank.placement_choices()),
+            ],
+            routed_bank_fill::WorkflowArgs {
+                slots: (&slots).into(),
+                stamps: stamps.tensor_mut().into(),
+                step: step.tensor().into(),
+                control: control.tensor_mut().into(),
+                placement: placement.tensor().into(),
+                heartbeat: heartbeat.tensor().into(),
+                staged_gate: staged[0].tensor().into(),
+                staged_up: staged[1].tensor().into(),
+                staged_down: staged[2].tensor().into(),
+                expert_gate: expert_gate.tensor_mut().into(),
+                expert_up: expert_up.tensor_mut().into(),
+                expert_down: expert_down.tensor_mut().into(),
+                slot_map: slot_map.tensor_mut().into(),
+                commits: commits.tensor_mut().into(),
+            },
+        )?
+        .value;
+    // The resident choices and output over the bank and the bound slots:
+    // the value is the resident load's, bit for bit.
+    let records = bank.records(scope)?;
+    let expert_product = graph
+        .enqueue(
+            choices,
+            &[
+                ("M", rows),
+                ("H", hidden),
+                ("E", records),
+                ("K", shape.selected),
+                ("F", shape.intermediate),
+            ],
+            routed_gate_up::WorkflowArgs {
+                normalized: (&normalized).into(),
+                routes: (&bound).into(),
+                expert_gate: expert_gate.tensor().into(),
+                expert_up: expert_up.tensor().into(),
+                // SiLU: the fused Qwen form's experts.
+                activation: 0,
+            },
+        )?
+        .value;
+    let output_dims = output_dims
+        .iter()
+        .map(|&(name, value)| (name, if name == "E" { records } else { value }))
+        .collect::<Vec<_>>();
+    Ok(graph
+        .enqueue(
+            output,
+            &output_dims,
+            routed_output::WorkflowArgs {
+                residual: residual.into(),
+                inject: inject.into(),
+                expert_product: (&expert_product).into(),
+                shared_product: (&shared_product).into(),
+                routes: (&bound).into(),
+                scores: scores.tensor().into(),
+                coefficient: (&coefficient).into(),
+                expert_down: expert_down.tensor().into(),
                 shared_down: (&shared_down).into(),
             },
         )?

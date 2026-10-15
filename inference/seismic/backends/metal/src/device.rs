@@ -461,6 +461,15 @@ impl DeviceService<Metal> for MetalDevice {
     fn buffer_len(&self, buffer: &Self::Buffer) -> u64 {
         buffer.len
     }
+
+    /// Shared storage mode: `contents()` is host-visible for the buffer's
+    /// whole lifetime. A read-only host mapping is not offered.
+    fn host_address(&self, buffer: &Self::Buffer) -> Option<std::ptr::NonNull<u8>> {
+        if buffer.read_only {
+            return None;
+        }
+        std::ptr::NonNull::new(buffer.buffer.contents().as_ptr().cast::<u8>())
+    }
 }
 
 #[cfg(test)]

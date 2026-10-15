@@ -47,6 +47,14 @@ impl ElementUseSet {
         }
     }
 
+    /// A `&mut` parameter of `T` storage, or a store of whole trailing
+    /// matrices of it from `T` values.
+    pub(crate) fn record_stored(&mut self, element: &Elem) {
+        if let Elem::Param(parameter) = element {
+            self.entry(parameter).record_stored = true;
+        }
+    }
+
     /// `to_owned` of a `T` view selecting part of its packing axis (L22).
     pub(crate) fn partial_copy(&mut self, element: &Elem) {
         if let Elem::Param(parameter) = element {

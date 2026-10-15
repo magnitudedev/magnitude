@@ -417,6 +417,11 @@ pub(crate) trait Storage: Send + Sync {
     fn read_only(&self) -> bool {
         false
     }
+    /// The host address of the storage's first byte where the host addresses
+    /// it directly (`DeviceService::host_address`).
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        None
+    }
 }
 
 struct TypedStorage<T: TargetFamily, E: NativeExecutor<T>> {
@@ -442,6 +447,12 @@ impl<T: TargetFamily, E: NativeExecutor<T>> Storage for TypedStorage<T, E> {
     }
     fn read_only(&self) -> bool {
         self.read_only
+    }
+    fn host_address(&self) -> Option<std::ptr::NonNull<u8>> {
+        if self.read_only {
+            return None;
+        }
+        self.service.host_address(&self.buffer)
     }
 }
 

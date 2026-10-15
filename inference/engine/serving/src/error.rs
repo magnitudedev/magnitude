@@ -298,6 +298,7 @@ fn request_class(error: &RequestError) -> Class {
             cause: UnloadCause::Internal { .. },
         } => (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "worker_exited", true),
         RequestError::Overloaded => (unavailable, SERVER, "overloaded", true),
+        RequestError::ExpertFetchFailed { .. } => (unavailable, SERVER, "expert_fetch_failed", true),
         RequestError::Cancelled => (StatusCode::INTERNAL_SERVER_ERROR, "cancelled", "request_cancelled", true),
         RequestError::WorkerLost { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, SERVER, "worker_exited", true)

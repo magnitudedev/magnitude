@@ -1226,3 +1226,349 @@ native routed_scatter for cpu from "cpu/routed_scatter.rs":
         threadgroups (M, 1, 1)
         threads_per_threadgroup (1, 1, 1)
         shared_bytes (H * 8)
+
+# ---------------------------------------------------------------------------
+# Expert streaming: a decode class's choices through a bank of S < E slots
+# (specs/26-10-11/expert-streaming.md 4.6).
+#
+# `slot_map[e]` is the slot holding expert e, or -1; the host writes it.
+# `stamps[s]` is the step sequence that last read slot s; the host reads it
+# to choose victims. `step[0]` is this step's sequence.
+#
+# `control` is the layer's request region, in system-coherent memory:
+#   [0] request sequence (device), [1] acknowledged sequence (host),
+#   [2] failure (host), [3] choice count, [4..4 + M * K) routed experts.
+#
+# Routing order, grouping and combining keep the expert index; only weight
+# addresses use the slot.
+
+# Steps 1 and 2 (4.6, 4.7): `routed_route_shared`'s routing, then
+#   - resolve: `slots`, the slot of every choice, -1 for an absent one, and
+#     the stamp of every slot read. When any choice is absent the native
+#     implementation publishes the request (it does not wait); the reference
+#     has no host and only looks up.
+#   - the prefetch hints of the first `ahead` of the two layers ahead (near,
+#     one layer on; far, two): layer j's experts predicted from this layer's
+#     residual through layer j's own norm and router, the K largest logits
+#     per row (ties to the higher expert), `rms_norm(r_l) ⊙ g_j · R_j`. Each
+#     predicted expert absent from layer j's slot map is published once, in
+#     row then rank order, to this layer's ring for that distance, which the
+#     host reads while the step runs:
+#       [0] step sequence, [1] count, [2..2 + count) experts.
+#     The tensors of a distance past `ahead` are not read. A hint never
+#     changes a bank, a slot map or an output (rule 7).
+# BANK is the bank's slots, C the request region's words, RING a ring's.
+fn routed_route_streamed[M, H, PT, NM, E, K, S, BANK, C, RING](residual: &tensor[M, PT * H] f32,
+    norm: &tensor[NM] NW, router: &tensor[E, H] RW, shared_router: &tensor[H] f32,
+    shared_gate: &tensor[S, H] SGW, shared_up: &tensor[S, H] SUW,
+    routes: &mut tensor[M, K] i32, scores: &mut tensor[M, K] f32,
+    slot_map: &tensor[E] i32, stamps: &mut tensor[BANK] i32, step: &tensor[1] i32,
+    control: &mut tensor[C] i32,
+    near_norm: &tensor[NM] NW, near_router: &tensor[E, H] RW, near_map: &tensor[E] i32,
+    far_norm: &tensor[NM] NW, far_router: &tensor[E, H] RW, far_map: &tensor[E] i32,
+    near_ring: &mut tensor[RING] i32, far_ring: &mut tensor[RING] i32,
+    eps: f32, normalize: i32, ahead: i32)
+    -> (tensor[M, H] A, tensor[M] f32, tensor[M, S] A, tensor[M, K] i32)
+    where NM >= 0 and ((NM == H and PT == 1) or (NM == 0 and PT >= 1)):
+    let mut normalized = tensor[M, H] A
+    let mut logits = tensor[M, E] f32
+    let mut coefficient = tensor[M] f32
+    let mut shared_product = tensor[M, S] A
+    let mut slots = tensor[M, K] i32
+    form_input(residual, norm, normalized, eps)
+    linear(normalized, router, logits)
+    for row in 0..M:
+        let values = f32(logits[row])
+        let maximum = reduce(values, 0, max)
+        let mut probabilities = exp(values - maximum)
+        let total = reduce(probabilities, 0, sum)
+        probabilities = probabilities / total
+        for rank in 0..K:
+            let best = reduce(probabilities, 0, max)
+            let mut candidates = tensor[E] i32
+            for expert in 0..E:
+                candidates[expert] = -1
+                if probabilities[expert] == best:
+                    candidates[expert] = i32(expert)
+            let winner = reduce(i32(candidates), 0, max)
+            routes[row, K - 1 - rank] = winner
+            scores[row, K - 1 - rank] = best
+            # Only a selected expert is excluded from the next rank.
+            for expert in 0..E:
+                if i32(expert) == winner:
+                    probabilities[expert] = -inf
+        if normalize != 0:
+            let denominator = reduce(f32(scores[row]), 0, sum)
+            for choice in 0..K:
+                scores[row, choice] = scores[row, choice] / denominator
+        let shared_logit = reduce(f32(normalized[row]) * f32(shared_router), 0, sum)
+        coefficient[row] = 1.0 / (1.0 + exp(-shared_logit))
+        for feature in 0..S:
+            let mut gate = f32(0.0)
+            let mut up = f32(0.0)
+            for source in 0..H:
+                gate = fma(f32(normalized[row, source]), f32(shared_gate[feature, source]), gate)
+                up = fma(f32(normalized[row, source]), f32(shared_up[feature, source]), up)
+            shared_product[row, feature] = (gate / (1.0 + exp(-gate))) * up
+    for row in 0..M:
+        for choice in 0..K:
+            let slot = slot_map[routes[row, choice]]
+            slots[row, choice] = slot
+            if slot >= 0:
+                stamps[slot] = step[0]
+
+    if ahead >= 1:
+        let mut near_input = tensor[M, H] A
+        let mut near_logits = tensor[M, E] f32
+        let mut near_routes = tensor[M, K] i32
+        form_input(residual, near_norm, near_input, eps)
+        linear(near_input, near_router, near_logits)
+        for row in 0..M:
+            let mut values = f32(near_logits[row])
+            for rank in 0..K:
+                let best = reduce(values, 0, max)
+                let mut candidates = tensor[E] i32
+                for expert in 0..E:
+                    candidates[expert] = -1
+                    if values[expert] == best:
+                        candidates[expert] = i32(expert)
+                let winner = reduce(i32(candidates), 0, max)
+                near_routes[row, rank] = winner
+                for expert in 0..E:
+                    if i32(expert) == winner:
+                        values[expert] = -inf
+        let mut count = 0
+        for row in 0..M:
+            for rank in 0..K:
+                let expert = near_routes[row, rank]
+                if near_map[expert] < 0:
+                    let mut seen = 0
+                    for earlier_row in 0..M:
+                        for earlier_rank in 0..K:
+                            if earlier_row * K + earlier_rank < row * K + rank:
+                                if near_routes[earlier_row, earlier_rank] == expert:
+                                    seen = 1
+                    if seen == 0:
+                        near_ring[2 + count] = expert
+                        count = count + 1
+        if RING >= 2:
+            near_ring[1] = count
+            near_ring[0] = step[0]
+
+    if ahead >= 2:
+        let mut far_input = tensor[M, H] A
+        let mut far_logits = tensor[M, E] f32
+        let mut far_routes = tensor[M, K] i32
+        form_input(residual, far_norm, far_input, eps)
+        linear(far_input, far_router, far_logits)
+        for row in 0..M:
+            let mut values = f32(far_logits[row])
+            for rank in 0..K:
+                let best = reduce(values, 0, max)
+                let mut candidates = tensor[E] i32
+                for expert in 0..E:
+                    candidates[expert] = -1
+                    if values[expert] == best:
+                        candidates[expert] = i32(expert)
+                let winner = reduce(i32(candidates), 0, max)
+                far_routes[row, rank] = winner
+                for expert in 0..E:
+                    if i32(expert) == winner:
+                        values[expert] = -inf
+        let mut count = 0
+        for row in 0..M:
+            for rank in 0..K:
+                let expert = far_routes[row, rank]
+                if far_map[expert] < 0:
+                    let mut seen = 0
+                    for earlier_row in 0..M:
+                        for earlier_rank in 0..K:
+                            if earlier_row * K + earlier_rank < row * K + rank:
+                                if far_routes[earlier_row, earlier_rank] == expert:
+                                    seen = 1
+                    if seen == 0:
+                        far_ring[2 + count] = expert
+                        count = count + 1
+        if RING >= 2:
+            far_ring[1] = count
+            far_ring[0] = step[0]
+    return (normalized, coefficient, shared_product, slots)
+
+# Metal (Qwen's decode rows): `routed_route_shared`'s threadgroups (the
+# router GEMV, the shared-expert gate column, the shared expert's gate/up),
+# their parameters pinned to the resident entry's so every routing bit is
+# the same, then ceil_div(E, SIMDGROUPS) router threadgroups per distance
+# ahead over the same normalized rows, with that layer's norm. Three groups
+# of threadgroups arrive separately (`arrive::last`): the last router
+# threadgroup selects, then resolves, publishing the request under
+# system-scope fences when a choice is absent; the last of each distance
+# selects its predictions and publishes the absent ones (one thread checks
+# each choice's map entry), then, after one system-scope fence, the
+# sequence. Stamps are system-coherent stores.
+native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
+    static (H, PT, NM, E, K, S, BANK, C, RING)
+    params (SIMDGROUPS in [8, 16, 4, 2], ROWS in [1, 2, 4], arithmetic LANES in [32, 16])
+    where H % 32 == 0 and E % 32 == 0 and E <= 1024 and K <= 32 and C >= 4 + 8 * K and RING >= 2 + 8 * K
+    scratch logits bytes (3 * M * (E + 1) * 4)
+    scratch arrivals bytes (12) sync
+    launch routed_route_streamed:
+        threadgroups (ceil_div(E, SIMDGROUPS) + 1 + ceil_div(S, SIMDGROUPS * ROWS * 32 / LANES) + 2 * ceil_div(E, SIMDGROUPS), 1, 1)
+        threads_per_threadgroup (32 * SIMDGROUPS, 1, 1)
+        shared_bytes (min(ceil_div(H, 32) * (min(M, 2) + 2 * min(M / 3, 1) + 4 * min(M / 5, 1)), 448) * 64)
+
+# A scratch fill round's convert (4.9): the round's listed staging records
+# into their scratch slots, by the registered GGUF -> resident conversion:
+# `list[0]` is the step sequence the list was written for and `list[1]` the
+# count n; record i < n is staging record list[2 + 2 i] into slot
+# list[3 + 2 i]. A list written for another step converts nothing. R bounds
+# n.
+fn routed_convert_wide[R, S, N, K](source: &tensor[R, N, K] E,
+    list: &tensor[2 + 2 * R] i32, step: &tensor[1] i32,
+    destination: &mut tensor[S, N, K] U):
+    if list[0] == step[0]:
+        for record in 0..R:
+            if record < list[1]:
+                destination[list[3 + 2 * record], :, :] = repack[U = U](source[list[2 + 2 * record], :, :])
+
+native routed_convert_wide for metal from "metal/routed_convert_wide.metal":
+    launch routed_convert_wide:
+        threadgroups (ceil_div(N, 32) * 2, R, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# Expert streaming, the step sequence (4.3): the first routed layer of every
+# bank-served step advances it, before any entry of the step reads it. The
+# host counts the same steps in submission order, so it knows each step's
+# sequence without reading it.
+fn routed_step(step: &mut tensor[1] i32):
+    step[0] = step[0] + 1
+
+native routed_step for metal from "metal/routed_step.metal":
+    launch routed_step:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# ---------------------------------------------------------------------------
+# Expert streaming, a scratch-served step (4.9): the launch's experts fill the
+# layer's scratch bank, slot e holding expert e, in parked rounds. `flags[e]`
+# is 1 when the launch routes to expert e. The layer's scratch request region
+# (every layer of a step requests under the step's one sequence, so each has
+# its own):
+#   [0] request sequence (device), [1] layer (device), [2] failure (host),
+#   [3] reserved, then each round's acknowledgement (host) and each round's
+#   arrival (device), at word indices the graph passes to
+#   `routed_scratch_wait`.
+
+# The routed experts' flags, then the layer, then the step's sequence. It
+# does not wait.
+fn routed_scratch_request[M, K, E, C](routes: &tensor[M, K] i32,
+    step: &tensor[1] i32, flags: &mut tensor[E] i32, control: &mut tensor[C] i32,
+    layer: i32):
+    for expert in 0..E:
+        flags[expert] = 0
+    for row in 0..M:
+        for choice in 0..K:
+            flags[routes[row, choice]] = 1
+    if C >= 4:
+        control[1] = layer
+        control[0] = step[0]
+
+# Metal: one threadgroup; the flags cleared, then set by every choice, then
+# the layer and the sequence, under system-scope fences.
+native routed_scratch_request for metal from "metal/routed_scratch_request.metal":
+    static (K, E, C)
+    where E <= 1024 and C >= 4
+    launch routed_scratch_request:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (1024, 1, 1)
+
+# One round's park: publishes the step's sequence at word `arrival`, then
+# waits for it at word `acknowledgement` or the failure word (the host
+# enforces the one-second bound). The reference has no host and only
+# arrives.
+fn routed_scratch_wait[C](step: &tensor[1] i32, control: &mut tensor[C] i32,
+    heartbeat: &tensor[1] i32, acknowledgement: i32, arrival: i32):
+    if arrival >= 0:
+        if arrival < C:
+            control[arrival] = step[0]
+
+native routed_scratch_wait for metal from "metal/routed_scratch_wait.metal":
+    static (C)
+    launch routed_scratch_wait:
+        threadgroups (1, 1, 1)
+        threads_per_threadgroup (32, 1, 1)
+
+# Steps 2 to 5 (4.6): a streamed layer's absent experts, between its route
+# and the resident `routed_gate_up` and `routed_output`, which then compute
+# every choice from the bank slot `bound` names. `slots` is the route's
+# resolve: a hit's slot, or -1 for a choice the route requested.
+# `control` is the layer's request region (`routed_route_streamed`); for a
+# requested choice c of the decode rows' P, `placement[0, c]` is its slot,
+# `placement[1 + kind, c]` its staging record per routed tensor (gate, up,
+# down; -1 when the slot already holds the expert) and `placement[4, c]` its
+# acknowledgement, which the host writes after the placement. A choice with
+# staging records is converted into its slot by the registered GGUF ->
+# resident conversion, the slot stamped with the step, and, when the request
+# was acknowledged for this step and did not fail, committed: the expert's
+# map entry names the slot and `commits[slot]` the step.
+fn routed_bank_fill[M, H, K, F, BANK, T, X, C, P](slots: &tensor[M, K] i32,
+    stamps: &mut tensor[BANK] i32, step: &tensor[1] i32, control: &mut tensor[C] i32,
+    placement: &tensor[5, P] i32, heartbeat: &tensor[1] i32,
+    staged_gate: &tensor[T, F, H] SG, staged_up: &tensor[T, F, H] SU,
+    staged_down: &tensor[T, H, F] SD, expert_gate: &mut tensor[BANK, F, H] EGW,
+    expert_up: &mut tensor[BANK, F, H] EUW, expert_down: &mut tensor[BANK, H, F] EDW,
+    slot_map: &mut tensor[X] i32, commits: &mut tensor[BANK] i32) -> tensor[M, K] i32
+    where C >= 4 and P > 0:
+    let mut bound = tensor[M, K] i32
+    for row in 0..M:
+        for choice in 0..K:
+            let c = row * K + choice
+            bound[row, choice] = slots[row, choice]
+            if slots[row, choice] < 0 and c < P:
+                let slot = placement[0, c]
+                bound[row, choice] = slot
+                if placement[1, c] >= 0:
+                    expert_gate[slot, :, :] = repack[U = EGW](staged_gate[placement[1, c], :, :])
+                    expert_up[slot, :, :] = repack[U = EUW](staged_up[placement[2, c], :, :])
+                    expert_down[slot, :, :] = repack[U = EDW](staged_down[placement[3, c], :, :])
+                    stamps[slot] = step[0]
+                    if control[0] == step[0] and control[1] == step[0] and control[2] != step[0] and 4 + c < C:
+                        let expert = control[4 + c]
+                        if expert >= 0 and expert < X:
+                            slot_map[expert] = slot
+                            commits[slot] = step[0]
+    return bound
+
+# Metal: threadgroup row y is choice y; a hit binds its slot and returns,
+# so a step that requested nothing costs one small launch. A requested
+# choice's 32 threadgroups wait for its acknowledgement (one thread, under
+# system-scope fences, watching the heartbeat); only the first requested
+# choice of each placed expert converts it, its threadgroups striding over
+# the gate, up and down records' items by windows (`lib/streaming/window.h`).
+# After a failure a requested choice binds slot 0, keeping later addresses in
+# bounds; the host fails the step (rule 6). The commit waits for the request's
+# acknowledgement and publishes under system-scope fences.
+native routed_bank_fill for metal from "metal/routed_bank_fill.metal":
+    static (H, K, F, T, C, P)
+    where K <= 32 and C >= 4 + 8 * K and P >= 8 * K
+    launch routed_bank_fill:
+        threadgroups (32, M * K, 1)
+        threads_per_threadgroup (256, 1, 1)
+        shared_bytes (16384)
+
+# The listed bank slots into their scratch slots, byte for byte: `list[0]`
+# is the step sequence the list was written for and `list[1]` the count n;
+# entry i < n copies bank slot list[2 + 2 i] to scratch slot list[3 + 2 i].
+# A list written for another step copies nothing.
+fn routed_copy[S, E, N, K](bank: &tensor[S, N, K] U, list: &tensor[2 + 2 * E] i32,
+    step: &tensor[1] i32, scratch: &mut tensor[E, N, K] U):
+    if list[0] == step[0]:
+        for entry in 0..E:
+            if entry < list[1]:
+                scratch[list[3 + 2 * entry], :, :] = bank[list[2 + 2 * entry], :, :]
+
+# Metal: 8 threadgroup rows stride over the list entries; 64 threadgroups
+# of 256 threads stride over each matrix's bytes in 16-byte vectors.
+native routed_copy for metal from "metal/routed_copy.metal":
+    launch routed_copy:
+        threadgroups (64, 8, 1)
+        threads_per_threadgroup (256, 1, 1)

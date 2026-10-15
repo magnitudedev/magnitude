@@ -172,7 +172,7 @@ impl<'a> Checker<'a> {
             c.source_values.insert(id, value);
             if p.ownership == ParamOwnership::Exclusive {
                 for element in tensor_elements(&p.ty) {
-                    c.elements.stored(element);
+                    c.elements.record_stored(element);
                 }
             }
         }
@@ -475,7 +475,17 @@ impl<'a> Checker<'a> {
 
     /// Check that the selected storage can be written. The source-order
     /// region walk decides independent-loop access legality for the body.
-    pub fn write(&mut self, root: LocalId, binding: LocalId, span: Span) -> Option<LocalId> {
+    ///
+    /// `record` is a store of whole trailing matrices from values of the
+    /// same element, the one write packed storage admits
+    /// (`registry::record_writable`).
+    pub fn write(
+        &mut self,
+        root: LocalId,
+        binding: LocalId,
+        record: bool,
+        span: Span,
+    ) -> Option<LocalId> {
         let binding_name = self.locals[binding.index()].name.clone();
         match &self.kinds[binding.index()] {
             LocalKind::Param(i) if self.sig.params[*i].ownership == ParamOwnership::Owned => {
@@ -512,12 +522,13 @@ impl<'a> Checker<'a> {
             if let Elem::Repr(representation) = &tensor.elem {
                 if crate::registry::representation_info(*representation).access
                     != crate::registry::RepresentationAccess::ReadWrite
+                    && !(record && crate::registry::record_writable(*representation))
                 {
                     self.error(
                         DiagnosticRule::Type,
                         span,
                         format!(
-                            "representation `{}` is decode-only and has no canonical write contract",
+                            "representation `{}` is decode-only: it is written only by whole trailing matrices of the same representation",
                             crate::registry::representation_info(*representation).name
                         ),
                     );
@@ -525,7 +536,11 @@ impl<'a> Checker<'a> {
                 }
             }
             let element = tensor.elem.clone();
-            self.elements.stored(&element);
+            if record {
+                self.elements.record_stored(&element);
+            } else {
+                self.elements.stored(&element);
+            }
         }
         if self
             .live_borrows()

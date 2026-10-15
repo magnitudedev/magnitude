@@ -62,6 +62,7 @@ pub fn plan_execution(
         manifest.model.kv_codec,
         limits,
     )
+    .and_then(|draft| draft.with_weight_cap(&manifest.definition, manifest.model.weight_cap))
     .map_err(ExecutionPlanningError::Plan)
 }
 
@@ -191,6 +192,7 @@ mod tests {
             lookahead: false,
             exported_logits_rows,
             numerical_profile: None,
+            weight_cap: None,
         }
     }
 

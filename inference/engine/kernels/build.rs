@@ -58,6 +58,41 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         &[BackendName::Metal, BackendName::Cuda],
         "the full exact readout over the progressive head's planes (decode rows)",
     ),
+    (
+        "routed_route_streamed",
+        &[BackendName::Metal],
+        "expert streaming's routing with in-step slot resolution and prefetch hints, published to the host through a qualified system-coherent handshake; Metal is the first backend qualified for it (specs/26-10-11/expert-streaming.md 4.3)",
+    ),
+    (
+        "routed_bank_fill",
+        &[BackendName::Metal],
+        "expert streaming's park and conversion of a streamed layer's absent experts into their bank slots, and their commit; Metal first, with `routed_route_streamed`",
+    ),
+    (
+        "routed_scratch_request",
+        &[BackendName::Metal],
+        "expert streaming's scratch fill request, published to the host mid-step through system-coherent memory; Metal first, with `routed_route_streamed`",
+    ),
+    (
+        "routed_scratch_wait",
+        &[BackendName::Metal],
+        "expert streaming's parked scratch fill rounds; Metal first, with `routed_route_streamed`",
+    ),
+    (
+        "routed_convert_wide",
+        &[BackendName::Metal],
+        "expert streaming's scratch-round convert of the round's staged records into their scratch slots; Metal first, with `routed_route_streamed`",
+    ),
+    (
+        "routed_copy",
+        &[BackendName::Metal],
+        "expert streaming's copy of bank slots into the scratch bank; Metal first, with `routed_route_streamed`",
+    ),
+    (
+        "routed_step",
+        &[BackendName::Metal],
+        "expert streaming's device step sequence, read by the request, stamp and hint words; Metal first, with `routed_route_streamed`",
+    ),
 ];
 
 /// Files of the per-backend trees that exist on only some backends: (path
@@ -91,6 +126,51 @@ const TREE_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
         "lib/attention/flash",
         &[BackendName::Vulkan],
         "cooperative-matrix tile pieces shared by the prefill and vision attention bodies",
+    ),
+    (
+        "lib/streaming/convert",
+        &[BackendName::Metal],
+        "expert streaming's convert kernel body, shared by its two Metal entries",
+    ),
+    (
+        "lib/repack/bind",
+        &[BackendName::Metal],
+        "`repack_weight`'s binding type of the Metal repack templates",
+    ),
+    (
+        "lib/streaming/bind_convert",
+        &[BackendName::Metal],
+        "`routed_convert_wide`'s binding type of the Metal repack templates",
+    ),
+    (
+        "lib/streaming/bind_gate",
+        &[BackendName::Metal],
+        "the gate conversion's binding type of the Metal repack templates in `routed_bank_fill`, which holds three conversions",
+    ),
+    (
+        "lib/streaming/bind_up",
+        &[BackendName::Metal],
+        "the up conversion's binding type of the Metal repack templates in `routed_bank_fill`",
+    ),
+    (
+        "lib/streaming/bind_down",
+        &[BackendName::Metal],
+        "the down conversion's binding type of the Metal repack templates in `routed_bank_fill`",
+    ),
+    (
+        "lib/streaming/window",
+        &[BackendName::Metal],
+        "expert streaming's windowed conversion of staged records, shared by the Metal convert entries and the bank fill",
+    ),
+    (
+        "lib/streaming/control",
+        &[BackendName::Metal],
+        "expert streaming's system-coherent handshake words and fences, shared by the Metal-only streaming entries",
+    ),
+    (
+        "lib/repack/repack",
+        &[BackendName::Metal],
+        "the GGUF -> resident conversion body shared by `repack_weight` and the Metal-only streaming conversions",
     ),
     (
         "lib/core/arrive",
@@ -196,6 +276,7 @@ fn main() {
         .expect("the kernels directory exists");
     let mut violations = entry_parity(&kernels, &artifacts.natives);
     violations.extend(tree_parity(&kernels));
+    violations.extend(repack_bindings(&kernels.join("metal/lib")));
     if !violations.is_empty() {
         panic!(
             "native backend parity failed ({} violations):\n  - {}",
@@ -477,4 +558,48 @@ fn names(backends: &BTreeSet<BackendName>) -> String {
         .map(|backend| backend.as_str())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The repack templates (`repack/repack.h`, `streaming/window.h`) read a
+/// conversion's elements and geometry from a binding type `B`, so one kernel
+/// holds several conversions. Every `B::` member those headers read must be
+/// defined by each binding: one a binding misses fails only the kernels
+/// that instantiate it.
+fn repack_bindings(lib: &Path) -> Vec<String> {
+    let read = |path: &str| {
+        let path = lib.join(path);
+        println!("cargo:rerun-if-changed={}", path.display());
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+    };
+    let mut members = BTreeSet::new();
+    for header in ["repack/repack.h", "streaming/window.h"] {
+        let text = read(header);
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find("B::") {
+            let tail = &rest[at + 3..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(tail.len());
+            if end > 0 {
+                members.insert(tail[..end].to_owned());
+            }
+            rest = &tail[end..];
+        }
+    }
+    let mut violations = Vec::new();
+    for binding in [
+        "repack/bind.h",
+        "streaming/bind_convert.h",
+        "streaming/bind_gate.h",
+        "streaming/bind_up.h",
+        "streaming/bind_down.h",
+    ] {
+        let text = read(binding);
+        for member in &members {
+            if !text.contains(&format!(" {member}(")) {
+                violations.push(format!("metal/lib/{binding} does not define {member}, which the repack templates read"));
+            }
+        }
+    }
+    violations
 }

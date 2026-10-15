@@ -33,11 +33,12 @@ pub use resources::{
     reads_decoded_history,
 };
 pub use weights::{
+    BANK_KINDS, BankTensor, ExpertBankPlan,
     AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,
     DirectoryForm, EmbeddingBinding, FeaturesBinding, HeadBinding, HostPeak, HostTablePlan,
     ModelLoadPlan,
     NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
-    ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBinding, ScalableWeight,
+    ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBank, RoutedBinding, ScalableWeight,
     SelectionBinding, SelectionShape, SublayerTail, WeightPlan, WeightScalePlan, WeightStorageIdentity,
     resident_element, resident_layout, source_element,
 };
@@ -1010,3 +1011,6 @@ pub(crate) mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) use weights::{BankLayer, ScratchPlan, StagingPoolPlan};

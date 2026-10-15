@@ -155,6 +155,8 @@ pub struct ResidentTarget {
     pub fusion: Option<ResidentFusion>,
     /// The per-layer entry, when the model has per-layer inputs.
     pub per_layer: Option<ResidentPerLayer>,
+    /// A streamed load's banks: their directories, staging and watcher.
+    pub(crate) bank: Option<std::sync::Arc<crate::streaming::bank::ResidentBank>>,
 }
 
 /// The target's vocabulary projection, as its plan places it.
@@ -318,6 +320,15 @@ pub(crate) fn import_target(
             })
         })
         .transpose()?;
+    let bank = residency
+        .load_plan()
+        .expert_bank()
+        .map(|plan| {
+            crate::streaming::bank::ResidentBank::open(residency.device(), plan, target, &sublayers)
+                .map(std::sync::Arc::new)
+                .map_err(invalid)
+        })
+        .transpose()?;
     Ok(ResidentTarget {
         embedding,
         blocks: decoder.blocks.len(),
@@ -326,6 +337,7 @@ pub(crate) fn import_target(
         output,
         fusion,
         per_layer,
+        bank,
     })
 }
 

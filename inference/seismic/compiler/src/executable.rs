@@ -1589,6 +1589,12 @@ pub trait DeviceService<T: seismic_native_target::TargetFamily>: Send + Sync + '
         into: &mut [u8],
     ) -> Result<(), ExecutionError>;
     fn buffer_len(&self, buffer: &Self::Buffer) -> u64;
+    /// The host address of `buffer`'s first byte where the device keeps the
+    /// buffer in memory the host addresses directly for its whole lifetime
+    /// (unified memory); `None` where host access goes through transfers.
+    fn host_address(&self, _buffer: &Self::Buffer) -> Option<std::ptr::NonNull<u8>> {
+        None
+    }
 }
 
 /// One invocation-bound physical allocation. `base_offset` is the caller's

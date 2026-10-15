@@ -44,6 +44,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             lookahead: false,
             exported_logits_rows: 64,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {

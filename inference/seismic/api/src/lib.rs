@@ -700,9 +700,13 @@ impl Tensor {
         seismic_runtime::api::tensor::TensorInner::canonical_layout(element.id(), extents)
     }
 
-    /// A typed region inside a byte-addressed tensor allocation. Views share
-    /// the allocation and its device-use lifetime.
-    pub(crate) fn region(
+    /// A typed region at `byte_offset` inside a byte-addressed tensor
+    /// allocation (`Element::bool()` storage, aligned for the region's
+    /// layout). Views share the allocation and its device-use lifetime.
+    /// Views may overlap: an arena holding one of several forms at a time
+    /// binds the view of the form it currently holds, and the caller orders
+    /// every use of overlapping views.
+    pub fn region(
         &self,
         element: Element,
         extents: &[u64],
@@ -903,6 +907,15 @@ impl Tensor {
     pub fn write_from_host(&mut self, bytes: &[u8]) -> Result<(), TensorError> {
         self.inner.write_from_host(bytes)
     }
+    /// The host address and byte length of this tensor's bytes on a device
+    /// that keeps them in host-addressable memory (unified memory), for
+    /// protocols in which the host and running device work share words.
+    /// Access through it is not synchronized with device work: the caller
+    /// orders it through the backend's cross-agent memory model, and keeps
+    /// this tensor alive while it uses the address.
+    pub fn host_window(&self) -> Result<(std::ptr::NonNull<u8>, u64), TensorError> {
+        self.inner.host_window()
+    }
     /// Fill all physical bytes of a canonical upload tensor from `reader`
     /// with bounded scratch, rather than materializing a second whole tensor.
     /// On error the tensor is only partly initialized and must not be used.
@@ -946,6 +959,13 @@ impl Tensor {
         TensorStorageObserver {
             inner: self.inner.observe_storage(),
         }
+    }
+    /// Weak observations of each physical allocation retained by this
+    /// tensor, including a slab tensor's address table and backed slabs.
+    /// Callers observing several aliases must deduplicate their identities.
+    pub fn storage_observers(&self) -> Vec<TensorStorageObserver> {
+        self.inner.storage_observers().into_iter()
+            .map(|inner| TensorStorageObserver { inner }).collect()
     }
     pub fn belongs_to(&self, device: &Device) -> bool {
         Arc::ptr_eq(self.inner.device(), device.inner())

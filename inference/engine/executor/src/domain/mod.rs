@@ -86,6 +86,9 @@ pub enum DomainError {
     /// One sequence's table rows could not be read: that sequence fails,
     /// and execution continues.
     TableRead(crate::TableReadError),
+    /// A streamed load's expert fetch failed or exceeded its bound
+    /// (expert-streaming rule 6).
+    Streaming(String),
 }
 
 impl DomainError {
@@ -109,6 +112,7 @@ impl std::fmt::Display for DomainError {
             Self::Device(error) => error.fmt(f),
             Self::Invariant(error) => error.fmt(f),
             Self::TableRead(error) => error.fmt(f),
+            Self::Streaming(message) => write!(f, "expert streaming: {message}"),
         }
     }
 }

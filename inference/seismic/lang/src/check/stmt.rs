@@ -2,7 +2,8 @@
 //! one result — emitted as the checked statement set.
 
 use super::ir::{
-    Block as CheckedBlock, Expr as CheckedExpr, ExprKind as CheckedExprKind, LocalId, LoopKind,
+    Block as CheckedBlock, Expr as CheckedExpr, ExprKind as CheckedExprKind,
+    Index as CheckedIndex, LocalId, LoopKind,
     Ownership as ParamOwnership, Pattern, Place as CheckedPlace, Stmt as CheckedStmt,
 };
 use super::{elem_rounds, Checker, LocalKind};
@@ -654,15 +655,19 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                // Packed representations are readable and decodable but never writable.
+                // Packed storage is written only by whole trailing matrices
+                // of a value of the same representation (its exact bytes).
+                let record = whole_records(&indices, &selected);
                 if let Some(shaped) = self.locals[binding.index()].ty.shaped() {
-                    if matches!(shaped.elem, Elem::Repr(_)) {
-                        self.error(
-                            DiagnosticRule::Type,
-                            target.span,
-                            "packed representations are readable and decodable but not writable",
-                        );
-                        return None;
+                    if let Elem::Repr(representation) = &shaped.elem {
+                        if !(record && crate::registry::record_writable(*representation)) {
+                            self.error(
+                                DiagnosticRule::Type,
+                                target.span,
+                                "a packed representation is decode-only: it is written only by whole trailing matrices of the same representation",
+                            );
+                            return None;
+                        }
                     }
                 }
                 if !matches!(selected, ValueType::Scalar(_) | ValueType::Tensor(_)) {
@@ -736,7 +741,7 @@ impl<'a> Checker<'a> {
                         "this selection has type",
                     )?,
                 };
-                self.write(root, binding, target.span)?;
+                self.write(root, binding, record, target.span)?;
                 let checked_place = CheckedPlace::Element {
                     root: super::ownership::LocalPlace::root(root),
                     indices,
@@ -776,7 +781,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, span)
+                self.write(root.local, root.local, false, span)
             }
             CheckedPlace::Element { root, .. } => {
                 if !self.writable_place(root) {
@@ -787,7 +792,7 @@ impl<'a> Checker<'a> {
                     );
                     return None;
                 }
-                self.write(root.local, root.local, span)
+                self.write(root.local, root.local, false, span)
             }
             CheckedPlace::Tuple(places) => {
                 let mut last = None;
@@ -1362,4 +1367,30 @@ impl<'a> Checker<'a> {
         }
         Some(result)
     }
+}
+
+/// Whether a selection is whole trailing matrices: points on every leading
+/// axis and the whole of the last two, selecting a tensor (a packed
+/// representation's records, `registry::record_writable`).
+fn whole_records(indices: &[CheckedIndex], selected: &ValueType) -> bool {
+    let ValueType::Tensor(_) = selected else {
+        return false;
+    };
+    let Some(leading) = indices.len().checked_sub(2) else {
+        return false;
+    };
+    indices[..leading]
+        .iter()
+        .all(|index| matches!(index, CheckedIndex::Point { .. }))
+        && indices[leading..].iter().all(|index| {
+            matches!(
+                index,
+                CheckedIndex::Full
+                    | CheckedIndex::Range {
+                        start: None,
+                        end: None,
+                        ..
+                    }
+            )
+        })
 }

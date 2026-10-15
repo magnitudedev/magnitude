@@ -179,6 +179,89 @@ impl ExecutionPlanDraft {
         Ok(self)
     }
 
+    /// The weight cap (spec 6.1). The resident plan when the standard
+    /// workload fits the device with every weight resident and `cap` (when
+    /// given) covers every weight; otherwise the streamed plan with the
+    /// largest bank that fits both, or a refusal naming the limit.
+    ///
+    /// A cap never raises what the device permits, and a cap below the
+    /// model's weights streams even a model that fits: artificial capping and
+    /// "does not fit" are one path.
+    pub fn with_weight_cap(
+        self,
+        definition: &ModelDefinition,
+        cap: Option<u64>,
+    ) -> Result<Self, PlanError> {
+        let charge = |draft: &Self| -> Result<(u64, u64), PlanError> {
+            let context_limit = u32::try_from(definition.decoder.context_limit)
+                .map_err(|_| PlanError::Arithmetic("model context exceeds assessment range"))?;
+            let assessment =
+                crate::assessment::prepare_execution_assessment(definition, draft, context_limit)
+                    .map_err(|error| PlanError::ResourcePlanning(error.to_string()))?;
+            let [target, head, vision] = super::weights::weight_bytes_by_component(&draft.load)
+                .map_err(PlanError::ResourcePlanning)?;
+            Ok((
+                assessment.memory_charge().allocation_bytes,
+                target + head + vision,
+            ))
+        };
+        let capacity = self.device.assessment_capacity_bytes;
+        let (allocation, weights) = charge(&self)?;
+        if allocation <= capacity && cap.is_none_or(|cap| cap >= weights) {
+            return Ok(self);
+        }
+        let selected = definition_selected(definition)?;
+        let streamed = |slots: u64| -> Result<Self, PlanError> {
+            let mut draft = self.clone();
+            draft.load = draft
+                .load
+                .with_shared_expert_bank(slots, selected)
+                .map_err(PlanError::InvalidDefinition)?;
+            draft.programs = draft.load.program_plan(definition, draft.policy.codec)?;
+            Ok(draft)
+        };
+        // Assess each supported capacity directly. Directory storage,
+        // padded backing and graph workspaces belong to the candidate;
+        // neither weight nor total charge is inferred from a payload slope.
+        let probe = streamed(1)?;
+        let experts = probe.load.expert_bank().expect("streamed bank").experts;
+        let smallest = 1; // each shared group separately admits its launch union
+        let mut slots = experts - 1;
+        while slots >= smallest {
+            let candidate = streamed(slots)?;
+            // Weight bytes are exact metadata and monotone with capacity.
+            // Reject over-cap candidates before constructing graph-resource
+            // assessment. Every retained candidate still passes the original
+            // complete allocation assessment; no measured peak substitutes it.
+            let [target,head,vision]=super::weights::weight_bytes_by_component(&candidate.load)
+                .map_err(PlanError::ResourcePlanning)?;
+            let weights=target+head+vision;
+            if cap.is_some_and(|cap|weights>cap) {
+                slots-=1;
+                continue;
+            }
+            let (allocation, assessed_weights) = charge(&candidate)?;
+            if assessed_weights!=weights {
+                return Err(PlanError::ResourcePlanning("weight metadata changed during bank assessment".into()));
+            }
+            if allocation <= capacity && cap.is_none_or(|cap| weights <= cap) {
+                eprintln!("magnitude-engine: streamed load: {slots} of {experts} expert slots per routed layer (weights {weights}, allocation {allocation}, weight cap {cap:?}, device capacity {capacity})");
+                return Ok(candidate);
+            }
+            slots-=1;
+        }
+        // Preserve the detailed minimum-bank refusal after the exhaustive
+        // descending search finds no admissible capacity.
+        let minimum = streamed(smallest)?;
+        let (allocation, weights) = charge(&minimum)?;
+        if allocation <= capacity && cap.is_none_or(|cap| weights <= cap) {
+            return Ok(minimum);
+        }
+        Err(PlanError::ResourcePlanning(format!(
+            "the smallest expert bank ({smallest} slots) needs {weights} weight bytes and {allocation} total allocation bytes; weight cap {cap:?}, device capacity {capacity}"
+        )))
+    }
+
     pub fn admit(self, resources: ResourcePlan) -> Result<ExecutionPlan, PlanError> {
         let planned_weight_bytes = resources
             .bytes()
@@ -201,6 +284,26 @@ impl ExecutionPlanDraft {
             policy: self.policy,
         })
     }
+}
+
+/// The experts a routed layer selects per row (`K`), the same for every
+/// routed layer a bank streams.
+fn definition_selected(definition: &ModelDefinition) -> Result<u64, PlanError> {
+    let mut selected = None;
+    for (_, sublayer) in definition.decoder.sublayers() {
+        if let magnitude_family_contracts::Operator::RoutedFfn(routed) = &sublayer.op {
+            match selected {
+                None => selected = Some(routed.selected),
+                Some(k) if k == routed.selected => {}
+                Some(_) => {
+                    return Err(PlanError::Unsupported(
+                        "streamed routed layers selecting different expert counts",
+                    ));
+                }
+            }
+        }
+    }
+    selected.ok_or(PlanError::Unsupported("a streamed load without routed layers"))
 }
 
 impl ExecutionPlan {

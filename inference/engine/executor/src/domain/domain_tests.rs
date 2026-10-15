@@ -499,6 +499,7 @@ impl ProgramFamily for TestFamily {
                 },
                 selected_rows: None,
                 stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
+                bank_step: None,
             },
         ))
     }

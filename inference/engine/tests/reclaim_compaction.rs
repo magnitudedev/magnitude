@@ -43,6 +43,7 @@ fn domain() -> (ExecutorDomain, StateBindings, usize, usize, usize) {
             lookahead: false,
             exported_logits_rows: 64,
             numerical_profile: None,
+            weight_cap: None,
         },
         context_tokens: Some(8192),
         service: ServiceLimits {

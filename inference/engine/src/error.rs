@@ -347,6 +347,9 @@ pub enum RequestError {
     /// execution (a streamed table's rows) could not be read. Other
     /// requests continue. Retryable.
     WeightReadFailed { reason: String },
+    /// A streamed load could not read an expert the request's step routed
+    /// to (expert-streaming rule 6). Retryable.
+    ExpertFetchFailed { reason: String },
     /// The caller cancelled.
     Cancelled,
     /// The worker ended before the request's terminal outcome.
@@ -368,6 +371,7 @@ impl RequestError {
                 | Self::Overloaded
                 | Self::DeviceLost { .. }
                 | Self::WeightReadFailed { .. }
+                | Self::ExpertFetchFailed { .. }
                 | Self::WorkerLost { .. }
         )
     }
@@ -400,6 +404,7 @@ impl fmt::Display for RequestError {
             Self::WeightReadFailed { reason } => {
                 write!(formatter, "model weights could not be read: {reason}")
             }
+            Self::ExpertFetchFailed { reason } => write!(formatter, "expert fetch failed: {reason}"),
             Self::Cancelled => formatter.write_str("request cancelled"),
             Self::WorkerLost { reason } => write!(formatter, "worker lost: {reason}"),
             Self::Internal { reason } => write!(formatter, "internal engine failure: {reason}"),
@@ -463,6 +468,7 @@ impl From<magnitude_scheduler::publication::RequestError> for RequestError {
             Scheduled::TableRead(error) => Self::WeightReadFailed {
                 reason: error.detail,
             },
+            Scheduled::ExpertFetch(reason) => Self::ExpertFetchFailed { reason },
             Scheduled::WorkerClosed => Self::WorkerLost {
                 reason: "the execution owner closed the request's stream".into(),
             },

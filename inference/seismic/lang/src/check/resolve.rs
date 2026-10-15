@@ -973,9 +973,7 @@ pub(crate) fn signature_of(
         if ownership == Ownership::Exclusive {
             if let ValueType::Tensor(tensor) = &ty {
                 if let Elem::Repr(representation) = &tensor.elem {
-                    if crate::registry::representation_info(*representation).access
-                        != crate::registry::RepresentationAccess::ReadWrite
-                    {
+                    if !crate::registry::record_writable(*representation) {
                         return Err(Diagnostic::with_rule(
                             DiagnosticRule::Type,
                             p.ty.span,

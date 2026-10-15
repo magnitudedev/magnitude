@@ -604,6 +604,19 @@ pub struct RoutedBinding {
     pub shared_up: Element,
     pub shared_down: Element,
     pub activation: Element,
+    /// A streamed layer's bank (spec 4.1): its routed weights hold `slots`
+    /// experts, converted from staged records of `sources`.
+    pub bank: Option<RoutedBank>,
+}
+
+/// A streamed routed layer's bank as its entries see it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RoutedBank {
+    pub slots: u64,
+    /// The stored elements of the gate, up and down records.
+    pub sources: [Element; 3],
+    /// Records per staging pool.
+    pub staging_records: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -749,6 +762,247 @@ pub struct ModelLoadPlan {
     /// them stand and their demand is derived, and not placed. A weight has
     /// one stored form.
     pub(super) unplaced_output: Vec<WeightPlan>,
+    /// A streamed load's expert banks (spec 4.1): the target's routed weights
+    /// planned with `slots` experts in place of `experts`, fetched from the
+    /// model file when routed.
+    pub(super) bank: Option<ExpertBankPlan>,
+}
+
+/// The routed tensors of an expert record, in convert order.
+pub const BANK_KINDS: [WeightKind; 3] = [
+    WeightKind::ExpertGate,
+    WeightKind::ExpertUp,
+    WeightKind::ExpertDown,
+];
+
+/// A streamed load's banks (spec 4.1, 4.3, 6.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertBankPlan {
+    /// Immutable physical placement of the compatible shared cache. None
+    /// denotes the per-layer comparison control, never an implicit fallback.
+    pub(crate) shared: Option<crate::streaming::shared_bank::SharedBankPlan>,
+    /// Bank capacity `S`, the same for every routed layer.
+    pub slots: u64,
+    /// The true expert count `E`.
+    pub experts: u64,
+    /// The experts a routed layer selects per row (`K`).
+    pub selected: u64,
+    /// Staging records per pool (`T`).
+    pub staging_records: u64,
+    /// Every routed layer of the target, in decoder order.
+    pub layers: Vec<BankLayer>,
+    /// Staging pools: one per routed tensor (gate, up, down) and distinct
+    /// stored (source element, rows, packed columns) of it.
+    pub pools: Vec<StagingPoolPlan>,
+    /// Scratch bank forms (spec 4.9): one per routed tensor (gate, up, down)
+    /// and distinct resident (element, rows, columns) of it, each a view of
+    /// that tensor's scratch arena holding every expert.
+    pub scratch: Vec<ScratchPlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BankLayer {
+    pub scope: WeightScope,
+    /// Gate, up, down: each tensor's staging pool and the bytes of one
+    /// expert as the model file stores it.
+    pub tensors: [BankTensor; 3],
+    /// Gate, up, down as a resident load plans them: what tuning imports
+    /// to measure the entries both loads share.
+    pub resident: [WeightPlan; 3],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankTensor {
+    pub pool: usize,
+    /// The scratch bank a scratch-served step fills for this tensor.
+    pub scratch: usize,
+    pub stored_bytes: u64,
+    /// The resident bytes of one slot (`slot × P` rows, spec 4.1).
+    pub slot_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScratchPlan {
+    /// The routed tensor (gate, up, down) it holds: a launch's products read
+    /// all three at once, so they never share a scratch bank.
+    pub kind: usize,
+    /// The resident element and one expert's matrix extents `[N, K]`.
+    pub element: Element,
+    pub matrix: [u64; 2],
+    pub slot_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingPoolPlan {
+    /// The routed tensor (gate, up, down) whose records it holds: a launch's
+    /// reads take one record of each, so the three never share a pool.
+    pub kind: usize,
+    /// The stored element and one expert's matrix extents `[N, K]`.
+    pub source: Element,
+    pub matrix: [u64; 2],
+    pub record_bytes: u64,
+}
+
+impl ExpertBankPlan {
+    /// Staging records per pool (`streaming::layout::staging_records`).
+    pub fn staging_records_for(selected: u64) -> u64 {
+        crate::streaming::layout::staging_records(selected)
+    }
+
+    /// Words of a layer's request region: the request, acknowledgement,
+    /// failure and count words, then every choice of the decode form's rows
+    /// (`routed_route_streamed`).
+    pub fn control_words(&self) -> u64 {
+        crate::streaming::layout::control_words(self.selected)
+    }
+
+    /// Choices of the decode form's rows a layer's placement holds
+    /// (`routed_bank_fill`).
+    pub fn placement_choices(&self) -> u64 {
+        crate::operators::routed::fused_graph::DECODE_ROWS * self.selected
+    }
+
+    /// Words of a hint ring: the sequence and count, then every choice of
+    /// the decode form's rows (`routed_route_streamed`).
+    pub fn ring_words(&self) -> u64 {
+        crate::streaming::layout::ring_words(self.selected)
+    }
+
+    /// Words of a convert list: the step sequence it was written for and
+    /// the count, then a (record, slot) pair per staging record
+    /// (`routed_convert_wide`).
+    pub fn list_words(&self) -> u64 {
+        2 + 2 * self.staging_records
+    }
+
+    /// Records a scratch fill stages per round: half the pool, so one half
+    /// fills while the device converts the other (spec 4.9).
+    pub fn round_records(&self) -> u64 {
+        self.staging_records / 2
+    }
+
+    /// Rounds a scratch-served layer's graph holds: enough to deliver
+    /// every expert.
+    pub fn rounds(&self) -> u64 {
+        crate::streaming::layout::scratch_rounds(self.experts, self.selected)
+    }
+
+    /// Words of a layer's scratch request region (`routed_scratch_request`).
+    pub fn scratch_control_words(&self) -> u64 {
+        crate::streaming::layout::scratch_control_words(self.rounds())
+    }
+
+    /// Words of a copy list: the step sequence and the count, then a (bank
+    /// slot, expert) pair per expert a scratch fill can copy (`routed_copy`).
+    pub fn copy_list_words(&self) -> u64 {
+        2 + 2 * self.experts
+    }
+
+    /// Bytes a streamed load holds beside its banks: the scratch banks, the
+    /// staging pools, every layer's directory words, each bank group's stamps
+    /// and commits, and the load's step, heartbeat and scratch fill words.
+    pub fn charged_bytes(&self) -> Result<u64, String> {
+        let shared = self.shared.as_ref().ok_or("a streamed load without its shared bank plan")?;
+        let layer = self.experts
+            + self.control_words()
+            + 5 * self.placement_choices()
+            + self.scratch_control_words()
+            + 2 * self.ring_words();
+        let groups = shared.groups.iter().try_fold(0u64, |n, group| {
+            n.checked_add(2 * group.records).ok_or("bank group words overflow")
+        })?;
+        let load = 2 + self.experts + 3 * self.rounds() * self.list_words() + 3 * self.copy_list_words();
+        let directory = layer
+            .checked_mul(self.layers.len() as u64)
+            .and_then(|words| words.checked_add(groups + load))
+            .and_then(|words| words.checked_mul(4))
+            .ok_or("bank directory bytes overflow")?;
+        self.scratch_bytes()?.checked_add(self.staging_bytes()?)
+            .and_then(|bytes| bytes.checked_add(directory))
+            .ok_or_else(|| "streamed bytes overflow".to_owned())
+    }
+
+    /// Physical record extent of the bank a layer binds. Shared groups
+    /// retain fixed placement for the entire load, including queued steps.
+    pub(crate) fn records(&self, scope: WeightScope) -> Result<u64, String> {
+        let position = self.layers.iter().position(|l| l.scope == scope)
+            .ok_or("scope is outside the expert bank")?;
+        let shared = self.shared.as_ref().ok_or("a streamed load without its shared bank plan")?;
+        Ok(shared.groups[shared.group_of_layer[position]].records)
+    }
+
+    /// The resident plan of a bank's weight.
+    pub fn resident_plan(&self, role: WeightRole) -> Option<&WeightPlan> {
+        let kind = BANK_KINDS.iter().position(|kind| *kind == role.kind)?;
+        self.layers
+            .iter()
+            .find(|layer| layer.scope == role.scope)
+            .map(|layer| &layer.resident[kind])
+    }
+
+    /// Whether the weight of `role` is a bank.
+    pub fn holds(&self, role: WeightRole) -> bool {
+        BANK_KINDS.contains(&role.kind) && self.layers.iter().any(|layer| layer.scope == role.scope)
+    }
+
+    /// The bank of the routed layer of `scope`, if it streams.
+    pub fn routed(&self, scope: WeightScope) -> Option<RoutedBank> {
+        let layer = self.layers.iter().find(|layer| layer.scope == scope)?;
+        Some(RoutedBank {
+            slots: self.records(scope).ok()?,
+            sources: layer.tensors.map(|tensor| self.pools[tensor.pool].source),
+            staging_records: self.staging_records,
+        })
+    }
+
+    /// Bytes every staging pool holds.
+    pub fn staging_bytes(&self) -> Result<u64, String> {
+        self.pools.iter().try_fold(0u64, |total, pool| {
+            pool.record_bytes
+                .checked_mul(self.staging_records)
+                .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| "staging bytes overflow".to_owned())
+        })
+    }
+
+    /// The scratch arena of routed tensor `kind`: every expert of one layer
+    /// in the largest of the tensor's resident forms. One layer fills it at
+    /// a time, so each form is a view of the one arena.
+    pub fn scratch_arena_bytes(&self, kind: usize) -> Result<u64, String> {
+        self.scratch
+            .iter()
+            .filter(|scratch| scratch.kind == kind)
+            .map(|scratch| {
+                seismic::Tensor::canonical_layout(
+                    scratch.element,
+                    &[self.experts, scratch.matrix[0], scratch.matrix[1]],
+                )
+                .map(|(bytes, _)| bytes)
+                .map_err(|error| error.to_string())
+            })
+            .try_fold(0u64, |largest, bytes| Ok(largest.max(bytes?)))
+    }
+
+    /// The scratch arenas (spec 4.9), one per routed tensor.
+    pub fn scratch_bytes(&self) -> Result<u64, String> {
+        (0..BANK_KINDS.len()).try_fold(0u64, |total, kind| {
+            total
+                .checked_add(self.scratch_arena_bytes(kind)?)
+                .ok_or_else(|| "scratch bytes overflow".to_owned())
+        })
+    }
+
+    /// One slot of every layer's bank.
+    pub fn slot_bytes(&self) -> Result<u64, String> {
+        self.layers
+            .iter()
+            .flat_map(|layer| layer.tensors.iter())
+            .try_fold(0u64, |total, tensor| {
+                total
+                    .checked_add(tensor.slot_bytes)
+                    .ok_or_else(|| "bank slot bytes overflow".to_owned())
+            })
+    }
 }
 
 /// Whether a readout scope's weights are planned with the head component's.
@@ -894,6 +1148,8 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
     .enumerate()
     {
         for weight in weights {
+            if load.bank.as_ref().is_some_and(|bank|
+                bank.shared.is_some() && bank.holds(weight.role)) { continue; }
             let storage = (
                 weight.upload,
                 weight.shape.clone(),
@@ -914,6 +1170,17 @@ pub(super) fn weight_bytes_by_component(load: &ModelLoadPlan) -> Result<[u64; 3]
                 std::collections::hash_map::Entry::Occupied(_) => {}
             }
         }
+    }
+    // A streamed load's scratch bank and staging are target weight holdings
+    // (spec 6.1: the cap counts every weight the plan charges).
+    if let Some(bank) = &load.bank {
+        if let Some(shared) = &bank.shared {
+            bytes[0] = bytes[0].checked_add(shared.allocated_bytes)
+                .ok_or("shared bank weight count overflow")?;
+        }
+        bytes[0] = bytes[0]
+            .checked_add(bank.charged_bytes()?)
+            .ok_or("streamed weight byte count overflow")?;
     }
     Ok(bytes)
 }
@@ -959,6 +1226,7 @@ impl ModelLoadPlan {
             self.vision.as_deref(),
             &self.host_tables,
             &self.readout_choices,
+            self.bank.as_ref(),
             history,
         )
     }
@@ -1206,7 +1474,227 @@ impl ModelLoadPlan {
             readout_candidates: Vec::new(),
             readout_choices: Vec::new(),
             unplaced_output: Vec::new(),
+            bank: None,
         })
+    }
+
+    /// A streamed load's banks, if this plan streams.
+    pub fn expert_bank(&self) -> Option<&ExpertBankPlan> {
+        self.bank.as_ref()
+    }
+
+    /// Whether the weight of `role` is a bank: planned `[slots, rows,
+    /// columns]`, allocated empty, and filled from the model file when
+    /// routed (rule 5).
+    pub fn banked(&self, role: WeightRole) -> bool {
+        self.bank.as_ref().is_some_and(|bank| bank.holds(role))
+    }
+
+    /// The routed layers of the target and their expert weight plans, in
+    /// decoder order: the weights a bank holds `slots` of.
+    fn routed_target_layers(&self) -> Result<Vec<(WeightScope, [usize; 3])>, String> {
+        let mut layers: Vec<(WeightScope, [Option<usize>; 3])> = Vec::new();
+        for (index, plan) in self.target.iter().enumerate() {
+            let Some(kind) = BANK_KINDS.iter().position(|kind| *kind == plan.role.kind) else {
+                continue;
+            };
+            if !matches!(plan.role.scope, WeightScope::TargetSublayer(_)) {
+                continue;
+            }
+            match layers.iter_mut().find(|(scope, _)| *scope == plan.role.scope) {
+                Some((_, slots)) => slots[kind] = Some(index),
+                None => {
+                    let mut slots = [None; 3];
+                    slots[kind] = Some(index);
+                    layers.push((plan.role.scope, slots));
+                }
+            }
+        }
+        layers
+            .into_iter()
+            .map(|(scope, slots)| {
+                Ok((
+                    scope,
+                    [0, 1, 2].map(|kind| slots[kind]).map(|slot| {
+                        slot.ok_or_else(|| {
+                            format!("routed layer {scope:?} lacks separate gate, up and down experts")
+                        })
+                    }),
+                ))
+            })
+            .map(|layer: Result<(WeightScope, [Result<usize, String>; 3]), String>| {
+                let (scope, [gate, up, down]) = layer?;
+                Ok((scope, [gate?, up?, down?]))
+            })
+            .collect()
+    }
+
+    /// Bytes of the target's routed weights as planned resident: what a
+    /// bank of every expert would hold.
+    pub fn routed_target_bytes(&self) -> Result<u64, String> {
+        self.routed_target_layers()?
+            .iter()
+            .flat_map(|(_, plans)| plans.iter())
+            .try_fold(0u64, |total, &index| {
+                total
+                    .checked_add(self.target[index].resident_bytes)
+                    .ok_or_else(|| "routed weight bytes overflow".to_owned())
+            })
+    }
+
+    /// The streamed plan with `slots` slots per routed layer whose rows
+    /// select `selected` experts (spec 4.1, 4.3): every
+    /// routed target weight is planned `[slots, rows, columns]`, imported
+    /// from nothing (a bank starts empty, rule 5), and its stored records
+    /// fetched from the model file when routed.
+    pub fn with_expert_bank(mut self, slots: u64, selected: u64) -> Result<Self, String> {
+        if self.bank.is_some() {
+            return Err("load plan already streams".into());
+        }
+        let layers = self.routed_target_layers()?;
+        let experts = layers
+            .first()
+            .map(|(_, plans)| self.target[plans[0]].shape[0])
+            .ok_or("a streamed load needs routed layers")?;
+        if slots == 0 || slots >= experts {
+            return Err(format!("a bank of {slots} slots for {experts} experts"));
+        }
+        let mut pools: Vec<StagingPoolPlan> = Vec::new();
+        let mut scratch: Vec<ScratchPlan> = Vec::new();
+        let mut bank_layers = Vec::with_capacity(layers.len());
+        for (scope, plans) in layers {
+            let resident = plans.map(|index| self.target[index].clone());
+            let mut tensors = [BankTensor {
+                pool: 0,
+                scratch: 0,
+                stored_bytes: 0,
+                slot_bytes: 0,
+            }; 3];
+            for (kind, index) in plans.into_iter().enumerate() {
+                let plan = &mut self.target[index];
+                let [count, rows, columns] = plan.shape[..] else {
+                    return Err(format!("{:?} is not a stack of expert matrices", plan.role));
+                };
+                if count != experts {
+                    return Err(format!("{:?} stacks {count} experts, not {experts}", plan.role));
+                }
+                if plan.host_prepared() || plan.scale.is_some() {
+                    return Err(format!(
+                        "{:?} is transformed on the host; a bank converts stored bytes only",
+                        plan.role
+                    ));
+                }
+                let stored_bytes = representation_bytes(plan.source, &[1, rows, columns])?;
+                // `source_bytes` is the stored range: the weight uploads as
+                // stored.
+                if stored_bytes.checked_mul(experts) != Some(plan.source_bytes) {
+                    return Err(format!(
+                        "{:?} does not store one contiguous range per expert",
+                        plan.role
+                    ));
+                }
+                let slot_bytes = representation_bytes(plan.resident, &[1, rows, columns])?;
+                let pool = match pools.iter().position(|pool| {
+                    pool.kind == kind && pool.source == plan.source && pool.matrix == [rows, columns]
+                }) {
+                    Some(pool) => pool,
+                    None => {
+                        pools.push(StagingPoolPlan {
+                            kind,
+                            source: plan.source,
+                            matrix: [rows, columns],
+                            record_bytes: stored_bytes,
+                        });
+                        pools.len() - 1
+                    }
+                };
+                let scratch_index = match scratch.iter().position(|region| {
+                    region.kind == kind
+                        && region.element == plan.resident
+                        && region.matrix == [rows, columns]
+                }) {
+                    Some(index) => index,
+                    None => {
+                        scratch.push(ScratchPlan {
+                            kind,
+                            element: plan.resident,
+                            matrix: [rows, columns],
+                            slot_bytes,
+                        });
+                        scratch.len() - 1
+                    }
+                };
+                plan.shape[0] = slots;
+                plan.resident_bytes = representation_bytes(plan.resident, &plan.shape)?;
+                // Nothing is uploaded at load.
+                plan.source_bytes = 0;
+                tensors[kind] = BankTensor {
+                    pool,
+                    scratch: scratch_index,
+                    stored_bytes,
+                    slot_bytes,
+                };
+            }
+            bank_layers.push(BankLayer {
+                scope,
+                tensors,
+                resident,
+            });
+        }
+        self.bank = Some(ExpertBankPlan {
+            shared: None,
+            slots,
+            experts,
+            selected,
+            staging_records: ExpertBankPlan::staging_records_for(selected),
+            layers: bank_layers,
+            pools,
+            scratch,
+        });
+        Ok(self)
+    }
+
+    /// Stream the routed experts through a shared bank of `slots` records
+    /// per layer, grouped by resident encoding. Weight ports keep their
+    /// numerical geometry; physical allocation is charged by group.
+    pub(crate) fn with_shared_expert_bank(self, slots: u64, selected: u64)
+        -> Result<Self, String> {
+        let load = self.with_expert_bank(slots, selected)?;
+        let shared = crate::streaming::shared_bank::SharedBankPlan::from_bank(
+            load.bank.as_ref().expect("formed expert bank"))?;
+        let bank = load.bank.as_ref().expect("formed expert bank");
+        let minimum = crate::operators::routed::fused_graph::DECODE_ROWS
+            .checked_mul(selected).ok_or("route union overflow")?.min(bank.experts);
+        let records = shared.groups.iter().map(|g| g.records.max(minimum)).collect::<Vec<_>>();
+        let shared = shared.with_records(bank, &records)?;
+        load.place_shared(shared)
+    }
+    /// Capacity in physical records, once per compatible group. The seed
+    /// per-layer slot count only forms source/staging metadata; it determines
+    /// neither shared admission nor any shared graph/storage extent.
+    #[cfg(test)]
+    pub(crate) fn with_shared_expert_bank_capacity(self, records: &[u64], selected: u64)
+        -> Result<Self, String> {
+        let load = self.with_expert_bank(1, selected)?;
+        let bank = load.bank.as_ref().expect("formed expert bank");
+        let shared = crate::streaming::shared_bank::SharedBankPlan::from_bank(bank)?
+            .with_records(bank, records)?;
+        load.place_shared(shared)
+    }
+    fn place_shared(mut self, shared: crate::streaming::shared_bank::SharedBankPlan)
+        -> Result<Self, String> {
+        let bank = self.bank.as_mut().expect("formed expert bank");
+        bank.shared = Some(shared);
+        let shared = crate::streaming::shared_bank::SharedBankPlan::admitted(bank)?;
+        for weight in &mut self.target {
+            if !bank.holds(weight.role) { continue; }
+            let position = bank.layers.iter().position(|l| l.scope == weight.role.scope)
+                .expect("banked layer");
+            weight.shape[0] = shared.groups[shared.group_of_layer[position]].records;
+            weight.resident_bytes = representation_bytes(weight.resident, &weight.shape)?;
+        }
+        bank.shared = Some(shared);
+        Ok(self)
     }
 
     /// Offer lossless bounded-selection views of the target's output
@@ -1399,8 +1887,17 @@ impl ModelLoadPlan {
 
     /// Preparation may import optional views under its transient budget; final
     /// residency, assessment and ordinary graphs use only `weights()`.
+    /// The weights tuning measures entries on: a bank's weights in their
+    /// resident form, since its entries are tuned as a resident load's.
     pub(crate) fn qualification_weights(&self) -> impl Iterator<Item = &WeightPlan> {
-        self.weights().chain(self.readout_candidates.iter())
+        self.weights()
+            .map(|plan| {
+                self.bank
+                    .as_ref()
+                    .and_then(|bank| bank.resident_plan(plan.role))
+                    .unwrap_or(plan)
+            })
+            .chain(self.readout_candidates.iter())
     }
 
     pub fn weights(&self) -> impl Iterator<Item = &WeightPlan> {
@@ -2291,3 +2788,7 @@ mod representation_byte_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "shared_storage_tests.rs"]
+mod shared_storage_tests;

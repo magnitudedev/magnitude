@@ -736,6 +736,9 @@ struct BlockGraphShape {
     mixes_exit: bool,
     /// Where a separate draft taps the block.
     tapped: TapPositions,
+    /// A streamed routed layer's place among the bank's layers
+    /// (`streaming::layout::block_key`).
+    streaming: Option<String>,
 }
 
 /// A block's draft tap indices (column blocks of the draft input rows): at
@@ -926,6 +929,7 @@ fn block_graph_shapes(
                 mixes_exit: index + 1 == geometry.blocks.len()
                     && matches!(geometry.exit.norm, ExitNorm::HyperConnectionHead(_)),
                 tapped: tapped[index].positions(),
+                streaming: crate::streaming::layout::block_key(load, index)?,
             })
         })
         .collect()
@@ -1411,8 +1415,17 @@ impl PreparedTargetGraphs {
                         // A graph shared by equal-shape blocks names the
                         // roles of the block it was prepared for; each block
                         // binds its own.
-                        let role = block_role(weight.role, index)?;
-                        Ok((port, weight.part.of(resident.sublayers.get(role)?)?))
+                        let role = block_role(weight.role, index + weight.ahead as usize)?;
+                        let tensor = match weight.part {
+                            WeightPart::Bank(part) => resident
+                                .bank
+                                .as_ref()
+                                .ok_or("bank port bound to a resident load")?
+                                .tensors
+                                .part(role.scope, part)?,
+                            part => part.of(resident.sublayers.get(role)?)?,
+                        };
+                        Ok((port, tensor))
                     })
                     .chain(
                         constant_tensors
@@ -1521,6 +1534,7 @@ impl PreparedTargetGraphs {
             embedding,
             stored,
             notice,
+            bank: resident.bank.clone(),
         };
         // A binding that holds another heap than the plan counted is a
         // defect of the plan's accounting: an error in a debug build.
@@ -1636,6 +1650,8 @@ pub(crate) struct BoundTargetGraphs {
     /// Where steps reading selected tokens copy them for the host: present
     /// with a stored table (`EntryNotice`).
     pub notice: Option<SelectionNotice>,
+    /// A streamed load's banks, which its bank-served steps count.
+    pub bank: Option<Arc<crate::streaming::bank::ResidentBank>>,
 }
 
 impl BoundTargetGraphs {
@@ -2177,10 +2193,16 @@ pub(crate) struct PreparedTargetBlockGraph {
 }
 
 /// What a graph's weight port binds of the resident weight of `role`.
+///
+/// A block graph names the roles of the block it was prepared for; a port
+/// `ahead` blocks ahead names a later block's role (a prefetch predictor's
+/// norm, router and directory, spec 4.7), and each block binding the graph
+/// binds the block that far ahead of itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WeightPort {
     pub role: WeightRole,
     pub part: WeightPart,
+    pub ahead: u32,
 }
 
 /// A resident weight's bound parts.
@@ -2195,6 +2217,40 @@ pub(crate) enum WeightPart {
     /// A streamed gathered table's directory of every row's slot
     /// (`WeightPlan::streamed`).
     Directory,
+    /// A streamed load's directory or staging of the routed layer of
+    /// `role`'s scope (spec 4.3), bound like a weight.
+    Bank(BankPart),
+}
+
+/// The streamed-load tensors a routed layer's entries bind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum BankPart {
+    /// The step sequence the device counts (`routed_step`), one per load.
+    Step,
+    /// The host's heartbeat a parked wait watches, one per load.
+    Heartbeat,
+    SlotMap,
+    Stamps,
+    Commits,
+    Control,
+    /// Per choice of the decode rows, the slot, staging records and
+    /// acknowledgement of an absent expert the host placed (`routed_bank_fill`).
+    Placement,
+    /// The layer's hint ring for the predictions it makes `distance` layers
+    /// ahead.
+    Ring { distance: u8 },
+    /// The staging pool the layer's routed tensor `kind` is read into.
+    Staging { kind: u8 },
+    /// The scratch bank of the layer's routed tensor `kind` (spec 4.9).
+    Scratch { kind: u8 },
+    /// The layer's scratch request region.
+    ScratchControl,
+    /// The experts a scratch-served launch routes to, a flag each.
+    ScratchFlags,
+    /// A scratch fill round's convert list of routed tensor `kind`.
+    ScratchList { round: u8, kind: u8 },
+    /// The list of bank slots a scratch fill copies, for tensor `kind`.
+    CopyList { kind: u8 },
 }
 
 impl WeightPart {
@@ -2220,16 +2276,20 @@ impl WeightPart {
                     weight.descriptor().name
                 )
             }),
+            Self::Bank(part) => Err(format!(
+                "streamed-load part {part:?} is bound from the load's banks, not a weight"
+            )),
         }
     }
 }
 
 /// The port of the planned weight of `role`'s `part`.
-fn weight_port<G: GraphDraft>(
+pub(crate) fn weight_port<G: GraphDraft>(
     graph: &mut G,
     load: &ModelLoadPlan,
     role: WeightRole,
     part: WeightPart,
+    ahead: u32,
     ports: &mut Vec<(WeightPort, NativePort)>,
 ) -> Result<NativePort, GraphError> {
     let plan = load
@@ -2254,8 +2314,12 @@ fn weight_port<G: GraphDraft>(
                 );
             }
         },
+        (WeightPart::Bank(part), _) => {
+            let (element, extents) = crate::streaming::layout::bank_port(load, role.scope, part)?;
+            graph.port(element, &extents)
+        }
     }?;
-    ports.push((WeightPort { role, part }, port.clone()));
+    ports.push((WeightPort { role, part, ahead }, port.clone()));
     Ok(port)
 }
 
@@ -2320,7 +2384,7 @@ impl GatheredTable {
             .find(|plan| plan.role == role)
             .ok_or_else(|| format!("missing planned weight {role:?}"))?;
         let rows = plan.shape[0];
-        let table = weight_port(graph, load, role, WeightPart::Values, ports)?
+        let table = weight_port(graph, load, role, WeightPart::Values, 0, ports)?
             .tensor()
             .clone();
         Ok(Self {
@@ -2364,7 +2428,7 @@ impl GatheredTable {
         if let Some(directory) = &self.directory {
             return Ok(directory.clone());
         }
-        let tensor = weight_port(graph, load, self.role, WeightPart::Directory, ports)?
+        let tensor = weight_port(graph, load, self.role, WeightPart::Directory, 0, ports)?
             .tensor()
             .clone();
         Ok(self
@@ -2446,6 +2510,7 @@ pub(crate) fn weight<G: GraphDraft>(
         load,
         WeightRole { scope, kind },
         WeightPart::Values,
+        0,
         ports,
     )
     .map(|port| port.tensor().clone())
@@ -2499,7 +2564,7 @@ impl PackingBound {
         match extent {
             0 => Self::absent(graph, constants),
             _ => Ok(Self {
-                tensor: weight_port(graph, load, role, WeightPart::Bound, ports)?
+                tensor: weight_port(graph, load, role, WeightPart::Bound, 0, ports)?
                     .tensor()
                     .clone(),
                 extent,
@@ -2564,6 +2629,7 @@ pub(crate) fn projection_ports<G: GraphDraft>(
                                 kind: WeightKind::OutputPlane(plane),
                             },
                             WeightPart::Values,
+                            0,
                             ports,
                         )?,
                     ))
@@ -2620,7 +2686,7 @@ pub(crate) fn scaled_weight_ports<G: GraphDraft>(
     constants: &mut Vec<GraphConstant>,
 ) -> Result<(NativePort, NativePort, u64), GraphError> {
     let role = WeightRole { scope, kind };
-    let weight = weight_port(graph, load, role, WeightPart::Values, ports)?;
+    let weight = weight_port(graph, load, role, WeightPart::Values, 0, ports)?;
     let (scale, extent) = weight_scale_port(graph, load, role, ports, constants)?;
     Ok((weight, scale, extent))
 }
@@ -2636,7 +2702,7 @@ pub(crate) fn weight_scale_port<G: GraphDraft>(
     let extent = planned_scale_extent(load, role)?;
     let scale = match extent {
         0 => GraphConstant::absent(graph, constants)?,
-        1 => weight_port(graph, load, role, WeightPart::Scale, ports)?,
+        1 => weight_port(graph, load, role, WeightPart::Scale, 0, ports)?,
         _ => return Err(format!("{role:?} has a per-matrix scale at a per-tensor port").into()),
     };
     Ok((scale, extent))
@@ -2654,7 +2720,7 @@ pub(crate) fn resident_scale<G: GraphDraft>(
     let role = WeightRole { scope, kind };
     match planned_scale_extent(load, role)? {
         0 => Ok(None),
-        _ => weight_port(graph, load, role, WeightPart::Scale, ports)
+        _ => weight_port(graph, load, role, WeightPart::Scale, 0, ports)
             .map(|port| Some(port.tensor().clone())),
     }
 }

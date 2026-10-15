@@ -499,6 +499,7 @@ pub(super) fn derive_program_plan(
     vision: Option<&[WeightPlan]>,
     host_tables: &[HostTablePlan],
     readout_choices: &[super::ReadoutClassChoice],
+    bank: Option<&super::ExpertBankPlan>,
     history: KvCodec,
 ) -> Result<ProgramPlan, PlanError> {
     operators::admit(definition, head.is_some())?;
@@ -509,7 +510,8 @@ pub(super) fn derive_program_plan(
         .iter()
         .chain(head.unwrap_or_default())
         .chain(vision.unwrap_or_default())
-        // A host-placed weight needs no import entry.
+        // A host-placed weight needs no import entry. A bank's weights,
+        // which a load does not import, keep theirs: tuning imports them.
         .filter(|weight| !weight.placed_on_host() && !weight.stored_in_slots())
         .map(ImportProgramSlot::of)
     {
@@ -556,6 +558,15 @@ pub(super) fn derive_program_plan(
                             |scope, kind| planned_scalable(target, scope, kind),
                             active_element,
                         )
+                        .map(|slot| match (slot, bank.and_then(|bank| bank.routed(feed_forward))) {
+                            (crate::FeedForwardProgramSlot::Routed(binding), Some(routed)) => {
+                                crate::FeedForwardProgramSlot::Routed(crate::RoutedBinding {
+                                    bank: Some(routed),
+                                    ..binding
+                                })
+                            }
+                            (slot, _) => slot,
+                        })
                     })
                     .transpose()?,
             )

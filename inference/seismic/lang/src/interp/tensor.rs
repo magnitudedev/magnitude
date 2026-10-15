@@ -143,6 +143,26 @@ impl TensorData {
         }
     }
 
+    /// The encoded bytes of whole trailing matrices `records` of encoded
+    /// storage: each matrix is the encoded bytes of its own `[N, K]` shape,
+    /// consecutive in the storage.
+    pub(super) fn record_bytes(&mut self, records: std::ops::Range<usize>) -> Option<&mut [u8]> {
+        let Self::Encoded {
+            representation,
+            shape,
+            bytes,
+        } = self
+        else {
+            return None;
+        };
+        let matrix = shape.len().checked_sub(2).map(|leading| &shape[leading..])?;
+        let record = encoded_bytes(*representation, matrix).ok()?;
+        if record.checked_mul(element_count(&shape[..shape.len() - 2]).ok()?) != Some(bytes.len()) {
+            return None;
+        }
+        bytes.get_mut(records.start * record..records.end * record)
+    }
+
     pub fn representation(&self) -> RepresentationId {
         match self {
             Self::Dense { representation, .. } | Self::Encoded { representation, .. } => {

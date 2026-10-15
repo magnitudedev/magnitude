@@ -418,6 +418,7 @@ struct ImportProgress {
 /// Sole cache and importer for one planned device. Resident components are
 /// assembled from this store before their numerical programs are bound.
 pub struct ResidencyStore {
+    shared_bank: Option<crate::streaming::shared_bank::SharedBankStore>,
     device: Rc<Device>,
     programs: Rc<crate::native::AttestedPrograms>,
     execution: ExecutionPlan,
@@ -444,7 +445,12 @@ impl ResidencyStore {
                 "attested programs, selected plan, and residency device differ",
             ));
         }
+        let shared_bank = execution.load().expert_bank()
+            .filter(|bank| bank.shared.is_some())
+            .map(crate::streaming::shared_bank::SharedBankStore::new)
+            .transpose().map_err(invalid)?;
         Ok(Self {
+            shared_bank,
             device,
             programs,
             execution,
@@ -463,8 +469,9 @@ impl ResidencyStore {
         key: ResidencyKey,
         weight: ResidentWeight,
     ) -> Result<(), WeightImportError> {
-        let storage_bytes = weight.storage_bytes();
+        let before = self.resident_bytes().map_err(invalid)?;
         self.resident.insert(key, weight);
+        let storage_bytes = self.resident_bytes().map_err(invalid)?.saturating_sub(before);
         if let Some(progress) = &mut self.import_progress {
             // Planned and allocated storage agree; the bound keeps a
             // disagreement from reporting past completion.
@@ -495,11 +502,7 @@ impl ResidencyStore {
     /// share one key and one allocation; a failed component import may leave
     /// a partial set, which this observation still counts exactly.
     pub fn resident_bytes(&self) -> Result<u64, &'static str> {
-        self.resident.values().try_fold(0u64, |bytes, weight| {
-            bytes
-                .checked_add(weight.storage_bytes())
-                .ok_or("resident cache charge overflows")
-        })
+        resident_storage_bytes(self.resident.values())
     }
 
     pub fn mapped_import_report(&self) -> MappedImportReport {
@@ -665,6 +668,11 @@ impl ResidencyStore {
         Ok(Arc::new(table))
     }
 
+    /// The load plan this store imports.
+    pub(crate) fn load_plan(&self) -> &crate::ModelLoadPlan {
+        self.execution.load()
+    }
+
     /// The imported physical view selected for an explicit semantic weight role.
     pub(crate) fn planned(&self, role: WeightRole) -> Option<&WeightPlan> {
         self.execution
@@ -766,6 +774,9 @@ impl ResidencyStore {
         if let Some(weight) = self.streamed(artifact, descriptor)? {
             return Ok(weight);
         }
+        if let Some(weight) = self.empty_bank(artifact, descriptor)? {
+            return Ok(weight);
+        }
         let (key, descriptor, scale, launch, mut program) =
             match self.prepare_gguf(artifact, descriptor, target, None)? {
                 ImportPreparation::Resident(weight) => return Ok(weight),
@@ -792,6 +803,56 @@ impl ResidencyStore {
         };
         self.publish(key, weight.clone())?;
         Ok(weight)
+    }
+
+    /// A bank weight of a streamed load, allocated and left empty: nothing
+    /// is read from the model file at load (rule 5), and a slot is written
+    /// only by a convert of a fetched record.
+    fn empty_bank(
+        &mut self,
+        artifact: &GgufArtifact,
+        descriptor: &WeightDescriptor,
+    ) -> Result<Option<ResidentWeight>, WeightImportError> {
+        let Some(planned) = self
+            .execution
+            .weights()
+            .find(|weight| {
+                weight.component.identity == artifact.identity() && weight.descriptor == *descriptor
+            })
+            .filter(|weight| self.execution.load().banked(weight.role))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let key = ResidencyKey {
+            artifact: artifact.identity(),
+            name: descriptor.name.clone(),
+            transforms: descriptor.transforms.clone(),
+            resident: planned.resident,
+        };
+        if let Some(weight) = self.resident.get(&key) {
+            return Ok(Some(weight.clone()));
+        }
+        let tensor = match &mut self.shared_bank {
+            Some(shared) => shared.bind(&self.device, planned.role)
+                .map_err(WeightImportError::Device)?,
+            None => Tensor::zeros(&self.device, planned.resident, &planned.shape)
+                .map_err(|error| WeightImportError::Device(error.to_string()))?,
+        };
+        if tensor.extents() != planned.shape || tensor.element() != planned.resident {
+            return Err(invalid("expert bank storage differs from its planned weight port"));
+        }
+        // A bank's stacked expert weights have no packing bound
+        // (`packing_bound` is per 2-D weight) and are not gathered tables.
+        let weight = ResidentWeight {
+            descriptor: descriptor.clone(),
+            tensor,
+            scale: None,
+            bound: None,
+            table: ResidentTable::whole(),
+        };
+        self.publish(key, weight.clone())?;
+        Ok(Some(weight))
     }
 
     fn prepare_gguf(
@@ -1005,11 +1066,13 @@ impl ResidencyStore {
         let mut ordered = Vec::new();
         // A host-placed weight takes no import entry (`import_progressive`).
         // Nor is a streamed table imported: its rows reach the device as
-        // steps name them (`stream_table`).
-        for plan in weights
-            .iter()
-            .filter(|plan| !plan.placed_on_host() && plan.streamed.is_none())
-        {
+        // steps name them (`stream_table`). A bank takes none either: it
+        // starts empty (`import_gguf`).
+        for plan in weights.iter().filter(|plan| {
+            !plan.placed_on_host()
+                && plan.streamed.is_none()
+                && !self.execution.load().banked(plan.role)
+        }) {
             if !seen.insert(plan.storage_identity()) {
                 continue;
             }
@@ -1058,6 +1121,10 @@ impl ResidencyStore {
             let mut last = first + 1;
             while last < ordered.len()
                 && Arc::ptr_eq(&source, &ordered[last].source)
+                // Join consecutive source tensors, allowing only the file
+                // format's alignment padding. A span across an excluded
+                // bank/table tensor would fault its pages despite not importing it.
+                && ordered[last].offset.saturating_sub(end) < artifact.directory().alignment
                 && ordered[last].end.saturating_sub(start) <= largest
             {
                 end = end.max(ordered[last].end);
@@ -1511,9 +1578,45 @@ fn validate_dense(stored: &StoredTensor) -> Result<usize, WeightImportError> {
     Ok(count)
 }
 
+fn resident_storage_bytes<'a>(weights: impl IntoIterator<Item = &'a ResidentWeight>)
+    -> Result<u64, &'static str> {
+        let mut seen = HashSet::new();
+        weights.into_iter().flat_map(|weight|
+            std::iter::once(&weight.tensor).chain(weight.scale.iter())
+        ).flat_map(Tensor::storage_observers).try_fold(0u64, |bytes, observation| {
+            if !seen.insert(observation.identity()) { return Ok(bytes); }
+            bytes.checked_add(observation.charged_bytes().unwrap_or(0))
+                .ok_or("resident cache charge overflows")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resident_census_charges_shared_bank_storage_once_across_roles_and_scales() {
+        let device = seismic::DeviceCatalog::discover().unwrap()
+            .open_backend(seismic::BackendName::Cpu).unwrap();
+        // A bank group's components, each bound by the roles of two layers.
+        let components = (0..3)
+            .map(|_| Tensor::zeros(&device, Element::f32(), &[32, 2, 2]).unwrap())
+            .collect::<Vec<_>>();
+        let scale = Tensor::zeros(&device, Element::f32(), &[1]).unwrap();
+        let dense = Tensor::zeros(&device, Element::f32(), &[2]).unwrap();
+        let mut weights = (0..6).map(|role| ResidentWeight {
+            descriptor: WeightDescriptor::stored(format!("role.{role}"), vec![32, 2, 2]),
+            tensor: components[role % 3].clone(), scale: Some(scale.clone()),
+            bound: None, table: ResidentTable::whole(),
+        }).collect::<Vec<_>>();
+        weights.push(ResidentWeight { descriptor: WeightDescriptor::stored("dense", vec![2]),
+            tensor: dense.clone(), scale: None, bound: None, table: ResidentTable::whole() });
+        let expected = components.iter().map(Tensor::storage_bytes).sum::<u64>()
+            + scale.storage_bytes() + dense.storage_bytes();
+        assert_eq!(resident_storage_bytes(&weights).unwrap(), expected);
+        drop(components);
+        assert_eq!(resident_storage_bytes(&weights).unwrap(), expected);
+    }
 
     #[test]
     fn catalog_encoding_map_is_exact() {

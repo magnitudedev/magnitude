@@ -439,6 +439,43 @@ impl<'a> Specializer<'a> {
         self.form(entry, bindings, &specialization)
     }
 
+    /// Prepare an entry at the parameters `resident` was prepared at: an
+    /// entry that must reproduce another's values bit for bit takes its
+    /// arithmetic (and every other) parameter instead of tuning its own.
+    /// `None` during a count or a listing, as for `resident` itself.
+    pub fn pinned<E: Entry>(
+        &mut self,
+        bindings: &str,
+        values: &[(&str, u64)],
+        entry: BoundEntry<E>,
+        resident: Option<&NativeSpecialization>,
+    ) -> Result<Option<NativeKernel<E>>, CatalogFailure> {
+        let implementation = self.implementation::<E>(bindings)?;
+        let fixed = domain_statics(&implementation, E::NAME, bindings, values)?;
+        let specialization = match (&self.mode, resident) {
+            (Mode::CountUntuned(..), _) => return Ok(None),
+            (Mode::Prepare(_), None) => {
+                return Err(failure(
+                    E::NAME,
+                    bindings,
+                    "pinned to an entry that was not prepared".into(),
+                ));
+            }
+            (Mode::Prepare(_), Some(resident)) => {
+                let mut pinned = resident
+                    .params()
+                    .iter()
+                    .fold(fixed, |pinned, (name, value)| pinned.with_param(name.clone(), *value));
+                for ((launch, name), value) in resident.launch_params() {
+                    pinned = pinned.with_launch_param(*launch, name.clone(), *value);
+                }
+                pinned
+            }
+            (Mode::Count | Mode::List(_), _) => fixed,
+        };
+        self.form(entry, bindings, &specialization)
+    }
+
     /// Prepare an entry through its tuning case: static values from the
     /// case, parameters tuned on the device when the implementation declares
     /// any. `None` during a tuning count, which forms nothing, or a listing,

@@ -34,6 +34,8 @@ pub struct EngineOptions {
     pub device: DeviceRequest,
     pub kv_codec: KvCodec,
     pub numerical_profile: Option<NumericalProfile>,
+    /// Bytes every weight of a load may hold (`ModelPolicy::weight_cap`).
+    pub weight_cap: Option<u64>,
     pub budget: std::time::Duration,
     /// Search afresh in the Prepare of the run's first load. Later loads of
     /// the run reuse what it stored, as any later load would.
@@ -104,6 +106,7 @@ pub fn configuration(
             lookahead: load.lookahead,
             exported_logits_rows: load.exported_logits_rows,
             numerical_profile: options.numerical_profile.clone(),
+            weight_cap: options.weight_cap,
         },
         context_tokens: Some(load.context_tokens),
         service: ServiceLimits {

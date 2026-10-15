@@ -1,0 +1,7 @@
+# origin: C11:packed_record_store
+# invoke: q4g64[2,4,128]=rand(32) ; i32[3]=1,1,0 ; q4g64[2,4,128]=bits(33)
+fn probe(bank: &tensor[2, 4, 128] q4g64, list: &tensor[3] i32,
+    scratch: &mut tensor[2, 4, 128] q4g64) -> f32:
+    if list[0] > 0:
+        scratch[list[2], :, :] = bank[list[1], :, :]
+    return f32(scratch[0, 1, 3]) - f32(bank[1, 1, 3])

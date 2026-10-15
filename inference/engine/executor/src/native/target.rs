@@ -18,6 +18,10 @@ use magnitude_kernels::{
     routed_select, routed_up, state_space_chunk, state_space_gate, state_space_step, tap_rows,
 };
 use magnitude_kernels::{short_conv_project, short_conv_rows};
+use magnitude_kernels::{
+    routed_bank_fill, routed_convert_wide, routed_copy, routed_route_streamed, routed_scratch_request,
+    routed_scratch_wait, routed_step,
+};
 use seismic::NativeKernel;
 use std::collections::HashMap;
 
@@ -194,6 +198,31 @@ pub struct RoutedKernels {
     pub group: NativeKernel<routed_group::Entry>,
     pub experts: NativeKernel<routed_experts::Entry>,
     pub combine: NativeKernel<routed_combine::Entry>,
+    /// A streamed layer's bank-served decode entries.
+    pub streamed: Option<StreamedRoutedKernels>,
+}
+
+/// A streamed layer's entries beside the resident ones (spec 4.6, 4.7,
+/// 4.9). Its decode rows run the resident shared-route form's `choices` and
+/// `output` over the bank and the bound slots, so every value is the
+/// resident load's; these entries route with resolve and hints, fill the
+/// absent experts, and fill the scratch banks of larger row classes.
+#[derive(Clone, Debug)]
+pub struct StreamedRoutedKernels {
+    pub step: NativeKernel<routed_step::Entry>,
+    /// The routing with resolve and the hints of the layers ahead, at the
+    /// resident shared route's parameters.
+    pub route: NativeKernel<routed_route_streamed::Entry>,
+    /// The park and conversion of the absent experts into their slots.
+    pub fill: NativeKernel<routed_bank_fill::Entry>,
+    /// The scratch-served classes' fill (spec 4.9): the request, a round's
+    /// park, and the copy of bank slots per routed tensor.
+    pub scratch_request: NativeKernel<routed_scratch_request::Entry>,
+    pub scratch_wait: NativeKernel<routed_scratch_wait::Entry>,
+    pub copy: [NativeKernel<routed_copy::Entry>; 3],
+    /// A round's convert, per routed tensor: every record of the round at
+    /// once.
+    pub convert_wide: [NativeKernel<routed_convert_wide::Entry>; 3],
 }
 
 /// The decode rows' routing and expansions, by the backend's

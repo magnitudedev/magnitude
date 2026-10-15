@@ -2069,6 +2069,7 @@ mod tests {
             readout_candidates: Vec::new(),
             readout_choices: Vec::new(),
             unplaced_output: Vec::new(),
+            bank: None,
         };
         let program = crate::operators::vision::vision_program(&description, &|_| Ok(f32)).unwrap();
         let plan = VisionProgramPlan::new(program.kernels().into_iter().cloned().collect());

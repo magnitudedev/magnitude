@@ -51,6 +51,9 @@ pub enum RequestError {
     TableRead(TableReadError),
     WorkerClosed,
     ModelUnloaded { cause: ModelUnloadCause },
+    /// A streamed load's expert fetch for the request's step failed or
+    /// exceeded its bound (expert-streaming rule 6).
+    ExpertFetch(String),
 }
 
 impl std::fmt::Display for RequestError {
@@ -67,6 +70,7 @@ impl std::fmt::Display for RequestError {
             Self::Invariant(error) => error.fmt(formatter),
             Self::TableRead(error) => error.fmt(formatter),
             Self::WorkerClosed => formatter.write_str("the execution worker closed"),
+            Self::ExpertFetch(reason) => write!(formatter, "expert fetch failed: {reason}"),
             Self::ModelUnloaded {
                 cause: ModelUnloadCause::MemoryPressure,
             } => formatter.write_str("model unloaded due to memory pressure"),

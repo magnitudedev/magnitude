@@ -2161,7 +2161,7 @@ impl<'a> Checker<'a> {
                 return None;
             };
             let storage_root = self.root_var_local(binding_local);
-            self.write(storage_root, binding_local, arg.span)?;
+            self.write(storage_root, binding_local, false, arg.span)?;
         }
 
         // The members that apply at this call: the contract, then every

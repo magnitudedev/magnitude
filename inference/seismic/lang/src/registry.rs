@@ -1180,6 +1180,19 @@ pub fn representation(name: &str) -> Option<RepresentationId> {
 pub fn representation_info(id: RepresentationId) -> &'static RepresentationInfo {
     internals::representation_info(id)
 }
+
+/// Whether storage of `id` is written by whole records: a packed
+/// representation has no canonical logical write, but a whole trailing
+/// matrix (the last two axes) holding a value of the same representation is
+/// its exact encoded bytes, which a store copies.
+pub fn record_writable(id: RepresentationId) -> bool {
+    let info = representation_info(id);
+    info.access == RepresentationAccess::ReadWrite
+        || matches!(
+            info.kind,
+            RepresentationKind::Packed(_) | RepresentationKind::PackedRows(_)
+        )
+}
 pub fn representations() -> &'static [RepresentationInfo] {
     internals::representations()
 }

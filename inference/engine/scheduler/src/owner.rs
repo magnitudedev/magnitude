@@ -406,6 +406,7 @@ fn classify_domain_error(error: DomainError) -> RequestError {
             detail: DomainError::Reclaim.to_string(),
         }),
         DomainError::Input(error) => RequestError::Input(error),
+        DomainError::Streaming(reason) => RequestError::ExpertFetch(reason),
         DomainError::State(error) => RequestError::State(error),
         DomainError::Device(error) | DomainError::Submit(SubmitError::Device(error)) => {
             RequestError::Device(error)

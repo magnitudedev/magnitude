@@ -1974,7 +1974,10 @@ impl AttestedPrograms {
             other => FixtureScope::Other(other),
         };
         let mut scopes = HashMap::<FixtureScope, u64>::new();
-        for weight in load.weights() {
+        // Tuning imports original per-layer resident fixtures. Shared-bank
+        // ports describe persistent global backing and never become these
+        // fixtures; use the same plans as TuningWeightSource::weight_plan.
+        for weight in load.qualification_weights() {
             if weight.role.kind == WeightKind::Embedding {
                 continue;
             }

@@ -34,6 +34,7 @@ pub use programs::{
 pub mod platform;
 mod residency;
 mod resident_weights;
+mod streaming;
 mod resources;
 
 pub use completion::{Completed, Completion, CompletionWake};
@@ -99,13 +100,13 @@ pub use planning::{
     AssessmentMemoryCharge, AssessmentMemoryTerms, AttentionBinding, AttentionShape, BackendPlan,
     CapabilityPlan, ComponentPlan, ComponentSelection, DenseBinding, DenseBranchBinding,
     DenseScales, Dflash2Binding, DraftBlockBinding, DraftProgramPlan, EmbeddingBinding,
-    ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, FeaturesBinding, FeedForwardProgramSlot,
+    ExecutionPlan, ExecutionPlanDraft, ExecutionPlanner, ExpertBankPlan, FeaturesBinding, FeedForwardProgramSlot,
     GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan, ImportProgramSlot,
     MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding, MixerProgramSlot, ModelLoadPlan,
     NGramBinding, NativeGraphCharge, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
     PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead,
     RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity, ResourceLimits,
-    ResourcePlan, ResourcePlanner, RoutedBinding, ScalableWeight, SealedGraphHostBytes,
+    ResourcePlan, ResourcePlanner, RoutedBank, RoutedBinding, ScalableWeight, SealedGraphHostBytes,
     SelectionBinding, SelectionShape, SelectorBinding, SharedHeadProgramPlan, StartupSlots, StateCapacityPlan, StateProgramPlan,
     StateResourcePlan, StateStorePlan, SublayerTail, TapProgramPlan, TargetBlockProgramSlot,
     TargetProgramPlan, TensorOperations, VisionProgramPlan, WeightPlan, WeightScalePlan,

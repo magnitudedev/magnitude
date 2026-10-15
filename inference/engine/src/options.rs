@@ -110,6 +110,11 @@ pub struct ModelPolicy {
     /// The caller's numerical requirement (α and the allowed deviation
     /// classes); the engine's standard profile when absent.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
+    /// Bytes every weight of the load may hold together (target, drafter and
+    /// vision, with a streamed load's scratch and staging). Below the
+    /// model's weights the load streams its routed experts; a load that does
+    /// not fit the device streams without one.
+    pub weight_cap: Option<u64>,
 }
 
 impl Default for ModelPolicy {
@@ -122,6 +127,7 @@ impl Default for ModelPolicy {
             lookahead: true,
             exported_logits_rows: 0,
             numerical_profile: None,
+            weight_cap: None,
         }
     }
 }
@@ -209,6 +215,8 @@ pub struct ResolvedModelPolicy {
     pub exported_logits_rows: usize,
     /// The caller's profile, checked before device opening.
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
+    /// The weight cap (`ModelPolicy::weight_cap`).
+    pub weight_cap: Option<u64>,
 }
 
 impl ResolvedModelPolicy {
@@ -295,6 +303,7 @@ impl ModelPolicy {
             lookahead: self.lookahead && definition.decoder.entry.per_layer.is_none(),
             exported_logits_rows: self.exported_logits_rows,
             numerical_profile: self.numerical_profile.clone(),
+            weight_cap: self.weight_cap,
         })
     }
 }

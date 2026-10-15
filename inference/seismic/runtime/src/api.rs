@@ -1233,6 +1233,33 @@ pub mod tensor {
             )?;
             Ok(bytes)
         }
+        /// The host address and byte length of this tensor's bytes where its
+        /// device keeps them in memory the host addresses directly (unified
+        /// memory), for protocols in which the host and running device work
+        /// read and write the same words. Unlike every other host access it
+        /// neither waits for submitted device work nor excludes it: ordering
+        /// against the device is the caller's, through the backend's
+        /// cross-agent memory model.
+        pub fn host_window(&self) -> Result<(std::ptr::NonNull<u8>, u64), TensorError> {
+            if self.slabs.is_some() || self.reserved {
+                return Err(TensorError::HostRegion(
+                    "a slab or reserved tensor has no single host window".into(),
+                ));
+            }
+            self.backed()?;
+            let base = self.allocation.storage().host_address().ok_or_else(|| {
+                TensorError::HostRegion("the device does not share this storage with the host".into())
+            })?;
+            let offset = usize::try_from(self.byte_offset)
+                .map_err(|_| TensorError::HostRegion("tensor offset exceeds the host".into()))?;
+            // In bounds: a backed tensor's bytes lie inside its allocation.
+            let address = unsafe { base.as_ptr().add(offset) };
+            Ok((
+                std::ptr::NonNull::new(address).expect("a non-null base plus an offset"),
+                self.byte_len,
+            ))
+        }
+
         pub fn write_from_host(&self, bytes: &[u8]) -> Result<(), TensorError> {
             if let Some(slabs) = &self.slabs {
                 let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -1375,6 +1402,24 @@ pub mod tensor {
             TensorStorageObserver {
                 allocation: Arc::downgrade(&self.allocation),
                 identity: self.allocation.identity(),
+            }
+        }
+        /// Weak observations of every physical allocation this tensor holds,
+        /// including the address table and all retained slab allocations.
+        pub fn storage_observers(&self) -> Vec<TensorStorageObserver> {
+            let mut seen = std::collections::HashSet::new();
+            let mut observations = Vec::new();
+            self.collect_storage_observers(&mut seen, &mut observations);
+            observations
+        }
+        fn collect_storage_observers(&self, seen: &mut std::collections::HashSet<u64>,
+            observations: &mut Vec<TensorStorageObserver>) {
+            let observation = self.observe_storage();
+            if seen.insert(observation.identity()) { observations.push(observation); }
+            if let Some(slabs) = &self.slabs {
+                for region in slabs.regions.iter().flatten() {
+                    region.collect_storage_observers(seen, observations);
+                }
             }
         }
         #[doc(hidden)]

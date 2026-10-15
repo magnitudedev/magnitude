@@ -471,6 +471,9 @@ pub struct ElementUses {
     /// The component additionally requires an interpreted integer code.
     pub integer_code_read: bool,
     pub stored: bool,
+    /// A `&mut` parameter, or a store of whole trailing matrices from values
+    /// of the same element (`registry::record_writable`).
+    pub record_stored: bool,
     pub conversion_source: bool,
     /// `to_owned` of a view selecting part of the packing axis.
     pub partial_copy: bool,
@@ -556,6 +559,7 @@ impl ElementUses {
             ) && registry::decode_recipe(representation, DType::F32).is_some());
         info.decoded.is_float()
             && (!self.stored || (info.access == RepresentationAccess::ReadWrite && dense_float))
+            && (!self.record_stored || registry::record_writable(representation))
             && (!self.decoded_read
                 || (matches!(
                     info.access,

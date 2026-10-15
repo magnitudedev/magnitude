@@ -277,6 +277,10 @@ struct EngineArgs {
     /// Explicitly approved complete numerical computations (JSON).
     #[arg(long, value_name = "FILE")]
     numerical_profile: Option<PathBuf>,
+    /// Bytes every weight of a load may hold; below the model's weights the
+    /// load streams its routed experts.
+    #[arg(long, value_name = "BYTES")]
+    weight_cap: Option<u64>,
     /// Seconds the first load of a model spends tuning.
     #[arg(long, value_name = "SECONDS", default_value_t = STANDARD_TUNING_BUDGET.as_secs_f64())]
     tuning_budget: f64,
@@ -420,6 +424,7 @@ fn engine_options(
                 .parse()
                 .map_err(|error| format!("--kv-codec: {error}"))?,
             numerical_profile,
+            weight_cap: engine.weight_cap,
             budget,
             fresh: Cell::new(engine.fresh_tuning),
             tuning_trace: inputs.run.path(tuning::TRACE),
@@ -653,3 +658,5 @@ fn run(command: Command) -> Result<(), String> {
         }
     }
 }
+
+mod resource_window;

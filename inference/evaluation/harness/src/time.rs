@@ -125,7 +125,7 @@ pub fn run(
                 &histories,
             ));
             eprintln!("magnitude-harness: decode context={context} concurrency={concurrency}");
-            let cell = decode_cell(&mut engine, time, &histories)?;
+            let cell = decode_cell(&mut engine, time, &histories, &renderer.stop_tokens())?;
             eprintln!(
                 "  {:.1} tok/s",
                 cell["tokens_per_second"].as_f64().unwrap_or(f64::NAN)
@@ -292,14 +292,37 @@ fn decode_cell(
     engine: &mut Engine,
     time: &TimeOptions,
     histories: &[&Rendered],
+    stops: &[u32],
 ) -> Result<Value, String> {
+    let selected_tokens = std::cell::RefCell::new(Vec::<Vec<u32>>::new());
     let mut sequences = Vec::with_capacity(histories.len());
     for history in histories {
         let mut sequence = engine.open_sequence()?;
-        engine.prefill(&mut sequence, &engine::tokens(&history.tokens), true)?;
+        // Decode measures a served response: the prompt up to the
+        // assistant's turn, not past the end of a recorded one.
+        let prompt = history
+            .generation_prompt
+            .as_ref()
+            .ok_or("decode timing requires a serving prompt")?;
+        engine.prefill(&mut sequence, &engine::tokens(prompt), true)?;
         sequences.push(sequence);
     }
     let decode = |sequences: &[Sequence]| -> Result<Vec<Operation>, String> {
+        let tokens = sequences
+            .iter()
+            .map(|sequence| {
+                sequence
+                    .selected
+                    .map(|token| token.0)
+                    .ok_or("a decode follows a selection".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if tokens.iter().any(|token| stops.contains(token)) {
+            return Err("the response stopped before the timing window ended".into());
+        }
+        // Operations are built before `Engine::step` begins its measured
+        // interval; the selections are kept in memory, never written.
+        selected_tokens.borrow_mut().push(tokens);
         sequences
             .iter()
             .map(|sequence| {
@@ -329,6 +352,7 @@ fn decode_cell(
         "tokens_per_second": concurrency / (step_ms / MS),
         "samples": samples,
         "detail": detail,
+        "selected_tokens": selected_tokens.into_inner(),
     }))
 }
 
@@ -353,11 +377,14 @@ fn measure(
         // collect would wait for the step queued behind this one.
         let per_step = (!engine.lookahead).then_some(trace);
         let (step, _) = engine.step(operations, &mut refs, per_step)?;
-        selected.borrow_mut().extend(
-            sequences
-                .iter()
-                .flat_map(|sequence| sequence.selected.map_or(u32::MAX, |token| token.0).to_le_bytes()),
-        );
+        selected
+            .borrow_mut()
+            .extend(sequences.iter().flat_map(|sequence| {
+                sequence
+                    .selected
+                    .map_or(u32::MAX, |token| token.0)
+                    .to_le_bytes()
+            }));
         Ok(step)
     };
     let collect = |trace: &SubmissionTrace| trace.collect().map_err(|error| error.to_string());
@@ -366,6 +393,7 @@ fn measure(
         run(engine, sequences, &trace)?;
     }
     collect(&trace)?;
+    let resources_before = crate::resource_window::snapshot(engine.device());
     let mut summaries = Vec::with_capacity(time.steps);
     let mut previous = None;
     let mut submissions = Vec::new();
@@ -392,6 +420,7 @@ fn measure(
         }
         submissions.extend(step.submissions);
     }
+    let resources_after = crate::resource_window::snapshot(engine.device());
     submissions.extend(collect(&trace)?);
     drop(trace);
     let attributed = if time.attribution_steps == 0 {
@@ -420,6 +449,8 @@ fn measure(
     let mut window = window(time.steps - 1, span, &submissions);
     window["process_cpu_ms_per_step"] = json!((cpu.1 - cpu.0) * MS / (time.steps - 1) as f64);
     Ok(json!({
+        "resources_before": resources_before,
+        "resources_after": resources_after,
         "warm_steps": time.warm,
         "lookahead": engine.lookahead,
         "median_ms": median(&mut wall),

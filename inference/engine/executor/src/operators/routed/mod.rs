@@ -321,6 +321,7 @@ pub(super) fn fused_binding(
         shared_up: lookup(WeightKind::SharedUp)?,
         shared_down: lookup(WeightKind::SharedDown)?,
         activation,
+        bank: None,
     })
 }
 

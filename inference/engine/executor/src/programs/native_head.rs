@@ -411,6 +411,7 @@ fn planned_weight<G: GraphDraft>(
         WeightPort {
             role,
             part: WeightPart::Values,
+            ahead: 0,
         },
         port,
     ));
@@ -952,6 +953,8 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                         group: entries.group,
                         experts: entries.experts,
                         combine: entries.combine,
+                        // Head blocks are resident.
+                        streamed: None,
                     },
                     load,
                     feed_forward_scope,

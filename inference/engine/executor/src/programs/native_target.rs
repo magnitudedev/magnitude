@@ -259,6 +259,8 @@ pub struct TargetOutput {
     pub selected_rows: Option<SelectedRead>,
     /// The step's reads of stored tables (`StoredTable`).
     pub stored_reads: Vec<StoredRead>,
+    /// A bank-served step of a streamed load (spec 4.5).
+    pub(crate) bank_step: Option<crate::streaming::bank::BankStep>,
 }
 
 impl TargetOutput {
@@ -1638,10 +1640,14 @@ impl TargetProgram for NativeTargetProgram {
         &mut self,
         mut launch: ValidatedTargetLaunch,
     ) -> Result<Self::Submission, (SubmitError, ValidatedTargetLaunch)> {
+        let bank_step;
         let queued = {
             let (core, graph_workspace, graph_outputs, readout_workspace, readout_output) =
                 launch.submission_parts_mut();
             let batch = core.batch().upload();
+            // Every step of a streamed load is bank-served or scratch-served
+            // (spec 4.5); the watcher serves its requests by sequence.
+            bank_step = self.graphs.bank.as_ref().map(|bank| bank.begin_step());
             self.queue_rows(
                 &batch,
                 &RowState(core),
@@ -1671,6 +1677,7 @@ impl TargetProgram for NativeTargetProgram {
                 commits: queued.commits,
                 selected_rows: queued.selected_rows,
                 stored_reads: queued.stored_reads,
+                bank_step,
             },
         ))
     }

@@ -1,4 +1,4 @@
-use magnitude_kernels::{import_dense, repack_weight};
+use magnitude_kernels::{import_dense, repack_weight, routed_convert_wide};
 
 fn dense_bytes(name: &str, values: &[f32]) -> Vec<u8> {
     match name {
@@ -676,6 +676,94 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
                     "{label}"
                 );
             }
+        }
+    }
+}
+
+/// Expert streaming's convert (spec 10 test 7): listed staging records land in
+/// their bank slots as exactly the bytes a resident import places for that
+/// matrix, for every format and Metal layout; unlisted slots are untouched.
+#[test]
+fn metal_convert_places_what_the_import_places() {
+    let Some(device) = device(seismic::BackendName::Metal) else {
+        return;
+    };
+    let words = |values: &[i32]| values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+    let i32s = |values: &[i32]| {
+        seismic::Tensor::from_host(&device, seismic::Element::i32(), &[values.len() as u64], &words(values))
+            .unwrap()
+    };
+    let step = i32s(&[7]);
+    for (source_name, resident) in FORMATS {
+        let source_element = seismic::Element::named(source_name).unwrap();
+        let group = source_element.logical_group().unwrap();
+        let (records, slots, n, k) = (3u64, 4u64, 17u64, 3 * group);
+        let shape = [records, n, k];
+        let length = source_element.canonical_byte_len(&shape).unwrap();
+        let bytes = source_bytes(length, n as u32 + 7);
+        let staging = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
+        let record = (length / records) as usize;
+        for layout in [
+            seismic::Layout::Packet,
+            seismic::Layout::Rows16,
+            seismic::Layout::Rows32,
+            seismic::Layout::Mma16,
+        ] {
+            let Some(destination) = seismic::Element::stored(resident, layout) else {
+                continue;
+            };
+            let Ok(slot_bytes) = destination.canonical_byte_len(&[1, n, k]) else {
+                continue;
+            };
+            let slot_bytes = slot_bytes as usize;
+            let sentinel = vec![0xa5u8; slot_bytes * slots as usize];
+            let mut bank =
+                seismic::Tensor::from_host(&device, destination, &[slots, n, k], &sentinel).unwrap();
+            // Record 2 into slot 0, record 0 into slot 3 for step 7; slots 1
+            // and 2 stay. The same list stamped for step 6 converts nothing.
+            let convert = routed_convert_wide::native_for_device_with(
+                &device,
+                routed_convert_wide::Elements {
+                    E: source_element,
+                    U: destination,
+                },
+                &seismic::NativeSpecialization::new(),
+            )
+            .unwrap();
+            for stamp in [6, 7] {
+                let mut list = vec![0i32; 2 + 2 * records as usize];
+                list[..6].copy_from_slice(&[stamp, 2, 2, 0, 0, 3]);
+                let list = i32s(&list);
+                convert
+                    .call(routed_convert_wide::Args {
+                        source: &staging,
+                        list: &list,
+                        step: &step,
+                        destination: &mut bank,
+                    })
+                    .unwrap();
+                if stamp == 6 {
+                    assert!(
+                        bank.read_to_host().unwrap().iter().all(|&b| b == 0xa5),
+                        "a list stamped for another step converted"
+                    );
+                }
+            }
+            let actual = bank.read_to_host().unwrap();
+            let imported = |index: usize| {
+                destination
+                    .repack_host(
+                        source_element,
+                        &[1, n, k],
+                        &bytes[index * record..(index + 1) * record],
+                    )
+                    .unwrap()
+            };
+            let slot = |index: usize| &actual[index * slot_bytes..(index + 1) * slot_bytes];
+            let label = format!("{source_name} -> {}", destination.name());
+            assert_eq!(slot(0), imported(2).as_slice(), "{label}: slot 0");
+            assert_eq!(slot(3), imported(0).as_slice(), "{label}: slot 3");
+            assert!(slot(1).iter().chain(slot(2)).all(|&b| b == 0xa5), "{label}: unlisted slots");
         }
     }
 }

@@ -159,6 +159,15 @@ impl ReadoutRecipe {
             .with_static("P", self.low_planes)
     }
 
+    /// The refine and exact rows' statics: they read selected candidates,
+    /// not the input form, so take no `PT`/`NM`.
+    fn candidate_statics(self) -> NativeSpecialization {
+        NativeSpecialization::new()
+            .with_static("V", self.vocabulary)
+            .with_static("D", self.hidden)
+            .with_static("P", self.low_planes)
+    }
+
     /// `readout_features_rows`' statics over this recipe's input form.
     fn feature_statics(self) -> NativeSpecialization {
         NativeSpecialization::new()
@@ -188,6 +197,7 @@ impl ReadoutRecipe {
     /// Form the recipe's four programs, to the end.
     fn form(self, device: &seismic::Device) -> Result<QualifiedRecipe, CatalogFailure> {
         let spec = self.statics();
+        let candidates = self.candidate_statics();
         let top = readout_top_rows::native_for_device_with(
             device,
             readout_top_rows::Elements {
@@ -200,13 +210,13 @@ impl ReadoutRecipe {
         let refine = readout_refine_rows::native_for_device_with(
             device,
             readout_refine_rows::Elements { A: self.activation },
-            &declared_defaults::<readout_refine_rows::Entry>(device, &spec)?,
+            &declared_defaults::<readout_refine_rows::Entry>(device, &candidates)?,
         )
         .map_err(fail)?;
         let exact = readout_exact_rows::native_for_device_with(
             device,
             readout_exact_rows::Elements { A: self.activation },
-            &declared_defaults::<readout_exact_rows::Entry>(device, &spec)?,
+            &declared_defaults::<readout_exact_rows::Entry>(device, &candidates)?,
         )
         .map_err(fail)?;
         let planes = readout_planes_rows::native_for_device_with(

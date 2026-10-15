@@ -299,6 +299,16 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// The tokenizer's stop tokens.
+    pub fn stop_tokens(&self) -> Vec<u32> {
+        self.host
+            .tokenizer()
+            .stop_tokens()
+            .iter()
+            .map(|token| token.0)
+            .collect()
+    }
+
     /// Render `fixture`, sized to `context` tokens when given.
     pub fn render(&self, fixture: &Fixture, context: Option<usize>) -> Result<Rendered, String> {
         let failed = |error: String| format!("fixture {}: {error}", fixture.id);

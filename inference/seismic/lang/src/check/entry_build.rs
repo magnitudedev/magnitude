@@ -2090,8 +2090,7 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
         let mut ty = ty;
         if let SemanticType::Tensor(tensor) = &mut ty {
             if leaf_access == ParameterAccess::Mutable
-                && crate::registry::representation_info(tensor.representation).access
-                    != crate::registry::RepresentationAccess::ReadWrite
+                && !crate::registry::record_writable(tensor.representation)
             {
                 return Err(SourceDiagnostic::new(
                     &self.module.sources.files()[self.definition.file],
@@ -3240,15 +3239,33 @@ impl<'a, 'm> FunctionLowering<'a, 'm> {
                     participants
                 });
                 if let SemanticType::Tensor(tensor) = &self.values[base.index()].ty {
+                    // Packed storage is written only by whole trailing
+                    // matrices of the same representation (the checker
+                    // types the value as the selection).
+                    let leading = tensor.axes.len().saturating_sub(2);
+                    let whole_records = tensor.axes.len() >= 2
+                        && (0..tensor.axes.len()).all(|axis| match indices.get(axis) {
+                            Some(ir::Index::Point { .. }) => axis < leading,
+                            Some(ir::Index::Range {
+                                start: None,
+                                end: None,
+                                ..
+                            })
+                            | Some(ir::Index::Full)
+                            | None => axis >= leading,
+                            Some(ir::Index::Range { .. }) => false,
+                        });
                     if crate::registry::representation_info(tensor.representation).access
                         != crate::registry::RepresentationAccess::ReadWrite
+                        && !(whole_records
+                            && crate::registry::record_writable(tensor.representation))
                     {
                         return Err(SourceDiagnostic::new(
                             &self.module.sources.files()[self.definition.file],
                             span,
                             crate::checked::DiagnosticRule::Type,
                             format!(
-                                "representation `{}` is decode-only and has no canonical write contract",
+                                "representation `{}` is decode-only: it is written only by whole trailing matrices of the same representation",
                                 crate::registry::representation_info(tensor.representation).name
                             ),
                         ));

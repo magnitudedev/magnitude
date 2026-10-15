@@ -570,7 +570,11 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
             boundary,
             selected_rows: _,
             stored_reads: _,
+            bank_step,
         } = output;
+        if let Some(step) = bank_step {
+            step.complete().map_err(DomainError::Streaming)?;
+        }
         let batch = core.batch();
         if batch.actual_slots() != flight.requests.len() {
             return Err("completed target slot count differs from submitted requests".into());

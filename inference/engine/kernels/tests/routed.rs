@@ -2,8 +2,9 @@
 //! contract; native implementations are checked against them.
 
 use magnitude_kernels::{
-    routed_combine, routed_down, routed_expand, routed_experts, routed_gate_up, routed_group,
-    routed_output, routed_route, routed_route_shared,
+    routed_bank_fill, routed_combine, routed_copy, routed_down, routed_expand, routed_experts,
+    routed_gate_up, routed_group, routed_output, routed_route, routed_route_shared,
+    routed_route_streamed,
 };
 use seismic_lang::{
     checked::{CheckedModule, SourceFile, check_source},
@@ -3050,6 +3051,261 @@ fn native_35b_geometry_chain_matches_reference_on(device: &seismic::Device) {
     }
 }
 
+/// Expert streaming's routing (spec 4.6, 4.7): `routed_route_streamed` keeps
+/// every bit of `routed_route_shared` at the same parameters, resolves each
+/// choice through the slot map (stamping the slots read and publishing the
+/// request when a choice is absent), and publishes, for each of the first
+/// `ahead` layers ahead, the predicted experts absent from that layer's map:
+/// `routed_route`'s choices under the layer's own norm and router, once each,
+/// in row then rank order, then the step's sequence.
+#[test]
+fn metal_35b_streamed_route_keeps_every_bit() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let block = Qwen35b::new(&device);
+    let (h, e, k, s) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::SHARED as u64,
+    );
+    let (slots, control_words, ring_words) = (64u64, 4 + 8 * k, 2 + 8 * k);
+    let sequence = 7;
+    let bf16 = seismic::Element::bf16();
+    let q8 = element(&device, "q8g32s");
+    let norm = bf16_tensor(&device, &[h], &block.norm);
+    let router = bf16_tensor(&device, &[e, h], &block.router);
+    let shared_router = f32_tensor(&device, &[h], &block.shared_router);
+    // The layers ahead: this layer's router rows moved to other experts, and
+    // the norm reversed.
+    let ahead_weights = |shift: usize| {
+        let (h, e) = (h as usize, e as usize);
+        let mut moved = vec![0.0; e * h];
+        for expert in 0..e {
+            let from = (expert * 7 + shift) % e;
+            moved[expert * h..(expert + 1) * h].copy_from_slice(&block.router[from * h..(from + 1) * h]);
+        }
+        let reversed = block.norm.iter().rev().copied().collect::<Vec<_>>();
+        (reversed, moved)
+    };
+    let (near_norm_values, near_router_values) = ahead_weights(3);
+    let (far_norm_values, far_router_values) = ahead_weights(11);
+    let near_norm = bf16_tensor(&device, &[h], &near_norm_values);
+    let near_router = bf16_tensor(&device, &[e, h], &near_router_values);
+    let far_norm = bf16_tensor(&device, &[h], &far_norm_values);
+    let far_router = bf16_tensor(&device, &[e, h], &far_router_values);
+    // Every other used expert resident here; a few experts resident in
+    // the layers ahead.
+    let used = block
+        .slot
+        .iter()
+        .enumerate()
+        .filter_map(|(expert, slot)| slot.map(|_| expert))
+        .collect::<Vec<_>>();
+    let mut slot_map = vec![-1i32; e as usize];
+    for (index, &expert) in used.iter().enumerate().step_by(2) {
+        slot_map[expert] = slots as i32 - 1 - 3 * index as i32;
+    }
+    let ahead_map = (0..e as i32).map(|expert| if expert % 3 == 0 { expert % 64 } else { -1 }).collect::<Vec<_>>();
+    let slot_map_tensor = i32_tensor(&device, &[e], &slot_map);
+    let ahead_map_tensor = i32_tensor(&device, &[e], &ahead_map);
+    let step = i32_tensor(&device, &[1], &[sequence]);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    // `routed_route`'s choices under `norm` and `router`, in rank order per
+    // row (rank r sits at slot K - 1 - r).
+    let predicted = |residual: &seismic::Tensor, m: u64, norm: &seismic::Tensor, router: &seismic::Tensor| {
+        let mut routes = i32_tensor(&device, &[m, k], &vec![-7; (m * k) as usize]);
+        let mut scores = f32_tensor(&device, &[m, k], &vec![-7.0; (m * k) as usize]);
+        routed_route::native_for_device_with(
+            &device,
+            routed_route::Elements {
+                NW: bf16,
+                RW: bf16,
+                A: bf16,
+            },
+            &specialization_on(
+                &device,
+                &route_statics(&[("H", h), ("E", e), ("K", k)], h),
+                &route_mapping(&device, 8, route_splits(&device)[0]),
+            ),
+        )
+        .unwrap()
+        .call(routed_route::Args {
+            residual,
+            norm,
+            router,
+            shared_router: &shared_router,
+            routes: &mut routes,
+            scores: &mut scores,
+            eps: 1e-6,
+            normalize: 1,
+        })
+        .unwrap();
+        read_i32(&routes)
+            .chunks(k as usize)
+            .flat_map(|row| row.iter().rev().copied().collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let ring_of = |choices: &[i32]| {
+        let mut ring = vec![0i32; ring_words as usize];
+        let mut published = Vec::new();
+        for &expert in choices {
+            if ahead_map[expert as usize] < 0 && !published.contains(&expert) {
+                published.push(expert);
+            }
+        }
+        ring[0] = sequence;
+        ring[1] = published.len() as i32;
+        ring[2..2 + published.len()].copy_from_slice(&published);
+        ring
+    };
+    for rows in 1..=8usize {
+        let m = rows as u64;
+        let residual = Qwen35b::residual(rows);
+        let residual_tensor = f32_tensor(&device, &[m, h], &residual);
+        let near_ring_expected = ring_of(&predicted(&residual_tensor, m, &near_norm, &near_router));
+        let far_ring_expected = ring_of(&predicted(&residual_tensor, m, &far_norm, &far_router));
+        for lanes in [32u64, 16] {
+            // Every launch parameter the executor can pin the entry to.
+            for (simdgroups, route_rows) in
+                [8u64, 16, 4, 2].into_iter().flat_map(|simdgroups| [1u64, 2, 4].map(|r| (simdgroups, r)))
+            {
+                let mapping = [("SIMDGROUPS", simdgroups), ("ROWS", route_rows), ("LANES", lanes)];
+                let mut routes = i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
+                let mut scores = f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
+                let shared = routed_route_shared::native_for_device_with(
+                    &device,
+                    routed_route_shared::Elements {
+                        NW: bf16,
+                        RW: bf16,
+                        A: bf16,
+                        SGW: q8,
+                        SUW: q8,
+                    },
+                    &specialize(&route_statics(&[("H", h), ("E", e), ("K", k), ("S", s)], h), &mapping),
+                )
+                .unwrap()
+                .call(routed_route_shared::Args {
+                    residual: &residual_tensor,
+                    norm: &norm,
+                    router: &router,
+                    shared_router: &shared_router,
+                    shared_gate: &block.shared_gate,
+                    shared_up: &block.shared_up,
+                    routes: &mut routes,
+                    scores: &mut scores,
+                    eps: 1e-6,
+                    normalize: 1,
+                })
+                .unwrap();
+                let expected_routes = read_i32(&routes);
+                let expected_scores = bits(&read_f32(&scores));
+                let streamed = routed_route_streamed::native_for_device_with(
+                    &device,
+                    routed_route_streamed::Elements {
+                        NW: bf16,
+                        RW: bf16,
+                        A: bf16,
+                        SGW: q8,
+                        SUW: q8,
+                    },
+                    &specialize(
+                        &route_statics(
+                            &[
+                                ("H", h),
+                                ("E", e),
+                                ("K", k),
+                                ("S", s),
+                                ("BANK", slots),
+                                ("C", control_words),
+                                ("RING", ring_words),
+                            ],
+                            h,
+                        ),
+                        &mapping,
+                    ),
+                )
+                .unwrap();
+                for ahead in 0..=2 {
+                    let label =
+                        format!("rows {rows} SIMDGROUPS {simdgroups} ROWS {route_rows} LANES {lanes} ahead {ahead}");
+                    let mut routes = i32_tensor(&device, &[m, k], &vec![-7; rows * Qwen35b::CHOICES]);
+                    let mut scores = f32_tensor(&device, &[m, k], &vec![-7.0; rows * Qwen35b::CHOICES]);
+                    let mut stamps = i32_tensor(&device, &[slots], &vec![0; slots as usize]);
+                    let mut control = i32_tensor(&device, &[control_words], &vec![0; control_words as usize]);
+                    let mut near_ring = i32_tensor(&device, &[ring_words], &vec![0; ring_words as usize]);
+                    let mut far_ring = i32_tensor(&device, &[ring_words], &vec![0; ring_words as usize]);
+                    let outcome = streamed
+                        .call(routed_route_streamed::Args {
+                            residual: &residual_tensor,
+                            norm: &norm,
+                            router: &router,
+                            shared_router: &shared_router,
+                            shared_gate: &block.shared_gate,
+                            shared_up: &block.shared_up,
+                            routes: &mut routes,
+                            scores: &mut scores,
+                            slot_map: &slot_map_tensor,
+                            stamps: &mut stamps,
+                            step: &step,
+                            control: &mut control,
+                            near_norm: &near_norm,
+                            near_router: &near_router,
+                            near_map: &ahead_map_tensor,
+                            far_norm: &far_norm,
+                            far_router: &far_router,
+                            far_map: &ahead_map_tensor,
+                            near_ring: &mut near_ring,
+                            far_ring: &mut far_ring,
+                            eps: 1e-6,
+                            normalize: 1,
+                            ahead,
+                        })
+                        .unwrap();
+                    assert_eq!(read_i32(&routes), expected_routes, "{label} routes");
+                    assert_eq!(bits(&read_f32(&scores)), expected_scores, "{label} scores");
+                    assert_eq!(bits(&read_bf16(&outcome.r0)), bits(&read_bf16(&shared.r0)), "{label} normalized");
+                    assert_eq!(bits(&read_f32(&outcome.r1)), bits(&read_f32(&shared.r1)), "{label} coefficient");
+                    assert_eq!(bits(&read_bf16(&outcome.r2)), bits(&read_bf16(&shared.r2)), "{label} shared product");
+                    // Resolve.
+                    let expected_slots = expected_routes.iter().map(|&expert| slot_map[expert as usize]).collect::<Vec<_>>();
+                    assert_eq!(read_i32(&outcome.r3), expected_slots, "{label} slots");
+                    let mut expected_stamps = vec![0; slots as usize];
+                    for &slot in expected_slots.iter().filter(|&&slot| slot >= 0) {
+                        expected_stamps[slot as usize] = sequence;
+                    }
+                    assert_eq!(read_i32(&stamps), expected_stamps, "{label} stamps");
+                    let mut expected_control = vec![0; control_words as usize];
+                    if expected_slots.iter().any(|&slot| slot < 0) {
+                        expected_control[0] = sequence;
+                        expected_control[3] = expected_routes.len() as i32;
+                        // An absent choice as its expert, a resident one as
+                        // -1 - expert.
+                        for (choice, (&expert, &slot)) in expected_routes.iter().zip(&expected_slots).enumerate() {
+                            expected_control[4 + choice] = if slot >= 0 { -1 - expert } else { expert };
+                        }
+                    }
+                    assert_eq!(read_i32(&control), expected_control, "{label} request");
+                    // The hints.
+                    let untouched = vec![0; ring_words as usize];
+                    assert_eq!(
+                        read_i32(&near_ring),
+                        if ahead >= 1 { near_ring_expected.clone() } else { untouched.clone() },
+                        "{label} near ring"
+                    );
+                    assert_eq!(
+                        read_i32(&far_ring),
+                        if ahead >= 2 { far_ring_expected.clone() } else { untouched },
+                        "{label} far ring"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Metal's decode form over the 35B geometry: `routed_route_shared` and
 /// `routed_gate_up` (SiLU) keep every bit of `routed_route` and
 /// `routed_expand` for every decode row count and mapping: the routes,
@@ -4368,4 +4624,409 @@ fn host_group(
 /// The inject port of a single residual stream: no columns.
 fn no_inject(device: &seismic::Device, rows: u64) -> seismic::Tensor {
     seismic::Tensor::zeros(device, seismic::Element::f32(), &[rows, 0]).unwrap()
+}
+
+/// Expert streaming's decode (spec 4.6) keeps every bit of the resident
+/// decode form. The routed experts come from GGUF-stored bytes: the resident
+/// load imports them; the streamed one holds some in a bank of fewer slots
+/// in a permuted order (hits at resolve), finds some mapped since resolve
+/// (placed with records of -1), and has `routed_bank_fill` convert the rest
+/// from staging records into the slots the host placed them in. Then the
+/// bank's slots hold the import's bytes, the fill binds every choice's slot,
+/// stamps and commits exactly the converted ones, and the resident
+/// `routed_gate_up` and `routed_output` over the bank and the bound slots
+/// give the resident value, bit for bit.
+#[test]
+fn metal_35b_bank_fill_keeps_every_bit() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let block = Qwen35b::new(&device);
+    let (h, e, k, f, s) = (
+        Qwen35b::HIDDEN as u64,
+        Qwen35b::EXPERTS as u64,
+        Qwen35b::CHOICES as u64,
+        Qwen35b::FEATURES as u64,
+        Qwen35b::SHARED as u64,
+    );
+    let (slots, records) = (64u64, 10 * k);
+    let (control_words, placed) = (4 + 8 * k, 8 * k);
+    let sequence = 3;
+    let bf16 = seismic::Element::bf16();
+    let q8 = element(&device, "q8g32s");
+    // Gate, up and down: GGUF source, resident element, matrix shape.
+    let kinds = [("gguf_q4_k", "q4k", [f, h]), ("gguf_q4_k", "q4k", [f, h]), ("gguf_q5_k", "q5k", [h, f])]
+        .map(|(source, resident, matrix)| {
+            (seismic::Element::named(source).unwrap(), element(&device, resident), matrix)
+        });
+    let used = block
+        .slot
+        .iter()
+        .enumerate()
+        .filter_map(|(expert, slot)| slot.map(|_| expert))
+        .collect::<Vec<_>>();
+    let stale = (0..e as usize).find(|expert| !used.contains(expert)).unwrap();
+    // Each expert's stored bytes and their import, per kind.
+    let stored = kinds
+        .iter()
+        .enumerate()
+        .map(|(kind, (source, _, matrix))| {
+            let bytes = source.canonical_byte_len(&[1, matrix[0], matrix[1]]).unwrap();
+            (0..e as u32)
+                .map(|expert| {
+                    let mut values = vec![0u8; bytes as usize];
+                    for (index, value) in values.iter_mut().enumerate() {
+                        let x = (index as u32)
+                            .wrapping_add(expert * 7919 + kind as u32 * 104_729)
+                            .wrapping_mul(2_654_435_761);
+                        // Small block scales keep the products finite.
+                        *value = ((x >> 13) as u8) & 0x3b;
+                    }
+                    values
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let imports = (0..3)
+        .map(|kind| {
+            let (source, resident, matrix) = kinds[kind];
+            used.iter()
+                .chain(std::iter::once(&stale))
+                .map(|&expert| {
+                    let bytes = resident
+                        .repack_host(source, &[1, matrix[0], matrix[1]], &stored[kind][expert])
+                        .unwrap();
+                    (expert, bytes)
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let import = |kind: usize, expert: usize| &imports[kind][&expert];
+    let slot_bytes = kinds.map(|(_, resident, matrix)| {
+        resident.canonical_byte_len(&[1, matrix[0], matrix[1]]).unwrap() as usize
+    });
+    let resident = (0..3)
+        .map(|kind| {
+            let (_, element, matrix) = kinds[kind];
+            let mut bytes = vec![0u8; slot_bytes[kind] * e as usize];
+            for &expert in &used {
+                bytes[expert * slot_bytes[kind]..(expert + 1) * slot_bytes[kind]]
+                    .copy_from_slice(import(kind, expert));
+            }
+            seismic::Tensor::from_host(&device, element, &[e, matrix[0], matrix[1]], &bytes).unwrap()
+        })
+        .collect::<Vec<_>>();
+    // Used expert i: a hit (i % 3 == 0), mapped since resolve (1) or absent
+    // and staged in record 2 i + 1 (2); its slot 63 - 5 i either way.
+    let slot_of = |index: usize| slots as i32 - 1 - 5 * index as i32;
+    let staging = (0..3)
+        .map(|kind| {
+            let (source, _, matrix) = kinds[kind];
+            let record = stored[kind][0].len();
+            let mut bytes = vec![0u8; record * records as usize];
+            for (index, &expert) in used.iter().enumerate() {
+                let at = (2 * index + 1) * record;
+                bytes[at..at + record].copy_from_slice(&stored[kind][expert]);
+            }
+            seismic::Tensor::from_host(&device, source, &[records, matrix[0], matrix[1]], &bytes).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let step = i32_tensor(&device, &[1], &[sequence]);
+    let heartbeat = i32_tensor(&device, &[1], &[0]);
+    let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    // The resident entries at the 35B target's pinned parameters, which
+    // the streamed layer runs over its bank.
+    let gate_up = routed_gate_up::native_for_device_with(
+        &device,
+        routed_gate_up::Elements {
+            A: bf16,
+            EGW: kinds[0].1,
+            EUW: kinds[1].1,
+        },
+        &decode_specialization::<routed_gate_up::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f)],
+            &[("SIMDGROUPS", 2), ("ROWS", 1), ("LANES", 32)],
+        ),
+    )
+    .unwrap();
+    let output = routed_output::native_for_device_with(
+        &device,
+        routed_output::Elements {
+            A: bf16,
+            EDW: kinds[2].1,
+            SDW: q8,
+        },
+        &decode_specialization::<routed_output::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("S", s)],
+            &[("ROWS", 2), ("LANES", 16)],
+        ),
+    )
+    .unwrap();
+    let expand = routed_expand::native_for_device_with(
+        &device,
+        routed_expand::Elements {
+            A: bf16,
+            EGW: kinds[0].1,
+            EUW: kinds[1].1,
+            SGW: q8,
+            SUW: q8,
+        },
+        &decode_specialization::<routed_expand::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("S", s)],
+            &[("SIMDGROUPS", 4), ("ROWS", 2), ("LANES", 32)],
+        ),
+    )
+    .unwrap();
+    let fill = routed_bank_fill::native_for_device_with(
+        &device,
+        routed_bank_fill::Elements {
+            SG: kinds[0].0,
+            SU: kinds[1].0,
+            SD: kinds[2].0,
+            EGW: kinds[0].1,
+            EUW: kinds[1].1,
+            EDW: kinds[2].1,
+        },
+        &decode_specialization::<routed_bank_fill::Entry>(
+            &device,
+            &[("H", h), ("K", k), ("F", f), ("T", records), ("C", control_words), ("P", placed)],
+            &[],
+        ),
+    )
+    .unwrap();
+    for rows in 1..=8usize {
+        let m = rows as u64;
+        let residual = Qwen35b::residual(rows);
+        let routing = block.route(&device, &residual);
+        let residual_tensor = f32_tensor(&device, &[m, h], &residual);
+        let index_of = |expert: i32| used.iter().position(|&used| used == expert as usize).unwrap();
+        let shared_product = expand
+            .call(routed_expand::Args {
+                normalized: &routing.normalized,
+                routes: &routing.routes,
+                expert_gate: &resident[0],
+                expert_up: &resident[1],
+                shared_gate: &block.shared_gate,
+                shared_up: &block.shared_up,
+            })
+            .unwrap()
+            .r1;
+        let resident_product = gate_up
+            .call(routed_gate_up::Args {
+                normalized: &routing.normalized,
+                routes: &routing.routes,
+                expert_gate: &resident[0],
+                expert_up: &resident[1],
+                activation: 0,
+            })
+            .unwrap()
+            .value;
+        let expected = output
+            .call(routed_output::Args {
+                residual: &residual_tensor,
+                inject: &no_inject(&device, m),
+                expert_product: &resident_product,
+                shared_product: &shared_product,
+                routes: &routing.routes,
+                scores: &routing.scores,
+                coefficient: &routing.coefficient,
+                expert_down: &resident[2],
+                shared_down: &block.shared_down,
+            })
+            .unwrap()
+            .value;
+        for (case, misses) in [("split", true), ("no miss", false)] {
+            let late = |index: usize| misses && index % 3 != 0;
+            let converted = |index: usize| misses && index % 3 == 2;
+            let resolved = routing
+                .routes_values
+                .iter()
+                .map(|&expert| {
+                    let index = index_of(expert);
+                    if late(index) { -1 } else { slot_of(index) }
+                })
+                .collect::<Vec<_>>();
+            let slots_tensor = i32_tensor(&device, &[m, k], &resolved);
+            // The host's placement of each late choice and its
+            // acknowledgement, and the acknowledged request naming every
+            // choice's expert (a hit's as -1 - expert).
+            let mut placement = vec![0i32; 5 * placed as usize];
+            let mut control_values = vec![0i32; control_words as usize];
+            control_values[..4].copy_from_slice(&[sequence, sequence, 0, (m * k) as i32]);
+            for (choice, &expert) in routing.routes_values.iter().enumerate() {
+                let index = index_of(expert);
+                control_values[4 + choice] = if late(index) { expert } else { -1 - expert };
+                if !late(index) {
+                    continue;
+                }
+                placement[choice] = slot_of(index);
+                for kind in 0..3 {
+                    placement[(1 + kind) * placed as usize + choice] =
+                        if converted(index) { 2 * index as i32 + 1 } else { -1 };
+                }
+                placement[4 * placed as usize + choice] = sequence;
+            }
+            let placement = i32_tensor(&device, &[5, placed], &placement);
+            let bound_slots = routing
+                .routes_values
+                .iter()
+                .map(|&expert| slot_of(index_of(expert)))
+                .collect::<Vec<_>>();
+            let mut expected_slot_map = vec![-1i32; e as usize];
+            let mut expected_commits = vec![0i32; slots as usize];
+            for &expert in &routing.routes_values {
+                let index = index_of(expert);
+                if converted(index) {
+                    expected_slot_map[expert as usize] = slot_of(index);
+                    expected_commits[slot_of(index) as usize] = sequence;
+                }
+            }
+            {
+                let label = format!("rows {rows} {case}");
+                // The bank before the step: hits and mapped experts in their
+                // slots, every other slot another expert's (stale) bytes.
+                let mut bank = (0..3)
+                    .map(|kind| {
+                        let (_, element, matrix) = kinds[kind];
+                        let mut bytes = import(kind, stale).repeat(slots as usize);
+                        for (index, &expert) in used.iter().enumerate() {
+                            if !converted(index) {
+                                let at = slot_of(index) as usize * slot_bytes[kind];
+                                bytes[at..at + slot_bytes[kind]].copy_from_slice(import(kind, expert));
+                            }
+                        }
+                        seismic::Tensor::from_host(&device, element, &[slots, matrix[0], matrix[1]], &bytes)
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let mut stamps = i32_tensor(&device, &[slots], &vec![0; slots as usize]);
+                let mut control = i32_tensor(&device, &[control_words], &control_values);
+                let mut slot_map = i32_tensor(&device, &[e], &vec![-1; e as usize]);
+                let mut commits = i32_tensor(&device, &[slots], &vec![0; slots as usize]);
+                let [bank_gate, bank_up, bank_down] = &mut bank[..] else {
+                    unreachable!()
+                };
+                let bound = fill
+                    .call(routed_bank_fill::Args {
+                        slots: &slots_tensor,
+                        stamps: &mut stamps,
+                        step: &step,
+                        control: &mut control,
+                        placement: &placement,
+                        heartbeat: &heartbeat,
+                        staged_gate: &staging[0],
+                        staged_up: &staging[1],
+                        staged_down: &staging[2],
+                        expert_gate: bank_gate,
+                        expert_up: bank_up,
+                        expert_down: bank_down,
+                        slot_map: &mut slot_map,
+                        commits: &mut commits,
+                    })
+                    .unwrap()
+                    .value;
+                assert_eq!(read_i32(&bound), bound_slots, "{label}: bound slots");
+                for kind in 0..3 {
+                    let bytes = bank[kind].read_to_host().unwrap();
+                    for &expert in &routing.routes_values {
+                        let slot = slot_of(index_of(expert)) as usize;
+                        assert!(
+                            bytes[slot * slot_bytes[kind]..(slot + 1) * slot_bytes[kind]]
+                                == import(kind, expert as usize)[..],
+                            "{label}: expert {expert} kind {kind}"
+                        );
+                    }
+                }
+                let mut expected_stamps = vec![0i32; slots as usize];
+                for (slot, _) in expected_commits.iter().enumerate().filter(|(_, &c)| c != 0) {
+                    expected_stamps[slot] = sequence;
+                }
+                assert_eq!(read_i32(&stamps), expected_stamps, "{label}: stamps");
+                assert_eq!(read_i32(&slot_map), expected_slot_map, "{label}: slot map");
+                assert_eq!(read_i32(&commits), expected_commits, "{label}: commits");
+                let product = gate_up
+                    .call(routed_gate_up::Args {
+                        normalized: &routing.normalized,
+                        routes: &bound,
+                        expert_gate: &bank[0],
+                        expert_up: &bank[1],
+                        activation: 0,
+                    })
+                    .unwrap()
+                    .value;
+                let value = output
+                    .call(routed_output::Args {
+                        residual: &residual_tensor,
+                        inject: &no_inject(&device, m),
+                        expert_product: &product,
+                        shared_product: &shared_product,
+                        routes: &bound,
+                        scores: &routing.scores,
+                        coefficient: &routing.coefficient,
+                        expert_down: &bank[2],
+                        shared_down: &block.shared_down,
+                    })
+                    .unwrap()
+                    .value;
+                assert_eq!(
+                    bits(&read_f32(&value)),
+                    bits(&read_f32(&expected)),
+                    "{label}: the streamed decode differs from the resident one"
+                );
+            }
+        }
+    }
+}
+
+/// A streamed prefill's scratch copy (spec 4.9) places each listed bank slot
+/// in its scratch slot byte for byte, for every routed element and matrix
+/// geometry the 35B target streams.
+#[test]
+fn metal_copy_places_bank_records_exactly() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let (experts, records) = (256u64, 112u64);
+    for (representation, matrix) in [("q4k", [512u64, 2048]), ("q5k", [2048, 512]), ("q6k", [2048, 512])] {
+        let element = element(&device, representation);
+        let record = element.canonical_byte_len(&[1, matrix[0], matrix[1]]).unwrap() as usize;
+        // Distinct bytes in every bank slot.
+        let bytes = (0..record * records as usize)
+            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 7) as u8)
+            .collect::<Vec<_>>();
+        let bank = seismic::Tensor::from_host(&device, element, &[records, matrix[0], matrix[1]], &bytes).unwrap();
+        // Bank slots to scratch slots in permuted order.
+        let pairs = (0..40u64).map(|i| ((i * 37) % records, (i * 101 + 3) % experts)).collect::<Vec<_>>();
+        let mut list = vec![1i32, pairs.len() as i32];
+        for (slot, destination) in &pairs {
+            list.push(*slot as i32);
+            list.push(*destination as i32);
+        }
+        list.resize((2 + 2 * experts) as usize, 0);
+        let list = i32_tensor(&device, &[2 + 2 * experts], &list);
+        let step = i32_tensor(&device, &[1], &[1]);
+        let mut scratch = seismic::Tensor::zeros(&device, element, &[experts, matrix[0], matrix[1]]).unwrap();
+        routed_copy::native_for_device_with(&device, routed_copy::Elements { U: element }, &specialize(&[], &[]))
+            .unwrap()
+            .call(routed_copy::Args {
+                bank: &bank,
+                list: &list,
+                step: &step,
+                scratch: &mut scratch,
+            })
+            .unwrap();
+        let copied = scratch.read_to_host().unwrap();
+        for (slot, destination) in pairs {
+            let (slot, destination) = (slot as usize, destination as usize);
+            assert!(
+                copied[destination * record..(destination + 1) * record] == bytes[slot * record..(slot + 1) * record],
+                "{representation}: bank slot {slot} differs in scratch slot {destination}"
+            );
+        }
+    }
 }
