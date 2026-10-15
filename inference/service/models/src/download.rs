@@ -1491,6 +1491,14 @@ fn package_download_key(package: &ModelPackage) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The download's partial file and integrity checkpoint beside a repository blob; removing the
+/// blob removes them too.
+pub(crate) fn blob_sidecars(blob: &Path) -> Option<[PathBuf; 2]> {
+    let (blobs, key) = (blob.parent()?, blob.file_name()?.to_str()?);
+    let paths = DownloadComponentPaths::new(blobs, key);
+    Some([paths.partial, paths.checkpoint])
+}
+
 pub(crate) fn blob_key(content: &ContentIdentity) -> String {
     match content {
         ContentIdentity::Sha256 { value } => format!("lfs-sha256-{value}"),

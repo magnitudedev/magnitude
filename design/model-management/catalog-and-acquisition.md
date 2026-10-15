@@ -355,6 +355,7 @@ ready outcome. The filesystem observation remains authoritative.
 Deletion plans derive exclusively from current managed files and the addressed package or bundle.
 ICN validates containment, scans every repository snapshot, removes only the addressed package's
 entries, and removes a blob only when no remaining snapshot entry references its proven content identity.
+A removed blob takes its download partial file and integrity checkpoint with it.
 Bytes reclaimed are measured from blobs actually removed. Inventory cannot recreate deleted links
 from catalog declarations or retained blobs.
 

@@ -2200,6 +2200,11 @@ mod tests {
         fs::rename(&source, &blob).unwrap();
         fs::create_dir_all(&snapshot).unwrap();
         fs::hard_link(&blob, snapshot.join("model.gguf")).unwrap();
+        let checkpoint = blob.with_file_name(format!(
+            "{}.integrity",
+            blob.file_name().unwrap().to_str().unwrap()
+        ));
+        fs::write(&checkpoint, b"{}").unwrap();
 
         let mut config =
             InventoryConfig::with_roots(store, temporary.path().join("cache")).unwrap();
@@ -2228,6 +2233,7 @@ mod tests {
         assert_eq!(removed.freed_bytes, u64::try_from(bytes.len()).unwrap());
         assert!(!blob.exists());
         assert!(!snapshot.join("model.gguf").exists());
+        assert!(!checkpoint.exists(), "the integrity checkpoint goes with its blob");
         assert!(manager.list().await.unwrap().is_empty());
     }
 
