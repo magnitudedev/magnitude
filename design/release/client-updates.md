@@ -31,7 +31,7 @@ must be resolved explicitly; uninstall removes only registration owned by that i
 
 `magnitude update` and `magnitude update check` request a fresh check from the application owner
 and wait (up to two minutes) for it to finish, so they print its result. While a check runs, its
-state supersedes the previous check's offer.
+state supersedes the previous check's offer. A check that fails prints its failure and exits non-zero.
 `magnitude update status` observes current update state without starting the application.
 `magnitude update download` explicitly admits a download of the selected offer. It acknowledges
 admission and directs the caller to status; download completion belongs to the owner. While a
@@ -39,9 +39,10 @@ download is already under way, staging or ready it answers with that state inste
 An offer whose version is held back because it failed here carries the failure (verify, install,
 authorization or startup), so `update status` and Settings say that version failed and is not
 downloaded automatically, rather than presenting it as an ordinary available update.
-`magnitude update install` requires a prepared update. Desktop may stop its model and service to
-install and restart; a running Headless owner refuses an explicit install, because it installs by
-itself when idle.
+`magnitude update install` with nothing downloaded prints the update status (up to date when the
+last check found nothing) and asks no owner to install. Otherwise it requires a prepared update.
+Desktop may stop its model and service to install and restart; a running Headless owner refuses an
+explicit install, because it installs by itself when idle.
 
 No owner installs at startup: Desktop launch and `serve` start normally with a prepared update
 retained, and Desktop offers Restart. A macOS or Linux `serve`, the system service (`magnitude

@@ -32,6 +32,17 @@ describe("headless CLI entrypoint", () => {
     expect(result.stderr).toContain(argument.startsWith("--") ? "unknown option" : "too many arguments")
     expect(result.stdout).toBe("")
   })
+  it.each(["catalog", "models", "connections", "server"])("prints help and succeeds for the %s group without a subcommand", async (group) => {
+    const result = await invoke([group])
+    expect(result.code).toBe(0)
+    expect(result.stdout).toContain(`Usage: magnitude ${group} [options] [command]`)
+    expect(result.stderr).toBe("")
+  })
+  it("still rejects an unknown subcommand of a group", async () => {
+    const result = await invoke(["models", "bogus"])
+    expect(result.code).not.toBe(0)
+    expect(result.stderr).toContain("unknown command 'bogus'")
+  })
   it.each(["", "catalog", "models", "connections", "status", "serve", "docs", "update"])("supports finite help for %s", async (command) => {
     const result = await invoke([...(command ? [command] : []), "--help"])
     expect(result.code).toBe(0)

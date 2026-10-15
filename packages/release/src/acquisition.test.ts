@@ -21,7 +21,8 @@ import {
   installArtifact,
   validateReleaseManifestBytes,
 } from "./acquisition"
-import { NodeArchiveExtractor } from "./archive"
+import { ArchiveExtractor, NodeArchiveExtractor } from "./archive"
+import { ReleaseDiskFullError } from "./errors"
 import { ReleaseArtifactSchema } from "./contracts"
 import type { ArtifactInstallationEvent } from "./installation-progress"
 
@@ -175,6 +176,7 @@ describe("unsigned release acquisition", () => {
           Effect.flip,
         ),
       )
+      if (error._tag !== "ReleaseAcquisitionError") throw new Error(`unexpected ${error._tag}`)
       expect(error.stage).toBe("download")
       expect(error.message).toContain(message)
     } finally {
@@ -263,8 +265,9 @@ describe("unsigned release acquisition", () => {
       expect(await readFile(join(destination, "bin", "magnitude-cli"), "utf8"))
         .toBe("#!/bin/sh\nexit 0\n")
       expect(sequentialRequests).toBe(0)
-      expect(requestedRanges[0]).toBe("bytes=0-0")
-      expect(requestedRanges.slice(1)).toHaveLength(4)
+      expect(requestedRanges[0]).toBe(`bytes=${archiveBytes.byteLength - 4}-${archiveBytes.byteLength - 1}`)
+      expect(requestedRanges[1]).toBe("bytes=0-0")
+      expect(requestedRanges.slice(2)).toHaveLength(4)
       expect(new Set(events.map((event) => event._tag))).toEqual(
         new Set(["Downloading", "Verifying", "Extracting"]),
       )
@@ -280,6 +283,49 @@ describe("unsigned release acquisition", () => {
         (await readdir(join(root, "installations")))
           .filter((entry) => entry.startsWith(".release-")),
       ).toEqual([])
+    } finally {
+      server.stop(true)
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it("reports a disk that fills during extraction with the space the whole installation needs", async () => {
+    const root = await mkdtemp(join(tmpdir(), "magnitude-release-test-"))
+    const expandedBytes = 1_100_000_000
+    const gzip = new Uint8Array([...new Uint8Array(16), 0, 0, 0, 0])
+    new DataView(gzip.buffer).setUint32(16, expandedBytes, true)
+    const installable = Schema.decodeUnknownSync(ReleaseArtifactSchema)({
+      ...Schema.encodeSync(ReleaseArtifactSchema)(artifact),
+      bytes: gzip.byteLength,
+      sha256: sha256(gzip),
+    })
+    const server = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response(gzip),
+    })
+    const fullDisk = Layer.succeed(ArchiveExtractor, ArchiveExtractor.of({
+      extract: (_archive, destination) => Effect.fail(new ReleaseDiskFullError({
+        directory: destination,
+        requiredBytes: Option.none(),
+        availableBytes: Option.none(),
+      })),
+    }))
+    try {
+      const error = await Effect.runPromise(
+        installArtifact(
+          `http://127.0.0.1:${server.port}`,
+          version,
+          installable,
+          join(root, "installations", "digest"),
+        ).pipe(
+          Effect.provide(Layer.merge(AcquisitionLayer, fullDisk)),
+          Effect.flip,
+        ),
+      )
+      if (error._tag !== "ReleaseDiskFullError") throw new Error(`unexpected ${error._tag}: ${error.message}`)
+      expect(error.directory).toBe(join(root, "installations"))
+      expect(error.requiredBytes).toEqual(Option.some(gzip.byteLength + expandedBytes))
     } finally {
       server.stop(true)
       await rm(root, { recursive: true, force: true })

@@ -1,11 +1,11 @@
 import { Command, CommandExecutor, FileSystem } from "@effect/platform"
 import { NodeContext } from "@effect/platform-node"
 import { BrowserWindow, ipcMain, nativeTheme, shell } from "electron"
-import { Deferred, Duration, Effect, Option, Runtime, Schedule, Schema } from "effect"
+import { Deferred, Duration, Effect, Option, Runtime, Schedule, Schema, Stream } from "effect"
 import { join } from "node:path"
 import { slate } from "@magnitudedev/client-common"
 import { MAC_SERVER_PLIST, installedServerCli, isServerProfileActive, requestApplication } from "@magnitudedev/daemon-management/desktop-native"
-import { LINUX_SERVER_REMOVER_PATH } from "@magnitudedev/release/executables"
+import { serverRemovalCommand, serverRemovalFailure } from "./server-removal"
 import { windowChrome } from "./window-chrome"
 
 export const SERVER_ADDRESS = "http://localhost:10100"
@@ -32,25 +32,22 @@ export const isServerRunning = (personalStateDirectory: string) => Effect.gen(fu
   return false
 }).pipe(Effect.orElseSucceed(() => false), Effect.provide(NodeContext.layer))
 
-/**
- * Removes the server; the server keeps its data. On Linux, Polkit admits the person at the machine
- * to the removal wrapper without a password; macOS asks for an administrator.
- */
+/** Removes the server setup; the server keeps its data, and `magnitude server setup` sets it up again. */
 const removeServer = Effect.gen(function* () {
   const cli = installedServerCli(process.platform)
   if (Option.isNone(cli)) return yield* new ServerRemovalFailed({ message: "Server mode isn't available here." })
   const executor = yield* CommandExecutor.CommandExecutor
-  const command = process.platform === "darwin"
-    ? Command.make("/usr/bin/osascript", "-e", `do shell script quoted form of "${cli.value}" & " _server-remove" with administrator privileges`)
-    // Any Polkit prompt, for a session that isn't the active one, comes from the desktop's own authentication agent only.
-    : Command.make("/usr/bin/pkexec", "--disable-internal-agent", LINUX_SERVER_REMOVER_PATH)
-  const code = yield* executor.exitCode(command).pipe(Effect.orElseSucceed(() => -1))
-  if (code !== 0) return yield* new ServerRemovalFailed({ message: "The server was not stopped. Stopping it needs an administrator of this computer: try again as one, or ask one to run `magnitude server remove`." })
+  const { code, stderr } = yield* Effect.scoped(Effect.gen(function* () {
+    const child = yield* executor.start(serverRemovalCommand(process.platform, cli.value))
+    const [code, stderr] = yield* Effect.all([child.exitCode, child.stderr.pipe(Stream.decodeText(), Stream.mkString)], { concurrency: "unbounded" })
+    return { code: Number(code), stderr }
+  })).pipe(Effect.orElseSucceed(() => ({ code: -1, stderr: "" })))
+  if (code !== 0) return yield* new ServerRemovalFailed({ message: serverRemovalFailure(process.platform, code, stderr) })
 }).pipe(Effect.provide(NodeContext.layer))
 
 /**
  * While the server runs, the whole window is this one screen. Keep opens the server in the browser
- * and quits; Stop removes the server, then the app starts. If the server stops, the app continues.
+ * and quits; Remove removes the server setup, keeping its data, then the app starts. If the server stops, the app continues.
  * A quit request (Cmd-Q, logout, SIGTERM) quits, like closing the window.
  */
 export const resolveServerConflict = (options: {

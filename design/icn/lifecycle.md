@@ -273,7 +273,9 @@ native build; `nativeBuild` is the engine build identity (engine version plus ke
 identity). A release installation whose download fails says, in one line and without stack frames,
 that Magnitude couldn't download its inference engine, the HTTP status or failure and the host, and
 what to do for that cause: a release the host doesn't have (HTTP 404 or 410) isn't available for
-download, while a network failure asks to check the connection. ACN's startup failure carries that
+download, while a network failure asks to check the connection. An installation the disk has no
+room for says so instead, naming the data directory, about how much space the engine needs and how
+much is free, and is permanent like a missing release. ACN's startup failure carries that
 line to `serve`, the service log and `server setup`; neither ACN's exit nor its supervisor repeats it
 with stack frames or a copy of output that already reached the log.
 

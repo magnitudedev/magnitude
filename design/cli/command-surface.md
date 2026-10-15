@@ -15,8 +15,8 @@ applies_to:
 ## Scope
 
 The non-interactive CLI is a human-readable, agent-usable projection of Magnitude product state.
-It does not expose transport documents or internal state graphs. Bare `magnitude` prints help and
-exits. Help, version, and documentation do not start the desktop or service. There is no terminal
+It does not expose transport documents or internal state graphs. Bare `magnitude`, or a command group such as `magnitude models` alone, prints help and
+exits successfully. Help, version, and documentation do not start the desktop or service. There is no terminal
 onboarding, chat harness, or hidden hosted-setup mode. All onboarding lives in the desktop
 application. `server setup` registers Magnitude as a system service; it is not onboarding.
 
@@ -47,7 +47,7 @@ plugins call the SDK over RPC instead.
 - `server setup` and `server remove` register and remove the system service on Linux (systemd) and
   macOS (launchd), running as the person and asking for authorization only for their one root step.
   On Windows they explain that server mode isn't available and change nothing.
-- `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance (for the system service where one is set up) and exits successfully without starting anything.
+- `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance (for the system service where one is set up) and exits successfully without starting anything. A set-up server is the owner (`Server`) even while it isn't serving, and while systemd runs its unit before it serves, status says Starting rather than how to start it.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
 - `catalog` reports catalog assessment progress, reviewed model choices,
   machine-specific assessment evidence, recommendations, and download operations.

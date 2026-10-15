@@ -1,11 +1,11 @@
 import { afterEach, expect, it } from "vitest"
 import { BunContext } from "@effect/platform-bun"
-import { Effect } from "effect"
+import { Effect, Option } from "effect"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
-import { hostById, inferenceNvrtcPaths, inferenceRequiredPaths, ReleaseAcquisitionError } from "@magnitudedev/release"
-import { acquisitionError, isCompleteArtifact } from "./release-installation"
+import { hostById, inferenceNvrtcPaths, inferenceRequiredPaths, ReleaseAcquisitionError, ReleaseDiskFullError } from "@magnitudedev/release"
+import { acquisitionError, diskFullError, isCompleteArtifact } from "./release-installation"
 
 let directory: string | undefined
 
@@ -26,6 +26,20 @@ it("says plainly that the inference engine couldn't be downloaded, from where, a
   expect(explain(new ReleaseAcquisitionError({ stage: "download", message: "release request failed", transient: true })).permanent).toBe(false)
   expect(explain(new ReleaseAcquisitionError({ stage: "verify", message: "artifact digest mismatch", transient: false })).message)
     .toBe("artifact digest mismatch")
+})
+
+it("says the disk is full, where, and how much space the engine needs, as a failure a restart cannot fix", () => {
+  const explain = diskFullError("/home/qa/.magnitude")
+  const measured = explain(new ReleaseDiskFullError({
+    directory: "/home/qa/.magnitude/releases/artifacts/0.2.9/linux-x64-gnu",
+    requiredBytes: Option.some(1_449_725_607),
+    availableBytes: Option.some(612_000_000),
+  }))
+  expect(measured.message).toBe("There isn't enough free disk space in /home/qa/.magnitude to install Magnitude's inference engine. "
+    + "It needs about 1.5 GB free, and 612 MB is free. Free up space on that disk, then start Magnitude again.")
+  expect(measured.permanent).toBe(true)
+  expect(explain(new ReleaseDiskFullError({ directory: "/home/qa/.magnitude", requiredBytes: Option.none(), availableBytes: Option.none() })).message)
+    .toBe("There isn't enough free disk space in /home/qa/.magnitude to install Magnitude's inference engine. Free up space on that disk, then start Magnitude again.")
 })
 
 it("requires every bundled NVRTC file before reusing a cached Linux installation", async () => {

@@ -6,7 +6,7 @@ import { connect } from "node:net"
 import { join } from "node:path"
 import { userInfo } from "node:os"
 import { MagnitudeClient } from "@magnitudedev/sdk"
-import { applicationStateDirectory, hasLinuxServerRemnants, installedServerCli, MAC_SERVER_LABEL, requestApplication, TerminalCommand,
+import { applicationStateDirectory, hasForeignServerAccount, hasLinuxServerRemnants, installedServerCli, MAC_SERVER_LABEL, requestApplication, TerminalCommand,
   nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { isServerSetUp } from "./serve-owner"
 import { desktopApplication, desktopDataDirectory, desktopServiceOrigin, turnOffDesktopLoginStartupForServer } from "./application"
@@ -102,6 +102,9 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
       ? Effect.all([isServerSetUp, hasLinuxServerRemnants.pipe(
         Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(CommandExecutor.CommandExecutor, executor), Effect.orElseSucceed(() => false))]).pipe(Effect.map(found => found.some(Boolean)))
       : isServerSetUp,
+    hasForeignAccount: platform === "linux"
+      ? hasForeignServerAccount.pipe(Effect.provideService(FileSystem.FileSystem, fs), Effect.provideService(CommandExecutor.CommandExecutor, executor), Effect.orElseSucceed(() => false))
+      : Effect.succeed(false),
     hasTerminal: Effect.tryPromise(() => open("/dev/tty", "r+").then(tty => tty.close())).pipe(Effect.as(true), Effect.orElseSucceed(() => false)),
     sudoWithoutPrompt: executor.exitCode(Command.make("/usr/bin/sudo", "-n", "true")).pipe(Effect.map(code => code === 0), Effect.orElseSucceed(() => false)),
     confirm: question => askTerminal(question).pipe(Effect.map(answer => /^y(es)?$/i.test(answer))),

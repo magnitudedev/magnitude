@@ -7,8 +7,8 @@ const keep = element<HTMLButtonElement>("keep"), stop = element<HTMLButtonElemen
 
 // Linux keeps the server's data in its own account; macOS serves from the person's own data.
 element<HTMLParagraphElement>("data").textContent = bridge.platform === "linux"
-  ? "Stopping keeps the server's data. The app uses your own models, so models downloaded on the server won't be in it."
-  : "The app uses the same models as the server."
+  ? "Removing the server keeps its data, and `magnitude server setup` sets it up again. The app uses your own models, so models downloaded on the server won't be in it."
+  : "Removing the server keeps its data, and `magnitude server setup` sets it up again. The app uses the same models as the server."
 
 element<HTMLAnchorElement>("address").addEventListener("click", event => {
   event.preventDefault()
@@ -21,7 +21,7 @@ keep.addEventListener("click", () => {
 stop.addEventListener("click", () => {
   keep.disabled = stop.disabled = true
   status.className = ""
-  status.textContent = "Stopping the server…"
+  status.textContent = "Removing the server…"
   void bridge.stop().then(result => {
     if (result.ok) return
     keep.disabled = stop.disabled = false

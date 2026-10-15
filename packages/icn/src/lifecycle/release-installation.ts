@@ -17,6 +17,7 @@ import {
   type HostId,
   NodeArchiveExtractor,
   type ReleaseAcquisitionError,
+  type ReleaseDiskFullError,
   releaseBundleSizes,
   selectArtifact,
   type ReleaseArtifact,
@@ -58,6 +59,31 @@ export const acquisitionError = (baseUrl: string) => (cause: ReleaseAcquisitionE
     : "The release host refused the download. Try again later."
   // The download already retried what was transient; what remains won't change on a restart.
   return installationError("acquire", `Magnitude couldn't download its inference engine (${detail}${host}). ${advice}`, !cause.transient)
+}
+
+/** Space needed rounds up and space free rounds down, so the two never appear to meet when they don't. */
+const formatStorage = (bytes: number, round: (value: number) => number) =>
+  bytes >= 1_000_000_000
+    ? `${round(bytes / 100_000_000) / 10} GB`
+    : `${round(bytes / 1_000_000)} MB`
+
+/**
+ * A full disk is the person's to fix, so it says where Magnitude installs the engine and how much
+ * room that needs. Starting again can't help until space is freed.
+ */
+export const diskFullError = (dataDir: string) => (cause: ReleaseDiskFullError) => {
+  const need = Option.match(cause.requiredBytes, {
+    onNone: () => "",
+    onSome: (required) => ` It needs about ${formatStorage(required, Math.ceil)} free${Option.match(cause.availableBytes, {
+      onNone: () => "",
+      onSome: (available) => `, and ${formatStorage(available, Math.floor)} is free`,
+    })}.`,
+  })
+  return installationError(
+    "acquire",
+    `There isn't enough free disk space in ${dataDir} to install Magnitude's inference engine.${need} Free up space on that disk, then start Magnitude again.`,
+    true
+  )
 }
 
 const executableName = () =>
@@ -147,6 +173,7 @@ export const isCompleteArtifact = (
   })
 
 const ensureArtifact = (
+  dataDir: string,
   baseUrl: string,
   version: string,
   artifact: ReleaseArtifact,
@@ -180,7 +207,9 @@ const ensureArtifact = (
         }),
       }).pipe(
         Effect.provide(NodeArchiveExtractor),
-        Effect.mapError(acquisitionError(baseUrl))
+        Effect.mapError((cause) => cause._tag === "ReleaseDiskFullError"
+          ? diskFullError(dataDir)(cause)
+          : acquisitionError(baseUrl)(cause))
       )
     }
     if (!(yield* isCompleteArtifact(destination, host))) {
@@ -317,7 +346,7 @@ export const resolveReleaseIcnInstallation = (
     const artifactRoot = path.join(releaseRoot, "artifacts", version, host)
     const prepare = Effect.suspend(() =>
       Effect.gen(function* () {
-        const root = yield* ensureArtifact(baseUrl, version, artifact, artifactRoot, host)
+        const root = yield* ensureArtifact(dataDir, baseUrl, version, artifact, artifactRoot, host)
         const native = yield* readIdentity(root, artifact)
         return yield* declareInstallation(root, native)
       })

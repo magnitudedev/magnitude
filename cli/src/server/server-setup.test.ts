@@ -11,6 +11,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     personalOwner: Effect.succeed(Option.none()),
     isSetUp: Effect.succeed(true),
     hasRemnants: Effect.succeed(true),
+    hasForeignAccount: Effect.succeed(false),
     hasTerminal: Effect.succeed(true),
     sudoWithoutPrompt: Effect.succeed(false),
     servicePort: Effect.succeed("Service"),
@@ -42,6 +43,16 @@ describe("magnitude server setup", () => {
     const h = harness({ hasServiceManager: Effect.succeed(false) })
     const result = await h.run(serverSetup)
     expect(Either.isLeft(result) && result.left.message).toContain("magnitude serve")
+    expect(h.events).toEqual([])
+  })
+  it("refuses an existing person's magnitude account before sudo, naming it and what to do, not an administrator problem", async () => {
+    const h = harness({ hasForeignAccount: Effect.succeed(true) })
+    const result = await h.run(serverSetup)
+    const message = Either.isLeft(result) ? result.left.message : ""
+    expect(message).toContain("An account or group named magnitude already exists on this computer")
+    expect(message).toContain("rename or remove that account")
+    expect(message).toContain("nothing was changed")
+    expect(message).not.toMatch(/administrator|sudo refused/)
     expect(h.events).toEqual([])
   })
   it.each([["Desktop", "Quit the Magnitude desktop app"], ["Headless", "Stop `magnitude serve`"]] as const)("refuses while %s runs in the person's profile", async (owner, message) => {

@@ -65,4 +65,9 @@ program.action(async (options) => {
   }
 })
 
-await program.parseAsync()
+// A command group run alone prints its help and succeeds, as `magnitude` alone does. Commander would
+// print it as an error; an action on the group would cost its unknown-command error and `help` subcommand.
+const [first, ...rest] = process.argv.slice(2)
+const group = program.commands.find(command => command.name() === first && command.commands.length > 0)
+if (group !== undefined && rest.length === 0) group.outputHelp()
+else await program.parseAsync()

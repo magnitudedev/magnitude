@@ -139,8 +139,16 @@ export const inspectServerAccounts = Effect.gen(function* () {
   })
 })
 
-const foreignAccount = `An account or group named ${SERVER_USER} already exists, and it isn't the system account Magnitude creates `
-  + `(home ${SERVER_DATA_DIRECTORY}, no login shell). Server setup won't use it. Nothing was changed.`
+const isForeign = (accounts: ServerAccounts) => accounts.user === "Foreign" || accounts.group === "Foreign"
+
+/** Whether an account or group named `magnitude` exists that setup didn't create, which setup never takes over. */
+export const hasForeignServerAccount = inspectServerAccounts.pipe(Effect.map(isForeign))
+
+export const FOREIGN_SERVER_ACCOUNT_MESSAGE = `An account or group named ${SERVER_USER} already exists on this computer, and it isn't the system account `
+  + `Magnitude creates (home ${SERVER_DATA_DIRECTORY}, no login shell). Server setup needs that name for its own account and won't take over `
+  + `an existing one, so nothing was changed. To set up the server, rename or remove that account and its group `
+  + `(for example \`sudo usermod -l <new-name> ${SERVER_USER}\` and \`sudo groupmod -n <new-name> ${SERVER_USER}\`), then run \`magnitude server setup\` again. `
+  + `Otherwise run \`magnitude serve\` to serve as your own account until you stop it.`
 
 const systemctl = "/usr/bin/systemctl"
 const SYSTEMD = "/run/systemd/system"
@@ -194,7 +202,7 @@ export const installLinuxServer = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   if (!(yield* fs.exists(SYSTEMD))) return yield* failed("Server setup needs systemd. Run `magnitude serve` instead.")
   const accounts = yield* inspectServerAccounts
-  if (accounts.user === "Foreign" || accounts.group === "Foreign") return yield* failed(foreignAccount)
+  if (isForeign(accounts)) return yield* failed(FOREIGN_SERVER_ACCOUNT_MESSAGE)
   const hadSudoersRule = yield* fs.exists(SERVER_SUDOERS_PATH)
   const wasEnabled = yield* succeeds(systemctl, "is-enabled", "--quiet", UNIT)
   const undo: Array<Effect.Effect<void, unknown, Services>> = []
