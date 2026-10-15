@@ -15,7 +15,7 @@ const setsid = spawnSync("/bin/sh", ["-c", "command -v setsid"], { encoding: "ut
 const systemTools = ["cat", "chmod", "cp", "cut", "getconf", "id", "kill", "mkdir", "mktemp", "openssl", "python3", "rm", "sha256sum", "sh", "sleep", "timeout", "tr", "uname", "wc"]
 const managers = [
   { manager: "apt-get", package: "deb", receipt: /^update\ninstall\n-y\n-o\nDPkg::Lock::Timeout=300\n.*magnitude\.deb\n$/ },
-  { manager: "pacman", package: "pacman", receipt: /^-U\n--noconfirm\n.*magnitude\.pacman\n$/ },
+  { manager: "pacman", package: "pacman", receipt: /^-Q\nmagnitude-desktop\n-U\n--noconfirm\n.*magnitude\.pacman\n-Q\nmagnitude-desktop\n$/ },
 ] as const
 
 describe.skipIf(process.platform !== "linux").each(managers)("Linux installation shell verification with $manager", ({ manager, package: format, receipt: expected }) => {

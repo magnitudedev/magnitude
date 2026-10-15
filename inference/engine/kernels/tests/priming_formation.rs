@@ -1,4 +1,4 @@
-use seismic::coverage::{CoverageError, RequestFormer};
+use seismic::coverage::{form_requests, InProcess, Progress, Toolchain};
 use seismic::{BackendName, Element, KernelRequest};
 fn request(
     entry: &'static str,
@@ -28,16 +28,8 @@ fn k8v4_planes(width: u64) -> [(&'static str, u64); 4] {
 #[test]
 fn vulkan_priming_abi_forms() {
     let module = magnitude_kernels::module().unwrap();
-    let former = match RequestFormer::open(BackendName::Vulkan) {
-        Ok(former) => former,
-        Err(CoverageError::ToolchainUnavailable(reason))
-            if std::env::var_os("MAGNITUDE_REQUIRE_KERNEL_FORMATION").is_none() =>
-        {
-            eprintln!("skipping focused Vulkan priming ABI formation: {reason}");
-            return;
-        }
-        Err(error) => panic!("Vulkan priming ABI formation did not run: {error}"),
-    };
+    // glslang is linked: Vulkan forms on every host.
+    let toolchain = Toolchain::open(BackendName::Vulkan).expect("Vulkan forms on every host");
     let mut requests = Vec::new();
     // Qwen 4B fixture geometry; cover all normalization/presence branches.
     let (p, s) = (32, 192);
@@ -93,7 +85,13 @@ fn vulkan_priming_abi_forms() {
             ));
         }
     }
-    let results = former.form_all(module, &requests);
+    let results = form_requests(
+        module,
+        &toolchain,
+        &InProcess,
+        &requests,
+        &Progress::default(),
+    );
     for (request, result) in requests.iter().zip(results) {
         eprintln!("{request}: {result:?}");
         assert!(result.is_ok(), "{request}: {result:?}");

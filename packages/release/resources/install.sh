@@ -49,14 +49,28 @@ download() {
 offer() { download "$origin/api/installer?os=$1&arch=$arch&package=$2&offer=1" "$scratch/offer.json" 16384; }
 # Answers come from the terminal, never from the script's piped stdin.
 has_terminal() { (: </dev/tty) 2>/dev/null; }
-# The installed package's version, or nothing when it is not installed.
+# The installed Magnitude version without the package revision, or nothing when it is not installed.
 installed_version() {
   case "$package" in
     deb) version=$(dpkg-query -W -f '${Version}' magnitude-desktop 2>/dev/null) || version='' ;;
     rpm) version=$(rpm -q --qf '%{VERSION}-%{RELEASE}' magnitude-desktop 2>/dev/null) || version='' ;;
     *) version=$(pacman -Q magnitude-desktop 2>/dev/null) && version=${version#* } || version='' ;;
   esac
-  printf '%s' "$version"
+  printf '%s' "${version%-*}"
+}
+# What the package step did, from the versions installed before and after it.
+installed_summary() {
+  if [ -z "$after" ]; then printf '%s\n' 'Magnitude was installed.'
+  elif [ "$after" = "$before" ]; then printf '%s\n' "Magnitude $after is already up to date."
+  elif [ -n "$before" ]; then printf '%s\n' "Magnitude was upgraded from $before to $after."
+  else printf '%s\n' "Magnitude $after was installed."
+  fi
+}
+# Only a machine with a desktop session installed has an applications menu to open Magnitude from.
+desktop_hint() {
+  for sessions in /usr/share/xsessions /usr/share/wayland-sessions; do
+    if [ -n "$(ls -A "$sessions" 2>/dev/null)" ]; then printf '%s\n' 'Open it from your applications menu.'; return 0; fi
+  done
 }
 
 case "$(uname -s)" in
@@ -203,7 +217,7 @@ PY
     fi
     # The scratch directory is private; apt reads the already verified package as its _apt account.
     if [ "$package" = deb ]; then chmod 755 "$scratch"; chmod 644 "$scratch/magnitude.deb"; fi
-    before=''; [ "$answer" != configured ] || before=$(installed_version)
+    before=$(installed_version)
     # A running server holds the installation lock the package checks, so upgrade it stopped.
     if [ "$answer" = configured ] && systemctl is-active --quiet magnitude.service; then
       stopped_server=1
@@ -215,14 +229,12 @@ PY
     fi || fail 'The Magnitude package could not be installed; see the package manager output above.'
     restart=$stopped_server
     stopped_server=''
-    after=''; [ "$answer" != configured ] || after=$(installed_version)
+    after=$(installed_version)
 
     # 4. Set up the server, reusing the sudo session from step 2, or say how to later.
     case "$answer" in
       configured)
-        if [ -n "$after" ] && [ "$after" = "$before" ]; then printf '%s\n' "Magnitude $after is already up to date."
-        else printf '%s\n' "Magnitude was upgraded${after:+ to $after}."
-        fi
+        installed_summary
         # Only a server this installer stopped is started; one an administrator stopped stays stopped.
         if [ -n "$restart" ]; then
           $privilege systemctl start magnitude.service
@@ -230,12 +242,19 @@ PY
         else printf '%s\n' 'The server was not running and was left stopped. Start it with: sudo systemctl start magnitude'
         fi ;;
       yes)
+        installed_summary
         if [ -z "$privilege" ] && [ -n "${SUDO_USER:-}" ]; then
-          printf '%s\n' "Magnitude was installed. To set up the server, run as $SUDO_USER: magnitude server setup"
+          printf '%s\n' "To set up the server, run as $SUDO_USER: magnitude server setup"
         else magnitude server setup </dev/null
         fi ;;
-      timeout) printf '%s\n' 'Magnitude was installed. Open it from your applications menu.' 'No answer, skipping. To set it up later: magnitude server setup' ;;
-      *) printf '%s\n' 'Magnitude was installed. Open it from your applications menu.' 'Skipped. To set it up later: magnitude server setup' ;;
+      timeout)
+        installed_summary
+        desktop_hint
+        printf '%s\n' 'No answer, so it was not set up as a server. To run it as one later: magnitude server setup' ;;
+      *)
+        installed_summary
+        desktop_hint
+        printf '%s\n' 'Not set up as a server. To run it as one later: magnitude server setup' ;;
     esac
     ;;
   *) fail 'This operating system is not supported.' ;;

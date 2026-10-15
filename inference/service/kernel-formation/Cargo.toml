@@ -1,0 +1,22 @@
+[package]
+name = "magnitude-kernel-formation"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+
+# Forms every native kernel the engine ships and every kernel every supported
+# catalog model requests, with each GPU backend's real toolchain
+# (`bun run kernels:form`).
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+magnitude-kernels = { path = "../../engine/kernels" }
+magnitude-service-server = { path = "../server" }
+seismic = { workspace = true, features = ["coverage"] }
+sha2.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc.workspace = true
+
+[build-dependencies]
+sha2.workspace = true

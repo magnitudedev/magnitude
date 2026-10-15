@@ -32,17 +32,18 @@ impl MetalToolchain {
         Self {
             device,
             language: facts.language,
-            // The OS build ships the Metal compiler.
             identity: ToolchainIdentity {
                 namespace: "metal",
-                material: format!(
-                    "metal;{};msl-{}",
-                    facts.operating_system(),
-                    facts.language.label()
-                ),
+                material: material(facts.operating_system(), facts.language),
             },
         }
     }
+}
+
+/// Everything besides the source that determines a formation: the OS build,
+/// which ships the Metal compiler, and the language version compiled to.
+pub fn material(operating_system: &str, language: LanguageVersion) -> String {
+    format!("metal;{operating_system};msl-{}", language.label())
 }
 
 /// The function name of an entry: a plain kernel name as is, a template

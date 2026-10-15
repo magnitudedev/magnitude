@@ -2400,6 +2400,7 @@ dependencies = [
  "magnitude-family-common",
  "magnitude-family-contracts",
  "magnitude-family-qwen",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -2448,6 +2449,19 @@ dependencies = [
  "seismic",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "magnitude-kernel-formation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "magnitude-kernels",
+ "magnitude-service-server",
+ "seismic",
  "sha2 0.10.9",
 ]
 
@@ -2559,7 +2573,6 @@ dependencies = [
  "libc",
  "magnitude-engine",
  "magnitude-executor",
- "magnitude-kernels",
  "magnitude-service-api",
  "magnitude-service-contracts",
  "magnitude-service-models",

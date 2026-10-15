@@ -1,12 +1,24 @@
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, readFile, writeFile, chmod, mkdir } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, get } from 'node:http';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
+
+// node:http rather than fetch: Node 24's fetch throws an uncatchable setTypeOfService EINVAL on macOS
+// when the service it probes resets the connection, which this lifecycle does on purpose.
+const request = url => new Promise((resolve, reject) => {
+  get(url, { agent: false }, response => {
+    let body = '';
+    response.setEncoding('utf8');
+    response.on('data', chunk => { body += chunk; });
+    response.on('end', () => resolve(body));
+    response.on('error', reject);
+  }).on('error', reject);
+});
 
 // Playwright's Electron driver runs under Node; the owning Vitest suite runs under Bun.
 // Preserve normal Chromium launch flags: Playwright otherwise injects --no-sandbox.
@@ -152,18 +164,18 @@ try {
   application = await launchOwner({ chromiumSandbox: true, executablePath, args: ['--background'], env, timeout: 60000 });
   const app = application;
   const visibility = () => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({ visible: window.isVisible(), minimized: window.isMinimized() })));
-  const health = () => fetch('http://127.0.0.1:11109/health').then(response => response.json()).catch(() => null);
+  const health = () => request('http://127.0.0.1:11109/health').then(body => JSON.parse(body)).catch(() => null);
   await eventually(visibility, [{ visible: false, minimized: false }]);
   await eventually(() => readFile(probePids, 'utf8').then(text => text.trim().split('\n').map(Number).some(alive)).catch(() => false), true);
   console.log('Slow shell probe: owner and hidden window available while shell is still running');
   assert.equal(await invoke([]), 0);
   await eventually(async () => (await control(profile, 'Observe').catch(() => null))?.service?._tag, 'Failed', 60000);
   assert.equal((await control(profile, 'Observe')).owner.tray._tag, 'Registered');
-  assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
+  assert.equal(await request('http://127.0.0.1:11109'), 'unrelated service');
   await control(profile, 'Retry');
   await eventually(async () => (await control(profile, 'Observe')).service._tag, 'Starting', 30000);
   await eventually(async () => (await control(profile, 'Observe')).service._tag, 'Failed', 60000);
-  assert.equal(await (await fetch('http://127.0.0.1:11109')).text(), 'unrelated service');
+  assert.equal(await request('http://127.0.0.1:11109'), 'unrelated service');
   await new Promise(resolve => incumbent.close(resolve));
   incumbent = undefined;
   await control(profile, 'Retry');
@@ -191,8 +203,8 @@ try {
   await eventually(visibility, [{ visible: true, minimized: false }]);
   const window = await app.firstWindow();
   window.setDefaultTimeout(10000);
-  // Connections go through the service, so the packaged CLI reaches the same failure the app shows.
-  const rejectedCommand = spawnSync(join(dirname(dirname(executablePath)), 'Resources', 'magnitude'), ['connections', 'add', 'codex'], { env, encoding: 'utf8' });
+  // The packaged CLI connects a harness for the person running it and reports the same failure the app shows.
+  const rejectedCommand = spawnSync(join(dirname(dirname(executablePath)), 'Resources', 'magnitude'), ['connections', 'connect', 'codex'], { env, encoding: 'utf8' });
   assert.notEqual(rejectedCommand.status, 0);
   const rejectedConnection = `${rejectedCommand.stdout}${rejectedCommand.stderr}`;
   assert.match(rejectedConnection, /No installed Magnitude models are available|Codex is not installed/);
