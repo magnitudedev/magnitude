@@ -23,6 +23,12 @@ The installer installs for your user account under `%LOCALAPPDATA%\Programs\Magn
 
 Use **Settings → Application updates** to check for updates. **Restart to update** stops local inference while the application is replaced.
 
-Uninstall Magnitude through Windows **Settings → Apps**. Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
+Before uninstalling, quit Magnitude: right-click its icon in the notification area and choose **Quit Magnitude**. The uninstaller stops if Magnitude is still running. Then uninstall Magnitude through Windows **Settings → Apps**. Downloaded models and settings are stored separately in `%USERPROFILE%\.magnitude`; keep them if you intend to reinstall.
+
+If you turned on network access and allowed Magnitude through Windows Defender Firewall, uninstalling leaves the allow rules Windows created. Remove them from an administrator PowerShell:
+
+```powershell
+Get-NetFirewallApplicationFilter | Where-Object Program -like "*\Programs\Magnitude\resources\*" | Get-NetFirewallRule | Remove-NetFirewallRule
+```
 
 Agents installed inside WSL need a small amount of configuration; see [Windows and WSL](/api/windows-wsl).
