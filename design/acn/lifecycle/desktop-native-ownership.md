@@ -316,7 +316,9 @@ system account. Setup creates that account and group with home and data director
 unit, and writes a root-owned marker last. An existing `magnitude` account is reused only when it is
 recognizably Magnitude's own: a uid and primary group in the system ranges of `/etc/login.defs`, home
 `/var/lib/magnitude` and no login shell. Any other account or group with that name, such as a
-person's, makes setup refuse before changing anything, and removal never deletes it. A failed root
+person's, makes setup refuse before changing anything, and removal never deletes it. The CLI reads
+the accounts without sudo and refuses before its root step, saying the name is taken and that the
+account must be renamed or removed, rather than suggesting an administrator problem. A failed root
 step undoes what that run created, so no marker points the CLI at a server that was never enabled;
 re-running setup over a complete or partial setup finishes the remaining steps. When firewalld is running, the root step also opens the server's TCP port 10100 in its default
 zone, at runtime and permanently, and says so; if that fails it prints the `firewall-cmd` command

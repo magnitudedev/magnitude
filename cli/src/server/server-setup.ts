@@ -1,5 +1,5 @@
 import { Context, Duration, Effect, Option, Schema } from "effect"
-import { MAC_SERVER_LABEL, MAC_SERVER_PLIST, SERVER_DATA_DIRECTORY, SERVER_PORT } from "@magnitudedev/daemon-management/desktop-native"
+import { FOREIGN_SERVER_ACCOUNT_MESSAGE, MAC_SERVER_LABEL, MAC_SERVER_PLIST, SERVER_DATA_DIRECTORY, SERVER_PORT } from "@magnitudedev/daemon-management/desktop-native"
 
 export const WINDOWS_SERVER_MESSAGE = "Server mode isn't available on Windows. To run Magnitude as a service, see https://docs.magnitude.dev/remote-server#windows"
 
@@ -30,6 +30,7 @@ export interface ServerSetupHost {
   readonly personalOwner: Effect.Effect<Option.Option<"Desktop" | "Headless">>
   readonly isSetUp: Effect.Effect<boolean>
   readonly hasRemnants: Effect.Effect<boolean>
+  readonly hasForeignAccount: Effect.Effect<boolean>
   readonly hasTerminal: Effect.Effect<boolean>
   /** Whether sudo can run without asking: a cached password or a NOPASSWD rule. */
   readonly sudoWithoutPrompt: Effect.Effect<boolean>
@@ -181,6 +182,8 @@ export const serverSetup = Effect.gen(function* () {
   if (host.platform !== "linux" && host.platform !== "darwin") return yield* failed("Server mode is available on Linux and macOS.")
   if (host.isRoot && (host.underSudo || host.platform !== "linux")) return yield* failed("Run `magnitude server setup` as yourself, without sudo. It asks for your password when it needs it.")
   if (!(yield* host.hasServiceManager)) return yield* failed("Server setup needs systemd, which this machine doesn't run. Run `magnitude serve` instead to serve until you stop it.")
+  // Readable without sudo, so the refusal is the whole answer rather than a failed root step.
+  if (yield* host.hasForeignAccount) return yield* failed(FOREIGN_SERVER_ACCOUNT_MESSAGE)
   const owner = yield* host.personalOwner
   // On macOS the service serves in the person's own profile, so after a setup that did not finish it is the Headless owner.
   const service = Option.isSome(owner) && owner.value === "Headless" && (yield* host.isSetUp)
