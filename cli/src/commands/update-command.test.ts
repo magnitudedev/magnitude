@@ -26,3 +26,18 @@ it("reports a successful update check", async () => {
   const result = await Effect.runPromise(performUpdate("check", update))
   expect(renderApplicationUpdate(result.state)).toBe("Magnitude is up to date.\n")
 })
+
+it("says Magnitude is up to date when install has nothing downloaded, without asking the owner to install", async () => {
+  const { calls, update } = owner({ status: state({ _tag: "Succeeded", at: 1 }) })
+  const result = await Effect.runPromise(performUpdate("install", update))
+  expect(calls).toEqual(["status"])
+  expect(result.installed).toBe(false)
+  expect(renderApplicationUpdate(result.state, "Headless", true)).toBe("Magnitude is up to date.\n")
+})
+
+it("asks the owner to install a downloaded update", async () => {
+  const { calls, update } = owner({ status: state({ _tag: "Succeeded", at: 1 }, { _tag: "Ready", version: "2.0.0" }) })
+  const result = await Effect.runPromise(performUpdate("install", update))
+  expect(calls).toEqual(["status", "install"])
+  expect(result.installed).toBe(true)
+})

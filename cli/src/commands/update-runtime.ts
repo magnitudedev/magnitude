@@ -49,15 +49,21 @@ class UpdateCheckFailed extends Data.TaggedError("UpdateCheckFailed")<{ readonly
 const failedUpdateCheck = (state: ApplicationUpdateState): Option.Option<string> =>
   state.transfer._tag === "Idle" && state.check._tag === "Failed" ? Option.some(state.check.message) : Option.none()
 
-/** Runs an update action through `update`; a check that failed fails the command. */
+/**
+ * Runs an update action through `update`. `install` with nothing downloaded reports the update status
+ * instead of asking the owner to install, and a check that failed fails the command.
+ */
 export const performUpdate = <A extends { readonly state: ApplicationUpdateState }, E, R>(
   action: ApplicationUpdateAction,
   update: (action: ApplicationUpdateAction) => Effect.Effect<A, E, R>,
 ): Effect.Effect<A & { readonly installed: boolean }, E | UpdateCheckFailed, R> => {
-  const performed = update(action).pipe(
-    Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, update("status")) : Effect.succeed(result)),
-    Effect.map(result => ({ ...result, installed: action === "install" })))
-  return performed.pipe(Effect.tap(result => Option.match(action === "check" ? failedUpdateCheck(result.state) : Option.none(), {
+  const performed = action === "install"
+    ? update("status").pipe(Effect.flatMap(current => current.state.transfer._tag === "Idle"
+      ? Effect.succeed({ ...current, installed: false }) : update("install").pipe(Effect.map(result => ({ ...result, installed: true })))))
+    : update(action).pipe(
+      Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, update("status")) : Effect.succeed(result)),
+      Effect.map(result => ({ ...result, installed: false })))
+  return performed.pipe(Effect.tap(result => Option.match(action === "check" || action === "install" ? failedUpdateCheck(result.state) : Option.none(), {
     onNone: () => Effect.void, onSome: message => new UpdateCheckFailed({ message }),
   })))
 }
