@@ -11,13 +11,29 @@ On Linux and macOS, Magnitude runs as a service: it starts at boot, keeps runnin
 
 Install the package for [Linux](/installation/linux) or the app for [macOS](/installation/macos) on the server. On a Mac, open the app once so it adds the `magnitude` command.
 
-On a Linux server without a browser, download the package over SSH. For example, on Ubuntu or Debian (use `arch=arm64` on an ARM64 server):
+On a Linux server without a browser, download the package over SSH. Use `arch=arm64` on an ARM64 server; the Arch package is available for x64 only.
 
+<Tabs>
+<Tab title="Ubuntu / Debian">
 ```sh
 curl -fL -o magnitude-desktop.deb 'https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb'
 sudo apt update
 sudo apt install ./magnitude-desktop.deb
 ```
+</Tab>
+<Tab title="Fedora / Red Hat">
+```sh
+curl -fL -o magnitude-desktop.rpm 'https://magnitude.dev/api/installer?os=linux&arch=x64&package=rpm'
+sudo dnf install ./magnitude-desktop.rpm
+```
+</Tab>
+<Tab title="Arch">
+```sh
+curl -fL -o magnitude-desktop.pkg.tar.zst 'https://magnitude.dev/api/installer?os=linux&arch=x64&package=pacman'
+sudo pacman -U ./magnitude-desktop.pkg.tar.zst
+```
+</Tab>
+</Tabs>
 
 Then set up the server:
 
@@ -37,8 +53,10 @@ Magnitude is running as a server on this machine.
 Open it in a browser on another computer:
   http://192.168.1.20:10100
 
-Network access key: mag_…
+Network access key: mag-…
 ```
+
+On a cloud VM, the address shown is usually the machine's private address. From outside its network, use its public address instead, and allow inbound TCP port 10100 in the provider's firewall, such as an AWS security group or an Azure network security group.
 
 Save the key; `magnitude status` never shows it. Afterwards it is in **Settings → Network access** in the browser app on this machine, and setting the server up again keeps it.
 
@@ -124,7 +142,7 @@ The app and the server can't run at the same time. Opening the app while the ser
 magnitude server remove
 ```
 
-It stops the service and removes it, and asks for your password once. Its data stays: in `/var/lib/magnitude` on Linux, now owned by root, or in `~/.magnitude` on macOS. Run `magnitude server setup` again to bring the server back with the same models. If removal stops partway, run it again to finish.
+It asks you to confirm with `y`, so run it in a terminal, then stops the service and removes it, and asks for your password once. Its data stays: in `/var/lib/magnitude` on Linux, now owned by root, or in `~/.magnitude` on macOS. Run `magnitude server setup` again to bring the server back with the same models. If removal stops partway, run it again to finish.
 
 ## Without the service
 
