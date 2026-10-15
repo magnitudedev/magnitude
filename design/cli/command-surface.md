@@ -15,8 +15,8 @@ applies_to:
 ## Scope
 
 The non-interactive CLI is a human-readable, agent-usable projection of Magnitude product state.
-It does not expose transport documents or internal state graphs. Bare `magnitude` prints help and
-exits. Help, version, and documentation do not start the desktop or service. There is no terminal
+It does not expose transport documents or internal state graphs. Bare `magnitude`, or a command group such as `magnitude models` alone, prints help and
+exits successfully. Help, version, and documentation do not start the desktop or service. There is no terminal
 onboarding, chat harness, or hidden hosted-setup mode. All onboarding lives in the desktop
 application. `server setup` registers Magnitude as a system service; it is not onboarding.
 
