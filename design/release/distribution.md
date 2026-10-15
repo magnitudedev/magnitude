@@ -97,7 +97,8 @@ RPM removal refusal retains the repair gate because DNF can still remove automat
 from the failed transaction. The existing owner continues running, but subsequent startup requires
 package reinstallation to restore dependencies and clear the gate; after the refusal's own reason,
 removal says only that Magnitude was not removed and that it must be reinstalled before it next
-starts, never that removal was interrupted.
+starts, never that removal was interrupted. Downloaded packages have no repository to reinstall from,
+so the advice names `dnf reinstall` of the installed version's published package file.
 `/usr/bin/magnitude-desktop` is the graphical launch entry; `/usr/bin/magnitude` resolves the
 bundled headless CLI. Login registration remains a user preference controlled
 by the running application. Package installation does not register an independent daemon or

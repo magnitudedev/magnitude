@@ -21,6 +21,8 @@ Magnitude requires **glibc 2.34 or later**. Ubuntu 22.04, Debian 12 and RHEL 9 (
 
 Your package manager installs required desktop libraries. GPU inference also needs a supported driver; see [Hardware](/hardware). Alpine/musl packages are not available.
 
+Magnitude downloads its inference engine, about 1.1 GB, into `~/.magnitude` the first time it starts (`/var/lib/magnitude` for a [server](/remote-server)), and models go there too. Make sure that file system has room for both; some cloud images, such as RHEL on Azure, give `/home` only about 1 GB.
+
 ## Install
 
 Open the downloaded package in your distribution's software installer, or install it from the terminal. Replace the filename below with the file you downloaded.
@@ -44,10 +46,10 @@ sudo pacman -U ./magnitude-desktop.pkg.tar.zst
 </Tab>
 </Tabs>
 
-Open **Magnitude** from your applications menu and follow [Quick start](/get-started).
+Open **Magnitude** from your applications menu and follow [Quick start](/get-started). On a machine without a desktop, run `magnitude serve`, or set it up as a [Remote server](/remote-server).
 
 ## Updates and removal
 
-App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. Use **Settings → Application updates** for the available actions. A [server](/remote-server) installs its updates by itself.
+App updates use your system package manager. Click **Restart** to install a downloaded update; at your desktop it installs without a password, while over SSH it asks for administrator authentication. The update from 0.2.8 is the exception: 0.2.8 can't install updates without a password, so that one update asks for an administrator's password even at your desktop. If your account isn't an administrator, ask one to enter it. Use **Settings → About** for the available actions. A [server](/remote-server) installs its updates by itself.
 
 Remove Magnitude through your distribution's software manager. Downloaded models and settings live in `~/.magnitude` and are separate from the installed application package. On a server, run `magnitude server remove` before removing the package; reinstalling the package without it keeps the server set up.
