@@ -80,6 +80,7 @@ const LIMITS: ResourceLimits = ResourceLimits {
     max_images_per_request: 1,
     max_image_cells: 0,
     lookahead: true,
+    group_capacity: std::num::NonZeroUsize::MIN,
 };
 
 #[test]

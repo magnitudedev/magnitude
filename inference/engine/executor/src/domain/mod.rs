@@ -33,8 +33,8 @@ mod head;
 mod heap;
 mod in_flight;
 mod input;
-mod lookahead;
 mod ownership;
+mod queue;
 mod reconcile;
 mod state;
 mod target;
@@ -48,7 +48,7 @@ pub use heap::{ClaimRefusal, DeviceHeap, require_normal};
 pub use in_flight::{
     HeadFlight, PrimingCompletionFlight, TargetContinuation, TargetFlight, VisionFlight,
 };
-use in_flight::{PrimingFlight, TargetWork, decode_selected};
+use in_flight::{PrimingFlight, TargetRequests, TargetWork, decode_selected};
 pub use ownership::OpenRequirements;
 pub use state::MemoryChargeReconciliation;
 pub use target::TargetHostTiming;
@@ -212,10 +212,12 @@ impl From<magnitude_state::Error> for DomainError {
 pub struct StateBindings<F: ProgramFamily = NativeFamily> {
     target: StoreBindings,
     head: Option<StoreBindings>,
-    /// The step queued behind the last flight, with its drafter priming. It
-    /// is the only work that holds bindings between flights, so it lives
-    /// here and is resolved before bindings change.
-    lookahead: Option<lookahead::Lookahead<F>>,
+    /// The steps queued behind the last flight, each behind the one before,
+    /// with their drafter entries: one pipelined successor, or the remaining
+    /// chunks of a layer-major prompt group (`queue`). They are the only
+    /// work that holds bindings between flights, so they live here and are
+    /// resolved before bindings change.
+    queue: std::collections::VecDeque<queue::QueuedStep<F>>,
 }
 
 impl<F: ProgramFamily> StateBindings<F> {
@@ -1564,7 +1566,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         let bindings = StateBindings {
             target: target_state,
             head: head_state,
-            lookahead: None,
+            queue: std::collections::VecDeque::new(),
         };
         (domain, bindings)
     }

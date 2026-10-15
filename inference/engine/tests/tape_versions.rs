@@ -45,6 +45,7 @@ fn open_domain() -> Option<(ExecutorDomain, StateBindings, usize)> {
             exported_logits_rows: 64,
             numerical_profile: None,
             weight_cap: None,
+            prefill_group: magnitude_executor::PrefillGroup::Auto,
         },
         context_tokens: Some(1024),
         service: ServiceLimits {

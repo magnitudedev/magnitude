@@ -4,7 +4,7 @@
 use magnitude_kernels::{
     routed_bank_fill, routed_combine, routed_copy, routed_down, routed_expand, routed_experts,
     routed_gate_up, routed_group, routed_output, routed_route, routed_route_shared,
-    routed_route_streamed,
+    routed_route_streamed, routed_seed_commit, routed_step,
 };
 use seismic_lang::{
     checked::{CheckedModule, SourceFile, check_source},
@@ -4982,11 +4982,11 @@ fn metal_35b_bank_fill_keeps_every_bit() {
     }
 }
 
-/// A streamed prefill's scratch copy (spec 4.9) places each listed bank slot
-/// in its scratch slot byte for byte, for every routed element and matrix
-/// geometry the 35B target streams.
+/// `routed_copy` places listed records byte for byte in both directions a
+/// scratch fill uses: bank slots into the scratch bank (its hits), and scratch
+/// slots into bank slots (its seeding), in permuted order.
 #[test]
-fn metal_copy_places_bank_records_exactly() {
+fn metal_copy_places_listed_records_exactly() {
     let catalog = seismic::DeviceCatalog::discover().unwrap();
     let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
         return;
@@ -4994,39 +4994,155 @@ fn metal_copy_places_bank_records_exactly() {
     let (experts, records) = (256u64, 112u64);
     for (representation, matrix) in [("q4k", [512u64, 2048]), ("q5k", [2048, 512]), ("q6k", [2048, 512])] {
         let element = element(&device, representation);
-        let record = element.canonical_byte_len(&[1, matrix[0], matrix[1]]).unwrap() as usize;
-        // Distinct bytes in every bank slot.
-        let bytes = (0..record * records as usize)
-            .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 7) as u8)
-            .collect::<Vec<_>>();
-        let bank = seismic::Tensor::from_host(&device, element, &[records, matrix[0], matrix[1]], &bytes).unwrap();
-        // Bank slots to scratch slots in permuted order.
-        let pairs = (0..40u64).map(|i| ((i * 37) % records, (i * 101 + 3) % experts)).collect::<Vec<_>>();
-        let mut list = vec![1i32, pairs.len() as i32];
-        for (slot, destination) in &pairs {
-            list.push(*slot as i32);
-            list.push(*destination as i32);
-        }
-        list.resize((2 + 2 * experts) as usize, 0);
-        let list = i32_tensor(&device, &[2 + 2 * experts], &list);
-        let step = i32_tensor(&device, &[1], &[1]);
-        let mut scratch = seismic::Tensor::zeros(&device, element, &[experts, matrix[0], matrix[1]]).unwrap();
-        routed_copy::native_for_device_with(&device, routed_copy::Elements { U: element }, &specialize(&[], &[]))
+        let record = element
+            .canonical_byte_len(&[1, matrix[0], matrix[1]])
+            .unwrap() as usize;
+        // (source extent, destination extent): bank to scratch, scratch to bank.
+        for (sources, destinations) in [(records, experts), (experts, records)] {
+            // Distinct bytes in every source record.
+            let bytes = (0..record * sources as usize)
+                .map(|i| ((i as u64).wrapping_mul(2_654_435_761) >> 7) as u8)
+                .collect::<Vec<_>>();
+            let source = seismic::Tensor::from_host(
+                &device,
+                element,
+                &[sources, matrix[0], matrix[1]],
+                &bytes,
+            )
+            .unwrap();
+            let pairs = (0..40u64)
+                .map(|i| ((i * 37) % sources, (i * 101 + 3) % destinations))
+                .collect::<Vec<_>>();
+            let mut list = vec![1i32, pairs.len() as i32];
+            for (from, to) in &pairs {
+                list.push(*from as i32);
+                list.push(*to as i32);
+            }
+            list.resize((2 + 2 * experts) as usize, 0);
+            let list = i32_tensor(&device, &[2 + 2 * experts], &list);
+            let step = i32_tensor(&device, &[1], &[1]);
+            let mut destination =
+                seismic::Tensor::zeros(&device, element, &[destinations, matrix[0], matrix[1]])
+                    .unwrap();
+            routed_copy::native_for_device_with(
+                &device,
+                routed_copy::Elements { U: element },
+                &specialize(&[], &[]),
+            )
             .unwrap()
             .call(routed_copy::Args {
-                bank: &bank,
+                source: &source,
                 list: &list,
                 step: &step,
-                scratch: &mut scratch,
+                destination: &mut destination,
             })
             .unwrap();
-        let copied = scratch.read_to_host().unwrap();
-        for (slot, destination) in pairs {
-            let (slot, destination) = (slot as usize, destination as usize);
-            assert!(
-                copied[destination * record..(destination + 1) * record] == bytes[slot * record..(slot + 1) * record],
-                "{representation}: bank slot {slot} differs in scratch slot {destination}"
+            let copied = destination.read_to_host().unwrap();
+            for (from, to) in pairs {
+                let (from, to) = (from as usize, to as usize);
+                assert!(
+                    copied[to * record..(to + 1) * record]
+                        == bytes[from * record..(from + 1) * record],
+                    "{representation}: source record {from} differs in destination record {to}"
+                );
+            }
+        }
+    }
+}
+
+/// `routed_seed_commit` stamps and commits exactly the listed slots of its
+/// step and maps their experts; a list of another step, or a failed step,
+/// changes nothing.
+#[test]
+fn metal_seed_commit_publishes_listed_slots() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let (experts, bank, control_words) = (256u64, 112u64, 8u64);
+    let pairs = (0..40i32)
+        .map(|i| ((i * 101 + 3) % 256, (i * 37) % 112))
+        .collect::<Vec<_>>();
+    let mut words = vec![7i32, pairs.len() as i32];
+    for (expert, slot) in &pairs {
+        words.push(*expert);
+        words.push(*slot);
+    }
+    words.resize((2 + 2 * experts) as usize, 0);
+    for (list_step, failed) in [(7, false), (6, false), (7, true)] {
+        words[0] = list_step;
+        let list = i32_tensor(&device, &[2 + 2 * experts], &words);
+        let step = i32_tensor(&device, &[1], &[7]);
+        let mut control_values = vec![0i32; control_words as usize];
+        if failed {
+            control_values[2] = 7;
+        }
+        let control = i32_tensor(&device, &[control_words], &control_values);
+        let mut slot_map = i32_tensor(&device, &[experts], &vec![-1; experts as usize]);
+        let mut stamps = i32_tensor(&device, &[bank], &vec![0; bank as usize]);
+        let mut commits = i32_tensor(&device, &[bank], &vec![0; bank as usize]);
+        routed_seed_commit::native_for_device(&device, &specialize(&[], &[]))
+            .unwrap()
+            .call(routed_seed_commit::Args {
+                list: &list,
+                step: &step,
+                control: &control,
+                slot_map: &mut slot_map,
+                stamps: &mut stamps,
+                commits: &mut commits,
+            })
+            .unwrap();
+        let (map, stamps, commits) = (read_i32(&slot_map), read_i32(&stamps), read_i32(&commits));
+        let published = list_step == 7 && !failed;
+        for expert in 0..experts as i32 {
+            let expected = if published {
+                pairs
+                    .iter()
+                    .rev()
+                    .find(|(e, _)| *e == expert)
+                    .map_or(-1, |(_, slot)| *slot)
+            } else {
+                -1
+            };
+            assert_eq!(
+                map[expert as usize], expected,
+                "expert {expert} (list step {list_step}, failed {failed})"
             );
         }
+        for slot in 0..bank as i32 {
+            let listed = published && pairs.iter().any(|(_, s)| *s == slot);
+            assert_eq!(
+                commits[slot as usize],
+                if listed { 7 } else { 0 },
+                "commit of slot {slot}"
+            );
+            assert_eq!(
+                stamps[slot as usize],
+                if listed { 7 } else { 0 },
+                "stamp of slot {slot}"
+            );
+        }
+    }
+}
+
+/// A step sets the device's step word to its own sequence, whatever step ran
+/// before it: a layer-major group's steps alternate at every layer.
+#[test]
+fn metal_step_sets_the_steps_own_sequence() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let mut step = i32_tensor(&device, &[1], &[0]);
+    let kernel = routed_step::native_for_device(&device, &specialize(&[], &[])).unwrap();
+    for sequence in [5, 6, 5, 6, 7] {
+        let word = i32_tensor(&device, &[1], &[sequence]);
+        kernel
+            .call(routed_step::Args {
+                step: &mut step,
+                sequence: &word,
+            })
+            .unwrap();
+        assert_eq!(read_i32(&step), [sequence]);
     }
 }

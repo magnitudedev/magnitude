@@ -225,6 +225,7 @@ fn prefill_sample(
         let mut budget = PREFILL_ROWS;
         let mut operations = Vec::new();
         let mut advancing = Vec::new();
+        let mut later = Vec::new();
         for (sequence, tokens) in sequences.iter_mut().zip(&tokens) {
             let rows = (tokens.len() - sequence.position).min(PREFILL_ROWS);
             if rows == 0 || rows > budget {
@@ -239,8 +240,16 @@ fn prefill_sample(
                 Demand::NONE
             };
             operations.push(Engine::forward(sequence, WorkKind::Prefill, piece, demand));
+            let next = sequence.position + rows;
+            later.push(Engine::prompt_chunks(sequence, next, &tokens[next..], true));
             advancing.push(sequence);
         }
+        // A lone sequence's later chunks are planned behind this one, as the
+        // service's owner plans a prompt.
+        engine.plan_successors(match <[_; 1]>::try_from(later) {
+            Ok([later]) => later,
+            Err(_) => Vec::new(),
+        });
         let (step, _) = engine.step(operations, &mut advancing, Some(trace))?;
         steps.push(step);
     }
@@ -267,7 +276,9 @@ fn prefill_cell(
         let (seconds, steps) = prefill_sample(engine, histories, &trace)?;
         samples_ms.push(seconds * MS);
         if sample > 0 {
-            for step in &steps {
+            // A chunk of a layer-major group submits nothing itself: the
+            // group's first step submitted the whole group.
+            for step in steps.iter().filter(|step| !step.submissions.is_empty()) {
                 summaries.push(summary(step, None)?);
             }
         }

@@ -721,6 +721,7 @@ fn metal_convert_places_what_the_import_places() {
                 seismic::Tensor::from_host(&device, destination, &[slots, n, k], &sentinel).unwrap();
             // Record 2 into slot 0, record 0 into slot 3 for step 7; slots 1
             // and 2 stay. The same list stamped for step 6 converts nothing.
+            // The list holds two of the three staging records.
             let convert = routed_convert_wide::native_for_device_with(
                 &device,
                 routed_convert_wide::Elements {
@@ -731,9 +732,7 @@ fn metal_convert_places_what_the_import_places() {
             )
             .unwrap();
             for stamp in [6, 7] {
-                let mut list = vec![0i32; 2 + 2 * records as usize];
-                list[..6].copy_from_slice(&[stamp, 2, 2, 0, 0, 3]);
-                let list = i32s(&list);
+                let list = i32s(&[stamp, 2, 2, 0, 0, 3]);
                 convert
                     .call(routed_convert_wide::Args {
                         source: &staging,

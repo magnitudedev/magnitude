@@ -579,7 +579,8 @@ impl BlockSublayers<'_> {
     }
 
     /// The block's feed-forward over the mixer's residual `mixed`; a lone
-    /// mixer block's output is `mixed`.
+    /// mixer block's output is `mixed`. A streamed routed layer that sets
+    /// the step also returns its step-sequence input (`routed::routed`).
     pub(crate) fn feed_forward<'e, G: GraphDraft + 'e>(
         &self,
         graph: &mut G,
@@ -588,7 +589,7 @@ impl BlockSublayers<'_> {
         mixed: WorkflowTensor,
         weights: &mut Vec<(WeightPort, NativePort)>,
         constants: &mut Vec<GraphConstant>,
-    ) -> Result<WorkflowTensor, GraphError> {
+    ) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
         let Self {
             paired,
             load,
@@ -608,13 +609,13 @@ impl BlockSublayers<'_> {
             self.read(graph, source, streams, 1, &mixed, weights, constants)
         };
         Ok(match (paired.feed_forward, entries) {
-            (None, None) => mixed,
+            (None, None) => (mixed, None),
             (Some(sublayer), Some(entries)) => match (sublayer.op, entries) {
                 (FeedForward::Dense(operator), FeedForwardEntries::Dense(entries)) => {
                     if matches!(sublayer.input, Some(SublayerSource::Mix(_))) {
                         return Err("a dense feed-forward over residual streams".into());
                     }
-                    dense(
+                    let output = dense(
                         graph,
                         entries,
                         load,
@@ -627,7 +628,8 @@ impl BlockSublayers<'_> {
                         dense_ffn::activation_code(operator.up.activation()),
                         post_norm_epsilon(sublayer.output).unwrap_or_default() as f32,
                         output_scales.feed_forward,
-                    )?
+                    )?;
+                    (output, None)
                 }
                 (FeedForward::Routed(shape), FeedForwardEntries::Routed(entries)) => {
                     let (input_rows, form, join) = read(graph, weights, constants, sublayer.input)?;
@@ -653,22 +655,25 @@ impl BlockSublayers<'_> {
                 (
                     FeedForward::GeneralRouted(operator),
                     FeedForwardEntries::GeneralRouted(entries),
-                ) => general_routed(
-                    graph,
-                    entries,
-                    load,
-                    scope,
-                    weights,
-                    constants,
-                    &mixed,
-                    RoutedSum::Residual,
-                    rows,
-                    &GeneralRoutedShape::of(geometry.hidden, operator)
-                        .map_err(|error| error.to_string())?,
-                    epsilon,
-                )?,
+                ) => (
+                    general_routed(
+                        graph,
+                        entries,
+                        load,
+                        scope,
+                        weights,
+                        constants,
+                        &mixed,
+                        RoutedSum::Residual,
+                        rows,
+                        &GeneralRoutedShape::of(geometry.hidden, operator)
+                            .map_err(|error| error.to_string())?,
+                        epsilon,
+                    )?,
+                    None,
+                ),
                 (FeedForward::Parallel(branches), FeedForwardEntries::Parallel(entries)) => {
-                    parallel(
+                    let output = parallel(
                         graph,
                         entries,
                         load,
@@ -682,7 +687,8 @@ impl BlockSublayers<'_> {
                         epsilon,
                         dense_ffn::activation_code(branches.dense.up.activation()),
                         output_scales.feed_forward,
-                    )?
+                    )?;
+                    (output, None)
                 }
                 _ => return Err("target block feed-forward and its kernel entries disagree".into()),
             },

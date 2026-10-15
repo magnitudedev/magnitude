@@ -493,6 +493,7 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         for backend in [
             BackendName::Cpu,
@@ -592,6 +593,7 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let selection = ComponentSelection {
             head: false,

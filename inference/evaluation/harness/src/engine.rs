@@ -36,6 +36,8 @@ pub struct EngineOptions {
     pub numerical_profile: Option<NumericalProfile>,
     /// Bytes every weight of a load may hold (`ModelPolicy::weight_cap`).
     pub weight_cap: Option<u64>,
+    /// The requested prompt group (`ModelPolicy::prefill_group`).
+    pub prefill_group: magnitude_executor::PrefillGroup,
     pub budget: std::time::Duration,
     /// Search afresh in the Prepare of the run's first load. Later loads of
     /// the run reuse what it stored, as any later load would.
@@ -107,6 +109,7 @@ pub fn configuration(
             exported_logits_rows: load.exported_logits_rows,
             numerical_profile: options.numerical_profile.clone(),
             weight_cap: options.weight_cap,
+            prefill_group: options.prefill_group,
         },
         context_tokens: Some(load.context_tokens),
         service: ServiceLimits {
@@ -275,7 +278,18 @@ impl Engine {
         tokens: Vec<TokenId>,
         demand: Demand,
     ) -> Operation {
-        let last = sequence.position + tokens.len() - 1;
+        Self::forward_at(sequence, sequence.position, kind, tokens, demand)
+    }
+
+    /// The forward of `tokens` from `position` of the sequence.
+    pub fn forward_at(
+        sequence: &Sequence,
+        position: usize,
+        kind: WorkKind,
+        tokens: Vec<TokenId>,
+        demand: Demand,
+    ) -> Operation {
+        let last = position + tokens.len() - 1;
         let select = if demand.contains(Demand::SELECT) {
             vec![Self::greedy(last)]
         } else {
@@ -286,7 +300,7 @@ impl Engine {
             request: sequence.request,
             kind,
             tokens,
-            position: sequence.position,
+            position,
             conditioning: None,
             demand,
             select,
@@ -365,23 +379,62 @@ impl Engine {
         ))
     }
 
+    /// The prompt chunks that follow the next step, as the service's owner
+    /// plans them (`ExecutorDomain::plan_successors`).
+    pub fn plan_successors(&mut self, planned: Vec<Operation>) {
+        self.domain.plan_successors(planned);
+    }
+
+    /// The prefill chunks of `tokens` from `position` of the sequence, as
+    /// the service's owner plans a prompt: `PREFILL_ROWS` rows each, the
+    /// last selecting when `select`.
+    pub fn prompt_chunks(
+        sequence: &Sequence,
+        position: usize,
+        tokens: &[TokenId],
+        select: bool,
+    ) -> Vec<Operation> {
+        let chunks = tokens.chunks(PREFILL_ROWS).collect::<Vec<_>>();
+        let mut position = position;
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| {
+                let demand = if select && index + 1 == chunks.len() {
+                    Demand::SELECT
+                } else {
+                    Demand::NONE
+                };
+                let operation = Self::forward_at(
+                    sequence,
+                    position,
+                    WorkKind::Prefill,
+                    chunk.to_vec(),
+                    demand,
+                );
+                position += chunk.len();
+                operation
+            })
+            .collect()
+    }
+
     /// Accept `tokens` from the sequence's position in prefill chunks, as the
     /// service runs a prompt. The last chunk selects when `select`.
+    ///
+    /// Before each chunk the domain is told the chunks after it, as the
+    /// service's owner plans them: a load that prefills layer-major submits a
+    /// group of them together and later chunks claim their queued launches;
+    /// otherwise each chunk queues the next behind it (lookahead).
     pub fn prefill(
         &mut self,
         sequence: &mut Sequence,
         tokens: &[TokenId],
         select: bool,
     ) -> Result<(), String> {
-        let chunks = tokens.chunks(PREFILL_ROWS).collect::<Vec<_>>();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let demand = if select && index + 1 == chunks.len() {
-                Demand::SELECT
-            } else {
-                Demand::NONE
-            };
-            let operation = Self::forward(sequence, WorkKind::Prefill, chunk.to_vec(), demand);
-            self.step(vec![operation], &mut [&mut *sequence], None)?;
+        let operations = Self::prompt_chunks(sequence, sequence.position, tokens, select);
+        for (index, operation) in operations.iter().enumerate() {
+            self.plan_successors(operations[index + 1..].to_vec());
+            self.step(vec![operation.clone()], &mut [&mut *sequence], None)?;
         }
         Ok(())
     }

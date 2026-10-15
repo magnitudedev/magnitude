@@ -472,11 +472,12 @@ impl AssessmentMemoryTerms {
             .ok_or("history row bytes overflow")?;
         let recurrent_per_bank = recurrent_bank_bytes(&layout.target_recurrent)?;
         // The state store's own capacity rule for one live conversation: its
-        // accepted bank, its in-flight step (and that step's queued successor
-        // under lookahead) and the permanently pristine zero seed.
+        // accepted bank, its in-flight chain (a step and its queued successor
+        // under lookahead, or a prompt group) and the permanently pristine
+        // zero seed.
         let recurrent_banks = BankCapacity {
             active: 1,
-            in_flight: 1 + usize::from(limits.lookahead),
+            in_flight: limits.longest_chain(),
             retained: 0,
         }
         .storage_total()
@@ -826,6 +827,7 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let state = crate::ResourcePlanner::state_plan(
             &definition,
@@ -987,6 +989,7 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let state = crate::ResourcePlanner::state_plan(
             &definition,
@@ -1924,6 +1927,7 @@ mod tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let family = crate::programs::graph::readout::checked_readout_family_storage(
             BackendName::Cpu,
@@ -2111,6 +2115,7 @@ mod tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead,
+            group_capacity: std::num::NonZeroUsize::MIN,
         }
     }
 

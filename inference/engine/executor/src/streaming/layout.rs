@@ -27,23 +27,42 @@ pub(crate) fn ring_words(selected: u64) -> u64 {
     2 + DECODE_ROWS * selected
 }
 
-/// Staging records per pool (spec 4.3): the prefetch window, two layers of
-/// one row's choices, beside every demand read of the widest bank-served
-/// launch (the decode form's rows).
-pub(crate) fn staging_records(selected: u64) -> u64 {
-    prefetch_records(selected) + DECODE_ROWS * selected
+/// Staging records per pool (spec 4.3, 4.9): the conveyor's beside those
+/// it leaves to demand reads and hints.
+pub(crate) fn staging_records(experts: u64, selected: u64) -> u64 {
+    conveyor_records(experts) + demand_records(selected)
 }
 
-/// Staging records prefetches may hold (spec 4.3, 4.7): one row's predicted
-/// experts for each distance ahead.
-pub(crate) fn prefetch_records(selected: u64) -> u64 {
+/// Staging records the conveyor may hold (spec 4.9): a whole layer's
+/// experts, read for a scratch-served step's next streamed layer while the
+/// device computes this one.
+pub(crate) fn conveyor_records(experts: u64) -> u64 {
+    experts
+}
+
+/// Staging records a decode step's hints may hold (spec 4.7): one row's
+/// predicted experts for each distance ahead.
+pub(crate) fn hint_records(selected: u64) -> u64 {
     DISTANCES.len() as u64 * selected
 }
 
-/// Rounds a scratch-served layer's graph holds (spec 4.9): each stages half
-/// the pool, so one half fills while the device converts the other.
+/// Staging records the conveyor leaves: two scratch-fill rounds, one filling
+/// while the device converts the other, which hold the hint window beside
+/// every demand read of the widest bank-served launch (the decode form's
+/// rows).
+pub(crate) fn demand_records(selected: u64) -> u64 {
+    hint_records(selected) + DECODE_ROWS * selected
+}
+
+/// Records a scratch fill stages per round (spec 4.9).
+pub(crate) fn scratch_round_records(selected: u64) -> u64 {
+    (demand_records(selected) / 2).max(1)
+}
+
+/// Rounds a scratch-served layer's graph holds: enough to deliver every
+/// expert.
 pub(crate) fn scratch_rounds(experts: u64, selected: u64) -> u64 {
-    experts.div_ceil((staging_records(selected) / 2).max(1))
+    experts.div_ceil(scratch_round_records(selected))
 }
 
 /// Words of a load's scratch request region (`routed_scratch_request`):
@@ -108,7 +127,7 @@ pub(crate) fn bank_port(
         BankPart::ScratchControl => words(bank.scratch_control_words()),
         BankPart::ScratchFlags => words(bank.experts),
         BankPart::ScratchList { .. } => words(bank.list_words()),
-        BankPart::CopyList { .. } => words(bank.copy_list_words()),
+        BankPart::CopyList { .. } | BankPart::SeedList => words(bank.copy_list_words()),
     }
 }
 
@@ -181,11 +200,12 @@ pub(crate) struct BankTensors {
     pub layers: Vec<LayerTensors>,
     pub pools: Vec<Tensor>,
     /// The scratch fill's: one bank per resident form, the request region,
-    /// each round's convert lists and the copy lists (spec 4.9).
+    /// each round's convert lists, the copy lists and the seed list (spec 4.9).
     pub scratch: Vec<Tensor>,
     pub scratch_flags: Tensor,
     pub scratch_lists: Vec<[Tensor; 3]>,
     pub copy_lists: [Tensor; 3],
+    pub seed_list: Tensor,
 }
 
 impl BankTensors {
@@ -278,11 +298,8 @@ impl BankTensors {
             scratch,
             scratch_flags: words(bank.experts)?,
             scratch_lists,
-            copy_lists: [
-                words(copy_words)?,
-                words(copy_words)?,
-                words(copy_words)?,
-            ],
+            copy_lists: [words(copy_words)?, words(copy_words)?, words(copy_words)?],
+            seed_list: words(copy_words)?,
         })
     }
 
@@ -318,6 +335,7 @@ impl BankTensors {
                 &self.scratch_lists[index(round, self.scratch_lists.len())?][index(kind, 3)?]
             }
             BankPart::CopyList { kind } => &self.copy_lists[index(kind, 3)?],
+            BankPart::SeedList => &self.seed_list,
         })
     }
 }

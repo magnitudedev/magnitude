@@ -63,6 +63,7 @@ fn resolved(projector: bool) -> ResolvedEngineConfiguration {
             exported_logits_rows: 512,
             numerical_profile: None,
             weight_cap: None,
+            prefill_group: magnitude_executor::PrefillGroup::Auto,
         },
         context_tokens: Some(CONTEXT),
         service: limits(),

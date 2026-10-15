@@ -2191,6 +2191,7 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let norm = target_readout_norm(&load, &definition.decoder).unwrap();
         let classes = qualified_readout_classes(limits, selecting, backend).unwrap();
@@ -2255,6 +2256,7 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let diagnostic = ResourceLimits {
             exported_logits_rows: 64,
@@ -2381,6 +2383,7 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         for backend in [BackendName::Metal, BackendName::Cpu] {
             let load = ModelLoadPlan::derive(
@@ -2460,6 +2463,7 @@ mod resource_regime_tests {
             max_images_per_request: 0,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let classes = readout_classes(limits, 4).unwrap();
         assert!(

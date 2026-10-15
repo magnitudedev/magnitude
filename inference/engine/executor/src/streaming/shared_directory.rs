@@ -7,10 +7,17 @@ use super::arena::{
 use super::shared_bank::SharedBankPlan;
 use std::collections::HashMap;
 
+/// A point in the device's visit order of streamed layers. Steps run in
+/// submission order, each through its layers in order, except that a
+/// layer-major prompt group interleaves its steps' layers: every step of the
+/// group at a layer, in sequence order, before any at the next. So points
+/// order by `group` (the sequence of the group's first step; a lone step is
+/// its own group), then layer, then sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Clock {
-    pub sequence: i32,
+    pub group: i32,
     pub layer: usize,
+    pub sequence: i32,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -99,10 +106,22 @@ impl SharedDirectory {
         })
     }
     fn valid_clock(&self, clock: Clock) -> Result<(), Error> {
-        if clock.sequence <= 0 || clock.layer >= self.group_of_layer.len() {
+        if clock.group <= 0
+            || clock.group > clock.sequence
+            || clock.layer >= self.group_of_layer.len()
+        {
             return Err(Error::InvalidRequest);
         }
         Ok(())
+    }
+    /// Records of the bank group `layer` belongs to: the most experts one
+    /// request may hold.
+    pub fn capacity(&self, layer: usize) -> Result<usize, Error> {
+        let group = self
+            .group_of_layer
+            .get(layer)
+            .ok_or(Error::InvalidRequest)?;
+        Ok(self.capacities[*group])
     }
     pub fn validate_ports(&self, sizes: &[(usize, usize)]) -> Result<(), Error> {
         if sizes.len() != self.group_of_layer.len() {
@@ -301,7 +320,11 @@ impl SharedDirectory {
 mod tests {
     use super::*;
     fn clock(sequence: i32, layer: usize) -> Clock {
-        Clock { sequence, layer }
+        Clock {
+            group: sequence,
+            layer,
+            sequence,
+        }
     }
     fn directory(capacity: usize) -> SharedDirectory {
         SharedDirectory::from_parts(vec![capacity], vec![0, 0], 16).unwrap()
@@ -429,5 +452,33 @@ mod tests {
             observe(&mut d, clock(3, 0)).unwrap();
             assert!(d.begin(clock(3, 0), &[0]).unwrap().choices[0].needs_conversion);
         }
+    }
+    /// A layer-major group of steps 2 and 3 visits (2, layer 0), (3, layer 0),
+    /// (2, layer 1), (3, layer 1). Step 3 at layer 0 finds what step 2 filled
+    /// there, and the later step's earlier layer never reads as progress past
+    /// the earlier step's later one.
+    #[test]
+    fn a_layer_major_group_orders_layers_before_steps() {
+        let mut d = directory(4);
+        let at = |sequence, layer| Clock {
+            group: 2,
+            layer,
+            sequence,
+        };
+        observe(&mut d, at(2, 0)).unwrap();
+        let first = d.begin(at(2, 0), &[5]).unwrap();
+        d.submitted(at(2, 0)).unwrap();
+        assert!(first.choices[0].needs_conversion);
+        let slot = first.choices[0].location.slot;
+        let commits = |_: usize, s: usize| if s == slot { 2 } else { 0 };
+        assert!(d.retire_progress(at(3, 0), commits).unwrap().is_empty());
+        let second = d.begin(at(3, 0), &[5]).unwrap();
+        d.submitted(at(3, 0)).unwrap();
+        assert!(!second.choices[0].needs_conversion);
+        assert_eq!(second.choices[0].location, first.choices[0].location);
+        assert!(at(3, 0) < at(2, 1));
+        assert!(d.retire_progress(at(2, 1), commits).unwrap().is_empty());
+        assert_eq!(observe(&mut d, at(3, 0)), Err(Error::BackwardClock));
+        assert!(at(3, 1) < clock(4, 0));
     }
 }

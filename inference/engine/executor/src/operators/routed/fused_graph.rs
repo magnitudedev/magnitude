@@ -22,9 +22,10 @@ use magnitude_family_contracts::{
     RouteNormalization, RoutedFfn, SublayerIndex, WeightKind, WeightRole, WeightScope,
 };
 use magnitude_kernels::{
-    routed_bank_fill, routed_combine, routed_convert_wide, routed_copy, routed_expand, routed_experts,
-    routed_gate_up, routed_group, routed_output, routed_route, routed_route_shared,
-    routed_route_streamed, routed_scratch_request, routed_scratch_wait, routed_step,
+    routed_bank_fill, routed_combine, routed_convert_wide, routed_copy, routed_expand,
+    routed_experts, routed_gate_up, routed_group, routed_output, routed_route, routed_route_shared,
+    routed_route_streamed, routed_scratch_request, routed_scratch_wait, routed_seed_commit,
+    routed_step,
 };
 use seismic::{BackendName, Element, NativeGraph, NativeGraphMetadata, NativePort, WorkflowTensor};
 
@@ -76,6 +77,7 @@ pub(crate) struct StreamedGraphEntries<'a, G: GraphDraft + 'a> {
     pub scratch_request: G::Binding<'a, routed_scratch_request::Entry>,
     pub scratch_wait: G::Binding<'a, routed_scratch_wait::Entry>,
     pub copy: [G::Binding<'a, routed_copy::Entry>; 3],
+    pub seed_commit: G::Binding<'a, routed_seed_commit::Entry>,
     pub convert_wide: [G::Binding<'a, routed_convert_wide::Entry>; 3],
 }
 
@@ -90,6 +92,7 @@ impl<'a> From<&'a StreamedRoutedKernels> for StreamedGraphEntries<'a, NativeGrap
             scratch_request: &kernels.scratch_request,
             scratch_wait: &kernels.scratch_wait,
             copy: [copy_gate, copy_up, copy_down],
+            seed_commit: &kernels.seed_commit,
             convert_wide: [wide_gate, wide_up, wide_down],
         }
     }
@@ -256,6 +259,7 @@ impl CheckedRoutedEntries {
                     scratch_request: &[][..],
                     scratch_wait: &[][..],
                     copy: [&copy_gate[..], &copy_up[..], &copy_down[..]],
+                    seed_commit: &[][..],
                     convert_wide: [&gate[..], &up[..], &down[..]],
                 }
             }),
@@ -329,7 +333,9 @@ pub(crate) fn grouped_blocks(rows: u64, experts: u64, selected: u64) -> Result<u
         .ok_or_else(|| format!("grouped tiles of {rows} rows overflow"))
 }
 
-/// The routed feed-forward of one block over `rows` rows of `residual`.
+/// The routed feed-forward of one block over `rows` rows of `residual`, and
+/// the step-sequence input of a streamed layer that sets the step
+/// (`routed_step`), which each run binds to its launch's sequence.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -345,7 +351,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     hidden: u64,
     shape: &ExpertShape,
     epsilon: f32,
-) -> Result<WorkflowTensor, GraphError> {
+) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
     // A mix site's partials have no input norm: the port is empty.
     let norm = if input.form.normalized {
         weight(graph, load, scope, WeightKind::InputNorm, weights)?
@@ -523,7 +529,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
             }
         };
         let inject = join.inject(graph, rows, constants)?;
-        return Ok(graph
+        let value = graph
             .enqueue(
                 handle.output,
                 &output_dims,
@@ -539,7 +545,8 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                     shared_down: (&shared_down).into(),
                 },
             )?
-            .value);
+            .value;
+        return Ok((value, None));
     }
 
     let routed = graph.enqueue(
@@ -560,29 +567,31 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
     // A streamed layer's products read its scratch banks, which the graph
     // fills in parked rounds (spec 4.9); every value is the resident
     // load's.
-    let [expert_gate, expert_up, expert_down] = match load.expert_bank().filter(|bank| {
-        bank.holds(WeightRole {
-            scope,
-            kind: WeightKind::ExpertGate,
-        })
-    }) {
-        None => [expert_gate, expert_up, expert_down],
-        Some(bank) => fill_scratch(
-            graph,
-            handle
-                .streamed
-                .as_ref()
-                .ok_or("a streamed layer without its scratch fill entries")?,
-            load,
-            bank,
-            scope,
-            weights,
-            routes.tensor(),
-            rows,
-            shape,
-            [&expert_gate, &expert_up, &expert_down],
-        )?,
-    };
+    let ([expert_gate, expert_up, expert_down], sequence) =
+        match load.expert_bank().filter(|bank| {
+            bank.holds(WeightRole {
+                scope,
+                kind: WeightKind::ExpertGate,
+            })
+        }) {
+            None => ([expert_gate, expert_up, expert_down], None),
+            Some(bank) => fill_scratch(
+                graph,
+                handle
+                    .streamed
+                    .as_ref()
+                    .ok_or("a streamed layer without its scratch fill entries")?,
+                load,
+                bank,
+                scope,
+                weights,
+                routes.tensor(),
+                rows,
+                shape,
+                expert_ports,
+            )
+            .map(|(banks, sequence)| (banks, Some(sequence)))?,
+        };
     let blocks = grouped_blocks(rows, shape.count, shape.selected)?;
     let tables = [
         ("M", rows),
@@ -641,7 +650,7 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
         )?
         .value;
     let inject = join.inject(graph, rows, constants)?;
-    Ok(graph
+    let value = graph
         .enqueue(
             handle.combine,
             &combine_dims,
@@ -658,14 +667,17 @@ pub(crate) fn routed<'a, G: GraphDraft + 'a>(
                 shared_down: (&shared_down).into(),
             },
         )?
-        .value)
+        .value;
+    Ok((value, sequence))
 }
 
 /// The scratch fill of a scratch-served launch (spec 4.9): the request of
 /// the launch's experts, then `rounds` parks, the first followed by the copy
 /// of the experts in the layer's bank, each followed by the convert of the
-/// round's staged records. Returns the scratch banks, slot `e` holding
-/// expert `e`.
+/// round's staged records; then the seeding: the converted experts copied
+/// from the scratch banks into the bank slots the host placed them in, and
+/// committed. Returns the scratch banks, slot `e` holding expert `e`, and
+/// the step-sequence input.
 #[allow(clippy::too_many_arguments)]
 fn fill_scratch<'a, G: GraphDraft + 'a>(
     graph: &mut G,
@@ -677,8 +689,8 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
     routes: &WorkflowTensor,
     rows: u64,
     shape: &ExpertShape,
-    banks: [&WorkflowTensor; 3],
-) -> Result<[WorkflowTensor; 3], GraphError> {
+    mut banks: [NativePort; 3],
+) -> Result<([WorkflowTensor; 3], NativePort), GraphError> {
     let position = bank
         .layers
         .iter()
@@ -720,15 +732,18 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
             part(graph, BankPart::ScratchList { round, kind: 2 })?,
         ]);
     }
-    if position == 0 {
-        graph.enqueue(
-            entries.step,
-            &[],
-            routed_step::WorkflowArgs {
-                step: step.tensor_mut().into(),
-            },
-        )?;
-    }
+    // A layer-major prompt group interleaves its launches' layers on the
+    // device, so every streamed layer of a scratch-served launch sets the
+    // step to its own.
+    let sequence = graph.input_for(entries.step, "sequence", &[])?;
+    graph.enqueue(
+        entries.step,
+        &[],
+        routed_step::WorkflowArgs {
+            step: step.tensor_mut().into(),
+            sequence: sequence.tensor().into(),
+        },
+    )?;
     let words = bank.scratch_control_words();
     graph.enqueue(
         entries.scratch_request,
@@ -766,12 +781,18 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
             if round == 0 {
                 graph.enqueue(
                     entries.copy[kind],
-                    &[("S", bank.records(scope)?), ("E", shape.count), matrix[0], matrix[1]],
+                    &[
+                        ("S", bank.records(scope)?),
+                        ("D", shape.count),
+                        ("E", shape.count),
+                        matrix[0],
+                        matrix[1],
+                    ],
                     routed_copy::WorkflowArgs {
-                        bank: banks[kind].into(),
+                        source: banks[kind].tensor().into(),
                         list: copy_lists[kind].tensor().into(),
                         step: step.tensor().into(),
-                        scratch: scratch[kind].tensor_mut().into(),
+                        destination: scratch[kind].tensor_mut().into(),
                     },
                 )?;
             }
@@ -779,6 +800,7 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
                 entries.convert_wide[kind],
                 &[
                     ("R", bank.staging_records),
+                    ("L", bank.round_records()),
                     ("S", shape.count),
                     matrix[0],
                     matrix[1],
@@ -792,7 +814,49 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
             )?;
         }
     }
-    Ok(scratch.map(|port| port.tensor().clone()))
+    // The seeding: the bank keeps what the launch read.
+    let seed_list = part(graph, BankPart::SeedList)?;
+    let mut slot_map = part(graph, BankPart::SlotMap)?;
+    let mut stamps = part(graph, BankPart::Stamps)?;
+    let mut commits = part(graph, BankPart::Commits)?;
+    let records = bank.records(scope)?;
+    for kind in 0..3 {
+        let region = &bank.scratch[bank.layers[position].tensors[kind].scratch];
+        graph.enqueue(
+            entries.copy[kind],
+            &[
+                ("S", shape.count),
+                ("D", records),
+                ("E", shape.count),
+                ("N", region.matrix[0]),
+                ("K", region.matrix[1]),
+            ],
+            routed_copy::WorkflowArgs {
+                source: scratch[kind].tensor().into(),
+                list: seed_list.tensor().into(),
+                step: step.tensor().into(),
+                destination: banks[kind].tensor_mut().into(),
+            },
+        )?;
+    }
+    graph.enqueue(
+        entries.seed_commit,
+        &[
+            ("E", shape.count),
+            ("X", bank.experts),
+            ("BANK", records),
+            ("C", words),
+        ],
+        routed_seed_commit::WorkflowArgs {
+            list: seed_list.tensor().into(),
+            step: step.tensor().into(),
+            control: control.tensor().into(),
+            slot_map: slot_map.tensor_mut().into(),
+            stamps: stamps.tensor_mut().into(),
+            commits: commits.tensor_mut().into(),
+        },
+    )?;
+    Ok((scratch.map(|port| port.tensor().clone()), sequence))
 }
 
 /// A routed layer's weight ports; the experts are its banks.
@@ -815,7 +879,7 @@ struct LayerWeights {
 ///          bank and the bound slots
 /// ```
 ///
-/// The first routed layer of the target advances the step sequence. The
+/// The first routed layer of the target sets the step sequence. The
 /// products and the combine are the resident entries themselves, so the
 /// value is the resident load's; a step that requested nothing adds one
 /// small launch to the resident form.
@@ -836,8 +900,10 @@ fn streamed_decode<'a, G: GraphDraft + 'a>(
     shape: &ExpertShape,
     epsilon: f32,
     layer: LayerWeights,
-) -> Result<WorkflowTensor, GraphError> {
-    bank.shared.as_ref().ok_or("slab decode requires an admitted shared plan")?;
+) -> Result<(WorkflowTensor, Option<NativePort>), GraphError> {
+    bank.shared
+        .as_ref()
+        .ok_or("slab decode requires an admitted shared plan")?;
     let LayerWeights {
         norm,
         router,
@@ -866,15 +932,23 @@ fn streamed_decode<'a, G: GraphDraft + 'a>(
     let mut near_ring = part(graph, weights, BankPart::Ring { distance: 1 })?;
     let mut far_ring = part(graph, weights, BankPart::Ring { distance: 2 })?;
 
-    if position == 0 {
-        graph.enqueue(
-            entries.step,
-            &[],
-            routed_step::WorkflowArgs {
-                step: step.tensor_mut().into(),
-            },
-        )?;
-    }
+    // A bank-served launch's layers run in order, so its first streamed
+    // layer sets the step for all of them.
+    let sequence = match position {
+        0 => {
+            let sequence = graph.input_for(entries.step, "sequence", &[])?;
+            graph.enqueue(
+                entries.step,
+                &[],
+                routed_step::WorkflowArgs {
+                    step: step.tensor_mut().into(),
+                    sequence: sequence.tensor().into(),
+                },
+            )?;
+            Some(sequence)
+        }
+        _ => None,
+    };
 
     // The layers ahead (spec 4.7), predicted from this layer's residual
     // through their own norm and router into this layer's rings. Near the
@@ -1035,7 +1109,7 @@ fn streamed_decode<'a, G: GraphDraft + 'a>(
         .iter()
         .map(|&(name, value)| (name, if name == "E" { records } else { value }))
         .collect::<Vec<_>>();
-    Ok(graph
+    let value = graph
         .enqueue(
             output,
             &output_dims,
@@ -1051,7 +1125,8 @@ fn streamed_decode<'a, G: GraphDraft + 'a>(
                 shared_down: (&shared_down).into(),
             },
         )?
-        .value)
+        .value;
+    Ok((value, sequence))
 }
 
 #[cfg(test)]

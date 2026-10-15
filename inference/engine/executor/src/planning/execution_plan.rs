@@ -2,8 +2,8 @@
 
 use super::{
     ArtifactComponent, ArtifactComponentKind, CapabilityPlan, ComponentPlan, ComponentSelection,
-    MAX_DRAFT_PROPOSALS, ModelLoadPlan, PlannedMethod, ProgramPlan, ReadoutClassChoice,
-    ResourceLimits, ResourcePlan, WeightPlan,
+    MAX_DRAFT_PROPOSALS, ModelLoadPlan, PlannedMethod, PrefillGroup, ProgramPlan,
+    ReadoutClassChoice, ResourceLimits, ResourcePlan, WeightPlan,
 };
 use crate::{ExecutionPath, error::PlanError, platform::SelectedDevice};
 use magnitude_artifacts::PackageManifest;
@@ -186,11 +186,14 @@ impl ExecutionPlanDraft {
     ///
     /// A cap never raises what the device permits, and a cap below the
     /// model's weights streams even a model that fits: artificial capping and
-    /// "does not fit" are one path.
+    /// "does not fit" are one path. A streamed plan's prompt group is
+    /// `prefill_group`'s for a load that streams; its chunks' slots and
+    /// successor banks belong to each candidate.
     pub fn with_weight_cap(
         self,
         definition: &ModelDefinition,
         cap: Option<u64>,
+        prefill_group: PrefillGroup,
     ) -> Result<Self, PlanError> {
         let charge = |draft: &Self| -> Result<(u64, u64), PlanError> {
             let context_limit = u32::try_from(definition.decoder.context_limit)
@@ -217,6 +220,7 @@ impl ExecutionPlanDraft {
                 .load
                 .with_shared_expert_bank(slots, selected)
                 .map_err(PlanError::InvalidDefinition)?;
+            draft.policy.limits.group_capacity = prefill_group.capacity(true);
             draft.programs = draft.load.program_plan(definition, draft.policy.codec)?;
             Ok(draft)
         };

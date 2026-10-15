@@ -90,10 +90,19 @@ fn fixture_on(
     head: bool,
     device_request: platform::DeviceRequest,
 ) -> Option<Fixture> {
-    fixture_of(tiny_definition(), 2, control, lookahead, head, device_request)
+    fixture_of(
+        tiny_definition(),
+        2,
+        control,
+        lookahead,
+        head,
+        device_request,
+        1,
+    )
 }
 
-/// A domain over `definition` launching up to `rows` rows.
+/// A domain over `definition` launching up to `rows` rows, running up to
+/// `group_capacity` prompt chunks as one layer-major group.
 fn fixture_of(
     definition: ModelDefinition,
     rows: usize,
@@ -101,6 +110,7 @@ fn fixture_of(
     lookahead: bool,
     head: bool,
     device_request: platform::DeviceRequest,
+    group_capacity: usize,
 ) -> Option<Fixture> {
     let catalog = seismic::DeviceCatalog::discover().ok()?;
     let reserves = platform::MemoryReserves::standard();
@@ -122,6 +132,7 @@ fn fixture_of(
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: 0,
         lookahead,
+        group_capacity: std::num::NonZeroUsize::new(group_capacity)?,
     };
     let capacity_bytes = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
@@ -483,25 +494,33 @@ impl ProgramFamily for TestFamily {
     }
     fn submit_target(
         &mut self,
-        launch: ValidatedTargetLaunch,
-    ) -> Result<Self::TargetSubmission, (crate::SubmitError, ValidatedTargetLaunch)> {
-        let (core, _) = launch.into_submission_parts();
+        chain: Vec<ValidatedTargetLaunch>,
+    ) -> Result<Vec<Self::TargetSubmission>, (crate::SubmitError, Vec<ValidatedTargetLaunch>)> {
+        // The fixture models ownership and completion only: a chain's
+        // launches complete as separate submissions do.
         let now = std::time::Instant::now();
-        Ok(self.submit(
-            core,
-            (),
-            crate::TargetOutput {
-                boundary: None,
-                readout: None,
-                commits: crate::CommitSpan {
-                    first: now,
-                    last: now,
-                },
-                selected_rows: None,
-                stored_reads: STORED_READS.with(|reads| std::mem::take(&mut *reads.borrow_mut())),
-                bank_step: None,
-            },
-        ))
+        Ok(chain
+            .into_iter()
+            .map(|launch| {
+                let (core, _) = launch.into_submission_parts();
+                self.submit(
+                    core,
+                    (),
+                    crate::TargetOutput {
+                        boundary: None,
+                        readout: None,
+                        commits: crate::CommitSpan {
+                            first: now,
+                            last: now,
+                        },
+                        selected_rows: None,
+                        stored_reads: STORED_READS
+                            .with(|reads| std::mem::take(&mut *reads.borrow_mut())),
+                        bank_step: None,
+                    },
+                )
+            })
+            .collect())
     }
     fn submit_head(
         &mut self,
@@ -580,7 +599,7 @@ fn queue_lookahead(
     domain
         .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
         .unwrap();
-    assert!(bindings.lookahead.is_some(), "the next chunk is queued");
+    assert!(!bindings.queue.is_empty(), "the next chunk is queued");
     bindings
 }
 
@@ -607,6 +626,89 @@ fn ready_target_can_abort_then_reconcile() {
     assert_eq!(domain.resume_state(request).unwrap().target.position(), 1);
 }
 
+/// A layer-major group queues its planned chunks behind its first, on the
+/// device with it. Until its last chunk is claimed, `group_holder` names its
+/// request (the owner submits that request's claims before any other round,
+/// which would orphan them), and each later chunk claims its queued launch.
+#[test]
+fn a_layer_major_group_is_claimed_chunk_by_chunk() {
+    let Some((mut domain, mut bindings)) = fixture_of(
+        tiny_definition(),
+        2,
+        None,
+        true,
+        false,
+        platform::DeviceRequest::Automatic,
+        3,
+    ) else {
+        return;
+    };
+    let request = RequestId(70);
+    open(&mut domain, &mut bindings, request);
+    assert_eq!(domain.group_holder(&bindings), None);
+    for position in 0..3 {
+        // The owner plans the prompt's later chunks before each round.
+        domain.plan_successors(
+            (position + 1..3)
+                .map(|next| prefill(request, next))
+                .collect(),
+        );
+        let flight =
+            submit_reserved_target(&mut domain, bindings, vec![prefill(request, position)]);
+        let (pending, reconciled) = finish_one(&mut domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        bindings = reconciled;
+        let expected = (position < 2).then_some(request);
+        assert_eq!(
+            domain.group_holder(&bindings),
+            expected,
+            "after chunk {position}"
+        );
+        assert_eq!(bindings.queue.len(), 2 - position);
+    }
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 3);
+}
+
+/// A prompt longer than one group runs in consecutive groups: the chunk
+/// after a group's last opens the next group, never queued alone.
+#[test]
+fn a_prompt_longer_than_a_group_runs_in_groups() {
+    let Some((mut domain, mut bindings)) = fixture_of(
+        tiny_definition(),
+        2,
+        None,
+        true,
+        false,
+        platform::DeviceRequest::Automatic,
+        2,
+    ) else {
+        return;
+    };
+    let request = RequestId(71);
+    open(&mut domain, &mut bindings, request);
+    let mut queued = Vec::new();
+    for position in 0..5 {
+        domain.plan_successors(
+            (position + 1..5)
+                .map(|next| prefill(request, next))
+                .collect(),
+        );
+        let flight =
+            submit_reserved_target(&mut domain, bindings, vec![prefill(request, position)]);
+        let (pending, reconciled) = finish_one(&mut domain, flight);
+        domain
+            .reconcile(pending, PhysicalDecision { accepted_rows: 1 })
+            .unwrap();
+        bindings = reconciled;
+        queued.push(bindings.queue.len());
+    }
+    // Groups of chunks 0-1 and 2-3, then chunk 4 alone.
+    assert_eq!(queued, [1, 0, 1, 0, 0]);
+    assert_eq!(domain.resume_state(request).unwrap().target.position(), 5);
+}
+
 /// Growth changes bindings: every entry that can grow resolves a queued
 /// lookahead first, then commits the slab.
 #[test]
@@ -626,7 +728,7 @@ fn growth_orphans_a_queued_lookahead_then_grows() {
     }];
     domain.provision_open(&mut bindings).unwrap();
     assert!(
-        bindings.lookahead.is_none(),
+        bindings.queue.is_empty(),
         "the growing entry orphaned the lookahead"
     );
     domain
@@ -672,7 +774,7 @@ fn drafter_work_resolves_its_requests_lookahead_before_provisioning() {
         Err(error) => panic!("provisioning drafter work failed: {error}"),
     }
     assert!(
-        bindings.lookahead.is_none(),
+        bindings.queue.is_empty(),
         "drafter work resolved the lookahead"
     );
     assert!(domain.target[&request].blocked_tails().is_empty());
@@ -1997,6 +2099,7 @@ fn selected_histories_follow_blocks_across_rollback() {
         false,
         false,
         platform::DeviceRequest::Automatic,
+        1,
     ) else {
         return;
     };

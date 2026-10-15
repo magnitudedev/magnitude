@@ -218,6 +218,20 @@ fn score(
         if operations.is_empty() {
             return Ok(());
         }
+        // A lone walk's prefill runs as the service runs a prompt: its later
+        // chunks are planned behind this one.
+        if let (true, [walk]) = (prefilling, advancing.as_slice()) {
+            let scored = walk
+                .next_rows()
+                .ok_or("a prefilling walk has no scored rows")?;
+            let position = walk.sequence.position + operations[0].row_count();
+            engine.plan_successors(Engine::prompt_chunks(
+                &walk.sequence,
+                position,
+                &walk.tokens[position..scored.start.max(position)],
+                false,
+            ));
+        }
         let starts = advancing
             .iter()
             .map(|walk| walk.sequence.position)

@@ -61,10 +61,11 @@ pub trait ProgramFamily: 'static {
             .ok_or("bound graph constant charge overflows")
     }
 
+    /// Submit a chain of target launches (`TargetProgram::submit`).
     fn submit_target(
         &mut self,
-        launch: ValidatedTargetLaunch,
-    ) -> Result<Self::TargetSubmission, (SubmitError, ValidatedTargetLaunch)>;
+        chain: Vec<ValidatedTargetLaunch>,
+    ) -> Result<Vec<Self::TargetSubmission>, (SubmitError, Vec<ValidatedTargetLaunch>)>;
     fn submit_head(
         &mut self,
         launch: ValidatedHeadLaunch,
@@ -208,9 +209,9 @@ impl ProgramFamily for NativeFamily {
 
     fn submit_target(
         &mut self,
-        launch: ValidatedTargetLaunch,
-    ) -> Result<Self::TargetSubmission, (SubmitError, ValidatedTargetLaunch)> {
-        self.target.submit(launch)
+        chain: Vec<ValidatedTargetLaunch>,
+    ) -> Result<Vec<Self::TargetSubmission>, (SubmitError, Vec<ValidatedTargetLaunch>)> {
+        self.target.submit(chain)
     }
     fn submit_head(
         &mut self,

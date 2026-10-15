@@ -2189,6 +2189,9 @@ pub(crate) struct PreparedTargetBlockGraph {
     pub per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     pub ngram: Option<NGramStepPorts>,
+    /// The step-sequence input of a streamed routed layer that sets the step
+    /// (`routed_step`): each run writes its launch's bank-step sequence.
+    pub step_sequence: Option<NativePort>,
     pub output: WorkflowTensor,
 }
 
@@ -2250,7 +2253,11 @@ pub(crate) enum BankPart {
     /// A scratch fill round's convert list of routed tensor `kind`.
     ScratchList { round: u8, kind: u8 },
     /// The list of bank slots a scratch fill copies, for tensor `kind`.
-    CopyList { kind: u8 },
+    CopyList {
+        kind: u8,
+    },
+    /// The (expert, bank slot) pairs a scratch fill seeds the bank with.
+    SeedList,
 }
 
 impl WeightPart {
@@ -2831,6 +2838,7 @@ impl PreparedTargetBlockGraph {
             taps: parts.taps,
             per_layer: parts.per_layer,
             ngram: parts.ngram,
+            step_sequence: parts.step_sequence,
             residual: parts.residual,
             output: parts.output,
         })
@@ -2872,6 +2880,8 @@ struct BlockGraphParts {
     per_layer: Option<NativePort>,
     /// What each step binds of a block with an n-gram input.
     ngram: Option<NGramStepPorts>,
+    /// The step-sequence input of a streamed routed layer that sets the step.
+    step_sequence: Option<NativePort>,
 }
 
 /// The width of block `block_index`'s input rows: the embedded rows into
@@ -2968,7 +2978,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         }
         taps.ports.middle = Some(taps.tap(graph, &mixed)?);
     }
-    let output = sublayers.feed_forward(
+    let (output, step_sequence) = sublayers.feed_forward(
         graph,
         feed_forward_entries,
         streams_entries,
@@ -3027,6 +3037,7 @@ fn block_graph<'a, G: GraphDraft + 'a>(
         taps: taps.map(|taps| taps.ports),
         per_layer,
         ngram,
+        step_sequence,
     })
 }
 
@@ -3567,6 +3578,7 @@ mod resource_template_tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let load = ModelLoadPlan::derive(
             &manifest,
@@ -3651,6 +3663,7 @@ mod resource_template_tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let mut configuration = QWEN35_CONFIGURATIONS[0];
         configuration.blocks = configuration.attention_interval;
@@ -3852,6 +3865,7 @@ mod resource_template_tests {
             max_images_per_request: 1,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         for mut configuration in [QWEN35_CONFIGURATIONS[0], QWEN35_CONFIGURATIONS[3]] {
             // One recurrent and one attention block shape.

@@ -60,12 +60,17 @@ pub type CompletedImportWork = CompletedWork<ImportLaunchCore, ResidentWeightSlo
 pub trait TargetProgram {
     type Submission: ProgramSubmission<CompletedWork = CompletedTargetWork>;
 
-    /// A rejected submission returns its still-owned launch so the domain can
-    /// terminate the group without losing state ownership.
+    /// Submit a chain of launches, each chained on the one before: every
+    /// launch's entry, then each block over every launch in chain order,
+    /// then every launch's readout, one submission per launch. A chain of
+    /// one is a step; a longer one is a layer-major prompt group, whose later
+    /// launches feed the host's tokens. A rejected chain returns its
+    /// still-owned launches so the domain can terminate its groups without
+    /// losing state ownership.
     fn submit(
         &mut self,
-        launch: ValidatedTargetLaunch,
-    ) -> Result<Self::Submission, (SubmitError, ValidatedTargetLaunch)>;
+        chain: Vec<ValidatedTargetLaunch>,
+    ) -> Result<Vec<Self::Submission>, (SubmitError, Vec<ValidatedTargetLaunch>)>;
 }
 
 pub trait HeadProgram {

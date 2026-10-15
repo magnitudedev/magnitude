@@ -115,6 +115,12 @@ pub struct ModelPolicy {
     /// model's weights the load streams its routed experts; a load that does
     /// not fit the device streams without one.
     pub weight_cap: Option<u64>,
+    /// How many of a prompt's chunks the load can run as one layer-major
+    /// group (`PrefillGroup`): by default grouped for a streamed load and one
+    /// at a time for a resident one. The load reports what it resolved
+    /// (`ResourceLimits::group_capacity`); its scheduler chooses each
+    /// round's group within it.
+    pub prefill_group: magnitude_executor::PrefillGroup,
 }
 
 impl Default for ModelPolicy {
@@ -128,6 +134,7 @@ impl Default for ModelPolicy {
             exported_logits_rows: 0,
             numerical_profile: None,
             weight_cap: None,
+            prefill_group: magnitude_executor::PrefillGroup::Auto,
         }
     }
 }
@@ -217,6 +224,8 @@ pub struct ResolvedModelPolicy {
     pub numerical_profile: Option<magnitude_executor::NumericalProfile>,
     /// The weight cap (`ModelPolicy::weight_cap`).
     pub weight_cap: Option<u64>,
+    /// The requested prompt group (`ModelPolicy::prefill_group`).
+    pub prefill_group: magnitude_executor::PrefillGroup,
 }
 
 impl ResolvedModelPolicy {
@@ -304,6 +313,7 @@ impl ModelPolicy {
             exported_logits_rows: self.exported_logits_rows,
             numerical_profile: self.numerical_profile.clone(),
             weight_cap: self.weight_cap,
+            prefill_group: self.prefill_group,
         })
     }
 }

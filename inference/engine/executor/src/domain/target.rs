@@ -1,5 +1,6 @@
 //! Target submission, completion, and row construction.
 
+use super::queue::Behind;
 use super::*;
 use crate::programs::SubmittedTarget;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,8 +78,8 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     }
 
     /// Submit one target group with state advances already reserved, or
-    /// claim the queued lookahead step it equals. A continuable group queues
-    /// its own lookahead behind it, in the bindings the flight holds until
+    /// claim the queued step it equals. The steps that run behind it
+    /// (`behind`) queue in the bindings the flight holds until
     /// `finish_target` returns them.
     pub fn submit_target(
         &mut self,
@@ -88,10 +89,10 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     ) -> Result<TargetFlight<F>, SubmitFailure<F>> {
         let work = match reservation {
             TargetGraphReservation::Claim(slots) => self
-                .claim_lookahead(&mut bindings, operations, slots)
+                .claim_queued(&mut bindings, operations, slots)
                 .map_err(SubmitFailure::Failed)?,
             TargetGraphReservation::Launch(reservation) => {
-                match self.launch_target(operations, reservation) {
+                match self.launch_target(&mut bindings, operations, reservation) {
                     Ok(work) => work,
                     Err(failure) => return Err(failure.with(bindings)),
                 }
@@ -102,29 +103,88 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         // sequences' accepted ones.
         self.feed_tokens(operations)
             .map_err(|error| SubmitFailure::Failed(DomainError::invariant(error)))?;
-        self.queue_lookahead(&mut bindings, &work, operations)
+        self.queue_successor(&mut bindings, &work, operations)
             .map_err(SubmitFailure::Failed)?;
         Ok(TargetFlight { work, bindings })
     }
 
-    /// Launch the group's target step, then a primed prompt chunk's drafter
-    /// entry behind it.
+    /// Launch the group's target step as the first of a chain: alone, or with
+    /// the rest of the layer-major group it opens (`behind`), queued behind
+    /// it. Then each primed chunk's drafter entry behind its own step. A
+    /// refused chain restores the step's accepted states and drafter entry.
     fn launch_target(
         &mut self,
+        bindings: &mut StateBindings<F>,
         operations: &[Operation],
         mut reservation: TargetLaunchReservation,
     ) -> Result<TargetWork<F>, Unsubmitted> {
         let priming = reservation.priming.take();
-        let work = match self.launch_target_graph(operations, reservation) {
-            Ok(work) => work,
+        let abort = |domain: &mut Self, priming: Option<PrimingReservation>| {
+            if let (Some(priming), [operation]) = (priming, operations) {
+                domain
+                    .head
+                    .insert(operation.request(), priming.advance.abort());
+            }
+        };
+        let (first, requests) = match self.build_target_launch(operations, reservation) {
+            Ok(built) => built,
             Err(failure) => {
-                if let (Some(priming), [operation]) = (priming, operations) {
-                    self.head
-                        .insert(operation.request(), priming.advance.abort());
-                }
+                abort(self, priming);
                 return Err(failure);
             }
         };
+        let group = match self.behind(operations) {
+            Behind::Group(chunks) => self.build_group(&first, priming.as_ref(), chunks),
+            Behind::Nothing | Behind::Successor { .. } => Ok((Vec::new(), Vec::new())),
+        };
+        let (launches, pending) = match group {
+            Ok(group) => group,
+            Err(error) => {
+                let (core, _) = first.into_submission_parts();
+                let (_, advances, _, _) = core.into_parts();
+                self.restore_advances(requests, advances);
+                abort(self, priming);
+                return Err(Unsubmitted::Failed(error));
+            }
+        };
+        let launch_trace = self.trace_target_submission(operations);
+        let started = Instant::now();
+        let chain = std::iter::once(first).chain(launches).collect();
+        let mut submissions = match self.family.submit_target(chain) {
+            Ok(submissions) => submissions.into_iter(),
+            Err((error, mut chain)) => {
+                let (core, _) = chain.remove(0).into_submission_parts();
+                let (_, advances, _, _) = core.into_parts();
+                self.restore_advances(requests, advances);
+                abort(self, priming);
+                return Err(Unsubmitted::Failed(error.into()));
+            }
+        };
+        let submission = submissions
+            .next()
+            .ok_or_else(|| Unsubmitted::Failed(DomainError::invariant("a chain submitted nothing")))?;
+        let work = TargetWork::submitted(
+            self.flight_id(),
+            requests,
+            submission,
+            launch_trace,
+            started,
+            self.selection_read.take(),
+        );
+        let work = self.attach_priming(work, operations, priming)?;
+        self.enqueue(bindings, &work, pending.into_iter().zip(submissions), started, true)
+            .map_err(Unsubmitted::Failed)?;
+        Ok(work)
+    }
+
+    /// The group's drafter entry behind its launched step, when its prompt
+    /// chunk primes one.
+    fn attach_priming(
+        &mut self,
+        work: TargetWork<F>,
+        operations: &[Operation],
+        priming: Option<PrimingReservation>,
+    ) -> Result<TargetWork<F>, Unsubmitted> {
         let Some(PrimingReservation {
             advance,
             graph_workspace,
@@ -247,11 +307,13 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         Ok(work)
     }
 
-    fn launch_target_graph(
+    /// The group's validated launch over its reserved advances, with the
+    /// requests it carries. A refusal restores the advances' accepted states.
+    fn build_target_launch(
         &mut self,
         operations: &[Operation],
         reservation: TargetLaunchReservation,
-    ) -> Result<TargetWork<F>, Unsubmitted> {
+    ) -> Result<(ValidatedTargetLaunch, TargetRequests), Unsubmitted> {
         let TargetLaunchReservation {
             advances,
             graph_workspace,
@@ -406,28 +468,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                 return Err(Unsubmitted::Failed(DomainError::Invariant(error)));
             }
         };
-        let launch_trace = self.trace_target_submission(operations);
-        let started = Instant::now();
-        let submission = match self.family.submit_target(launch) {
-            Ok(submission) => submission,
-            Err((error, launch)) => {
-                let (core, _) = launch.into_submission_parts();
-                let (_, advances, _, _) = core.into_parts();
-                self.restore_advances(metadata, advances);
-                return Err(Unsubmitted::Failed(error.into()));
-            }
-        };
-        Ok(TargetWork {
-            requests: metadata,
-            submission,
-            priming: None,
-            launch_trace,
-            started,
-            runnable: started,
-            previous_selection: self.selection_read.take(),
-            id: self.flight_id(),
-            continuation: None,
-        })
+        Ok((launch, metadata))
     }
 
     /// Completion exposes immutable outcomes while every owned advance stays

@@ -50,6 +50,7 @@ struct Options {
     numerical_profile: Option<magnitude_executor::NumericalProfile>,
     weight_cap: Option<u64>,
     lookahead: bool,
+    prefill_group: magnitude_executor::PrefillGroup,
     telemetry_endpoint: String,
     device: DeviceRequest,
     kernel_cache: Option<PathBuf>,
@@ -60,7 +61,7 @@ struct Options {
 const USAGE: &str = "magnitude-engine --model TARGET.gguf [--projector PROJECTOR.gguf | --no-projector] \
 [--draft DRAFT.gguf] [--host ADDR] [--port N] [--served-model NAME] [--context-tokens N] \
 [--output-capacity N] [--prefill-tokens N] [--method auto|plain|mtp|dflash|dspark|dflash2] [--mtp-proposals N] [--draft-budget JSON|adaptive] \
-[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--weight-cap BYTES] [--lookahead on|off] [--telemetry URL] \
+[--kv-codec dense|affine-k8v4] [--numerical-profile JSON_FILE] [--weight-cap BYTES] [--lookahead on|off] [--prefill-group auto|CHUNKS] [--telemetry URL] \
 [--device auto|metal|cuda|vulkan|cpu|SELECTOR] [--cache-dir DIR] \
 [--tuning-budget SECONDS] [--fresh-tuning] [--tuning-trace FILE]";
 
@@ -108,6 +109,7 @@ fn parse() -> Result<Options, String> {
     let mut numerical_profile = defaults.numerical_profile;
     let mut weight_cap = defaults.weight_cap;
     let mut lookahead = defaults.lookahead;
+    let mut prefill_group = defaults.prefill_group;
     let mut telemetry_endpoint = DEFAULT_TRACES_ENDPOINT.to_owned();
     let mut device = DeviceRequest::Automatic;
     let mut kernel_cache = None;
@@ -163,6 +165,7 @@ fn parse() -> Result<Options, String> {
             }
             "--weight-cap" => weight_cap = Some(number(&flag, &mut args)?),
             "--lookahead" => lookahead = switch(&flag, &value(&flag, &mut args)?)?,
+            "--prefill-group" => prefill_group = value(&flag, &mut args)?.parse()?,
             "--telemetry" => telemetry_endpoint = value(&flag, &mut args)?,
             "--device" => {
                 device = value(&flag, &mut args)?
@@ -214,6 +217,7 @@ fn parse() -> Result<Options, String> {
         numerical_profile,
         weight_cap,
         lookahead,
+        prefill_group,
         telemetry_endpoint,
         device,
         kernel_cache,
@@ -346,6 +350,7 @@ fn run() -> Result<(), String> {
             exported_logits_rows: 0,
             numerical_profile: options.numerical_profile,
             weight_cap: options.weight_cap,
+            prefill_group: options.prefill_group,
         },
         context_tokens: options.context_tokens,
         service,

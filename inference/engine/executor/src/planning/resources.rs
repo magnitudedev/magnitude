@@ -10,6 +10,7 @@ use magnitude_state::{
     ModelStateLayout, StateStore, StoreBindings,
 };
 use seismic::{BackendName, Device, Element, SlabLayout, SlabRegion};
+use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 /// The service's bounds a load plans for. None is a request-count batch
@@ -38,6 +39,56 @@ pub struct ResourceLimits {
     /// completes (cross-step pipelining): one more target launch in flight
     /// and one more successor bank per live request.
     pub lookahead: bool,
+    /// The most chunks of one prompt a launch chain runs as a layer-major
+    /// group, resolved from the requested `PrefillGroup` and whether the load
+    /// streams. One is chunk-major.
+    pub group_capacity: NonZeroUsize,
+}
+
+/// The prompt group a load requests: how many of a prompt's chunks one
+/// launch chain may run together. Chunk-major runs each chunk through every
+/// block before the next; a group of chained chunks runs block by block, each
+/// block over every chunk of the group (layer-major), so a streamed load reads
+/// each routed layer's experts once per group rather than once per chunk.
+/// Every size computes the same values; a group holds all its chunks in flight
+/// at once, and its chunks run on the device as one unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefillGroup {
+    /// `STREAMED_PREFILL_GROUP` chunks for a load that streams its routed
+    /// experts, one for a resident load, which has no read to save.
+    Auto,
+    Chunks(NonZeroUsize),
+}
+
+/// Chunks of a streamed load's prompt group under `PrefillGroup::Auto`.
+pub const STREAMED_PREFILL_GROUP: NonZeroUsize = NonZeroUsize::new(8).expect("nonzero");
+
+impl PrefillGroup {
+    /// The group capacity of a load that does or does not stream its routed
+    /// experts.
+    pub fn capacity(self, streams: bool) -> NonZeroUsize {
+        match self {
+            Self::Auto if streams => STREAMED_PREFILL_GROUP,
+            Self::Auto => NonZeroUsize::MIN,
+            Self::Chunks(chunks) => chunks,
+        }
+    }
+}
+
+impl std::str::FromStr for PrefillGroup {
+    type Err = String;
+
+    /// `auto`, or a chunk count (1 is chunk-major).
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            _ => value
+                .parse::<NonZeroUsize>()
+                .map(Self::Chunks)
+                .map_err(|_| format!("expected auto or a chunk count of at least 1, got {value}")),
+        }
+    }
 }
 
 /// The most merged cells one image encodes, whatever its model declares:
@@ -83,10 +134,11 @@ pub fn image_cell_limit(
 }
 
 impl ResourceLimits {
-    /// Target launches in flight at once: a step and, with lookahead, its
-    /// queued successor. The owner submits one launch at a time.
-    pub fn target_launches(&self) -> usize {
-        1 + usize::from(self.lookahead)
+    /// Target launches in flight at once, the longest chain the device
+    /// queues: a step and, with lookahead, its queued successor, or a prompt
+    /// group's chunks.
+    pub fn longest_chain(&self) -> usize {
+        (1 + usize::from(self.lookahead)).max(self.group_capacity.get())
     }
 
     /// The graph slots a load commits at startup: what one request needs to
@@ -95,15 +147,17 @@ impl ResourceLimits {
     /// the device's one workspace arena. The target's outputs are its
     /// residual pair: each block graph reads one and writes the other, and
     /// the device's submission order lets every launch reuse the same pair.
+    /// A prompt group interleaves its chunks' blocks, so each chunk holds its
+    /// own pair.
     /// Outputs a request retains after its launch completes (readout
     /// features, head drafts, encoded images) start at one request's need
     /// and grow one slot at a time under a heap claim.
     pub fn startup_slots(&self) -> StartupSlots {
-        let launches = self.target_launches();
+        let launches = self.longest_chain();
         StartupSlots {
             target: GraphSlots {
                 activations: launches,
-                output: 2,
+                output: 2 * self.group_capacity.get(),
             },
             readout: GraphSlots {
                 activations: launches,
@@ -1034,7 +1088,7 @@ impl ResourcePlanner {
         let bank_capacity = BankCapacity {
             active: possible_requests,
             in_flight: possible_requests
-                .checked_mul(limits.target_launches())
+                .checked_mul(limits.longest_chain())
                 .ok_or("in-flight bank count overflow")?,
             retained: possible_requests
                 .checked_add(retention_entries)

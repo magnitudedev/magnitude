@@ -1611,10 +1611,20 @@ impl<F: ProgramFamily> Service<F> {
                 }
             })
             .collect::<Vec<_>>();
-        let selection = self
-            .scheduler
-            .select(&operations, self.now)
-            .map_err(|error| (None, invariant("scheduler")(error)))?;
+        // A layer-major prompt group runs on the device as one: its request's
+        // next chunk claims the group's queued launch before any other round
+        // could orphan it.
+        let selection = match self.domain.group_holder(bindings).and_then(|holder| {
+            operations
+                .iter()
+                .find(|operation| operation.identity == holder)
+        }) {
+            Some(holder) => Some(self.scheduler.continuation(holder.identity, holder.phase)),
+            None => self
+                .scheduler
+                .select(&operations, self.now)
+                .map_err(|error| (None, invariant("scheduler")(error)))?,
+        };
         let Some(mut selection) = selection else {
             // Idle (no request is live, not merely none schedulable now):
             // release state backing well beyond what the stores need.
@@ -2203,15 +2213,14 @@ impl<F: ProgramFamily> Service<F> {
         if stop.is_some_and(|stop| stop <= end) {
             return Ok(Vec::new());
         }
-        let allowance = stop
-            .map(|stop| stop - end)
-            .into_iter()
-            .fold(self.scheduler.limits().prefill_tokens.max(1), usize::min);
-        Ok(started
-            .planned_prefill(*request, allowance)
-            .map_err(invariant("planned prefill"))?
-            .into_iter()
-            .collect())
+        started
+            .planned_prefill(
+                *request,
+                self.scheduler.limits().prefill_tokens.max(1),
+                stop,
+                self.scheduler.planned_chunks(self.domain.group_capacity()),
+            )
+            .map_err(invariant("planned prefill"))
     }
 
     /// Provision a group's state and check its reservation. A requirement

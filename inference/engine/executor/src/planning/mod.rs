@@ -27,20 +27,19 @@ pub use programs::{
     TargetProgramPlan, VisionProgramPlan,
 };
 pub use resources::{
-    GraphSlots, HistoryStorePlan, LayerHistory, MAX_IMAGE_CELLS, NativeGraphCharge, ResourceBytes,
-    ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
+    GraphSlots, HistoryStorePlan, LayerHistory, MAX_IMAGE_CELLS, NativeGraphCharge, PrefillGroup,
+    ResourceBytes, ResourceCapacity, ResourceLimits, ResourcePlan, ResourcePlanner, StartupSlots,
     StateCapacityPlan, StateResourcePlan, StateStorePlan, TensorOperations, image_cell_limit,
     reads_decoded_history,
 };
 pub use weights::{
-    BANK_KINDS, BankTensor, ExpertBankPlan,
-    AttentionBinding, AttentionShape, DenseBinding, DenseBranchBinding, DenseScales,
-    DirectoryForm, EmbeddingBinding, FeaturesBinding, HeadBinding, HostPeak, HostTablePlan,
-    ModelLoadPlan,
-    NGramBinding, ParallelBinding, PerLayerBinding, PerLayerEntryBinding, ReadoutBinding,
-    ReadoutClassChoice, ReadoutHead, RecurrentBinding, RoutedBank, RoutedBinding, ScalableWeight,
-    SelectionBinding, SelectionShape, SublayerTail, WeightPlan, WeightScalePlan, WeightStorageIdentity,
-    resident_element, resident_layout, source_element,
+    AttentionBinding, AttentionShape, BANK_KINDS, BankTensor, DenseBinding, DenseBranchBinding,
+    DenseScales, DirectoryForm, EmbeddingBinding, ExpertBankPlan, FeaturesBinding, HeadBinding,
+    HostPeak, HostTablePlan, ModelLoadPlan, NGramBinding, ParallelBinding, PerLayerBinding,
+    PerLayerEntryBinding, ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding,
+    RoutedBank, RoutedBinding, ScalableWeight, SelectionBinding, SelectionShape, SublayerTail,
+    WeightPlan, WeightScalePlan, WeightStorageIdentity, resident_element, resident_layout,
+    source_element,
 };
 
 pub(crate) use weights::{activation_dtype, packing_residue, packing_run};
@@ -330,6 +329,7 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let selection = ComponentSelection {
             head: false,
@@ -443,6 +443,7 @@ pub(crate) mod tests {
                 max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
                 max_image_cells: 0,
                 lookahead: false,
+                group_capacity: std::num::NonZeroUsize::MIN,
             },
         )
         .unwrap();
@@ -502,6 +503,7 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         let capacity_bytes = ResourceCapacity {
             domain_bytes: selected.assessment_capacity_bytes.min(512 * 1024 * 1024),
@@ -919,6 +921,7 @@ pub(crate) mod tests {
             max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
             max_image_cells: 0,
             lookahead: false,
+            group_capacity: std::num::NonZeroUsize::MIN,
         };
         for backend in [seismic::BackendName::Metal, seismic::BackendName::Cpu] {
             let Ok(selected) = crate::platform::select_device(

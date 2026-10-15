@@ -416,6 +416,12 @@ impl ValidatedTargetLaunch {
         &self.core.domain
     }
 
+    /// The advances the launch's rows commit: a layer-major group chains
+    /// each chunk's successors on the chunk before it before any is submitted.
+    pub(crate) fn advances(&self) -> &[TentativeAdvance] {
+        self.core.advances()
+    }
+
     pub(crate) fn submission_parts_mut(
         &mut self,
     ) -> (

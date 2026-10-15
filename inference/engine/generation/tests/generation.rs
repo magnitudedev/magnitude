@@ -1307,7 +1307,7 @@ fn reusable_draft_prefixes_keep_each_intermediate_history_complete() {
     let generation = resident(dflash_fresh(&prompt, 2));
     let first = start(generation, 4);
     assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 4);
-    let planned = first.planned_prefill(RequestId(1), 4).unwrap().unwrap();
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 4, None, 1).unwrap()).unwrap();
     let Operation::Forward { prime: Some(prime), .. } = planned else {
         panic!("planned prompt chunk primes the drafter")
     };
@@ -1333,7 +1333,7 @@ fn transient_draft_priming_preserves_its_final_prompt_horizon() {
     assert!(generation.method_checkpoint().is_err());
     let first = start(generation, 4);
     assert_eq!(first.round_forward().prime.as_ref().unwrap().draft_from, 16);
-    let planned = first.planned_prefill(RequestId(1), 4).unwrap().unwrap();
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 4, None, 1).unwrap()).unwrap();
     let Operation::Forward { prime: Some(prime), .. } = planned else {
         panic!("planned prompt chunk primes the drafter")
     };
@@ -1366,7 +1366,7 @@ fn mtp_cached_prefix_leaves_successor_for_the_resumed_request() {
 fn mtp_single_token_chunks_capture_without_entering_a_future_token() {
     let first = start(mtp_generation(&[1, 2, 3], 2), 1);
     assert_eq!(primed(&first), Some((vec![], 0, 1)));
-    let planned = first.planned_prefill(RequestId(1), 1).unwrap().unwrap();
+    let [planned] = <[_; 1]>::try_from(first.planned_prefill(RequestId(1), 1, None, 1).unwrap()).unwrap();
     let Operation::Forward { prime: Some(prime), .. } = planned else { panic!("planned chunk") };
     assert_eq!((prime.tokens, prime.position, prime.boundary), (vec![TokenId(2)], 0, true));
     let (generation, effects) = resolve(first, &[], Some(feature(10)));

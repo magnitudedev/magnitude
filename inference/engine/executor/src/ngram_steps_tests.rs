@@ -253,6 +253,7 @@ fn load(
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: 0,
         lookahead: true,
+        group_capacity: std::num::NonZeroUsize::MIN,
     };
     let capacity = ResourceCapacity {
         domain_bytes: selected.assessment_capacity_bytes.min(1024 * 1024 * 1024),

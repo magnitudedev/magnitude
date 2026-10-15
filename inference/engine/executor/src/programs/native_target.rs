@@ -296,11 +296,13 @@ impl TargetOutput {
     }
 }
 
-/// Runs of one step queued on the device, with the outputs they will fill.
+/// One launch of a chain once queued on the device: the outputs its runs will
+/// fill, and the chain's submitted command sequences up to and including its
+/// own last one.
 struct QueuedStep {
     readout: Option<TargetReadoutGraphResult>,
     commits: CommitSpan,
-    completions: Vec<NativeGraphCompletion>,
+    sequences: usize,
     selected_rows: Option<SelectedRead>,
     stored_reads: Vec<StoredRead>,
 }
@@ -908,65 +910,105 @@ impl NativeTargetProgram {
         Ok(sources)
     }
 
-    /// Queue every run of one step. On failure, runs already queued are
-    /// observed before the caller regains the storage they use.
-    fn queue_rows(
+    /// Queue a chain's runs (`TargetProgram::submit`): every launch's entry,
+    /// then each block over every launch in chain order, then every launch's
+    /// readout, each ending its own command sequence. `sequences` are the
+    /// launches' bank step sequences.
+    fn queue_chain(
         &self,
-        batch: &TargetBatchUpload<'_>,
-        state: &RowState<'_>,
-        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
-        graph_workspace: &mut TargetGraphWorkspaceLease,
-        graph_outputs: &mut [TargetGraphOutputLease; 2],
-    ) -> Result<QueuedStep, SubmitError> {
-        // Device-selected tokens name rows of the embedding table, which
-        // the device may not hold of a streamed one: the step's claim asks
-        // (`TargetOutput::found_selected`).
-        let selected_rows = matches!(state.tokens(), TargetTokens::Selected(_))
-            .then(|| self.graphs.embedding.read_selected());
-        let mut submitter = StepSubmitter::new(&self.device);
-        let queued = self
-            .queue_graphs(
-                batch,
-                state,
-                readout,
+        chain: &mut [ValidatedTargetLaunch],
+        sequences: &[Option<i32>],
+        submitter: &mut StepSubmitter,
+    ) -> Result<Vec<QueuedStep>, SubmitError> {
+        let mut parts = chain
+            .iter_mut()
+            .map(|launch| launch.submission_parts_mut())
+            .collect::<Vec<_>>();
+        let mut runs = Vec::with_capacity(parts.len());
+        let mut selected_rows = Vec::with_capacity(parts.len());
+        for (index, ((core, graph_workspace, graph_outputs, ..), &sequence)) in
+            parts.iter_mut().zip(sequences).enumerate()
+        {
+            let selected = matches!(core.tokens(), TargetTokens::Selected(_));
+            // A later launch's entry runs before the chain's readouts, so it
+            // cannot read a selection the chain makes.
+            if index > 0 && selected {
+                return Err(invalid("a chained launch feeds the host's tokens"));
+            }
+            // Device-selected tokens name rows of the embedding table, which
+            // the device may not hold of a streamed one: the step's claim
+            // asks (`TargetOutput::found_selected`).
+            selected_rows.push(selected.then(|| self.graphs.embedding.read_selected()));
+            let batch = core.batch().upload();
+            runs.push(Some(self.begin_run(
+                &batch,
+                &RowState(core),
+                sequence,
                 graph_workspace,
                 graph_outputs,
-                &mut submitter,
-            )
-            .and_then(|step| submitter.flush().map(|()| step));
-        match queued {
-            Ok((readout, commits)) => Ok(QueuedStep {
-                readout,
-                commits,
-                completions: submitter.completions,
-                selected_rows,
-                stored_reads: submitter.reads,
-            }),
-            Err(error) => {
-                // The failure is reported; outcomes of runs submitted before
-                // it matter only for draining the device. Runs still queued
-                // are dropped unsubmitted, and their stored-table steps
-                // read nothing.
-                let _ = wait_all(std::mem::take(&mut submitter.completions));
-                submitter.abandon_unsubmitted();
-                Err(error)
+                submitter,
+            )?));
+        }
+        for index in 0..self.geometry.blocks.len() {
+            for ((core, graph_workspace, graph_outputs, ..), run) in parts.iter_mut().zip(&mut runs)
+            {
+                let batch = core.batch().upload();
+                let current = run.take().ok_or_else(|| invalid("a chained run is absent"))?;
+                *run = Some(self.run_block(
+                    current,
+                    index,
+                    &batch,
+                    &RowState(core),
+                    graph_workspace,
+                    graph_outputs,
+                    submitter,
+                )?);
             }
         }
+        let mut steps = Vec::with_capacity(parts.len());
+        for (((core, _, graph_outputs, readout_workspace, readout_output), run), selected_rows) in
+            parts.iter_mut().zip(runs).zip(selected_rows)
+        {
+            let batch = core.batch().upload();
+            let run = run.ok_or_else(|| invalid("a chained run is absent"))?;
+            let output = readout_output
+                .take()
+                .ok_or_else(|| invalid("readout output was not reserved before submit"))?;
+            let (readout, commits) = self.finish_run(
+                run,
+                &batch,
+                &RowState(core),
+                (readout_workspace, output),
+                graph_outputs,
+                submitter,
+            )?;
+            submitter.flush()?;
+            steps.push(QueuedStep {
+                readout,
+                commits,
+                sequences: submitter.completions.len(),
+                selected_rows,
+                stored_reads: std::mem::take(&mut submitter.reads),
+            });
+        }
+        Ok(steps)
     }
 
-    fn queue_graphs(
+    /// Queue a step's entry: its embedding, conditioning overlays and
+    /// per-layer inputs. The returned run then takes its blocks in order
+    /// (`run_block`) and its readout (`finish_run`).
+    fn begin_run(
         &self,
         batch: &TargetBatchUpload<'_>,
         state: &RowState<'_>,
-        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
+        sequence: Option<i32>,
         graph_workspace: &mut TargetGraphWorkspaceLease,
         graph_outputs: &mut [TargetGraphOutputLease; 2],
         submitter: &mut StepSubmitter,
-    ) -> Result<(Option<TargetReadoutGraphResult>, CommitSpan), SubmitError> {
+    ) -> Result<TargetRun, SubmitError> {
         let rows =
             u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
         let mut pending: [Option<NativeGraphOutputs>; 2] = [None, None];
-        let mut residual = None;
         let tokens = state.tokens();
         let source = match tokens {
             TargetTokens::Host => EntryTokens::Uploaded,
@@ -1039,9 +1081,9 @@ impl NativeTargetProgram {
             .map_err(|_| invalid("segment class exceeds u64"))?;
         let slots = u64::try_from(batch.actual_slots)
             .map_err(|_| invalid("request slot class exceeds u64"))?;
-        let mut controls = GraphControls::new(batch)?;
-        let mut window = RowWindow::whole(rows);
-        let mut hidden = entry_outputs
+        let controls = GraphControls::new(batch)?;
+        let window = RowWindow::whole(rows);
+        let hidden = entry_outputs
             .exported(&entry.hidden)
             .ok_or_else(|| invalid("target embedding hidden was not exported"))?;
         let conditioning = self.conditioning_sources(state, batch)?;
@@ -1065,7 +1107,7 @@ impl NativeTargetProgram {
                 .map_err(device)?;
             submitter.queue(ready)?;
         }
-        let mut per_layer_rows = self.queue_per_layer_entry(
+        let per_layer_rows = self.queue_per_layer_entry(
             batch,
             tokens,
             rows,
@@ -1075,7 +1117,7 @@ impl NativeTargetProgram {
             submitter,
         )?;
         pending[0] = Some(entry_outputs);
-        let mut recurrent_component = 0usize;
+        let recurrent_component = 0usize;
         if self.trace.batch {
             eprintln!(
                 "target batch actual_rows={} class_rows={} actual_slots={} outputs={} selections={}",
@@ -1108,304 +1150,419 @@ impl NativeTargetProgram {
                 );
             }
         }
-        // Blocks whose outputs the step reads; the last one's output feeds
-        // the readout.
-        let mut executed = self.geometry.blocks.len();
-        for index in 0..self.geometry.blocks.len() {
-            if index == self.graphs.prepared.stateless_tail() {
-                // From here no block publishes state: run the rest over the
-                // rows the readout consumes, or not at all without any.
-                match RowWindow::consumed(batch.out_rows, rows)? {
-                    None => {
-                        executed = index;
-                        break;
-                    }
-                    Some(tail) if tail.rows < rows => {
-                        hidden = tail.slice(&hidden)?;
-                        per_layer_rows = per_layer_rows
-                            .map(|inputs| tail.slice(&inputs))
-                            .transpose()?;
-                        controls = controls.window(rows, tail);
-                        window = tail;
-                    }
-                    Some(_) => {}
+        Ok(TargetRun {
+            pending,
+            residual: None,
+            hidden,
+            per_layer_rows,
+            controls,
+            window,
+            segments,
+            slots,
+            notice,
+            recurrent_component,
+            executed: self.geometry.blocks.len(),
+            first_commit,
+            sequence,
+        })
+    }
+
+    /// Queue block `index` of a step's run. Blocks are taken in order; a
+    /// run whose stateless tail reads no rows stops before it.
+    #[allow(clippy::too_many_arguments)]
+    fn run_block(
+        &self,
+        run: TargetRun,
+        index: usize,
+        batch: &TargetBatchUpload<'_>,
+        state: &RowState<'_>,
+        graph_workspace: &mut TargetGraphWorkspaceLease,
+        graph_outputs: &mut [TargetGraphOutputLease; 2],
+        submitter: &mut StepSubmitter,
+    ) -> Result<TargetRun, SubmitError> {
+        if index >= run.executed {
+            return Ok(run);
+        }
+        let TargetRun {
+            mut pending,
+            mut residual,
+            mut hidden,
+            mut per_layer_rows,
+            mut controls,
+            mut window,
+            segments,
+            slots,
+            notice,
+            mut recurrent_component,
+            mut executed,
+            first_commit,
+            sequence,
+        } = run;
+        let rows =
+            u64::try_from(batch.class.rows()).map_err(|_| invalid("row class exceeds u64"))?;
+        if index == self.graphs.prepared.stateless_tail() {
+            // From here no block publishes state: run the rest over the
+            // rows the readout consumes, or not at all without any.
+            match RowWindow::consumed(batch.out_rows, rows)? {
+                None => {
+                    executed = index;
+                    return Ok(TargetRun {
+                        pending,
+                        residual,
+                        hidden,
+                        per_layer_rows,
+                        controls,
+                        window,
+                        segments,
+                        slots,
+                        notice,
+                        recurrent_component,
+                        executed,
+                        first_commit,
+                        sequence,
+                    });
                 }
-            }
-            let rows = window.rows;
-            let block_started = self.trace.blocks.then(Instant::now);
-            // A block with listing classes lists the history row tiles the
-            // launch's rows see in the smallest class that holds them; a
-            // launch that sees more than the largest (many requests with
-            // long histories) takes the class that lists none.
-            let listed_tiles = self
-                .graphs
-                .prepared
-                .listed_tiles(index, rows)
-                .iter()
-                .find_map(|&tiles| {
-                    let (read, _) = state.history(LayerRef::Target(index as u32)).ok()?;
-                    let visible = &controls.histories.get(read)?.visible;
-                    crate::operators::attention::graph::history_tile_bytes(
-                        visible,
-                        usize::try_from(tiles).ok()?,
-                    )
-                    .map(|bytes| (tiles, bytes))
-                });
-            // A listing class may be sealed for more segments than the
-            // launch has: its rows' spans are then padded with empty ones.
-            let block_segments = match &listed_tiles {
-                Some(_) => self.graphs.prepared.listed_segments(index, segments),
-                None => segments,
-            };
-            let scored = match self.graphs.prepared.selection(index) {
-                None => false,
-                Some(selection) => {
-                    let [_, (block_read, _)] = state.indexer(index as u32)?;
-                    let blocks = controls
-                        .histories
-                        .get(block_read)
-                        .ok_or_else(|| invalid("the batch lacks an indexer's history read"))?;
-                    selection_scores(blocks, segments, selection.blocks)
+                Some(tail) if tail.rows < rows => {
+                    hidden = tail.slice(&hidden)?;
+                    per_layer_rows = per_layer_rows
+                        .map(|inputs| tail.slice(&inputs))
+                        .transpose()?;
+                    controls = controls.window(rows, tail);
+                    window = tail;
                 }
-            };
-            let (graph, bound) = self
-                .graphs
-                .block(
-                    rows,
-                    block_segments,
-                    slots,
-                    listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
-                    scored,
-                    index,
-                )
-                .map_err(invalid)?;
-            let parity = (index + 1) % 2;
-            let mut active = graph_workspace
-                .slot_mut()
-                .activate(&graph.plan)
-                .map_err(device)?;
-            let tap_rows = graph
-                .taps
-                .as_ref()
-                .map(|_| self.tap_rows(rows))
-                .transpose()?;
-            let mut bindings = bound.bindings();
-            bindings.set(&graph.hidden, &hidden).map_err(device)?;
-            match (&graph.per_layer, &per_layer_rows) {
-                (None, _) => {}
-                (Some(port), Some(inputs)) => bindings.set(port, inputs).map_err(device)?,
-                (Some(_), None) => {
-                    return Err(invalid("a per-layer block graph has no per-layer rows"));
-                }
-            }
-            // An n-gram input reads the step's token rows: the host's, as
-            // the entry kept them, or the previous step's selection.
-            if let Some(ports) = &graph.ngram {
-                match state.tokens() {
-                    TargetTokens::Host => bindings
-                        .set(&ports.tokens, &self.kept_token_rows(rows)?)
-                        .map_err(device)?,
-                    TargetTokens::Selected(selected) => bindings
-                        .set(&ports.tokens, selected.tensor())
-                        .map_err(device)?,
-                }
-                // Its table's rows: written by the host before the step's
-                // gate opens, from the step's tokens and the ones before.
-                let table = self
-                    .graphs
-                    .stored
-                    .get(&index)
-                    .ok_or_else(|| invalid("an n-gram block has no stored table"))?;
-                let rows = self.stored_step_rows(index, batch, state, notice.as_ref())?;
-                let step = table.queue(rows).map_err(invalid)?;
-                submitter.reads(table.clone(), step.value);
-                bindings
-                    .set_timeline(ports.table.gate, &step.gate, step.value)
-                    .map_err(device)?;
-                bindings
-                    .set_timeline(ports.table.read, &step.read, step.value)
-                    .map_err(device)?;
-            }
-            if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
-                let taps = self.graphs.prepared.block_taps(index);
-                bindings.set(&ports.taps, tap_rows).map_err(device)?;
-                for (port, tap) in [
-                    (&ports.entry, taps.entry),
-                    (&ports.middle, taps.middle),
-                    (&ports.output, taps.output),
-                ] {
-                    match (port, tap) {
-                        (Some(port), Some(tap)) => active
-                            .write_input(port, &i32_bytes(&[tap as i32]))
-                            .map_err(device)?,
-                        (None, None) => {}
-                        _ => return Err(invalid("a block's tap ports differ from its taps")),
-                    }
-                }
-            }
-            match (&graph.state, &graph.controls) {
-                (
-                    BlockStatePorts::Attention(ports, indexer_planes),
-                    BlockControlPorts::Attention {
-                        coordinates,
-                        visible,
-                        fresh,
-                        destinations,
-                        history_tiles,
-                        indexer,
-                    },
-                ) => {
-                    // A selected read's indexer: its planes, and its rows'
-                    // spans and destinations in its two histories, written
-                    // as the block's own read is.
-                    match (indexer_planes, indexer) {
-                        (Some(planes), Some(tables)) => {
-                            let [(window_read, window), (block_read, blocks)] =
-                                state.indexer(index as u32)?;
-                            let [window_keys, window_coordinates] = window.as_slice() else {
-                                return Err(invalid("an indexer's raw-key planes are not two"));
-                            };
-                            let [block_keys] = blocks.as_slice() else {
-                                return Err(invalid("an indexer's block-key planes are not one"));
-                            };
-                            for (port, plane) in [
-                                (&planes.window_keys, window_keys),
-                                (&planes.window_coordinates, window_coordinates),
-                                (&planes.block_keys, block_keys),
-                            ] {
-                                bindings.set(port, plane).map_err(device)?;
-                            }
-                            for (read, visible, destinations) in [
-                                (
-                                    window_read,
-                                    &tables.window_visible,
-                                    &tables.window_destinations,
-                                ),
-                                (block_read, &tables.block_visible, &tables.block_destinations),
-                            ] {
-                                let history = controls.histories.get(read).ok_or_else(|| {
-                                    invalid("the batch lacks an indexer's history read")
-                                })?;
-                                active
-                                    .write_input(visible, &history.visible)
-                                    .map_err(device)?;
-                                active
-                                    .write_input(destinations, &history.destinations)
-                                    .map_err(device)?;
-                            }
-                        }
-                        (None, None) => {}
-                        _ => return Err(invalid("an indexer's planes and tables disagree")),
-                    }
-                    let (read, history) = state.history(LayerRef::Target(index as u32))?;
-                    if history.len() != ports.len() {
-                        return Err(invalid(
-                            "the layer's history planes disagree with its attention entry",
-                        ));
-                    }
-                    for (port, plane) in ports.iter().zip(history) {
-                        bindings.set(port, plane).map_err(device)?;
-                    }
-                    let history_controls = controls
-                        .histories
-                        .get(read)
-                        .ok_or_else(|| invalid("the batch lacks the layer's history read"))?;
-                    active
-                        .write_input(coordinates, &controls.coordinates)
-                        .map_err(device)?;
-                    match block_segments == segments {
-                        true => active.write_input(visible, &history_controls.visible),
-                        false => active.write_input(
-                            visible,
-                            &padded_spans(&history_controls.visible, segments, block_segments),
-                        ),
-                    }
-                    .map_err(device)?;
-                    active
-                        .write_input(fresh, &history_controls.fresh)
-                        .map_err(device)?;
-                    active
-                        .write_input(destinations, &history_controls.destinations)
-                        .map_err(device)?;
-                    match (history_tiles, &listed_tiles) {
-                        (Some(tiles), Some((_, bytes))) => {
-                            active.write_input(&tiles.port, bytes).map_err(device)?
-                        }
-                        (None, None) => {}
-                        _ => {
-                            return Err(invalid(
-                                "the block's graph class and its history tile list disagree",
-                            ));
-                        }
-                    }
-                }
-                (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
-                    let arenas = state.recurrent_arenas()?;
-                    for (offset, port) in ports.iter().enumerate() {
-                        bindings
-                            .set(
-                                port,
-                                arenas
-                                    .get(recurrent_component + offset)
-                                    .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
-                            )
-                            .map_err(device)?;
-                    }
-                    active
-                        .write_input(&recurrent.segments, &controls.segments)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.stop, &controls.stop)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.previous_bank, &controls.previous_bank)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.previous_tape, &controls.previous_tape)
-                        .map_err(device)?;
-                    active
-                        .write_input(&recurrent.following_bank, &controls.following_bank)
-                        .map_err(device)?;
-                }
-                _ => return Err(invalid("sealed graph block state and controls disagree")),
-            }
-            let ready = active
-                .attach(
-                    bindings,
-                    graph_outputs[parity]
-                        .activate(&graph.plan)
-                        .map_err(SubmitError::Invariant)?,
-                )
-                .map_err(device)?;
-            let outputs = submitter.queue(ready)?;
-            if let BlockStatePorts::Recurrent(ports) = &graph.state {
-                recurrent_component += ports.len();
-            }
-            residual = graph.residual.as_ref().map(|edge| outputs.exported(edge).ok_or_else(|| invalid("target residual was not exported"))).transpose()?;
-            hidden = outputs
-                .exported(&graph.output)
-                .ok_or_else(|| invalid("target block output was not exported"))?;
-            let previous = index % 2;
-            graph_outputs[previous]
-                .recycle(
-                    pending[previous]
-                        .take()
-                        .ok_or_else(|| invalid("prior target graph output is absent"))?,
-                )
-                .map_err(SubmitError::Invariant)?;
-            pending[parity] = Some(outputs);
-            if let Some(started) = block_started {
-                let kind = match &graph.state {
-                    BlockStatePorts::Attention(..) => "attention",
-                    BlockStatePorts::Recurrent(_) => "recurrent",
-                };
-                eprintln!(
-                    "target block {index} {kind} rows {rows} lists {} history tiles {:.3}s",
-                    listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
-                    started.elapsed().as_secs_f64()
-                );
+                Some(_) => {}
             }
         }
+        let rows = window.rows;
+        let block_started = self.trace.blocks.then(Instant::now);
+        // A block with listing classes lists the history row tiles the
+        // launch's rows see in the smallest class that holds them; a
+        // launch that sees more than the largest (many requests with
+        // long histories) takes the class that lists none.
+        let listed_tiles = self
+            .graphs
+            .prepared
+            .listed_tiles(index, rows)
+            .iter()
+            .find_map(|&tiles| {
+                let (read, _) = state.history(LayerRef::Target(index as u32)).ok()?;
+                let visible = &controls.histories.get(read)?.visible;
+                crate::operators::attention::graph::history_tile_bytes(
+                    visible,
+                    usize::try_from(tiles).ok()?,
+                )
+                .map(|bytes| (tiles, bytes))
+            });
+        // A listing class may be sealed for more segments than the
+        // launch has: its rows' spans are then padded with empty ones.
+        let block_segments = match &listed_tiles {
+            Some(_) => self.graphs.prepared.listed_segments(index, segments),
+            None => segments,
+        };
+        let scored = match self.graphs.prepared.selection(index) {
+            None => false,
+            Some(selection) => {
+                let [_, (block_read, _)] = state.indexer(index as u32)?;
+                let blocks = controls
+                    .histories
+                    .get(block_read)
+                    .ok_or_else(|| invalid("the batch lacks an indexer's history read"))?;
+                selection_scores(blocks, segments, selection.blocks)
+            }
+        };
+        let (graph, bound) = self
+            .graphs
+            .block(
+                rows,
+                block_segments,
+                slots,
+                listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
+                scored,
+                index,
+            )
+            .map_err(invalid)?;
+        let parity = (index + 1) % 2;
+        let mut active = graph_workspace
+            .slot_mut()
+            .activate(&graph.plan)
+            .map_err(device)?;
+        let tap_rows = graph
+            .taps
+            .as_ref()
+            .map(|_| self.tap_rows(rows))
+            .transpose()?;
+        let mut bindings = bound.bindings();
+        bindings.set(&graph.hidden, &hidden).map_err(device)?;
+        match (&graph.per_layer, &per_layer_rows) {
+            (None, _) => {}
+            (Some(port), Some(inputs)) => bindings.set(port, inputs).map_err(device)?,
+            (Some(_), None) => {
+                return Err(invalid("a per-layer block graph has no per-layer rows"));
+            }
+        }
+        // An n-gram input reads the step's token rows: the host's, as
+        // the entry kept them, or the previous step's selection.
+        if let Some(ports) = &graph.ngram {
+            match state.tokens() {
+                TargetTokens::Host => bindings
+                    .set(&ports.tokens, &self.kept_token_rows(rows)?)
+                    .map_err(device)?,
+                TargetTokens::Selected(selected) => bindings
+                    .set(&ports.tokens, selected.tensor())
+                    .map_err(device)?,
+            }
+            // Its table's rows: written by the host before the step's
+            // gate opens, from the step's tokens and the ones before.
+            let table = self
+                .graphs
+                .stored
+                .get(&index)
+                .ok_or_else(|| invalid("an n-gram block has no stored table"))?;
+            let rows = self.stored_step_rows(index, batch, state, notice.as_ref())?;
+            let step = table.queue(rows).map_err(invalid)?;
+            submitter.reads(table.clone(), step.value);
+            bindings
+                .set_timeline(ports.table.gate, &step.gate, step.value)
+                .map_err(device)?;
+            bindings
+                .set_timeline(ports.table.read, &step.read, step.value)
+                .map_err(device)?;
+        }
+        if let (Some(ports), Some(tap_rows)) = (&graph.taps, &tap_rows) {
+            let taps = self.graphs.prepared.block_taps(index);
+            bindings.set(&ports.taps, tap_rows).map_err(device)?;
+            for (port, tap) in [
+                (&ports.entry, taps.entry),
+                (&ports.middle, taps.middle),
+                (&ports.output, taps.output),
+            ] {
+                match (port, tap) {
+                    (Some(port), Some(tap)) => active
+                        .write_input(port, &i32_bytes(&[tap as i32]))
+                        .map_err(device)?,
+                    (None, None) => {}
+                    _ => return Err(invalid("a block's tap ports differ from its taps")),
+                }
+            }
+        }
+        match (&graph.state, &graph.controls) {
+            (
+                BlockStatePorts::Attention(ports, indexer_planes),
+                BlockControlPorts::Attention {
+                    coordinates,
+                    visible,
+                    fresh,
+                    destinations,
+                    history_tiles,
+                    indexer,
+                },
+            ) => {
+                // A selected read's indexer: its planes, and its rows'
+                // spans and destinations in its two histories, written
+                // as the block's own read is.
+                match (indexer_planes, indexer) {
+                    (Some(planes), Some(tables)) => {
+                        let [(window_read, window), (block_read, blocks)] =
+                            state.indexer(index as u32)?;
+                        let [window_keys, window_coordinates] = window.as_slice() else {
+                            return Err(invalid("an indexer's raw-key planes are not two"));
+                        };
+                        let [block_keys] = blocks.as_slice() else {
+                            return Err(invalid("an indexer's block-key planes are not one"));
+                        };
+                        for (port, plane) in [
+                            (&planes.window_keys, window_keys),
+                            (&planes.window_coordinates, window_coordinates),
+                            (&planes.block_keys, block_keys),
+                        ] {
+                            bindings.set(port, plane).map_err(device)?;
+                        }
+                        for (read, visible, destinations) in [
+                            (
+                                window_read,
+                                &tables.window_visible,
+                                &tables.window_destinations,
+                            ),
+                            (
+                                block_read,
+                                &tables.block_visible,
+                                &tables.block_destinations,
+                            ),
+                        ] {
+                            let history = controls.histories.get(read).ok_or_else(|| {
+                                invalid("the batch lacks an indexer's history read")
+                            })?;
+                            active
+                                .write_input(visible, &history.visible)
+                                .map_err(device)?;
+                            active
+                                .write_input(destinations, &history.destinations)
+                                .map_err(device)?;
+                        }
+                    }
+                    (None, None) => {}
+                    _ => return Err(invalid("an indexer's planes and tables disagree")),
+                }
+                let (read, history) = state.history(LayerRef::Target(index as u32))?;
+                if history.len() != ports.len() {
+                    return Err(invalid(
+                        "the layer's history planes disagree with its attention entry",
+                    ));
+                }
+                for (port, plane) in ports.iter().zip(history) {
+                    bindings.set(port, plane).map_err(device)?;
+                }
+                let history_controls = controls
+                    .histories
+                    .get(read)
+                    .ok_or_else(|| invalid("the batch lacks the layer's history read"))?;
+                active
+                    .write_input(coordinates, &controls.coordinates)
+                    .map_err(device)?;
+                match block_segments == segments {
+                    true => active.write_input(visible, &history_controls.visible),
+                    false => active.write_input(
+                        visible,
+                        &padded_spans(&history_controls.visible, segments, block_segments),
+                    ),
+                }
+                .map_err(device)?;
+                active
+                    .write_input(fresh, &history_controls.fresh)
+                    .map_err(device)?;
+                active
+                    .write_input(destinations, &history_controls.destinations)
+                    .map_err(device)?;
+                match (history_tiles, &listed_tiles) {
+                    (Some(tiles), Some((_, bytes))) => {
+                        active.write_input(&tiles.port, bytes).map_err(device)?
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(invalid(
+                            "the block's graph class and its history tile list disagree",
+                        ));
+                    }
+                }
+            }
+            (BlockStatePorts::Recurrent(ports), BlockControlPorts::Recurrent(recurrent)) => {
+                let arenas = state.recurrent_arenas()?;
+                for (offset, port) in ports.iter().enumerate() {
+                    bindings
+                        .set(
+                            port,
+                            arenas
+                                .get(recurrent_component + offset)
+                                .ok_or_else(|| invalid("recurrent bank arena is absent"))?,
+                        )
+                        .map_err(device)?;
+                }
+                active
+                    .write_input(&recurrent.segments, &controls.segments)
+                    .map_err(device)?;
+                active
+                    .write_input(&recurrent.stop, &controls.stop)
+                    .map_err(device)?;
+                active
+                    .write_input(&recurrent.previous_bank, &controls.previous_bank)
+                    .map_err(device)?;
+                active
+                    .write_input(&recurrent.previous_tape, &controls.previous_tape)
+                    .map_err(device)?;
+                active
+                    .write_input(&recurrent.following_bank, &controls.following_bank)
+                    .map_err(device)?;
+            }
+            _ => return Err(invalid("sealed graph block state and controls disagree")),
+        }
+        match (&graph.step_sequence, sequence) {
+            (None, _) => {}
+            (Some(port), Some(sequence)) => active
+                .write_input(port, &sequence.to_le_bytes())
+                .map_err(device)?,
+            (Some(_), None) => return Err(invalid("a streamed layer outside a bank step")),
+        }
+        let ready = active
+            .attach(
+                bindings,
+                graph_outputs[parity]
+                    .activate(&graph.plan)
+                    .map_err(SubmitError::Invariant)?,
+            )
+            .map_err(device)?;
+        let outputs = submitter.queue(ready)?;
+        if let BlockStatePorts::Recurrent(ports) = &graph.state {
+            recurrent_component += ports.len();
+        }
+        residual = graph
+            .residual
+            .as_ref()
+            .map(|edge| {
+                outputs
+                    .exported(edge)
+                    .ok_or_else(|| invalid("target residual was not exported"))
+            })
+            .transpose()?;
+        hidden = outputs
+            .exported(&graph.output)
+            .ok_or_else(|| invalid("target block output was not exported"))?;
+        let previous = index % 2;
+        graph_outputs[previous]
+            .recycle(
+                pending[previous]
+                    .take()
+                    .ok_or_else(|| invalid("prior target graph output is absent"))?,
+            )
+            .map_err(SubmitError::Invariant)?;
+        pending[parity] = Some(outputs);
+        if let Some(started) = block_started {
+            let kind = match &graph.state {
+                BlockStatePorts::Attention(..) => "attention",
+                BlockStatePorts::Recurrent(_) => "recurrent",
+            };
+            eprintln!(
+                "target block {index} {kind} rows {rows} lists {} history tiles {:.3}s",
+                listed_tiles.as_ref().map_or(0, |(tiles, _)| *tiles),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        Ok(TargetRun {
+            pending,
+            residual,
+            hidden,
+            per_layer_rows,
+            controls,
+            window,
+            segments,
+            slots,
+            notice,
+            recurrent_component,
+            executed,
+            first_commit,
+            sequence,
+        })
+    }
+
+    /// Queue a step's readout and boundary capture once every block is
+    /// queued, and return its readout and commit span.
+    fn finish_run(
+        &self,
+        run: TargetRun,
+        batch: &TargetBatchUpload<'_>,
+        state: &RowState<'_>,
+        readout: (&mut NativeGraphWorkspaceLease, NativeGraphOutputLease),
+        graph_outputs: &mut [TargetGraphOutputLease; 2],
+        submitter: &mut StepSubmitter,
+    ) -> Result<(Option<TargetReadoutGraphResult>, CommitSpan), SubmitError> {
+        let TargetRun {
+            mut pending,
+            residual,
+            hidden,
+            window,
+            executed,
+            first_commit,
+            ..
+        } = run;
         let (readout_workspace, readout_output) = readout;
         let result = self.graph_readout(
             batch,
@@ -1460,6 +1617,29 @@ impl NativeTargetProgram {
             },
         ))
     }
+}
+
+/// One step's queued work between its blocks: what the next block reads
+/// and the outputs still in use (`begin_run`, `run_block`, `finish_run`).
+struct TargetRun {
+    /// The two output slots blocks alternate between, the last two blocks'.
+    pending: [Option<NativeGraphOutputs>; 2],
+    residual: Option<Tensor>,
+    hidden: Tensor,
+    per_layer_rows: Option<Tensor>,
+    controls: GraphControls,
+    window: RowWindow,
+    segments: u64,
+    slots: u64,
+    notice: Option<Arc<crate::stored_table::NoticeStep>>,
+    recurrent_component: usize,
+    /// Blocks the step runs: all of them, or those before a stateless tail
+    /// whose rows nothing reads.
+    executed: usize,
+    first_commit: Instant,
+    /// The sequence of the launch's bank step on a streamed load, which its
+    /// streamed layers set the device's step to (`routed_step`).
+    sequence: Option<i32>,
 }
 
 /// The batch rows a step's blocks run over: `rows` rows (a row class) from
@@ -1636,50 +1816,70 @@ impl GraphControls {
 impl TargetProgram for NativeTargetProgram {
     type Submission = DeviceSubmission<TargetLaunchCore, TargetLaunchWorkspace, TargetOutput>;
 
+    /// Each launch is exactly the step it would be alone; a chain only
+    /// interleaves their runs, and every run still follows the runs it reads
+    /// (launch `k + 1` reads launch `k`'s history rows and successor bank at
+    /// the block it runs). A streamed load thereby fills each routed layer
+    /// once for the whole chain rather than once per launch. The device
+    /// queue completes command sequences in order, so each launch ends its
+    /// own sequence after its readout and completes with it.
     fn submit(
         &mut self,
-        mut launch: ValidatedTargetLaunch,
-    ) -> Result<Self::Submission, (SubmitError, ValidatedTargetLaunch)> {
-        let bank_step;
-        let queued = {
-            let (core, graph_workspace, graph_outputs, readout_workspace, readout_output) =
-                launch.submission_parts_mut();
-            let batch = core.batch().upload();
-            // Every step of a streamed load is bank-served or scratch-served
-            // (spec 4.5); the watcher serves its requests by sequence.
-            bank_step = self.graphs.bank.as_ref().map(|bank| bank.begin_step());
-            self.queue_rows(
-                &batch,
-                &RowState(core),
-                (
-                    readout_workspace,
-                    readout_output
-                        .take()
-                        .expect("readout output was reserved before submit"),
-                ),
-                graph_workspace,
-                graph_outputs,
-            )
+        mut chain: Vec<ValidatedTargetLaunch>,
+    ) -> Result<Vec<Self::Submission>, (SubmitError, Vec<ValidatedTargetLaunch>)> {
+        // Every step of a streamed load is bank-served or scratch-served
+        // (spec 4.5); the watcher serves its requests by sequence.
+        let bank_steps = match &self.graphs.bank {
+            Some(bank) => bank.begin_group(chain.len()).into_iter().map(Some).collect(),
+            None => chain.iter().map(|_| None).collect::<Vec<_>>(),
         };
-        let queued = match queued {
-            Ok(queued) => queued,
-            Err(error) => return Err((error, launch)),
+        let sequences = bank_steps
+            .iter()
+            .map(|step| step.as_ref().map(crate::streaming::bank::BankStep::sequence))
+            .collect::<Vec<_>>();
+        let mut submitter = StepSubmitter::new(&self.device);
+        let steps = match self.queue_chain(&mut chain, &sequences, &mut submitter) {
+            Ok(steps) => steps,
+            Err(error) => {
+                // The failure is reported; outcomes of runs submitted before
+                // it matter only for draining the device. Runs still queued
+                // are dropped unsubmitted, and their stored-table steps read
+                // nothing.
+                let _ = wait_all(std::mem::take(&mut submitter.completions));
+                submitter.abandon_unsubmitted();
+                return Err((error, chain));
+            }
         };
-        let (core, workspace) = launch.into_submission_parts();
-        let boundary = core.boundary().cloned();
-        Ok(DeviceSubmission::new(
-            self.waiter.completion(queued.completions),
-            core,
-            workspace,
-            TargetOutput {
-                boundary,
-                readout: queued.readout,
-                commits: queued.commits,
-                selected_rows: queued.selected_rows,
-                stored_reads: queued.stored_reads,
-                bank_step,
-            },
-        ))
+        let mut completions = submitter.completions.into_iter();
+        let mut taken = 0;
+        let submissions = chain
+            .into_iter()
+            .zip(bank_steps)
+            .zip(steps)
+            .map(|((launch, bank_step), step)| {
+                let runs = completions
+                    .by_ref()
+                    .take(step.sequences - taken)
+                    .collect::<Vec<_>>();
+                taken = step.sequences;
+                let (core, workspace) = launch.into_submission_parts();
+                let boundary = core.boundary().cloned();
+                DeviceSubmission::new(
+                    self.waiter.completion(runs),
+                    core,
+                    workspace,
+                    TargetOutput {
+                        boundary,
+                        readout: step.readout,
+                        commits: step.commits,
+                        selected_rows: step.selected_rows,
+                        stored_reads: step.stored_reads,
+                        bank_step,
+                    },
+                )
+            })
+            .collect();
+        Ok(submissions)
     }
 }
 

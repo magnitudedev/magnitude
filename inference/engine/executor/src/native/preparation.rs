@@ -54,9 +54,9 @@ use magnitude_kernels::{
     draft_convolve_residual, draft_gated_rows, draft_path_step, draft_top_k, feature_copy,
     feature_rows, import_dense, moe_tail, ngram_gate, ngram_inject, ngram_rows, packing_bound,
     per_layer_inputs, place_logits_rows, post_norm_residual, repack_weight, repeat_rows,
-    routed_bank_fill, routed_convert_wide, routed_copy, routed_route_streamed, routed_scratch_request,
-    routed_scratch_wait, routed_step, selection_notice, stored_rows,
-    tap_rows, widen_rows,
+    routed_bank_fill, routed_convert_wide, routed_copy, routed_route_streamed,
+    routed_scratch_request, routed_scratch_wait, routed_seed_commit, routed_step, selection_notice,
+    stored_rows, tap_rows, widen_rows,
 };
 use seismic::KernelRequest;
 use std::collections::HashSet;
@@ -2805,6 +2805,11 @@ impl<'a> Preparation<'a> {
             &[("C", scratch_control)],
             routed_scratch_wait::native_entry(),
         )?;
+        let seed_commit = spec.fixed(
+            &bindings,
+            &[("C", scratch_control)],
+            routed_seed_commit::native_entry(),
+        )?;
         let mut copy = Vec::with_capacity(3);
         for resident in residents {
             copy.push(spec.fixed(
@@ -2828,11 +2833,23 @@ impl<'a> Preparation<'a> {
         Ok(
             match (
                 (step, route, fill),
-                (scratch_request, scratch_wait, copy, convert_wide),
+                (
+                    scratch_request,
+                    scratch_wait,
+                    copy,
+                    seed_commit,
+                    convert_wide,
+                ),
             ) {
                 (
                     (Some(step), Some(route), Some(fill)),
-                    (Some(scratch_request), Some(scratch_wait), Some(copy), Some(convert_wide)),
+                    (
+                        Some(scratch_request),
+                        Some(scratch_wait),
+                        Some(copy),
+                        Some(seed_commit),
+                        Some(convert_wide),
+                    ),
                 ) => Some(StreamedRoutedKernels {
                     step,
                     route,
@@ -2840,6 +2857,7 @@ impl<'a> Preparation<'a> {
                     scratch_request,
                     scratch_wait,
                     copy,
+                    seed_commit,
                     convert_wide,
                 }),
                 _ => None,

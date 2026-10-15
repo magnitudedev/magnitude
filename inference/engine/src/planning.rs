@@ -62,7 +62,13 @@ pub fn plan_execution(
         manifest.model.kv_codec,
         limits,
     )
-    .and_then(|draft| draft.with_weight_cap(&manifest.definition, manifest.model.weight_cap))
+    .and_then(|draft| {
+        draft.with_weight_cap(
+            &manifest.definition,
+            manifest.model.weight_cap,
+            manifest.model.prefill_group,
+        )
+    })
     .map_err(ExecutionPlanningError::Plan)
 }
 
@@ -176,6 +182,9 @@ fn resource_limits(
         max_images_per_request: magnitude_artifacts::MAX_IMAGES_PER_REQUEST,
         max_image_cells: image_cells,
         lookahead,
+        // A resident load's; a streamed plan resolves its own
+        // (`ExecutionPlanDraft::with_weight_cap`).
+        group_capacity: model.prefill_group.capacity(false),
     })
 }
 
@@ -190,6 +199,7 @@ mod tests {
             method: ResolvedMethod::Plain,
             kv_codec: KvCodec::AffineK8V4,
             lookahead: false,
+            prefill_group: magnitude_executor::PrefillGroup::Auto,
             exported_logits_rows,
             numerical_profile: None,
             weight_cap: None,

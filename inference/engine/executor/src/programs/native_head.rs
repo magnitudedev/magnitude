@@ -944,7 +944,7 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     class: (pass == 0).then_some("head_entry_rows"),
                 };
                 graph.set_class_scope((pass == 0).then_some("head-entry-routed"));
-                let output = routed::routed(
+                let (output, None) = routed::routed(
                     &mut graph,
                     RoutedGraphEntries {
                         route: entries.route,
@@ -972,7 +972,10 @@ fn head_graph_draft<'a, G: GraphDraft + 'a>(
                     hidden,
                     &shape,
                     epsilon,
-                )?;
+                )?
+                else {
+                    return Err("a head block with a streamed routed layer".into());
+                };
                 graph.set_class_scope((pass == 0).then_some("head-entry"));
                 output
             }

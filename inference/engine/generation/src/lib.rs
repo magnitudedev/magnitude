@@ -715,33 +715,53 @@ impl Generation {
         &self,
         forward: &RoundForward,
         request: RequestId,
-        allowance: usize,
-    ) -> Result<Option<Operation>, String> {
+        chunk_rows: usize,
+        stop: Option<usize>,
+        chunks: usize,
+    ) -> Result<Vec<Operation>, String> {
         if forward.kind != WorkKind::Prefill
             || !forward.selects.is_empty()
             || forward.committed != forward.tokens.len()
             || !self.layout.spans().is_empty()
             || self.finish.is_some()
-            || allowance == 0
+            || chunk_rows == 0
         {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        let position = self.resident_position + forward.tokens.len();
-        if position < self.reconciliation_target || position >= self.prompt.len() {
-            return Ok(None);
+        let mut position = self.resident_position + forward.tokens.len();
+        if position < self.reconciliation_target {
+            return Ok(Vec::new());
         }
-        let drafter = forward
+        let mut drafter = forward
             .prime
             .as_ref()
             .map(|prime| prime.position + prime.tokens.len());
-        let end = self
-            .layout
-            .chunk_end(position, self.prompt.len(), allowance)?;
-        self.prefill_round(position, end, drafter)?
-            .forward()
-            .clone()
-            .into_operation(request, position, None)
-            .map(Some)
+        let mut planned = Vec::new();
+        while planned.len() < chunks && position < self.prompt.len() {
+            let allowance =
+                chunk_rows.min(stop.map_or(usize::MAX, |stop| stop.saturating_sub(position)));
+            if allowance == 0 {
+                break;
+            }
+            let end = self
+                .layout
+                .chunk_end(position, self.prompt.len(), allowance)?;
+            let next = self
+                .prefill_round(position, end, drafter)?
+                .forward()
+                .clone();
+            let selects = !next.selects.is_empty();
+            drafter = next
+                .prime
+                .as_ref()
+                .map(|prime| prime.position + prime.tokens.len());
+            planned.push(next.into_operation(request, position, None)?);
+            if selects {
+                break;
+            }
+            position = end;
+        }
+        Ok(planned)
     }
 
     /// One selection per proposal, keyed like the target's selection of the
@@ -1236,17 +1256,22 @@ impl StartedRound {
         self.round.publication_bound()
     }
 
-    /// The prompt chunk of at most `allowance` rows that follows this round
-    /// once it commits, when that is known now: the round is a prompt chunk
-    /// that selects nothing, and the prompt is plain text (a conditioned
-    /// span's rows need its encoding).
+    /// The prompt chunks that follow this round once it commits, when they
+    /// are known now: the round is a prompt chunk that selects nothing, and
+    /// the prompt is plain text (a conditioned span's rows need its
+    /// encoding). At most `chunks` of them, each at most `chunk_rows` rows and
+    /// none past `stop`: the chunks a lookahead or a layer-major prompt group
+    /// queues behind it. Each chunk's drafter entry follows the one before it;
+    /// planning ends with the chunk that selects the first token.
     pub fn planned_prefill(
         &self,
         request: RequestId,
-        allowance: usize,
-    ) -> Result<Option<Operation>, String> {
+        chunk_rows: usize,
+        stop: Option<usize>,
+        chunks: usize,
+    ) -> Result<Vec<Operation>, String> {
         self.generation
-            .planned_prefill(self.round.forward(), request, allowance)
+            .planned_prefill(self.round.forward(), request, chunk_rows, stop, chunks)
     }
 
     /// Prepare acceptance, grammar, method effects, counters, and publication

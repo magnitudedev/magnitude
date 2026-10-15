@@ -154,6 +154,27 @@ impl Scheduler {
             contended,
         }))
     }
+    /// The prompt chunks to plan behind a prompt chunk, for a load that runs
+    /// up to `group_capacity` of them as one layer-major group: the rest of a
+    /// full group, or without grouping the one chunk a pipelined successor
+    /// may run. A group is one unit on the device, so its size bounds how
+    /// long other requests' decode waits; this policy groups to capacity.
+    pub fn planned_chunks(&self, group_capacity: usize) -> usize {
+        group_capacity.saturating_sub(1).max(1)
+    }
+
+    /// The round that continues `identity`'s work already on the device (a
+    /// layer-major prompt group's queued chunks), ahead of every other
+    /// candidate. It is charged under the current contention, so the time
+    /// the group took is owed to decode as any prefill round's.
+    pub fn continuation(&self, identity: RequestId, phase: Phase) -> Selection {
+        Selection {
+            phase,
+            requests: vec![identity],
+            contended: self.contended,
+        }
+    }
+
     pub fn completed(&mut self, selection: Selection, elapsed_ns: u64) {
         self.completed_service_ns += u128::from(elapsed_ns);
         if selection.contended {

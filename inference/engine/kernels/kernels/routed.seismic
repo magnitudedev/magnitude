@@ -1420,27 +1420,29 @@ native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
 # into their scratch slots, by the registered GGUF -> resident conversion:
 # `list[0]` is the step sequence the list was written for and `list[1]` the
 # count n; record i < n is staging record list[2 + 2 i] into slot
-# list[3 + 2 i]. A list written for another step converts nothing. R bounds
-# n.
-fn routed_convert_wide[R, S, N, K](source: &tensor[R, N, K] E,
-    list: &tensor[2 + 2 * R] i32, step: &tensor[1] i32,
+# list[3 + 2 i]. A list written for another step converts nothing. L bounds
+# n: a round lists at most L of the R staging records.
+fn routed_convert_wide[R, L, S, N, K](source: &tensor[R, N, K] E,
+    list: &tensor[2 + 2 * L] i32, step: &tensor[1] i32,
     destination: &mut tensor[S, N, K] U):
     if list[0] == step[0]:
-        for record in 0..R:
+        for record in 0..L:
             if record < list[1]:
                 destination[list[3 + 2 * record], :, :] = repack[U = U](source[list[2 + 2 * record], :, :])
 
 native routed_convert_wide for metal from "metal/routed_convert_wide.metal":
     launch routed_convert_wide:
-        threadgroups (ceil_div(N, 32) * 2, R, 1)
+        threadgroups (ceil_div(N, 32) * 2, L, 1)
         threads_per_threadgroup (256, 1, 1)
 
-# Expert streaming, the step sequence (4.3): the first routed layer of every
-# bank-served step advances it, before any entry of the step reads it. The
-# host counts the same steps in submission order, so it knows each step's
-# sequence without reading it.
-fn routed_step(step: &mut tensor[1] i32):
-    step[0] = step[0] + 1
+# Expert streaming, the step sequence (4.3): a bank-served step sets it to its
+# own sequence, the host's count of the step (`sequence`, a word the host
+# wrote before submitting the step), before any of its entries read it. A
+# step sets it at its first streamed layer; a scratch-served step at each of
+# its streamed layers, since a layer-major prompt group interleaves its
+# chunks' layers on the device.
+fn routed_step(step: &mut tensor[1] i32, sequence: &tensor[1] i32):
+    step[0] = sequence[0]
 
 native routed_step for metal from "metal/routed_step.metal":
     launch routed_step:
@@ -1555,20 +1557,50 @@ native routed_bank_fill for metal from "metal/routed_bank_fill.metal":
         threads_per_threadgroup (256, 1, 1)
         shared_bytes (16384)
 
-# The listed bank slots into their scratch slots, byte for byte: `list[0]`
+# Listed records of `source` into `destination`, byte for byte: `list[0]`
 # is the step sequence the list was written for and `list[1]` the count n;
-# entry i < n copies bank slot list[2 + 2 i] to scratch slot list[3 + 2 i].
-# A list written for another step copies nothing.
-fn routed_copy[S, E, N, K](bank: &tensor[S, N, K] U, list: &tensor[2 + 2 * E] i32,
-    step: &tensor[1] i32, scratch: &mut tensor[E, N, K] U):
+# entry i < n copies source record list[2 + 2 i] to destination record
+# list[3 + 2 i]. A list written for another step copies nothing. A scratch
+# fill copies its bank hits into the scratch bank, and seeds the bank with the
+# experts it converted by copying them from the scratch bank into the bank
+# slots placed for them.
+fn routed_copy[S, D, E, N, K](source: &tensor[S, N, K] U, list: &tensor[2 + 2 * E] i32,
+    step: &tensor[1] i32, destination: &mut tensor[D, N, K] U):
     if list[0] == step[0]:
         for entry in 0..E:
             if entry < list[1]:
-                scratch[list[3 + 2 * entry], :, :] = bank[list[2 + 2 * entry], :, :]
+                destination[list[3 + 2 * entry], :, :] = source[list[2 + 2 * entry], :, :]
 
 # Metal: 8 threadgroup rows stride over the list entries; 64 threadgroups
 # of 256 threads stride over each matrix's bytes in 16-byte vectors.
 native routed_copy for metal from "metal/routed_copy.metal":
     launch routed_copy:
         threadgroups (64, 8, 1)
+        threads_per_threadgroup (256, 1, 1)
+
+# A scratch fill's seeding (spec 4.9): once `routed_copy` placed the experts
+# it converted for the launch into their bank slots, each listed (expert,
+# slot) pair's slot is stamped with the step and, when the step has not
+# failed (`control` is the layer's scratch request region), committed: the
+# expert's map entry names the slot and `commits[slot]` the step. The bank
+# then holds what the prompt read, as a decode step's fill leaves it.
+fn routed_seed_commit[E, X, BANK, C](list: &tensor[2 + 2 * E] i32, step: &tensor[1] i32,
+    control: &tensor[C] i32, slot_map: &mut tensor[X] i32, stamps: &mut tensor[BANK] i32,
+    commits: &mut tensor[BANK] i32)
+    where C >= 4:
+    if list[0] == step[0] and control[2] != step[0]:
+        for entry in 0..E:
+            if entry < list[1]:
+                let expert = list[2 + 2 * entry]
+                let slot = list[3 + 2 * entry]
+                if expert >= 0 and expert < X and slot >= 0 and slot < BANK:
+                    stamps[slot] = step[0]
+                    slot_map[expert] = slot
+                    commits[slot] = step[0]
+
+# Metal: one threadgroup strides over the list, publishing every map entry
+# under a system-scope fence before any commit.
+native routed_seed_commit for metal from "metal/routed_seed_commit.metal":
+    launch routed_seed_commit:
+        threadgroups (1, 1, 1)
         threads_per_threadgroup (256, 1, 1)

@@ -71,7 +71,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if !self.target.is_empty() || !self.head.is_empty() || !self.input.is_empty() {
             return Ok(0);
         }
-        self.orphan_lookahead(bindings)
+        self.orphan_queue(bindings)
             .map_err(|error| error.to_string())?;
         let before = self.domain.device().memory_usage().charged;
         self.family.unbind_optional();
@@ -272,7 +272,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         if self.claim_slots(bindings, operations).is_some() {
             return Ok(());
         }
-        self.orphan_lookahead(bindings)?;
+        self.orphan_queue(bindings)?;
         for operation in operations {
             if let Operation::Forward { request, .. } | Operation::Head { request, .. } = operation
             {
@@ -281,23 +281,20 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         }
         let mut target = Vec::new();
         let mut head = Vec::new();
-        // A continuable step also queues its lookahead, which follows it by
-        // one row and one bank.
-        let lookahead = self.execution.policy().limits().lookahead;
+        // The steps queued behind the group (`behind`) each follow the one
+        // before by their rows and one bank.
+        let behind = self.behind(operations);
         let mut target_banks = 0usize;
         let mut head_banks = 0usize;
         for operation in operations {
             let rows = operation.row_count();
             match operation {
                 Operation::Forward { request, prime, .. } => {
-                    let next = lookahead
-                        .then(|| self.successor_of(operation))
-                        .flatten()
-                        .map(|(next, _)| next);
-                    // A primed chunk's drafter entry, and the entry of the
-                    // chunk queued behind it.
-                    let entries = [prime.as_ref(), next.as_ref().and_then(primed)]
-                        .into_iter()
+                    let queued = behind.of(*request).collect::<Vec<_>>();
+                    // A primed chunk's drafter entry, and the entries of the
+                    // chunks queued behind it.
+                    let entries = std::iter::once(prime.as_ref())
+                        .chain(queued.iter().copied().map(primed))
                         .flatten()
                         .map(|prime| prime.tokens.len())
                         .collect::<Vec<_>>();
@@ -306,9 +303,9 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
                         head_banks += entries.len();
                     }
                     if let Some(state) = self.target.get(request) {
-                        let ahead = next.as_ref().map_or(0, Operation::row_count);
+                        let ahead = queued.iter().copied().map(Operation::row_count).sum::<usize>();
                         target.extend(state.demands(rows + ahead));
-                        target_banks += 1 + usize::from(ahead != 0);
+                        target_banks += 1 + queued.len();
                     }
                 }
                 Operation::Head { request, .. } => {
@@ -596,7 +593,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
     /// Commit the successor banks a newly opened request needs. Free banks
     /// change no bindings and leave a queued lookahead running.
     pub fn provision_open(&mut self, bindings: &mut StateBindings<F>) -> Result<(), DomainError> {
-        self.orphan_lookahead(bindings)?;
+        self.orphan_queue(bindings)?;
         let requirements = self.open_requirements();
         self.grant_state_growth(bindings, false, &[], requirements.target_banks())?;
         if self.head_store.is_some() {
@@ -615,7 +612,7 @@ impl<F: ProgramFamily> ExecutorDomain<F> {
         bindings: &mut StateBindings<F>,
         policy: ShrinkPolicy,
     ) -> Result<u64, DomainError> {
-        self.orphan_lookahead(bindings)?;
+        self.orphan_queue(bindings)?;
         let mut released = self.shrink_store(bindings, false, policy)?;
         if self.head_store.is_some() {
             released += self.shrink_store(bindings, true, policy)?;

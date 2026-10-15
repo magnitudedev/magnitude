@@ -845,8 +845,8 @@ pub struct StagingPoolPlan {
 
 impl ExpertBankPlan {
     /// Staging records per pool (`streaming::layout::staging_records`).
-    pub fn staging_records_for(selected: u64) -> u64 {
-        crate::streaming::layout::staging_records(selected)
+    pub fn staging_records_for(experts: u64, selected: u64) -> u64 {
+        crate::streaming::layout::staging_records(experts, selected)
     }
 
     /// Words of a layer's request region: the request, acknowledgement,
@@ -869,16 +869,15 @@ impl ExpertBankPlan {
     }
 
     /// Words of a convert list: the step sequence it was written for and
-    /// the count, then a (record, slot) pair per staging record
-    /// (`routed_convert_wide`).
+    /// the count, then a (record, slot) pair per record its round stages
+    /// (`routed_convert_wide`, whose grid has a row per pair).
     pub fn list_words(&self) -> u64 {
-        2 + 2 * self.staging_records
+        2 + 2 * self.round_records()
     }
 
-    /// Records a scratch fill stages per round: half the pool, so one half
-    /// fills while the device converts the other (spec 4.9).
+    /// Records a scratch fill stages per round (spec 4.9).
     pub fn round_records(&self) -> u64 {
-        self.staging_records / 2
+        crate::streaming::layout::scratch_round_records(self.selected)
     }
 
     /// Rounds a scratch-served layer's graph holds: enough to deliver
@@ -892,15 +891,17 @@ impl ExpertBankPlan {
         crate::streaming::layout::scratch_control_words(self.rounds())
     }
 
-    /// Words of a copy list: the step sequence and the count, then a (bank
-    /// slot, expert) pair per expert a scratch fill can copy (`routed_copy`).
+    /// Words of a copy or seed list: the step sequence and the count, then a
+    /// (source, destination) pair per expert a scratch fill can copy or seed
+    /// (`routed_copy`, `routed_seed_commit`).
     pub fn copy_list_words(&self) -> u64 {
         2 + 2 * self.experts
     }
 
     /// Bytes a streamed load holds beside its banks: the scratch banks, the
     /// staging pools, every layer's directory words, each bank group's stamps
-    /// and commits, and the load's step, heartbeat and scratch fill words.
+    /// and commits, and the load's step, heartbeat and scratch fill words
+    /// (flags, convert, copy and seed lists).
     pub fn charged_bytes(&self) -> Result<u64, String> {
         let shared = self.shared.as_ref().ok_or("a streamed load without its shared bank plan")?;
         let layer = self.experts
@@ -911,7 +912,8 @@ impl ExpertBankPlan {
         let groups = shared.groups.iter().try_fold(0u64, |n, group| {
             n.checked_add(2 * group.records).ok_or("bank group words overflow")
         })?;
-        let load = 2 + self.experts + 3 * self.rounds() * self.list_words() + 3 * self.copy_list_words();
+        let load =
+            2 + self.experts + 3 * self.rounds() * self.list_words() + 4 * self.copy_list_words();
         let directory = layer
             .checked_mul(self.layers.len() as u64)
             .and_then(|words| words.checked_add(groups + load))
@@ -1646,7 +1648,7 @@ impl ModelLoadPlan {
             slots,
             experts,
             selected,
-            staging_records: ExpertBankPlan::staging_records_for(selected),
+            staging_records: ExpertBankPlan::staging_records_for(experts, selected),
             layers: bank_layers,
             pools,
             scratch,

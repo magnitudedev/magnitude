@@ -86,7 +86,12 @@ const ENTRY_EXCEPTIONS: &[(&str, &[BackendName], &str)] = &[
     (
         "routed_copy",
         &[BackendName::Metal],
-        "expert streaming's copy of bank slots into the scratch bank; Metal first, with `routed_route_streamed`",
+        "expert streaming's copy of listed records between the bank and the scratch bank; Metal first, with `routed_route_streamed`",
+    ),
+    (
+        "routed_seed_commit",
+        &[BackendName::Metal],
+        "expert streaming's commit of the experts a scratch fill seeded into the bank, published to the host through system-coherent memory; Metal first, with `routed_route_streamed`",
     ),
     (
         "routed_step",

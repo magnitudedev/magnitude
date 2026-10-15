@@ -19,8 +19,8 @@ use magnitude_kernels::{
 };
 use magnitude_kernels::{short_conv_project, short_conv_rows};
 use magnitude_kernels::{
-    routed_bank_fill, routed_convert_wide, routed_copy, routed_route_streamed, routed_scratch_request,
-    routed_scratch_wait, routed_step,
+    routed_bank_fill, routed_convert_wide, routed_copy, routed_route_streamed,
+    routed_scratch_request, routed_scratch_wait, routed_seed_commit, routed_step,
 };
 use seismic::NativeKernel;
 use std::collections::HashMap;
@@ -216,10 +216,12 @@ pub struct StreamedRoutedKernels {
     /// The park and conversion of the absent experts into their slots.
     pub fill: NativeKernel<routed_bank_fill::Entry>,
     /// The scratch-served classes' fill (spec 4.9): the request, a round's
-    /// park, and the copy of bank slots per routed tensor.
+    /// park, the listed copy between the bank and the scratch bank per routed
+    /// tensor (hits in, seeded experts out), and the seeding's commit.
     pub scratch_request: NativeKernel<routed_scratch_request::Entry>,
     pub scratch_wait: NativeKernel<routed_scratch_wait::Entry>,
     pub copy: [NativeKernel<routed_copy::Entry>; 3],
+    pub seed_commit: NativeKernel<routed_seed_commit::Entry>,
     /// A round's convert, per routed tensor: every record of the round at
     /// once.
     pub convert_wide: [NativeKernel<routed_convert_wide::Entry>; 3],

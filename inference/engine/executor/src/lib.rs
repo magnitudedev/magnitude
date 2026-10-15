@@ -104,7 +104,7 @@ pub use planning::{
     GraphSlots, HeadBinding, HeadProgramPlan, HostTablePlan, ImportProgramSlot,
     MAX_DRAFT_PROPOSALS, MAX_IMAGE_CELLS, MarkovBinding, MixerProgramSlot, ModelLoadPlan,
     NGramBinding, NativeGraphCharge, ParallelBinding, PerLayerBinding, PerLayerEntryBinding,
-    PlannedDevice, PlannedMethod, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead,
+    PlannedDevice, PlannedMethod, PrefillGroup, ProgramPlan, ReadoutBinding, ReadoutClassChoice, ReadoutHead,
     RecurrentBinding, ResolvedPolicy, ResourceBytes, ResourceCapacity, ResourceLimits,
     ResourcePlan, ResourcePlanner, RoutedBank, RoutedBinding, ScalableWeight, SealedGraphHostBytes,
     SelectionBinding, SelectionShape, SelectorBinding, SharedHeadProgramPlan, StartupSlots, StateCapacityPlan, StateProgramPlan,

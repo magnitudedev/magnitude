@@ -281,6 +281,11 @@ struct EngineArgs {
     /// load streams its routed experts.
     #[arg(long, value_name = "BYTES")]
     weight_cap: Option<u64>,
+    /// How many of a prompt's chunks run as one layer-major group: auto
+    /// (grouped for a streamed load, one at a time for a resident one) or a
+    /// chunk count (1 is chunk-major).
+    #[arg(long, value_name = "CHUNKS", default_value = "auto", value_parser = str::parse::<magnitude_executor::PrefillGroup>)]
+    prefill_group: magnitude_executor::PrefillGroup,
     /// Seconds the first load of a model spends tuning.
     #[arg(long, value_name = "SECONDS", default_value_t = STANDARD_TUNING_BUDGET.as_secs_f64())]
     tuning_budget: f64,
@@ -425,6 +430,7 @@ fn engine_options(
                 .map_err(|error| format!("--kv-codec: {error}"))?,
             numerical_profile,
             weight_cap: engine.weight_cap,
+            prefill_group: engine.prefill_group,
             budget,
             fresh: Cell::new(engine.fresh_tuning),
             tuning_trace: inputs.run.path(tuning::TRACE),

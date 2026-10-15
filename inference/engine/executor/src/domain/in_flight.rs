@@ -48,16 +48,19 @@ pub(super) struct PrimingFlight<H> {
     pub(super) continuation: Option<Option<InFlightState>>,
 }
 
-/// One submitted target step: a group's flight, or the lookahead queued
-/// behind one.
+/// Per request of a target step: its rows, conditioning, work kind and
+/// committed rows.
+pub(super) type TargetRequests = Vec<(
+    RequestId,
+    usize,
+    Option<crate::ConditioningRef>,
+    WorkKind,
+    usize,
+)>;
+
+/// One submitted target step: a group's flight, or a step queued behind one.
 pub(super) struct TargetWork<F: ProgramFamily> {
-    pub(super) requests: Vec<(
-        RequestId,
-        usize,
-        Option<crate::ConditioningRef>,
-        WorkKind,
-        usize,
-    )>,
+    pub(super) requests: TargetRequests,
     pub(super) submission: F::TargetSubmission,
     /// The drafter entry of the step's prompt chunk, when it primes one.
     pub(super) priming: Option<PrimingFlight<F::HeadSubmission>>,
@@ -77,6 +80,31 @@ pub(super) struct TargetWork<F: ProgramFamily> {
     /// advance attaches to at finish, or `None` for a slot nobody claimed
     /// (its rows are discarded). `None` for an ordinary step.
     pub(super) continuation: Option<Vec<Option<InFlightState>>>,
+}
+
+impl<F: ProgramFamily> TargetWork<F> {
+    /// A step just submitted at `started`: runnable from then, with no
+    /// drafter entry yet and no claimed continuation.
+    pub(super) fn submitted(
+        id: u64,
+        requests: TargetRequests,
+        submission: F::TargetSubmission,
+        launch_trace: Option<seismic::SubmissionTrace>,
+        started: Instant,
+        previous_selection: Option<Instant>,
+    ) -> Self {
+        Self {
+            requests,
+            submission,
+            priming: None,
+            launch_trace,
+            started,
+            runnable: started,
+            previous_selection,
+            id,
+            continuation: None,
+        }
+    }
 }
 
 pub struct TargetFlight<F: ProgramFamily = NativeFamily> {

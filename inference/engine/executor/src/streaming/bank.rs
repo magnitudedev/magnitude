@@ -20,8 +20,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 pub(crate) struct ResidentBank {
     pub tensors: BankTensors,
     runtime: StreamingRuntime,
-    /// The sequence of the last bank-served step submitted: the device's
-    /// step word as `routed_step` will have advanced it (4.3).
+    /// The sequence of the last step submitted (4.3).
     submitted: AtomicI32,
 }
 
@@ -35,6 +34,12 @@ pub(crate) struct BankStep {
 }
 
 impl BankStep {
+    /// The step's sequence, which its streamed layers set the device's step
+    /// to (`routed_step`).
+    pub(crate) fn sequence(&self) -> i32 {
+        self.sequence
+    }
+
     pub(crate) fn complete(mut self) -> Result<(), String> {
         self.completed = true;
         self.bank.runtime.step_completed(self.sequence, true)
@@ -123,8 +128,10 @@ impl ResidentBank {
         SharedWords::new(tensors.step.clone())?.fill(0);
         let records =
             u32::try_from(plan.staging_records).map_err(|_| "staging records exceed u32")?;
-        let prefetch = u32::try_from(crate::streaming::layout::prefetch_records(plan.selected))
-            .map_err(|_| "prefetch records exceed u32")?;
+        let hints = u32::try_from(crate::streaming::layout::hint_records(plan.selected))
+            .map_err(|_| "hint records exceed u32")?;
+        let conveyor = u32::try_from(crate::streaming::layout::conveyor_records(plan.experts))
+            .map_err(|_| "conveyor records exceed u32")?;
         let pools = plan
             .pools
             .iter()
@@ -133,7 +140,8 @@ impl ResidentBank {
                 Ok(StagingPool::new(
                     SharedBytes::new(tensor.clone())?,
                     records,
-                    prefetch,
+                    hints,
+                    conveyor,
                     pool.record_bytes,
                 ))
             })
@@ -152,6 +160,7 @@ impl ResidentBank {
                 let [gate, up, down] = &tensors.copy_lists;
                 [words(gate)?, words(up)?, words(down)?]
             },
+            words(&tensors.seed_list)?,
             usize::try_from(plan.experts).map_err(|_| "experts exceed the host")?,
             usize::try_from(plan.round_records()).map_err(|_| "round records exceed the host")?,
         );
@@ -164,15 +173,20 @@ impl ResidentBank {
         })
     }
 
-    /// A step is being submitted, bank-served or scratch-served (spec 4.5);
-    /// steps run in submission order, so its sequence is the next one.
-    pub(crate) fn begin_step(self: &Arc<Self>) -> BankStep {
-        let sequence = self.submitted.fetch_add(1, Ordering::AcqRel) + 1;
-        self.runtime.step_submitted();
-        BankStep {
-            bank: Arc::clone(self),
-            sequence,
-            completed: false,
-        }
+    /// `count` steps are being submitted as one chain, bank-served or
+    /// scratch-served (spec 4.5): one step, or a layer-major group, which
+    /// interleaves their streamed layers on the device. Their sequences are
+    /// the next `count`, in chain order.
+    pub(crate) fn begin_group(self: &Arc<Self>, count: usize) -> Vec<BankStep> {
+        let count = i32::try_from(count).expect("a layer-major group's steps fit i32");
+        let first = self.submitted.fetch_add(count, Ordering::AcqRel) + 1;
+        self.runtime.steps_submitted(first, count);
+        (first..first + count)
+            .map(|sequence| BankStep {
+                bank: Arc::clone(self),
+                sequence,
+                completed: false,
+            })
+            .collect()
     }
 }

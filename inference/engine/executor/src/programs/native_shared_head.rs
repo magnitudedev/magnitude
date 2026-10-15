@@ -484,7 +484,7 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
             else {
                 return Err("a head block other than unlisted attention".into());
             };
-            residual = sublayers.feed_forward(
+            let (output, step_sequence) = sublayers.feed_forward(
                 &mut graph,
                 (entries.feed_forward)(index)?,
                 None,
@@ -492,6 +492,10 @@ fn shared_head_graph<'a, G: GraphDraft + 'a>(
                 &mut weights,
                 &mut constants,
             )?;
+            if step_sequence.is_some() {
+                return Err("a head block with a streamed routed layer".into());
+            }
+            residual = output;
             blocks.push(BlockPorts {
                 coordinates,
                 visible,
