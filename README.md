@@ -32,13 +32,6 @@ https://github.com/user-attachments/assets/983328c8-93e8-4360-bfef-11e93ff76035
 2. Choose a recommended model in **Discover** and download it.
 3. Connect your agent in **Connections** and start using it.
 
-Or install from a terminal:
-
-```sh
-curl -fsSL https://magnitude.dev/install.sh | sh     # macOS and Linux
-irm https://magnitude.dev/install.ps1 | iex          # Windows PowerShell
-```
-
 The desktop app includes the `magnitude` CLI. No separate installation is needed.
 
 ### Run it on a server

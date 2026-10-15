@@ -9,21 +9,23 @@ On Linux and macOS, Magnitude runs as a service: it starts at boot, keeps runnin
 
 ## Install on the server
 
-Run this on the server, over SSH if needed:
+Install the package for [Linux](/installation/linux) or the app for [macOS](/installation/macos) on the server. On a Mac, open the app once so it adds the `magnitude` command.
+
+On a Linux server without a browser, download the package over SSH. For example, on Ubuntu or Debian (use `arch=arm64` on an ARM64 server):
 
 ```sh
-curl -fsSL https://magnitude.dev/install.sh | sh
+curl -fL -o magnitude-desktop.deb 'https://magnitude.dev/api/installer?os=linux&arch=x64&package=deb'
+sudo apt update
+sudo apt install ./magnitude-desktop.deb
 ```
 
-On Linux, the installer first asks whether to run Magnitude as a server, then asks for your password once, and does the rest without further questions. Answer **y** to set the server up right away. If you answer no, or don't answer within a minute, set it up later with `magnitude server setup`.
-
-On macOS the installer installs the app without asking. Then run:
+Then set up the server:
 
 ```sh
 magnitude server setup
 ```
 
-You can also install the package for [Linux](/installation/linux) or the app for [macOS](/installation/macos) yourself and run `magnitude server setup` afterwards. Run it as yourself, not with `sudo`: it asks for your password once, for the one step that needs it.
+Run it as yourself, not with `sudo`: it asks for your password once, for the one step that needs it.
 
 ## What setup does
 
@@ -110,7 +112,7 @@ This writes the agent's configuration into your home folder, pointing at the ser
 
 ## Updates
 
-The server checks for updates about once an hour, downloads them, and installs them when no request or agent turn is running. Clients reconnect after a short pause. If an update needs something only you can do, `magnitude status` and the logs say so. To install a downloaded update right away, restart the server (`sudo systemctl restart magnitude` on Linux, `sudo launchctl kickstart -k system/dev.magnitude.server` on macOS); it installs the update as soon as it is idle. Running the install script again upgrades a Linux server in place; on macOS it asks you to remove the server first, since the server keeps itself up to date.
+The server checks for updates about once an hour, downloads them, and installs them when no request or agent turn is running. Clients reconnect after a short pause. If an update needs something only you can do, `magnitude status` and the logs say so. To install a downloaded update right away, restart the server (`sudo systemctl restart magnitude` on Linux, `sudo launchctl kickstart -k system/dev.magnitude.server` on macOS); it installs the update as soon as it is idle.
 
 ## The desktop app on the same machine
 
