@@ -12,7 +12,8 @@ import { WindowsProcessObserver, WindowsProcessObserverUnavailable, nativeWindow
 import { WindowsProcessId } from "@magnitudedev/utils/windows-native"
 import { applicationStateDirectory } from "./application-state-directory"
 import { SERVER_DATA_DIRECTORY, isServerProfileActive } from "./server-profile"
-import { BunFileSystem } from "@effect/platform-bun"
+import { BunContext, BunFileSystem } from "@effect/platform-bun"
+import { Command, CommandExecutor } from "@effect/platform"
 import { LINUX_DESKTOP_EXECUTABLE_PATH } from "@magnitudedev/release/executables"
 import { NativeMacApplicationInstallation, waitForMacApplicationInstallation } from "./mac-update-installation"
 
@@ -115,9 +116,21 @@ export const makeDesktopApplicationHost = (developmentRepository: Option.Option<
     Effect.zipRight(endpoint.pipe(Effect.flatMap(path => requestLoginStartup(path, enabled ? "enable" : "disable")))),
   )
 
+  /**
+   * Only the app can change its macOS login item. Started in the background while the Mac serves with
+   * `magnitude server setup`, it turns its launch at login off and quits, which `open -W` waits for.
+   * Whether it ran: without the person's login session it cannot start.
+   */
+  const turnOffDesktopLoginStartupForServer = Effect.gen(function* () {
+    const bundle = yield* resolveMacApplicationPath(process.execPath, homedir(), process.env.MAGNITUDE_DESKTOP_PATH)
+    yield* exists(join(bundle, "Contents/Frameworks/Electron Framework.framework"))
+    const executor = yield* CommandExecutor.CommandExecutor
+    return (yield* executor.exitCode(Command.make("/usr/bin/open", "-W", "-n", "-g", "-j", "-a", bundle, "--args", "--background"))) === 0
+  }).pipe(Effect.timeout("1 minute"), Effect.provide(BunContext.layer), Effect.orElseSucceed(() => false))
+
   const updateDesktopApplication = (action: import("@magnitudedev/sdk/desktop-host").ApplicationUpdateAction) =>
     endpoint.pipe(Effect.flatMap(path => requestApplicationUpdate(path, action)))
 
-  return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, serverProfile, applicationDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup }
+  return { updateDesktopApplication, desktopIsolatedProfile, desktopDataDirectory, serverProfile, applicationDataDirectory, desktopServiceOrigin, desktopApplication, startDesktopApplication, stopDesktopApplication, readDesktopLoginStartup, setDesktopLoginStartup, turnOffDesktopLoginStartupForServer }
 
 }

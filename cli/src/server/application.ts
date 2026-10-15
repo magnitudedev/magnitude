@@ -12,7 +12,7 @@ const host = makeDesktopApplicationHost(isDevelopmentBuild()
 export const {
   desktopIsolatedProfile, desktopDataDirectory, desktopServiceOrigin, desktopApplication, serverProfile, applicationDataDirectory,
   startDesktopApplication,
-  readDesktopLoginStartup, updateDesktopApplication,
+  readDesktopLoginStartup, updateDesktopApplication, turnOffDesktopLoginStartupForServer,
 } = host
 
 export class ServerNotRunning extends Schema.TaggedError<ServerNotRunning>()("ServerNotRunning", {}) {
