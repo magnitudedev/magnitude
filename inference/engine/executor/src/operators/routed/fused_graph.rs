@@ -717,6 +717,11 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
         part(graph, BankPart::Staging { kind: 1 })?,
         part(graph, BankPart::Staging { kind: 2 })?,
     ];
+    let conveyors = [
+        part(graph, BankPart::Conveyor { kind: 0 })?,
+        part(graph, BankPart::Conveyor { kind: 1 })?,
+        part(graph, BankPart::Conveyor { kind: 2 })?,
+    ];
     let copy_lists = [
         part(graph, BankPart::CopyList { kind: 0 })?,
         part(graph, BankPart::CopyList { kind: 1 })?,
@@ -800,6 +805,7 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
                 entries.convert_wide[kind],
                 &[
                     ("R", bank.staging_records),
+                    ("C", bank.conveyor_records()),
                     ("L", bank.round_records()),
                     ("S", shape.count),
                     matrix[0],
@@ -807,6 +813,7 @@ fn fill_scratch<'a, G: GraphDraft + 'a>(
                 ],
                 routed_convert_wide::WorkflowArgs {
                     source: staging[kind].tensor().into(),
+                    conveyor: conveyors[kind].tensor().into(),
                     list: lists[kind].tensor().into(),
                     step: step.tensor().into(),
                     destination: scratch[kind].tensor_mut().into(),

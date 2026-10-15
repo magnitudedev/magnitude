@@ -3,7 +3,7 @@
 
 use super::layout::BankTensors;
 use super::runtime::{
-    Heartbeat, ScratchFill, StagingPool, StoredTensor, StreamedLayer, StreamingRuntime,
+    Heartbeat, Loan, ScratchFill, StagingPool, StoredTensor, StreamedLayer, StreamingRuntime,
 };
 use super::source::{ExpertSource, ModelFile};
 use super::words::{SharedBytes, SharedWords};
@@ -65,15 +65,17 @@ impl std::fmt::Debug for BankStep {
 impl ResidentBank {
     /// Allocate the banks' tensors and start the watcher over `target`'s
     /// stored expert records. `sublayers` holds the empty bank weights,
-    /// whose descriptors name the stored tensors.
+    /// whose descriptors name the stored tensors; `lender` the byte arenas of
+    /// the bank group the conveyor borrows records of (`ConveyorPlan`).
     pub(crate) fn open(
         device: &Device,
         plan: &ExpertBankPlan,
         target: &GgufArtifact,
         sublayers: &ResidentRoles,
+        lender: Option<[seismic::Tensor; 3]>,
     ) -> Result<Self, String> {
         let shared = plan.shared.as_ref().ok_or("a streamed load without its shared bank plan")?;
-        let tensors = BankTensors::allocate(device, plan, shared)?;
+        let tensors = BankTensors::allocate(device, plan, shared, lender)?;
         let directory = super::shared_directory::SharedDirectory::new(shared, plan.experts)
             .map_err(|e| format!("shared bank directory: {e:?}"))?;
         let mut path = None;
@@ -135,10 +137,11 @@ impl ResidentBank {
         let pools = plan
             .pools
             .iter()
-            .zip(&tensors.pools)
-            .map(|(pool, tensor)| {
+            .zip(tensors.pools.iter().zip(&tensors.conveyors))
+            .map(|(pool, (own, carried))| {
                 Ok(StagingPool::new(
-                    SharedBytes::new(tensor.clone())?,
+                    SharedBytes::new(own.clone())?,
+                    SharedBytes::new(carried.clone())?,
                     records,
                     hints,
                     conveyor,
@@ -146,6 +149,17 @@ impl ResidentBank {
                 ))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        // The bank records the conveyor lies on, when a group lends them.
+        let loan = match plan.conveyor.lender {
+            Some(group) => {
+                let end = usize::try_from(shared.groups[group].records)
+                    .map_err(|_| "bank records exceed the host")?;
+                let lent = usize::try_from(plan.conveyor.lent)
+                    .map_err(|_| "lent records exceed the host")?;
+                Some(Loan::new(group, end - lent..end))
+            }
+            None => None,
+        };
         let path = path.ok_or("a streamed load without routed layers")?;
         let source = ExpertSource::new(ModelFile::open(&path)?)?;
         let words = |tensor: &seismic::Tensor| SharedWords::new(tensor.clone());
@@ -165,7 +179,8 @@ impl ResidentBank {
             usize::try_from(plan.round_records()).map_err(|_| "round records exceed the host")?,
         );
         let heartbeat = Heartbeat::new(words(&tensors.heartbeat)?);
-        let runtime = StreamingRuntime::new(layers, scratch, heartbeat, pools, source, directory)?;
+        let runtime =
+            StreamingRuntime::new(layers, scratch, heartbeat, pools, source, directory, loan)?;
         Ok(Self {
             tensors,
             runtime,

@@ -51,55 +51,95 @@ pub(crate) struct StoredTensor {
     pub pool: usize,
 }
 
-/// One staging pool: `records` stored records of one (kind, source element,
-/// matrix shape), each `record_bytes` long, host-addressed.
+/// One staging pool of one (kind, source element, matrix shape), its
+/// records `record_bytes` long and host-addressed: its own `0..own`, then
+/// the conveyor's `own..own + conveyor` (spec 4.9), on bank records a prompt
+/// borrows when a bank group lends them.
 pub(crate) struct StagingPool {
-    pub bytes: SharedBytes,
+    own_bytes: SharedBytes,
+    conveyor_bytes: SharedBytes,
     pub record_bytes: u64,
-    /// Free records, longest free first: a free record keeps the stored
-    /// bytes it last held until it is taken again.
-    free: VecDeque<u32>,
+    own: u32,
+    /// Free records of each shelf, longest free first: a free record keeps
+    /// the stored bytes it last held until it is taken again.
+    free: [VecDeque<u32>; 2],
     /// Per record, the (layer, expert) whose stored bytes a free record
     /// still holds.
     holds: Vec<Option<(usize, i32)>>,
-    /// Free records a prefetch of each window leaves (spec 4.7, 4.9).
-    keeps: [usize; 2],
+    /// Free own records a hint leaves (spec 4.7).
+    hint_keep: usize,
+}
+
+/// Which records of a staging pool a read takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shelf {
+    /// The pool's own: demand reads and a decode step's hints.
+    Own = 0,
+    /// The conveyor's (spec 4.9).
+    Conveyor = 1,
 }
 
 /// What a prefetch may take of a staging pool.
 #[derive(Clone, Copy)]
 enum Window {
-    /// A decode step's hints: at most the hint records of the whole pool.
-    Hint = 0,
-    /// The conveyor: all but the records demand reads and hints take.
-    Conveyor = 1,
+    /// A decode step's hints: at most the hint records of the pool's own.
+    Hint,
+    /// The conveyor: its records.
+    Conveyor,
 }
 
 impl StagingPool {
-    /// `records`, of which hints may hold `hints` and the conveyor
-    /// `conveyor`; the rest stay for demand reads.
+    /// `own` records of `own_bytes`, of which hints may hold `hints`, and
+    /// `conveyor` of `conveyor_bytes`.
     pub(crate) fn new(
-        bytes: SharedBytes,
-        records: u32,
+        own_bytes: SharedBytes,
+        conveyor_bytes: SharedBytes,
+        own: u32,
         hints: u32,
         conveyor: u32,
         record_bytes: u64,
     ) -> Self {
         Self {
-            bytes,
+            own_bytes,
+            conveyor_bytes,
             record_bytes,
-            free: (0..records).collect(),
-            holds: vec![None; records as usize],
-            keeps: [
-                records.saturating_sub(hints),
-                records.saturating_sub(conveyor),
-            ]
-            .map(|keep| keep as usize),
+            own,
+            free: [(0..own).collect(), (own..own + conveyor).collect()],
+            holds: vec![None; (own + conveyor) as usize],
+            hint_keep: own.saturating_sub(hints) as usize,
         }
     }
 
-    fn admits(&self, window: Window) -> bool {
-        self.free.len() > self.keeps[window as usize]
+    fn shelf(&self, record: u32) -> Shelf {
+        if record < self.own { Shelf::Own } else { Shelf::Conveyor }
+    }
+
+    /// The host address of record `record`, `bytes` of it in bounds.
+    fn at(&self, record: u32, bytes: u64) -> *mut u8 {
+        match self.shelf(record) {
+            Shelf::Own => self.own_bytes.at(u64::from(record) * self.record_bytes, bytes),
+            Shelf::Conveyor => self
+                .conveyor_bytes
+                .at(u64::from(record - self.own) * self.record_bytes, bytes),
+        }
+    }
+}
+
+/// The bank records the conveyor lies on (spec 4.9): group `group`'s
+/// `slots`, lent while a prompt runs.
+pub(crate) struct Loan {
+    group: usize,
+    slots: std::ops::Range<usize>,
+    lent: bool,
+}
+
+impl Loan {
+    pub(crate) fn new(group: usize, slots: std::ops::Range<usize>) -> Self {
+        Self {
+            group,
+            slots,
+            lent: false,
+        }
     }
 }
 
@@ -316,6 +356,11 @@ struct State {
     groups: std::collections::BTreeMap<i32, i32>,
     /// The device's progress: the newest point a hint or request proved.
     progress: Clock,
+    /// The bank records the conveyor lies on, when a bank group lends them.
+    loan: Option<Loan>,
+    /// The newest scratch-served step: a prompt holds the loan until the
+    /// device is past its group.
+    prompt: i32,
 }
 
 impl State {
@@ -361,6 +406,7 @@ impl StreamingRuntime {
         pools: Vec<StagingPool>,
         source: ExpertSource,
         directory: SharedDirectory,
+        loan: Option<Loan>,
     ) -> Result<Self, String> {
         let sizes = layers.iter().map(|l| (l.stamps.len(), l.commits.len())).collect::<Vec<_>>();
         directory.validate_ports(&sizes).map_err(|e| format!("shared directory ports: {e:?}"))?;
@@ -380,6 +426,8 @@ impl StreamingRuntime {
                 layer: 0,
                 sequence: 0,
             },
+            loan,
+            prompt: 0,
         }));
         let source = Arc::new(source);
         let in_flight = Arc::new((AtomicUsize::new(0), Mutex::new(()), Condvar::new()));
@@ -569,15 +617,71 @@ fn advance(state: &mut State, point: Clock, source: &ExpertSource) {
 fn invalidate(state: &mut State, invalid: Vec<(Clock, super::arena::Location)>) {
     for (clock, location) in invalid {
         state.failed_steps.insert(clock.sequence);
-        let layer = &mut state.layers[location.key.layer.0 as usize];
-        let expert = location.key.expert.0 as usize;
-        if layer.slot_of[expert] == location.slot as i32 {
-            layer.slot_of[expert] = -1;
-            layer.slot_map.store(expert, -1);
-            layer.expert_of[location.slot] = -1;
-        }
-        layer.control.store(FAILURE, clock.sequence);
+        unmap(state, location);
+        state.layers[location.key.layer.0 as usize]
+            .control
+            .store(FAILURE, clock.sequence);
     }
+}
+
+/// The bank no longer holds `location`'s expert in its slot.
+fn unmap(state: &mut State, location: super::arena::Location) {
+    let layer = &mut state.layers[location.key.layer.0 as usize];
+    let expert = location.key.expert.0 as usize;
+    if layer.slot_of[expert] == location.slot as i32 {
+        layer.slot_of[expert] = -1;
+        layer.slot_map.store(expert, -1);
+        layer.expert_of[location.slot] = -1;
+    }
+}
+
+/// Borrow the conveyor's bank records for a prompt (spec 4.9): the
+/// directory evicts the experts they hold, unless a step still reads or
+/// fills one, when the conveyor waits for a later round. The device runs
+/// steps in order and is parked at the prompt's request, so no step reads
+/// an evicted expert after its map entry is cleared.
+fn borrow(state: &mut State) -> bool {
+    let Some(loan) = &state.loan else {
+        return true;
+    };
+    if loan.lent {
+        return true;
+    }
+    let (group, slots) = (loan.group, loan.slots.clone());
+    let Ok(evicted) = state.directory.lend(group, slots) else {
+        return false;
+    };
+    for location in evicted {
+        unmap(state, location);
+    }
+    state.loan.as_mut().expect("a loan").lent = true;
+    true
+}
+
+/// Give the conveyor's bank records back once the device is past the
+/// prompt and none of them is taken: whatever bytes they keep are forgotten,
+/// and the bank fills them as empty slots.
+fn give_back(state: &mut State) {
+    if !state.loan.as_ref().is_some_and(|loan| loan.lent)
+        || state.clock(state.last_of_group(state.prompt), usize::MAX) > state.progress
+        || state.pools.iter().any(|pool| {
+            pool.free[Shelf::Conveyor as usize].len() + pool.own as usize != pool.holds.len()
+        })
+    {
+        return;
+    }
+    for pool in 0..state.pools.len() {
+        let own = state.pools[pool].own as usize;
+        for record in own..state.pools[pool].holds.len() {
+            if let Some(key) = state.pools[pool].holds[record].take() {
+                forget(state, key);
+            }
+        }
+    }
+    let loan = state.loan.as_mut().expect("a loan");
+    loan.lent = false;
+    let (group, slots) = (loan.group, loan.slots.clone());
+    state.directory.restore(group, slots).expect("the conveyor's lent records");
 }
 
 /// Free converted records and cancel or free unused prefetches of layers the
@@ -626,6 +730,7 @@ fn release_past(state: &mut State, source: &ExpertSource) {
             }
         }
     }
+    give_back(state);
 }
 
 /// Return a record's staging records to their pools. With `holds`, they
@@ -639,7 +744,8 @@ fn free_records(state: &mut State, layer: usize, records: [u32; KINDS], holds: O
     let pools = state.layers[layer].stored.map(|stored| stored.pool);
     for (kind, record) in records.into_iter().enumerate() {
         let pool = &mut state.pools[pools[kind]];
-        pool.free.push_back(record);
+        let shelf = pool.shelf(record);
+        pool.free[shelf as usize].push_back(record);
         pool.holds[record as usize] = holds.map(|expert| (layer, expert));
     }
     if let Some(expert) = holds {
@@ -647,9 +753,19 @@ fn free_records(state: &mut State, layer: usize, records: [u32; KINDS], holds: O
     }
 }
 
-/// Take `pool`'s longest-free record, forgetting what it held.
-fn take_record(state: &mut State, pool: usize) -> Option<u32> {
-    let record = state.pools[pool].free.pop_front()?;
+/// Whether `pool` can take a record of `shelf`: the conveyor's only while
+/// its bank records are lent.
+fn available(state: &State, pool: usize, shelf: Shelf) -> bool {
+    !state.pools[pool].free[shelf as usize].is_empty()
+        && (shelf == Shelf::Own || state.loan.as_ref().is_none_or(|loan| loan.lent))
+}
+
+/// Take `pool`'s longest-free record of `shelf`, forgetting what it held.
+fn take_record(state: &mut State, pool: usize, shelf: Shelf) -> Option<u32> {
+    if !available(state, pool, shelf) {
+        return None;
+    }
+    let record = state.pools[pool].free[shelf as usize].pop_front()?;
     if let Some(key) = state.pools[pool].holds[record as usize].take() {
         forget(state, key);
     }
@@ -677,27 +793,38 @@ fn revive(state: &mut State, layer: usize, expert: i32) -> Option<[u32; KINDS]> 
     for (kind, record) in records.into_iter().enumerate() {
         let pool = &mut state.pools[pools[kind]];
         pool.holds[record as usize] = None;
-        let index = pool
-            .free
+        let free = &mut pool.free[pool.shelf(record) as usize];
+        let index = free
             .iter()
             .position(|&free| free == record)
             .expect("a kept record is free");
-        pool.free.remove(index);
+        free.remove(index);
     }
     Some(records)
 }
 
-/// Reserve a staging record in each of the layer's pools and queue its
-/// reads, or take back free records still holding the expert's bytes.
+/// Reserve a staging record of `shelf` in each of the layer's pools and
+/// queue its reads, or take back free records still holding the expert's
+/// bytes. A decode fill converts from the pools' own records only
+/// (`routed_bank_fill`), so a read for one never takes back the conveyor's.
 fn fetch(
     state: &mut State,
     source: &ExpertSource,
     layer: usize,
     expert: i32,
     priority: Priority,
+    shelf: Shelf,
     sequence: i32,
 ) -> bool {
-    if let Some(records) = revive(state, layer, expert) {
+    let pools = state.layers[layer].stored.map(|stored| stored.pool);
+    let revivable = state.kept.get(&(layer, expert)).is_some_and(|records| {
+        shelf == Shelf::Conveyor
+            || records
+                .iter()
+                .zip(pools)
+                .all(|(&record, pool)| state.pools[pool].shelf(record) == Shelf::Own)
+    });
+    if let Some(records) = revivable.then(|| revive(state, layer, expert)).flatten() {
         state.staged.insert(
             (layer, expert),
             Staged {
@@ -709,24 +836,18 @@ fn fetch(
         return true;
     }
     let stored = state.layers[layer].stored;
-    if stored
-        .iter()
-        .any(|tensor| state.pools[tensor.pool].free.is_empty())
-    {
+    if !stored.iter().all(|tensor| available(state, tensor.pool, shelf)) {
         return false;
     }
     let mut records = [0u32; KINDS];
     let mut ranges = Vec::with_capacity(KINDS);
     for (kind, tensor) in stored.iter().enumerate() {
-        let record = take_record(state, tensor.pool).expect("checked free");
-        let pool = &state.pools[tensor.pool];
+        let record = take_record(state, tensor.pool, shelf).expect("checked free");
         records[kind] = record;
         ranges.push(Range {
             offset: tensor.base + u64::try_from(expert).expect("an expert index") * tensor.bytes,
             bytes: usize::try_from(tensor.bytes).expect("a record fits the host"),
-            destination: pool
-                .bytes
-                .at(u64::from(record) * pool.record_bytes, tensor.bytes),
+            destination: state.pools[tensor.pool].at(record, tensor.bytes),
         });
     }
     let ticket = source.submit(ranges, priority);
@@ -759,15 +880,21 @@ fn prefetch(
     {
         return;
     }
-    // A prefetch never takes the records a demand read would need.
-    if !state.layers[layer]
-        .stored
-        .iter()
-        .all(|tensor| state.pools[tensor.pool].admits(window))
-    {
-        return;
-    }
-    fetch(state, source, layer, expert, Priority::Prefetch, sequence);
+    // A hint never takes the records a demand read would need.
+    let shelf = match window {
+        Window::Hint => {
+            let admitted = state.layers[layer].stored.iter().all(|tensor| {
+                let pool = &state.pools[tensor.pool];
+                pool.free[Shelf::Own as usize].len() > pool.hint_keep
+            });
+            if !admitted {
+                return;
+            }
+            Shelf::Own
+        }
+        Window::Conveyor => Shelf::Conveyor,
+    };
+    fetch(state, source, layer, expert, Priority::Prefetch, shelf, sequence);
 }
 
 /// A parked step's request (spec 4.6 step 4): resolve it against the shared
@@ -846,9 +973,12 @@ fn serve(state: &mut State, source: &ExpertSource, layer: usize, sequence: i32) 
                 }
             }
             None => {
-                if !fetch(state, source, layer, expert, Priority::Demand, sequence) {
+                let demand = |state: &mut State| {
+                    fetch(state, source, layer, expert, Priority::Demand, Shelf::Own, sequence)
+                };
+                if !demand(state) {
                     reclaim_prefetches(state, source, layer);
-                    if !fetch(state, source, layer, expert, Priority::Demand, sequence) {
+                    if !demand(state) {
                         let point = state.clock(sequence, layer);
                         state
                             .directory
@@ -953,6 +1083,7 @@ fn serve(state: &mut State, source: &ExpertSource, layer: usize, sequence: i32) 
 /// them; the last rounds' once the device is past the layer.
 fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequence: i32) {
     state.layers[layer].scratch_served = sequence;
+    state.prompt = state.prompt.max(sequence);
     let point = state.clock(sequence, layer);
     advance(state, point, source);
     let mut holds = match state.scratch.holds.take() {
@@ -1091,25 +1222,22 @@ fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequenc
                 conveyed.push(staged.ticket);
                 continue;
             }
-            if pools.iter().any(|&pool| state.pools[pool].free.is_empty()) {
+            if !pools.iter().all(|&pool| available(state, pool, Shelf::Own)) {
                 reclaim_prefetches(state, source, layer);
             }
-            if pools.iter().any(|&pool| state.pools[pool].free.is_empty()) {
+            if !pools.iter().all(|&pool| available(state, pool, Shelf::Own)) {
                 failed = true;
                 break;
             }
             let mut record = [0u32; KINDS];
             let stored = state.layers[layer].stored;
             for (kind, tensor) in stored.iter().enumerate() {
-                record[kind] = take_record(state, tensor.pool).expect("checked free");
-                let pool = &state.pools[tensor.pool];
+                record[kind] = take_record(state, tensor.pool, Shelf::Own).expect("checked free");
                 ranges.push(Range {
                     offset: tensor.base
                         + u64::try_from(expert).expect("an expert index") * tensor.bytes,
                     bytes: usize::try_from(tensor.bytes).expect("a record fits the host"),
-                    destination: pool
-                        .bytes
-                        .at(u64::from(record[kind]) * pool.record_bytes, tensor.bytes),
+                    destination: state.pools[tensor.pool].at(record[kind], tensor.bytes),
                 });
             }
             records.push((expert, record));
@@ -1156,9 +1284,10 @@ fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequenc
 /// are read while the device runs this one, behind every demand read; that
 /// layer's fill takes them over. A fill tops it up as its rounds free
 /// staging, so the source stays busy while the device converts. A read is
-/// kept until the group's last step is past that layer.
+/// kept until the group's last step is past that layer. It reads into bank
+/// records the prompt borrows, when a bank group lends them.
 fn convey(state: &mut State, source: &ExpertSource, layer: usize, sequence: i32) {
-    if layer + 1 < state.layers.len() {
+    if layer + 1 < state.layers.len() && borrow(state) {
         let last = state.last_of_group(sequence);
         for expert in 0..state.scratch.experts as i32 {
             prefetch(state, source, layer + 1, expert, last, Window::Conveyor);
@@ -1178,13 +1307,18 @@ fn publish_list(list: &SharedWords, sequence: i32, entries: &[(u32, usize)]) {
     list.store(0, sequence);
 }
 
-/// Cancel every unstarted prefetch of the other layers so a demand read of
-/// `layer` finds staging.
+/// Cancel every unstarted hint prefetch of the other layers so a demand read
+/// of `layer` finds the pools' own records.
 fn reclaim_prefetches(state: &mut State, source: &ExpertSource, layer: usize) {
     let keys = state
         .staged
         .iter()
-        .filter(|(key, staged)| key.0 != layer && staged.ticket.priority() == Priority::Prefetch)
+        .filter(|(key, staged)| {
+            let pool = &state.pools[state.layers[key.0].stored[0].pool];
+            key.0 != layer
+                && staged.ticket.priority() == Priority::Prefetch
+                && pool.shelf(staged.records[0]) == Shelf::Own
+        })
         .map(|(key, _)| *key)
         .collect::<Vec<_>>();
     for key in keys {
@@ -1210,6 +1344,100 @@ mod tests {
     fn first_record_publishes_before_last_source_and_neither_becomes_a_cache_hit() {
         publication_case(false);
         publication_case(true);
+    }
+    /// The conveyor reads only into bank records a prompt has borrowed, and
+    /// gives them back, forgetting what they keep, once the device is past
+    /// the prompt and none is taken.
+    #[test]
+    fn the_conveyor_borrows_bank_records_for_a_prompt_and_gives_them_back() {
+        let device = DeviceCatalog::discover()
+            .unwrap()
+            .open_backend(BackendName::Metal)
+            .unwrap();
+        let layers = vec![StreamedLayer::new(
+            words(&device, 256),
+            words(&device, 8),
+            words(&device, 8),
+            words(&device, 68),
+            SharedWords::new(Tensor::zeros(&device, Element::i32(), &[5, 64]).unwrap()).unwrap(),
+            words(&device, 18),
+            [words(&device, 66), words(&device, 66)],
+            std::array::from_fn(|pool| StoredTensor {
+                base: 0,
+                bytes: 16,
+                pool,
+            }),
+        )];
+        let pools = (0..3)
+            .map(|_| {
+                StagingPool::new(
+                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[64, 2, 2]).unwrap())
+                        .unwrap(),
+                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[16, 2, 2]).unwrap())
+                        .unwrap(),
+                    64,
+                    16,
+                    16,
+                    16,
+                )
+            })
+            .collect();
+        let file =
+            std::env::temp_dir().join(format!("expert-conveyor-loan-{}", std::process::id()));
+        std::fs::write(&file, [0u8; 512]).unwrap();
+        let source =
+            ExpertSource::new(crate::streaming::source::ModelFile::open(&file).unwrap()).unwrap();
+        let runtime = StreamingRuntime::new(
+            layers,
+            ScratchFill::new(
+                words(&device, 256),
+                vec![],
+                [words(&device, 514), words(&device, 514), words(&device, 514)],
+                words(&device, 514),
+                256,
+                40,
+            ),
+            Heartbeat::new(words(&device, 1)),
+            pools,
+            source,
+            SharedDirectory::controlled(),
+            Some(Loan::new(0, 6..8)),
+        )
+        .unwrap();
+        let mut state = runtime.state.lock().unwrap();
+        assert_eq!(take_record(&mut state, 0, Shelf::Conveyor), None, "nothing borrowed");
+        assert!(borrow(&mut state));
+        assert_eq!(state.directory.capacity(0), Ok(6));
+        let records: [u32; KINDS] =
+            std::array::from_fn(|pool| take_record(&mut state, pool, Shelf::Conveyor).unwrap());
+        assert!(records.iter().all(|&record| (64..80).contains(&record)));
+        state.prompt = 1;
+        free_records(&mut state, 0, records, Some(5));
+        assert!(state.kept.contains_key(&(0, 5)));
+        // A decode fill converts from the pools' own records only: its read
+        // of expert 5 never takes back the conveyor's.
+        let source = Arc::clone(&runtime.source);
+        assert!(fetch(&mut state, &source, 0, 5, Priority::Demand, Shelf::Own, 1));
+        assert!(state.staged[&(0, 5)].records.iter().all(|&record| record < 64));
+        assert!(state.kept.contains_key(&(0, 5)));
+        // The device is not yet past the prompt: the records stay lent.
+        give_back(&mut state);
+        assert!(state.loan.as_ref().unwrap().lent);
+        state.progress = state.clock(1, usize::MAX);
+        let taken: [u32; KINDS] =
+            std::array::from_fn(|pool| take_record(&mut state, pool, Shelf::Conveyor).unwrap());
+        assert!(state.kept.contains_key(&(0, 5)), "the longest free are taken first");
+        give_back(&mut state);
+        assert!(state.loan.as_ref().unwrap().lent, "conveyor records are taken");
+        free_records(&mut state, 0, taken, None);
+        give_back(&mut state);
+        assert!(!state.loan.as_ref().unwrap().lent);
+        assert_eq!(state.directory.capacity(0), Ok(8));
+        assert!(!state.kept.contains_key(&(0, 5)), "the bank overwrites what they kept");
+        assert_eq!(take_record(&mut state, 0, Shelf::Conveyor), None);
+        drop(state);
+        drop(runtime);
+        std::fs::remove_file(file).unwrap();
     }
     fn publication_case(fail_last: bool) {
         let device = DeviceCatalog::discover()
@@ -1249,9 +1477,11 @@ mod tests {
         let pools = (0..3)
             .map(|_| {
                 StagingPool::new(
-                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[80, 2, 2]).unwrap())
+                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[64, 2, 2]).unwrap())
                         .unwrap(),
-                    80,
+                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[16, 2, 2]).unwrap())
+                        .unwrap(),
+                    64,
                     16,
                     16,
                     16,
@@ -1270,13 +1500,15 @@ mod tests {
             pools,
             source,
             SharedDirectory::controlled(),
+            None,
         )
         .unwrap();
         let last = Ticket::controlled();
         {
             let mut state = runtime.state.lock().unwrap();
             for expert in [0, 1] {
-                let records = std::array::from_fn(|pool| take_record(&mut state, pool).unwrap());
+                let records =
+                    std::array::from_fn(|pool| take_record(&mut state, pool, Shelf::Own).unwrap());
                 state.staged.insert(
                     (0, expert),
                     Staged {
@@ -1377,9 +1609,11 @@ mod tests {
         let pools = (0..3)
             .map(|_| {
                 StagingPool::new(
-                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[80, 2, 2]).unwrap())
+                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[64, 2, 2]).unwrap())
                         .unwrap(),
-                    80,
+                    SharedBytes::new(Tensor::zeros(&device, Element::f32(), &[16, 2, 2]).unwrap())
+                        .unwrap(),
+                    64,
                     16,
                     16,
                     16,
@@ -1397,6 +1631,7 @@ mod tests {
             pools,
             source,
             SharedDirectory::controlled(),
+            None,
         )
         .unwrap();
         runtime.steps_submitted(1, 2);

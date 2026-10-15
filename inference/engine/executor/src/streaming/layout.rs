@@ -27,13 +27,7 @@ pub(crate) fn ring_words(selected: u64) -> u64 {
     2 + DECODE_ROWS * selected
 }
 
-/// Staging records per pool (spec 4.3, 4.9): the conveyor's beside those
-/// it leaves to demand reads and hints.
-pub(crate) fn staging_records(experts: u64, selected: u64) -> u64 {
-    conveyor_records(experts) + demand_records(selected)
-}
-
-/// Staging records the conveyor may hold (spec 4.9): a whole layer's
+/// Records of a staging pool's conveyor (spec 4.9): a whole layer's
 /// experts, read for a scratch-served step's next streamed layer while the
 /// device computes this one.
 pub(crate) fn conveyor_records(experts: u64) -> u64 {
@@ -46,10 +40,9 @@ pub(crate) fn hint_records(selected: u64) -> u64 {
     DISTANCES.len() as u64 * selected
 }
 
-/// Staging records the conveyor leaves: two scratch-fill rounds, one filling
-/// while the device converts the other, which hold the hint window beside
-/// every demand read of the widest bank-served launch (the decode form's
-/// rows).
+/// A staging pool's own records: two scratch-fill rounds, one filling while
+/// the device converts the other, which hold the hint window beside every
+/// demand read of the widest bank-served launch (the decode form's rows).
 pub(crate) fn demand_records(selected: u64) -> u64 {
     hint_records(selected) + DECODE_ROWS * selected
 }
@@ -115,6 +108,13 @@ pub(crate) fn bank_port(
             Ok((
                 pool.source,
                 vec![bank.staging_records, pool.matrix[0], pool.matrix[1]],
+            ))
+        }
+        BankPart::Conveyor { kind } => {
+            let pool = &bank.pools[layer_tensor(bank, scope, kind)?.pool];
+            Ok((
+                pool.source,
+                vec![bank.conveyor_records(), pool.matrix[0], pool.matrix[1]],
             ))
         }
         BankPart::Scratch { kind } => {
@@ -198,7 +198,11 @@ pub(crate) struct BankTensors {
     pub step: Tensor,
     pub heartbeat: Tensor,
     pub layers: Vec<LayerTensors>,
+    /// Each staging pool's own records.
     pub pools: Vec<Tensor>,
+    /// Each staging pool's conveyor (spec 4.9): a view of its routed
+    /// tensor's conveyor arena.
+    pub conveyors: Vec<Tensor>,
     /// The scratch fill's: one bank per resident form, the request region,
     /// each round's convert lists, the copy lists and the seed list (spec 4.9).
     pub scratch: Vec<Tensor>,
@@ -210,11 +214,14 @@ pub(crate) struct BankTensors {
 
 impl BankTensors {
     /// Allocate the directory of a streamed load over its shared bank plan.
-    /// All fallible allocations remain private until this complete value
-    /// returns; the construction peak therefore equals its persistent device
-    /// charge.
+    /// `lender` is the byte arenas of the bank group lending the conveyor its
+    /// records (`ConveyorPlan::lender`); without one, the conveyor's arenas
+    /// are allocated here. All fallible allocations remain private until this
+    /// complete value returns; the construction peak therefore equals its
+    /// persistent device charge.
     pub(crate) fn allocate(device: &Device, bank: &ExpertBankPlan,
-        shared: &super::shared_bank::SharedBankPlan) -> Result<Self, String> {
+        shared: &super::shared_bank::SharedBankPlan,
+        lender: Option<[Tensor; 3]>) -> Result<Self, String> {
         if shared != &super::shared_bank::SharedBankPlan::admitted(bank)? {
             return Err("shared directory plan differs from bank metadata".into());
         }
@@ -258,6 +265,31 @@ impl BankTensors {
                 .map_err(|error| format!("staging allocation failed: {error}"))
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let carriers = match (bank.conveyor.lender, lender) {
+            (Some(_), Some(arenas)) => arenas,
+            (None, None) => {
+                let arena = |kind| {
+                    Tensor::zeros(device, Element::bool(), &[bank.conveyor_arena_bytes(kind)?])
+                        .map_err(|error| format!("conveyor arena allocation failed: {error}"))
+                };
+                [arena(0)?, arena(1)?, arena(2)?]
+            }
+            _ => return Err("the conveyor's lender differs from its plan".into()),
+        };
+        let conveyors = bank
+            .pools
+            .iter()
+            .zip(&bank.conveyor.offsets)
+            .map(|(pool, &offset)| {
+                carriers[pool.kind]
+                    .region(
+                        pool.source,
+                        &[bank.conveyor_records(), pool.matrix[0], pool.matrix[1]],
+                        offset,
+                    )
+                    .map_err(|error| format!("conveyor view failed: {error}"))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         // One arena per routed tensor, sized for its largest form; each
         // form is a view of it at offset 0 (one layer fills it at a time).
         let arenas = (0..3)
@@ -295,6 +327,7 @@ impl BankTensors {
             heartbeat: words(1)?,
             layers,
             pools,
+            conveyors,
             scratch,
             scratch_flags: words(bank.experts)?,
             scratch_lists,
@@ -328,6 +361,7 @@ impl BankTensors {
                 &layer.rings[index(distance.wrapping_sub(1), 2)?]
             }
             BankPart::Staging { kind } => &self.pools[layer.pools[index(kind, 3)?]],
+            BankPart::Conveyor { kind } => &self.conveyors[layer.pools[index(kind, 3)?]],
             BankPart::Scratch { kind } => &self.scratch[layer.scratch[index(kind, 3)?]],
             BankPart::ScratchControl => &layer.scratch_control,
             BankPart::ScratchFlags => &self.scratch_flags,

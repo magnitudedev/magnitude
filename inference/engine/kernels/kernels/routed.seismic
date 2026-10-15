@@ -1420,15 +1420,21 @@ native routed_route_streamed for metal from "metal/routed_route_streamed.metal":
 # into their scratch slots, by the registered GGUF -> resident conversion:
 # `list[0]` is the step sequence the list was written for and `list[1]` the
 # count n; record i < n is staging record list[2 + 2 i] into slot
-# list[3 + 2 i]. A list written for another step converts nothing. L bounds
-# n: a round lists at most L of the R staging records.
-fn routed_convert_wide[R, L, S, N, K](source: &tensor[R, N, K] E,
+# list[3 + 2 i]. A list written for another step converts nothing. A record
+# below R is the pool's own; one at or past R is the conveyor's record r - R,
+# a view of the bank records a prompt borrows (4.9). L bounds n: a round
+# lists at most L records.
+fn routed_convert_wide[R, C, L, S, N, K](source: &tensor[R, N, K] E,
+    conveyor: &tensor[C, N, K] E,
     list: &tensor[2 + 2 * L] i32, step: &tensor[1] i32,
     destination: &mut tensor[S, N, K] U):
     if list[0] == step[0]:
         for record in 0..L:
             if record < list[1]:
-                destination[list[3 + 2 * record], :, :] = repack[U = U](source[list[2 + 2 * record], :, :])
+                if list[2 + 2 * record] < R:
+                    destination[list[3 + 2 * record], :, :] = repack[U = U](source[list[2 + 2 * record], :, :])
+                else:
+                    destination[list[3 + 2 * record], :, :] = repack[U = U](conveyor[list[2 + 2 * record] - R, :, :])
 
 native routed_convert_wide for metal from "metal/routed_convert_wide.metal":
     launch routed_convert_wide:

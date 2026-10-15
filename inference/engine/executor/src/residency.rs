@@ -488,6 +488,14 @@ impl ResidencyStore {
     pub fn device(&self) -> &Device {
         &self.device
     }
+    /// The byte arenas of shared bank group `group`'s components, which a
+    /// streamed load's conveyor borrows records of (`ConveyorPlan`).
+    pub(crate) fn bank_arenas(&mut self, group: usize) -> Result<[Tensor; 3], String> {
+        self.shared_bank
+            .as_mut()
+            .ok_or("a load without a shared bank")?
+            .arenas(&self.device, group)
+    }
     pub fn belongs_to(&self, device: &Device) -> bool {
         self.device.info().id == device.info().id
     }

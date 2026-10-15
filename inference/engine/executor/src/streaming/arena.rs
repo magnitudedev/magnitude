@@ -65,6 +65,8 @@ enum Content {
     Empty,
     Filling(Key),
     Ready(Key),
+    /// Lent to a prompt's conveyor (spec 4.9): neither a victim nor a place.
+    Lent,
 }
 #[derive(Debug)]
 struct Slot {
@@ -249,6 +251,48 @@ impl Arena {
         self.slots[location.slot].readers -= 1;
         Ok(())
     }
+    /// Lend `slots` to a prompt's conveyor (spec 4.9), evicting the experts
+    /// they hold: all of them, or none while one is read or filled.
+    pub fn lend(&mut self, slots: std::ops::Range<usize>) -> Result<Vec<Location>, Error> {
+        let lent = self.slots.get(slots.clone()).ok_or(Error::OutOfBounds)?;
+        if lent
+            .iter()
+            .any(|s| s.readers > 0 || matches!(s.content, Content::Filling(_) | Content::Lent))
+        {
+            return Err(Error::WrongState);
+        }
+        let mut evicted = Vec::new();
+        for index in slots {
+            let slot = &mut self.slots[index];
+            let generation = slot.generation.checked_add(1).ok_or(Error::CounterOverflow)?;
+            if let Content::Ready(key) = slot.content {
+                self.mapped.remove(&key);
+                evicted.push(Location {
+                    slot: index,
+                    generation: slot.generation,
+                    key,
+                });
+            }
+            *slot = Slot {
+                generation,
+                content: Content::Lent,
+                phase: Phase(0),
+                readers: 0,
+            };
+        }
+        Ok(evicted)
+    }
+    /// Take lent `slots` back, empty.
+    pub fn restore(&mut self, slots: std::ops::Range<usize>) -> Result<(), Error> {
+        let lent = self.slots.get_mut(slots).ok_or(Error::OutOfBounds)?;
+        if lent.iter().any(|s| s.content != Content::Lent) {
+            return Err(Error::WrongState);
+        }
+        for slot in lent {
+            slot.content = Content::Empty;
+        }
+        Ok(())
+    }
     #[cfg(test)]
     pub fn validate_read(&self, location: Location) -> Result<(), Error> {
         let slot = self.slot_for(location)?;
@@ -386,6 +430,33 @@ mod tests {
             a.reserve(key(0, 4), Phase(0)).unwrap_err(),
             Error::OutOfBounds
         );
+    }
+    /// A lend evicts what its slots hold, waits for their readers, and its
+    /// slots are neither victims nor places until they come back empty.
+    #[test]
+    fn lent_slots_leave_the_bank_until_restored() {
+        let mut a = Arena::new(3, &[(LayerId(0), 8)]).unwrap();
+        let held = load(&mut a, key(0, 0), 0);
+        let free = load(&mut a, key(0, 1), 1);
+        let free_location = free.location();
+        a.release_after_reader_completion(free).unwrap();
+        assert_eq!(a.lend(0..2).unwrap_err(), Error::WrongState, "slot 0 is read");
+        a.validate_read(held.location()).unwrap();
+        a.release_after_reader_completion(held).unwrap();
+        let evicted = a.lend(1..3).unwrap();
+        assert_eq!(evicted.iter().map(|l| l.key).collect::<Vec<_>>(), vec![key(0, 1)]);
+        assert_eq!(a.validate_read(free_location), Err(Error::StaleLocation));
+        assert_eq!(a.acquire(key(0, 1), Phase(3)).unwrap_err(), Error::Missing);
+        // Only slot 0 remains: the next fill evicts expert 0, never a lent slot.
+        let fill = a.reserve(key(0, 2), Phase(3)).unwrap();
+        assert_eq!(fill.location().slot, 0);
+        let read = a.publish_after_conversion(fill).unwrap();
+        a.release_after_reader_completion(read).unwrap();
+        assert_eq!(a.reserve(key(0, 3), Phase(4)).map(|f| f.location().slot), Ok(0));
+        assert_eq!(a.lend(1..3).unwrap_err(), Error::WrongState, "already lent");
+        a.restore(1..3).unwrap();
+        assert_eq!(a.restore(1..3).unwrap_err(), Error::WrongState);
+        assert_eq!(a.reserve(key(0, 4), Phase(5)).map(|f| f.location().slot), Ok(1));
     }
     #[test]
     fn an_older_reader_cannot_regress_the_use_clock() {

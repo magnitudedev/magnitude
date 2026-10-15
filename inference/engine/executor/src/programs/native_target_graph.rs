@@ -2244,6 +2244,9 @@ pub(crate) enum BankPart {
     Ring { distance: u8 },
     /// The staging pool the layer's routed tensor `kind` is read into.
     Staging { kind: u8 },
+    /// The conveyor of that pool (spec 4.9): records a prompt's next layer
+    /// is read into, on bank records the prompt borrows.
+    Conveyor { kind: u8 },
     /// The scratch bank of the layer's routed tensor `kind` (spec 4.9).
     Scratch { kind: u8 },
     /// The layer's scratch request region.

@@ -8,11 +8,16 @@ use magnitude_family_contracts::SublayerIndex;
 use seismic::{DeviceCatalog, Tensor};
 
 fn resident_plan() -> ModelLoadPlan {
+    resident_plan_of([4, 4, 8])
+}
+
+/// Three routed layers whose expert matrices are `[2, columns[block]]`.
+fn resident_plan_of(columns: [u64; 3]) -> ModelLoadPlan {
     let target = (0..3)
         .flat_map(|block| {
             BANK_KINDS.into_iter().enumerate().map(move |(kind, name)| {
                 let scope = WeightScope::TargetSublayer(SublayerIndex { block, sublayer: 1 });
-                let shape = vec![256, 2, if block == 2 { 8 } else { 4 }];
+                let shape = vec![256, 2, columns[block as usize]];
                 let element = Element::f32();
                 let bytes = Tensor::canonical_layout(element, &shape).unwrap().0;
                 WeightPlan {
@@ -100,7 +105,8 @@ fn shared_storage_shapes_ports_and_physical_charge_agree() {
         .collect::<Vec<_>>();
     assert!(tensors[0].shares_allocation(&tensors[3]));
     assert!(!tensors[0].shares_allocation(&tensors[6]));
-    let controls = BankTensors::allocate(&device, bank, groups).unwrap();
+    let lender = bank.conveyor.lender.map(|group| store.arenas(&device, group).unwrap());
+    let controls = BankTensors::allocate(&device, bank, groups, lender).unwrap();
     assert_eq!(
         device.memory_usage().charged - baseline,
         weight_bytes_by_component(&shared).unwrap()[0]
@@ -147,7 +153,8 @@ fn group_minimum_is_one_launch_union_and_exact_charge_includes_padding() {
         .iter()
         .map(|w| store.bind(&device, w.role).unwrap())
         .collect::<Vec<_>>();
-    let controls = BankTensors::allocate(&device, bank, shared).unwrap();
+    let lender = bank.conveyor.lender.map(|group| store.arenas(&device, group).unwrap());
+    let controls = BankTensors::allocate(&device, bank, shared, lender).unwrap();
     assert_eq!(weights[0].extents(), &[8, 2, 4]);
     assert_eq!(weights[6].extents(), &[17, 2, 8]);
     assert_eq!(device.memory_usage().charged, baseline + charge);
@@ -179,4 +186,53 @@ fn group_capacity_rejects_unions_it_cannot_hold_and_foreign_metadata() {
     bank = load.expert_bank().unwrap().clone();
     bank.shared.as_mut().unwrap().group_of_layer.swap(0, 2);
     assert!(SharedBankStore::new(&bank).is_err());
+}
+
+/// A bank group holding the conveyor beside a launch's union lends it its
+/// last records (spec 4.9): the load charges no conveyor bytes, every
+/// conveyor view lies on those records, and the device holds exactly the
+/// plan's charge. A group that cannot lends nothing and the load holds the
+/// conveyor's arenas.
+#[test]
+fn a_bank_group_with_records_to_spare_lends_the_conveyor_its_bytes() {
+    // One encoding, one pool per routed tensor: its conveyor is a whole
+    // layer of 32-byte records, 256 records of the group.
+    let held = resident_plan_of([4, 4, 4])
+        .with_shared_expert_bank_capacity(&[256], 1)
+        .unwrap();
+    let held = held.expert_bank().unwrap();
+    assert_eq!(held.conveyor.lender, None);
+    let conveyor = (0..3).map(|kind| held.conveyor_arena_bytes(kind).unwrap()).sum::<u64>();
+    assert_eq!(conveyor, 3 * 256 * 32);
+    let load = resident_plan_of([4, 4, 4])
+        .with_shared_expert_bank_capacity(&[300], 1)
+        .unwrap();
+    let bank = load.expert_bank().unwrap();
+    assert_eq!(bank.conveyor.lender, Some(0));
+    assert_eq!(bank.conveyor.lent, 256);
+    assert_eq!(bank.conveyor.offsets, vec![44 * 32; 3]);
+    assert_eq!(bank.staging_bytes().unwrap() + conveyor, held.staging_bytes().unwrap());
+    let device = DeviceCatalog::discover()
+        .unwrap()
+        .open_backend(BackendName::Cpu)
+        .unwrap();
+    let baseline = device.memory_usage().charged;
+    let mut store = SharedBankStore::new(bank).unwrap();
+    let weights = load
+        .target()
+        .iter()
+        .map(|w| store.bind(&device, w.role).unwrap())
+        .collect::<Vec<_>>();
+    let lender = store.arenas(&device, 0).unwrap();
+    let shared = bank.shared.as_ref().unwrap();
+    let controls = BankTensors::allocate(&device, bank, shared, Some(lender.clone())).unwrap();
+    for (pool, view) in controls.conveyors.iter().enumerate() {
+        assert!(view.shares_allocation(&lender[bank.pools[pool].kind]));
+    }
+    assert_eq!(
+        device.memory_usage().charged - baseline,
+        weight_bytes_by_component(&load).unwrap()[0]
+    );
+    drop((controls, weights, lender, store));
+    assert_eq!(device.memory_usage().charged, baseline);
 }

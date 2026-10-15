@@ -1,18 +1,20 @@
-// Expert streaming's convert (`routed_convert`, `routed_convert_wide` in
-// routed.seismic): the listed staging records into bank slots, by windows
-// (lib/streaming/window.h): when list[0] is this step's sequence, record
-// i < list[1] is staging record list[2 + 2 i] into slot list[3 + 2 i].
+// Expert streaming's convert (`routed_convert_wide` in routed.seismic): the
+// listed staging records into bank slots, by windows (lib/streaming/window.h):
+// when list[0] is this step's sequence, record i < list[1] is staging record
+// list[2 + 2 i] into slot list[3 + 2 i]. A record below R is the pool's own,
+// one at or past R the conveyor's record r - R (4.9); both are canonical
+// [*, N, K] stacks of one element, so they share the source's strides.
 // Threadgroups of 8 simdgroups stride over the records' items, so a launch
 // costs what its list holds.
 
-// The including entry defines CONVERT_KERNEL, its kernel's name; the two
-// entries differ only in their grids.
+// The including entry defines CONVERT_KERNEL, its kernel's name.
 
 #include "bind_convert.h"
 #include "window.h"
 
 kernel void CONVERT_KERNEL(
     volatile coherent(system) device const uchar *source [[buffer(SEISMIC_BUFFER_SOURCE)]],
+    volatile coherent(system) device const uchar *conveyor [[buffer(SEISMIC_BUFFER_CONVEYOR)]],
     device uchar *destination [[buffer(SEISMIC_BUFFER_DESTINATION)]],
     volatile coherent(system) device const int *list [[buffer(SEISMIC_BUFFER_LIST)]],
     device const int *step [[buffer(SEISMIC_BUFFER_STEP)]],
@@ -33,6 +35,7 @@ kernel void CONVERT_KERNEL(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (header[0] != step[0])
         return;
+    const ulong own = ulong(SEISMIC_DIM_R);
     const ulong count = ulong(max(header[1], 0));
     const ulong per_record = streaming::record_items<ConvertBinding>(seismic_words);
     const ulong total = ulong(groups.x) * groups.y * groups.z;
@@ -44,7 +47,9 @@ kernel void CONVERT_KERNEL(
             entry[1] = list[3 + 2 * record];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        streaming::convert_item<ConvertBinding>(source, destination, seismic_words, ulong(entry[0]), ulong(entry[1]), item % per_record,
-            window, tid, 256, simd, 8, lane);
+        const ulong staged = ulong(entry[0]);
+        streaming::convert_item<ConvertBinding>(staged < own ? source : conveyor, destination, seismic_words,
+            staged < own ? staged : staged - own, ulong(entry[1]), item % per_record, window, tid, 256, simd, 8,
+            lane);
     }
 }

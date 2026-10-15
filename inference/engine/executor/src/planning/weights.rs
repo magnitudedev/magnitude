@@ -787,7 +787,7 @@ pub struct ExpertBankPlan {
     pub experts: u64,
     /// The experts a routed layer selects per row (`K`).
     pub selected: u64,
-    /// Staging records per pool (`T`).
+    /// Each staging pool's own records (`T`): demand reads and hints.
     pub staging_records: u64,
     /// Every routed layer of the target, in decoder order.
     pub layers: Vec<BankLayer>,
@@ -798,6 +798,21 @@ pub struct ExpertBankPlan {
     /// and distinct resident (element, rows, columns) of it, each a view of
     /// that tensor's scratch arena holding every expert.
     pub scratch: Vec<ScratchPlan>,
+    /// Where each staging pool's conveyor lies (spec 4.9).
+    pub conveyor: ConveyorPlan,
+}
+
+/// Where the conveyor's records lie (spec 4.9): each staging pool's
+/// [`ExpertBankPlan::conveyor_records`] at `offsets[pool]` bytes into its
+/// routed tensor's arena. The conveyor works only while a prompt runs, so a
+/// bank group with records to spare lends its last `lent` for it, and the
+/// arenas are that group's; otherwise the load holds an arena per routed
+/// tensor for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConveyorPlan {
+    pub lender: Option<usize>,
+    pub lent: u64,
+    pub offsets: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -844,9 +859,88 @@ pub struct StagingPoolPlan {
 }
 
 impl ExpertBankPlan {
-    /// Staging records per pool (`streaming::layout::staging_records`).
-    pub fn staging_records_for(experts: u64, selected: u64) -> u64 {
-        crate::streaming::layout::staging_records(experts, selected)
+    /// Records of each staging pool's conveyor (spec 4.9).
+    pub fn conveyor_records(&self) -> u64 {
+        crate::streaming::layout::conveyor_records(self.experts)
+    }
+
+    /// The bytes of routed tensor `kind`'s conveyors, laid end to end in
+    /// pool order, and each pool's offset among them.
+    fn conveyor_extents(&self) -> Result<([u64; 3], Vec<u64>), String> {
+        let mut ends = [0u64; 3];
+        let mut offsets = Vec::with_capacity(self.pools.len());
+        for pool in &self.pools {
+            offsets.push(ends[pool.kind]);
+            ends[pool.kind] = pool
+                .record_bytes
+                .checked_mul(self.conveyor_records())
+                .and_then(|bytes| ends[pool.kind].checked_add(bytes))
+                .ok_or("conveyor bytes overflow")?;
+        }
+        Ok((ends, offsets))
+    }
+
+    /// The conveyor on held arenas: what a bank without a lender holds.
+    fn held_conveyor(&self) -> Result<ConveyorPlan, String> {
+        Ok(ConveyorPlan {
+            lender: None,
+            lent: 0,
+            offsets: self.conveyor_extents()?.1,
+        })
+    }
+
+    /// The conveyor on the records of the shared bank group with the most,
+    /// when it holds them beside the decode form's widest launch; held
+    /// arenas otherwise. Lent records are whole slots: each tensor's
+    /// conveyors begin at the first lent slot's bytes.
+    fn lent_conveyor(
+        &self,
+        shared: &crate::streaming::shared_bank::SharedBankPlan,
+    ) -> Result<ConveyorPlan, String> {
+        let (ends, offsets) = self.conveyor_extents()?;
+        let Some((lender, group)) = shared
+            .groups
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, group)| (group.records, std::cmp::Reverse(*index)))
+        else {
+            return self.held_conveyor();
+        };
+        let slots = self.layers[group.layers[0]].tensors.map(|tensor| tensor.slot_bytes);
+        let lent = (0..3)
+            .map(|kind| ends[kind].div_ceil(slots[kind]))
+            .max()
+            .unwrap_or(0);
+        let minimum = (crate::operators::routed::fused_graph::DECODE_ROWS * self.selected)
+            .min(self.experts);
+        if lent.checked_add(minimum).is_none_or(|needed| needed > group.records) {
+            return self.held_conveyor();
+        }
+        let first = group.records - lent;
+        let offsets = offsets
+            .into_iter()
+            .zip(&self.pools)
+            .map(|(offset, pool)| {
+                first
+                    .checked_mul(slots[pool.kind])
+                    .and_then(|start| start.checked_add(offset))
+                    .ok_or_else(|| "conveyor offset overflow".to_owned())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(ConveyorPlan {
+            lender: Some(lender),
+            lent,
+            offsets,
+        })
+    }
+
+    /// The held conveyor arena of routed tensor `kind`: none when a bank
+    /// group lends the conveyor its records.
+    pub fn conveyor_arena_bytes(&self, kind: usize) -> Result<u64, String> {
+        match self.conveyor.lender {
+            Some(_) => Ok(0),
+            None => Ok(self.conveyor_extents()?.0[kind]),
+        }
     }
 
     /// Words of a layer's request region: the request, acknowledgement,
@@ -957,12 +1051,18 @@ impl ExpertBankPlan {
         })
     }
 
-    /// Bytes every staging pool holds.
+    /// Bytes the staging pools hold: their own records, and the conveyor's
+    /// arenas when no bank group lends it records.
     pub fn staging_bytes(&self) -> Result<u64, String> {
-        self.pools.iter().try_fold(0u64, |total, pool| {
+        let own = self.pools.iter().try_fold(0u64, |total, pool| {
             pool.record_bytes
                 .checked_mul(self.staging_records)
                 .and_then(|bytes| total.checked_add(bytes))
+                .ok_or_else(|| "staging bytes overflow".to_owned())
+        })?;
+        (0..BANK_KINDS.len()).try_fold(own, |total, kind| {
+            total
+                .checked_add(self.conveyor_arena_bytes(kind)?)
                 .ok_or_else(|| "staging bytes overflow".to_owned())
         })
     }
@@ -1643,16 +1743,23 @@ impl ModelLoadPlan {
                 resident,
             });
         }
-        self.bank = Some(ExpertBankPlan {
+        let mut bank = ExpertBankPlan {
             shared: None,
             slots,
             experts,
             selected,
-            staging_records: ExpertBankPlan::staging_records_for(experts, selected),
+            staging_records: crate::streaming::layout::demand_records(selected),
             layers: bank_layers,
             pools,
             scratch,
-        });
+            conveyor: ConveyorPlan {
+                lender: None,
+                lent: 0,
+                offsets: Vec::new(),
+            },
+        };
+        bank.conveyor = bank.held_conveyor()?;
+        self.bank = Some(bank);
         Ok(self)
     }
 
@@ -1695,6 +1802,7 @@ impl ModelLoadPlan {
             weight.shape[0] = shared.groups[shared.group_of_layer[position]].records;
             weight.resident_bytes = representation_bytes(weight.resident, &weight.shape)?;
         }
+        bank.conveyor = bank.lent_conveyor(&shared)?;
         bank.shared = Some(shared);
         Ok(self)
     }

@@ -195,7 +195,10 @@ impl SharedBankPlan {
     }
 }
 
+/// A group's components: each a byte arena, so a lent record range can be
+/// viewed in another form (`ConveyorPlan`), and its typed view at offset 0.
 struct GroupStorage {
+    arenas: [Tensor; 3],
     regions: [Tensor; 3],
 }
 pub(crate) struct SharedBankStore {
@@ -251,35 +254,48 @@ impl SharedBankStore {
             .group_of_layer
             .get(layer)
             .ok_or("unknown routed layer")?;
+        Ok(self.storage(device, group)?.regions[kind].clone())
+    }
+    /// The byte arenas of `group`'s components, which a lent record range is
+    /// viewed through (`ConveyorPlan`).
+    pub fn arenas(&mut self, device: &Device, group: usize) -> Result<[Tensor; 3]> {
+        Ok(self.storage(device, group)?.arenas.clone())
+    }
+    fn storage(&mut self, device: &Device, group: usize) -> Result<&GroupStorage> {
+        let planned = self.plan.groups.get(group).ok_or("unknown bank group")?;
         if let Some(storage) = &self.groups[group] {
-            if !storage.regions[kind].belongs_to(device) {
+            if !storage.arenas[0].belongs_to(device) {
                 return Err("shared bank device changed".into());
             }
         } else {
-            let planned = &self.plan.groups[group];
+            let mut arenas = Vec::with_capacity(3);
             let mut regions = Vec::with_capacity(3);
             for kind in 0..3 {
-                regions.push(checked(Tensor::zeros(
-                    device,
-                    planned.encoding.elements[kind],
-                    &planned.encoding.extents(kind, planned.records),
-                ))?);
+                let element = planned.encoding.elements[kind];
+                let extents = planned.encoding.extents(kind, planned.records);
+                let bytes = checked(Tensor::canonical_layout(element, &extents))?.0;
+                let arena = checked(Tensor::zeros(device, Element::bool(), &[bytes]))?;
+                regions.push(checked(arena.region(element, &extents, 0))?);
+                arenas.push(arena);
             }
-            let regions: [Tensor; 3] = regions.try_into().expect("three components");
-            if regions.iter().map(Tensor::storage_bytes).sum::<u64>() != planned.allocated_bytes {
+            let arenas: [Tensor; 3] = arenas.try_into().expect("three components");
+            if arenas.iter().map(Tensor::storage_bytes).sum::<u64>() != planned.allocated_bytes {
                 return Err("shared cache allocation differs from plan".into());
             }
             // The store is installed only after the whole group succeeds.
-            self.groups[group] = Some(GroupStorage { regions });
+            self.groups[group] = Some(GroupStorage {
+                arenas,
+                regions: regions.try_into().expect("three components"),
+            });
         }
-        Ok(self.groups[group].as_ref().expect("allocated").regions[kind].clone())
+        Ok(self.groups[group].as_ref().expect("allocated"))
     }
     #[cfg(test)]
     pub fn allocated_bytes(&self) -> u64 {
         self.groups
             .iter()
             .flatten()
-            .flat_map(|g| g.regions.iter().map(Tensor::storage_bytes))
+            .flat_map(|g| g.arenas.iter().map(Tensor::storage_bytes))
             .sum()
     }
     /// Weak observations of every physical allocation exactly once.
@@ -288,7 +304,7 @@ impl SharedBankStore {
         self.groups
             .iter()
             .flatten()
-            .flat_map(|group| group.regions.iter().map(Tensor::observe_storage))
+            .flat_map(|group| group.arenas.iter().map(Tensor::observe_storage))
             .collect()
     }
 }
@@ -300,6 +316,7 @@ mod tests {
         ArtifactComponent, ArtifactComponentKind, BankLayer, BankTensor, ScratchPlan,
         StagingPoolPlan, WeightPlan,
     };
+    use crate::streaming::layout::BankTensors;
     use magnitude_family_contracts::{SublayerIndex, WeightDescriptor, WeightScope};
     fn bank_metadata(e: &Encoding) -> ExpertBankPlan {
         let layers = (0..2)
@@ -384,6 +401,13 @@ mod tests {
                     .0,
                 })
                 .collect(),
+            // Each pool is its routed tensor's only one: its conveyor opens
+            // the tensor's held arena.
+            conveyor: crate::planning::ConveyorPlan {
+                lender: None,
+                lent: 0,
+                offsets: vec![0; 3],
+            },
         }
     }
     fn encoding(down: &str) -> Encoding {
@@ -511,7 +535,7 @@ mod tests {
         let shared = SharedBankPlan::from_bank(&metadata).unwrap();
         metadata.shared = Some(shared.clone());
         let tensors =
-            crate::streaming::layout::BankTensors::allocate(&device, &metadata, &shared).unwrap();
+            BankTensors::allocate(&device, &metadata, &shared, None).unwrap();
         assert!(tensors.layers[0]
             .stamps
             .shares_allocation(&tensors.layers[1].stamps));
@@ -549,11 +573,11 @@ mod tests {
         metadata.shared = Some(shared.clone());
         let charge = metadata.charged_bytes().unwrap();
         device.set_memory_limit(Some(baseline + charge - 1));
-        assert!(crate::streaming::layout::BankTensors::allocate(&device, &metadata, &shared).is_err());
+        assert!(BankTensors::allocate(&device, &metadata, &shared, None).is_err());
         assert_eq!(device.memory_usage().charged, baseline);
         device.set_memory_limit(Some(baseline + charge));
         let tensors =
-            crate::streaming::layout::BankTensors::allocate(&device, &metadata, &shared).unwrap();
+            BankTensors::allocate(&device, &metadata, &shared, None).unwrap();
         assert_eq!(device.memory_usage().charged, baseline + charge);
         drop(tensors);
         assert_eq!(device.memory_usage().charged, baseline);
@@ -561,7 +585,7 @@ mod tests {
         let mut foreign = shared.clone();
         foreign.group_of_layer.swap(0, 1); // identical members: still valid
         foreign.groups[0].records += 1;
-        assert!(crate::streaming::layout::BankTensors::allocate(&device, &metadata, &foreign).is_err());
+        assert!(BankTensors::allocate(&device, &metadata, &foreign, None).is_err());
         assert_eq!(device.memory_usage().charged, baseline);
     }
 }

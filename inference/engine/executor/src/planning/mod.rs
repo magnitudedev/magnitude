@@ -33,8 +33,9 @@ pub use resources::{
     reads_decoded_history,
 };
 pub use weights::{
-    AttentionBinding, AttentionShape, BANK_KINDS, BankTensor, DenseBinding, DenseBranchBinding,
-    DenseScales, DirectoryForm, EmbeddingBinding, ExpertBankPlan, FeaturesBinding, HeadBinding,
+    AttentionBinding, AttentionShape, BANK_KINDS, BankTensor, ConveyorPlan, DenseBinding,
+    DenseBranchBinding, DenseScales, DirectoryForm, EmbeddingBinding, ExpertBankPlan,
+    FeaturesBinding, HeadBinding,
     HostPeak, HostTablePlan, ModelLoadPlan, NGramBinding, ParallelBinding, PerLayerBinding,
     PerLayerEntryBinding, ReadoutBinding, ReadoutClassChoice, ReadoutHead, RecurrentBinding,
     RoutedBank, RoutedBinding, ScalableWeight, SelectionBinding, SelectionShape, SublayerTail,

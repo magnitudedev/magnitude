@@ -323,12 +323,17 @@ pub(crate) fn import_target(
     let bank = residency
         .load_plan()
         .expert_bank()
+        .cloned()
         .map(|plan| {
-            crate::streaming::bank::ResidentBank::open(residency.device(), plan, target, &sublayers)
+            // The conveyor borrows its lender's records (spec 4.9).
+            let lender =
+                plan.conveyor.lender.map(|group| residency.bank_arenas(group)).transpose()?;
+            let device = residency.device();
+            crate::streaming::bank::ResidentBank::open(device, &plan, target, &sublayers, lender)
                 .map(std::sync::Arc::new)
-                .map_err(invalid)
         })
-        .transpose()?;
+        .transpose()
+        .map_err(invalid)?;
     Ok(ResidentTarget {
         embedding,
         blocks: decoder.blocks.len(),

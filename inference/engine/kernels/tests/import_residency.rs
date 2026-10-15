@@ -680,9 +680,10 @@ fn repack_matches_the_registered_conversion(device: &seismic::Device, layouts: &
     }
 }
 
-/// Expert streaming's convert (spec 10 test 7): listed staging records land in
-/// their bank slots as exactly the bytes a resident import places for that
-/// matrix, for every format and Metal layout; unlisted slots are untouched.
+/// Expert streaming's convert (spec 10 test 7): listed staging records, the
+/// pool's own and the conveyor's, land in their bank slots as exactly the
+/// bytes a resident import places for that matrix, for every format and Metal
+/// layout; unlisted slots are untouched.
 #[test]
 fn metal_convert_places_what_the_import_places() {
     let Some(device) = device(seismic::BackendName::Metal) else {
@@ -703,6 +704,9 @@ fn metal_convert_places_what_the_import_places() {
         let bytes = source_bytes(length, n as u32 + 7);
         let staging = seismic::Tensor::from_host(&device, source_element, &shape, &bytes).unwrap();
         let record = (length / records) as usize;
+        let conveyed = source_bytes(2 * record as u64, n as u32 + 11);
+        let conveyor =
+            seismic::Tensor::from_host(&device, source_element, &[2, n, k], &conveyed).unwrap();
         for layout in [
             seismic::Layout::Packet,
             seismic::Layout::Rows16,
@@ -719,9 +723,10 @@ fn metal_convert_places_what_the_import_places() {
             let sentinel = vec![0xa5u8; slot_bytes * slots as usize];
             let mut bank =
                 seismic::Tensor::from_host(&device, destination, &[slots, n, k], &sentinel).unwrap();
-            // Record 2 into slot 0, record 0 into slot 3 for step 7; slots 1
-            // and 2 stay. The same list stamped for step 6 converts nothing.
-            // The list holds two of the three staging records.
+            // Record 2 into slot 0, record 0 into slot 3 and the conveyor's
+            // record 1 (record 3 + 1) into slot 1 for step 7; slot 2 stays.
+            // The same list stamped for step 6 converts nothing. The list
+            // holds three of the five records.
             let convert = routed_convert_wide::native_for_device_with(
                 &device,
                 routed_convert_wide::Elements {
@@ -732,10 +737,11 @@ fn metal_convert_places_what_the_import_places() {
             )
             .unwrap();
             for stamp in [6, 7] {
-                let list = i32s(&[stamp, 2, 2, 0, 0, 3]);
+                let list = i32s(&[stamp, 3, 2, 0, 0, 3, 4, 1]);
                 convert
                     .call(routed_convert_wide::Args {
                         source: &staging,
+                        conveyor: &conveyor,
                         list: &list,
                         step: &step,
                         destination: &mut bank,
@@ -749,7 +755,7 @@ fn metal_convert_places_what_the_import_places() {
                 }
             }
             let actual = bank.read_to_host().unwrap();
-            let imported = |index: usize| {
+            let imported = |bytes: &[u8], index: usize| {
                 destination
                     .repack_host(
                         source_element,
@@ -760,9 +766,10 @@ fn metal_convert_places_what_the_import_places() {
             };
             let slot = |index: usize| &actual[index * slot_bytes..(index + 1) * slot_bytes];
             let label = format!("{source_name} -> {}", destination.name());
-            assert_eq!(slot(0), imported(2).as_slice(), "{label}: slot 0");
-            assert_eq!(slot(3), imported(0).as_slice(), "{label}: slot 3");
-            assert!(slot(1).iter().chain(slot(2)).all(|&b| b == 0xa5), "{label}: unlisted slots");
+            assert_eq!(slot(0), imported(&bytes, 2).as_slice(), "{label}: slot 0");
+            assert_eq!(slot(3), imported(&bytes, 0).as_slice(), "{label}: slot 3");
+            assert_eq!(slot(1), imported(&conveyed, 1).as_slice(), "{label}: conveyed slot 1");
+            assert!(slot(2).iter().all(|&b| b == 0xa5), "{label}: unlisted slot");
         }
     }
 }

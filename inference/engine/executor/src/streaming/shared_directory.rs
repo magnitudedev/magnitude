@@ -53,6 +53,8 @@ pub(crate) struct SharedDirectory {
     groups: Vec<Arena>,
     group_of_layer: Vec<usize>,
     capacities: Vec<usize>,
+    /// Per group, the records lent to a prompt's conveyor (spec 4.9).
+    lent: Vec<usize>,
     experts: u32,
     observed: Option<Clock>,
     frames: Vec<Frame>,
@@ -99,6 +101,7 @@ impl SharedDirectory {
         Ok(Self {
             groups,
             group_of_layer,
+            lent: vec![0; capacities.len()],
             capacities,
             experts,
             observed: None,
@@ -114,14 +117,36 @@ impl SharedDirectory {
         }
         Ok(())
     }
-    /// Records of the bank group `layer` belongs to: the most experts one
-    /// request may hold.
+    /// Records of the bank group `layer` belongs to that are not lent: the
+    /// most experts one request may hold.
     pub fn capacity(&self, layer: usize) -> Result<usize, Error> {
         let group = self
             .group_of_layer
             .get(layer)
             .ok_or(Error::InvalidRequest)?;
-        Ok(self.capacities[*group])
+        Ok(self.capacities[*group] - self.lent[*group])
+    }
+    /// Lend `group`'s records `slots` to a prompt's conveyor (spec 4.9): the
+    /// experts they held, which the caller unmaps. Refused, changing
+    /// nothing, while a step reads or fills one of them.
+    pub fn lend(
+        &mut self,
+        group: usize,
+        slots: std::ops::Range<usize>,
+    ) -> Result<Vec<Location>, Error> {
+        let arena = self.groups.get_mut(group).ok_or(Error::InvalidRequest)?;
+        let count = slots.len();
+        let evicted = arena.lend(slots)?;
+        self.lent[group] += count;
+        Ok(evicted)
+    }
+    /// Take lent records back into `group`, empty.
+    pub fn restore(&mut self, group: usize, slots: std::ops::Range<usize>) -> Result<(), Error> {
+        let arena = self.groups.get_mut(group).ok_or(Error::InvalidRequest)?;
+        let count = slots.len();
+        arena.restore(slots)?;
+        self.lent[group] -= count;
+        Ok(())
     }
     pub fn validate_ports(&self, sizes: &[(usize, usize)]) -> Result<(), Error> {
         if sizes.len() != self.group_of_layer.len() {
@@ -235,7 +260,7 @@ impl SharedDirectory {
                 unique.push(expert);
             }
         }
-        if unique.len() > self.capacities[group] {
+        if unique.len() > self.capacities[group] - self.lent[group] {
             return Err(Error::InvalidRequest);
         }
         let arena = &mut self.groups[group];
