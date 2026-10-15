@@ -60,8 +60,8 @@ export const windowsExecutableResources = async (platform: string, description: 
   const version = /export const MAGNITUDE_VERSION = "([0-9]+)\.([0-9]+)\.([0-9]+)/.exec(generated)
   if (!version) throw new Error("The generated Magnitude version has no numeric release version")
   const icon = fileURLToPath(new URL("../../resources/windows/Magnitude.ico", import.meta.url))
-  return ["--windows-title=Magnitude", "--windows-publisher=Magnitude", `--windows-description=${description}`,
-    `--windows-version=${version.slice(1, 4).join(".")}.0`, "--windows-copyright=Copyright Magnitude", `--windows-icon=${icon}`]
+  return ["--windows-title=Magnitude", "--windows-publisher=Magnitude AI Inc.", `--windows-description=${description}`,
+    `--windows-version=${version.slice(1, 4).join(".")}.0`, "--windows-copyright=Copyright Magnitude AI Inc.", `--windows-icon=${icon}`]
 }
 
 export const run = (

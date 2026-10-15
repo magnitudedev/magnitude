@@ -154,9 +154,6 @@ Section "Magnitude"
   WriteRegStr HKCU "${REGKEY}" "DisplayName" "Magnitude"
   IfErrors registrationFailed
   ClearErrors
-  WriteRegStr HKCU "${REGKEY}" "Publisher" "Magnitude"
-  IfErrors registrationFailed
-  ClearErrors
   WriteRegStr HKCU "${REGKEY}" "DisplayVersion" "${MAGNITUDE_VERSION}"
   IfErrors registrationFailed
   ClearErrors
@@ -194,6 +191,7 @@ stageFailed:
   !insertmacro LogFailure "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
   Abort "Setup could not complete. Installation files were retained for recovery. Close applications using them and run setup again."
 installed:
+  WriteRegStr HKCU "${REGKEY}" "Publisher" "Magnitude AI Inc."
   WriteRegStr HKCU "${REGKEY}" "DisplayIcon" "$INSTDIR\Magnitude.exe"
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   WriteRegDWORD HKCU "${REGKEY}" "EstimatedSize" "$0"

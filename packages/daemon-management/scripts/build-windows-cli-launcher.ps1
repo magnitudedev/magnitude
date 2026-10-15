@@ -28,11 +28,11 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
-      VALUE "CompanyName", "Magnitude"
+      VALUE "CompanyName", "Magnitude AI Inc."
       VALUE "FileDescription", "Magnitude command"
       VALUE "FileVersion", "$Version.0"
       VALUE "InternalName", "magnitude"
-      VALUE "LegalCopyright", "Copyright Magnitude"
+      VALUE "LegalCopyright", "Copyright Magnitude AI Inc."
       VALUE "OriginalFilename", "magnitude.exe"
       VALUE "ProductName", "Magnitude"
       VALUE "ProductVersion", "$Version.0"
