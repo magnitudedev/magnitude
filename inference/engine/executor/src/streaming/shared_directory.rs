@@ -129,6 +129,20 @@ impl SharedDirectory {
         let members = self.group_of_layer.iter().filter(|g| **g == group).count();
         Ok((self.capacities[group] - self.lent[group]) / members)
     }
+    /// Evict `expert` of `layer` from the bank: its location, which the
+    /// caller unmaps, or None when the bank does not hold it or a step reads
+    /// or fills its slot now.
+    pub fn discard(&mut self, layer: usize, expert: i32) -> Result<Option<Location>, Error> {
+        let group = *self
+            .group_of_layer
+            .get(layer)
+            .ok_or(Error::InvalidRequest)?;
+        let expert = u32::try_from(expert).map_err(|_| Error::InvalidRequest)?;
+        Ok(self.groups[group].discard(Key {
+            layer: LayerId(layer as u32),
+            expert: ExpertId(expert),
+        })?)
+    }
     /// Lend `group`'s records `slots` to a prompt's conveyor (spec 4.9): the
     /// experts they held, which the caller unmaps. Refused, changing
     /// nothing, while a step reads or fills one of them.

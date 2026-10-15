@@ -274,11 +274,12 @@ pub(crate) struct ScratchFill {
     experts: usize,
     /// Records staged per round.
     round_records: usize,
-    /// The layer whose experts the scratch banks hold, and which. Only fills
-    /// write the scratch banks and the device runs them in request order, so
-    /// a later fill of the same layer (the next step of a layer-major group)
-    /// reads only the experts the banks lack.
-    holds: Option<(usize, Vec<bool>)>,
+    /// The layer whose experts the scratch banks hold, and how many choices of
+    /// the group routed to each (0 for one they do not hold). Only fills write
+    /// the scratch banks and the device runs them in request order, so a later
+    /// fill of the same layer (the next step of a layer-major group) reads only
+    /// the experts the banks lack.
+    holds: Option<(usize, Vec<u32>)>,
 }
 
 impl ScratchFill {
@@ -1075,6 +1076,53 @@ fn serve(state: &mut State, source: &ExpertSource, layer: usize, sequence: i32) 
     state.layers[layer].served = sequence;
 }
 
+/// The experts of `layer` a prompt group seeds at its last step: its most
+/// routed (`routed`, the group's choices per expert) up to the layer's share,
+/// those the bank lacks. To make room within the share it evicts the layer's
+/// least recently read other experts, never the step's `hits`, which the fill
+/// copies; a short prompt evicts no more than its seeds need.
+fn keep_routed(state: &mut State, layer: usize, routed: &[u32], hits: &[i32]) -> Vec<i32> {
+    let share = state
+        .directory
+        .share(layer)
+        .expect("a streamed layer of the directory");
+    let mut kept = (0..routed.len() as i32)
+        .filter(|&expert| routed[expert as usize] > 0)
+        .collect::<Vec<_>>();
+    kept.sort_by_key(|&expert| std::cmp::Reverse(routed[expert as usize]));
+    kept.truncate(share);
+    let slot_of = &state.layers[layer].slot_of;
+    let seeded = kept
+        .iter()
+        .copied()
+        .filter(|&expert| slot_of[expert as usize] < 0)
+        .collect::<Vec<_>>();
+    let resident = slot_of.iter().filter(|&&slot| slot >= 0).count();
+    let excess = (resident + seeded.len()).saturating_sub(share);
+    if excess > 0 {
+        let mut others = (0..slot_of.len() as i32)
+            .filter(|&expert| {
+                slot_of[expert as usize] >= 0 && !kept.contains(&expert) && !hits.contains(&expert)
+            })
+            .map(|expert| {
+                let slot = slot_of[expert as usize] as usize;
+                (state.layers[layer].stamps.load(slot), expert)
+            })
+            .collect::<Vec<_>>();
+        others.sort_unstable();
+        for (_, expert) in others.into_iter().take(excess) {
+            let discarded = state
+                .directory
+                .discard(layer, expert)
+                .expect("a streamed layer of the directory");
+            if let Some(location) = discarded {
+                unmap(state, location);
+            }
+        }
+    }
+    seeded
+}
+
 /// A scratch-served launch's fill (spec 4.9): of the routed experts the
 /// scratch banks lack, list those in the layer's bank for the copy, then
 /// stage the rest round by round, each
@@ -1086,44 +1134,44 @@ fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequenc
     state.prompt = state.prompt.max(sequence);
     let point = state.clock(sequence, layer);
     advance(state, point, source);
-    let mut holds = match state.scratch.holds.take() {
-        Some((held, holds)) if held == layer => holds,
-        _ => vec![false; state.scratch.experts],
+    let held = match state.scratch.holds.take() {
+        Some((held_layer, held)) if held_layer == layer => held,
+        _ => vec![0; state.scratch.experts],
     };
+    let flags = (0..state.scratch.experts)
+        .map(|expert| state.scratch.flags.load(expert))
+        .collect::<Vec<_>>();
     let flagged = (0..state.scratch.experts)
-        .filter(|&expert| state.scratch.flags.load(expert) != 0 && !holds[expert])
+        .filter(|&expert| flags[expert] != 0 && held[expert] == 0)
         .map(|expert| expert as i32)
         .collect::<Vec<_>>();
     // The launch's experts resolve against the shared directory as a decode
     // request does: its hits are pinned while the fill copies them into the
-    // scratch banks, and its absent experts get bank slots until the layer
-    // holds its share of the bank group. The fill reads and converts every
-    // absent expert into the scratch banks, then seeds the placed ones into
-    // their slots; the device commits them (`routed_seed_commit`), so the bank
-    // holds what the prompt read. A prompt reads every layer in turn: past its
-    // share, a layer's seeds would evict the other layers' before the next
-    // prompt reads them, and the bank would keep none of the prompt.
-    let share = state
-        .directory
-        .share(layer)
-        .expect("a streamed layer of the directory");
-    let resident = state.layers[layer]
-        .slot_of
-        .iter()
-        .filter(|&&slot| slot >= 0)
-        .count();
+    // scratch banks. The fill reads and converts every absent expert into the
+    // scratch banks. At the group's last step of the layer the bank keeps the
+    // group's most routed experts, up to the layer's share of its bank group:
+    // the fill seeds them from the scratch banks into their slots and the
+    // device commits them (`routed_seed_commit`). The decode that follows
+    // reads what the prompt read most. A prompt reads every layer in turn:
+    // past its share, a layer's seeds would evict the other layers' before
+    // the next prompt reads them, and the bank would keep none of it.
     let (hits, absent): (Vec<i32>, Vec<i32>) = flagged
         .iter()
         .partition(|&&expert| state.layers[layer].slot_of[expert as usize] >= 0);
-    let placed = absent.len().min(share.saturating_sub(resident));
-    let request = hits
+    let routed = held
         .iter()
-        .chain(&absent[..placed])
-        .copied()
+        .zip(&flags)
+        .map(|(&held, &flag)| held + flag.max(0) as u32)
         .collect::<Vec<_>>();
+    let seeded = if sequence == state.last_of_group(sequence) {
+        keep_routed(state, layer, &routed, &hits)
+    } else {
+        Vec::new()
+    };
+    let request = hits.iter().chain(&seeded).copied().collect::<Vec<_>>();
     let mut copies = Vec::new();
     let mut seeds = Vec::new();
-    let mut cold = absent[placed..].to_vec();
+    let mut cold = absent;
     if !request.is_empty() {
         let clock = point;
         state
@@ -1154,7 +1202,6 @@ fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequenc
             state.layers[layer].expert_of[slot] = expert;
             state.layers[layer].stamps.store(slot, sequence);
             seeds.push((expert as u32, slot));
-            cold.push(expert);
         }
         publish_list(&state.scratch.seeds, sequence, &seeds);
         state
@@ -1275,10 +1322,7 @@ fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequenc
     if failed {
         state.layers[layer].scratch_control.store(FAILURE, sequence);
     } else {
-        for &expert in &flagged {
-            holds[expert as usize] = true;
-        }
-        state.scratch.holds = Some((layer, holds));
+        state.scratch.holds = Some((layer, routed));
     }
     // The device may still read these until it is past the layer.
     for (expert, records) in held.into_iter().flatten() {
@@ -1567,11 +1611,11 @@ mod tests {
         std::fs::remove_file(file).unwrap();
     }
 
-    /// A layer-major group's second step at a layer finds what the first
-    /// step's fill left in the scratch banks: it reads, copies and seeds only
-    /// the expert they lack.
+    /// A layer-major group's later steps at a layer find what the earlier
+    /// steps' fills left in the scratch banks and read only the experts they
+    /// lack; the group's last step seeds the bank with its most routed.
     #[test]
-    fn a_groups_later_fill_of_a_layer_reads_only_what_scratch_lacks() {
+    fn a_prompt_group_reads_what_scratch_lacks_and_keeps_its_most_routed_experts() {
         let device = DeviceCatalog::discover()
             .unwrap()
             .open_backend(BackendName::Metal)
@@ -1648,14 +1692,18 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let mut seeded = Vec::new();
+        // (expert, flag): the choices that route to it.
         for (sequence, routed) in [
-            (1, &[3, 4][..]),
-            (2, &[4, 5][..]),
-            (3, &[6, 7, 8, 9, 10, 11, 12][..]),
+            (1, &[(3, 1), (4, 2)][..]),
+            (2, &[(4, 1), (5, 1)][..]),
+            (
+                3,
+                &[(6, 1), (7, 1), (8, 1), (9, 2), (10, 2), (11, 2), (12, 2)][..],
+            ),
         ] {
             device_flags.fill(0);
-            for &expert in routed {
-                device_flags.store(expert as usize, 1);
+            for &(expert, flag) in routed {
+                device_flags.store(expert as usize, flag);
             }
             device_control.store(REQUEST, sequence);
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1681,10 +1729,10 @@ mod tests {
                 device_commits.store(device_seeds.load(3 + 2 * i) as usize, sequence);
             }
         }
-        // The layer holds its share of the bank (all 8 records): the third
-        // step reads every expert it lacks but seeds only the 5 that fill
-        // the share.
-        assert_eq!(seeded, [vec![3, 4], vec![5], vec![6, 7, 8, 9, 10]]);
+        // Only the group's last step seeds: the layer's share (all 8
+        // records) of the group's most routed experts, the group's choices
+        // summed over its steps. Experts 7 and 8 are read but not kept.
+        assert_eq!(seeded, [vec![], vec![], vec![4, 9, 10, 11, 12, 3, 5, 6]]);
         runtime.step_completed(1, true).unwrap();
         runtime.step_completed(2, true).unwrap();
         runtime.step_completed(3, true).unwrap();

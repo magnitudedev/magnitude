@@ -251,6 +251,34 @@ impl Arena {
         self.slots[location.slot].readers -= 1;
         Ok(())
     }
+    /// Empty `key`'s slot: the expert it held, or None when the key is not
+    /// held or its slot is read or filled now.
+    pub fn discard(&mut self, key: Key) -> Result<Option<Location>, Error> {
+        self.check_key(key)?;
+        let Some(&index) = self.mapped.get(&key) else {
+            return Ok(None);
+        };
+        let slot = &mut self.slots[index];
+        if slot.readers > 0 || slot.content != Content::Ready(key) {
+            return Ok(None);
+        }
+        let location = Location {
+            slot: index,
+            generation: slot.generation,
+            key,
+        };
+        *slot = Slot {
+            generation: slot
+                .generation
+                .checked_add(1)
+                .ok_or(Error::CounterOverflow)?,
+            content: Content::Empty,
+            phase: Phase(0),
+            readers: 0,
+        };
+        self.mapped.remove(&key);
+        Ok(Some(location))
+    }
     /// Lend `slots` to a prompt's conveyor (spec 4.9), evicting the experts
     /// they hold: all of them, or none while one is read or filled.
     pub fn lend(&mut self, slots: std::ops::Range<usize>) -> Result<Vec<Location>, Error> {
@@ -332,6 +360,21 @@ mod tests {
     fn load(arena: &mut Arena, k: Key, phase: u64) -> ReadLease {
         let fill = arena.reserve(k, Phase(phase)).unwrap();
         arena.publish_after_conversion(fill).unwrap()
+    }
+    #[test]
+    fn a_discarded_expert_leaves_an_empty_slot_but_a_read_one_stays() {
+        let mut a = Arena::new(1, &[(LayerId(0), 4)]).unwrap();
+        let read = load(&mut a, key(0, 0), 1);
+        let kept = read.location();
+        assert_eq!(a.discard(key(0, 0)), Ok(None), "a step reads it");
+        a.release_after_reader_completion(read).unwrap();
+        assert_eq!(a.discard(key(0, 0)), Ok(Some(kept)));
+        assert_eq!(a.discard(key(0, 0)), Ok(None), "no longer held");
+        assert_eq!(a.validate_read(kept), Err(Error::StaleLocation));
+        // The emptied slot is a place: the next reservation evicts nothing.
+        let fill = a.reserve(key(0, 1), Phase(2)).unwrap();
+        assert_eq!(fill.evicted(), None);
+        assert_eq!(fill.location().slot, kept.slot);
     }
     #[test]
     fn reader_prevents_eviction_until_its_fence() {

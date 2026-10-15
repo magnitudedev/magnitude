@@ -1458,7 +1458,8 @@ native routed_step for metal from "metal/routed_step.metal":
 # ---------------------------------------------------------------------------
 # Expert streaming, a scratch-served step (4.9): the launch's experts fill the
 # layer's scratch bank, slot e holding expert e, in parked rounds. `flags[e]`
-# is 1 when the launch routes to expert e. The layer's scratch request region
+# is the number of choices that route to expert e, 0 when none does: the host
+# keeps a prompt's most routed experts. The layer's scratch request region
 # (every layer of a step requests under the step's one sequence, so each has
 # its own):
 #   [0] request sequence (device), [1] layer (device), [2] failure (host),
@@ -1475,13 +1476,13 @@ fn routed_scratch_request[M, K, E, C](routes: &tensor[M, K] i32,
         flags[expert] = 0
     for row in 0..M:
         for choice in 0..K:
-            flags[routes[row, choice]] = 1
+            flags[routes[row, choice]] = flags[routes[row, choice]] + 1
     if C >= 4:
         control[1] = layer
         control[0] = step[0]
 
-# Metal: one threadgroup; the flags cleared, then set by every choice, then
-# the layer and the sequence, under system-scope fences.
+# Metal: one threadgroup; each expert's choices counted by threadgroup atomic
+# adds, then the flags, the layer and the sequence, under system-scope fences.
 native routed_scratch_request for metal from "metal/routed_scratch_request.metal":
     static (K, E, C)
     where E <= 1024 and C >= 4

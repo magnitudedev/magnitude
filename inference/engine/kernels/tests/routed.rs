@@ -4,7 +4,7 @@
 use magnitude_kernels::{
     routed_bank_fill, routed_combine, routed_copy, routed_down, routed_expand, routed_experts,
     routed_gate_up, routed_group, routed_output, routed_route, routed_route_shared,
-    routed_route_streamed, routed_seed_commit, routed_step,
+    routed_route_streamed, routed_scratch_request, routed_seed_commit, routed_step,
 };
 use seismic_lang::{
     checked::{CheckedModule, SourceFile, check_source},
@@ -5047,6 +5047,76 @@ fn metal_copy_places_listed_records_exactly() {
                 );
             }
         }
+    }
+}
+
+/// `routed_scratch_request` flags every expert with the number of choices
+/// that route to it, as the portable body does, then publishes the layer
+/// and the step.
+#[test]
+fn metal_scratch_request_counts_every_expert_s_choices() {
+    let catalog = seismic::DeviceCatalog::discover().unwrap();
+    let Ok(device) = catalog.open_backend(seismic::BackendName::Metal) else {
+        return;
+    };
+    let module = module();
+    let control_words = 8usize;
+    for (rows, experts) in [(1usize, 32usize), (37, 32), (64, 256), (512, 256)] {
+        let routes = (0..rows * K)
+            .map(|flat| {
+                let (row, choice) = (flat / K, flat % K);
+                ((row * row + 7 * row + 13 * choice) % if row % 3 == 0 { 5 } else { experts })
+                    as i32
+            })
+            .collect::<Vec<_>>();
+        let outcome = interpret(
+            &module,
+            "routed_scratch_request",
+            &[],
+            vec![
+                ints(&[rows, K], &routes),
+                ints(&[1], &[5]),
+                ints(&[experts], &vec![9; experts]),
+                ints(&[control_words], &vec![0; control_words]),
+                Input::I32(3),
+            ],
+        );
+        let expected = input(&outcome, 2)
+            .into_iter()
+            .map(|v| v as i32)
+            .collect::<Vec<_>>();
+        for expert in 0..experts as i32 {
+            let count = routes.iter().filter(|&&e| e == expert).count() as i32;
+            assert_eq!(
+                expected[expert as usize], count,
+                "portable count of expert {expert}"
+            );
+        }
+        let mut flags = i32_tensor(&device, &[experts as u64], &vec![9; experts]);
+        let mut control = i32_tensor(&device, &[control_words as u64], &vec![0; control_words]);
+        routed_scratch_request::native_for_device(
+            &device,
+            &specialize(
+                &[
+                    ("K", K as u64),
+                    ("E", experts as u64),
+                    ("C", control_words as u64),
+                ],
+                &[],
+            ),
+        )
+        .unwrap()
+        .call(routed_scratch_request::Args {
+            routes: &i32_tensor(&device, &[rows as u64, K as u64], &routes),
+            step: &i32_tensor(&device, &[1], &[5]),
+            flags: &mut flags,
+            control: &mut control,
+            layer: 3,
+        })
+        .unwrap();
+        assert_eq!(read_i32(&flags), expected, "rows {rows} experts {experts}");
+        let control = read_i32(&control);
+        assert_eq!((control[0], control[1]), (5, 3), "request and layer");
     }
 }
 
