@@ -44,7 +44,7 @@ Var PreviousVersion
   File /oname=MagnitudeInstallGuard.dll "MagnitudeInstallGuard.dll"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::HoldOwnership() i .r0'
   ${If} $0 != 0
-    !insertmacro Fail "Close Magnitude using Quit from its tray menu, then ${Retry} again."
+    !insertmacro Fail "Magnitude is still running. Right-click its icon in the notification area, choose Quit Magnitude, then ${Retry} again."
   ${EndIf}
 !macroend
 Function .onInit
