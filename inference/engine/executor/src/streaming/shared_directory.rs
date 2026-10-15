@@ -117,14 +117,17 @@ impl SharedDirectory {
         }
         Ok(())
     }
-    /// Records of the bank group `layer` belongs to that are not lent: the
-    /// most experts one request may hold.
-    pub fn capacity(&self, layer: usize) -> Result<usize, Error> {
-        let group = self
+    /// `layer`'s even share of its bank group's unlent records: the most a
+    /// prompt seeds the layer up to (spec 4.9). A prompt reads every layer
+    /// in turn, so seeding past a layer's share would evict another layer's
+    /// seeds before the next prompt reads them.
+    pub fn share(&self, layer: usize) -> Result<usize, Error> {
+        let group = *self
             .group_of_layer
             .get(layer)
             .ok_or(Error::InvalidRequest)?;
-        Ok(self.capacities[*group] - self.lent[*group])
+        let members = self.group_of_layer.iter().filter(|g| **g == group).count();
+        Ok((self.capacities[group] - self.lent[group]) / members)
     }
     /// Lend `group`'s records `slots` to a prompt's conveyor (spec 4.9): the
     /// experts they held, which the caller unmaps. Refused, changing
@@ -365,6 +368,15 @@ mod tests {
         d.submitted(c).unwrap();
         assert!(d.retire_step(c.sequence, |_, _| c.sequence).unwrap().is_empty());
         r
+    }
+    #[test]
+    fn a_layers_share_divides_its_groups_unlent_records() {
+        let mut d = SharedDirectory::from_parts(vec![9, 4], vec![0, 0, 1, 0], 16).unwrap();
+        assert_eq!(d.share(0).unwrap(), 3);
+        assert_eq!(d.share(2).unwrap(), 4);
+        d.lend(0, 6..9).unwrap();
+        assert_eq!(d.share(3).unwrap(), 2);
+        assert_eq!(d.share(4), Err(Error::InvalidRequest));
     }
     #[test]
     fn all_hits_are_pinned_before_a_route_order_miss_selects_victims() {

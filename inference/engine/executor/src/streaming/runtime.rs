@@ -1096,19 +1096,26 @@ fn serve_scratch(state: &mut State, source: &ExpertSource, layer: usize, sequenc
         .collect::<Vec<_>>();
     // The launch's experts resolve against the shared directory as a decode
     // request does: its hits are pinned while the fill copies them into the
-    // scratch banks, and as many of its absent experts as their bank group
-    // holds beside the hits get bank slots. The fill reads and converts every
+    // scratch banks, and its absent experts get bank slots until the layer
+    // holds its share of the bank group. The fill reads and converts every
     // absent expert into the scratch banks, then seeds the placed ones into
     // their slots; the device commits them (`routed_seed_commit`), so the bank
-    // holds what the prompt read.
-    let capacity = state
+    // holds what the prompt read. A prompt reads every layer in turn: past its
+    // share, a layer's seeds would evict the other layers' before the next
+    // prompt reads them, and the bank would keep none of the prompt.
+    let share = state
         .directory
-        .capacity(layer)
+        .share(layer)
         .expect("a streamed layer of the directory");
+    let resident = state.layers[layer]
+        .slot_of
+        .iter()
+        .filter(|&&slot| slot >= 0)
+        .count();
     let (hits, absent): (Vec<i32>, Vec<i32>) = flagged
         .iter()
         .partition(|&&expert| state.layers[layer].slot_of[expert as usize] >= 0);
-    let placed = absent.len().min(capacity.saturating_sub(hits.len()));
+    let placed = absent.len().min(share.saturating_sub(resident));
     let request = hits
         .iter()
         .chain(&absent[..placed])
@@ -1407,7 +1414,7 @@ mod tests {
         let mut state = runtime.state.lock().unwrap();
         assert_eq!(take_record(&mut state, 0, Shelf::Conveyor), None, "nothing borrowed");
         assert!(borrow(&mut state));
-        assert_eq!(state.directory.capacity(0), Ok(6));
+        assert_eq!(state.directory.share(0), Ok(6));
         let records: [u32; KINDS] =
             std::array::from_fn(|pool| take_record(&mut state, pool, Shelf::Conveyor).unwrap());
         assert!(records.iter().all(|&record| (64..80).contains(&record)));
@@ -1432,7 +1439,7 @@ mod tests {
         free_records(&mut state, 0, taken, None);
         give_back(&mut state);
         assert!(!state.loan.as_ref().unwrap().lent);
-        assert_eq!(state.directory.capacity(0), Ok(8));
+        assert_eq!(state.directory.share(0), Ok(8));
         assert!(!state.kept.contains_key(&(0, 5)), "the bank overwrites what they kept");
         assert_eq!(take_record(&mut state, 0, Shelf::Conveyor), None);
         drop(state);
@@ -1634,16 +1641,20 @@ mod tests {
             None,
         )
         .unwrap();
-        runtime.steps_submitted(1, 2);
+        runtime.steps_submitted(1, 3);
         let listed = |list: &SharedWords, at: usize| {
             (0..list.load(1) as usize)
                 .map(|i| list.load(at + 2 * i))
                 .collect::<Vec<_>>()
         };
         let mut seeded = Vec::new();
-        for (sequence, routed) in [(1, [3, 4]), (2, [4, 5])] {
+        for (sequence, routed) in [
+            (1, &[3, 4][..]),
+            (2, &[4, 5][..]),
+            (3, &[6, 7, 8, 9, 10, 11, 12][..]),
+        ] {
             device_flags.fill(0);
-            for expert in routed {
+            for &expert in routed {
                 device_flags.store(expert as usize, 1);
             }
             device_control.store(REQUEST, sequence);
@@ -1655,12 +1666,14 @@ mod tests {
             assert_eq!(device_control.load(FAILURE), 0);
             assert_eq!(device_lists[0].load(0), sequence);
             seeded.push(listed(&device_seeds, 2));
-            let read = listed(&device_lists[0], 3);
+            let mut read = listed(&device_lists[0], 3);
+            read.sort();
             let copied =
                 (device_copies[0].load(0) == sequence).then(|| listed(&device_copies[0], 3));
             match sequence {
                 1 => assert_eq!(read, [3, 4]),
-                _ => assert_eq!(read, [5]),
+                2 => assert_eq!(read, [5]),
+                _ => assert_eq!(read, [6, 7, 8, 9, 10, 11, 12]),
             }
             assert_eq!(copied.unwrap_or_default(), Vec::<i32>::new());
             // The device commits the step's seeds before it runs on.
@@ -1668,9 +1681,13 @@ mod tests {
                 device_commits.store(device_seeds.load(3 + 2 * i) as usize, sequence);
             }
         }
-        assert_eq!(seeded, [vec![3, 4], vec![5]]);
+        // The layer holds its share of the bank (all 8 records): the third
+        // step reads every expert it lacks but seeds only the 5 that fill
+        // the share.
+        assert_eq!(seeded, [vec![3, 4], vec![5], vec![6, 7, 8, 9, 10]]);
         runtime.step_completed(1, true).unwrap();
         runtime.step_completed(2, true).unwrap();
+        runtime.step_completed(3, true).unwrap();
         drop(runtime);
         std::fs::remove_file(file).unwrap();
     }
