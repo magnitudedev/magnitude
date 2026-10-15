@@ -52,9 +52,9 @@ if ! (
   touch /var/lib/magnitude-desktop/installing
   # The refusal above already said why; this only says what the retained gate means.
   if systemctl is-active --quiet magnitude.service 2>/dev/null; then
-    echo 'Magnitude was not removed, and its server keeps running. DNF may still remove packages it depends on in this transaction, so before the server starts again, reinstall its package (run the install script again, or `sudo dnf reinstall magnitude-desktop`).' >&2
+    echo 'Magnitude was not removed, and its server keeps running, but DNF may still remove packages it depends on in this transaction. To restore them, stop the server with `sudo systemctl stop magnitude`, reinstall the package file from https://magnitude.dev/download with `sudo dnf reinstall ./@MAGNITUDE_RPM_FILE@`, then start it with `sudo systemctl start magnitude`.' >&2
   else
-    echo 'Magnitude was not removed. DNF may still remove packages it depends on in this transaction, so before starting Magnitude again, reinstall its package (run the install script again, or `sudo dnf reinstall magnitude-desktop`).' >&2
+    echo 'Magnitude was not removed, but DNF may still remove packages it depends on in this transaction. Before starting Magnitude again, quit it for all users and reinstall the package file from https://magnitude.dev/download with `sudo dnf reinstall ./@MAGNITUDE_RPM_FILE@`.' >&2
   fi
   exit 1
 fi

@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
-import { buildLinuxDesktopInstaller, mtreeFileModes, preferLightTrashHelper, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxPolkitPolicy, validatePacmanMetadataModes } from "./desktop-linux"
+import { buildLinuxDesktopInstaller, mtreeFileModes, preferLightTrashHelper, renderRpmSpecTemplate, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxPolkitPolicy, validatePacmanMetadataModes } from "./desktop-linux"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 import { linuxDesktopInstaller } from "../../src/targets"
 
@@ -44,6 +44,22 @@ describe("Linux package publisher-trust protection", () => {
     ["deb", ""], ["rpm", ""], ["pacman", ""],
   ] as const)("rejects unprotected or missing %s payload: %s", async (format, listing) => {
     await expect(Effect.runPromise(validateLinuxPayloadPermissions(format, listing))).rejects.toThrow("root-owned")
+  })
+})
+
+describe("RPM removal refusal", () => {
+  const resources = join(import.meta.dirname, "../../resources/linux")
+  const preun = (rpmFile: string) => {
+    const spec = renderRpmSpecTemplate(readFileSync(join(resources, "desktop.spec.ejs"), "utf8"),
+      readFileSync(join(resources, "installation-begin.sh"), "utf8"), readFileSync(join(resources, "installation-end.sh"), "utf8"), rpmFile)
+    return spec.slice(spec.indexOf("%preun"), spec.indexOf("%postun"))
+  }
+
+  it("tells both a running server and a desktop to reinstall the exact downloaded package file", () => {
+    const script = preun("magnitude-desktop-0.2.9-59.x86_64.rpm")
+    expect(script.match(/sudo dnf reinstall \.\/magnitude-desktop-0\.2\.9-59\.x86_64\.rpm/g)).toHaveLength(2)
+    expect(script).toContain("sudo systemctl stop magnitude")
+    expect(script).not.toMatch(/install script|reinstall magnitude-desktop|@MAGNITUDE_/)
   })
 })
 

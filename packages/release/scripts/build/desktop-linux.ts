@@ -223,6 +223,14 @@ interface LinuxInstallerOptions {
   readonly revision: number
 }
 
+/** The RPM refusal's repair advice names the published file, which is the only source `dnf reinstall` has. */
+export const renderRpmSpecTemplate = (spec: string, begin: string, end: string, rpmFile: string) =>
+  spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end).replaceAll("@MAGNITUDE_REMOVE_SERVER_GRANT@", removeServerGrant)
+    .replaceAll("@MAGNITUDE_RESTORE_SERVER_GRANT@", restoreServerGrant).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd)
+    .replaceAll("@MAGNITUDE_RPM_FILE@", rpmFile)
+    .replaceAll("@MAGNITUDE_SYSTEM_INSTALL@", linuxSystemFiles.map(file => `install -D -m ${file.mode.toString(8).padStart(4, "0")} '${file.source}' '%{buildroot}/${file.path}'`).join("\n"))
+    .replaceAll("@MAGNITUDE_SYSTEM_FILES@", linuxSystemFiles.map(file => `%attr(${file.mode.toString(8).padStart(4, "0")},root,root) /${file.path}`).join("\n"))
+
 /** Dpkg and rpm packages are produced by electron-installer from the staged payload. */
 const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly format: "deb" | "rpm" }, stage: string, payload: string, begin: string, end: string) => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
@@ -235,10 +243,8 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
   }
   const specTemplate = join(stage, "desktop.spec.ejs")
   const spec = yield* fs.readFileString(join(root, "packages/release/resources/linux/desktop.spec.ejs"))
-  yield* fs.writeFileString(specTemplate, spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end).replaceAll("@MAGNITUDE_REMOVE_SERVER_GRANT@", removeServerGrant)
-    .replaceAll("@MAGNITUDE_RESTORE_SERVER_GRANT@", restoreServerGrant).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd)
-    .replaceAll("@MAGNITUDE_SYSTEM_INSTALL@", linuxSystemFiles.map(file => `install -D -m ${file.mode.toString(8).padStart(4, "0")} '${file.source}' '%{buildroot}/${file.path}'`).join("\n"))
-    .replaceAll("@MAGNITUDE_SYSTEM_FILES@", linuxSystemFiles.map(file => `%attr(${file.mode.toString(8).padStart(4, "0")},root,root) /${file.path}`).join("\n")))
+  const filename = linuxDesktopInstaller(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", options.format, options.version, options.revision)
+  yield* fs.writeFileString(specTemplate, renderRpmSpecTemplate(spec, begin, end, filename))
   const desktopTemplate = join(stage, "magnitude.desktop.ejs")
   yield* fs.writeFileString(desktopTemplate, desktopEntry)
   const metadata = {
@@ -266,7 +272,6 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
   if (code !== 0) return yield* new DesktopBuildFailed({ message: `${options.format} desktop packaging exited ${code}` })
   const packages = (yield* fs.readDirectory(destination)).filter(path => path.endsWith(`.${options.format}`))
   if (packages.length !== 1) return yield* new DesktopBuildFailed({ message: `${options.format} desktop packaging did not produce exactly one installer` })
-  const filename = linuxDesktopInstaller(options.arch === "arm64" ? "linux-arm64-gnu" : "linux-x64-gnu", options.format, options.version, options.revision)
   // Package metadata uses '~' for prerelease ordering; GitHub rewrites it in asset names.
   if (packages[0] !== filename.replace(options.version, metadata.version)) {
     return yield* new DesktopBuildFailed({ message: "Linux desktop installer filename does not match its release target" })
