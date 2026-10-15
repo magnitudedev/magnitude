@@ -116,9 +116,14 @@ const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" :
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
   const baseline = useRef<{ at: number; completed: number } | null>(null)
-  if (progress === null || progress.stage !== "tuning") {
+  if (progress === null) {
     baseline.current = null
     return "—"
+  }
+  // Preparation reports no share of its work; on some devices it runs for many minutes.
+  if (progress.stage !== "tuning") {
+    baseline.current = null
+    return "Can take several minutes"
   }
   const now = Date.now()
   if (baseline.current === null || progress.completed < baseline.current.completed) baseline.current = { at: now, completed: progress.completed }

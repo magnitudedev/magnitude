@@ -93,13 +93,14 @@ export const modelOptimizationFraction = (progress: ModelOptimizationProgress): 
     ? Option.some(Math.min(1, progress.completed / progress.total))
     : Option.none()
 
-/** Post-download optimization in full, naming the accelerator it tunes for when known. */
+/**
+ * Post-download optimization in full, naming the accelerator it tunes for when known. Preparation
+ * includes the kernel search, which can run for many minutes, so it reads as optimizing too.
+ */
 export const describeModelOptimization = (
   progress: ModelOptimizationProgress,
   hardware: Option.Option<LocalInferenceHardware>,
-): string => progress.stage === "preparing"
-  ? "Preparing to optimize…"
-  : describeOptimizing(progress.device, hardware)
+): string => describeOptimizing(progress.device, hardware)
 
 /** Post-download optimization where space is short (the CLI). */
 export const formatModelOptimization = (progress: ModelOptimizationProgress): string => Option.match(
