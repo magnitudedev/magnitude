@@ -208,3 +208,11 @@ it.each(["RTX 5090", "Radeon 8060S Graphics", "Arc B580", "RX 580"])("omits impl
   expect(group.details.some(detail => /CUDA cores|GPU compute units|Xe cores|Stream processors/.test(detail))).toBe(false)
   expect(group.details[0]).toBe("16 GB VRAM")
 })
+it("labels a headless service on a non-portable machine as a server and counts cores with threads", () => {
+  const vm = identity("Microsoft Corporation", "Virtual Machine", "Desktop")
+  const value = hardware("AMD EPYC 7763 64-Core Processor", 16, 4, [], 2)
+  expect(hardwareDetails(vm, value).category).toBe("Desktop")
+  expect(hardwareDetails(vm, value, true).category).toBe("Server")
+  expect(hardwareDetails(identity("Lenovo", "21HD", "Portable"), value, true).category).toBe("Laptop / tablet")
+  expect(hardwareDetails(vm, value, true).groups[0]?.details).toContain("2 CPU cores (4 threads)")
+})

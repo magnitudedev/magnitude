@@ -116,9 +116,14 @@ const minutesRemaining = (seconds: number) => seconds < 60 ? "Less than 1 min" :
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
   const baseline = useRef<{ at: number; completed: number } | null>(null)
-  if (progress === null || progress.stage !== "tuning") {
+  if (progress === null) {
     baseline.current = null
     return "—"
+  }
+  // Preparation reports no share of its work; on some devices it runs for many minutes.
+  if (progress.stage !== "tuning") {
+    baseline.current = null
+    return "Can take several minutes"
   }
   const now = Date.now()
   if (baseline.current === null || progress.completed < baseline.current.completed) baseline.current = { at: now, completed: progress.completed }
@@ -529,14 +534,16 @@ function ModelStatus() {
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
-  if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
+  // A failure kept while the status is read again (after Magnitude restarts) is not shown as an error.
+  const unavailable = Result.isFailure(models) && !models.waiting
+  if (Result.isInitial(models) || (Result.isFailure(models) && models.waiting)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
   if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400">No model is loaded yet. It will load automatically on the first request.</p></div>
   return <div className="mt-5">
     <div className="flex min-h-12 items-center justify-between gap-5">
       <div className="flex min-w-0 items-center gap-3">
         {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
         <div className="flex min-w-0 items-baseline gap-2">
-          <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
+          <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (unavailable ? "Model status unavailable" : "Reading model status…")}</p>
           {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
         </div>
       </div>
@@ -549,7 +556,7 @@ function ModelStatus() {
         <span className="w-9 shrink-0 text-right text-xs tabular-nums text-slate-500 dark:text-slate-400">{formatModelLoadPercentage(fraction)}</span>
       </div>,
     })}
-    {Result.isFailure(models) && <ErrorNotice title="Couldn’t read model status" description="Magnitude can’t confirm whether a model is running." className="mt-2" />}
+    {unavailable && <ErrorNotice title="Couldn’t read model status" description="Magnitude can’t confirm whether a model is running." className="mt-2" />}
     {Option.isSome(stopping.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopping.failure.value} className="mt-2" />}
   </div>
 }

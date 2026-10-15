@@ -1,5 +1,5 @@
 import { Option } from "effect"
-import { formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
+import { formatCpuCores, formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
 import type { LocalInferenceHardware, LocalInferenceMemoryDomainId } from "@magnitudedev/sdk"
 
 export const formatContext = (tokens: number): string => tokens < 1_000
@@ -54,7 +54,7 @@ export const describeLocalHardware = (
     system: {
       name: systemName,
       details: [
-        `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${hardware.logicalCores} logical CPU core${hardware.logicalCores === 1 ? "" : "s"}`,
+        `${hardware.platform === "MacOS" ? "macOS" : hardware.platform} · ${hardware.architecture === "Arm64" ? "ARM64" : "x86-64"} · ${formatCpuCores(hardware.physicalCores, hardware.logicalCores)}`,
         `${formatMemorySize(hardware.totalSystemMemoryBytes)} ${unified.length > 0 ? "unified" : "system"} memory${unifiedBackends.length > 0 ? ` · ${unifiedBackends.join(" + ")} GPU acceleration` : ""}`,
       ],
     },

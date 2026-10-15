@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import { LocalInferenceHardwareSchema, ModelInstanceAllocationSchema } from "@magnitudedev/sdk"
-import { deriveHardwareMemoryView } from "./hardware-memory"
+import { deriveHardwareMemoryView, formatCpuCores } from "./hardware-memory"
 
 const GiB = 1024 ** 3
 const hardware = (available: number | null = 8 * GiB, discrete = false, bothBackends = false) => Schema.decodeUnknownSync(LocalInferenceHardwareSchema)({
@@ -51,5 +51,14 @@ describe("hardware memory breakdown", () => {
     expect(domain.status).toBe("rounding_adjusted")
     expect(domain.systemAndAppsBytes).toBe(0)
     expect(domain.usedBytes! + domain.freeBytes!).toBe(16 * GiB)
+  })
+})
+
+describe("formatCpuCores", () => {
+  it("names physical cores and adds threads only when they differ", () => {
+    expect(formatCpuCores(Option.some(2), 4)).toBe("2 CPU cores (4 threads)")
+    expect(formatCpuCores(Option.some(8), 8)).toBe("8 CPU cores")
+    expect(formatCpuCores(Option.some(1), 1)).toBe("1 CPU core")
+    expect(formatCpuCores(Option.none(), 4)).toBe("4 CPU threads")
   })
 })

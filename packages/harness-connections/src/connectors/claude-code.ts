@@ -2,6 +2,7 @@ import { Command } from "@effect/platform"
 import { Effect, Option } from "effect"
 import { isDeepStrictEqual } from "node:util"
 import { MAGNITUDE_CLAUDE_CODE_PLACEHOLDER_CREDENTIAL } from "@magnitudedev/sdk"
+import type { HarnessModel } from "../contract"
 import type { HarnessConnectionPaths } from "../paths"
 import {
   ANTHROPIC_BASE_URL,
@@ -72,6 +73,22 @@ const noLoginEnv: ReadonlyArray<readonly [ReadonlyArray<string>, string]> = [
   [["env", "ANTHROPIC_API_KEY"], ""],
 ]
 
+/**
+ * Claude Code cannot learn a gateway model's context window from discovery, so it reads one window
+ * for every non-Claude model from `CLAUDE_CODE_MAX_CONTEXT_TOKENS`. The connection declares the
+ * selected local model's window, or the smallest local window when no local model is selected.
+ */
+const CONTEXT_WINDOW_ENV = ["env", "CLAUDE_CODE_MAX_CONTEXT_TOKENS"] as const
+
+export const claudeCodeContextWindow = (
+  models: ReadonlyArray<HarnessModel>,
+  selected: unknown,
+): Option.Option<number> => {
+  const chosen = models.find((model) => anthropicLocalModelId(model.id) === selected)
+  if (chosen !== undefined) return Option.some(chosen.contextWindow)
+  return models.length === 0 ? Option.none() : Option.some(Math.min(...models.map((model) => model.contextWindow)))
+}
+
 export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl = ANTHROPIC_BASE_URL) => defineConnector({
   id: "claude-code",
   name: "Claude Code",
@@ -89,7 +106,11 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
     ]
     if (!loggedIn) changes.push(...noLoginEnv)
     if (Option.isSome(spec.model)) changes.push([["model"], anthropicLocalModelId(spec.model.value)])
-    const base = loggedIn ? removeOwnedJsonc(source, noLoginEnv) : source
+    const selected = Option.match(spec.model, { onNone: () => previous, onSome: anthropicLocalModelId })
+    const window = claudeCodeContextWindow(spec.models, selected)
+    if (Option.isSome(window)) changes.push([CONTEXT_WINDOW_ENV, String(window.value)])
+    const withoutLogin = loggedIn ? removeOwnedJsonc(source, noLoginEnv) : source
+    const base = Option.isNone(window) ? removeJsoncPaths(withoutLogin, [CONTEXT_WINDOW_ENV]) : withoutLogin
     yield* writeIfChanged(paths.claude, source, updateJsonc(base, changes))
     return Option.map(spec.model, () => ({
       model: typeof previous === "string" ? Option.some(previous) : Option.none(),
@@ -100,7 +121,8 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
     const value = jsonObject(source)
     const current = valueAt(value, ["model"])
     const currentBaseUrl = valueAt(value, ["env", "ANTHROPIC_BASE_URL"])
-    const withoutGatewayEnv = removeOwnedJsonc(source, [
+    const routed = currentBaseUrl === baseUrl ? removeJsoncPaths(source, [CONTEXT_WINDOW_ENV]) : source
+    const withoutGatewayEnv = removeOwnedJsonc(routed, [
       [["env", "ANTHROPIC_BASE_URL"], baseUrl],
       [["env", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], CLAUDE_GATEWAY_DISCOVERY],
       ...noLoginEnv,

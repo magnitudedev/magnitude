@@ -2633,6 +2633,9 @@
           "reasoning_effort": {
             "$ref": "#/components/schemas/ReasoningEffortRequest"
           },
+          "reasoning": {
+            "$ref": "#/components/schemas/ChatReasoningRequest"
+          },
           "thinking_budget_tokens": {
             "type": "integer",
             "format": "int32",
@@ -2890,6 +2893,23 @@
             }
           }
         ]
+      },
+      "ChatReasoningRequest": {
+        "type": "object",
+        "description": "The reasoning object OpenAI-compatible clients and routers send. It asks for the same thing as\n`reasoning_effort` and `thinking_budget_tokens`; `enabled: false` is effort `none`.",
+        "properties": {
+          "effort": {
+            "$ref": "#/components/schemas/ReasoningEffortRequest"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "max_tokens": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
       },
       "ChatToolCallRequest": {
         "type": "object",

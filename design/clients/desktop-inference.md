@@ -192,12 +192,13 @@ While a model loads, its residency text names the stage in full (for example "Op
 <accelerator>…", "Loading weights…") and the bar below shows the load's measured fraction with its
 percentage to the bar's right; a requested load is preparing at zero, so nothing snaps back when it
 starts. A loaded model's residency text includes the memory it holds.
-A model's download card stays in place and becomes its optimization: "Preparing to optimize…"
-while preparing, then "Optimizing for <accelerator>…" (or "Optimizing…" when the previewed device
-is unknown) while tuning. The finished download's full bar pulses while preparing and then gives
-way to the tuning fraction without jumping backwards; the card describes the work as one-time setup
-for this device with its percentage and an estimated time remaining from the observed tuning rate,
-and its cancel action reads "Skip optimization". While the card is shown, load and remove are not
+A model's download card stays in place and becomes its optimization: "Optimizing for
+<accelerator>…" (or "Optimizing…" when the previewed device is unknown) from the start, since
+preparation includes a kernel search that can run for many minutes. The finished download's full
+bar pulses while preparing and then gives way to the tuning fraction without jumping backwards; the
+card describes the work as one-time setup for this device with its percentage and an estimated time
+remaining from the observed tuning rate (while preparing, which reports no share, it says the work
+can take several minutes), and its cancel action reads "Skip optimization". While the card is shown, load and remove are not
 offered beside it; skipping restores them, and an inference request still loads the model, which
 ends the optimization. Download selection, the Downloading filter and activity include optimizing
 models, whose activity label is `<model> · Optimizing`.
@@ -270,7 +271,9 @@ adds a This browser group with Sign out, and turning network access off, regener
 changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
 AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
 loses the service, it checks whether the service now asks for the key, as after a restart, and
-returns to Sign in instead of showing that the service is unreachable. A browser retries every 2
+returns to Sign in instead of showing that the service is unreachable. While a browser's connection
+that was ready recovers, it shows that it is reconnecting to Magnitude, never that the service is
+starting, and a model-status failure kept while status is read again is not shown. A browser retries every 2
 seconds for 30 seconds, then shows that the service is unreachable with Reconnect and keeps retrying
 with backoff up to once a minute, and at once when the device comes back online or the page regains
 focus or visibility, so it recovers by itself after a reboot, a failed update, or a sleeping laptop.

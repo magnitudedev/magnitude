@@ -1532,6 +1532,44 @@ fn normalizes_disabled_aliases_to_the_none_effort() {
     );
 }
 
+#[test]
+fn reads_the_openai_reasoning_object_like_the_top_level_controls() {
+    let reasoning = |patch: Value| {
+        let mut request = minimal_request();
+        for (key, value) in patch.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        chat_request(request).map(|request| (request.input.reasoning, request.controls.reasoning_budget.map(|budget| budget.get())))
+    };
+    let none = ReasoningIntent::Effort {
+        effort: "none".into(),
+    };
+    assert_eq!(reasoning(json!({"reasoning": {"effort": "none"}})).unwrap().0, none);
+    assert_eq!(reasoning(json!({"reasoning": {"enabled": false}})).unwrap().0, none);
+    assert_eq!(
+        reasoning(json!({"reasoning": {"enabled": true}})).unwrap().0,
+        ReasoningIntent::Enabled
+    );
+    assert_eq!(
+        reasoning(json!({"reasoning": {"enabled": true, "effort": "high", "max_tokens": 64}})).unwrap(),
+        (
+            ReasoningIntent::Effort {
+                effort: "high".into()
+            },
+            Some(64)
+        )
+    );
+    assert_eq!(
+        reasoning(json!({"reasoning_effort": "off", "reasoning": {"effort": "none"}})).unwrap().0,
+        none
+    );
+    let error = |patch: Value| reasoning(patch).unwrap_err().body.message;
+    assert!(error(json!({"reasoning": {"enabled": false, "effort": "high"}})).contains("conflicts"));
+    assert!(error(json!({"reasoning_effort": "high", "reasoning": {"enabled": false}})).contains("conflicts"));
+    assert!(error(json!({"thinking_budget_tokens": 10, "reasoning": {"max_tokens": 20}})).contains("conflicts"));
+    assert!(error(json!({"reasoning": {"enabled": false, "max_tokens": 20}})).contains("reasoning is disabled"));
+}
+
 // ---------------------------------------------------------------------------
 // HTTP behavior
 

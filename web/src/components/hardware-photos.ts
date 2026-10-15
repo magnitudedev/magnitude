@@ -47,8 +47,12 @@ export const normalizeGpuName = (value: string) => normalizeHardwareName(value)
   .replace(/ graphics$/, "")
 const portableCategories = new Set(["Laptop", "Gaming laptop", "Gaming tablet", "Mobile workstation", "All-in-one"])
 
-/** Only pass accelerators backed by observed dedicated memory as component candidates. */
-export const hardwarePresentation = (identity: MachineIdentityObservation | null, dedicatedAccelerators: readonly string[], processor: Option.Option<string>) => {
+/**
+ * Only pass accelerators backed by observed dedicated memory as component candidates. A headless
+ * service (`magnitude serve`) on a machine that is not portable reads as a server: virtual machines
+ * report a desktop enclosure.
+ */
+export const hardwarePresentation = (identity: MachineIdentityObservation | null, dedicatedAccelerators: readonly string[], processor: Option.Option<string>, headless = false) => {
   const identified = identity?._tag === "Identified" ? identity : null
   const devicePhoto = Option.fromNullable(identified ? hardwarePhotoInventory.find(({ match, processorModels }) => {
     if (match._tag === "Gpu") return false
@@ -60,7 +64,7 @@ export const hardwarePresentation = (identity: MachineIdentityObservation | null
   }) : undefined)
   const enclosure = Option.match(devicePhoto, {
     onSome: entry => entry.category,
-    onNone: () => ({ Portable: "Laptop / tablet", Desktop: "Desktop", AllInOne: "All-in-one", MiniPc: "Mini PC", Server: "Server", Unknown: "Computer" })[identity?.formFactor ?? "Unknown"],
+    onNone: () => headless && identity?.formFactor !== "Portable" && identity?.formFactor !== "AllInOne" ? "Server" : ({ Portable: "Laptop / tablet", Desktop: "Desktop", AllInOne: "All-in-one", MiniPc: "Mini PC", Server: "Server", Unknown: "Computer" })[identity?.formFactor ?? "Unknown"],
   })
   const portable = identity?.formFactor === "Portable" || identity?.formFactor === "AllInOne" || portableCategories.has(enclosure)
   const photo = Option.orElse(devicePhoto, () => portable ? Option.none() : Option.fromNullable(hardwarePhotoInventory.find(({ match }) =>

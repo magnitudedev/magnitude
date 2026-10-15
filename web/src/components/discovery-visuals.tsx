@@ -65,14 +65,17 @@ export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
   </figure>
 }
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
+  const client = useAgentClient()
   const hardware = useLocalInferenceHardware()
+  const owner = useAtomValue(client.Application.WatchApplicationOwner({})).result
+  const headless = Result.isSuccess(owner) && owner.value.owner === "Headless"
   if (Result.isInitial(hardware)) return <HardwarePending />
   if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="my-6" />
   if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{"Getting to know your machine…"}</div>
-  return <HardwareSummary identity={identity} value={hardware.value} />
+  return <HardwareSummary identity={identity} value={hardware.value} headless={headless} />
 }
-export function HardwareSummary({ identity, value }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware }) {
-  const presentation = hardwareDetails(identity, value)
+export function HardwareSummary({ identity, value, headless = false }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware; headless?: boolean }) {
+  const presentation = hardwareDetails(identity, value, headless)
   return <section aria-label="Your hardware" className={pageLayout.hardware}>
     <div className={`grid items-center gap-6 ${Option.isSome(presentation.photo) ? pageLayout.hardwareGrid : ""}`}>
       {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}

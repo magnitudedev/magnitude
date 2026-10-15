@@ -1,7 +1,7 @@
 import { createContext, useContext, useMemo, type ReactNode } from "react"
 import { Atom, Result, useAtomValue } from "@effect-atom/atom-react"
 import { Duration, Effect, Option, Schedule, Stream, SubscriptionRef } from "effect"
-import type { MagnitudeConnection } from "@magnitudedev/sdk"
+import type { ConnectionState, MagnitudeConnection } from "@magnitudedev/sdk"
 import type { TrayRegistration } from "@magnitudedev/sdk/desktop-host"
 import { useSession } from "./session"
 import { useSignInRecheck } from "./remote-access"
@@ -40,10 +40,10 @@ export const useServiceConnection = (): MagnitudeConnection => {
 type Reachability = "Connected" | "Reconnecting" | "Unreachable"
 
 /** Moments worth trying again at once: the device is back online, or someone is looking at the page. */
-const wakeUps = Stream.merge(
+const wakeUps = Stream.suspend(() => Stream.merge(
   Stream.merge(Stream.fromEventListener(window, "online"), Stream.fromEventListener(window, "focus")),
   Stream.fromEventListener(document, "visibilitychange").pipe(Stream.filter(() => document.visibilityState === "visible")),
-)
+))
 
 /**
  * A browser loses its connection whenever the service restarts. It retries every 2 seconds for 30
@@ -73,6 +73,12 @@ const browserReachability = (connection: MagnitudeConnection, attempt: Effect.Ef
   })), Effect.forkScoped)
   return reachability.changes
 }))
+
+/** A browser's connection that drops after it was ready is reconnecting to a restarting service, not starting one. */
+export const browserServiceView = (state: ConnectionState): ServiceView =>
+  state._tag === "Ready" ? { _tag: "Ready" }
+  : state._tag === "Connecting" && state.reason !== "initial" ? { _tag: "Reconnecting" }
+  : { _tag: "Starting" }
 
 /** One attempt to reach the service again, after checking whether it now asks for sign-in. */
 export const useReconnectAttempt = (): Effect.Effect<void, unknown> => {
@@ -107,7 +113,7 @@ export const useServiceObservation = (): ServiceObservation => {
   }
   return {
     service: Result.isSuccess(reachability) && reachability.value !== "Connected" ? Result.success<ServiceView>({ _tag: reachability.value })
-      : Result.map(state, value => value._tag === "Ready" ? { _tag: "Ready" as const } : { _tag: "Starting" as const }),
+      : Result.map(state, browserServiceView),
     tray: Option.none(),
     canRetry: false,
   }

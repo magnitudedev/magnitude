@@ -17,11 +17,11 @@ const hardware = Option.some({
 } as unknown as LocalInferenceHardware)
 
 describe("model optimization wording", () => {
-  it("names the accelerator while tuning and has no share while preparing", () => {
+  it("names the accelerator while optimizing and has no share while preparing", () => {
     const preparing: ModelOptimizationProgress = { stage: "preparing", completed: 0, total: 0, device: Option.some(device) }
     const tuning: ModelOptimizationProgress = { stage: "tuning", completed: 42, total: 100, device: Option.some(device) }
 
-    expect(describeModelOptimization(preparing, hardware)).toBe("Preparing to optimize…")
+    expect(describeModelOptimization(preparing, hardware)).toBe("Optimizing for Apple M3 Max…")
     expect(describeModelOptimization(tuning, hardware)).toBe("Optimizing for Apple M3 Max…")
     expect(describeModelOptimization(tuning, Option.none())).toBe("Optimizing…")
     expect(modelOptimizationFraction(preparing)).toEqual(Option.none())
