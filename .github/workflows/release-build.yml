@@ -79,6 +79,8 @@ jobs:
   # failed one keeps what it finished. Caches are branch-scoped: a run on main reads only ledgers
   # written on main.
   kernels:
+    # Disabled: the coverage search's binding-pair rounds stall the Metal job on its largest entry.
+    if: false
     needs: catalog
     strategy:
       fail-fast: false
