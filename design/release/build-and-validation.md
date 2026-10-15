@@ -105,7 +105,8 @@ cancellation, concurrent admission, model reload, and worker cleanup.
 An independent Windows consumer extracts and runs the final archives, checks their metadata,
 and exercises engine readiness and parent-loss shutdown before candidate assembly can pass.
 Windows executables carry Magnitude's own version resources (product, publisher, description and
-the release version), never Bun's or Electron's defaults; Bun writes them only on a Windows build host.
+the release version) and Magnitude's icon, never Bun's or Electron's defaults; Bun writes them only on a
+Windows build host.
 The native CLI launcher compiles the same fields from a VERSIONINFO resource. Bun has no option for
 InternalName or OriginalFilename, so its executables keep Bun's values for those two fields.
 Production Windows packaging uses Artifact Signing with an explicit publisher identity. Owned code,

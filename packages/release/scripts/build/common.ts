@@ -8,6 +8,7 @@ import {
 } from "node:fs/promises"
 import { basename, dirname } from "node:path"
 import { pipeline } from "node:stream/promises"
+import { fileURLToPath } from "node:url"
 import { createGzip } from "node:zlib"
 import { Effect, Schema } from "effect"
 import { pack } from "tar-stream"
@@ -48,7 +49,8 @@ export const fileSha256 = async (file: string): Promise<string> => {
 class BuildCommandFailed extends Schema.TaggedError<BuildCommandFailed>()("BuildCommandFailed", { message: Schema.String }) {}
 
 /**
- * Bun arguments that name a Windows executable as Magnitude's instead of Bun's. Bun writes version
+ * Bun arguments that name a Windows executable as Magnitude's instead of Bun's, with Magnitude's icon
+ * (Windows Firewall shows it when the service first listens on the network). Bun writes version
  * resources only when compiling on Windows. The version is read when compiling because release
  * builds stamp the generated version file after this module loads.
  */
@@ -57,8 +59,9 @@ export const windowsExecutableResources = async (platform: string, description: 
   const generated = await Bun.file(new URL("../../../version/src/version.generated.ts", import.meta.url)).text()
   const version = /export const MAGNITUDE_VERSION = "([0-9]+)\.([0-9]+)\.([0-9]+)/.exec(generated)
   if (!version) throw new Error("The generated Magnitude version has no numeric release version")
+  const icon = fileURLToPath(new URL("../../resources/windows/Magnitude.ico", import.meta.url))
   return ["--windows-title=Magnitude", "--windows-publisher=Magnitude", `--windows-description=${description}`,
-    `--windows-version=${version.slice(1, 4).join(".")}.0`, "--windows-copyright=Copyright Magnitude"]
+    `--windows-version=${version.slice(1, 4).join(".")}.0`, "--windows-copyright=Copyright Magnitude", `--windows-icon=${icon}`]
 }
 
 export const run = (
