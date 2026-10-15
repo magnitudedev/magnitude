@@ -269,7 +269,9 @@ adds a This browser group with Sign out, and turning network access off, regener
 changing the address, and restarting Magnitude (to apply settings or an update) first ask in an
 AlertDialog, because they disconnect that browser once the service restarts. If a signed-in browser
 loses the service, it checks whether the service now asks for the key, as after a restart, and
-returns to Sign in instead of showing that the service is unreachable. A browser retries every 2
+returns to Sign in instead of showing that the service is unreachable. While a browser's connection
+that was ready recovers, it shows that it is reconnecting to Magnitude, never that the service is
+starting, and a model-status failure kept while status is read again is not shown. A browser retries every 2
 seconds for 30 seconds, then shows that the service is unreachable with Reconnect and keeps retrying
 with backoff up to once a minute, and at once when the device comes back online or the page regains
 focus or visibility, so it recovers by itself after a reboot, a failed update, or a sleeping laptop.
