@@ -356,9 +356,11 @@ on macOS, where the service serves in the person's own profile, a re-run treats 
 of a registered service as that service rather than refusing it. Desktop launch first checks for a running server (the active Linux unit
 under the server profile, or the macOS daemon answering as Headless on the person's endpoint). While
 it runs, the whole window is one screen offering to keep the server, which opens it in the browser
-and quits, or to stop it and continue. On Linux, stopping runs pkexec of the packaged removal
-wrapper, which Polkit admits without a password for the active local session; macOS asks for an
-administrator. A background launch leaves
+and quits, or to remove it and continue. The screen says plainly that this removes the server setup
+(as `magnitude server remove` does) and keeps its data. On Linux, removal runs pkexec of the packaged
+removal wrapper, which Polkit admits without a password for the active local session; macOS asks
+for an administrator with a prompt saying why. A dismissed prompt is reported as cancelled, not as a
+missing administrator. A background launch leaves
 a running server alone, and a server that stops lets the app continue. A quit request (Cmd-Q,
 logout, SIGTERM) on that screen quits like closing it. When the screen or a background launch quits
 in favour of the macOS server, the desktop turns off its own launch at login. Windows has no server
