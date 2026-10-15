@@ -291,6 +291,12 @@ The Rust API accepts one normalized `reasoning_effort`. Omitting it selects the 
 After the target model and effective template are known, ICN validates that the requested option is
 present and applies its private native recipe.
 
+Chat Completions also accepts the OpenAI-compatible `reasoning` object that clients and routers
+send: `reasoning.effort` is `reasoning_effort`, `reasoning.enabled: false` is effort `none`,
+`reasoning.enabled: true` alone enables reasoning at the model's enabled default, and
+`reasoning.max_tokens` is `thinking_budget_tokens`. Values given both ways must agree; a
+disagreement is an invalid request rather than one silently winning.
+
 Examples:
 
 | Request | Effective template | Native behavior applied by ICN |

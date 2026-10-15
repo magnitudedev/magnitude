@@ -460,6 +460,10 @@ export const ChatCompletionRequest = S.Struct({
   n: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
   parallel_tool_calls: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
   presence_penalty: S.optionalWith(S.Number, { exact: true, as: "Option" }),
+  reasoning: S.optionalWith(
+    S.suspend((): S.Schema<ChatReasoningRequest, ChatReasoningRequestEncoded> => ChatReasoningRequest),
+    { exact: true, as: "Option" },
+  ),
   reasoning_effort: S.optionalWith(
     S.suspend((): S.Schema<ReasoningEffortRequest, ReasoningEffortRequestEncoded> => ReasoningEffortRequest),
     { exact: true, as: "Option" },
@@ -591,6 +595,20 @@ export const ChatMessageRequest = S.Union(
 )
 export type ChatMessageRequest = S.Schema.Type<typeof ChatMessageRequest>
 export type ChatMessageRequestEncoded = S.Schema.Encoded<typeof ChatMessageRequest>
+
+export const ChatReasoningRequest = S.extend(
+  S.Struct({
+    effort: S.optionalWith(
+      S.suspend((): S.Schema<ReasoningEffortRequest, ReasoningEffortRequestEncoded> => ReasoningEffortRequest),
+      { exact: true, as: "Option" },
+    ),
+    enabled: S.optionalWith(S.Boolean, { exact: true, as: "Option" }),
+    max_tokens: S.optionalWith(S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)), { exact: true, as: "Option" }),
+  }),
+  S.Record({ key: S.String, value: JsonValue }),
+)
+export type ChatReasoningRequest = S.Schema.Type<typeof ChatReasoningRequest>
+export type ChatReasoningRequestEncoded = S.Schema.Encoded<typeof ChatReasoningRequest>
 
 export const ChatToolCallRequest = S.Struct({
   function: S.suspend(

@@ -147,6 +147,8 @@ pub struct ChatCompletionRequest {
     #[schema(nullable = false)]
     pub reasoning_effort: Option<ReasoningEffortRequest>,
     #[schema(nullable = false)]
+    pub reasoning: Option<ChatReasoningRequest>,
+    #[schema(nullable = false)]
     pub thinking_budget_tokens: Option<u32>,
     #[schema(nullable = false)]
     pub response_format: Option<ResponseFormatRequest>,
@@ -320,6 +322,18 @@ pub struct AllowedToolRequest {
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 #[serde(transparent)]
 pub struct ReasoningEffortRequest(pub String);
+
+/// The reasoning object OpenAI-compatible clients and routers send. It asks for the same thing as
+/// `reasoning_effort` and `thinking_budget_tokens`; `enabled: false` is effort `none`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ChatReasoningRequest {
+    #[schema(nullable = false)]
+    pub effort: Option<ReasoningEffortRequest>,
+    #[schema(nullable = false)]
+    pub enabled: Option<bool>,
+    #[schema(nullable = false)]
+    pub max_tokens: Option<u32>,
+}
 
 impl ReasoningEffortRequest {
     /// The normalized public effort this spelling names.
@@ -876,6 +890,7 @@ pub(crate) fn validate_apply_template_request(
         parallel_tool_calls: request.parallel_tool_calls,
         store: None,
         reasoning_effort: None,
+        reasoning: None,
         thinking_budget_tokens: None,
         response_format: request.response_format,
         chat_template_kwargs: request.chat_template_kwargs,
@@ -911,8 +926,7 @@ pub(crate) struct ValidatedChatRequest {
     tools: Vec<ToolDefinition>,
     tool_choice: ToolChoice,
     parallel_tool_calls: bool,
-    reasoning_effort: Option<ReasoningEffortRequest>,
-    thinking_budget_tokens: Option<u32>,
+    reasoning: ReasoningControls,
     response_format: OutputFormat,
     template_args: BTreeMap<String, JsonValue>,
     stop: Vec<String>,
@@ -1035,14 +1049,18 @@ pub(crate) fn validate_request(
     }
     let response_format = response_format(request.response_format)?;
     let stop = stops(request.stop)?;
+    let reasoning = reasoning_controls(
+        request.reasoning_effort,
+        request.thinking_budget_tokens,
+        request.reasoning,
+    )?;
     Ok(ValidatedChatRequest {
         model: request.model,
         conversation,
         tools,
         tool_choice,
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
-        reasoning_effort: request.reasoning_effort,
-        thinking_budget_tokens: request.thinking_budget_tokens,
+        reasoning,
         response_format,
         template_args,
         stop,
@@ -1071,11 +1089,7 @@ pub(crate) fn validate_request(
 pub(crate) fn finalize_request(
     mut validated: ValidatedChatRequest,
 ) -> Result<(GenerationRequest, bool), ApiError> {
-    let (reasoning, budget) = reasoning_intent(
-        validated.reasoning_effort,
-        validated.thinking_budget_tokens,
-        &validated.template_args,
-    )?;
+    let (reasoning, budget) = reasoning_intent(validated.reasoning, &validated.template_args)?;
     let tools = Tools::new(
         validated.tools,
         validated.tool_choice,
@@ -1393,11 +1407,65 @@ const RAW_REASONING_CONTROLS: &[&str] = &[
     "thinking_budget",
 ];
 
-fn reasoning_intent(
+/// A request's reasoning controls, from the top-level fields and the `reasoning` object together.
+struct ReasoningControls {
+    effort: Option<ReasoningEffortRequest>,
+    enabled: bool,
+    budget_tokens: Option<u32>,
+}
+
+fn reasoning_controls(
     effort: Option<ReasoningEffortRequest>,
     budget_tokens: Option<u32>,
+    reasoning: Option<ChatReasoningRequest>,
+) -> Result<ReasoningControls, ApiError> {
+    let Some(reasoning) = reasoning else {
+        return Ok(ReasoningControls {
+            effort,
+            enabled: false,
+            budget_tokens,
+        });
+    };
+    let object_effort = match (reasoning.enabled, reasoning.effort) {
+        (Some(enabled), Some(named)) if enabled != (named.normalize()? != "none") => {
+            return Err(ApiError::invalid(
+                "reasoning.enabled conflicts with reasoning.effort",
+            ));
+        }
+        (Some(false), _) => Some(ReasoningEffortRequest("none".into())),
+        (_, named) => named,
+    };
+    let effort = match (effort, object_effort) {
+        (Some(top), Some(object)) if top.normalize()? != object.normalize()? => {
+            return Err(ApiError::invalid(
+                "reasoning_effort conflicts with reasoning.effort",
+            ));
+        }
+        (top, object) => top.or(object),
+    };
+    if let (Some(top), Some(object)) = (budget_tokens, reasoning.max_tokens)
+        && top != object
+    {
+        return Err(ApiError::invalid(
+            "thinking_budget_tokens conflicts with reasoning.max_tokens",
+        ));
+    }
+    Ok(ReasoningControls {
+        enabled: effort.is_none() && reasoning.enabled == Some(true),
+        effort,
+        budget_tokens: budget_tokens.or(reasoning.max_tokens),
+    })
+}
+
+fn reasoning_intent(
+    controls: ReasoningControls,
     template_args: &BTreeMap<String, JsonValue>,
 ) -> Result<(ReasoningIntent, Option<NonZeroU32>), ApiError> {
+    let ReasoningControls {
+        effort,
+        enabled,
+        budget_tokens,
+    } = controls;
     let raw_reasoning_controls = template_args
         .keys()
         .any(|key| RAW_REASONING_CONTROLS.contains(&key.as_str()));
@@ -1426,6 +1494,14 @@ fn reasoning_intent(
                 },
                 budget,
             ))
+        }
+        None if enabled => {
+            if raw_reasoning_controls {
+                return Err(ApiError::invalid(
+                    "reasoning.enabled conflicts with reasoning controls in chat_template_kwargs",
+                ));
+            }
+            Ok((ReasoningIntent::Enabled, budget))
         }
         None => {
             let explicitly_disabled = matches!(
