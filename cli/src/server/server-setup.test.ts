@@ -19,6 +19,7 @@ const harness = (overrides: Partial<ServerSetupHost> = {}) => {
     confirm: () => Effect.sync(() => { events.push("confirm"); return true }),
     runRootStep: args => Effect.sync(() => { events.push(`root ${args.join(" ")}`) }),
     enableNetworkAccess: Effect.sync(() => { events.push("network"); return { addresses: ["192.168.1.5"], port: 10100, key: "mag-key" } }),
+    turnOffDesktopLoginStartup: Effect.sync(() => { events.push("desktop login off"); return true }),
     write: text => Effect.sync(() => { output.push(text) }),
     ...overrides,
   }
@@ -52,7 +53,19 @@ describe("magnitude server setup", () => {
   it("finishes a macOS setup whose service is already serving, instead of asking to stop it", async () => {
     const h = harness({ platform: "darwin", personalOwner: Effect.succeed(Option.some("Headless")) })
     expect(Either.isRight(await h.run(serverSetup))).toBe(true)
-    expect(h.events).toEqual(["root _server-install ada", "network"])
+    expect(h.events).toEqual(["root _server-install ada", "network", "desktop login off"])
+  })
+  it("turns off the desktop app's launch at login once a macOS server serves, so login doesn't open it onto the server", async () => {
+    const h = harness({ platform: "darwin" })
+    expect(Either.isRight(await h.run(serverSetup))).toBe(true)
+    expect(h.events).toEqual(["root _server-install ada", "network", "desktop login off"])
+    expect(h.output()).toContain("The Magnitude app no longer opens when you log in")
+  })
+  it("says where to turn off launch at login when the desktop app could not start to do it", async () => {
+    const h = harness({ platform: "darwin", turnOffDesktopLoginStartup: Effect.succeed(false) })
+    expect(Either.isRight(await h.run(serverSetup))).toBe(true)
+    expect(h.output()).toContain("Login Items & Extensions")
+    expect(h.output()).not.toContain("no longer opens")
   })
   it("still refuses the desktop app when the service is registered", async () => {
     const h = harness({ platform: "darwin", personalOwner: Effect.succeed(Option.some("Desktop")) })

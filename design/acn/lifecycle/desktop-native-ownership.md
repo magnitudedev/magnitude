@@ -359,6 +359,9 @@ wrapper, which Polkit admits without a password for the active local session; ma
 administrator. A background launch leaves
 a running server alone, and a server that stops lets the app continue. A quit request (Cmd-Q,
 logout, SIGTERM) on that screen quits like closing it. When the screen or a background launch quits
-in favour of the macOS server, the desktop turns off its own launch at login. Windows has no server
+in favour of the macOS server, the desktop turns off its own launch at login. macOS does not tell an
+SMAppService login item that it was opened at login, so once the macOS server answers, setup starts
+the app in the background (`open -W`) to do that, and says so; without the person's login session it
+says where to turn launch at login off instead. Windows has no server
 mode; its command launcher ignores logoff, which Windows sends only to services, so a third-party
 service wrapper keeps serving.

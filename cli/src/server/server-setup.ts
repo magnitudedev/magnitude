@@ -47,6 +47,7 @@ export interface ServerSetupHost {
   readonly serviceLog: Effect.Effect<readonly string[]>
   /** Turns network access on with a key once the service answers, and restarts it if that is needed. */
   readonly enableNetworkAccess: Effect.Effect<ServerAccess, ServerSetupFailed>
+  readonly turnOffDesktopLoginStartup: Effect.Effect<boolean>
   readonly write: (text: string) => Effect.Effect<void>
 }
 export type ServicePort = "Free" | "Service" | "Other"
@@ -164,6 +165,13 @@ export const renderServerReady = (platform: NodeJS.Platform, access: ServerAcces
   "",
 ].join("\n")
 
+/** A Mac's desktop app opens at login by default, where it could only offer to stop the server. */
+export const renderDesktopLoginStartup = (turnedOff: boolean) => turnedOff
+  ? "The Magnitude app no longer opens when you log in; it can't run while the server does.\n"
+    + "After `magnitude server remove`, you can turn Launch at login back on in its Settings.\n"
+  : "If the Magnitude app opens when you log in, it can only offer to stop the server.\n"
+    + "Turn that off in System Settings → General → Login Items & Extensions.\n"
+
 /** A registered service that is still starting can answer on the port before its owner reports it, so it gets a few seconds. */
 const settledPort = (host: ServerSetupHost) => Effect.gen(function* () {
   const registered = yield* host.isSetUp
@@ -195,6 +203,7 @@ export const serverSetup = Effect.gen(function* () {
   yield* host.write("Waiting for the Magnitude server to start…\n")
   const access = yield* withinServerStart(host, host.enableNetworkAccess)
   yield* host.write(renderServerReady(host.platform, access))
+  if (host.platform === "darwin") yield* host.write(renderDesktopLoginStartup(yield* host.turnOffDesktopLoginStartup))
 })
 
 export const serverRemove = Effect.gen(function* () {

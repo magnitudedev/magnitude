@@ -9,7 +9,7 @@ import { MagnitudeClient } from "@magnitudedev/sdk"
 import { applicationStateDirectory, hasLinuxServerRemnants, installedServerCli, MAC_SERVER_LABEL, requestApplication, TerminalCommand,
   nodeTerminalCommand } from "@magnitudedev/daemon-management/desktop-native"
 import { isServerSetUp } from "./serve-owner"
-import { desktopApplication, desktopDataDirectory, desktopServiceOrigin } from "./application"
+import { desktopApplication, desktopDataDirectory, desktopServiceOrigin, turnOffDesktopLoginStartupForServer } from "./application"
 import { ServerSetupFailed, ServerSetupHost, type ServerAccess, type ServicePort } from "./server-setup"
 import { withLocalService } from "./server-reach"
 
@@ -132,6 +132,7 @@ export const ServerSetupHostLive = Layer.effect(ServerSetupHost, Effect.gen(func
         Effect.flatMap(text => text.trim() !== "" || process.getuid?.() === 0 ? Effect.succeed(text) : output("/usr/bin/sudo", "-n", "--", "/usr/bin/journalctl", ...journal)),
         Effect.map(text => text.split("\n")))),
     enableNetworkAccess,
+    turnOffDesktopLoginStartup: turnOffDesktopLoginStartupForServer,
     write: text => Effect.sync(() => { process.stdout.write(text) }),
   })
 })).pipe(Layer.provide([BunContext.layer, nodeTerminalCommand]))
