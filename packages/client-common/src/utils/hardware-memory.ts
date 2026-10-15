@@ -158,3 +158,14 @@ export const deriveHardwareMemoryView = (
     },
   }
 }
+
+/** One CPU count wording for every client: physical cores, with hardware threads when they differ. */
+export const formatCpuCores = (physicalCores: Option.Option<number>, logicalCores: number): string => {
+  const count = (value: number, noun: string) => `${value} ${noun}${value === 1 ? "" : "s"}`
+  return Option.match(physicalCores, {
+    onNone: () => count(logicalCores, "CPU thread"),
+    onSome: (cores) => cores === logicalCores
+      ? count(cores, "CPU core")
+      : `${count(cores, "CPU core")} (${count(logicalCores, "thread")})`,
+  })
+}

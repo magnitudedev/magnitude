@@ -1,7 +1,7 @@
 import { Option, Schema } from "effect"
 import type { LocalInferenceHardware } from "@magnitudedev/sdk"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
-import { formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
+import { formatCpuCores, formatLocalInferenceBackend, formatMemorySize } from "@magnitudedev/client-common"
 import { hardwarePresentation, normalizeGpuName, normalizeHardwareName } from "./hardware-photos"
 import facts from "../../../assets/hardware/facts.json"
 
@@ -49,13 +49,13 @@ const publishedFacts = (target: typeof CatalogEntry.Type.target, name: string, p
 }
 
 /** A view of existing observations and exact published specifications; no probing or benchmarking. */
-export const hardwareDetails = (identity: MachineIdentityObservation | null, hardware: LocalInferenceHardware) => {
+export const hardwareDetails = (identity: MachineIdentityObservation | null, hardware: LocalInferenceHardware, headless = false) => {
   const domainFor = (id: string) => hardware.memoryDomains.find(domain => domain.memoryDomainId === id)
   const dedicated = hardware.accelerators.filter(accelerator => {
     const domain = domainFor(accelerator.memoryDomainId)
     return domain?.kind === "PhysicalDevice" && !domain.sharesSystemMemory
   })
-  const presentation = hardwarePresentation(identity, dedicated.map(accelerator => accelerator.name), hardware.processor)
+  const presentation = hardwarePresentation(identity, dedicated.map(accelerator => accelerator.name), hardware.processor, headless)
   const unified = hardware.memoryDomains.some(domain => domain.kind === "UnifiedMemory" && domain.sharesSystemMemory)
   const processorFacts = Option.match(hardware.processor, { onNone: () => [], onSome: name => publishedFacts("Processor", name, hardware.physicalCores) })
   const fixedCoreCount = processorFacts.find(fact => fact.label === "CPU cores / processor (spec)")
@@ -99,7 +99,7 @@ export const hardwareDetails = (identity: MachineIdentityObservation | null, har
   const processorDetails = summary.filter(fact => !memoryFacts.includes(fact) && fact.label !== "Neural Engine cores (spec)")
   const hiddenAcceleratorFactLabels = new Set(["CUDA cores (spec)", "GPU compute units (spec)", "Xe cores (spec)", "Stream processors (spec)", "GPU architecture (spec)"])
   const groups = [
-    { label: integratedChip ? "Chip" : "CPU", name: processorName, truncateName: !findHardwareFacts("Processor", processorName), details: processorDetails.map(fact => `${fact.value} ${fact.label}`) },
+    { label: integratedChip ? "Chip" : "CPU", name: processorName, truncateName: !findHardwareFacts("Processor", processorName), details: processorDetails.map(fact => fact.label === "CPU cores" && Option.isSome(hardware.physicalCores) ? formatCpuCores(hardware.physicalCores, hardware.logicalCores) : `${fact.value} ${fact.label}`) },
     { label: "Memory", name: memoryFacts[0]?.value ?? "Unknown", truncateName: false, details: memoryFacts.map((fact, index) => index === 0 ? fact.label : `${fact.value} ${fact.label}`) },
     ...visibleAccelerators.map((accelerator, index) => ({
       label: visibleAccelerators.length > 1 ? `GPU ${index + 1}` : "GPU", name: accelerator.name, truncateName: !findHardwareFacts("Accelerator", accelerator.name),
