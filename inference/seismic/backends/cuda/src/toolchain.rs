@@ -27,9 +27,7 @@ impl CudaToolchain {
     pub fn new(device: Device, architecture: u32) -> Self {
         let formation = nvrtc::formation(architecture).map_err(formation_error);
         let material = match &formation {
-            // The release, architecture and options determine the CUBIN; the
-            // driver only loads it.
-            Ok(formation) => format!("cuda;{formation}"),
+            Ok(formation) => material(formation),
             Err(error) => format!("cuda;sm_{architecture};unavailable: {error:?}"),
         };
         Self {
@@ -58,6 +56,12 @@ impl CudaToolchain {
             .collect::<Option<Vec<_>>>()?;
         DirectModule::load(&self.device, cubin, &kernels).ok()
     }
+}
+
+/// Everything besides the source that determines a CUBIN: the release,
+/// architecture and options of `formation`. The driver only loads it.
+pub fn material(formation: &nvrtc::Formation) -> String {
+    format!("cuda;{formation}")
 }
 
 impl Toolchain for CudaToolchain {

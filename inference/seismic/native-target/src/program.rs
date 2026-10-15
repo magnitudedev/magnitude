@@ -14,7 +14,7 @@ use crate::NativeCompilationError;
 
 /// Rendered source in a backend's language and the entries a caller needs
 /// from it, in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProgramSource {
     pub text: String,
     pub entries: Vec<ProgramEntry>,
@@ -25,7 +25,7 @@ pub struct ProgramSource {
 /// caller fixes it (Vulkan forms its pipeline with it; Metal forms a pipeline
 /// that admits it), and the backend's specialization constants (Vulkan's
 /// view lengths; empty elsewhere).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProgramEntry {
     pub symbol: String,
     pub group_size: Option<[u32; 3]>,

@@ -91,9 +91,7 @@ fn discover_device(device: &MetalDevice) -> Result<DeviceDescription<Metal>, Tar
     let facts = MetalFacts {
         device_name: handle.name(),
         architecture: raw.architecture().name().to_string(),
-        operating_system: NSProcessInfo::processInfo()
-            .operatingSystemVersionString()
-            .to_string(),
+        operating_system: operating_system(),
         registry_id: handle.registry_id(),
         unified_memory: handle.has_unified_memory(),
         families: observed_families(raw),
@@ -501,6 +499,14 @@ pub(crate) fn compile_options(language: LanguageVersion) -> objc2::rc::Retained<
 }
 
 const PROBE_PRELUDE: &str = "#include <metal_stdlib>\nusing namespace metal;\n";
+
+/// The OS version and build, as the OS reports it: the build ships the
+/// Metal compiler.
+pub fn operating_system() -> String {
+    NSProcessInfo::processInfo()
+        .operatingSystemVersionString()
+        .to_string()
+}
 
 /// The highest language version accepted by the runtime compiler.
 pub fn probe_language_version(device: &crate::DeviceHandle) -> Option<LanguageVersion> {

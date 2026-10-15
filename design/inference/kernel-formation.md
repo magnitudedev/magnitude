@@ -1,0 +1,128 @@
+---
+applies_to:
+  - inference/seismic/runtime/src/native/coverage.rs
+  - inference/seismic/runtime/src/native/coverage/**
+  - inference/service/kernel-formation/**
+  - inference/service/server/src/assessment/catalog_kernels.rs
+  - inference/scripts/kernels-form.ts
+---
+
+# Kernel formation
+
+Kernel formation proves, before release, that every native kernel the engine ships forms with
+each GPU backend's real toolchain, and that every kernel every supported catalog model requests
+forms. It is an offline check: no shipped binary contains it.
+
+## What a run establishes
+
+For one backend, a run:
+
+- forms every native implementation under configurations chosen so that every preprocessor group
+  of its sources (the asset, its includes and Seismic's native library) is compiled at least once,
+  and every value of every `form` tuning parameter is formed under each device configuration;
+- forms every distinct kernel request of every supported catalog model at its default
+  specialization on the backend's base configuration.
+
+A run succeeds only if every formation succeeded, every group was reached, every form value was
+formed, no entry lacks an implemented configuration, this host could form every configuration the
+search kept, and every catalog request formed. A backend whose toolchain the host lacks is an
+error when named, never a skip.
+
+Formation produces the real artifact preparation produces (a CUBIN through ptxas, sealed SPIR-V,
+Metal functions), short of loading it on a device. No lighter proxy substitutes for it.
+
+## Ownership
+
+- **The coverage search** (Seismic) decides what to form. It renders programs and preprocesses
+  their skeletons, but runs no formation itself: each formation goes to the caller's `Forming`,
+  which returns a verdict. The search is independent of processes, caches and memory.
+- **The formation tool** owns how formations run: the ledger, worker processes, memory admission
+  and progress reporting. It is a workspace member outside the default members, so the coverage
+  feature never joins default builds.
+
+## Verdicts
+
+| Verdict | Meaning |
+|---|---|
+| Formed | the toolchain produced the artifact |
+| Rejected | a `static_assert` fired: the configuration is not implemented, and the search seeks its groups elsewhere |
+| Failed | a compile error: a defect |
+
+A row's programs form in order; the first that does not form decides the row.
+
+## Formation identity
+
+A formation is determined by its program (text and entries) and its toolchain identity: the
+toolchain namespace and the identity material of the configuration. The material is derived from
+the same compiler-identity functions the runtime's program cache uses (CUDA: NVRTC release,
+architecture and compile options; Vulkan: glslang release, SPIR-V target, seal version, and the
+formation facts; Metal: the OS build, which ships the compiler, and the language version). The
+rendered text is the entire compiler input; no headers or include paths are passed separately.
+The ledger key hashes exactly these inputs, so an unchanged key is an unchanged formation.
+
+## Ledger
+
+The ledger keeps, per backend, what runs established:
+
+- a **verdict** per formation key: Formed or Rejected, with the peak memory of the worker that
+  established it. Failed is never recorded, nor is anything from a worker that ended abnormally;
+- a **completion** per coverage key: a coverage run that established everything, with its
+  summary.
+
+Records are appended as they are established, so a run that fails or dies keeps everything it
+finished. Unparseable lines are ignored and a missing ledger is an empty one. The ledger only
+skips work whose outcome is already known; correctness never depends on it.
+
+The coverage key hashes the toolchain identity (every configuration it forms and the preprocessor
+that chooses them) and a digest, taken when the tool is built, of every source coverage's result
+depends on: the kernel crate and the standard library its bundle is built from, Seismic, and the
+locked dependency versions. Engine and service sources do not enter it. Coverage whose key has a
+completion reports it and searches nothing; any change to those inputs runs the search again, and
+every formation whose key is recorded is recalled. Catalog requests depend on the engine's
+planning as well, so they are always enumerated; each request's formation is recalled when its key
+is recorded.
+
+## Search memory
+
+The search holds no table of admissible configurations. Where an entry's condition can fail to
+evaluate at its statics, the nearest-configuration questions of every frontier row sharing those
+statics are answered by one walk over the admissible configurations that keeps only the current
+answers, so the search's memory is independent of how many configurations a declaration admits.
+
+## Workers and admission
+
+Every formation the ledger does not hold runs in its own worker process, which exits after one
+program, so its memory returns to the system and its peak is the formation's alone.
+
+The pool starts a worker when fewer run than the host has cores, and the host's available memory
+(its headroom within any cgroup limit), less what each running worker may still grow by (its
+estimate minus its current resident size), holds another worker's estimate. The estimate is the
+largest peak known, measured in this run or kept by the ledger. One worker always runs, so the pool
+never stalls; until a peak is known, one runs alone. No concurrency or memory value is configured.
+
+A worker that ends abnormally forms again alone, after the running workers finish. The kernel's
+out-of-memory killer chooses the largest process, a worker rather than the driver. A worker that
+ends abnormally while alone fails its formation; killed alone, the failure states that this host's
+memory cannot form the program.
+
+Metal compiles inside the operating system's compiler service, so a Metal worker's peak understates
+the compile and the core bound governs. macOS compresses and swaps rather than killing processes.
+
+## Progress
+
+While a phase runs, the tool reports at a fixed interval the elapsed time, the phase's units done
+of its total (entries searched during coverage, requests formed during catalog formation), and the
+workers' activity (formed, recalled from the ledger, running). Formations per entry are discovered
+by the search, so entry progress is not proportional to time.
+
+## Acceptance
+
+- Identical inputs give identical formation keys; changing the namespace, material, text, or any
+  entry's symbol, group size or constants changes the key.
+- A run repeated with no coverage input changed reports the coverage completion, searches nothing,
+  and recalls every catalog formation.
+- An engine or service change alone does not invalidate the coverage completion.
+- A run after a change to one kernel family forms only that family's changed programs.
+- Admission never starts a worker beyond the core count or the memory bound, except the one that
+  always runs; a worker waiting to run alone blocks other admissions until it has run.
+- A run that is killed keeps every verdict it recorded.

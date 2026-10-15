@@ -31,6 +31,14 @@
 //! and Metal skeletons by `clang -E`. Their conditions may read no
 //! toolchain-predefined macro except `__CUDA_ARCH__`, which the CUDA skeleton
 //! defines for the configuration's architecture.
+//!
+//! The search decides what to form; the caller's [`Forming`] forms it, each
+//! [`Formation`] identified by everything it reads.
+
+mod forming;
+
+pub use forming::{form, Formation, Forming, InProcess, Progress, Target, Verdict};
+pub use seismic_native_target::{ProgramEntry, ProgramSource};
 
 use super::abi::{self, Dialect, render_source};
 use super::plan::{self, LaunchVariant};
@@ -38,7 +46,6 @@ use seismic_lang::checked::{CheckedModule, EntryInfo, NativeImplementation, Nati
 use seismic_lang::entry::ElementBindings;
 use seismic_lang::ids::{EntryId, RepresentationId};
 use seismic_lang::registry::{self, BackendName};
-use seismic_native_target::{NativeCompilationError, ProgramEntry, ProgramSource};
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -179,17 +186,46 @@ impl fmt::Display for CoverageError {
 
 impl std::error::Error for CoverageError {}
 
-/// One backend's toolchain, as preparation forms with it.
+/// One backend's formation toolchain on this host.
+pub struct Toolchain {
+    former: Former,
+}
+
+impl Toolchain {
+    /// The toolchain for `backend`, or why this host cannot form for it.
+    pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
+        Ok(Self {
+            former: Former::open(backend)?,
+        })
+    }
+
+    pub fn backend(&self) -> BackendName {
+        self.former.backend()
+    }
+
+    /// What identifies this toolchain across every configuration it forms,
+    /// with the preprocessor that chooses the configurations.
+    pub fn identity(&self) -> String {
+        self.former.identity()
+    }
+}
+
+/// One backend's toolchain as preparation forms with it: the configurations
+/// it forms, and what identifies and forms each formation.
 enum Former {
     Vulkan,
     Cuda {
         architectures: Vec<u32>,
+        release: (u32, u32),
+        /// `clang --version`, which preprocesses the skeletons.
+        preprocessor: String,
     },
     #[cfg(target_os = "macos")]
     Metal {
-        device: seismic_metal::DeviceHandle,
         language: seismic_metal::facts::LanguageVersion,
         tensor_ops: bool,
+        operating_system: String,
+        preprocessor: String,
     },
 }
 
@@ -214,12 +250,17 @@ impl Former {
             BackendName::Cuda => {
                 let floor = u32::from(seismic_cuda::ComputeCapability::SM80.major) * 10
                     + u32::from(seismic_cuda::ComputeCapability::SM80.minor);
+                let unavailable = |error| CoverageError::ToolchainUnavailable(format!("{error:?}"));
                 let architectures = seismic_cuda::nvrtc::supported_architectures()
-                    .map_err(|error| CoverageError::ToolchainUnavailable(format!("{error:?}")))?
+                    .map_err(unavailable)?
                     .into_iter()
                     .filter(|architecture| *architecture >= floor)
                     .collect();
-                Ok(Self::Cuda { architectures })
+                Ok(Self::Cuda {
+                    architectures,
+                    release: seismic_cuda::nvrtc::release().map_err(unavailable)?,
+                    preprocessor: clang_identity()?,
+                })
             }
             #[cfg(target_os = "macos")]
             BackendName::Metal => {
@@ -234,9 +275,10 @@ impl Former {
                 let tensor_ops =
                     seismic_metal::toolchain::forms_tensor_operations(&device, language);
                 Ok(Self::Metal {
-                    device,
                     language,
                     tensor_ops,
+                    operating_system: seismic_metal::profile::operating_system(),
+                    preprocessor: clang_identity()?,
                 })
             }
             #[cfg(not(target_os = "macos"))]
@@ -252,7 +294,7 @@ impl Former {
     fn base(&self) -> Configuration {
         match self {
             Self::Vulkan => Configuration::Vulkan(VULKAN_BASE),
-            Self::Cuda { architectures } => Configuration::Cuda {
+            Self::Cuda { architectures, .. } => Configuration::Cuda {
                 architecture: architectures[0],
             },
             #[cfg(target_os = "macos")]
@@ -268,13 +310,15 @@ impl Former {
                 .into_iter()
                 .map(Configuration::Vulkan)
                 .collect(),
-            (Self::Cuda { architectures }, Configuration::Cuda { architecture }) => architectures
-                .iter()
-                .filter(|candidate| **candidate != architecture)
-                .map(|architecture| Configuration::Cuda {
-                    architecture: *architecture,
-                })
-                .collect(),
+            (Self::Cuda { architectures, .. }, Configuration::Cuda { architecture }) => {
+                architectures
+                    .iter()
+                    .filter(|candidate| **candidate != architecture)
+                    .map(|architecture| Configuration::Cuda {
+                        architecture: *architecture,
+                    })
+                    .collect()
+            }
             #[cfg(target_os = "macos")]
             (Self::Metal { .. }, Configuration::Metal { tensor_ops }) => {
                 vec![Configuration::Metal {
@@ -296,46 +340,116 @@ impl Former {
         }
     }
 
-    /// Form `programs` as preparation forms them, short of loading them on a
-    /// device.
-    fn form(
-        &self,
-        programs: &[ProgramSource],
-        configuration: Configuration,
-    ) -> Result<(), NativeCompilationError> {
+    fn backend(&self) -> BackendName {
+        match self {
+            Self::Vulkan => BackendName::Vulkan,
+            Self::Cuda { .. } => BackendName::Cuda,
+            #[cfg(target_os = "macos")]
+            Self::Metal { .. } => BackendName::Metal,
+        }
+    }
+
+    /// What identifies this toolchain across every configuration it forms,
+    /// with the preprocessor that chooses the configurations.
+    fn identity(&self) -> String {
+        match self {
+            Self::Vulkan => seismic_vulkan::formation::compiler(),
+            Self::Cuda {
+                architectures,
+                release,
+                preprocessor,
+            } => format!(
+                "cuda;nvrtc {}.{};{};sm {architectures:?};{preprocessor}",
+                release.0,
+                release.1,
+                seismic_cuda::nvrtc::COMPILE_OPTIONS.join(" ")
+            ),
+            #[cfg(target_os = "macos")]
+            Self::Metal {
+                language,
+                tensor_ops,
+                operating_system,
+                preprocessor,
+            } => format!(
+                "{};tensor_ops {tensor_ops};{preprocessor}",
+                seismic_metal::toolchain::material(operating_system, *language)
+            ),
+        }
+    }
+
+    /// The toolchain namespace and the identity material of a formation
+    /// under `configuration`: with the program, everything it reads.
+    fn material(&self, configuration: Configuration) -> (&'static str, String) {
         match (self, configuration) {
-            (Self::Vulkan, Configuration::Vulkan(facts)) => {
-                for program in programs {
-                    for entry in &program.entries {
-                        seismic_vulkan::formation::compile(
-                            &program.text,
-                            &entry.symbol,
-                            facts.environment(),
-                        )?;
-                    }
-                }
-                Ok(())
-            }
-            (Self::Cuda { .. }, Configuration::Cuda { architecture }) => {
-                for program in programs {
-                    seismic_cuda::toolchain::form_cubin(program, architecture)?;
-                }
-                Ok(())
-            }
+            (Self::Vulkan, Configuration::Vulkan(facts)) => (
+                "vulkan",
+                format!("{};{facts:?}", seismic_vulkan::formation::compiler()),
+            ),
+            (Self::Cuda { release, .. }, Configuration::Cuda { architecture }) => (
+                "cuda",
+                seismic_cuda::toolchain::material(&seismic_cuda::nvrtc::Formation {
+                    release: *release,
+                    architecture,
+                    options: seismic_cuda::nvrtc::COMPILE_OPTIONS,
+                }),
+            ),
             #[cfg(target_os = "macos")]
             (
                 Self::Metal {
-                    device, language, ..
+                    language,
+                    operating_system,
+                    ..
                 },
-                Configuration::Metal { .. },
-            ) => {
-                for program in programs {
-                    seismic_metal::toolchain::form_functions(device, program, *language)?;
-                }
-                Ok(())
-            }
-            _ => unreachable!("a former forms only its own configurations"),
+                Configuration::Metal { tensor_ops },
+            ) => (
+                "metal",
+                format!(
+                    "{};tensor_ops {tensor_ops}",
+                    seismic_metal::toolchain::material(operating_system, *language)
+                ),
+            ),
+            _ => unreachable!("a former identifies only its own configurations"),
         }
+    }
+
+    /// Forming `program` under `configuration`, with what identifies it.
+    fn formation<'a>(
+        &self,
+        configuration: Configuration,
+        program: &'a ProgramSource,
+    ) -> Formation<'a> {
+        let (namespace, material) = self.material(configuration);
+        let target = match (self, configuration) {
+            (Self::Vulkan, Configuration::Vulkan(facts)) => Target::Vulkan(facts),
+            (Self::Cuda { .. }, Configuration::Cuda { architecture }) => {
+                Target::Cuda { architecture }
+            }
+            #[cfg(target_os = "macos")]
+            (Self::Metal { language, .. }, Configuration::Metal { .. }) => Target::Metal {
+                language: *language,
+            },
+            _ => unreachable!("a former targets only its own configurations"),
+        };
+        Formation {
+            namespace,
+            material,
+            target,
+            program,
+        }
+    }
+}
+
+/// A search's toolchain and how its formations run.
+#[derive(Clone, Copy)]
+struct Forms<'a> {
+    former: &'a Former,
+    forming: &'a dyn Forming,
+}
+
+impl Forms<'_> {
+    fn form(&self, configuration: Configuration, program: &ProgramSource) -> Verdict {
+        self.forming
+            .form(self.former.formation(configuration, program))
     }
 }
 
@@ -635,6 +749,22 @@ fn preprocess_clang(skeletons: &[&str]) -> Result<Vec<Outcome>, CoverageError> {
 /// Ends each skeleton in a batched `clang -E`.
 const END: &str = "seismic_skeleton_end_";
 
+/// `clang --version`: the preprocessor that decides which CUDA and Metal
+/// configurations a search keeps.
+fn clang_identity() -> Result<String, CoverageError> {
+    let output = std::process::Command::new("clang")
+        .arg("--version")
+        .output()
+        .map_err(|error| CoverageError::ToolchainUnavailable(format!("clang: {error}")))?;
+    if !output.status.success() {
+        return Err(CoverageError::ToolchainUnavailable(format!(
+            "clang --version: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// Every representation of the registry, bf16 and f16 first. Which of them
 /// an entry admits is what monomorphizing it accepts, as preparation decides
 /// it; which the kernel implements, its `#error` and `static_assert`
@@ -855,22 +985,18 @@ fn statics_of(specialization: &NativeSpecialization) -> NativeSpecialization {
 /// configurations of its parameter product the condition admits, in order,
 /// so each question is answered by walks over a part of the product, and the
 /// first configuration such a walk visits is the first of the whole walk's
-/// within that part. Otherwise every admissible configuration is walked once
-/// and held ([`Walked`]): a declaration can admit hundreds of millions.
+/// within that part. Otherwise each question is answered by one walk over
+/// every admissible configuration, holding only its answers: a declaration
+/// can admit hundreds of millions, so they are never held.
 struct Admissible<'m> {
     implementation: &'m NativeImplementation,
     statics: NativeSpecialization,
     axes: Vec<(Option<usize>, &'m NativeParameter)>,
     first: NativeSpecialization,
-    walked: Option<Walked>,
+    /// Whether the condition can fail to evaluate at `statics`, so questions
+    /// are answered by whole walks rather than walks over parts.
+    fallible: bool,
     variants: Vec<Vec<LaunchVariant>>,
-}
-
-/// Every admissible configuration, as the index of each parameter's value in
-/// its declaration: one row of codes per configuration, in walk order.
-struct Walked {
-    codes: Vec<u16>,
-    count: usize,
 }
 
 /// A parameter a configuration leaves unset.
@@ -903,7 +1029,7 @@ impl<'m> Admissible<'m> {
                 ))
                 .collect(),
             first: NativeSpecialization::new(),
-            walked: None,
+            fallible: false,
             variants: Vec::new(),
         }
     }
@@ -933,6 +1059,7 @@ impl<'m> Admissible<'m> {
         variant_programs: bool,
     ) -> Self {
         let mut admissible = Self::new(implementation, statics);
+        admissible.fallible = true;
         admissible.variants = vec![
             Vec::new();
             if variant_programs {
@@ -941,23 +1068,12 @@ impl<'m> Admissible<'m> {
                 0
             }
         ];
-        let mut walked = Walked {
-            codes: Vec::new(),
-            count: 0,
-        };
+        let mut first = None;
         implementation
             .walk_admissible(statics, |candidate| {
-                if walked.count == 0 {
-                    admissible.first = candidate.clone();
+                if first.is_none() {
+                    first = Some(candidate.clone());
                 }
-                let codes = admissible.codes_of(candidate);
-                debug_assert_eq!(
-                    codes.iter().filter(|code| **code != UNSET).count(),
-                    candidate.params().len() + candidate.launch_params().len(),
-                    "every parameter a configuration sets is declared"
-                );
-                walked.codes.extend(codes);
-                walked.count += 1;
                 for (ordinal, variants) in admissible.variants.iter_mut().enumerate() {
                     let variant = variant_of(implementation, candidate, ordinal);
                     if !variants.contains(&variant) {
@@ -967,8 +1083,7 @@ impl<'m> Admissible<'m> {
                 true
             })
             .expect("a row's statics admit its specialization");
-        assert!(walked.count > 0, "a row's statics admit its specialization");
-        admissible.walked = Some(walked);
+        admissible.first = first.expect("a row's statics admit its specialization");
         admissible
     }
 
@@ -1073,24 +1188,82 @@ impl<'m> Admissible<'m> {
         variants
     }
 
-    /// The first configuration in walk order holding `code` on `axis` with
-    /// the fewest set parameters differing from `held`.
-    fn nearest(&self, held: &[u16], axis: usize, code: u16) -> Option<NativeSpecialization> {
-        if let Some(walked) = &self.walked {
-            let row = |index: usize| {
-                &walked.codes[index * self.axes.len()..(index + 1) * self.axes.len()]
-            };
-            return (0..walked.count)
-                .filter(|index| row(*index)[axis] == code)
-                .min_by_key(|index| {
-                    row(*index)
+    /// For each of `helds`: for every axis and every code of it the held
+    /// codes do not hold, in axis then code order, the first configuration in
+    /// walk order holding that code with the fewest set parameters differing
+    /// from them; codes no configuration holds are skipped.
+    fn nearest_each(&self, helds: &[Vec<u16>]) -> Vec<Vec<NativeSpecialization>> {
+        if !self.fallible {
+            return helds
+                .iter()
+                .map(|held| {
+                    self.axes
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(axis, (_, parameter))| {
+                            (0..parameter.values.len() as u16)
+                                .filter(move |code| held[axis] != *code)
+                                .filter_map(move |code| self.nearest(held, axis, code))
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+        // One walk for every held: each configuration is a candidate for the
+        // code it holds on each axis, at its distance from each held. A
+        // strictly nearer candidate replaces an answer, so ties keep the first
+        // in walk order.
+        let empty = self
+            .axes
+            .iter()
+            .map(|(_, parameter)| vec![None; parameter.values.len()])
+            .collect::<Vec<Vec<Option<(usize, NativeSpecialization)>>>>();
+        let mut nearest = vec![empty; helds.len()];
+        self.implementation
+            .walk_admissible(&self.statics, |candidate| {
+                let codes = self.codes_of(candidate);
+                debug_assert_eq!(
+                    codes.iter().filter(|code| **code != UNSET).count(),
+                    candidate.params().len() + candidate.launch_params().len(),
+                    "every parameter a configuration sets is declared"
+                );
+                for (held, nearest) in helds.iter().zip(&mut nearest) {
+                    let distance = codes
                         .iter()
                         .zip(held)
-                        .filter(|(candidate, held)| **candidate != UNSET && candidate != held)
-                        .count()
-                })
-                .map(|index| self.specialization(row(index)));
-        }
+                        .filter(|(code, held)| **code != UNSET && code != held)
+                        .count();
+                    for (axis, code) in codes.iter().enumerate() {
+                        if *code == UNSET || *code == held[axis] {
+                            continue;
+                        }
+                        let answer = &mut nearest[axis][*code as usize];
+                        if answer.as_ref().is_none_or(|(least, _)| distance < *least) {
+                            *answer = Some((distance, candidate.clone()));
+                        }
+                    }
+                }
+                true
+            })
+            .expect("a row's statics admit its specialization");
+        nearest
+            .into_iter()
+            .map(|answers| {
+                answers
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|(_, specialization)| specialization)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The first configuration in walk order holding `code` on `axis` with
+    /// the fewest set parameters differing from `held`, answered by walks
+    /// over parts of the product. Only for statics at which the condition
+    /// cannot fail.
+    fn nearest(&self, held: &[u16], axis: usize, code: u16) -> Option<NativeSpecialization> {
         // Every configuration differs from `held` on the axes it leaves
         // unset; on each other axis a configuration holds its value or one
         // of the rest. So the configurations differing in exactly the axes
@@ -1169,24 +1342,6 @@ impl<'m> Admissible<'m> {
         // first in walk order of all holding `code` is one of them.
         Some(first)
     }
-
-    fn specialization(&self, row: &[u16]) -> NativeSpecialization {
-        self.axes.iter().zip(row).fold(
-            statics_of(&self.first),
-            |specialization, ((launch, parameter), code)| {
-                if *code == UNSET {
-                    return specialization;
-                }
-                let value = parameter.values[*code as usize];
-                match launch {
-                    None => specialization.with_param(parameter.name.clone(), value),
-                    Some(launch) => {
-                        specialization.with_launch_param(*launch, parameter.name.clone(), value)
-                    }
-                }
-            },
-        )
-    }
 }
 
 /// The code variant of launch `launch` a configuration names.
@@ -1201,8 +1356,44 @@ fn variant_of(
     }
 }
 
-/// The changes of one choice from `row` the search considers.
-fn variations(subject: &Subject<'_>, former: &Former, row: &Row) -> Vec<Row> {
+/// The changes of one choice from each of `rows` the search considers, in
+/// row order. The nearest configurations of rows sharing statics come from
+/// one set of walks.
+fn variations(subject: &Subject<'_>, former: &Former, rows: &[Row]) -> Vec<Row> {
+    let mut groups: Vec<(NativeSpecialization, Vec<usize>)> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let statics = statics_of(&row.specialization);
+        match groups.iter_mut().find(|(held, _)| *held == statics) {
+            Some((_, indices)) => indices.push(index),
+            None => groups.push((statics, vec![index])),
+        }
+    }
+    let mut nearest = vec![Vec::new(); rows.len()];
+    for (statics, indices) in groups {
+        let admissible = subject.admissible(&statics);
+        let helds = indices
+            .iter()
+            .map(|index| admissible.codes_of(&rows[*index].specialization))
+            .collect::<Vec<_>>();
+        for (index, answers) in indices.into_iter().zip(admissible.nearest_each(&helds)) {
+            nearest[index] = answers;
+        }
+    }
+    rows.iter()
+        .zip(nearest)
+        .flat_map(|(row, nearest)| row_variations(subject, former, row, nearest))
+        .collect()
+}
+
+/// The changes of one choice from `row`: its bindings, its statics, the
+/// `nearest` configuration holding each parameter value it does not hold
+/// (ties to the first in walk order), and its device configuration.
+fn row_variations(
+    subject: &Subject<'_>,
+    former: &Former,
+    row: &Row,
+    nearest: Vec<NativeSpecialization>,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for (parameter, candidates) in &subject.candidates {
         for representation in candidates {
@@ -1233,21 +1424,11 @@ fn variations(subject: &Subject<'_>, former: &Former, row: &Row) -> Vec<Row> {
             }
         }
     }
-    let admissible = subject.admissible(&statics);
-    // The admissible configuration nearest the row holding each parameter
-    // value the row does not hold, ties to the first in walk order.
-    let held = admissible.codes_of(&row.specialization);
-    for (axis, (_, parameter)) in admissible.axes.iter().enumerate() {
-        for code in 0..parameter.values.len() as u16 {
-            if held[axis] != code {
-                if let Some(specialization) = admissible.nearest(&held, axis, code) {
-                    rows.push(Row {
-                        specialization,
-                        ..row.clone()
-                    });
-                }
-            }
-        }
+    for specialization in nearest {
+        rows.push(Row {
+            specialization,
+            ..row.clone()
+        });
     }
     for configuration in former.variations(row.configuration) {
         rows.push(Row {
@@ -1355,7 +1536,7 @@ fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, Cover
 }
 
 /// What forming one row established.
-enum Formation {
+enum RowOutcome {
     /// The toolchain formed these programs.
     Formed(usize),
     /// The kernel rejects the configuration: a `static_assert` fired, which
@@ -1366,22 +1547,20 @@ enum Formation {
     Unformable,
 }
 
-fn form_row(subject: &Subject<'_>, former: &Former, row: &Row) -> Formation {
-    if !former.formable(row.configuration) {
-        return Formation::Unformable;
+/// Form `row`'s programs in order: the first that does not form decides.
+fn form_row(subject: &Subject<'_>, forms: Forms<'_>, row: &Row) -> RowOutcome {
+    if !forms.former.formable(row.configuration) {
+        return RowOutcome::Unformable;
     }
     let programs = subject.programs(row);
-    match gated(|| former.form(&programs, row.configuration)) {
-        Ok(()) => Formation::Formed(programs.len()),
-        Err(error) if asserted(&error) => Formation::Rejected,
-        Err(error) => Formation::Failed(compilation_message(&error)),
+    for program in &programs {
+        match forms.form(row.configuration, program) {
+            Verdict::Formed => {}
+            Verdict::Rejected => return RowOutcome::Rejected,
+            Verdict::Failed(error) => return RowOutcome::Failed(error),
+        }
     }
-}
-
-/// Whether a compilation failed because a `static_assert` fired.
-fn asserted(error: &NativeCompilationError) -> bool {
-    let text = format!("{error:?}");
-    text.contains("static assertion failed") || text.contains("static_assert failed")
+    RowOutcome::Formed(programs.len())
 }
 
 /// One entry's search: its kept rows, what forming them established, and
@@ -1404,15 +1583,15 @@ struct Search {
 
 impl Search {
     /// Record a kept row's formation; `false` when the kernel rejects it.
-    fn record(&mut self, subject: &Subject<'_>, row: &Row, formation: Formation) -> bool {
+    fn record(&mut self, subject: &Subject<'_>, row: &Row, formation: RowOutcome) -> bool {
         match formation {
-            Formation::Formed(programs) => {
+            RowOutcome::Formed(programs) => {
                 self.formed += programs;
                 self.kept.push(row.clone());
             }
-            Formation::Rejected => return false,
-            Formation::Failed(error) => self.failures.push(subject.describe(row, error)),
-            Formation::Unformable => self.unformable.push(row.configuration),
+            RowOutcome::Rejected => return false,
+            RowOutcome::Failed(error) => self.failures.push(subject.describe(row, error)),
+            RowOutcome::Unformable => self.unformable.push(row.configuration),
         }
         true
     }
@@ -1424,7 +1603,7 @@ impl Search {
     }
 }
 
-fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, CoverageError> {
+fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, CoverageError> {
     let implementation = subject.implementation;
     let Some(statics) = subject.statics(&[]) else {
         return Ok(None);
@@ -1432,7 +1611,7 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
     let specialization = implementation
         .default_specialization(&statics)
         .expect("searched statics admit a configuration");
-    let configuration = former.base();
+    let configuration = forms.former.base();
     let mut search = Search::default();
     // The base: the first binding in candidate order that is admitted,
     // implemented and not rejected by the toolchain.
@@ -1462,7 +1641,7 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
                 search.universe.extend(evaluated.universe);
                 search.rejecting.extend(evaluated.rejecting);
                 if let Some(reached) = evaluated.reached {
-                    if search.record(subject, &row, form_row(subject, former, &row)) {
+                    if search.record(subject, &row, form_row(subject, forms, &row)) {
                         search.reached.extend(reached);
                         base = Some(row);
                         break;
@@ -1495,15 +1674,11 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
     loop {
         // Change one choice at a time from every newly kept configuration.
         while !frontier.is_empty() {
-            let mut candidates = Vec::new();
-            for row in &frontier {
-                for candidate in variations(subject, former, row) {
-                    if seen.insert(candidate.key()) {
-                        candidates.push(candidate);
-                    }
-                }
-            }
-            frontier = keep(subject, former, candidates, &mut search)?;
+            let candidates = variations(subject, forms.former, &frontier)
+                .into_iter()
+                .filter(|candidate| seen.insert(candidate.key()))
+                .collect();
+            frontier = keep(subject, forms, candidates, &mut search)?;
         }
         if search.complete() || paired {
             break;
@@ -1514,9 +1689,9 @@ fn search(subject: &Subject<'_>, former: &Former) -> Result<Option<Search>, Cove
         // from whatever the pairs reach.
         paired = true;
         let candidates = binding_pairs(subject, &base, &mut seen);
-        frontier = keep(subject, former, candidates, &mut search)?;
+        frontier = keep(subject, forms, candidates, &mut search)?;
     }
-    form_values(subject, former, &base, &mut search)?;
+    form_values(subject, forms, &base, &mut search)?;
     let rejecting = std::mem::take(&mut search.rejecting);
     search.universe.retain(|site| !rejecting.contains(site));
     Ok(Some(search))
@@ -1541,12 +1716,12 @@ fn holds(specialization: &NativeSpecialization, (launch, name, value): Form<'_>)
 /// device configuration, never the product with the other parameters.
 fn form_values(
     subject: &Subject<'_>,
-    former: &Former,
+    forms: Forms<'_>,
     base: &Row,
     search: &mut Search,
 ) -> Result<(), CoverageError> {
     let implementation = subject.implementation;
-    let forms: Vec<Form<'_>> = implementation
+    let values: Vec<Form<'_>> = implementation
         .params
         .iter()
         .map(|parameter| (None, parameter))
@@ -1571,13 +1746,13 @@ fn form_values(
         })
         .collect();
     let mut configurations = vec![base.configuration];
-    configurations.extend(former.variations(base.configuration));
+    configurations.extend(forms.former.variations(base.configuration));
     // Whether each form is settled (formed, or beyond this host's toolchain)
     // and whether a row of it failed, which is reported as that failure.
-    let mut settled = vec![false; forms.len()];
-    let mut failed = vec![false; forms.len()];
+    let mut settled = vec![false; values.len()];
+    let mut failed = vec![false; values.len()];
     let mut rows: Vec<(usize, Row)> = Vec::new();
-    for (index, form) in forms.iter().enumerate() {
+    for (index, form) in values.iter().enumerate() {
         let specialization = search
             .kept
             .iter()
@@ -1616,20 +1791,20 @@ fn form_values(
             implemented.push((index, row, reached));
         }
     }
-    let formations = in_parallel(&implemented, |(_, row, _)| form_row(subject, former, row));
+    let formations = in_parallel(&implemented, |(_, row, _)| form_row(subject, forms, row));
     for ((index, row, reached), formation) in implemented.into_iter().zip(formations) {
         match formation {
-            Formation::Failed(_) => failed[index] = true,
-            Formation::Formed(_) | Formation::Unformable => settled[index] = true,
-            Formation::Rejected => {}
+            RowOutcome::Failed(_) => failed[index] = true,
+            RowOutcome::Formed(_) | RowOutcome::Unformable => settled[index] = true,
+            RowOutcome::Rejected => {}
         }
         if search.record(subject, &row, formation) {
             search.reached.extend(reached);
         }
     }
-    search.forms = forms.len();
+    search.forms = values.len();
     search.forms_formed = settled.iter().filter(|settled| **settled).count();
-    search.unformed = forms
+    search.unformed = values
         .iter()
         .zip(settled.iter().zip(&failed))
         .filter(|(_, (settled, failed))| !**settled && !**failed)
@@ -1650,7 +1825,7 @@ fn form_values(
 /// again among the rest. The kept candidates are returned.
 fn keep(
     subject: &Subject<'_>,
-    former: &Former,
+    forms: Forms<'_>,
     candidates: Vec<Row>,
     search: &mut Search,
 ) -> Result<Vec<Row>, CoverageError> {
@@ -1680,7 +1855,7 @@ fn keep(
             return Ok(kept);
         }
         let formations = in_parallel(&chosen, |(candidate, _)| {
-            form_row(subject, former, candidate)
+            form_row(subject, forms, candidate)
         });
         let mut rejected = false;
         for ((candidate, reached), formation) in chosen.into_iter().zip(formations) {
@@ -1730,12 +1905,22 @@ fn binding_pairs(subject: &Subject<'_>, row: &Row, seen: &mut BTreeSet<String>) 
     rows
 }
 
-/// Form every native implementation of `module` for `backend`. Entries are
-/// searched in parallel, each search preprocessing and forming its
-/// candidates in parallel; the toolchain work itself runs at most one job
-/// per core.
-pub fn cover(module: &CheckedModule, backend: BackendName) -> Result<Coverage, CoverageError> {
-    let former = Former::open(backend)?;
+/// Form every native implementation of `module` with `toolchain`, through
+/// `forming`. Entries are searched in parallel, each search preprocessing
+/// and forming its candidates in parallel; preprocessing runs at most one
+/// job per core, and formation as `forming` runs it. `progress` counts the
+/// entries searched.
+pub fn cover(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+    forming: &dyn Forming,
+    progress: &Progress,
+) -> Result<Coverage, CoverageError> {
+    let forms = Forms {
+        former: &toolchain.former,
+        forming,
+    };
+    let backend = toolchain.backend();
     let subjects = module
         .entries()
         .iter()
@@ -1748,7 +1933,12 @@ pub fn cover(module: &CheckedModule, backend: BackendName) -> Result<Coverage, C
             Subject::new(module, info, backend, candidates)
         })
         .collect::<Vec<_>>();
-    let searches = in_parallel(&subjects, |subject| search(subject, &former));
+    progress.begin(subjects.len());
+    let searches = in_parallel(&subjects, |subject| {
+        let searched = search(subject, forms);
+        progress.advance();
+        searched
+    });
     let mut coverage = Coverage::default();
     let mut reached = BTreeSet::new();
     let mut universe = BTreeSet::new();
@@ -1807,8 +1997,9 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
     results.into_iter().map(|(_, result)| result).collect()
 }
 
-/// Run `work` holding one of a core's worth of permits: the toolchain work
-/// of every concurrent search shares the cores without oversubscribing them.
+/// Run `work` holding one of a core's worth of permits: the rendering and
+/// preprocessing of every concurrent search share the cores without
+/// oversubscribing them. Formation runs as the caller's [`Forming`] runs it.
 fn gated<R>(work: impl FnOnce() -> R) -> R {
     static PERMITS: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
@@ -1837,15 +2028,6 @@ fn gated<R>(work: impl FnOnce() -> R) -> R {
     }
     let _permit = Permit(free, released);
     work()
-}
-
-fn compilation_message(error: &NativeCompilationError) -> String {
-    let text = format!("{error:?}");
-    text.lines()
-        .filter(|line| line.contains("ERROR") || line.contains("error"))
-        .take(4)
-        .collect::<Vec<_>>()
-        .join(" | ")
 }
 
 /// A kernel request a program makes: an entry at element bindings and
@@ -1880,63 +2062,61 @@ impl fmt::Display for RequestFailure {
     }
 }
 
-/// Forms requests as preparation forms them on one backend's base
-/// configuration, at each request's default specialization.
-pub struct RequestFormer {
-    former: Former,
-    backend: BackendName,
+/// Form every request as preparation forms it on `toolchain`'s base
+/// configuration, at its default specialization, in parallel through
+/// `forming`; results in request order. `progress` counts the requests
+/// formed.
+pub fn form_requests(
+    module: &CheckedModule,
+    toolchain: &Toolchain,
+    forming: &dyn Forming,
+    requests: &[Request],
+    progress: &Progress,
+) -> Vec<Result<(), RequestFailure>> {
+    let forms = Forms {
+        former: &toolchain.former,
+        forming,
+    };
+    progress.begin(requests.len());
+    in_parallel(requests, |request| {
+        let formed = form_request(module, forms, request);
+        progress.advance();
+        formed
+    })
 }
 
-impl RequestFormer {
-    pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
-        Ok(Self {
-            former: Former::open(backend)?,
-            backend,
-        })
+fn form_request(
+    module: &CheckedModule,
+    forms: Forms<'_>,
+    request: &Request,
+) -> Result<(), RequestFailure> {
+    let info = module
+        .entries()
+        .iter()
+        .find(|info| info.id == request.entry)
+        .expect("a request names an entry of the module");
+    let subject = Subject::new(module, info, forms.former.backend(), Vec::new())
+        .expect("a request names an entry with a native implementation");
+    let specialization = subject
+        .implementation
+        .default_specialization(&request.statics)
+        .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
+    let row = Row {
+        bindings: request.bindings.clone(),
+        specialization,
+        configuration: forms.former.base(),
+    };
+    let evaluated = evaluate(&subject, std::slice::from_ref(&row))
+        .map_err(|error| RequestFailure::Formation(error.to_string()))?
+        .pop()
+        .expect("one row evaluated");
+    if evaluated.reached.is_none() {
+        return Err(RequestFailure::Unimplemented);
     }
-
-    pub fn backend(&self) -> BackendName {
-        self.backend
-    }
-
-    pub fn form(&self, module: &CheckedModule, request: &Request) -> Result<(), RequestFailure> {
-        let info = module
-            .entries()
-            .iter()
-            .find(|info| info.id == request.entry)
-            .expect("a request names an entry of the module");
-        let subject = Subject::new(module, info, self.backend, Vec::new())
-            .expect("a request names an entry with a native implementation");
-        let specialization = subject
-            .implementation
-            .default_specialization(&request.statics)
-            .map_err(|error| RequestFailure::Inadmissible(error.to_string()))?;
-        let row = Row {
-            bindings: request.bindings.clone(),
-            specialization,
-            configuration: self.former.base(),
-        };
-        let evaluated = evaluate(&subject, std::slice::from_ref(&row))
-            .map_err(|error| RequestFailure::Formation(error.to_string()))?
-            .pop()
-            .expect("one row evaluated");
-        if evaluated.reached.is_none() {
-            return Err(RequestFailure::Unimplemented);
-        }
-        match form_row(&subject, &self.former, &row) {
-            Formation::Formed(_) | Formation::Unformable => Ok(()),
-            Formation::Rejected => Err(RequestFailure::Unimplemented),
-            Formation::Failed(error) => Err(RequestFailure::Formation(error)),
-        }
-    }
-
-    /// [`Self::form`] over every request, in parallel, results in order.
-    pub fn form_all(
-        &self,
-        module: &CheckedModule,
-        requests: &[Request],
-    ) -> Vec<Result<(), RequestFailure>> {
-        in_parallel(requests, |request| self.form(module, request))
+    match form_row(&subject, forms, &row) {
+        RowOutcome::Formed(_) | RowOutcome::Unformable => Ok(()),
+        RowOutcome::Rejected => Err(RequestFailure::Unimplemented),
+        RowOutcome::Failed(error) => Err(RequestFailure::Formation(error)),
     }
 }
 

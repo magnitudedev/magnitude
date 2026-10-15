@@ -253,6 +253,13 @@ Vision acceptance sends an actual image through the shipped projector and checks
 It exercises streaming, concurrent requests, prefill, unload and reload on native Intel
 hardware, retaining results and server diagnostics without publishing or replacing candidate gates.
 
+Kernel formation ([kernel formation](../inference/kernel-formation.md)) runs once per GPU backend
+on a host with that backend's toolchain. Each job restores the most recent formation ledger of
+its backend and saves its own under a key unique to the run attempt, even when the run fails, so a
+run forms only what changed and a failed run keeps what it finished. Caches are branch-scoped: a
+run on the default branch reads only ledgers written there, never one a pull request wrote. An
+evicted ledger costs a cold run, never correctness.
+
 Pull requests run the complete build and acceptance graph without publishing. A manually dispatched
 Linux x64 dry run exercises the CPU-only production path but cannot authorize publication.
 For local diagnosis, a final Linux inference archive can run from an isolated profile in a

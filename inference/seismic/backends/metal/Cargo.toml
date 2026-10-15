@@ -11,6 +11,7 @@ seismic-estimator.workspace = true
 seismic-lang.workspace = true
 seismic-native-target.workspace = true
 seismic-compiler.workspace = true
+serde.workspace = true
 sha2 = "=0.11.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]

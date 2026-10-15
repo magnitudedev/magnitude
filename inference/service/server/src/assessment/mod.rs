@@ -3,8 +3,7 @@
 //! per-target deadlines, publication guards and one-attempt `Dropped` semantics.
 
 pub mod assessor;
-#[cfg(test)]
-mod catalog_kernels_tests;
+pub mod catalog_kernels;
 pub mod environment;
 
 use std::sync::{Arc, Mutex, Weak};

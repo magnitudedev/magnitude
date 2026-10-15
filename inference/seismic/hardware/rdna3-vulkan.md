@@ -94,7 +94,7 @@ Check at least:
   every zero accumulator from one function (`lib/core/matrix.glsl`). A minimal repro is a compute shader
   with two functions that each clear an accumulator with `coopmat<float, …, gl_MatrixUseAccumulator>(0.0)`.
 - Neither RADV nor the NVIDIA driver has this fault, so only a Windows AMD machine catches a regression. The
-  kernel crate's `vulkan_kernels_form` coverage does not: it passes with and without the workaround. Load a model
+  Vulkan kernel formation coverage (`bun run kernels:form vulkan`) does not: it passes with and without the workaround. Load a model
   (prefill attention forms on every load) on such a machine instead.
 
 ## Baselines

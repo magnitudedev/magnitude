@@ -21,10 +21,14 @@ pub const GLSLANG_RELEASE: &str = "glslang 0.8.1+275822a";
 /// compiler, target, seal passes and the device facts they and the driver
 /// consume (§7.5).
 pub(crate) fn formation(device: &Device) -> String {
-    format!(
-        "vulkan;{GLSLANG_RELEASE};spirv 1.6;seal {SEAL_VERSION};{}",
-        device.facts().formation_identity()
-    )
+    format!("{};{}", compiler(), device.facts().formation_identity())
+}
+
+/// The part of every formation identity the compiler determines: glslang,
+/// the SPIR-V target and the seal passes. Offline formation, which forms no
+/// pipeline on a device, is identified by this and the formation facts.
+pub fn compiler() -> String {
+    format!("vulkan;{GLSLANG_RELEASE};spirv 1.6;seal {SEAL_VERSION}")
 }
 
 fn toolchain(error: impl std::fmt::Display) -> NativeCompilationError {

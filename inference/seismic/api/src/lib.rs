@@ -33,71 +33,69 @@ pub use seismic_runtime::artifacts::{ArtifactKey, ArtifactStore, DeviceOptions};
 /// implementations, and offline formation of the kernels a program requests.
 #[cfg(feature = "coverage")]
 pub mod coverage {
-    use crate::{BackendName, KernelRequest, NativeSpecialization, generated::Module};
+    use crate::{KernelRequest, NativeSpecialization, generated::Module};
     pub use seismic_runtime::native::coverage::{
-        Configuration, Coverage, CoverageError, FormationFailure, GroupSite, RequestFailure,
+        Configuration, Coverage, CoverageError, Formation, FormationFailure, Forming, GroupSite,
+        InProcess, ProgramEntry, ProgramSource, Progress, RequestFailure, Target, Toolchain,
+        Verdict, form,
     };
 
-    /// Form every native implementation of `module` for `backend` until
-    /// every preprocessor group of its sources has been formed under some
-    /// configuration.
-    pub fn cover(module: &Module, backend: BackendName) -> Result<Coverage, CoverageError> {
-        seismic_runtime::native::coverage::cover(module.checked(), backend)
+    /// Form every native implementation of `module` with `toolchain`,
+    /// through `forming`, until every preprocessor group of its sources has
+    /// been formed under some configuration. `progress` counts the entries
+    /// searched.
+    pub fn cover(
+        module: &Module,
+        toolchain: &Toolchain,
+        forming: &dyn Forming,
+        progress: &Progress,
+    ) -> Result<Coverage, CoverageError> {
+        seismic_runtime::native::coverage::cover(module.checked(), toolchain, forming, progress)
     }
 
-    /// Forms kernel requests at their default specialization on one
-    /// backend's base configuration.
-    pub struct RequestFormer {
-        inner: seismic_runtime::native::coverage::RequestFormer,
-    }
-
-    impl RequestFormer {
-        pub fn open(backend: BackendName) -> Result<Self, CoverageError> {
-            Ok(Self {
-                inner: seismic_runtime::native::coverage::RequestFormer::open(backend)?,
+    /// Form every kernel request at its default specialization on
+    /// `toolchain`'s base configuration, in parallel through `forming`;
+    /// results in request order. `progress` counts the requests formed.
+    pub fn form_requests(
+        module: &Module,
+        toolchain: &Toolchain,
+        forming: &dyn Forming,
+        requests: &[KernelRequest],
+        progress: &Progress,
+    ) -> Vec<Result<(), RequestFailure>> {
+        let requests = requests
+            .iter()
+            .map(|request| {
+                assert_eq!(
+                    request.backend,
+                    toolchain.backend(),
+                    "a request forms on its own backend"
+                );
+                seismic_runtime::native::coverage::Request {
+                    entry: module
+                        .checked()
+                        .entry_named(request.entry)
+                        .expect("a request names an entry of its module"),
+                    bindings: request.elements.iter().fold(
+                        seismic_lang::entry::ElementBindings::new(),
+                        |bindings, (name, element)| bindings.bind(name, element.id()),
+                    ),
+                    statics: request
+                        .statics
+                        .iter()
+                        .fold(NativeSpecialization::new(), |statics, (name, value)| {
+                            statics.with_static(name.clone(), *value)
+                        }),
+                }
             })
-        }
-
-        /// Form every request, in parallel; results in request order.
-        pub fn form_all(
-            &self,
-            module: &Module,
-            requests: &[KernelRequest],
-        ) -> Vec<Result<(), RequestFailure>> {
-            let requests = requests
-                .iter()
-                .map(|request| self.request(module, request))
-                .collect::<Vec<_>>();
-            self.inner.form_all(module.checked(), &requests)
-        }
-
-        fn request(
-            &self,
-            module: &Module,
-            request: &KernelRequest,
-        ) -> seismic_runtime::native::coverage::Request {
-            assert_eq!(
-                request.backend,
-                self.inner.backend(),
-                "a request forms on its own backend"
-            );
-            seismic_runtime::native::coverage::Request {
-                entry: module
-                    .checked()
-                    .entry_named(request.entry)
-                    .expect("a request names an entry of its module"),
-                bindings: request.elements.iter().fold(
-                    seismic_lang::entry::ElementBindings::new(),
-                    |bindings, (name, element)| bindings.bind(name, element.id()),
-                ),
-                statics: request
-                    .statics
-                    .iter()
-                    .fold(NativeSpecialization::new(), |statics, (name, value)| {
-                        statics.with_static(name.clone(), *value)
-                    }),
-            }
-        }
+            .collect::<Vec<_>>();
+        seismic_runtime::native::coverage::form_requests(
+            module.checked(),
+            toolchain,
+            forming,
+            &requests,
+            progress,
+        )
     }
 }
 /// Replay of the tuning search against recorded surveys (development).

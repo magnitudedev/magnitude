@@ -2453,6 +2453,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnitude-kernel-formation"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "magnitude-kernels",
+ "magnitude-service-server",
+ "postcard",
+ "seismic",
+ "serde",
+ "sha2 0.10.9",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "magnitude-kernels"
 version = "0.1.0"
 dependencies = [
@@ -2560,7 +2576,6 @@ dependencies = [
  "libc",
  "magnitude-engine",
  "magnitude-executor",
- "magnitude-kernels",
  "magnitude-service-api",
  "magnitude-service-contracts",
  "magnitude-service-models",
@@ -4137,6 +4152,7 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
+ "serde",
  "sha2 0.11.0",
 ]
 
@@ -4153,6 +4169,7 @@ version = "0.1.0"
 dependencies = [
  "seismic-ir",
  "seismic-lang",
+ "serde",
 ]
 
 [[package]]
@@ -4211,6 +4228,7 @@ dependencies = [
  "glslang",
  "seismic-compiler",
  "seismic-native-target",
+ "serde",
  "spirv-tools",
 ]
 

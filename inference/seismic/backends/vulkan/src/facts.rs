@@ -22,7 +22,7 @@ pub const SUBGROUP_WIDTH: u32 = 32;
 /// The device facts formation reads (§7.2): what the generated prefix
 /// exposes to sources and what the seal pass declares. Two devices with
 /// equal formation facts form every source identically.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FormationFacts {
     /// Lanes of one hardware subgroup: 32, or 64 holding two logical
     /// subgroups.

@@ -32,7 +32,9 @@ impl MetalFamily {
 
 /// The Metal Shading Language version the device's compiler accepts, as
 /// established by a compile probe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum LanguageVersion {
     V2_3,
     V2_4,
