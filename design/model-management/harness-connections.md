@@ -223,6 +223,10 @@ not own this wire-compatibility behavior.
   boundary.
 - **Claude Code:** persist the Magnitude gateway settings and the selected `anthropic-local/`
   model, but no effort default. Its discovery schema limitation requires the Anthropic boundary.
+  Discovery cannot carry a context window either, and Claude Code reads one window for every
+  non-Claude model from `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, so the connection writes the selected
+  local model's window there (the smallest local window when no local model is selected) and sync
+  keeps it current. Disconnect removes it while Claude Code still routes through Magnitude.
   The gateway forwards Claude models upstream with the client's own credential, so a Claude login
   is left in charge whenever Claude Code has one: an OAuth login or Console key in its own storage
   (the macOS Keychain items, `.credentials.json`, or the global config's `primaryApiKey`, honoring

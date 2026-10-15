@@ -1340,6 +1340,7 @@ describe("HarnessConnection model-set behavior", () => {
           ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
           ANTHROPIC_API_KEY: "",
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "32768",
         },
       })
       expect(readYaml(yield* fs.readFileString(paths.ompModels))).toMatchObject({
@@ -1873,8 +1874,31 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
         theme: "dark",
         model: anthropicLocalModelId(model),
-        env: { USER_KEY: "preserve", ANTHROPIC_BASE_URL: "https://user-gateway.example" },
+        env: { USER_KEY: "preserve", ANTHROPIC_BASE_URL: "https://user-gateway.example", CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
       })
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+
+  it("declares the selected local model's context window to Claude Code", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-harness-claude-window-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures(initialFiles(paths))
+      const service = yield* installedService(paths)
+      const id = HarnessIdSchema.make("claude-code")
+      const window = Effect.map(fs.readFileString(paths.claude), (source) =>
+        (readJson(source) as { env: Record<string, string> }).env.CLAUDE_CODE_MAX_CONTEXT_TOKENS)
+
+      yield* service.connect(id, { model: Option.some(secondModel) })
+      expect(yield* window).toBe("32768")
+      yield* service.connect(id, { model: Option.some(model) })
+      expect(yield* window).toBe("50000")
+      yield* service.sync(id)
+      expect(yield* window).toBe("50000")
+
+      yield* service.disconnect(id)
+      expect(readJson(yield* fs.readFileString(paths.claude))).toEqual(readJson(initialFiles(paths)[paths.claude]!))
     }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
   })
 
@@ -1900,6 +1924,7 @@ describe("HarnessConnection model-set behavior", () => {
           ANTHROPIC_AUTH_TOKEN: CLAUDE_AUTH_TOKEN_PLACEHOLDER,
           ANTHROPIC_API_KEY: "",
           CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000",
         },
       })
       expect(yield* claudeInspection(service)).toBe("Connected")
@@ -1933,7 +1958,7 @@ describe("HarnessConnection model-set behavior", () => {
         expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
           theme: "dark",
           model: anthropicLocalModelId(model),
-          env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY },
+          env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
         })
         expect(yield* claudeInspection(service)).toBe("Connected")
 
@@ -1978,7 +2003,7 @@ describe("HarnessConnection model-set behavior", () => {
       expect(readJson(yield* fs.readFileString(paths.claude))).toEqual({
         theme: "dark",
         model: anthropicLocalModelId(model),
-        env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY },
+        env: { ANTHROPIC_BASE_URL, CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY, CLAUDE_CODE_MAX_CONTEXT_TOKENS: "50000" },
       })
       expect(yield* claudeInspection(service)).toBe("Connected")
 

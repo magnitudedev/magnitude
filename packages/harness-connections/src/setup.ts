@@ -144,6 +144,7 @@ const plan = (target: HarnessSetupTarget): SetupPlan => {
             ANTHROPIC_BASE_URL: endpoints.anthropic,
             ...(Option.isSome(target.key) ? { ANTHROPIC_AUTH_TOKEN: target.key.value } : {}),
             CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: CLAUDE_GATEWAY_DISCOVERY,
+            CLAUDE_CODE_MAX_CONTEXT_TOKENS: String(model.contextWindow),
           },
           model: anthropicLocalModelId(model.id),
         } }],
