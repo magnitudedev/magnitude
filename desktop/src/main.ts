@@ -51,6 +51,7 @@ import { resolveHarnessEnvironment } from "@magnitudedev/harness-connections"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { MAGNITUDE_VERSION } from "@magnitudedev/version"
 import { desktopLogLayer } from "./desktop-log"
+import { presentWindow } from "./window-presentation"
 
 app.setName("Magnitude")
 if (process.platform === "win32") app.setAppUserModelId(WINDOWS_APPLICATION_ID)
@@ -296,11 +297,7 @@ const program = Effect.scoped(Effect.gen(function* () {
     wantsWindow = true
     if (!window) return
     const reload = yield* rendererRecovery.open
-    yield* Effect.sync(() => {
-      if (window.isMinimized()) window.restore()
-      window.show()
-      window.focus()
-    })
+    yield* presentWindow(process.platform, window)
     if (reload) yield* loadRenderer()
     // Raising the retained window must preserve the renderer's current page.
     if (page !== undefined) yield* PubSub.publish(actions, { _tag: "Navigate", page })
