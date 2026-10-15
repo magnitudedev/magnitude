@@ -54,13 +54,17 @@ export const startWindowsUpdateHandoff = (request: WindowsUpdateHandoffRequest) 
     return Effect.sync(() => { helper.kill(); helper.stdin!.destroy(); helper.stdout!.destroy() })
   })), Effect.timeoutFail({ duration: "10 seconds", onTimeout: failed }))
 
-/** Per-user installation needs no elevation. Installer exit, not spawn, is the completion boundary. */
+/**
+ * Per-user installation needs no elevation. Installer exit, not spawn, is the completion boundary.
+ * An update Desktop continues after is one the person started, so setup shows its progress banner.
+ */
 export const completeWindowsUpdateHandoff = (request: WindowsUpdateHandoffRequest) => Effect.gen(function* () {
   if (process.platform !== "win32" || win32.resolve(process.execPath) !== win32.join(request.helperDirectory, "magnitude.exe")) {
     return yield* failed()
   }
   const executor = yield* CommandExecutor.CommandExecutor
-  const result = yield* executor.exitCode(Command.make(win32.join(request.dataDirectory, "updates", "magnitude-setup.exe"), "/S")
+  const result = yield* executor.exitCode(Command.make(win32.join(request.dataDirectory, "updates", "magnitude-setup.exe"), "/S",
+    ...(request.continuation._tag === "Desktop" ? ["/PROGRESS"] : []))
     .pipe(Command.workingDirectory(request.helperDirectory))).pipe(Effect.either)
   const error = result._tag === "Left" ? Option.some("The application update installer could not be started.")
     : result.right === 0 ? Option.none<string>()

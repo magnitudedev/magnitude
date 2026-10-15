@@ -202,9 +202,15 @@ This allows connections on networks Windows treats as private. If the server's n
 
 5. Download a model. Models download through the running server, so do this once the service is running: use the commands in [Download a model](#download-a-model) on the server, or the browser app from your laptop.
 
-The service keeps running when you or another user log off. Don't open the desktop app while it runs: the app can't serve until you stop the service, and says so. To install an update, stop the service (`nssm stop Magnitude`), run `magnitude update install`, then start it again. To remove the service, stop it first, then remove it; a running service keeps serving, including on the network, until it stops:
+The service keeps running when you or another user log off. Avoid opening the desktop app as the service's account while the service runs: the app takes over, the service stops serving (its log says `The desktop app was opened and is taking over`), and the app serves with its own settings instead. NSSM's restarts of the service fail while the app runs, so NSSM pauses the service. After you quit the app from its tray menu, NSSM starts the service again by itself within about a minute; run `nssm restart Magnitude` to bring it back at once. To install an update, stop the service (`nssm stop Magnitude`), run `magnitude update install`, then start it again. To remove the service, stop it first, then remove it; a running service keeps serving, including on the network, until it stops:
 
 ```powershell
 nssm stop Magnitude
 nssm remove Magnitude confirm
+```
+
+If you added the firewall rule in step 4, remove it too:
+
+```powershell
+Remove-NetFirewallRule -DisplayName "Magnitude"
 ```

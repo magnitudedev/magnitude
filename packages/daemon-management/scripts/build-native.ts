@@ -1,6 +1,6 @@
 import { createRequire } from "node:module"
 import { spawn } from "node:child_process"
-import { existsSync, mkdirSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync } from "node:fs"
 import { resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Effect, Schema } from "effect"
@@ -25,9 +25,15 @@ const build = Effect.gen(function* () {
     if (process.arch !== "x64" || !library || !existsSync(library)) {
       return yield* new NativeBuildFailed({ message: "Windows x64 native build requires Visual Studio C++ tools and MAGNITUDE_NODE_LIBRARY pointing to a verified x64 node.lib" })
     }
+    // Read when building because release builds stamp the generated version before compiling.
+    const version = yield* Effect.try({
+      try: () => /export const MAGNITUDE_VERSION = "([0-9]+\.[0-9]+\.[0-9]+)/.exec(readFileSync(resolve(root, "../version/src/version.generated.ts"), "utf8"))?.[1],
+      catch: error => new NativeBuildFailed({ message: `Cannot read the generated Magnitude version: ${String(error)}` }),
+    })
+    if (!version) return yield* new NativeBuildFailed({ message: "The generated Magnitude version has no numeric release version" })
     for (const args of [
       [resolve(root, "scripts/build-windows-native.ps1"), "-Headers", headers, "-NodeLibrary", library, "-Output", output],
-      [resolve(root, "scripts/build-windows-cli-launcher.ps1"), "-Output", resolve(output, "..", "magnitude-launcher.exe")],
+      [resolve(root, "scripts/build-windows-cli-launcher.ps1"), "-Output", resolve(output, "..", "magnitude-launcher.exe"), "-Version", version],
     ]) yield* Effect.async<void, NativeBuildFailed>(resume => {
       const child = spawn("pwsh", ["-NoProfile", "-File", ...args], { stdio: "inherit" })
       child.once("error", error => resume(Effect.fail(new NativeBuildFailed({ message: error.message }))))

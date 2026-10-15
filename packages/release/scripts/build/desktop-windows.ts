@@ -81,7 +81,7 @@ export const renderWindowsInstaller = (template: string, input: typeof WindowsIn
   for (const token of Object.keys(replacements)) {
     if (template.split(token).length !== 2) return yield* new DesktopBuildFailed({ message: `Installer template must contain exactly one ${token}` })
   }
-  const metadata = `VIProductVersion "${versionParts.join(".")}.${options.revision}"\nVIAddVersionKey "ProductName" "Magnitude"\nVIAddVersionKey "CompanyName" "Magnitude"\nVIAddVersionKey "FileDescription" "Magnitude Setup"\nVIAddVersionKey "FileVersion" "${quote(options.version)}"\nVIAddVersionKey "ProductVersion" "${quote(options.version)}"`
+  const metadata = `VIProductVersion "${versionParts.join(".")}.${options.revision}"\nVIAddVersionKey "ProductName" "Magnitude"\nVIAddVersionKey "CompanyName" "Magnitude AI Inc."\nVIAddVersionKey "FileDescription" "Magnitude Setup"\nVIAddVersionKey "FileVersion" "${quote(options.version)}"\nVIAddVersionKey "ProductVersion" "${quote(options.version)}"`
   return `${prefix}\n${metadata}\n${template.replace(/@(?:PAYLOAD_FILES|REMOVE_FILES|REMOVE_DIRECTORIES)@/g, token => replacements[token]!)}`
 })
 

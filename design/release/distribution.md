@@ -147,6 +147,9 @@ an independent service. The PowerShell bootstrap authenticates a publisher-signe
 before using its embedded publisher key to verify the installer release and bytes. It separately
 authenticates the installer, waits for silent setup, and refreshes command PATH in the invoking shell.
 Both executable signatures require the configured publisher and a timestamp. Fresh installation publishes a complete staged payload by same-volume rename.
+Every setup or uninstall refusal is also appended to `%TEMP%\magnitude-install.log`, because silent
+setup shows no message; an installation folder carrying permission entries setup didn't create is
+named as such rather than as an unverifiable installation.
 A private installer-owned scratch container permits recovery after interrupted extraction; cleanup
 is relative to retained handles and cannot follow directory redirections. Existing unsafe scratch
 permissions are rejected without repair. The installed uninstaller is the sole removal record and
