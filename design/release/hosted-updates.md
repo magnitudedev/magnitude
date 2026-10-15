@@ -22,7 +22,9 @@ and relaunch; preparation itself never restarts the application or its service. 
 separates authorization permission from continuation: Desktop retains its visibility choice, while
 Caller leaves continuation to the invoking foreground or finite command. Helpers must never launch
 Desktop for Caller intent. Handoff admission is distinct from completed installation; the caller
-must verify replacement before continuing startup.
+must verify replacement before continuing startup. On Windows, setup runs silently; for Desktop
+continuation it also shows a small "Updating Magnitude" banner until it exits, since the window is
+already gone and the replacement takes about a minute.
 
 One schedule belongs to each owner. Manual checks reset its deadline; resume wakes the same timer.
 Automatic-download preference changes are persisted before they affect transfers. Disabling automatic

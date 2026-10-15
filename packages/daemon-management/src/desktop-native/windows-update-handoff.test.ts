@@ -23,6 +23,21 @@ const request: WindowsUpdateHandoffRequest = {
   dataDirectory: "C:\\Users\\tester\\.magnitude", continuation: { _tag: "Desktop", showWindow: false },
   release: Schema.decodeUnknownSync(UpdateRelease)({ version: "2.0.0", bytes: 1, sha256: "a".repeat(64), signature: "A".repeat(86) + "==" }),
 }
+it("shows setup's progress banner only for an update Desktop continues after", async () => {
+  vi.stubGlobal("process", { ...process, platform: "win32", execPath: `${request.helperDirectory}\\magnitude.exe` })
+  const executor = CommandExecutor.makeExecutor(() => Effect.die("Unexpected process"))
+  for (const [continuation, args] of [[request.continuation, ["/S", "/PROGRESS"]], [{ _tag: "Caller" as const }, ["/S"]]] as const) {
+    let seen: ReadonlyArray<string> = []
+    await Effect.runPromise(completeWindowsUpdateHandoff({ ...request, continuation }).pipe(
+      Effect.provideService(CommandExecutor.CommandExecutor, { ...executor, exitCode: command => Effect.sync(() => {
+        seen = command._tag === "StandardCommand" ? command.args : []
+        return CommandExecutor.ExitCode(0)
+      }) }),
+      Effect.provide(unixPrivateFilePermissions.pipe(Layer.provideMerge(BunContext.layer))),
+    ))
+    expect(seen).toEqual(args)
+  }
+})
 it("leaves caller continuation to the invoking command without launching Desktop", async () => {
   await Effect.runPromise(relaunchWindowsAfterUpdate({ ...request, continuation: { _tag: "Caller" } }))
   expect(spawn).not.toHaveBeenCalled()
@@ -84,7 +99,7 @@ describe("Windows update handoff", () => {
     await Effect.runPromise(completeWindowsUpdateHandoff(attempt).pipe(
       Effect.provideService(CommandExecutor.CommandExecutor, { ...executor, exitCode: command => Effect.sync(() => {
         expect(command._tag === "StandardCommand" && command.command).toBe(`${directory.replaceAll("/", "\\")}\\updates\\magnitude-setup.exe`)
-        expect(command._tag === "StandardCommand" && command.args).toEqual(["/S"])
+        expect(command._tag === "StandardCommand" && command.args).toEqual(["/S", "/PROGRESS"])
         events.push("installer exited")
         return CommandExecutor.ExitCode(code)
       }) }),

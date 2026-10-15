@@ -53,6 +53,13 @@ Function .onInit
   SetShellVarContext current
   StrCpy $INSTDIR "$LOCALAPPDATA\Programs\Magnitude"
   !insertmacro Lease "run setup"
+  ; Silent setup shows nothing, so an update the person started shows a banner until setup exits.
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/PROGRESS" $R1
+  ${IfNot} ${Errors}
+    Banner::show /set 76 "Updating Magnitude" "This takes about a minute."
+  ${EndIf}
   StrCpy $PreviousVersion ""
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::ReadInstallationVersion(w "$INSTDIR", w "${REGKEY}", w .r8, i 1024) i .r0'
   ${If} $0 == 0
@@ -100,7 +107,11 @@ Function CleanupStage
 done:
 FunctionEnd
 Function .onInstFailed
+  Banner::destroy
   Call CleanupStage
+FunctionEnd
+Function .onInstSuccess
+  Banner::destroy
 FunctionEnd
 Section "Magnitude"
   System::Call '$PLUGINSDIR\MagnitudeInstallGuard.dll::CreateStage(w .r9, i 1024) i .r0'
