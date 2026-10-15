@@ -1,4 +1,4 @@
-import { Effect, Option, Schema } from "effect"
+import { Data, Effect, Option, Schema } from "effect"
 import { ApplicationUpdateAction, type ApplicationUpdateState } from "@magnitudedev/sdk/desktop-host"
 import { formatStorageSize } from "@magnitudedev/client-common"
 import { updateApplication } from "../server/application"
@@ -43,9 +43,27 @@ export const awaitUpdateCheck = <A extends { readonly state: ApplicationUpdateSt
     Effect.repeat({ until: result => result.state.check._tag !== "Checking" }),
     Effect.timeout("2 minutes"), Effect.catchTag("TimeoutException", () => Effect.succeed(started)))
 
+class UpdateCheckFailed extends Data.TaggedError("UpdateCheckFailed")<{ readonly message: string }> {}
+
+/** A check's failure, when nothing else about the update is shown in its place. */
+const failedUpdateCheck = (state: ApplicationUpdateState): Option.Option<string> =>
+  state.transfer._tag === "Idle" && state.check._tag === "Failed" ? Option.some(state.check.message) : Option.none()
+
+/** Runs an update action through `update`; a check that failed fails the command. */
+export const performUpdate = <A extends { readonly state: ApplicationUpdateState }, E, R>(
+  action: ApplicationUpdateAction,
+  update: (action: ApplicationUpdateAction) => Effect.Effect<A, E, R>,
+): Effect.Effect<A & { readonly installed: boolean }, E | UpdateCheckFailed, R> => {
+  const performed = update(action).pipe(
+    Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, update("status")) : Effect.succeed(result)),
+    Effect.map(result => ({ ...result, installed: action === "install" })))
+  return performed.pipe(Effect.tap(result => Option.match(action === "check" ? failedUpdateCheck(result.state) : Option.none(), {
+    onNone: () => Effect.void, onSome: message => new UpdateCheckFailed({ message }),
+  })))
+}
+
 export const runUpdate = (input: string) => runCommand({
-  effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => updateApplication(action).pipe(
-    Effect.flatMap(result => action === "check" ? awaitUpdateCheck(result, updateApplication("status")) : Effect.succeed(result)),
+  effect: Schema.decodeUnknown(ApplicationUpdateAction)(input).pipe(Effect.flatMap(action => performUpdate(action, updateApplication).pipe(
     Effect.flatMap(result => (result.owner === "Headless" ? isServerSetUp : Effect.succeed(false)).pipe(Effect.map(server => ({ action, server, ...result }))))))),
-  render: ({ action, state, owner, server }) => action === "install" ? owner === "None" ? "The Magnitude update was installed.\n" : "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner, server),
+  render: ({ action, state, owner, server, installed }) => installed ? owner === "None" ? "The Magnitude update was installed.\n" : "Magnitude is stopping its model and service to install the update and restart.\n" : action === "discard" ? "The prepared update was discarded.\n" : renderApplicationUpdate(state, owner, server),
 })
