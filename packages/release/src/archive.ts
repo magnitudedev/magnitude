@@ -7,7 +7,7 @@ import { createGunzip } from "node:zlib"
 import { extract } from "tar-stream"
 import { Context, Effect, Either, Layer, Option, Runtime } from "effect"
 import type { ReleaseArtifact } from "./contracts"
-import { ReleaseAcquisitionError } from "./errors"
+import { ReleaseAcquisitionError, ReleaseDiskFullError } from "./errors"
 import type { ArtifactByteProgress } from "./installation-progress"
 import { MACOS_APP_NAME, MACOS_REQUIRED_FILES } from "./macos-app"
 import { ACN_EXECUTABLE_NAME } from "./executables"
@@ -25,7 +25,7 @@ export interface ArchiveExtractorService {
     onProgress: Option.Option<
       (progress: ArtifactByteProgress) => Effect.Effect<void>
     >,
-  ) => Effect.Effect<void, ReleaseAcquisitionError>
+  ) => Effect.Effect<void, ReleaseAcquisitionError | ReleaseDiskFullError>
 }
 
 export class ArchiveExtractor extends Context.Tag("@magnitudedev/release/ArchiveExtractor")<
@@ -39,6 +39,9 @@ const archiveError = (message: string) =>
     message,
     transient: false,
   })
+
+const isDiskFull = (cause: unknown): boolean =>
+  cause instanceof Error && "code" in cause && (cause.code === "ENOSPC" || cause.code === "EDQUOT")
 
 const safePath = (
   value: string,
@@ -107,11 +110,11 @@ const extractWithNodeStreams = (
   onProgress: Option.Option<
     (progress: ArtifactByteProgress) => Effect.Effect<void>
   >,
-): Effect.Effect<void, ReleaseAcquisitionError> =>
+): Effect.Effect<void, ReleaseAcquisitionError | ReleaseDiskFullError> =>
   Effect.gen(function* () {
     if (artifact.kind === "desktop") return yield* archiveError("Install the desktop application with its platform installer; it is not a runtime archive")
     const runtime = yield* Effect.runtime<never>()
-    return yield* Effect.async<void, ReleaseAcquisitionError>((resume) => {
+    return yield* Effect.async<void, ReleaseAcquisitionError | ReleaseDiskFullError>((resume) => {
       const reader = extract()
       const source = createReadStream(archive)
       let compressed = 0
@@ -186,13 +189,15 @@ const extractWithNodeStreams = (
           }))
           await chmod(output, (header.mode ?? 0o644) & 0o777)
           next()
-        })().catch((cause) => fail(new Error(String(cause))))
+        })().catch((cause) => fail(cause instanceof Error ? cause : new Error(String(cause))))
       })
       pipeline(source, reportProgress, gunzip, reader)
         .then(() => resume(validateLayout(artifact, paths)))
         .catch((cause) =>
           resume(Effect.fail(
-            archiveError(`archive extraction failed: ${String(cause)}`),
+            isDiskFull(cause)
+              ? new ReleaseDiskFullError({ directory: destination, requiredBytes: Option.none(), availableBytes: Option.none() })
+              : archiveError(`archive extraction failed: ${String(cause)}`),
           ))
         )
       return Effect.sync(() => {

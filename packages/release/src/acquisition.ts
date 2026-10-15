@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import { statfs } from "node:fs/promises"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as HttpClient from "@effect/platform/HttpClient"
 import * as HttpClientRequest from "@effect/platform/HttpClientRequest"
@@ -10,7 +11,7 @@ import {
   downloadArtifact as downloadReleaseArtifact,
 } from "./artifact-download"
 import type { ArtifactInstallationObserver } from "./installation-progress"
-import { ReleaseAcquisitionError } from "./errors"
+import { ReleaseAcquisitionError, ReleaseDiskFullError } from "./errors"
 import {
   decodeReleaseManifest,
   releaseTag,
@@ -283,6 +284,76 @@ export const releaseBundleSizes = (
     }
   })
 
+const freeBytes = (directory: string): Effect.Effect<Option.Option<number>> =>
+  Effect.tryPromise(() => statfs(directory)).pipe(
+    Effect.map((stats) => Option.some(stats.bavail * stats.bsize)),
+    Effect.orElseSucceed(() => Option.none<number>())
+  )
+
+/** A gzip archive records its expanded size, modulo 2^32, in its last four bytes. */
+const gzipTrailerSize = (trailer: Uint8Array): Option.Option<number> =>
+  trailer.byteLength === 4
+    ? Option.some(new DataView(trailer.buffer, trailer.byteOffset, 4).getUint32(0, true))
+    : Option.none()
+
+const localExpandedBytes = (
+  archive: string,
+  bytes: number
+): Effect.Effect<Option.Option<number>, never, FileSystem.FileSystem> =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const file = yield* fs.open(archive, { flag: "r" })
+      yield* file.seek(bytes - 4, "start")
+      const trailer = new Uint8Array(4)
+      const read = yield* file.read(trailer)
+      return read === BigInt(4) ? gzipTrailerSize(trailer) : Option.none<number>()
+    })
+  ).pipe(Effect.orElseSucceed(() => Option.none<number>()))
+
+/** Reads the archive's gzip trailer with one range request, so the space check precedes the download. */
+const remoteExpandedBytes = (
+  url: string,
+  bytes: number
+): Effect.Effect<Option.Option<number>, never, HttpClient.HttpClient> =>
+  Effect.gen(function* () {
+    const client = yield* HttpClient.HttpClient
+    const response = yield* client.execute(
+      HttpClientRequest.get(url).pipe(
+        HttpClientRequest.setHeader("range", `bytes=${bytes - 4}-${bytes - 1}`)
+      )
+    )
+    if (response.status !== 206 || response.headers["content-range"] !== `bytes ${bytes - 4}-${bytes - 1}/${bytes}`)
+      return Option.none<number>()
+    return gzipTrailerSize(new Uint8Array(yield* response.arrayBuffer))
+  }).pipe(
+    Effect.scoped,
+    Effect.timeout("15 seconds"),
+    Effect.orElseSucceed(() => Option.none<number>())
+  )
+
+/**
+ * Fails when the disk can't hold `neededBytes` more. `reclaimedBytes` is space this installation
+ * already holds and releases on failure, so the reported free space is what the person will see.
+ */
+const requireFreeSpace = (
+  directory: string,
+  neededBytes: number,
+  requiredBytes: Option.Option<number>,
+  reclaimedBytes: number
+): Effect.Effect<void, ReleaseDiskFullError> =>
+  freeBytes(directory).pipe(
+    Effect.flatMap((free) =>
+      Option.isSome(free) && free.value < neededBytes
+        ? Effect.fail(new ReleaseDiskFullError({
+            directory,
+            requiredBytes,
+            availableBytes: Option.some(free.value + reclaimedBytes),
+          }))
+        : Effect.void
+    )
+  )
+
 export const installArtifact = (
   baseUrl: string,
   version: string,
@@ -291,7 +362,7 @@ export const installArtifact = (
   options: InstallArtifactOptions = NoArtifactInstallationObserver
 ): Effect.Effect<
   string,
-  ReleaseAcquisitionError,
+  ReleaseAcquisitionError | ReleaseDiskFullError,
   FileSystem.FileSystem | Path.Path | HttpClient.HttpClient | ArchiveExtractor
 > =>
   Effect.scoped(
@@ -321,8 +392,18 @@ export const installArtifact = (
           )
         )
       const archive = path.join(downloadDirectory, "artifact")
+      const url = releaseUrl(baseUrl, version, artifact.filename)
+      const announced = artifact.bytes > 4
+        ? yield* remoteExpandedBytes(url, artifact.bytes)
+        : Option.none<number>()
+      yield* requireFreeSpace(
+        parent,
+        artifact.bytes + Option.getOrElse(announced, () => 0),
+        Option.map(announced, (expanded) => artifact.bytes + expanded),
+        0
+      )
       yield* downloadReleaseArtifact({
-        url: releaseUrl(baseUrl, version, artifact.filename),
+        url,
         destination: archive,
         bytes: artifact.bytes,
         sha256: artifact.sha256,
@@ -351,6 +432,12 @@ export const installArtifact = (
           failure("download", error.message, error.transient)
         )
       )
+      const expanded = artifact.bytes > 4
+        ? yield* localExpandedBytes(archive, artifact.bytes)
+        : Option.none<number>()
+      if (Option.isSome(expanded)) {
+        yield* requireFreeSpace(parent, expanded.value, Option.some(artifact.bytes + expanded.value), artifact.bytes)
+      }
       const staging = yield* fs
         .makeTempDirectory({
           directory: parent,
@@ -390,6 +477,13 @@ export const installArtifact = (
           fs
             .remove(staging, { recursive: true, force: true })
             .pipe(Effect.catchAll(() => Effect.void))
+        ),
+        Effect.catchTag("ReleaseDiskFullError", () =>
+          Effect.fail(new ReleaseDiskFullError({
+            directory: parent,
+            requiredBytes: Option.map(expanded, (bytes) => artifact.bytes + bytes),
+            availableBytes: Option.none(),
+          }))
         )
       )
       return destination

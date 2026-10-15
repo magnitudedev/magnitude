@@ -31,6 +31,12 @@ These responsibilities do not overlap.
 - Downloads and extraction are bounded. Range responses must identify the exact requested bytes and
   one consistent representation; unsupported ranges fall back to bounded sequential transfer.
 - Archives accept regular files only at validated relative paths.
+- An installation needs room for its archive and its expanded files. Before download the disk is
+  checked for the archive plus the expanded size its gzip trailer records, read with one range
+  request when the host allows it, and before extraction again against the downloaded trailer. A
+  disk short of that space, or one that fills during extraction, fails as disk full with the
+  directory, the bytes the whole installation needs when known, and the bytes free, never as a
+  generic archive error.
 - Installations are addressed by artifact digest and published atomically only after acquisition
   integrity and executable identity are verified. Published cache entries are trusted on subsequent
   launches; a missing executable is a cache miss.
