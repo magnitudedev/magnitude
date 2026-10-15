@@ -45,18 +45,30 @@ interface ServerFailing {
   readonly lastError: Option.Option<string>
 }
 
-const readServerFailing = Effect.gen(function* () {
+/**
+ * What systemd says of a system service that isn't serving yet: failing, or started and not ready
+ * yet. systemd marks a simple unit active as soon as its process runs, before it serves.
+ */
+interface ServerUnit {
+  readonly failing: Option.Option<ServerFailing>
+  readonly starting: boolean
+}
+
+const readServerUnit = Effect.gen(function* () {
   const executor = yield* CommandExecutor.CommandExecutor
   const output = (command: string, ...args: string[]) => executor.string(Command.make(command, ...args)).pipe(
     Effect.timeout("3 seconds"), Effect.orElseSucceed(() => ""))
   const unit = new Map((yield* output("/usr/bin/systemctl", "show", "magnitude.service", "--property=NRestarts,Result,ActiveState"))
     .split("\n").map(line => line.split("=", 2) as [string, string | undefined]))
   const restarts = Number(unit.get("NRestarts"))
+  const active = unit.get("ActiveState")
   // An administrator's stop leaves the restart count but a successful result.
-  const failed = (unit.get("Result") ?? "success") !== "success" || (restarts > 0 && unit.get("ActiveState") !== "inactive")
-  if (!Number.isInteger(restarts) || !failed) return Option.none<ServerFailing>()
+  const failed = (unit.get("Result") ?? "success") !== "success" || (restarts > 0 && active !== "inactive")
+  if (!Number.isInteger(restarts) || !failed) {
+    return { failing: Option.none(), starting: active === "active" || active === "activating" || active === "reloading" } satisfies ServerUnit
+  }
   const journal = yield* output("/usr/bin/journalctl", "-u", "magnitude.service", "-n", "300", "-o", "cat", "--no-pager", "--quiet")
-  return Option.some({ restarts, lastError: serviceFailureLine(journal.split("\n")) })
+  return { failing: Option.some({ restarts, lastError: serviceFailureLine(journal.split("\n")) }), starting: false } satisfies ServerUnit
 }).pipe(Effect.provide(BunContext.layer))
 
 /** The uid that owns the socket listening on a loopback or wildcard address at `port`, from `/proc/net/tcp` or `tcp6`. */
@@ -144,10 +156,11 @@ const ownStatus = desktopApplication.observe.pipe(
     const reach = state?._tag === "Ready" ? Effect.all([applicationDataDirectory, isServerSetUp]).pipe(
       Effect.flatMap(([dataDirectory, service]) => readServerReach({ endpoint: desktopServiceOrigin, dataDirectory, service })), Effect.option)
       : Effect.succeed(Option.none<ServerReach>())
-    const failing = (server: boolean) => server && process.platform === "linux" && state?._tag !== "Ready" ? readServerFailing : Effect.succeed(Option.none<ServerFailing>())
+    const unit = (server: boolean) => server && process.platform === "linux" && state?._tag !== "Ready" ? readServerUnit
+      : Effect.succeed<ServerUnit>({ failing: Option.none(), starting: false })
     const loaded = (server: boolean) => server && process.platform === "darwin" && Option.isNone(snapshot) ? readMacServerLoaded : Effect.succeed(Option.none<boolean>())
-    return Effect.all({ model: activeModel, reach, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), failing: failing(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, server: { server, failing, loaded } }): ServiceStatusPresentation => ({
-      status: state?._tag ?? "Stopped", address: serviceAddress,
+    return Effect.all({ model: activeModel, reach, server: isServerSetUp.pipe(Effect.flatMap(server => Effect.all({ server: Effect.succeed(server), unit: unit(server), loaded: loaded(server) }))), login: Option.isSome(snapshot) && snapshot.value.owner._tag === "Desktop" ? readDesktopLoginStartup.pipe(Effect.map(state => state._tag === "Enabled" ? Option.some(true) : state._tag === "Disabled" ? Option.some(false) : Option.none<boolean>()), Effect.orElseSucceed(() => Option.none<boolean>())) : Effect.succeed(Option.none<boolean>()) }, { concurrency: "unbounded" }).pipe(Effect.map(({ model, login, reach, server: { server, unit: { failing, starting }, loaded } }): ServiceStatusPresentation => ({
+      status: state?._tag ?? (starting ? "Starting" : "Stopped"), address: serviceAddress,
       version: state?._tag === "Ready" ? Option.some(String(state.health.version)) : Option.none(),
       startsAutomaticallyOnLogin: login, activeModel: model,
       owner: Option.map(snapshot, value => value.owner), reach, server, failing, loaded, elsewhere: Option.none(),
@@ -164,9 +177,9 @@ const publicServiceStatus = ownStatus.pipe(Effect.flatMap(status => Option.isSom
     }),
   })))))
 
-/** Where the system service is set up, a Headless owner is that service rather than someone's `serve`. */
+/** Where the system service is set up, it owns the service, observed or not, rather than someone's `serve`. */
 const ownerName = (status: ServiceStatusPresentation) => Option.match(status.owner, {
-  onNone: () => Option.match(status.elsewhere, { onNone: () => "None",
+  onNone: () => Option.match(status.elsewhere, { onNone: () => status.server ? "Server" : "None",
     onSome: other => other._tag === "OtherAccount" ? `Another account (${other.account})` : "Not this profile" }), onSome: owner => owner._tag === "Headless" && status.server ? "Server" : owner._tag })
 
 /** With network access active the service also listens on all interfaces or its configured address, as ACN resolves it. */
@@ -206,9 +219,9 @@ export const renderStatus =(status: ServiceStatusPresentation, platform: NodeJS.
       `The Magnitude server keeps stopping as it starts (restarted ${failing.restarts} ${failing.restarts === 1 ? "time" : "times"}).`,
       ...Option.match(failing.lastError, { onNone: () => [], onSome: line => [`Its last error: ${line}`] }),
       `See its log: ${serverLogs(platform)}`],
-    onNone: () => Option.isNone(status.owner) && Option.isNone(status.elsewhere) ? [
-      "", "Not running", status.server ? serverNotRunning(platform, status.loaded) : "Open the Magnitude desktop app or run `magnitude serve`.",
-    ] : [],
+    onNone: () => Option.isSome(status.owner) || Option.isSome(status.elsewhere) ? []
+      : status.server && status.status === "Starting" ? ["", "Starting", "The Magnitude server is starting. Run `magnitude status` again in a moment."]
+      : ["", "Not running", status.server ? serverNotRunning(platform, status.loaded) : "Open the Magnitude desktop app or run `magnitude serve`."],
   }),
   "",
 ].join("\n")

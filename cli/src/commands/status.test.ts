@@ -70,6 +70,16 @@ describe("Magnitude service definitions", () => {
     expect(output).not.toMatch(/desktop app|magnitude serve/)
   })
 
+  it("calls a set-up server the owner and says it is starting while systemd starts it", () => {
+    const base = { address: "127.0.0.1:10100", version: Option.none(), startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" } as const,
+      owner: Option.none(), reach: Option.none(), server: true, failing: Option.none(), loaded: Option.none(), elsewhere: Option.none() }
+    const starting = renderStatus({ ...base, status: "Starting" }, "linux")
+    expect(starting).toContain("Runtime         Starting\n  Owner           Server\n")
+    expect(starting).toContain("Starting\nThe Magnitude server is starting. Run `magnitude status` again in a moment.\n")
+    expect(starting).not.toMatch(/Not running|systemctl start/)
+    expect(renderStatus({ ...base, status: "Stopped" }, "linux")).toContain("Runtime         Stopped\n  Owner           Server\n")
+  })
+
   it("says a server systemd keeps restarting keeps failing, with its last error and log, instead of how to start it", () => {
     const output = renderStatus({ status: "Stopped", address: "127.0.0.1:10100", version: Option.none(),
       startsAutomaticallyOnLogin: Option.none(), activeModel: { _tag: "Unavailable" }, owner: Option.none(), reach: Option.none(), server: true,
