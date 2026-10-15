@@ -4,43 +4,38 @@
 //!
 //!   magnitude-kernel-formation <vulkan|cuda|metal> --ledger <path> --catalog <bundle>
 //!
-//! Formation runs in worker processes admitted by measured memory, through a
-//! ledger of what earlier runs established ([`pool`], [`ledger`]). Coverage
-//! whose sources and toolchain match a complete coverage run reports that run
-//! and searches nothing; catalog requests are always enumerated, and those
-//! the ledger holds are recalled. Any failure, unreached group, unformed form
-//! value, configuration this host cannot form, or catalog request that does
-//! not form fails the run.
+//! Formation goes through a ledger of what earlier runs established
+//! ([`forming`], [`ledger`]). Coverage whose sources and toolchain match a
+//! complete coverage run reports that run and searches nothing; catalog
+//! requests are always enumerated, and those the ledger holds are recalled.
+//! Any failure, unreached group, unformed form value, configuration this host
+//! cannot form, or catalog request that does not form fails the run.
 
+mod forming;
 mod ledger;
-mod pool;
-mod worker;
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
+use forming::Ledgered;
 use ledger::{Key, Ledger};
 use magnitude_service_server::assessment::catalog_kernels::catalog_kernel_requests;
-use pool::{Pool, WorkerCommand};
 use seismic::BackendName;
 use seismic::coverage::{Progress, Toolchain};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 struct Arguments {
-    /// Serve one formation request on standard input: how the pool starts its workers.
-    #[arg(long, exclusive = true)]
-    worker: bool,
-    #[arg(value_enum, required_unless_present = "worker")]
-    backend: Option<Backend>,
+    #[arg(value_enum)]
+    backend: Backend,
     /// The ledger of what earlier runs established.
-    #[arg(long, required_unless_present = "worker")]
-    ledger: Option<PathBuf>,
+    #[arg(long)]
+    ledger: PathBuf,
     /// The release header bundle the catalog is read from.
-    #[arg(long, required_unless_present = "worker")]
-    catalog: Option<PathBuf>,
+    #[arg(long)]
+    catalog: PathBuf,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -62,16 +57,11 @@ impl From<Backend> for BackendName {
 
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
-    let result = if arguments.worker {
-        worker::serve().map(|()| true)
-    } else {
-        form(
-            arguments.backend.expect("clap requires a backend").into(),
-            &arguments.ledger.expect("clap requires a ledger"),
-            &arguments.catalog.expect("clap requires a catalog"),
-        )
-    };
-    match result {
+    match form(
+        arguments.backend.into(),
+        &arguments.ledger,
+        &arguments.catalog,
+    ) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(error) => {
@@ -82,11 +72,7 @@ fn main() -> ExitCode {
 }
 
 /// Form for `backend`; whether everything formed.
-fn form(
-    backend: BackendName,
-    ledger: &std::path::Path,
-    catalog: &std::path::Path,
-) -> anyhow::Result<bool> {
+fn form(backend: BackendName, ledger: &Path, catalog: &Path) -> anyhow::Result<bool> {
     let name = backend.as_str();
     let toolchain = Toolchain::open(backend).map_err(|error| anyhow::anyhow!("{name}: {error}"))?;
     let ledger = Ledger::open(ledger).with_context(|| format!("opening {}", ledger.display()))?;
@@ -97,18 +83,12 @@ fn form(
         toolchain.identity().as_bytes(),
         env!("KERNEL_FORMATION_SEARCH_SOURCES").as_bytes(),
     ]);
-    let pool = Pool::new(
-        ledger,
-        WorkerCommand {
-            program: std::env::current_exe().context("locating this executable")?,
-            arguments: vec!["--worker".into()],
-        },
-    );
+    let forming = Ledgered::new(ledger);
     let module = magnitude_kernels::module().context("decoding the kernel bundle")?;
     let started = Instant::now();
     let progress = Progress::default();
 
-    let covered = match pool.ledger().completion(&coverage_run) {
+    let covered = match forming.ledger().completion(&coverage_run) {
         Some(summary) => {
             println!("{name}: coverage unchanged since a complete run: {summary}");
             true
@@ -119,14 +99,15 @@ fn form(
                 &format!("{name} coverage"),
                 "entries searched",
                 &progress,
-                &pool,
-                || seismic::coverage::cover(module, &toolchain, &pool, &progress),
+                &forming,
+                || seismic::coverage::cover(module, &toolchain, &forming, &progress),
             )
             .map_err(|error| anyhow::anyhow!("{name} coverage did not run: {error}"))?;
             println!("{name}: {coverage}");
             let covered = coverage.complete() && coverage.unformable.is_empty();
             if covered {
-                pool.ledger()
+                forming
+                    .ledger()
                     .complete(&coverage_run, coverage.to_string().trim());
             }
             covered
@@ -147,8 +128,8 @@ fn form(
         &format!("{name} catalog"),
         "requests formed",
         &progress,
-        &pool,
-        || seismic::coverage::form_requests(module, &toolchain, &pool, &requests, &progress),
+        &forming,
+        || seismic::coverage::form_requests(module, &toolchain, &forming, &requests, &progress),
     );
     let mut failures = 0;
     for (request, result) in catalog.requests.iter().zip(results) {
@@ -160,15 +141,15 @@ fn form(
             );
         }
     }
-    let requested = format!(
-        "formed {} of {} catalog kernel requests",
+    println!(
+        "{name}: formed {} of {} catalog kernel requests; {}",
         requests.len() - failures,
-        requests.len()
+        requests.len(),
+        forming.activity()
     );
-    println!("{name}: {requested}");
-    println!("{name}: {}", pool.report());
 
-    pool.ledger()
+    forming
+        .ledger()
         .compact()
         .context("compacting the formation ledger")?;
     Ok(covered && failures == 0)
@@ -177,20 +158,27 @@ fn form(
 /// How often a running phase reports its progress.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Run `work`, reporting its `progress` in `unit`s and the pool's activity
+/// Run `work`, reporting its `progress` in `unit`s and the formations done
 /// every [`PROGRESS_INTERVAL`] until it returns.
 fn reporting<T>(
     started: &Instant,
     phase: &str,
     unit: &str,
     progress: &Progress,
-    pool: &Pool,
+    forming: &Ledgered,
     work: impl FnOnce() -> T,
 ) -> T {
     std::thread::scope(|scope| {
         let (finished, waiting) = std::sync::mpsc::channel::<()>();
         scope.spawn(move || {
             while let Err(RecvTimeoutError::Timeout) = waiting.recv_timeout(PROGRESS_INTERVAL) {
+                // glibc keeps memory freed by the search's short-lived worker
+                // threads in their arenas; on a long run that grows into
+                // gigabytes the process does not use. Return it.
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                unsafe {
+                    libc::malloc_trim(0);
+                }
                 let (done, total) = (progress.done(), progress.total());
                 let percent = if total == 0 { 0 } else { done * 100 / total };
                 let elapsed = started.elapsed().as_secs();
@@ -198,7 +186,7 @@ fn reporting<T>(
                     "[{:02}:{:02}] {phase}: {done} of {total} {unit} ({percent}%); {}",
                     elapsed / 60,
                     elapsed % 60,
-                    pool.activity()
+                    forming.activity()
                 );
             }
         });

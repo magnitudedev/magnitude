@@ -1,14 +1,14 @@
 //! The formations a search needs, and forming one.
 //!
-//! The search decides what to form and reads only the [`Verdict`]; how a
-//! formation runs (in this process, in a worker, or recalled from an earlier
-//! run) is the caller's [`Forming`]. A [`Formation`] carries what identifies
-//! it, so a caller may key what it establishes by its inputs.
+//! The search decides what to form and reads only the [`Verdict`]; whether a
+//! formation runs or is recalled from an earlier run is the caller's
+//! [`Forming`]. A [`Formation`] carries what identifies it, so a caller may
+//! key what it establishes by its inputs.
 
 use seismic_native_target::{NativeCompilationError, ProgramSource};
 
 /// What forms a program: the toolchain and the facts it reads.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug)]
 pub enum Target {
     Vulkan(seismic_vulkan::FormationFacts),
     Cuda {
@@ -32,7 +32,7 @@ pub struct Formation<'a> {
 }
 
 /// What forming established.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Formed,
     /// A `static_assert` fired, which is how C++ kernels decline bindings

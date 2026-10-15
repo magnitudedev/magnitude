@@ -69,10 +69,11 @@ impl Configuration {
 
 /// An authored preprocessor group: the file (relative to its asset's
 /// directory; Seismic library files as `seismic/<name>`) and the line of the
-/// directive that opens it.
+/// directive that opens it. Searches hold sites by the million, so the file
+/// name is shared.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GroupSite {
-    pub file: String,
+    pub file: std::sync::Arc<str>,
     pub line: usize,
 }
 
@@ -511,7 +512,7 @@ fn skeleton(text: &str, asset: &str, label: &str, dialect: Dialect, preamble: &s
     let mut rejecting = BTreeSet::new();
     // Open authored groups, innermost last, by marker index.
     let mut open: Vec<Option<usize>> = Vec::new();
-    let mut file = label.to_owned();
+    let mut file: std::sync::Arc<str> = label.into();
     let mut line = 0usize;
     let mut offset = 0usize;
     let mut lines = text.split_inclusive('\n').peekable();
@@ -539,7 +540,7 @@ fn skeleton(text: &str, asset: &str, label: &str, dialect: Dialect, preamble: &s
             if let Some(number) = words.next().and_then(|word| word.parse::<usize>().ok()) {
                 line = number - 1;
                 if let Some(name) = words.next() {
-                    file = name.trim_matches('"').to_owned();
+                    file = name.trim_matches('"').into();
                 }
             }
             continue;
@@ -925,6 +926,16 @@ impl<'m> Subject<'m> {
                 self.asset,
                 &self.variants(&row.specialization),
             ),
+        }
+    }
+
+    /// How many programs [`Self::programs`] renders for a row: one per
+    /// launch for a launch-scoped CUDA or Metal implementation, else one.
+    fn programs_per_row(&self) -> usize {
+        if self.variant_programs && self.implementation.launch_scoped() {
+            self.implementation.launches.len().max(1)
+        } else {
+            1
         }
     }
 
@@ -1439,36 +1450,59 @@ fn row_variations(
     rows
 }
 
-/// What preprocessing one row's skeletons established: the authored groups
-/// its programs contain (`universe`, apart from `rejecting` ones that hold an
-/// `#error`) and, when no `#error` rejects it, the groups it compiles.
-struct Evaluated {
-    reached: Option<BTreeSet<GroupSite>>,
+/// What preprocessing rows' skeletons established: for each row, when no
+/// `#error` rejects it, the groups it compiles; and over all the rows, the
+/// authored groups their programs contain (`universe`, apart from
+/// `rejecting` ones that hold an `#error`).
+struct Evaluation {
+    reached: Vec<Option<BTreeSet<GroupSite>>>,
     universe: BTreeSet<GroupSite>,
     rejecting: BTreeSet<GroupSite>,
 }
 
-/// Preprocess every row's skeletons, in parallel.
-fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, CoverageError> {
-    let skeletons = in_parallel(rows, |row| gated(|| subject.skeletons(row)));
+/// Preprocess every row's skeletons. A round can hold tens of thousands of
+/// rows, each rendering several programs, so rows are evaluated a chunk at a
+/// time under one permit (a chunk is one clang batch of programs): a chunk's
+/// skeletons live only while it is preprocessed, and at most one chunk per
+/// core is held, whatever the round's size.
+fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Evaluation, CoverageError> {
+    let rows_per_chunk = (CLANG_BATCH / subject.programs_per_row()).max(1);
+    let chunks = rows.chunks(rows_per_chunk).collect::<Vec<_>>();
+    let mut evaluation = Evaluation {
+        reached: Vec::with_capacity(rows.len()),
+        universe: BTreeSet::new(),
+        rejecting: BTreeSet::new(),
+    };
+    for chunk in in_parallel(&chunks, |chunk| gated(|| evaluate_chunk(subject, chunk))) {
+        let chunk = chunk?;
+        evaluation.reached.extend(chunk.reached);
+        evaluation.universe.extend(chunk.universe);
+        evaluation.rejecting.extend(chunk.rejecting);
+    }
+    Ok(evaluation)
+}
+
+fn evaluate_chunk(subject: &Subject<'_>, rows: &[Row]) -> Result<Evaluation, CoverageError> {
+    let skeletons = rows
+        .iter()
+        .map(|row| subject.skeletons(row))
+        .collect::<Vec<_>>();
     let vulkan = rows
         .first()
         .is_some_and(|row| matches!(row.configuration, Configuration::Vulkan(_)));
     let outcomes: Vec<Vec<Outcome>> = if vulkan {
         let kernels = subject.kernels();
-        in_parallel(&skeletons, |programs| {
-            gated(|| {
+        skeletons
+            .iter()
+            .map(|programs| {
                 programs
                     .iter()
                     .map(|skeleton| preprocess_vulkan(skeleton, &kernels))
                     .collect::<Result<Vec<_>, _>>()
             })
-        })
-        .into_iter()
-        .collect::<Result<_, _>>()?
+            .collect::<Result<_, _>>()?
     } else {
-        // CUDA and Metal: clang over every program of every row, in
-        // parallel batches.
+        // CUDA and Metal: clang over every program of every row, in batches.
         let texts = skeletons
             .iter()
             .flat_map(|programs| programs.iter().map(|skeleton| skeleton.text.as_str()))
@@ -1484,9 +1518,9 @@ fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, Cover
                 )));
             }
         }
-        let batches = texts.chunks(CLANG_BATCH).collect::<Vec<_>>();
-        let mut flat = in_parallel(&batches, |batch| gated(|| preprocess_clang(batch)))
-            .into_iter()
+        let mut flat = texts
+            .chunks(CLANG_BATCH)
+            .map(preprocess_clang)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .flatten();
@@ -1500,39 +1534,37 @@ fn evaluate(subject: &Subject<'_>, rows: &[Row]) -> Result<Vec<Evaluated>, Cover
             })
             .collect()
     };
-    Ok(skeletons
-        .iter()
-        .zip(outcomes)
-        .map(|(programs, outcomes)| {
-            let mut evaluated = Evaluated {
-                reached: Some(BTreeSet::new()),
-                universe: BTreeSet::new(),
-                rejecting: BTreeSet::new(),
+    let mut evaluation = Evaluation {
+        reached: Vec::with_capacity(rows.len()),
+        universe: BTreeSet::new(),
+        rejecting: BTreeSet::new(),
+    };
+    for (programs, outcomes) in skeletons.iter().zip(outcomes) {
+        let mut reached = Some(BTreeSet::new());
+        for (skeleton, outcome) in programs.iter().zip(outcomes) {
+            let markers = match outcome {
+                Outcome::Rejected => {
+                    reached = None;
+                    BTreeSet::new()
+                }
+                Outcome::Reached(markers) => markers,
             };
-            for (skeleton, outcome) in programs.iter().zip(outcomes) {
-                let markers = match outcome {
-                    Outcome::Rejected => {
-                        evaluated.reached = None;
-                        BTreeSet::new()
-                    }
-                    Outcome::Reached(markers) => markers,
-                };
-                for (marker, site) in skeleton.sites.iter().enumerate() {
-                    if skeleton.rejecting.contains(&marker) {
-                        evaluated.rejecting.insert(site.clone());
-                        continue;
-                    }
-                    evaluated.universe.insert(site.clone());
-                    if markers.contains(&marker) {
-                        if let Some(reached) = &mut evaluated.reached {
-                            reached.insert(site.clone());
-                        }
+            for (marker, site) in skeleton.sites.iter().enumerate() {
+                if skeleton.rejecting.contains(&marker) {
+                    evaluation.rejecting.insert(site.clone());
+                    continue;
+                }
+                evaluation.universe.insert(site.clone());
+                if markers.contains(&marker) {
+                    if let Some(reached) = &mut reached {
+                        reached.insert(site.clone());
                     }
                 }
             }
-            evaluated
-        })
-        .collect())
+        }
+        evaluation.reached.push(reached);
+    }
+    Ok(evaluation)
 }
 
 /// What forming one row established.
@@ -1553,14 +1585,16 @@ fn form_row(subject: &Subject<'_>, forms: Forms<'_>, row: &Row) -> RowOutcome {
         return RowOutcome::Unformable;
     }
     let programs = subject.programs(row);
-    for program in &programs {
-        match forms.form(row.configuration, program) {
-            Verdict::Formed => {}
-            Verdict::Rejected => return RowOutcome::Rejected,
-            Verdict::Failed(error) => return RowOutcome::Failed(error),
+    gated(|| {
+        for program in &programs {
+            match forms.form(row.configuration, program) {
+                Verdict::Formed => {}
+                Verdict::Rejected => return RowOutcome::Rejected,
+                Verdict::Failed(error) => return RowOutcome::Failed(error),
+            }
         }
-    }
-    RowOutcome::Formed(programs.len())
+        RowOutcome::Formed(programs.len())
+    })
 }
 
 /// One entry's search: its kept rows, what forming them established, and
@@ -1635,12 +1669,10 @@ fn search(subject: &Subject<'_>, forms: Forms<'_>) -> Result<Option<Search>, Cov
                     specialization: specialization.clone(),
                     configuration,
                 };
-                let evaluated = evaluate(subject, std::slice::from_ref(&row))?
-                    .pop()
-                    .expect("one row evaluated");
+                let mut evaluated = evaluate(subject, std::slice::from_ref(&row))?;
                 search.universe.extend(evaluated.universe);
                 search.rejecting.extend(evaluated.rejecting);
-                if let Some(reached) = evaluated.reached {
+                if let Some(reached) = evaluated.reached.pop().expect("one row evaluated") {
                     if search.record(subject, &row, form_row(subject, forms, &row)) {
                         search.reached.extend(reached);
                         base = Some(row);
@@ -1784,10 +1816,11 @@ fn form_values(
     }
     let candidates = rows.iter().map(|(_, row)| row.clone()).collect::<Vec<_>>();
     let mut implemented = Vec::new();
-    for ((index, row), evaluated) in rows.into_iter().zip(evaluate(subject, &candidates)?) {
-        search.universe.extend(evaluated.universe);
-        search.rejecting.extend(evaluated.rejecting);
-        if let Some(reached) = evaluated.reached {
+    let evaluated = evaluate(subject, &candidates)?;
+    search.universe.extend(evaluated.universe);
+    search.rejecting.extend(evaluated.rejecting);
+    for ((index, row), reached) in rows.into_iter().zip(evaluated.reached) {
+        if let Some(reached) = reached {
             implemented.push((index, row, reached));
         }
     }
@@ -1830,11 +1863,11 @@ fn keep(
     search: &mut Search,
 ) -> Result<Vec<Row>, CoverageError> {
     let evaluated = evaluate(subject, &candidates)?;
+    search.universe.extend(evaluated.universe);
+    search.rejecting.extend(evaluated.rejecting);
     let mut open = Vec::new();
-    for (candidate, evaluated) in candidates.into_iter().zip(evaluated) {
-        search.universe.extend(evaluated.universe);
-        search.rejecting.extend(evaluated.rejecting);
-        if let Some(reached) = evaluated.reached {
+    for (candidate, reached) in candidates.into_iter().zip(evaluated.reached) {
+        if let Some(reached) = reached {
             open.push((candidate, reached));
         }
     }
@@ -1907,9 +1940,8 @@ fn binding_pairs(subject: &Subject<'_>, row: &Row, seen: &mut BTreeSet<String>) 
 
 /// Form every native implementation of `module` with `toolchain`, through
 /// `forming`. Entries are searched in parallel, each search preprocessing
-/// and forming its candidates in parallel; preprocessing runs at most one
-/// job per core, and formation as `forming` runs it. `progress` counts the
-/// entries searched.
+/// and forming its candidates in parallel; the toolchain work itself runs at
+/// most one job per core. `progress` counts the entries searched.
 pub fn cover(
     module: &CheckedModule,
     toolchain: &Toolchain,
@@ -1997,9 +2029,8 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
     results.into_iter().map(|(_, result)| result).collect()
 }
 
-/// Run `work` holding one of a core's worth of permits: the rendering and
-/// preprocessing of every concurrent search share the cores without
-/// oversubscribing them. Formation runs as the caller's [`Forming`] runs it.
+/// Run `work` holding one of a core's worth of permits: the toolchain work
+/// of every concurrent search shares the cores without oversubscribing them.
 fn gated<R>(work: impl FnOnce() -> R) -> R {
     static PERMITS: std::sync::OnceLock<(std::sync::Mutex<usize>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
@@ -2106,11 +2137,12 @@ fn form_request(
         specialization,
         configuration: forms.former.base(),
     };
-    let evaluated = evaluate(&subject, std::slice::from_ref(&row))
+    let reached = evaluate(&subject, std::slice::from_ref(&row))
         .map_err(|error| RequestFailure::Formation(error.to_string()))?
+        .reached
         .pop()
         .expect("one row evaluated");
-    if evaluated.reached.is_none() {
+    if reached.is_none() {
         return Err(RequestFailure::Unimplemented);
     }
     match form_row(&subject, forms, &row) {

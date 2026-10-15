@@ -2,9 +2,9 @@
 //!
 //! A verdict is a fact about its inputs: the program and the toolchain
 //! identity its key addresses. Only the toolchain's own verdicts are kept,
-//! formed or rejected by a `static_assert`; a compile error, or a worker that
-//! died, is never a fact about the inputs. A completion records a run that
-//! established everything, by a key derived from every input of the run.
+//! formed or rejected by a `static_assert`; a compile error is never kept. A
+//! completion records a coverage run that established everything, by a key
+//! derived from every input of its result.
 //!
 //! Records are appended as they are established, so a run that dies keeps
 //! everything it finished. A line that does not parse is ignored and an
@@ -53,16 +53,9 @@ pub enum Established {
     Rejected,
 }
 
-/// One kept verdict and the peak memory of the worker that established it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Verdict {
-    pub established: Established,
-    pub peak_bytes: u64,
-}
-
 #[derive(Default)]
 struct Records {
-    verdicts: BTreeMap<String, Verdict>,
+    verdicts: BTreeMap<String, Established>,
     completions: BTreeMap<String, String>,
 }
 
@@ -95,20 +88,11 @@ impl Ledger {
         })
     }
 
-    pub fn verdict(&self, key: &Key) -> Option<Verdict> {
+    pub fn verdict(&self, key: &Key) -> Option<Established> {
         self.lock().verdicts.get(&key.0).copied()
     }
 
-    /// The largest peak any kept verdict's worker reached.
-    pub fn largest_peak(&self) -> Option<u64> {
-        self.lock()
-            .verdicts
-            .values()
-            .map(|verdict| verdict.peak_bytes)
-            .max()
-    }
-
-    pub fn record(&self, key: &Key, verdict: Verdict) {
+    pub fn record(&self, key: &Key, verdict: Established) {
         self.lock().verdicts.insert(key.0.clone(), verdict);
         self.append(&verdict_line(&key.0, verdict));
     }
@@ -171,12 +155,12 @@ impl Ledger {
     }
 }
 
-fn verdict_line(key: &str, verdict: Verdict) -> String {
-    let established = match verdict.established {
+fn verdict_line(key: &str, verdict: Established) -> String {
+    let established = match verdict {
         Established::Formed => "formed",
         Established::Rejected => "rejected",
     };
-    format!("v {key} {established} {}\n", verdict.peak_bytes)
+    format!("v {key} {established}\n")
 }
 
 fn parse(text: &str) -> Records {
@@ -184,25 +168,13 @@ fn parse(text: &str) -> Records {
     for line in text.lines() {
         let mut fields = line.splitn(3, ' ');
         match (fields.next(), fields.next(), fields.next()) {
-            (Some("v"), Some(key), Some(rest)) => {
-                let mut rest = rest.split(' ');
-                let established = match rest.next() {
-                    Some("formed") => Established::Formed,
-                    Some("rejected") => Established::Rejected,
+            (Some("v"), Some(key), Some(established)) => {
+                let established = match established {
+                    "formed" => Established::Formed,
+                    "rejected" => Established::Rejected,
                     _ => continue,
                 };
-                let Some(Ok(peak_bytes)) = rest.next().map(str::parse) else {
-                    continue;
-                };
-                if rest.next().is_none() {
-                    records.verdicts.insert(
-                        key.to_owned(),
-                        Verdict {
-                            established,
-                            peak_bytes,
-                        },
-                    );
-                }
+                records.verdicts.insert(key.to_owned(), established);
             }
             (Some("c"), Some(run), Some(summary)) => {
                 records
@@ -226,13 +198,6 @@ mod tests {
         directory.join("cuda.ledger")
     }
 
-    fn formed(peak_bytes: u64) -> Verdict {
-        Verdict {
-            established: Established::Formed,
-            peak_bytes,
-        }
-    }
-
     #[test]
     fn records_survive_reopening_and_compaction() {
         let path = path("reopen");
@@ -240,24 +205,14 @@ mod tests {
         {
             let ledger = Ledger::open(&path).unwrap();
             assert_eq!(ledger.verdict(&a), None);
-            ledger.record(&a, formed(10));
-            ledger.record(
-                &b,
-                Verdict {
-                    established: Established::Rejected,
-                    peak_bytes: 30,
-                },
-            );
-            ledger.record(&a, formed(20));
+            ledger.record(&a, Established::Formed);
+            ledger.record(&b, Established::Rejected);
+            ledger.record(&a, Established::Formed);
             ledger.complete(&run, "formed 2 programs\nformed 1 request\n");
         }
         let ledger = Ledger::open(&path).unwrap();
-        assert_eq!(ledger.verdict(&a), Some(formed(20)));
-        assert_eq!(
-            ledger.verdict(&b).map(|verdict| verdict.established),
-            Some(Established::Rejected)
-        );
-        assert_eq!(ledger.largest_peak(), Some(30));
+        assert_eq!(ledger.verdict(&a), Some(Established::Formed));
+        assert_eq!(ledger.verdict(&b), Some(Established::Rejected));
         assert_eq!(
             ledger.completion(&run).as_deref(),
             Some("formed 2 programs; formed 1 request")
@@ -266,15 +221,16 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 3);
         // Appending continues into the compacted file.
         let c = Key::of(&[b"c"]);
-        ledger.record(&c, formed(1));
-        assert_eq!(Ledger::open(&path).unwrap().verdict(&c), Some(formed(1)));
+        ledger.record(&c, Established::Formed);
+        assert_eq!(
+            Ledger::open(&path).unwrap().verdict(&c),
+            Some(Established::Formed)
+        );
     }
 
     #[test]
     fn lines_that_do_not_parse_are_ignored() {
-        let records = parse(
-            "v k1 formed 5\nv k2 formed\nv k3 maybe 5\nv k4 formed five\nv k5 formed 5 6\nx y z\nc r done\n",
-        );
+        let records = parse("v k1 formed\nv k2\nv k3 maybe\nv k4 formed 5\nx y z\nc r done\n");
         assert_eq!(records.verdicts.keys().collect::<Vec<_>>(), ["k1"]);
         assert_eq!(
             records.completions.get("r").map(String::as_str),

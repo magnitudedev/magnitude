@@ -2461,11 +2461,8 @@ dependencies = [
  "libc",
  "magnitude-kernels",
  "magnitude-service-server",
- "postcard",
  "seismic",
- "serde",
  "sha2 0.10.9",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4152,7 +4149,6 @@ dependencies = [
  "seismic-ir",
  "seismic-lang",
  "seismic-native-target",
- "serde",
  "sha2 0.11.0",
 ]
 
@@ -4169,7 +4165,6 @@ version = "0.1.0"
 dependencies = [
  "seismic-ir",
  "seismic-lang",
- "serde",
 ]
 
 [[package]]
@@ -4228,7 +4223,6 @@ dependencies = [
  "glslang",
  "seismic-compiler",
  "seismic-native-target",
- "serde",
  "spirv-tools",
 ]
 

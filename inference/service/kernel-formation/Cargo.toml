@@ -12,20 +12,11 @@ anyhow.workspace = true
 clap.workspace = true
 magnitude-kernels = { path = "../../engine/kernels" }
 magnitude-service-server = { path = "../server" }
-postcard.workspace = true
 seismic = { workspace = true, features = ["coverage"] }
-serde.workspace = true
 sha2.workspace = true
+
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc.workspace = true
 
 [build-dependencies]
 sha2.workspace = true
-
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = [
-    "Win32_Foundation",
-    "Win32_System_ProcessStatus",
-    "Win32_System_Threading",
-] }

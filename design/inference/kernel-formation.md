@@ -34,11 +34,11 @@ Metal functions), short of loading it on a device. No lighter proxy substitutes 
 ## Ownership
 
 - **The coverage search** (Seismic) decides what to form. It renders programs and preprocesses
-  their skeletons, but runs no formation itself: each formation goes to the caller's `Forming`,
-  which returns a verdict. The search is independent of processes, caches and memory.
-- **The formation tool** owns how formations run: the ledger, worker processes, memory admission
-  and progress reporting. It is a workspace member outside the default members, so the coverage
-  feature never joins default builds.
+  their skeletons, and hands each formation to the caller's `Forming`, which returns a verdict.
+  Toolchain work runs at most one job per core.
+- **The formation tool** owns the ledger and progress reporting; it forms in its own process. It
+  is a workspace member outside the default members, so the coverage feature never joins default
+  builds.
 
 ## Verdicts
 
@@ -64,8 +64,7 @@ The ledger key hashes exactly these inputs, so an unchanged key is an unchanged 
 
 The ledger keeps, per backend, what runs established:
 
-- a **verdict** per formation key: Formed or Rejected, with the peak memory of the worker that
-  established it. Failed is never recorded, nor is anything from a worker that ended abnormally;
+- a **verdict** per formation key: Formed or Rejected. Failed is never recorded;
 - a **completion** per coverage key: a coverage run that established everything, with its
   summary.
 
@@ -89,31 +88,12 @@ evaluate at its statics, the nearest-configuration questions of every frontier r
 statics are answered by one walk over the admissible configurations that keeps only the current
 answers, so the search's memory is independent of how many configurations a declaration admits.
 
-## Workers and admission
-
-Every formation the ledger does not hold runs in its own worker process, which exits after one
-program, so its memory returns to the system and its peak is the formation's alone.
-
-The pool starts a worker when fewer run than the host has cores, and the host's available memory
-(its headroom within any cgroup limit), less what each running worker may still grow by (its
-estimate minus its current resident size), holds another worker's estimate. The estimate is the
-largest peak known, measured in this run or kept by the ledger. One worker always runs, so the pool
-never stalls; until a peak is known, one runs alone. No concurrency or memory value is configured.
-
-A worker that ends abnormally forms again alone, after the running workers finish. The kernel's
-out-of-memory killer chooses the largest process, a worker rather than the driver. A worker that
-ends abnormally while alone fails its formation; killed alone, the failure states that this host's
-memory cannot form the program.
-
-Metal compiles inside the operating system's compiler service, so a Metal worker's peak understates
-the compile and the core bound governs. macOS compresses and swaps rather than killing processes.
-
 ## Progress
 
 While a phase runs, the tool reports at a fixed interval the elapsed time, the phase's units done
 of its total (entries searched during coverage, requests formed during catalog formation), and the
-workers' activity (formed, recalled from the ledger, running). Formations per entry are discovered
-by the search, so entry progress is not proportional to time.
+formations formed and recalled from the ledger. Formations per entry are discovered by the search,
+so entry progress is not proportional to time.
 
 ## Acceptance
 
@@ -123,6 +103,4 @@ by the search, so entry progress is not proportional to time.
   and recalls every catalog formation.
 - An engine or service change alone does not invalidate the coverage completion.
 - A run after a change to one kernel family forms only that family's changed programs.
-- Admission never starts a worker beyond the core count or the memory bound, except the one that
-  always runs; a worker waiting to run alone blocks other admissions until it has run.
 - A run that is killed keeps every verdict it recorded.

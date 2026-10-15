@@ -12,4 +12,3 @@ seismic-native-target.workspace = true
 ash = "=0.38.0"
 glslang = "=0.8.1"
 spirv-tools = "=0.13.3"
-serde.workspace = true
