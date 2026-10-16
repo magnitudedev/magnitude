@@ -891,6 +891,7 @@ function LanguageRow() {
         <SelectItem value="en">{t("english")}</SelectItem>
         <SelectItem value="es">{t("spanish")}</SelectItem>
         <SelectItem value="zh-CN">{t("chineseSimplified")}</SelectItem>
+        <SelectItem value="zh-TW">{t("chineseTraditional")}</SelectItem>
         <SelectItem value="hi">{t("hindi")}</SelectItem>
         <SelectItem value="ur">{t("urdu")}</SelectItem>
         <SelectItem value="bn">{t("bengali")}</SelectItem>
@@ -900,6 +901,9 @@ function LanguageRow() {
         <SelectItem value="pt">Português</SelectItem>
         <SelectItem value="it">Italiano</SelectItem>
         <SelectItem value="uk">Українська</SelectItem>
+        <SelectItem value="id">{t("indonesian")}</SelectItem>
+        <SelectItem value="ko">{t("korean")}</SelectItem>
+        <SelectItem value="vi">{t("vietnamese")}</SelectItem>
       </SelectContent>
     </Select>} />
 }
