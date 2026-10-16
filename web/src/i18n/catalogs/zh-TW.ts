@@ -645,5 +645,9 @@ export const zhTW: { [K in keyof typeof en]: string } = {
   magnitudeCouldNotOpen: "Magnitude 无法打開",
   reloadWindowRestart: "重新載入此視窗。如果仍无法打開，请重啟 Magnitude。",
   quitAndReopen: "退出 Magnitude，然后重新打開。",
+  on: "開啟",
+  off: "關閉",
+  request: "請求",
+  appearanceCouldNotBeSaved: "無法在此瀏覽器中儲存外觀設定。",
   savedAppearanceReadError: "无法读取已儲存的外观設置。将使用系統外观。",
 }
