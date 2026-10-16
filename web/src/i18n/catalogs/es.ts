@@ -535,4 +535,7 @@ export const es: { [K in keyof typeof en]: string } = {
   checkingEllipsis: "Comprobando…",
   openAiBaseUrlHint: "Utiliza esta URL base compatible con OpenAI en otros dispositivos{keyHint}. Las aplicaciones compatibles con Anthropic usan /inference/anthropic en la misma dirección.",
   withApiKeyAbove: ", con la clave API anterior",
+  starting: "Iniciando",
+  unavailable: "No disponible",
+  optimizing: "Optimizando",
 }
