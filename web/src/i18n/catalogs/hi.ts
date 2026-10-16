@@ -641,6 +641,7 @@ export const hi = {
   on: "चालू",
   off: "बंद",
   request: "अनुरोध",
+  appearanceCouldNotBeSaved: "इस ब्राउज़र में दिखावट सहेजी नहीं जा सकी。",
   savedAppearanceReadError: "सहेजी गई दिखावट पढ़ी नहीं जा सकी। सिस्टम की दिखावट इस्तेमाल की जा रही है।",
   chineseTraditional: "पारंपरिक चीनी",
   korean: "कोरियाई",
