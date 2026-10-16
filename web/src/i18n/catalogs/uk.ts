@@ -639,4 +639,8 @@ export const uk = {
   reloadWindowRestart: "Перезавантажте це вікно. Якщо воно не відкриється, перезапустіть Magnitude.",
   quitAndReopen: "Закрийте Magnitude і відкрийте його знову.",
   savedAppearanceReadError: "Не вдалося прочитати збережене оформлення. Використовується оформлення системи.",
+  chineseTraditional: "Традиційна китайська",
+  korean: "Корейська",
+  vietnamese: "В’єтнамська",
+  indonesian: "Індонезійська",
 } satisfies typeof en
