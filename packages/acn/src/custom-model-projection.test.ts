@@ -1,8 +1,8 @@
 import { Option } from "effect"
 import { describe, expect, it } from "vitest"
 import type { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas"
-import { customModel, projectLocalModels, localModelDrafterKey } from "./local-models"
-import { customModelDownloads } from "./custom-model-downloads"
+import { customModel, projectLocalModels } from "./local-models"
+import { currentDownload, customModelDownloads } from "./custom-model-downloads"
 import type { LocalModelSourcesState } from "./local-model-sources"
 import {
   addedId,
@@ -53,7 +53,6 @@ const inputs = (entry = customSource(nativeCustomModel()), overrides: Partial<Pa
   assessment: fits,
   instances: [],
   related: [],
-  acceptance: [],
   catalog: [],
   ...overrides,
 })
@@ -74,6 +73,15 @@ describe("custom model rows", () => {
     expect(row.acquisitionState._tag).toBe("External")
     expect(row.servingState._tag).toBe("Assessed")
     expect(row.servingState).not.toHaveProperty("rankingScores")
+  })
+
+  it("names a model by ICN's display name and the quantization its file names", () => {
+    const row = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({
+      displayName: "MiniCPM5 1B",
+      variantLabel: "Q3_K_M",
+    })))))
+    expect(row.presentation.displayName).toBe("MiniCPM5 1B")
+    expect(row.presentation.variantLabel).toBe("Q3_K_M")
   })
 
   it("lists unsupported external models apart and keeps an unsupported added model removable", () => {
@@ -123,7 +131,7 @@ describe("custom model rows", () => {
     expect(unreadable.servingState._tag).toBe("Failed")
   })
 
-  it("reports a drafter-only download, its failure, a catalog drafter update, and measured acceptance", () => {
+  it("reports a drafter-only download, its failure, and a catalog drafter update", () => {
     const config = customModelsConfig()
     const entry = customSource(nativeCustomModel({ drafter: { ...attachedDrafter, state: { _tag: "NotInstalled" } } }))
     const downloading = customModelDownloads(foundId, config, [drafterDownload("dd", {
@@ -139,25 +147,27 @@ describe("custom model rows", () => {
     expect(Option.getOrThrow(customModel(inputs(entry, { related: failed }))).drafter).toMatchObject(Option.some({
       availability: { _tag: "DownloadFailed", failure: { _tag: "CorruptDownload" } },
     }))
-    const measured = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ drafter: attachedDrafter })), {
-      acceptance: [{
-        model: foundId,
-        drafter: "hf:magnitudedev/model-DFlash-GGUF@d1/dflash.gguf",
-        acceptance: { acceptanceRate: 0.58, tokensPerSecond: 40, withoutDrafterTokensPerSecond: Option.some(30), slower: false },
-      }],
-    })))
-    expect(Option.map(measured.measuredAcceptance, ({ acceptanceRate }) => acceptanceRate)).toEqual(Option.some(0.58))
-    expect(Option.map(measured.drafter, ({ availability }) => availability._tag)).toEqual(Option.some("Present"))
+    const present = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ drafter: attachedDrafter })))))
+    expect(Option.map(present.drafter, ({ availability }) => availability._tag)).toEqual(Option.some("Present"))
 
     const catalogDrafter = customSource(nativeCustomModel({
       drafter: { method: { _tag: "DFlash" }, reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, state: { _tag: "Ready" } },
     }))
     const catalog = [{
       id: "qwen3.6-35b-a3b:gguf:q4",
-      source: { localState: { _tag: "Installed", updateState: { _tag: "Available" } } },
+      source: {
+        displayName: "Qwen3.6 35B-A3B",
+        desired: { speculativeMethod: Option.some({ _tag: "DFlash" }) },
+        localState: { _tag: "Installed", updateState: { _tag: "Available" } },
+      },
     }] as never
-    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter, { catalog }))).drafter, ({ updateAvailable }) => updateAvailable))
-      .toEqual(Option.some(true))
+    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter, { catalog }))).drafter,
+      ({ updateAvailable, name, label }) => ({ updateAvailable, name, label })))
+      .toEqual(Option.some({
+        updateAvailable: true,
+        name: "Magnitude DFlash for Qwen3.6 35B-A3B",
+        label: "Trained for Qwen3.6 35B-A3B",
+      }))
   })
 })
 
@@ -172,6 +182,22 @@ describe("custom model downloads", () => {
       .toEqual([["Target", "t"], ["Drafter", "ad"]])
     expect(customModelDownloads(foundId, config, downloads).map(({ kind }) => kind)).toEqual(["Drafter"])
     expect(customModelDownloads(importedId, config, downloads)).toEqual([])
+  })
+
+  it("lets a newer attempt supersede an older failure", () => {
+    const config = customModelsConfig()
+    const failed = targetDownload("old", {
+      _tag: "Failed", acknowledged: false, completedBytes: 5, totalBytes: 10, failure: { _tag: "NetworkUnavailable" },
+    })
+    const added = customSource(nativeCustomModel({
+      modelId: addedId,
+      origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+    }))
+    const retried = customModelDownloads(addedId, config, [failed, targetDownload("new", { _tag: "Completed" })])
+    expect(currentDownload(retried, "Target")).toEqual(Option.none())
+    expect(Option.getOrThrow(customModel(inputs(added, { related: retried }))).acquisitionState._tag).toBe("Installed")
+    expect(currentDownload(customModelDownloads(addedId, config, [failed]), "Target").pipe(Option.map(({ id }) => id)))
+      .toEqual(Option.some("old"))
   })
 
   it("follows a catalog drafter's download, whose package names no attached repository file", () => {
@@ -243,7 +269,6 @@ describe("local models state", () => {
       removals: new Map(),
       config: customModelsConfig({ hidden: ["hf:other/hidden-GGUF/hidden.gguf"] }),
       downloads: [],
-      acceptance: [],
     })
     expect(state.models.map(({ modelId }) => modelId)).toEqual([foundId])
     expect(state.hidden.map(({ modelId }) => modelId)).toEqual(["hf:other/hidden-GGUF/hidden.gguf"])
@@ -258,8 +283,51 @@ describe("local models state", () => {
       discovery: { complete: true, modelsFound: 1 },
       assessment: { complete: true, settledModels: 1, totalModels: 1 },
     })
-    expect(localModelDrafterKey(state, foundId)).toEqual(Option.some("hf:magnitudedev/model-DFlash-GGUF@d1/dflash.gguf"))
   })
+  it("hides a catalog model found only in an external location, but never one Magnitude owns", () => {
+    const desired = {
+      metadata: { storageBytes: 1 },
+      profile: { contextLength: 32_768 },
+      speculativeMethod: Option.none(),
+    }
+    const catalogEntry = (id: string, ownership: string) => ({
+      id,
+      source: {
+        description: "",
+        desired,
+        displayName: "Catalog Model",
+        fidelityRank: 1,
+        intelligence: 1,
+        license: "apache-2.0",
+        localState: {
+          _tag: "Installed",
+          effective: { _tag: "Ready", model: desired },
+          installation: { _tag: "Resolved", installedBytes: 1, primaryPath: `/files/${id}.gguf`, ownership },
+          updateState: { _tag: "Current" },
+        },
+        parameterization: { architecture: "dense", totalParameters: 1 },
+        quantizationAware: false,
+        releaseDate: "2026-08-29",
+        sourceUrls: [],
+        support: { level: "supported" },
+        variantLabel: "Q4",
+      },
+    }) as unknown as LocalModelSourcesState["catalogModels"][number]
+    const external = "qwen3.6-35b-a3b:gguf:q4"
+    const owned = "qwen3.6-27b:gguf:q4"
+    const state = projectLocalModels({
+      source: { ...sources([]), catalogModels: [catalogEntry(external, "External"), catalogEntry(owned, "Magnitude")] },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig({ hidden: [external, owned] as never }),
+      downloads: [],
+    })
+    expect(state.models.map(({ modelId }) => modelId)).toEqual([owned])
+    expect(state.hidden.map(({ modelId }) => modelId)).toEqual([external])
+  })
+
   it("moves a found model the engine cannot run into the unsupported list with its reasons", () => {
     const unsupportedId = "hf:other/unsupported-GGUF/unsupported.gguf"
     const snapshot = assessments([foundId, unsupportedId]) as unknown as {
@@ -283,7 +351,6 @@ describe("local models state", () => {
       removals: new Map(),
       config: customModelsConfig(),
       downloads: [],
-      acceptance: [],
     })
     expect(state.models.map(({ modelId }) => modelId)).toEqual([foundId])
     expect(state.unsupported).toEqual([{
@@ -293,5 +360,42 @@ describe("local models state", () => {
       reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
       detail: "unknown architecture deepseek4",
     }])
+  })
+  it("renders decoded engine reasons with optional fields and kernel statics", () => {
+    const unsupportedId = "hf:unsloth/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q4_K_M.gguf"
+    const snapshot = assessments([unsupportedId]) as unknown as {
+      custom: { entries: Array<{ state: { profiles: unknown[] } }> }
+    }
+    snapshot.custom.entries[0]!.state.profiles = [{
+      _tag: "Unsupported",
+      profile: { contextLength: 40_960 },
+      reasons: [
+        { _tag: "Architecture", architecture: "qwen3" },
+        { _tag: "Tokenizer", model: "gpt2", pre: Option.some("qwen2") },
+        { _tag: "Tokenizer", model: "llama", pre: Option.none() },
+        { _tag: "KernelDomain", backend: "metal", entry: "attention", statics: [{ name: "head_dim", value: 96 }] },
+      ],
+      detail: "no registered model family recognizes architecture qwen3",
+    }]
+    const state = projectLocalModels({
+      source: { ...sources([customSource(nativeCustomModel({
+        modelId: unsupportedId,
+        displayName: "Qwen3-0.6B-Q4_K_M",
+        files: [{ path: "/models/Qwen3-0.6B-Q4_K_M.gguf", sizeBytes: 1 }],
+      }))]), unsupported: [] },
+      assessment: snapshot as unknown as ModelAssessmentsSnapshot,
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+    })
+    expect(state.models).toEqual([])
+    expect(state.unsupported.map(({ reasons }) => reasons)).toEqual([[
+      { _tag: "Architecture", architecture: "qwen3" },
+      { _tag: "Tokenizer", model: "gpt2", pre: Option.some("qwen2") },
+      { _tag: "Tokenizer", model: "llama", pre: Option.none() },
+      { _tag: "KernelDomain", backend: "metal", entry: "attention", statics: [["head_dim", 96]] },
+    ]])
   })
 })

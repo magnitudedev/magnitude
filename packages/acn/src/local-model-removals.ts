@@ -5,7 +5,7 @@ import {
   type ModelFailure,
   type CatalogFormModelId,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalog, IcnClient } from "@magnitudedev/icn"
+import { IcnCatalog, IcnClient, IcnLocalModels } from "@magnitudedev/icn"
 import type { CatalogInstallationRemoval } from "@magnitudedev/icn-protocol/schemas"
 import { icnCommandFailure } from "./icn-command-failure"
 
@@ -50,11 +50,12 @@ const updated = (
 export const LocalModelRemovalsLive: Layer.Layer<
   LocalModelRemovals,
   never,
-  IcnClient | IcnCatalog
+  IcnClient | IcnCatalog | IcnLocalModels
 > =
   Layer.effect(LocalModelRemovals, Effect.gen(function* () {
     const client = yield* IcnClient
     const catalog = yield* IcnCatalog
+    const localModels = yield* IcnLocalModels
     const removals = yield* SubscriptionRef.make<ReadonlyMap<CatalogFormModelId, LocalModelRemovalState>>(new Map())
     const remove = (modelId: CatalogFormModelId) => Effect.uninterruptibleMask((restore) => Effect.gen(function* () {
       const admitted = yield* SubscriptionRef.modify(removals, (current) => current.get(modelId)?._tag === "Removing"
@@ -72,6 +73,8 @@ export const LocalModelRemovalsLive: Layer.Layer<
         Effect.mapError((cause) => icnCommandFailure("remove", cause)),
         Effect.flatMap(catalogRemovalOutcome),
         Effect.tap(() => catalog.refresh.pipe(Effect.ignore)),
+        // The catalog model's drafter stays while another model uses it; otherwise it goes too.
+        Effect.tap(() => localModels.pruneDrafters.pipe(Effect.ignore)),
         Effect.tapError((failure) => SubscriptionRef.update(removals, (current) => updated(current, (next) => next.set(modelId, {
           _tag: "RemoveFailed",
           failure,

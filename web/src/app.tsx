@@ -75,7 +75,7 @@ import { CustomModelDetails, DrafterNotices, DrafterOffer, drafterUpdateAvailabl
 import { ModelRemoveAction } from "./components/model-remove-action"
 import { HiddenModels, SourceTag, UnsupportedModels } from "./components/local-model-lists"
 import { FoundModelsBanner, HuggingFaceLink, NoRecommendations } from "./components/discover-custom"
-import { ModelLocationsGroup } from "./components/model-locations"
+import { ModelLocationsRow } from "./components/model-locations"
 
 const ALL_INTERFACES = "all"
 const inferenceUrl = (address: string, port: number) => `http://${address}:${port}/inference/v1`
@@ -269,7 +269,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
   const canDownload = supported && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits"
   const [confirmingLoad, setConfirmingLoad] = useState(false)
   const requestLoad = () => { if (replacing) setConfirmingLoad(true); else load(model.modelId) }
-  const removeAction = <ModelRemoveAction model={model} running={canStop} disabled={pending} onRemove={() => remove(model.modelId)} onHide={() => { if (model._tag === "Custom") hide(model.modelId) }} />
+  const removeAction = <ModelRemoveAction model={model} running={canStop} disabled={pending} onRemove={() => remove(model.modelId)} onHide={() => hide(model.modelId)} />
 
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
@@ -329,12 +329,12 @@ function CustomModelDrafter({ model, models, detailsOpen, detailsId }: { model: 
   const add = (candidate: DrafterCandidate) => setDrafter(model.modelId, { _tag: "Reference", reference: candidate.reference })
   return <>
     {!detailsOpen && Option.isSome(customModelDrafterOffer(model)) && <div className="col-span-full -mt-2 pl-14"><DrafterOffer model={model} disabled={disabled} onAdd={add} /></div>}
-    <DrafterNotices model={model} disabled={disabled} onChangeDrafter={change} onTurnOffDrafter={turnOff} onRetry={() => install(model.modelId)} onCancel={() => cancel(model.modelId)} onDismiss={() => dismissFailure(model.modelId)} />
+    <DrafterNotices model={model} disabled={disabled} onRetry={() => install(model.modelId)} onCancel={() => cancel(model.modelId)} onDismiss={() => dismissFailure(model.modelId)} />
     <div className="col-span-full">
       <ModelDetails model={model} open={detailsOpen} contentId={detailsId}
         custom={<CustomModelDetails model={model} variantOfName={catalogVariantOfName(models, model.presentation.variantOf)} disabled={disabled} onChangeDrafter={change} onTurnOffDrafter={turnOff} onAddDrafter={add} />} />
     </div>
-    <DrafterPickerDialog model={model} models={models} open={choosing} onOpenChange={setChoosing} onChoose={choice => setDrafter(model.modelId, choice)} />
+    <DrafterPickerDialog model={model} open={choosing} onOpenChange={setChoosing} onChoose={choice => setDrafter(model.modelId, choice)} />
   </>
 }
 function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; active: ReturnType<typeof activeLocalModel> }) {
@@ -897,8 +897,7 @@ function SettingsPage() {
   const { storagePending, networkPending } = useRestartPending()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({})), Atom.refresh(client.Models.ListModelLocations({}))], { discard: true })), [client]))
   return <>
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
-    <ModelLocationsGroup />
+    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><ModelLocationsRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
     <SettingsGroup label="About"><AboutRow /></SettingsGroup>
     {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
     {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}

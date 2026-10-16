@@ -3,13 +3,13 @@ import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { AttachedDrafterAvailability } from "@magnitudedev/sdk"
 import { CustomModelDetails, DrafterNotices, DrafterOffer, customModelSource, drafterUpdateAvailable } from "./custom-model-details"
-import { added, attachedDrafter, catalogModel, customModel, drafterCandidate, foundIn, imported, measured, repository } from "../../test/models/fixtures"
+import { added, attachedDrafter, catalogModel, customModel, drafterCandidate, foundIn, imported, repository } from "../../test/models/fixtures"
 
 const attached = (availability: AttachedDrafterAvailability, updateAvailable = false) => Option.some(attachedDrafter(availability, { updateAvailable }))
 const downloading: AttachedDrafterAvailability = { _tag: "Downloading", progress: { stage: "downloading", completedBytes: 450, totalBytes: 900, bytesPerSecond: Option.none() } }
 const details = (model: ReturnType<typeof customModel>) => renderToStaticMarkup(<CustomModelDetails model={model} variantOfName={Option.some("Qwen3.6 35B-A3B")} disabled={false} onChangeDrafter={() => {}} onTurnOffDrafter={() => {}} onAddDrafter={() => {}} />)
 
-const notices = (model: ReturnType<typeof customModel>) => renderToStaticMarkup(<DrafterNotices model={model} disabled={false} onChangeDrafter={() => {}} onTurnOffDrafter={() => {}} onRetry={() => {}} onCancel={() => {}} onDismiss={() => {}} />)
+const notices = (model: ReturnType<typeof customModel>) => renderToStaticMarkup(<DrafterNotices model={model} disabled={false} onRetry={() => {}} onCancel={() => {}} onDismiss={() => {}} />)
 
 describe("custom model details", () => {
   it("names the source by origin: a pinned repository, an imported path, or where it was found", () => {
@@ -17,15 +17,16 @@ describe("custom model details", () => {
     expect(customModelSource(customModel(imported)).label).toBe("/Users/me/models/qwen.gguf")
     expect(customModelSource(customModel(foundIn({ _tag: "Ollama" }))).label).toBe("Ollama · /Users/me/.ollama/models/blobs/sha256-1")
   })
-  it("shows Source, Variant of, and the drafter with measured acceptance, Change, and Turn off", () => {
+  it("shows Source, Variant of, and the drafter by name with Change and Turn off", () => {
     const html = details(customModel(added, {
       drafter: attached({ _tag: "Present" }),
-      measuredAcceptance: Option.some(measured(0.58)),
     }))
     expect(html).toContain(`href="https://huggingface.co/${repository}"`)
     expect(html).toContain("Variant of")
     expect(html).toContain("Qwen3.6 35B-A3B")
-    expect(html).toContain("Magnitude DFlash · 58% of drafted tokens accepted")
+    expect(html).toContain(">Magnitude DFlash for Qwen3.6 35B-A3B<")
+    expect(html).not.toContain("accepted")
+    expect(html).not.toContain("%")
     expect(html).toContain(">Change<")
     expect(html).toContain(">Turn off<")
   })
@@ -43,11 +44,8 @@ describe("custom model details", () => {
     expect(renderToStaticMarkup(<DrafterOffer model={customModel(added)} disabled={false} onAdd={() => {}} />)).toBe("")
     expect(renderToStaticMarkup(<DrafterOffer model={customModel(added, { drafter: attached({ _tag: "Present" }), recommendedDrafter: Option.some(drafterCandidate()) })} disabled={false} onAdd={() => {}} />)).toBe("")
   })
-  it("reports a slowing drafter with Change and Turn off, and a drafter-only download's progress and failure", () => {
-    const slowing = notices(customModel(added, { drafter: attached({ _tag: "Present" }), measuredAcceptance: Option.some(measured(0.1, true)) }))
-    expect(slowing).toContain("This drafter is slowing responses")
-    expect(slowing).toContain(">Change<")
-    expect(slowing).toContain(">Turn off<")
+  it("reports a drafter-only download's progress and failure, and nothing for a present drafter", () => {
+    expect(notices(customModel(added, { drafter: attached({ _tag: "Present" }) }))).toBe("")
     expect(notices(customModel(added, { drafter: attached(downloading) }))).toContain("Downloading the drafter for Qwen3.6 35B A3B Uncensored (Q4_K_P) · 50%")
     const failed = notices(customModel(added, { drafter: attached({ _tag: "DownloadFailed", failure: { _tag: "NetworkUnavailable" } }) }))
     expect(failed).toContain("Can’t reach the model source")
@@ -71,6 +69,6 @@ describe("custom model details", () => {
     expect(drafterUpdateAvailable(customModel(added, { drafter: attached({ _tag: "Present" }) }))).toBe(false)
     expect(drafterUpdateAvailable(customModel(added))).toBe(false)
     expect(drafterUpdateAvailable(catalogModel())).toBe(false)
-    expect(details(customModel(imported, { drafter: attached({ _tag: "Present" }, true) }))).toContain("Magnitude DFlash · Update available")
+    expect(details(customModel(imported, { drafter: attached({ _tag: "Present" }, true) }))).toContain("Magnitude DFlash for Qwen3.6 35B-A3B · Update available")
   })
 })

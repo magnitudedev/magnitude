@@ -15,7 +15,7 @@ use magnitude_service_contracts::{
     InventoryError, LocalDeclaration, ModelComponent, ModelLocation, ModelSource,
 };
 
-use crate::cache::ModelCache;
+use crate::cache::{ModelCache, ModelIndexKind};
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
     ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, ModelGroup, canonical_or_self,
@@ -62,7 +62,7 @@ pub(crate) fn scan_root(
         ModelRootKind::HuggingFaceCache => scan_hf_cache(&root.path, declared, cache, output),
         ModelRootKind::LmStudio => scan_lm_studio(&root.path, cache, output),
         ModelRootKind::LlamaCpp => scan_llama_cpp(&root.path, cache, output),
-        ModelRootKind::Ollama => scan_ollama(&root.path, output),
+        ModelRootKind::Ollama => scan_ollama(&root.path, cache, output),
         ModelRootKind::Folder => scan_folder(&root.path, cache, output),
     }
 }
@@ -283,10 +283,19 @@ struct OllamaLayer {
     size: u64,
 }
 
-/// Ollama names models in `manifests/<registry>/<namespace>/<model>/<tag>`; each manifest's model
-/// layer is a content-addressed blob in `blobs/sha256-<hex>`, whose name is its full SHA-256.
-fn scan_ollama(root: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(), InventoryError> {
+/// One Ollama manifest: its registry path and its parsed layers.
+struct OllamaPull {
+    registry: String,
+    namespace: String,
+    model: String,
+    tag: String,
+    manifest: OllamaManifest,
+}
+
+/// Every manifest under an Ollama root, in `manifests/<registry>/<namespace>/<model>/<tag>`.
+fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
     let manifests = root.join("manifests");
+    let mut pulls = Vec::new();
     for registry in read_dir_sorted(&manifests)? {
         let registry_name = registry.file_name().to_string_lossy().into_owned();
         for namespace in read_dir_sorted(&registry.path())? {
@@ -297,7 +306,6 @@ fn scan_ollama(root: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(), 
                     if !tag.file_type().map_err(io_error)?.is_file() {
                         continue;
                     }
-                    let tag_name = tag.file_name().to_string_lossy().into_owned();
                     let Some(manifest) = read_bounded_json(&tag.path(), MAX_OLLAMA_MANIFEST_BYTES)
                         .and_then(|document| {
                             serde_json::from_value::<OllamaManifest>(document).ok()
@@ -305,42 +313,133 @@ fn scan_ollama(root: &Path, output: &mut Vec<DiscoveryCandidate>) -> Result<(), 
                     else {
                         continue;
                     };
-                    let (name, hub) =
-                        ollama_identity(&registry_name, &namespace_name, &model_name, &tag_name);
-                    if let Some(components) = ollama_components(root, &manifest) {
-                        push_external(
-                            root,
-                            "ollama",
-                            ExternalOrigin::Ollama { name, hub },
-                            LocalDeclaration::Discovery,
-                            components,
-                            output,
-                        );
-                    }
+                    pulls.push(OllamaPull {
+                        registry: registry_name.clone(),
+                        namespace: namespace_name.clone(),
+                        model: model_name.clone(),
+                        tag: tag.file_name().to_string_lossy().into_owned(),
+                        manifest,
+                    });
                 }
             }
+        }
+    }
+    Ok(pulls)
+}
+
+impl OllamaPull {
+    /// The repository of a `hf.co/<owner>/<repository>:<tag>` pull.
+    fn hub_repository(&self) -> Option<String> {
+        matches!(self.registry.as_str(), "hf.co" | "huggingface.co")
+            .then(|| format!("{}/{}", self.namespace, self.model))
+            .filter(|repository| HuggingFaceRepositoryId::new(repository.clone()).is_ok())
+    }
+
+    /// The SHA-256 of the model layer, which is the pulled file's own.
+    fn model_sha256(&self) -> Option<&str> {
+        self.manifest
+            .layers
+            .iter()
+            .find(|layer| layer.media_type == OLLAMA_MODEL_MEDIA_TYPE)?
+            .digest
+            .strip_prefix("sha256:")
+    }
+}
+
+/// Which file of a Hub repository a `hf.co` pull's bytes are, once resolved: `file` is `None` when
+/// no file of the repository has those bytes.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(crate) struct OllamaHubFile {
+    pub(crate) file: Option<String>,
+}
+
+fn ollama_hub_file_evidence(repository: &str, sha256: &str) -> String {
+    format!("ollama-hub-file-v1:{}@{sha256}", repository.to_lowercase())
+}
+
+pub(crate) fn read_ollama_hub_file(
+    cache: &ModelCache,
+    repository: &str,
+    sha256: &str,
+) -> Option<OllamaHubFile> {
+    cache.read_index(
+        ModelIndexKind::OllamaHubFile,
+        &ollama_hub_file_evidence(repository, sha256),
+    )
+}
+
+pub(crate) fn write_ollama_hub_file(
+    cache: &ModelCache,
+    repository: &str,
+    sha256: &str,
+    file: &OllamaHubFile,
+) {
+    cache.write_index(
+        ModelIndexKind::OllamaHubFile,
+        &ollama_hub_file_evidence(repository, sha256),
+        file,
+    );
+}
+
+/// `hf.co` pulls under the enabled Ollama roots whose Hub file is not yet resolved, as
+/// `(repository, sha256)`.
+pub(crate) fn unresolved_ollama_hub_pulls(
+    roots: &[ModelRoot],
+    cache: &ModelCache,
+) -> Vec<(String, String)> {
+    let mut unresolved = roots
+        .iter()
+        .filter(|root| root.enabled && root.kind == ModelRootKind::Ollama)
+        .flat_map(|root| ollama_pulls(&root.path).unwrap_or_default())
+        .filter_map(|pull| {
+            let repository = pull.hub_repository()?;
+            let sha256 = pull.model_sha256()?.to_owned();
+            read_ollama_hub_file(cache, &repository, &sha256)
+                .is_none()
+                .then_some((repository, sha256))
+        })
+        .collect::<Vec<_>>();
+    unresolved.sort();
+    unresolved.dedup();
+    unresolved
+}
+
+/// Each Ollama manifest's model blob. Ollama records only the tag of a `hf.co` pull, so its Hub
+/// identity is the repository file with the same bytes, resolved once and cached; until then, or
+/// when no such file exists, the blob has no Hub identity and is identified by its header. Either
+/// way the same bytes have the same identity whichever locations are enabled.
+fn scan_ollama(
+    root: &Path,
+    cache: &ModelCache,
+    output: &mut Vec<DiscoveryCandidate>,
+) -> Result<(), InventoryError> {
+    for pull in ollama_pulls(root)? {
+        let name = ollama_name(&pull.registry, &pull.namespace, &pull.model, &pull.tag);
+        let hub = pull.hub_repository().and_then(|repository| {
+            let file = read_ollama_hub_file(cache, &repository, pull.model_sha256()?)?.file?;
+            hub_file(repository, file)
+        });
+        if let Some(components) = ollama_components(root, &pull.manifest) {
+            push_external(
+                root,
+                "ollama",
+                ExternalOrigin::Ollama { name, hub },
+                LocalDeclaration::Discovery,
+                components,
+                output,
+            );
         }
     }
     Ok(())
 }
 
-/// The name Ollama shows and, for a `hf.co/<owner>/<repository>:<tag>` pull, the Hub identity.
-/// Ollama records only the tag, so the selector is `<tag>.gguf`.
-fn ollama_identity(
-    registry: &str,
-    namespace: &str,
-    model: &str,
-    tag: &str,
-) -> (String, Option<HubFile>) {
-    let name = match (registry, namespace) {
+/// The name Ollama shows for a model.
+fn ollama_name(registry: &str, namespace: &str, model: &str, tag: &str) -> String {
+    match (registry, namespace) {
         (OLLAMA_REGISTRY, "library") => format!("{model}:{tag}"),
         (OLLAMA_REGISTRY, _) => format!("{namespace}/{model}:{tag}"),
         _ => format!("{registry}/{namespace}/{model}:{tag}"),
-    };
-    let hub = matches!(registry, "hf.co" | "huggingface.co")
-        .then(|| hub_file(format!("{namespace}/{model}"), format!("{tag}.gguf")))
-        .flatten();
-    (name, hub)
+    }
 }
 
 fn ollama_blob(root: &Path, layer: &OllamaLayer) -> Option<(PathBuf, String)> {

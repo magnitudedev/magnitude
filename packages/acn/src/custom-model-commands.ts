@@ -1,8 +1,9 @@
 import * as FileSystem from "@effect/platform/FileSystem"
-import { Context, Effect, Either, Layer, Option, Schema } from "effect"
-import { dirname, basename, isAbsolute, normalize } from "node:path"
+import { Context, Effect, Either, Layer, Option, Schedule, Schema } from "effect"
+import { dirname, basename, isAbsolute, normalize, sep } from "node:path"
 import {
   CandidateInspectionSchema,
+  CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
   DirectoryAccessDenied,
   DirectoryNotFound,
@@ -18,6 +19,7 @@ import {
   preselectedDrafterCandidate,
   type AutomaticModelLocationKind,
   type CandidateInspection,
+  type CatalogFormModelId,
   type CustomFormModelId,
   type CustomLocalModel,
   type CustomModelMutationError,
@@ -28,10 +30,12 @@ import {
   type HuggingFaceRepositoryId,
   type HuggingFaceSearchResponse,
   type LocalInferenceError,
+  type LocalModelSyncOutcome,
   type ModelCandidateError,
   type ModelId,
   type ModelLocation,
   type ModelLocationError,
+  type ModelLocationKind,
 } from "@magnitudedev/acn-protocol"
 import {
   IcnCandidates,
@@ -54,8 +58,8 @@ import {
 import {
   DrafterMethods,
   drafterReferenceKey,
+  drafterReferenceNaming,
   nativeDrafterReference,
-  orderDrafterCandidates,
   presentField,
   productDrafterCandidate,
 } from "./drafter-references"
@@ -63,7 +67,7 @@ import { LocalModelSources } from "./local-model-sources"
 import { LocalModels, projectAssessment } from "./local-models"
 import { ModelLocations } from "./model-locations"
 import { parseModelReference, repositoryDisplayName } from "./model-references"
-import { ServingUsage } from "./serving-usage"
+import { productUnsupportedReasons } from "./unsupported-reasons"
 
 export interface AddedCustomModel {
   readonly modelId: CustomFormModelId
@@ -71,6 +75,59 @@ export interface AddedCustomModel {
   readonly drafter: Option.Option<DrafterCandidate>
   readonly outcome: "Started" | "AlreadyOnThisComputer"
 }
+
+/** Where a catalog model found only outside Magnitude's store keeps its files. */
+export interface ExternalModelFiles {
+  readonly path: string
+  readonly location: Option.Option<ModelLocationKind>
+}
+
+const locationPhrase = (files: ExternalModelFiles): string => Option.match(files.location, {
+  onNone: () => files.path,
+  onSome: (kind) => {
+    switch (kind) {
+      case "HuggingFaceCache": return `your Hugging Face cache (${files.path})`
+      case "LmStudio": return `LM Studio's models folder (${files.path})`
+      case "LlamaCpp": return `the llama.cpp cache (${files.path})`
+      case "Ollama": return `Ollama's models folder (${files.path})`
+      case "Folder": return files.path
+    }
+  },
+})
+
+const deleteElsewhere = (location: Option.Option<ModelLocationKind>): string => Option.match(location, {
+  onNone: () => "or delete the files yourself",
+  onSome: (kind) => {
+    switch (kind) {
+      case "HuggingFaceCache": return "or delete it with the Hugging Face CLI (`hf cache delete`)"
+      case "LmStudio": return "or delete it in LM Studio"
+      case "Ollama": return "or delete it with `ollama rm`"
+      case "LlamaCpp":
+      case "Folder": return "or delete the files yourself"
+    }
+  },
+})
+
+/** Why Remove leaves a catalog model found outside Magnitude's store, and what to do instead. */
+export const externalCatalogRemovalRefusal = (modelId: CatalogFormModelId, files: ExternalModelFiles) =>
+  new LocalModelMutationFailed({
+    code: "model_removal_retained_external",
+    message: `${modelId} uses files in ${locationPhrase(files)}, which Magnitude never deletes. `
+      + `Hide it with \`magnitude models hide ${modelId}\`, ${deleteElsewhere(files.location)}.`,
+    retryable: false,
+  })
+
+const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
+  code: "catalog_model_not_hideable",
+  message: `${modelId} is a catalog model. Remove it with \`magnitude catalog remove ${modelId}\` instead.`,
+  retryable: false,
+})
+
+/** The location holding a path: the deepest scanned directory that contains it. */
+const containingLocation = (path: string, locations: readonly ModelLocation[]): Option.Option<ModelLocationKind> =>
+  Option.fromNullable(locations
+    .filter((location) => path === location.path || path.startsWith(`${location.path.replace(/[\\/]+$/, "")}${sep}`))
+    .sort((left, right) => right.path.length - left.path.length)[0]?.kind)
 
 /** Custom-model commands: finding and adding models, drafters, hiding, and model locations. */
 export interface CustomModelCommandsApi {
@@ -98,8 +155,9 @@ export interface CustomModelCommandsApi {
     modelId: CustomFormModelId,
     drafter: DrafterChoice,
   ) => Effect.Effect<Option.Option<DrafterCandidate>, CustomModelMutationError>
-  readonly hide: (modelId: CustomFormModelId) => Effect.Effect<void, LocalModelMutationFailed>
-  readonly unhide: (modelId: CustomFormModelId) => Effect.Effect<void, LocalModelMutationFailed>
+  readonly hide: (modelId: ModelId) => Effect.Effect<void, LocalModelMutationFailed>
+  readonly unhide: (modelId: ModelId) => Effect.Effect<void, LocalModelMutationFailed>
+  readonly externalCatalogFiles: (modelId: CatalogFormModelId) => Effect.Effect<Option.Option<ExternalModelFiles>>
   readonly addFolder: (path: string) => Effect.Effect<void, ModelLocationError>
   readonly removeFolder: (path: string) => Effect.Effect<void, ModelLocationError>
   readonly setLocationEnabled: (
@@ -108,7 +166,7 @@ export interface CustomModelCommandsApi {
   ) => Effect.Effect<void, LocalModelMutationFailed>
   readonly listLocations: Effect.Effect<readonly ModelLocation[]>
   readonly remove: (modelId: CustomFormModelId) => Effect.Effect<{}, LocalInferenceError>
-  readonly sync: (modelId: CustomFormModelId) => Effect.Effect<{ readonly outcome: "Started" | "AlreadyCurrent" }, LocalInferenceError>
+  readonly sync: (modelId: CustomFormModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError>
   readonly cancelSync: (modelId: CustomFormModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly acknowledgeSyncFailure: (modelId: CustomFormModelId) => Effect.Effect<{}, LocalInferenceError>
 }
@@ -180,9 +238,8 @@ export const CustomModelCommandsLive: Layer.Layer<
   | CustomModelReconciler
   | DrafterMethods
   | ModelLocations
-  | ServingUsage
   | FileSystem.FileSystem
-> = Layer.effect(CustomModelCommands, Effect.gen(function* () {
+> = Layer.scoped(CustomModelCommands, Effect.gen(function* () {
   const icn = yield* IcnCandidates
   const downloads = yield* IcnDownloads
   const assessments = yield* IcnModelAssessments
@@ -193,7 +250,6 @@ export const CustomModelCommandsLive: Layer.Layer<
   const reconciler = yield* CustomModelReconciler
   const methods = yield* DrafterMethods
   const locations = yield* ModelLocations
-  const usage = yield* ServingUsage
   const fs = yield* FileSystem.FileSystem
 
   const environmentId = assessments.get.pipe(Effect.map(({ state }) => state.environmentId))
@@ -223,6 +279,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         modelId: decoded.value,
         files: version.files.map(({ path }) => path),
         sizeBytes: version.sizeBytes,
+        downloadBytes: version.downloadBytes,
         assessment: Option.map(version.assessment, (assessment) => projectAssessment(environment, assessment)),
         recommended: version.recommended,
         onThisComputer: version.onThisComputer,
@@ -253,7 +310,8 @@ export const CustomModelCommandsLive: Layer.Layer<
       })),
       ...presentField("selectedVersion", Option.map(selected, ({ label }) => label)),
       ...presentField("projector", native.projector),
-      ...presentField("unsupportedArchitecture", Option.filter(native.unsupportedArchitecture, (reasons) => reasons.length > 0)),
+      ...presentField("unsupportedArchitecture", Option.filter(native.unsupportedArchitecture, (reasons) => reasons.length > 0)
+        .pipe(Option.map((reasons) => productUnsupportedReasons(reasons, "")))),
     }).pipe(Effect.mapError(() => new ModelSourceUnavailable({
       message: "The inference service described this model in a form Magnitude doesn't understand.",
       retryable: false,
@@ -274,7 +332,12 @@ export const CustomModelCommandsLive: Layer.Layer<
   })
 
   /** The ICN drafter target and, when its files are readable, the same target as a candidate for bundles. */
-  const nativeTarget = (target: DrafterTarget) => Effect.gen(function* () {
+  interface NativeTarget {
+    readonly request: (other: Option.Option<string>) => Native.DrafterCandidatesRequest
+    readonly candidate: Option.Option<Native.ModelCandidate>
+  }
+
+  const nativeTarget = (target: DrafterTarget): Effect.Effect<NativeTarget> => Effect.gen(function* () {
     if (target._tag === "Candidate") {
       const candidate: Native.ModelCandidate = {
         source: target.source as Native.CandidateSource,
@@ -286,12 +349,19 @@ export const CustomModelCommandsLive: Layer.Layer<
         request: (other: Option.Option<string>) =>
           ({ _tag: "Candidate", candidate, other }) as Native.DrafterCandidatesRequest,
         candidate: Option.some(candidate),
-        modelId: target.source._tag === "HuggingFace"
-          ? Option.some(`hf:${target.source.repository}/${target.files[0]}`)
-          : Option.none<string>(),
       }
     }
     const custom = (yield* sources.state).customModels.find(({ id }) => id === target.modelId)
+    const declaration = (yield* customModels.get).declarations[target.modelId as CustomFormModelId]
+    // An added model still downloading has no files yet; its declared repository file stands in.
+    if (custom?.source.state._tag === "NotInstalled" && declaration?.origin._tag === "Added") {
+      const candidate: DrafterTarget = {
+        _tag: "Candidate",
+        source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit },
+        files: declaration.target,
+      }
+      return yield* nativeTarget(candidate)
+    }
     const primary = custom?.source.files[0]?.path
     return {
       request: (other: Option.Option<string>) =>
@@ -304,25 +374,19 @@ export const CustomModelCommandsLive: Layer.Layer<
             projector: Option.none(),
             drafter: Option.none(),
           }),
-      modelId: Option.some<string>(target.modelId),
     }
   })
 
-  const measuredFor = (modelId: Option.Option<string>) => Effect.map(usage.acceptance, (rows) =>
-    (reference: DrafterReference) => Option.flatMap(modelId, (id) => Option.fromNullable(rows.find((row) =>
-      row.model === id && row.drafter === drafterReferenceKey(reference))?.acceptance)))
-
   const listDrafterCandidates = (target: DrafterTarget, other: Option.Option<string>) => Effect.gen(function* () {
-    const { request, modelId } = yield* nativeTarget(target)
+    const { request } = yield* nativeTarget(target)
     const label = Option.getOrElse(other, () => target._tag === "Model" ? target.modelId : target.files[0])
     const native = yield* icn.drafters(request(other)).pipe(Effect.mapError(candidateFailure(label)))
-    const measured = yield* measuredFor(modelId)
-    const ordered = orderDrafterCandidates(native.flatMap((candidate) => Option.toArray(productDrafterCandidate(candidate)))
-      .map((candidate) => ({ ...candidate, measuredAcceptance: measured(candidate.reference) })))
-    yield* Effect.forEach(ordered, (candidate) => candidate.verdict._tag === "Bound"
+    const { catalogModels } = yield* sources.state
+    const candidates = native.flatMap((candidate) => Option.toArray(productDrafterCandidate(candidate, catalogModels)))
+    yield* Effect.forEach(candidates, (candidate) => candidate.verdict._tag === "Bound"
       ? methods.remember(candidate.reference, candidate.verdict.method)
       : Effect.void, { discard: true })
-    return ordered
+    return candidates
   })
 
   /** How ICN's "different drafter" input names a reference it did not list. */
@@ -417,6 +481,12 @@ export const CustomModelCommandsLive: Layer.Layer<
 
   const settle = reconciler.push.pipe(Effect.catchAll((error) => Effect.logWarning(error.message)))
 
+  /** After a model stops using a drafter, ICN deletes Magnitude's drafter packages no model uses. */
+  const pruneDrafters = localModels_.pruneDrafters.pipe(
+    Effect.asVoid,
+    Effect.catchAll((error) => Effect.logWarning(`Removing unused drafters failed: ${error.message}`)),
+  )
+
   const toMutation = (cause: GeneratedClientError<unknown> | CustomModelMutationError): CustomModelMutationError =>
     cause._tag === "InvalidModelReference" || cause._tag === "ModelSourceUnavailable" || cause._tag === "LocalModelMutationFailed"
       ? cause
@@ -432,6 +502,20 @@ export const CustomModelCommandsLive: Layer.Layer<
     return { config, related }
   })
 
+  /** A catalog model whose files are all in an external location is a found copy: hidden, never deleted. */
+  const externalCatalogFiles = (modelId: CatalogFormModelId) => Effect.gen(function* () {
+    const state = yield* localModels.state
+    const model = [...state.models, ...state.hidden].find((candidate) => candidate.modelId === modelId)
+    if (model?._tag !== "Catalog" || !("installation" in model.acquisitionState)) return Option.none<ExternalModelFiles>()
+    const { installation } = model.acquisitionState
+    if (installation.ownership !== "External" || installation._tag !== "Resolved") return Option.none<ExternalModelFiles>()
+    const scanned = yield* locations.list(yield* customModels.get)
+    return Option.some<ExternalModelFiles>({
+      path: installation.primaryPath,
+      location: containingLocation(installation.primaryPath, scanned),
+    })
+  })
+
   const validateFolder = (path: string): Effect.Effect<string, ModelLocationError> => Effect.gen(function* () {
     const trimmed = path.trim()
     if (!isAbsolute(trimmed)) return yield* new InvalidDirectoryPath({ path })
@@ -445,7 +529,7 @@ export const CustomModelCommandsLive: Layer.Layer<
     return folder
   })
 
-  return CustomModelCommands.of({
+  const commands = CustomModelCommands.of({
     searchHuggingFace: ({ query, limit, all }) => icn.search({
       query,
       limit: Option.getOrElse(limit, () => 20),
@@ -464,7 +548,8 @@ export const CustomModelCommandsLive: Layer.Layer<
             ...presentField("variantOf", result.variantOf),
             downloads: Option.getOrElse(result.downloads, () => 0),
             ...presentField("architecture", Option.filter(result.architecture, (value) => value.length > 0)),
-            ...presentField("unsupported", Option.some(result.unsupported).pipe(Option.filter((reasons) => reasons.length > 0))),
+            ...presentField("unsupported", Option.some(result.unsupported).pipe(Option.filter((reasons) => reasons.length > 0),
+              Option.map((reasons) => productUnsupportedReasons(reasons, "")))),
           }))
         }),
       })),
@@ -556,6 +641,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         drafters: { ...config.drafters, [modelId]: persistedChoice(drafter, chosen) },
       }] as const))
       yield* settle
+      yield* pruneDrafters
       yield* Option.match(chosen, {
         onNone: () => Effect.succeed(false),
         onSome: (value) => startDrafterOnly(modelId, { _tag: "Model", modelId }, value),
@@ -563,9 +649,17 @@ export const CustomModelCommandsLive: Layer.Layer<
       return chosen
     }).pipe(Effect.mapError(toMutation)),
 
-    hide: (modelId) => customModels.modify((config) => Effect.succeed([undefined, config.hidden.includes(modelId)
-      ? config
-      : { ...config, hidden: [...config.hidden, modelId] }] as const)).pipe(Effect.zipRight(settle)),
+    hide: (modelId) => Effect.gen(function* () {
+      if (Schema.is(CatalogFormModelIdSchema)(modelId) && Option.isNone(yield* externalCatalogFiles(modelId))) {
+        return yield* catalogHideRefusal(modelId)
+      }
+      yield* customModels.modify((config) => Effect.succeed([undefined, config.hidden.includes(modelId)
+        ? config
+        : { ...config, hidden: [...config.hidden, modelId] }] as const))
+      yield* settle
+    }),
+
+    externalCatalogFiles,
 
     unhide: (modelId) => customModels.modify((config) => Effect.succeed([undefined, {
       ...config,
@@ -625,6 +719,7 @@ export const CustomModelCommandsLive: Layer.Layer<
         drafters: withoutKey(current.drafters, modelId),
       }] as const))
       yield* settle
+      yield* pruneDrafters
       return {}
     }),
 
@@ -634,24 +729,35 @@ export const CustomModelCommandsLive: Layer.Layer<
       const declaration = config.declarations[modelId]
       if (Option.isNone(row) && declaration === undefined) return yield* notFound(modelId)
       const attached = Option.flatMap(row, ({ drafter }) => drafter)
-      const chosen = Option.map(attached, (drafter): DrafterCandidate => ({
-        category: "Other", reference: drafter.reference, label: drafter.label, sizeBytes: drafter.sizeBytes,
-        lineage: "None", verdict: drafter.verdict, onThisComputer: false, method: Option.none(),
-        measuredAcceptance: Option.none(),
-      }))
+      // Until ICN has bound a configured drafter (just after a restart) the persisted choice names it.
+      const configured = config.drafters[modelId]
+      const sourceState = yield* sources.state
+      const chosen = Option.orElse(
+        Option.map(attached, (drafter): DrafterCandidate => ({
+          category: "Other", reference: drafter.reference, name: drafter.name, label: drafter.label,
+          sizeBytes: drafter.sizeBytes, lineage: "None", verdict: drafter.verdict, onThisComputer: false,
+          method: Option.none(),
+        })),
+        () => configured?._tag === "Reference" ? Option.some<DrafterCandidate>({
+          category: "Other", reference: configured.reference,
+          ...drafterReferenceNaming(configured.reference, sourceState.catalogModels), sizeBytes: 0,
+          lineage: "None", verdict: { _tag: "None" }, onThisComputer: false, method: Option.none(),
+        }) : Option.none(),
+      )
       const acquisition = Option.map(row, ({ acquisitionState }) => acquisitionState._tag)
       const targetActive = Option.exists(currentDownload(related, "Target"), downloadIsActive)
       const targetMissing = declaration?.origin._tag === "Added" && !targetActive
         && Option.match(acquisition, { onNone: () => true, onSome: (tag) => tag === "NotInstalled" || tag === "InstallFailed" })
+      const current = { outcome: "AlreadyCurrent" as LocalModelSyncOutcome }
       if (targetMissing && declaration !== undefined) {
-        return { outcome: (yield* startAddedDownload(modelId, declaration, chosen)) ? "Started" as const : "AlreadyCurrent" as const }
+        return (yield* startAddedDownload(modelId, declaration, chosen)) ? { outcome: "Installing" as const } : current
       }
-      const needsDrafter = Option.exists(attached, ({ availability, updateAvailable }) =>
-        availability._tag === "DownloadFailed" || updateAvailable)
+      const drafterUpdate = Option.exists(attached, ({ updateAvailable }) => updateAvailable)
+      const drafterMissing = Option.exists(attached, ({ availability }) => availability._tag === "DownloadFailed")
       const drafterActive = Option.exists(currentDownload(related, "Drafter"), downloadIsActive)
-      if (!needsDrafter || drafterActive || targetActive || Option.isNone(chosen)) return { outcome: "AlreadyCurrent" as const }
+      if ((!drafterUpdate && !drafterMissing) || drafterActive || targetActive || Option.isNone(chosen)) return current
       const started = yield* startDrafterOnly(modelId, { _tag: "Model", modelId }, chosen.value)
-      return { outcome: started ? "Started" as const : "AlreadyCurrent" as const }
+      return started ? { outcome: drafterUpdate ? "Updating" as const : "DownloadingDrafter" as const } : current
     }).pipe(Effect.mapError((cause) => cause._tag === "LocalModelMutationFailed" ? cause : commandFailed("sync")(
       cause as GeneratedClientError<unknown> | ModelCandidateError,
     ))),
@@ -673,4 +779,20 @@ export const CustomModelCommandsLive: Layer.Layer<
       Effect.as({}),
     ),
   })
+
+  // Downloads do not outlive the service; an added model interrupted by a restart resumes, keeping its bytes.
+  // A push first relearns the drafter methods its bundle needs.
+  yield* Effect.gen(function* () {
+    yield* reconciler.push.pipe(Effect.ignore)
+    const state = yield* localModels.state.pipe(
+      Effect.filterOrFail((current) => current.preparation.discovery.complete, () => "discovering" as const),
+      Effect.retry(Schedule.spaced("1 second")),
+    )
+    const interrupted = state.models.filter((model) => model._tag === "Custom" && model.origin._tag === "Added"
+      && model.acquisitionState._tag === "NotInstalled")
+    yield* Effect.forEach(interrupted, (model) => commands.sync(model.modelId as CustomFormModelId).pipe(
+      Effect.catchAll((error) => Effect.logWarning(`Unable to resume the download of ${model.modelId}: ${error.message}`)),
+    ), { discard: true })
+  }).pipe(Effect.forkScoped)
+  return commands
 }))

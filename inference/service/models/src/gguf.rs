@@ -73,7 +73,38 @@ pub enum GgufError {
     UnknownFileType(u64),
 }
 
+/// Header inspection of a file that must be complete on disk: a local file shorter than the tensor
+/// data its header declares is truncated, so it is refused as unreadable. Header-only previews use
+/// [`inspect`].
+pub fn inspect_complete(path: &Path) -> Result<GgufInspection, GgufError> {
+    let directory = read_directory(path)?;
+    let declared = directory
+        .tensors
+        .iter()
+        .map(|tensor| tensor.offset.saturating_add(tensor.nbytes))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(directory.data_offset);
+    let actual = std::fs::metadata(path)?.len();
+    if actual < declared {
+        return Err(GgufError::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "GGUF file is truncated: it has {actual} bytes of the {declared} its header declares"
+            ),
+        )));
+    }
+    let header_digest = header_digest(path, directory.data_offset)?;
+    interpret(&directory, header_digest)
+}
+
 pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
+    let directory = read_directory(path)?;
+    let header_digest = header_digest(path, directory.data_offset)?;
+    interpret(&directory, header_digest)
+}
+
+fn read_directory(path: &Path) -> Result<Directory, GgufError> {
     let mut preamble = [0_u8; 8];
     File::open(path)?.read_exact(&mut preamble)?;
     if preamble[..4] != MAGIC {
@@ -84,9 +115,7 @@ pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     {
         return Err(GgufError::UnsupportedVersion(version));
     }
-    let directory = magnitude_artifacts::gguf::inspect_header(path).map_err(GgufError::Header)?;
-    let header_digest = header_digest(path, directory.data_offset)?;
-    interpret(&directory, header_digest)
+    magnitude_artifacts::gguf::inspect_header(path).map_err(GgufError::Header)
 }
 
 fn header_digest(path: &Path, header_bytes: u64) -> Result<String, GgufError> {
@@ -150,7 +179,7 @@ fn is_nextn_tensor(name: &str) -> bool {
         })
 }
 
-fn interpret(directory: &Directory, header_digest: String) -> Result<GgufInspection, GgufError> {
+pub(crate) fn interpret(directory: &Directory, header_digest: String) -> Result<GgufInspection, GgufError> {
     let architecture = string_value(directory, "general.architecture");
     let role = role(directory, architecture.as_deref());
     let training_context_length = architecture

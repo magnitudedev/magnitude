@@ -86,7 +86,6 @@ export const makeFoundModel = (
   },
   drafter: Option.none(),
   recommendedDrafter: Option.none(),
-  measuredAcceptance: Option.none(),
   acquisitionState: {
     _tag: "External",
     installation: {

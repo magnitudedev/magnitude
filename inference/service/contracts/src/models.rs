@@ -1430,15 +1430,16 @@ pub enum DrafterReference {
     },
 }
 
+/// Where a drafter candidate comes from, in the order automatic choice prefers: a separate drafter
+/// in the model's own repository or folder, the matched catalog model's drafter, MTP heads built
+/// into the model, then a drafter the user entered, which is never chosen automatically.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum DrafterCategory {
+    NextToModel,
     CatalogDrafter,
     BuiltIn,
-    NextToModel,
-    OnThisComputer,
-    HuggingFace,
     Other,
 }
 
@@ -1458,6 +1459,7 @@ pub enum DrafterLineage {
 pub struct DrafterCandidate {
     pub category: DrafterCategory,
     pub reference: DrafterReference,
+    pub name: String,
     pub label: String,
     pub size_bytes: u64,
     pub lineage: DrafterLineage,
@@ -1519,6 +1521,9 @@ pub struct CustomModel {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub variant_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub variant_of: Option<ModelId>,
     pub files: Vec<CustomModelFile>,
     pub size_bytes: u64,
@@ -1571,6 +1576,15 @@ pub struct LocalModelsResponse {
 pub struct LocalModelRemoval {
     pub model_id: ModelId,
     pub removed: bool,
+    pub freed_bytes: u64,
+}
+
+/// Magnitude-owned drafter packages removed because no model uses them any more.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DrafterPruning {
+    pub removed: Vec<ModelPackageId>,
     pub freed_bytes: u64,
 }
 
@@ -1697,6 +1711,9 @@ pub enum CandidateInspectionRequest {
     },
 }
 
+/// One version of a candidate. `download_bytes` is what adding it downloads before any drafter:
+/// its files and the repository's projector, or nothing when it is already on this computer or
+/// is a local file used in place.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1705,6 +1722,7 @@ pub struct CandidateVersion {
     pub model_id: ModelId,
     pub files: Vec<CandidateFile>,
     pub size_bytes: u64,
+    pub download_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub assessment: Option<ModelAssessment>,
@@ -2256,6 +2274,9 @@ pub trait LocalModels: Send + Sync + 'static {
         &self,
         model_id: &ModelId,
     ) -> BoxFuture<'_, Result<LocalModelRemoval, InventoryError>>;
+    /// Removes the Magnitude-owned drafter packages that neither an installed catalog model nor
+    /// any custom model uses. Drafters in other locations are never touched.
+    fn prune_drafters(&self) -> BoxFuture<'_, Result<DrafterPruning, InventoryError>>;
     fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation>;
 }
 

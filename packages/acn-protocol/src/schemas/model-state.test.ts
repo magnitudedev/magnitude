@@ -365,6 +365,7 @@ describe("CandidateInspectionSchema", () => {
     modelId: `hf:owner/repository/model-${label}.gguf`,
     files: [`model-${label}.gguf`],
     sizeBytes: 10,
+    downloadBytes: 10,
     recommended,
   })
   const inspection = {

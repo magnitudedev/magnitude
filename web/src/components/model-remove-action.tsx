@@ -1,15 +1,17 @@
 import { useState } from "react"
 import { EyeSlashIcon, TrashIcon } from "@phosphor-icons/react"
 import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
-import type { LocalModel } from "@magnitudedev/sdk"
+import { installedAcquisition, type LocalModel } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 import { ConfirmDialog } from "./confirm-dialog"
 
 /** What Remove does follows who owns the files: delete Magnitude's own, forget an imported file, hide a found one. */
 export type RemovalKind = "delete" | "forget" | "hide"
 
-export const removalKind = (model: LocalModel): RemovalKind =>
-  model._tag === "Catalog" || model.origin._tag === "Added" ? "delete" : model.origin._tag === "Imported" ? "forget" : "hide"
+export const removalKind = (model: LocalModel): RemovalKind => {
+  if (model._tag === "Catalog") return installedAcquisition(model.acquisitionState)?.installation.ownership === "External" ? "hide" : "delete"
+  return model.origin._tag === "Added" ? "delete" : model.origin._tag === "Imported" ? "forget" : "hide"
+}
 
 /** Remove for any model: deleting or forgetting asks first; hiding, offered with `onHide`, is undone from the Hidden filter. */
 export function ModelRemoveAction({ model, running, disabled, onRemove, onHide }: {

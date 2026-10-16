@@ -37,7 +37,6 @@ describe("model slot reconciliation", () => {
         },
         drafter: Option.none(),
         recommendedDrafter: Option.none(),
-        measuredAcceptance: Option.none(),
         acquisitionState: {
           _tag: "Unavailable",
           installation: {

@@ -1,7 +1,7 @@
 import { Option } from "effect"
 import { ArrowUpRightIcon, LightningIcon } from "@phosphor-icons/react"
 import {
-  customModelDrafterOffer, drafterAcceptanceLabel, drafterSlowingWarning, formatLocalModelDisplayName,
+  customModelDrafterOffer, formatLocalModelDisplayName,
 } from "@magnitudedev/client-common"
 import type { CustomLocalModel, DrafterCandidate, LocalModel, ModelTransferProgress } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
@@ -58,7 +58,7 @@ export function CustomModelDetails({ model, variantOfName, disabled, onChangeDra
     <div className="min-w-0 sm:col-span-2"><dt className="text-xs text-slate-500">Drafter</dt><dd className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
       {Option.match(model.drafter, {
         onSome: drafter => <>
-          <span>{drafter.label}{Option.match(model.measuredAcceptance, { onNone: () => "", onSome: acceptance => ` · ${drafterAcceptanceLabel(acceptance)}` })}{drafter.updateAvailable ? " · Update available" : ""}</span>
+          <span className="min-w-0 truncate" title={drafter.name}>{drafter.name}{drafter.updateAvailable ? " · Update available" : ""}</span>
           <Button variant="outline" size="unstyled" className={textButton} disabled={disabled} onClick={onChangeDrafter}>Change</Button>
           <Button variant="ghost" size="unstyled" className={textButton} disabled={disabled} onClick={onTurnOffDrafter}>Turn off</Button>
         </>,
@@ -71,18 +71,15 @@ export function CustomModelDetails({ model, variantOfName, disabled, onChangeDra
   </dl>
 }
 
-/** A drafter-only download's progress and failure, and a drafter that slows decoding, under a custom model's card. */
-export function DrafterNotices({ model, disabled, onChangeDrafter, onTurnOffDrafter, onRetry, onCancel, onDismiss }: {
+/** A drafter-only download's progress and failure under a custom model's card. */
+export function DrafterNotices({ model, disabled, onRetry, onCancel, onDismiss }: {
   model: CustomLocalModel
   disabled: boolean
-  onChangeDrafter: () => void
-  onTurnOffDrafter: () => void
   onRetry: () => void
   onCancel: () => void
   onDismiss: () => void
 }) {
   const availability = Option.map(model.drafter, drafter => drafter.availability)
-  const slowing = drafterSlowingWarning(model)
   return <>
     {Option.isSome(availability) && availability.value._tag === "Downloading" && <div className="col-span-full mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500">
       <p role="status">Downloading the drafter for {formatLocalModelDisplayName(model)} · {transferPercent(availability.value.progress)}</p>
@@ -90,7 +87,5 @@ export function DrafterNotices({ model, disabled, onChangeDrafter, onTurnOffDraf
     </div>}
     {Option.isSome(availability) && availability.value._tag === "DownloadFailed" && <ErrorNotice {...downloadNotice(availability.value.failure)} className="col-span-full mt-3"
       actions={<><NoticeAction disabled={disabled} onClick={onRetry}>Retry drafter download</NoticeAction><NoticeAction disabled={disabled} onClick={onDismiss}>Dismiss</NoticeAction></>} />}
-    {Option.isSome(slowing) && <ErrorNotice severity="warning" title={slowing.value} description="Responses are faster without it on this computer." className="col-span-full mt-3"
-      actions={<><NoticeAction disabled={disabled} onClick={onChangeDrafter}>Change</NoticeAction><NoticeAction disabled={disabled} onClick={onTurnOffDrafter}>Turn off</NoticeAction></>} />}
   </>
 }

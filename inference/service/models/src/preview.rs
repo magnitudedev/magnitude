@@ -39,7 +39,6 @@ const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
 const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 const SEARCH_LINEAGE_CONCURRENCY: usize = 4;
-const MAX_DRAFTER_SEARCH_RESULTS: u32 = 8;
 
 /// Live Hub search and immutable resolution for the service's API. Catalog publication and
 /// managed inventory do not depend on these queries.
@@ -47,6 +46,7 @@ pub struct HuggingFaceDiscovery {
     models: Arc<ManagedModelStore>,
     architectures: RecognizedArchitectures,
     lineage: Arc<CatalogLineage>,
+    shapes: Arc<dyn crate::lineage::CatalogShapes>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
 }
 
@@ -56,11 +56,13 @@ impl HuggingFaceDiscovery {
         models: Arc<ManagedModelStore>,
         architectures: RecognizedArchitectures,
         lineage: Arc<CatalogLineage>,
+        shapes: Arc<dyn crate::lineage::CatalogShapes>,
     ) -> Self {
         Self {
             models,
             architectures,
             lineage,
+            shapes,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
         }
     }
@@ -111,10 +113,19 @@ impl HuggingFaceDiscovery {
         let mut hidden_count = 0_u32;
         let mut kept = Vec::new();
         for model in metadata {
+            let parameters = model
+                .gguf
+                .as_ref()
+                .and_then(|gguf| gguf.get("total"))
+                .and_then(serde_json::Value::as_u64);
             let Some(mut result) = model.into_contract() else {
                 continue;
             };
-            if catalog_repositories.contains(&result.repository.to_lowercase()) {
+            if catalog_repositories.contains(&result.repository.to_lowercase())
+                || self
+                    .architectures
+                    .is_drafter_repository(result.architecture.as_deref(), &result.tags)
+            {
                 continue;
             }
             if !self
@@ -129,12 +140,12 @@ impl HuggingFaceDiscovery {
                     architecture: result.architecture.clone().unwrap_or_default(),
                 }];
             }
-            kept.push(result);
+            kept.push((result, parameters));
         }
         let results = futures_util::stream::iter(kept)
-            .map(|mut result| async move {
+            .map(|(mut result, parameters)| async move {
                 if result.unsupported.is_empty() {
-                    result.variant_of = self.variant_of(&result).await;
+                    result.variant_of = self.variant_of(&result, parameters).await;
                 }
                 result
             })
@@ -148,8 +159,13 @@ impl HuggingFaceDiscovery {
     }
 
     /// The catalog model a result derives from: its repository and direct base models first,
-    /// then one more hop through finetunes.
-    async fn variant_of(&self, result: &HuggingFaceModelSearchResult) -> Option<ModelId> {
+    /// then one more hop through finetunes, then, for a repository that declares no lineage the
+    /// catalog knows, the catalog model of its architecture and size.
+    async fn variant_of(
+        &self,
+        result: &HuggingFaceModelSearchResult,
+        parameters: Option<u64>,
+    ) -> Option<ModelId> {
         let mut direct = BTreeSet::from([result.repository.to_lowercase()]);
         direct.extend(result.base_models.iter().map(|base| base.to_lowercase()));
         if let Some(matched) = self.lineage.match_lineage(&direct).await {
@@ -160,10 +176,12 @@ impl HuggingFaceDiscovery {
             .hub()
             .lineage(&result.repository, Some(result.base_models.clone()))
             .await;
-        self.lineage
-            .match_lineage(&lineage)
-            .await
-            .map(|matched| matched.model_id)
+        if let Some(matched) = self.lineage.match_lineage(&lineage).await {
+            return Some(matched.model_id);
+        }
+        let shapes = self.shapes.catalog_shapes().await;
+        crate::lineage::shape_match(&shapes, result.architecture.as_deref()?, parameters?)
+            .map(|shape| shape.model_id.clone())
     }
 }
 
@@ -661,8 +679,7 @@ impl ManagedModelStore {
         let cached = self.cached_preview_artifact(source).filter(|artifact| {
             artifact.components.iter().all(|component| {
                 self.cache
-                    .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
-                    .is_some()
+                    .has_blob(ModelBlobKind::GgufHeader, &component.header_digest)
             })
         });
         let artifact = match cached {
@@ -693,8 +710,7 @@ impl ManagedModelStore {
         let cached = self.cached_preview_artifact(source).filter(|artifact| {
             artifact.components.iter().all(|component| {
                 self.cache
-                    .read_blob(ModelBlobKind::GgufHeader, &component.header_digest)
-                    .is_some()
+                    .has_blob(ModelBlobKind::GgufHeader, &component.header_digest)
             })
         });
         let artifact = match cached {
@@ -708,7 +724,10 @@ impl ManagedModelStore {
                 artifact
             }
         };
-        self.materialize_preview(artifact)
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.materialize_preview(artifact))
+            .await
+            .map_err(|error| InventoryError::Internal(error.to_string()))?
     }
 
     async fn acquire_preview_artifact(
@@ -764,6 +783,7 @@ impl ManagedModelStore {
                 &commit,
                 &component.path,
                 size,
+                None,
             )
             .await?;
             let header_digest = format!("{:x}", Sha256::digest(&header));
@@ -800,6 +820,7 @@ impl ManagedModelStore {
                             size_bytes: component.size_bytes,
                             content: component.content.clone(),
                         },
+                        None,
                     )
                     .await?;
                 Ok::<_, InventoryError>((
@@ -1332,14 +1353,13 @@ pub(crate) async fn bounded_response_bytes(
     Ok(bytes)
 }
 
-async fn fetch_header(
-    http: &reqwest::Client,
+/// The Hub URL of one file of a repository at a commit.
+fn resolve_url(
     endpoint: &str,
     repository: &str,
     commit: &str,
     path: &Path,
-    logical_size: u64,
-) -> Result<Vec<u8>, InventoryError> {
+) -> Result<reqwest::Url, InventoryError> {
     let mut url = reqwest::Url::parse(endpoint)
         .map_err(|error| InventoryError::Internal(error.to_string()))?;
     {
@@ -1357,17 +1377,60 @@ async fn fetch_header(
             }
         }
     }
+    Ok(url)
+}
 
-    let mut target_length =
-        INITIAL_HEADER_BYTES.min(usize::try_from(logical_size).unwrap_or(usize::MAX));
-    let mut bytes = Vec::with_capacity(target_length);
-    loop {
-        let range_start = bytes.len();
-        let range_length = target_length.saturating_sub(range_start);
-        let range = format!("bytes={range_start}-{}", target_length.saturating_sub(1));
-        let token = hub_token();
+/// One remote file read by exact range requests. After the first request it reads from the
+/// location the Hub redirected to, without the Hub credential, so later ranges skip the redirect.
+#[derive(Clone)]
+pub(crate) struct RemoteRanges<'a> {
+    http: &'a reqwest::Client,
+    url: reqwest::Url,
+    hub_host: Option<String>,
+    logical_size: u64,
+}
+
+impl<'a> RemoteRanges<'a> {
+    pub(crate) fn new(
+        http: &'a reqwest::Client,
+        endpoint: &str,
+        repository: &str,
+        commit: &str,
+        path: &Path,
+        logical_size: u64,
+    ) -> Result<Self, InventoryError> {
+        let url = resolve_url(endpoint, repository, commit, path)?;
+        Ok(Self {
+            http,
+            hub_host: url.host_str().map(ToOwned::to_owned),
+            url,
+            logical_size,
+        })
+    }
+
+    pub(crate) fn logical_length(&self) -> usize {
+        usize::try_from(self.logical_size).unwrap_or(usize::MAX)
+    }
+
+    /// Exactly the bytes `start..end` of the file.
+    pub(crate) async fn read(&mut self, start: usize, end: usize) -> Result<Vec<u8>, InventoryError> {
+        let range_length = end.saturating_sub(start);
+        let expected_start = u64::try_from(start)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let expected_length = u64::try_from(range_length)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        let expected_end = u64::try_from(end)
+            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
+        if range_length == 0 || expected_end > self.logical_size {
+            return Err(InventoryError::Internal("invalid header range".to_owned()));
+        }
+        let range = format!("bytes={start}-{}", end - 1);
+        let token = (self.url.host_str() == self.hub_host.as_deref())
+            .then(hub_token)
+            .flatten();
+        let url = self.url.clone();
         let mut response = send_hub_request(|| {
-            let mut request = http.get(url.clone()).header(RANGE, &range);
+            let mut request = self.http.get(url.clone()).header(RANGE, &range);
             if let Some(token) = &token {
                 request = request.bearer_auth(token);
             }
@@ -1380,14 +1443,8 @@ async fn fetch_header(
                 response.status()
             )));
         }
-        let expected_start = u64::try_from(range_start)
-            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
-        let expected_length = u64::try_from(range_length)
-            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
-        let expected_end = u64::try_from(target_length)
-            .map_err(|_| InventoryError::Internal("range length overflow".to_owned()))?;
         let complete_response = expected_start == 0
-            && expected_end == logical_size
+            && expected_end == self.logical_size
             && response.status().as_u16() == 200;
         let valid_partial = response.status().as_u16() == 206
             && response
@@ -1395,7 +1452,7 @@ async fn fetch_header(
                 .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|value| {
-                    valid_content_range(value, expected_start, expected_end, logical_size)
+                    valid_content_range(value, expected_start, expected_end, self.logical_size)
                 });
         if !complete_response && !valid_partial {
             return Err(InventoryError::Upstream(
@@ -1407,53 +1464,105 @@ async fn fetch_header(
                 "GGUF header response length did not match its content range".to_owned(),
             ));
         }
-        let previous_length = bytes.len();
+        self.url = response.url().clone();
+        let mut bytes = Vec::with_capacity(range_length);
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|error| InventoryError::Upstream(error.to_string()))?
         {
-            if bytes.len().saturating_add(chunk.len()) > target_length {
+            if bytes.len().saturating_add(chunk.len()) > range_length {
                 return Err(InventoryError::Upstream(
                     "GGUF header response exceeded its requested range".to_owned(),
                 ));
             }
             bytes.extend_from_slice(&chunk);
         }
-        if bytes.len().saturating_sub(previous_length) != range_length {
+        if bytes.len() != range_length {
             return Err(InventoryError::Upstream(
                 "GGUF header response ended before its requested range".to_owned(),
             ));
         }
-        let temporary = tempfile::NamedTempFile::new()
-            .map_err(|error| InventoryError::Io(error.to_string()))?;
-        fs::write(temporary.path(), &bytes)
-            .map_err(|error| InventoryError::Io(error.to_string()))?;
-        match crate::gguf::inspect(temporary.path()) {
-            Ok(inspection) => {
-                let header_length = usize::try_from(inspection.header_bytes).map_err(|_| {
-                    InventoryError::Integrity("GGUF header is too large".to_owned())
-                })?;
-                if header_length > bytes.len() {
-                    return Err(InventoryError::Integrity(
-                        "GGUF header response ended before its aligned data offset".to_owned(),
-                    ));
-                }
+        Ok(bytes)
+    }
+}
+
+/// Every byte of a remote GGUF through its aligned tensor-data offset, by exact range requests.
+/// The first request asks for `size_hint` (a sibling's header length) or `INITIAL_HEADER_BYTES`,
+/// and each further request grows the range fourfold, so a header costs one request when the
+/// hint holds and few when it doesn't.
+async fn fetch_header(
+    http: &reqwest::Client,
+    endpoint: &str,
+    repository: &str,
+    commit: &str,
+    path: &Path,
+    logical_size: u64,
+    size_hint: Option<usize>,
+) -> Result<Vec<u8>, InventoryError> {
+    let mut remote = RemoteRanges::new(http, endpoint, repository, commit, path, logical_size)?;
+    read_header(&mut remote, Vec::new(), size_hint.unwrap_or(INITIAL_HEADER_BYTES)).await
+}
+
+/// A remote header read on from `prefix` (its first bytes, possibly none), first to
+/// `target_length`.
+pub(crate) async fn read_header(
+    remote: &mut RemoteRanges<'_>,
+    mut bytes: Vec<u8>,
+    target_length: usize,
+) -> Result<Vec<u8>, InventoryError> {
+    let logical_length = remote.logical_length();
+    let mut target_length = target_length
+        .max(INITIAL_HEADER_BYTES)
+        .min(MAX_HEADER_BYTES)
+        .min(logical_length);
+    loop {
+        if target_length > bytes.len() {
+            let range = remote.read(bytes.len(), target_length).await?;
+            bytes.extend_from_slice(&range);
+        }
+        let (returned, inspected) = tokio::task::spawn_blocking(move || {
+            let inspected = header_length(&bytes);
+            (bytes, inspected)
+        })
+        .await
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        bytes = returned;
+        match inspected {
+            Ok(header_length) if header_length <= bytes.len() => {
                 bytes.truncate(header_length);
                 return Ok(bytes);
             }
-            Err(_)
-                if target_length < MAX_HEADER_BYTES
-                    && u64::try_from(target_length).is_ok_and(|value| value < logical_size) =>
-            {
-                target_length = target_length
-                    .saturating_mul(2)
-                    .min(MAX_HEADER_BYTES)
-                    .min(usize::try_from(logical_size).unwrap_or(usize::MAX));
+            Ok(header_length) if header_length <= MAX_HEADER_BYTES.min(logical_length) => {
+                target_length = header_length;
             }
-            Err(error) => return Err(InventoryError::Integrity(error.to_string())),
+            Ok(_) => {
+                return Err(InventoryError::Integrity(
+                    "GGUF header extends beyond its size bound".to_owned(),
+                ));
+            }
+            Err(_) if bytes.len() < MAX_HEADER_BYTES && bytes.len() < logical_length => {
+                target_length = bytes
+                    .len()
+                    .saturating_mul(4)
+                    .min(MAX_HEADER_BYTES)
+                    .min(logical_length);
+            }
+            Err(error) => return Err(error),
         }
     }
+}
+
+/// The aligned tensor-data offset of a GGUF prefix, or an error when the prefix is too short to
+/// hold the whole header.
+pub(crate) fn header_length(prefix: &[u8]) -> Result<usize, InventoryError> {
+    let temporary =
+        tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
+    fs::write(temporary.path(), prefix).map_err(|error| InventoryError::Io(error.to_string()))?;
+    let directory = magnitude_artifacts::gguf::inspect_header(temporary.path())
+        .map_err(|error| InventoryError::Integrity(error.to_string()))?;
+    usize::try_from(directory.data_offset)
+        .map_err(|_| InventoryError::Integrity("GGUF header is too large".to_owned()))
 }
 
 fn valid_content_range(
@@ -1504,6 +1613,74 @@ pub(crate) async fn send_hub_get(
     Ok(response)
 }
 
+impl ManagedModelStore {
+    /// Resolves which repository file each unresolved `hf.co` Ollama pull is, by matching the
+    /// pull's SHA-256 against the repository's files, and caches the answer (no match included).
+    /// Returns the enabled Ollama locations to rescan when any pull resolved to a file; a pull
+    /// whose repository can't be read stays unresolved and is tried again on a later scan.
+    pub(crate) async fn resolve_ollama_hub_files(&self) -> BTreeSet<PathBuf> {
+        let Ok(configuration) = self.local_models_configuration() else {
+            return BTreeSet::new();
+        };
+        let roots = configuration.roots;
+        let cache = self.cache.clone();
+        let scanned = roots.clone();
+        let unresolved = tokio::task::spawn_blocking(move || {
+            crate::local_roots::unresolved_ollama_hub_pulls(&scanned, &cache)
+        })
+        .await
+        .unwrap_or_default();
+        let store = Arc::new(self.clone());
+        let mut resolved_any = false;
+        for (repository, sha256) in unresolved {
+            let snapshot = match refresh_hugging_face_repository(
+                &store,
+                HuggingFaceRepositoryRequest {
+                    repository: repository.clone(),
+                    revision: "main".to_owned(),
+                },
+            )
+            .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(InventoryError::NotFound(_)) => {
+                    crate::local_roots::write_ollama_hub_file(
+                        &self.cache,
+                        &repository,
+                        &sha256,
+                        &crate::local_roots::OllamaHubFile { file: None },
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, repository = %repository, "Ollama pull's repository is unavailable");
+                    continue;
+                }
+            };
+            let file = snapshot
+                .gguf_files
+                .iter()
+                .find(|file| matches!(&file.content, ContentIdentity::Sha256 { value } if value == &sha256))
+                .map(|file| file.path.to_string_lossy().replace('\\', "/"));
+            resolved_any |= file.is_some();
+            crate::local_roots::write_ollama_hub_file(
+                &self.cache,
+                &repository,
+                &sha256,
+                &crate::local_roots::OllamaHubFile { file },
+            );
+        }
+        if !resolved_any {
+            return BTreeSet::new();
+        }
+        roots
+            .into_iter()
+            .filter(|root| root.enabled && root.kind == magnitude_service_contracts::models::ModelRootKind::Ollama)
+            .map(|root| crate::inventory::canonical_or_self(&root.path))
+            .collect()
+    }
+}
+
 /// A repository snapshot. An immutable commit already cached is served without a request, since
 /// its files and lineage can never change; anything else is refreshed.
 pub async fn pinned_hugging_face_repository(
@@ -1527,6 +1704,22 @@ pub async fn pinned_hugging_face_repository(
     refresh_hugging_face_repository(models, request).await
 }
 
+fn classification_evidence(
+    digest: &str,
+    architectures: &crate::candidate_files::RecognizedArchitectures,
+) -> String {
+    format!("candidate-classification-v1:{digest}:{}", architectures.key())
+}
+
+fn remote_header_evidence(
+    endpoint: &str,
+    repository: &str,
+    commit: &str,
+    file: &HuggingFaceRepositoryFile,
+) -> String {
+    format!("{endpoint}:{repository}@{commit}/{}", file.path.display())
+}
+
 /// One remote GGUF header: every byte through the aligned tensor-data offset, and its sha256.
 #[derive(Clone, Debug)]
 pub struct RemoteGgufHeader {
@@ -1542,55 +1735,134 @@ struct CachedRemoteGgufHeader {
 }
 
 impl ManagedModelStore {
-    /// The header of one file of an immutable repository snapshot, fetched by range request once
-    /// and then served from the header cache.
+    /// The header of one file of an immutable repository snapshot, fetched by range requests once
+    /// and then served from the header cache. `sibling` is the header of another quantization of
+    /// the same model, whose tokenizer this file most likely shares (see `header_delta`).
     pub async fn hugging_face_gguf_header(
         &self,
         repository: &str,
         commit: &str,
         file: &HuggingFaceRepositoryFile,
+        sibling: Option<&[u8]>,
     ) -> Result<RemoteGgufHeader, InventoryError> {
-        let evidence = format!(
-            "{}:{repository}@{commit}/{}",
-            self.client.endpoint(),
-            file.path.display()
-        );
-        if let Some(bytes) = self
-            .cache
-            .read_index::<CachedRemoteGgufHeader>(ModelIndexKind::HuggingFaceGgufHeader, &evidence)
-            .filter(|cached| cached.content == file.content)
-            .and_then(|cached| {
-                self.cache
-                    .read_blob(ModelBlobKind::GgufHeader, &cached.header_digest)
-                    .map(|bytes| (cached.header_digest, bytes))
+        let evidence = remote_header_evidence(self.client.endpoint(), repository, commit, file);
+        if let Some(digest) = self.cached_hugging_face_header_digest(repository, commit, file) {
+            let cache = self.cache.clone();
+            let cached = tokio::task::spawn_blocking(move || {
+                cache
+                    .read_blob(ModelBlobKind::GgufHeader, &digest)
+                    .map(|bytes| RemoteGgufHeader { digest, bytes })
             })
-        {
-            return Ok(RemoteGgufHeader {
-                digest: bytes.0,
-                bytes: bytes.1,
-            });
+            .await
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            if let Some(cached) = cached {
+                return Ok(cached);
+            }
         }
-        let bytes = fetch_header(
+        let mut remote = RemoteRanges::new(
             &self.http,
             self.client.endpoint(),
             repository,
             commit,
             &file.path,
             file.size_bytes,
-        )
-        .await?;
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        self.cache
-            .write_blob(ModelBlobKind::GgufHeader, &digest, &bytes);
+        )?;
+        let shared = match sibling {
+            Some(sibling) => {
+                crate::header_delta::read_header_sharing_tokenizer(&mut remote, sibling).await?
+            }
+            None => None,
+        };
+        let bytes = match shared {
+            Some(bytes) => bytes,
+            None => {
+                let target = sibling.map_or(INITIAL_HEADER_BYTES, <[u8]>::len);
+                read_header(&mut remote, Vec::new(), target).await?
+            }
+        };
+        let cache = self.cache.clone();
+        let content = file.content.clone();
+        tokio::task::spawn_blocking(move || {
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            cache.write_blob(ModelBlobKind::GgufHeader, &digest, &bytes);
+            cache.write_index(
+                ModelIndexKind::HuggingFaceGgufHeader,
+                &evidence,
+                &CachedRemoteGgufHeader {
+                    content,
+                    header_digest: digest.clone(),
+                },
+            );
+            RemoteGgufHeader { digest, bytes }
+        })
+        .await
+        .map_err(|error| InventoryError::Internal(error.to_string()))
+    }
+
+    /// The header digest and classification of one file of an immutable repository snapshot.
+    /// Once classified, a file costs one index read: neither its header nor the network is
+    /// touched again.
+    pub async fn classify_hugging_face_gguf(
+        &self,
+        repository: &str,
+        commit: &str,
+        file: &HuggingFaceRepositoryFile,
+        architectures: &crate::candidate_files::RecognizedArchitectures,
+        sibling: Option<&[u8]>,
+    ) -> Result<(String, crate::candidate_files::HeaderClassification), InventoryError> {
+        if let Some(classified) = self.cached_hugging_face_classification(repository, commit, file, architectures) {
+            return Ok(classified);
+        }
+        let header = self
+            .hugging_face_gguf_header(repository, commit, file, sibling)
+            .await?;
+        let classifier = architectures.clone();
+        let classification = tokio::task::spawn_blocking(move || {
+            crate::candidate_files::classify_header(&header.bytes, &classifier)
+        })
+        .await
+        .map_err(|error| InventoryError::Internal(error.to_string()))??;
         self.cache.write_index(
-            ModelIndexKind::HuggingFaceGgufHeader,
-            &evidence,
-            &CachedRemoteGgufHeader {
-                content: file.content.clone(),
-                header_digest: digest.clone(),
-            },
+            ModelIndexKind::CandidateClassification,
+            &classification_evidence(&header.digest, architectures),
+            &classification,
         );
-        Ok(RemoteGgufHeader { digest, bytes })
+        Ok((header.digest, classification))
+    }
+
+    /// A file's header digest and classification when it was classified before.
+    #[must_use]
+    pub fn cached_hugging_face_classification(
+        &self,
+        repository: &str,
+        commit: &str,
+        file: &HuggingFaceRepositoryFile,
+        architectures: &crate::candidate_files::RecognizedArchitectures,
+    ) -> Option<(String, crate::candidate_files::HeaderClassification)> {
+        let digest = self.cached_hugging_face_header_digest(repository, commit, file)?;
+        let classification = self.cache.read_index(
+            ModelIndexKind::CandidateClassification,
+            &classification_evidence(&digest, architectures),
+        )?;
+        Some((digest, classification))
+    }
+
+    /// The header digest of one file of an immutable repository snapshot when its header was
+    /// fetched before, without reading the header itself.
+    #[must_use]
+    pub fn cached_hugging_face_header_digest(
+        &self,
+        repository: &str,
+        commit: &str,
+        file: &HuggingFaceRepositoryFile,
+    ) -> Option<String> {
+        self.cache
+            .read_index::<CachedRemoteGgufHeader>(
+                ModelIndexKind::HuggingFaceGgufHeader,
+                &remote_header_evidence(self.client.endpoint(), repository, commit, file),
+            )
+            .filter(|cached| cached.content == file.content)
+            .map(|cached| cached.header_digest)
     }
 
     /// The exact package a repository-snapshot preview describes, identified as the same package
@@ -1605,48 +1877,6 @@ impl ManagedModelStore {
             .await?;
         let package = self.inspect_package_from_resolved(&prepared.model)?.package;
         Ok((package, prepared))
-    }
-
-    /// GGUF repositories on the Hub tagged for speculative decoding whose base model is `base`,
-    /// most downloaded first.
-    pub async fn search_speculative_drafters(
-        &self,
-        base: &str,
-    ) -> Result<Vec<String>, InventoryError> {
-        let mut url = reqwest::Url::parse(self.client.endpoint())
-            .map_err(|error| InventoryError::Internal(error.to_string()))?;
-        url.path_segments_mut()
-            .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?
-            .pop_if_empty()
-            .push("api")
-            .push("models");
-        url.query_pairs_mut()
-            .append_pair("filter", &format!("base_model:{base}"))
-            .append_pair("filter", "speculative-decoding")
-            .append_pair("filter", "gguf")
-            .append_pair("sort", "downloads")
-            .append_pair("direction", "-1")
-            .append_pair("limit", &MAX_DRAFTER_SEARCH_RESULTS.to_string());
-        let response = send_hub_get(&self.http, url).await?;
-        if !response.status().is_success() {
-            return Err(InventoryError::Upstream(format!(
-                "Hugging Face drafter search returned HTTP {}",
-                response.status()
-            )));
-        }
-        #[derive(Deserialize)]
-        struct Found {
-            id: String,
-        }
-        let found: Vec<Found> = serde_json::from_slice(
-            &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
-        )
-        .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-        Ok(found
-            .into_iter()
-            .map(|found| found.id)
-            .filter(|id| valid_repository(id))
-            .collect())
     }
 
     /// Whether an installed package, in any location, holds a file with this content digest.
@@ -2128,6 +2358,195 @@ mod tests {
         (endpoint, requests)
     }
 
+    /// A file server that honors exact range requests on files named by their last path segment,
+    /// and counts the bytes it sends.
+    fn serve_ranges(
+        files: Vec<(&'static str, Vec<u8>)>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("range listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("range address"));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (counted, sent_counted) = (Arc::clone(&requests), Arc::clone(&sent));
+        let files = Arc::new(files.into_iter().collect::<BTreeMap<_, _>>());
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let (files, counted, sent) = (Arc::clone(&files), Arc::clone(&counted), Arc::clone(&sent_counted));
+                std::thread::spawn(move || {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                    let mut request_line = String::new();
+                    let _ = reader.read_line(&mut request_line);
+                    let name = request_line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|target| target.rsplit('/').next())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let mut range = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                        if let Some((header, value)) = line.split_once(':')
+                            && header.eq_ignore_ascii_case("range")
+                        {
+                            let (start, end) = value.trim().trim_start_matches("bytes=").split_once('-').unwrap();
+                            range = Some((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()));
+                        }
+                    }
+                    let file = &files[name.as_str()];
+                    let (start, end) = range.unwrap_or((0, file.len() - 1));
+                    let body = &file[start..=end];
+                    sent.fetch_add(body.len(), std::sync::atomic::Ordering::SeqCst);
+                    let _ = write!(
+                        connection,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                        file.len()
+                    );
+                    let _ = connection.write_all(body);
+                });
+            }
+        });
+        (endpoint, requests, sent)
+    }
+
+    /// A model file with a token list of `tokens` entries (`renamed` replaces the middle one), a
+    /// file type and `weights` bytes of tensor data.
+    fn model_file(name: &str, tokens: usize, renamed: Option<&str>, file_type: u32) -> Vec<u8> {
+        let mut file = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("general.name", crate::test_gguf::Meta::Str(name)),
+            ],
+            &["token_embd.weight"],
+        );
+        let tensor_data = file.split_off(file.len() - 128);
+        let tensor_info_start = file
+            .windows(b"token_embd.weight".len())
+            .position(|window| window == b"token_embd.weight")
+            .unwrap()
+            - 8;
+        let mut tail = file.split_off(tensor_info_start);
+        while tail.last() == Some(&0) {
+            tail.pop();
+        }
+        let mut tokenizer = Vec::new();
+        let push_string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        };
+        push_string(&mut tokenizer, "tokenizer.ggml.tokens");
+        tokenizer.extend_from_slice(&9_u32.to_le_bytes());
+        tokenizer.extend_from_slice(&8_u32.to_le_bytes());
+        tokenizer.extend_from_slice(&(tokens as u64).to_le_bytes());
+        for token in 0..tokens {
+            let value = format!("token-{token:07}");
+            push_string(&mut tokenizer, renamed.filter(|_| token == tokens / 2).unwrap_or(&value));
+        }
+        push_string(&mut tokenizer, "general.file_type");
+        tokenizer.extend_from_slice(&4_u32.to_le_bytes());
+        tokenizer.extend_from_slice(&file_type.to_le_bytes());
+        file[16..24].copy_from_slice(&4_u64.to_le_bytes());
+        file.extend_from_slice(&tokenizer);
+        file.extend_from_slice(&tail);
+        file.resize(file.len().next_multiple_of(32), 0);
+        file.extend_from_slice(&tensor_data);
+        file.resize(file.len() + 4 * 1024 * 1024, 0);
+        file
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sibling_header_shares_its_tokenizer_and_a_different_one_is_read_whole() {
+        let sibling_file = model_file("Model Q8_0", 150_000, None, 7);
+        let same = model_file("Model Q4_K_M", 150_000, None, 15);
+        let renamed = model_file("Model Q4_K_M", 150_000, Some("token-RENAMED"), 15);
+        let (endpoint, _, sent) = serve_ranges(vec![
+            ("sibling.gguf", sibling_file.clone()),
+            ("same.gguf", same.clone()),
+            ("renamed.gguf", renamed.clone()),
+        ]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let file = |path: &str, bytes: &[u8]| HuggingFaceRepositoryFile {
+            path: PathBuf::from(path),
+            size_bytes: bytes.len() as u64,
+            content: ContentIdentity::Sha256 {
+                value: format!("{:x}", Sha256::digest(bytes)),
+            },
+        };
+        let commit = "a".repeat(40);
+        let sibling = store
+            .hugging_face_gguf_header("owner/repo", &commit, &file("sibling.gguf", &sibling_file), None)
+            .await
+            .unwrap();
+        let same_length = header_length(&same).unwrap();
+        assert!(same_length > 2 * 1024 * 1024);
+        let before = sent.load(std::sync::atomic::Ordering::SeqCst);
+        let shared = store
+            .hugging_face_gguf_header("owner/repo", &commit, &file("same.gguf", &same), Some(&sibling.bytes))
+            .await
+            .unwrap();
+        assert_eq!(shared.bytes, same[..same_length], "the shared header is exactly the file's");
+        assert!(
+            sent.load(std::sync::atomic::Ordering::SeqCst) - before < 512 * 1024,
+            "only the prefix, the verification windows and the remainder are read"
+        );
+        let different = store
+            .hugging_face_gguf_header("owner/repo", &commit, &file("renamed.gguf", &renamed), Some(&sibling.bytes))
+            .await
+            .unwrap();
+        assert_eq!(
+            different.bytes,
+            renamed[..header_length(&renamed).unwrap()],
+            "a tokenizer that differs inside a verification window is read whole"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_header_is_read_in_few_requests_and_in_one_with_a_sibling_hint() {
+        let description = "x".repeat(3 * 1024 * 1024);
+        let mut file = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("general.description", crate::test_gguf::Meta::Str(&description)),
+            ],
+            &["token_embd.weight"],
+        );
+        file.resize(file.len() + 8 * 1024 * 1024, 0);
+        let size = u64::try_from(file.len()).unwrap();
+        let (endpoint, requests, _) = serve_ranges(vec![("model-Q4_K_M.gguf", file.clone())]);
+        let http = reqwest::Client::new();
+        let path = Path::new("model-Q4_K_M.gguf");
+        let header = fetch_header(&http, &endpoint, "owner/repo", &"a".repeat(40), path, size, None)
+            .await
+            .unwrap();
+        assert!(header.len() > 3 * 1024 * 1024 && file.starts_with(&header));
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a 1 MiB probe, then a fourfold range"
+        );
+        let hinted = fetch_header(
+            &http,
+            &endpoint,
+            "owner/repo",
+            &"a".repeat(40),
+            path,
+            size,
+            Some(header.len()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hinted, header);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3, "the hint covers the header");
+    }
+
     async fn stub_store(endpoint: String) -> (tempfile::TempDir, Arc<ManagedModelStore>) {
         let temporary = tempfile::tempdir().unwrap();
         let mut config = crate::inventory::InventoryConfig::with_roots(
@@ -2205,6 +2624,20 @@ mod tests {
         })
     }
 
+    struct StubShapes;
+
+    impl crate::lineage::CatalogShapes for StubShapes {
+        fn catalog_shapes(&self) -> BoxFuture<'_, Vec<crate::lineage::CatalogShape>> {
+            Box::pin(async {
+                vec![crate::lineage::CatalogShape {
+                    model_id: "llama-test:gguf:q8".parse().unwrap(),
+                    architecture: "llama".to_owned(),
+                    parameters: 8_000_000_000,
+                }]
+            })
+        }
+    }
+
     fn search_hub() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         serve_hub(|path, query| {
             let result = |id: &str, seed: char, architecture: &str, base: &[&str]| {
@@ -2213,7 +2646,7 @@ mod tests {
                     "sha": seed.to_string().repeat(40),
                     "downloads": 7,
                     "tags": ["gguf"],
-                    "gguf": { "architecture": architecture },
+                    "gguf": { "architecture": architecture, "total": 8_030_000_000_u64 },
                     "baseModels": {
                         "relation": "quantized",
                         "models": base.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
@@ -2224,8 +2657,11 @@ mod tests {
                 "/api/models" if query.contains("search=") => Some(serde_json::json!([
                     result("catalog/Llama-GGUF", 'a', "llama", &["base/Llama"]),
                     result("unsloth/DeepSeek-V4-GGUF", 'f', "deepseek4", &[]),
+                    result("someone/Llama-DFlash-GGUF", 'd', "dflash", &["base/Llama"]),
+                    result("someone/Llama-EAGLE3-GGUF", 'b', "eagle3", &["base/Llama"]),
                     result("vision/Llama-Vision-GGUF", 'e', "clip", &[]),
                     result("community/Llama-Finetune-GGUF", 'c', "llama", &["community/Llama-Finetune"]),
+                    result("anonymous/Llama-Uncensored-GGUF", '7', "llama", &[]),
                 ])),
                 path if path.starts_with("/api/models/catalog/Llama-GGUF/revision/") => {
                     Some(revision_metadata("catalog/Llama-GGUF", &"a".repeat(40), &["base/Llama"]))
@@ -2243,7 +2679,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn search_hides_unknown_architectures_excludes_the_catalog_and_resolves_lineage() {
+    async fn search_hides_unknown_architectures_excludes_the_catalog_and_drafters_and_resolves_lineage() {
         let (endpoint, _) = search_hub();
         let (_temporary, store) = stub_store(endpoint).await;
         let catalog = catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40));
@@ -2251,6 +2687,7 @@ mod tests {
             Arc::clone(&store),
             RecognizedArchitectures::new(["llama"], ["dflash"]),
             CatalogLineage::new(Arc::clone(&store), catalog),
+            Arc::new(StubShapes),
         );
         let results = discovery
             .search(HuggingFaceModelSearchRequest {
@@ -2267,7 +2704,16 @@ mod tests {
                 .iter()
                 .map(|result| result.repository.as_str())
                 .collect::<Vec<_>>(),
-            ["vision/Llama-Vision-GGUF", "community/Llama-Finetune-GGUF"]
+            [
+                "vision/Llama-Vision-GGUF",
+                "community/Llama-Finetune-GGUF",
+                "anonymous/Llama-Uncensored-GGUF"
+            ]
+        );
+        assert_eq!(
+            results.results[2].variant_of.as_ref().map(ModelId::as_str),
+            Some("llama-test:gguf:q8"),
+            "a repository without lineage matches the catalog model of its architecture and size"
         );
         let community = &results.results[1];
         assert_eq!(community.architecture.as_deref(), Some("llama"));
@@ -2287,7 +2733,13 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(all.hidden_count, 1);
+        assert_eq!(all.hidden_count, 1, "drafter repositories are not counted as hidden models");
+        assert!(
+            all.results
+                .iter()
+                .all(|result| !result.repository.contains("DFlash") && !result.repository.contains("EAGLE3")),
+            "drafter repositories are never model results"
+        );
         let deepseek = all
             .results
             .iter()
@@ -2385,3 +2837,4 @@ mod tests {
         assert!(store.read_model_assessment("fits without a drafter verdict").is_none());
     }
 }
+

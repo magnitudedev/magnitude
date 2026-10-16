@@ -1,18 +1,13 @@
 import { expect, it } from "vitest"
-import { Effect, Option, Stream } from "effect"
-import { attributeDrafters, makeUsageFetch, makeUsageObservation, makeUsageWebSocket } from "./serving-usage-observer"
+import { Effect, Option } from "effect"
+import { makeUsageFetch, makeUsageObservation, makeUsageWebSocket } from "./serving-usage-observer"
 import type { ServingUsage, ServingUsageRecord } from "./serving-usage"
 const timings = { cache_n: 40, prompt_n: 60, predicted_n: 20, predicted_ms: 1000, time_to_first_token_ms: 150, parser_ms: 0, prompt_ms: 20, predicted_per_second: 20, predicted_per_token_ms: 50, prompt_per_second: 3000, prompt_per_token_ms: 1, sampler_ms: 0 }
 const chat = { model: "magnitude-local/model-a", usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, prompt_tokens_details: { cached_tokens: 40 } }, timings }
 const responsesUsage = { input_tokens: 100, input_tokens_details: { cached_tokens: 40 }, output_tokens: 20, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 120 }
 const sink = () => {
   const records: ServingUsageRecord[] = []
-  const service: ServingUsage = {
-    record: value => Effect.sync(() => { records.push(value) }),
-    read: () => Effect.succeed({ _tag: "Unavailable", message: "test" }),
-    acceptance: Effect.succeed([]),
-    changes: Stream.empty,
-  }
+  const service: ServingUsage = { record: value => Effect.sync(() => { records.push(value) }), read: () => Effect.succeed({ _tag: "Unavailable", message: "test" }) }
   return { records, service }
 }
 it("uses terminal timings without a separate usage block and records once", () => {
@@ -86,20 +81,4 @@ it("finalizes the active WebSocket request when the previously registered close 
   await Effect.runPromise(socket.received('{"type":"response.created","response":{"model":"model-a"}}'))
   await Effect.runPromise(finalizer)
   expect(records).toHaveLength(1); expect(records[0]).toMatchObject({ model: "model-a", complete: false })
-})
-it("records drafted and accepted tokens from terminal timings", () => {
-  const observation = makeUsageObservation({ streaming: false, startedAt: 0 })
-  observation.push({ ...chat, timings: { ...timings, draft_n: 30, draft_n_accepted: 18 } })
-  expect(Option.getOrThrow(observation.finish())).toMatchObject({ draftTokens: 30, acceptedDraftTokens: 18, drafter: null })
-  const plain = makeUsageObservation({ streaming: false, startedAt: 0 })
-  plain.push(chat)
-  expect(Option.getOrThrow(plain.finish())).toMatchObject({ draftTokens: null, acceptedDraftTokens: null })
-})
-it("attributes each record to the drafter attached to its model", async () => {
-  const { records, service } = sink()
-  const attributed = attributeDrafters(service, model => Effect.succeed(model === "model-a" ? Option.some("embedded") : Option.none()))
-  const observation = makeUsageObservation({ streaming: false, startedAt: 0 })
-  observation.push(chat)
-  await Effect.runPromise(attributed.record(Option.getOrThrow(observation.finish())))
-  expect(records[0]?.drafter).toBe("embedded")
 })

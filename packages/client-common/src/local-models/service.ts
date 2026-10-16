@@ -136,8 +136,8 @@ const makeLocalModels = Effect.gen(function* () {
     remove: (modelId: ModelId) => Mutation.execute(remove, { modelId }).pipe(provideRegistry),
     setDrafter: (modelId: CustomFormModelId, drafter: DrafterChoice) =>
       Mutation.execute(setDrafter, { modelId, drafter }).pipe(provideRegistry),
-    hide: (modelId: CustomFormModelId) => Mutation.execute(hide, { modelId }).pipe(provideRegistry),
-    unhide: (modelId: CustomFormModelId) => Mutation.execute(unhide, { modelId }).pipe(provideRegistry),
+    hide: (modelId: ModelId) => Mutation.execute(hide, { modelId }).pipe(provideRegistry),
+    unhide: (modelId: ModelId) => Mutation.execute(unhide, { modelId }).pipe(provideRegistry),
     addFromHuggingFace: (input: {
       readonly repository: HuggingFaceRepositoryId
       readonly revision: Option.Option<string>
@@ -167,8 +167,8 @@ export function useLocalModelMutations() {
   const load = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.load(modelId)), { concurrent: true }), [client]))
   const stop = useAtomSet(useMemo(() => client.runtime.fn(() => Effect.flatMap(LocalModels, models => models.stop), { concurrent: true }), [client]))
   const setDrafter = useAtomSet(useMemo(() => client.runtime.fn(({ modelId, drafter }: { readonly modelId: CustomFormModelId; readonly drafter: DrafterChoice }) => Effect.flatMap(LocalModels, models => models.setDrafter(modelId, drafter)), { concurrent: true }), [client]))
-  const hide = useAtomSet(useMemo(() => client.runtime.fn((modelId: CustomFormModelId) => Effect.flatMap(LocalModels, models => models.hide(modelId)), { concurrent: true }), [client]))
-  const unhide = useAtomSet(useMemo(() => client.runtime.fn((modelId: CustomFormModelId) => Effect.flatMap(LocalModels, models => models.unhide(modelId)), { concurrent: true }), [client]))
+  const hide = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.hide(modelId)), { concurrent: true }), [client]))
+  const unhide = useAtomSet(useMemo(() => client.runtime.fn((modelId: ModelId) => Effect.flatMap(LocalModels, models => models.unhide(modelId)), { concurrent: true }), [client]))
   return {
     install: useCallback((modelId: ModelId) => install(modelId), [install]),
     cancel: useCallback((modelId: ModelId) => cancel(modelId), [cancel]),
@@ -177,8 +177,8 @@ export function useLocalModelMutations() {
     load: useCallback((modelId: ModelId) => load(modelId), [load]),
     stop: useCallback(() => stop(), [stop]),
     setDrafter: useCallback((modelId: CustomFormModelId, drafter: DrafterChoice) => setDrafter({ modelId, drafter }), [setDrafter]),
-    hide: useCallback((modelId: CustomFormModelId) => hide(modelId), [hide]),
-    unhide: useCallback((modelId: CustomFormModelId) => unhide(modelId), [unhide]),
+    hide: useCallback((modelId: ModelId) => hide(modelId), [hide]),
+    unhide: useCallback((modelId: ModelId) => unhide(modelId), [unhide]),
   }
 }
 

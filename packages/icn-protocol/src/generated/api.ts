@@ -563,6 +563,16 @@ export const previewModelLoad = HttpApiEndpoint.post("previewModelLoad", "/api/v
     { status: 500 },
   )
 
+export const pruneLocalDrafters = HttpApiEndpoint.post("pruneLocalDrafters", "/api/v1/local-models/drafters/prune")
+  .addSuccess(
+    S.suspend((): S.Schema<Schemas.DrafterPruning, Schemas.DrafterPruningEncoded> => Schemas.DrafterPruning),
+    { status: 200 },
+  )
+  .addError(
+    S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+    { status: 500 },
+  )
+
 export const refreshLocalModels = HttpApiEndpoint.post("refreshLocalModels", "/api/v1/local-models/refresh")
   .addSuccess(
     S.suspend(
@@ -762,6 +772,7 @@ export const LocalModelsGroup = HttpApiGroup.make("localModels")
   .add(configureLocalModels)
   .add(getLocalModelsConfiguration)
   .add(listLocalModels)
+  .add(pruneLocalDrafters)
   .add(refreshLocalModels)
   .add(removeLocalModelFiles)
 

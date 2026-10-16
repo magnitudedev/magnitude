@@ -48,6 +48,7 @@ describe("custom model reconciliation", () => {
           drafters: () => Effect.succeed([{
             category: "CatalogDrafter",
             reference: drafterReference,
+            name: "Magnitude DFlash for Qwen3.6 35B-A3B",
             label: "Magnitude DFlash",
             lineage: "Lineage",
             method: Option.some({ _tag: "DSpark" }),
@@ -85,5 +86,57 @@ describe("custom model reconciliation", () => {
     expect(cleared).toEqual(["primary"])
     expect(published).toContain("ListModelLocations")
     expect(configured.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it("relearns the drafter method of an added model still downloading from its declared repository file", async () => {
+    const configured: LocalModelsConfiguration[] = []
+    const requests: string[] = []
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const custom = yield* makeTestCustomModels(customModelsConfig({
+        drafters: { [addedId]: { _tag: "Reference", reference: drafterReference } },
+      }))
+      const layer = CustomModelReconcilerLive.pipe(Layer.provide(Layer.mergeAll(
+        Layer.succeed(CustomModels, custom),
+        Layer.succeed(ModelLocations, {
+          environment: { platform: "linux", env: {}, home: "/h" },
+          resolve: Effect.succeed([]),
+          list: () => Effect.succeed([]),
+        }),
+        DrafterMethodsLive,
+        Layer.succeed(IcnLocalModels, {
+          configure: (configuration: LocalModelsConfiguration) => Effect.sync(() => { configured.push(configuration) }),
+        } as never),
+        Layer.succeed(IcnCandidates, {
+          drafters: (request: { readonly _tag: string }) => Effect.sync(() => {
+            requests.push(request._tag)
+            return request._tag === "Model" ? [] : [{
+              category: "CatalogDrafter",
+              reference: drafterReference,
+              name: "Magnitude DFlash for Qwen3.6 35B-A3B",
+              label: "Magnitude DFlash",
+              lineage: "Lineage",
+              method: Option.some({ _tag: "DFlash" }),
+              onThisComputer: false,
+              sizeBytes: 1,
+              verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1 },
+            }]
+          }),
+        } as never),
+        Layer.succeed(ModelSlotController, {
+          state: Effect.succeed({ slots: {
+            primary: { _tag: "Unassigned", slotId: "primary" },
+            secondary: { _tag: "Unassigned", slotId: "secondary" },
+          } }),
+          updateModelSlot: () => Effect.void,
+        } as never),
+        Layer.succeed(AcnChanges, { publish: () => Effect.void, stream: Stream.empty } as never),
+      )))
+      yield* Effect.flatMap(CustomModelReconciler, (reconciler) => reconciler.push).pipe(Effect.provide(layer))
+    })))
+    expect(requests.slice(0, 2)).toEqual(["Model", "Candidate"])
+    expect(configured[0]!.drafters).toEqual([{
+      modelId: addedId,
+      drafter: { _tag: "Reference", method: { _tag: "DFlash" }, reference: drafterReference },
+    }])
   })
 })

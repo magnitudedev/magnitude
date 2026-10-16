@@ -3,6 +3,7 @@ import {
   LocalModelMutationFailed,
   Models,
   type CustomFormModelId,
+  type ModelId,
 } from "@magnitudedev/acn-protocol"
 import { IcnCandidates, IcnLocalModels } from "@magnitudedev/icn"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
@@ -30,7 +31,7 @@ export class CustomModelReconciler extends Context.Tag("CustomModelReconciler")<
 export const disappearedCustomModels = (
   previous: CustomModelsConfig,
   next: CustomModelsConfig,
-): readonly CustomFormModelId[] => {
+): readonly ModelId[] => {
   const forgotten = (Object.keys(previous.declarations) as CustomFormModelId[])
     .filter((modelId) => !(modelId in next.declarations))
   const hidden = next.hidden.filter((modelId) => !previous.hidden.includes(modelId))
@@ -58,19 +59,36 @@ export const CustomModelReconcilerLive: Layer.Layer<
   const lock = yield* Effect.makeSemaphore(1)
 
   // A drafter's binding method is engine knowledge; after a restart it is relearned from ICN's candidates.
+  // An added model still downloading has no files to list from, so its declared repository file is asked.
   const learnMethods = (config: CustomModelsConfig) => Effect.forEach(
     Object.entries(config.drafters),
     ([modelId, choice]) => Effect.gen(function* () {
       if (choice._tag !== "Reference" || Option.isSome(yield* methods.get(choice.reference))) return
-      const listed = yield* candidates.drafters({ _tag: "Model", modelId, other: Option.none() } as unknown as Native.DrafterCandidatesRequest).pipe(Effect.orElseSucceed(() => []))
       const key = drafterReferenceKey(choice.reference)
-      for (const candidate of listed) {
-        if (candidate.verdict._tag !== "Bound") continue
-        const reference = productDrafterReference(candidate.reference)
-        if (Option.isSome(reference) && drafterReferenceKey(reference.value) === key) {
-          yield* methods.remember(choice.reference, candidate.verdict.method)
-        }
-      }
+      const learn = (request: unknown) => candidates.drafters(request as Native.DrafterCandidatesRequest).pipe(
+        Effect.orElseSucceed(() => []),
+        Effect.flatMap((listed) => Effect.forEach(listed, (candidate) => {
+          if (candidate.verdict._tag !== "Bound") return Effect.succeed(false)
+          const reference = productDrafterReference(candidate.reference)
+          return Option.isSome(reference) && drafterReferenceKey(reference.value) === key
+            ? methods.remember(choice.reference, candidate.verdict.method).pipe(Effect.as(true))
+            : Effect.succeed(false)
+        })),
+        Effect.map((learned) => learned.includes(true)),
+      )
+      if (yield* learn({ _tag: "Model", modelId, other: Option.none() })) return
+      const declaration = config.declarations[modelId as keyof CustomModelsConfig["declarations"]]
+      if (declaration?.origin._tag !== "Added") return
+      yield* learn({
+        _tag: "Candidate",
+        candidate: {
+          source: { _tag: "HuggingFace", repository: declaration.origin.repository, commit: declaration.origin.commit },
+          target: [...declaration.target],
+          projector: Option.none(),
+          drafter: Option.none(),
+        },
+        other: Option.none(),
+      })
     }),
     { discard: true },
   )

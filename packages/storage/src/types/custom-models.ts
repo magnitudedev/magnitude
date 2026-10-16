@@ -4,6 +4,7 @@ import {
   DrafterChoiceSchema,
   HuggingFaceRepositoryIdSchema,
   ModelHeaderDigestSchema,
+  ModelIdSchema,
   parseModelId,
   type CustomFormModelId,
 } from '@magnitudedev/acn-protocol'
@@ -47,14 +48,15 @@ const unique = <A>(values: ReadonlyArray<A>): boolean => new Set(values).size ==
 
 /**
  * Every user choice about custom models, persisted by ACN under `models` in `config.json`: declarations,
- * hidden models, attached drafters, user folders, and turned-off automatic locations.
+ * hidden found models (catalog models found only in an external location included), attached drafters,
+ * user folders, and turned-off automatic locations.
  */
 export const CustomModelsConfigSchema = Schema.Struct({
   declarations: Schema.optionalWith(
     Schema.Record({ key: CustomFormModelIdSchema, value: CustomModelDeclarationSchema }),
     { default: () => ({}) },
   ),
-  hidden: Schema.optionalWith(Schema.Array(CustomFormModelIdSchema), { default: () => [] }),
+  hidden: Schema.optionalWith(Schema.Array(ModelIdSchema), { default: () => [] }),
   drafters: Schema.optionalWith(
     Schema.Record({ key: CustomFormModelIdSchema, value: DrafterChoiceSchema }),
     { default: () => ({}) },

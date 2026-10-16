@@ -3,7 +3,7 @@ import {
   AssessmentEnvironmentIdSchema, CatalogFormModelIdSchema, CustomFormModelIdSchema, HuggingFaceArtifactSelectorSchema,
   HuggingFaceRepositoryIdSchema, ModelAssessmentIdSchema, ModelReleaseDateSchema, ModelVariantLabelSchema,
   type CandidateInspection, type CandidateVersion, type CatalogLocalModel, type CustomLocalModel, type CustomModelOrigin,
-  type AttachedDrafter, type AttachedDrafterAvailability, type DrafterCandidate, type LocalModelAssessment, type MeasuredDrafterAcceptance, type UnsupportedLocalModel, type UnsupportedReason,
+  type AttachedDrafter, type AttachedDrafterAvailability, type DrafterCandidate, type LocalModelAssessment, type UnsupportedLocalModel, type UnsupportedReason,
 } from "@magnitudedev/sdk"
 
 const GB = 1_000_000_000
@@ -40,23 +40,20 @@ export const catalogModel = (): CatalogLocalModel => ({
 export const drafterCandidate = (overrides: Partial<DrafterCandidate> = {}): DrafterCandidate => ({
   category: "CatalogDrafter",
   reference: { _tag: "Catalog", modelId: catalogId },
-  label: "Magnitude DFlash for Qwen3.6 35B-A3B",
+  name: "Magnitude DFlash for Qwen3.6 35B-A3B",
+  label: "Trained for Qwen3.6 35B-A3B",
   sizeBytes: 0.9 * GB,
   lineage: "Lineage",
   verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: GB },
   onThisComputer: false,
   method: Option.some({ _tag: "DFlash" }),
-  measuredAcceptance: Option.none(),
   ...overrides,
-})
-
-export const measured = (acceptanceRate: number, slower = false): MeasuredDrafterAcceptance => ({
-  acceptanceRate, tokensPerSecond: slower ? 40 : 90, withoutDrafterTokensPerSecond: Option.some(60), slower,
 })
 
 export const attachedDrafter = (availability: AttachedDrafterAvailability = { _tag: "Present" }, overrides: Partial<AttachedDrafter> = {}): AttachedDrafter => ({
   reference: { _tag: "Catalog", modelId: catalogId },
-  label: "Magnitude DFlash",
+  name: "Magnitude DFlash for Qwen3.6 35B-A3B",
+  label: "Trained for Qwen3.6 35B-A3B",
   sizeBytes: 0.9 * GB,
   verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: GB },
   availability,
@@ -74,7 +71,6 @@ export const customModel = (origin: CustomModelOrigin, overrides: Partial<Custom
   presentation: { displayName: "Qwen3.6 35B A3B Uncensored", variantLabel: ModelVariantLabelSchema.make("Q4_K_P"), sourceLabel: sourceLabel(origin), variantOf: Option.some(catalogId), license: Option.none(), sourceUrls: [] },
   drafter: Option.none(),
   recommendedDrafter: Option.none(),
-  measuredAcceptance: Option.none(),
   acquisitionState: origin._tag === "Added"
     ? { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 23 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } }
     : { _tag: "External", installation: { _tag: "Resolved", installedBytes: 23 * GB, primaryPath: "/Users/me/.ollama/models/blobs/sha256-1", ownership: "External" }, residencyState: { _tag: "Unloaded" } },
@@ -92,6 +88,7 @@ export const version = (label: string, overrides: Partial<CandidateVersion> = {}
   modelId: CustomFormModelIdSchema.make(`hf:${repository}/${label}.gguf`),
   files: [`${label}.gguf`],
   sizeBytes: 23.4 * GB,
+  downloadBytes: overrides.sizeBytes ?? 23.4 * GB,
   assessment: Option.some(fits),
   recommended: false,
   onThisComputer: Option.none(),

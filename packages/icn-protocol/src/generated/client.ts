@@ -71,6 +71,7 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         configureLocalModels: makeHttpOperation(http, options, Operations.configureLocalModelsOperation),
         getLocalModelsConfiguration: makeHttpOperation(http, options, Operations.getLocalModelsConfigurationOperation),
         listLocalModels: makeHttpOperation(http, options, Operations.listLocalModelsOperation),
+        pruneLocalDrafters: makeHttpOperation(http, options, Operations.pruneLocalDraftersOperation),
         refreshLocalModels: makeHttpOperation(http, options, Operations.refreshLocalModelsOperation),
         removeLocalModelFiles: makeHttpOperation(http, options, Operations.removeLocalModelFilesOperation),
       },

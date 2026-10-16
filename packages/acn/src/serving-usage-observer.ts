@@ -29,8 +29,6 @@ export const makeUsageObservation = (options: {
   let terminalAt: number | null = null
   let complete = false
   let finished = false
-  let draftTokens: number | null = null
-  let acceptedDraftTokens: number | null = null
   const push = (value: unknown) => {
     const frame = object(value)
     const response = frame.response === undefined ? frame : object(frame.response)
@@ -72,8 +70,6 @@ export const makeUsageObservation = (options: {
       input = t.prompt_n + t.cache_n; cached = t.cache_n; output = t.predicted_n
       generationMs = Number.isFinite(t.predicted_ms) && t.predicted_ms > 0 ? t.predicted_ms : null
       firstTokenMs = Number.isFinite(t.time_to_first_token_ms) && t.time_to_first_token_ms >= 0 ? t.time_to_first_token_ms : null
-      draftTokens = Option.getOrNull(t.draft_n)
-      acceptedDraftTokens = Option.getOrNull(t.draft_n_accepted)
       complete = true
     }
     if (complete && terminalAt === null) terminalAt = now()
@@ -89,25 +85,10 @@ export const makeUsageObservation = (options: {
         const elapsed = (terminalAt ?? now()) - firstOutputAt
         if (complete && output !== null && elapsed > 0) generationMs ??= elapsed
       }
-      return Option.some({
-        id: ServingUsageRecord.fields.id.make(id), model, completedAt: Date.now(), input, cached, output, generationMs,
-        firstTokenMs, complete, drafter: null, draftTokens, acceptedDraftTokens,
-      })
+      return Option.some({ id: ServingUsageRecord.fields.id.make(id), model, completedAt: Date.now(), input, cached, output, generationMs, firstTokenMs, complete })
     },
   }
 }
-
-/** The drafter attached to a model when its request completed, keyed by `drafterReferenceKey`. */
-export type DrafterAttribution = (model: typeof ServingModelId.Type) => Effect.Effect<Option.Option<string>>
-
-/** Records every observation with the drafter attached to its model when it completed. */
-export const attributeDrafters = (usage: ServingUsage, attribute: DrafterAttribution): ServingUsage => ({
-  ...usage,
-  record: (record) => attribute(record.model).pipe(
-    Effect.map((drafter) => ({ ...record, drafter: Option.getOrNull(drafter) })),
-    Effect.flatMap(usage.record),
-  ),
-})
 
 /** A pull-through observer preserves backpressure and forwards the original bytes. */
 export const makeUsageFetch = (origin: URL, usage: ServingUsage, fetchTarget: InferenceFetch = fetch): InferenceFetch => async (input, init) => {

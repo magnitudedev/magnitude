@@ -6,9 +6,12 @@ import { CustomModelCommands, type CustomModelCommandsApi } from "./custom-model
 const customCalls: string[] = []
 const customCommands = {
   remove: (modelId: string) => Effect.sync(() => { customCalls.push(`custom remove ${modelId}`); return {} }),
-  sync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom sync ${modelId}`); return { outcome: "Started" as const } }),
+  sync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom sync ${modelId}`); return { outcome: "Installing" as const } }),
   cancelSync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom cancel ${modelId}`); return {} }),
   acknowledgeSyncFailure: (modelId: string) => Effect.sync(() => { customCalls.push(`custom acknowledge ${modelId}`); return {} }),
+  externalCatalogFiles: (modelId: string) => Effect.succeed(modelId === "model-c:gguf:test"
+    ? Option.some({ path: "/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf", location: Option.some("HuggingFaceCache") })
+    : Option.none()),
 } as unknown as CustomModelCommandsApi
 
 describe("modelCommandFailure", () => {
@@ -113,8 +116,41 @@ it("stops a running model before removing it, and removes an idle model without 
   await Effect.runPromise(remove("model-a:gguf:test"))
   await Effect.runPromise(remove("model-b:gguf:test"))
   await Effect.runPromise(remove("hf:owner/repo/model-Q4_K_M.gguf"))
+  const external = await Effect.runPromise(remove("model-c:gguf:test").pipe(Effect.flip))
   expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
+  expect(external.message).toBe("model-c:gguf:test uses files in your Hugging Face cache "
+    + "(/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf), which Magnitude never deletes. "
+    + "Hide it with `magnitude models hide model-c:gguf:test`, or delete it with the Hugging Face CLI (`hf cache delete`).")
   expect(customCalls).toContain("custom remove hf:owner/repo/model-Q4_K_M.gguf")
+})
+
+it("reports whether a catalog sync installs, updates, or finds the model current", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovals } = await import("./local-model-removals")
+  const sync = (localState: string, admission: string) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return (yield* commands.sync(Schema.decodeUnknownSync(ModelIdSchema)("model-a:gguf:test"))).outcome
+  }).pipe(
+    Effect.provide(ModelCommandsLive),
+    Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, {
+      catalog: { installCatalogModel: () => Effect.succeed({ _tag: admission, operationId: "op" }) },
+    } as never),
+    Effect.provideService(IcnCatalog, {
+      get: Effect.succeed({ revision: 1, state: { models: [{ id: "model-a:gguf:test", localState: { _tag: localState } }] } }),
+      refresh: Effect.void,
+    } as never),
+    Effect.provideService(IcnCatalogInstallations, { refresh: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+    Effect.provideService(LocalModelRemovals, {} as never),
+  )
+  expect(await Effect.runPromise(sync("NotInstalled", "Admitted"))).toBe("Installing")
+  expect(await Effect.runPromise(sync("Installed", "Admitted"))).toBe("Updating")
+  expect(await Effect.runPromise(sync("Installed", "Current"))).toBe("AlreadyCurrent")
 })
 
 describe("load acknowledgement", () => {

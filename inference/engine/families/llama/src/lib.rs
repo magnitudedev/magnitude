@@ -137,12 +137,14 @@ impl Error {
                 .iter()
                 .map(|name| UnsupportedReason::UnrecognizedTensor { name: name.clone() })
                 .collect(),
+            Self::WeightShape { name, .. } => {
+                vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
+            }
             Self::Architecture(_)
             | Self::Metadata { .. }
             | Self::Geometry(_)
             | Self::Projector
             | Self::MissingWeight(_)
-            | Self::WeightShape { .. }
             | Self::Definition(_) => Vec::new(),
         }
     }

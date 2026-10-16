@@ -1,4 +1,5 @@
 import {
+  candidateDownloadBytes,
   catalogVariantOfName,
   formatStorageSize,
   preselectedDrafterCandidate,
@@ -11,6 +12,7 @@ import {
   DrafterCandidateSchema,
   HuggingFaceRepositoryIdSchema,
   HuggingFaceSearchResponseSchema,
+  LocalModelSyncOutcomeSchema,
   Models,
   type CandidateInspection,
   type CandidateVersion,
@@ -20,9 +22,11 @@ import {
   type DrafterTarget,
   type HuggingFaceSearchResponse,
   type LocalModel,
+  type LocalModelSyncOutcome,
   type UnsupportedReason,
 } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
+import { join } from "node:path"
 import { renderDrafterChoices } from "./drafter-output"
 import { catalogProducts, readCatalog, withClient, type CliModelsClient } from "./inference-client"
 import { CandidateInspectionJsonSchema } from "./json-schemas"
@@ -68,9 +72,9 @@ export const renderSearch = ({ query, all, response, models }: SearchView): stri
     onNone: () => [],
     onSome: (reasons) => [{ result, reasons }],
   }))
-  const footer = response.hiddenCount > 0 ? [
+  const footer = response.hiddenCount > 0 && !all ? [
     `${plural(response.hiddenCount, "more result uses", "more results use")} architectures Magnitude doesn't run.`,
-    ...(all ? [] : [`List them: magnitude catalog search ${quoted(query)} --all`]),
+    `List them: magnitude catalog search ${quoted(query)} --all`,
   ] : []
   const supportedSection = supported.length === 0
     ? [`No Hugging Face models that run in Magnitude match ${quoted(query)}.`]
@@ -202,8 +206,28 @@ export const acquisitionHint = (inspection: CandidateInspection): string => Opti
     onNone: () => "No version of this model runs on this computer.",
     onSome: (version) => inspection.source._tag === "HuggingFace"
       ? `Download: magnitude catalog pull ${inspection.source.repository}:${version.label}`
-      : `Add: magnitude models import ${inspection.source.path}`,
+      : `Add: magnitude models import ${join(inspection.source.path, version.files[0]!)}`,
   })
+
+/** "Download size: 3.7 GB (model 3.01 GB + projector 670 MB + drafter 685 MB)", omitting parts already here. */
+export const downloadSizeLine = (
+  inspection: CandidateInspection,
+  version: CandidateVersion,
+  drafters: readonly DrafterCandidate[],
+): string => {
+  const download = candidateDownloadBytes(version, inspection.projector, preselectedDrafterCandidate(drafters))
+  if (download.totalBytes === 0) return "Download size: nothing to download, it's all on this computer."
+  const parts = [
+    ["model", download.modelBytes],
+    ["projector", download.projectorBytes],
+    ["drafter", download.drafterBytes],
+  ] as const
+  const present = parts.filter(([, bytes]) => bytes > 0)
+  const total = `Download size: ${formatStorageSize(download.totalBytes)}`
+  return present.length < 2
+    ? `${total} (${present[0]![0]})`
+    : `${total} (${present.map(([part, bytes]) => `${part} ${formatStorageSize(bytes)}`).join(" + ")})`
+}
 
 export const renderInspection = ({ inspection, drafters, models }: InspectionView): string => {
   const header = inspectionHeader(inspection, models)
@@ -224,9 +248,10 @@ export const renderInspection = ({ inspection, drafters, models }: InspectionVie
     { heading: "SIZE", value: ({ sizeBytes }) => formatStorageSize(sizeBytes) },
     { heading: "ON THIS COMPUTER", value: (version) => versionVerdict(version, version.label === selectedLabel) },
   ]).trimEnd()
-  const drafterSection = chosen === undefined || !isRunnable(chosen) ? [] : [
+  const runnable = chosen !== undefined && isRunnable(chosen)
+  const drafterSection = !runnable ? [] : [
     "",
-    renderDrafterChoices(drafters, models, Option.map(preselectedDrafterCandidate(drafters), ({ reference }) => reference)),
+    renderDrafterChoices(drafters, Option.map(preselectedDrafterCandidate(drafters), ({ reference }) => reference)),
   ]
   return ensureTrailingNewline([
     ...header,
@@ -234,6 +259,7 @@ export const renderInspection = ({ inspection, drafters, models }: InspectionVie
     versions,
     ...drafterSection,
     "",
+    ...(runnable ? [downloadSizeLine(inspection, chosen, drafters)] : []),
     acquisitionHint(inspection),
   ].join("\n"))
 }
@@ -296,6 +322,27 @@ export const drafterChoice = (argument: Exclude<DrafterArgument, { readonly _tag
   }
 }
 
+const HUB_URL = /^https?:\/\/(?:www\.)?huggingface\.co\/([^/]+\/[^/]+)\/(?:blob|resolve)\/[^/]+\/(.+)$/
+const HUB_REFERENCE = /^([^/@:\s]+\/[^/@:\s]+)(?:@[^:]+)?:(.+)$/
+
+/** Whether a typed drafter reference names an already listed candidate: the same Hub file or the same local path. */
+export const drafterReferenceMatches = (input: string, reference: DrafterCandidate["reference"]): boolean => {
+  const typed = input.trim()
+  switch (reference._tag) {
+    case "HuggingFace": {
+      const hub = HUB_URL.exec(typed) ?? HUB_REFERENCE.exec(typed)
+      return hub !== null
+        && hub[1]!.toLowerCase() === reference.repository.toLowerCase()
+        && decodeURIComponent(hub[2]!) === reference.path
+    }
+    case "Local":
+      return absolutePath(typed) === reference.path
+    case "Catalog":
+    case "Embedded":
+      return false
+  }
+}
+
 const lookUpDrafter = (
   client: CliModelsClient,
   target: DrafterTarget,
@@ -305,6 +352,7 @@ const lookUpDrafter = (
   other: Option.some(reference),
 }).pipe(Effect.flatMap(({ candidates }) => {
   const found = candidates.find(({ category }) => category === "Other")
+    ?? candidates.find((candidate) => drafterReferenceMatches(reference, candidate.reference))
   if (found === undefined) {
     return Effect.fail(new ModelCommandError({ message: `Magnitude couldn't find a drafter at ${reference}.` }))
   }
@@ -330,11 +378,11 @@ const AddedModelSchema = Models.addHuggingFaceModel.successSchema
 export const PullResultSchema = Schema.Union(
   Schema.TaggedStruct("Catalog", {
     modelId: CatalogFormModelIdSchema,
-    outcome: Schema.Literal("Started", "AlreadyCurrent"),
+    outcome: LocalModelSyncOutcomeSchema,
   }),
   Schema.TaggedStruct("Custom", {
     modelId: CustomFormModelIdSchema,
-    outcome: Schema.Literal("Started", "AlreadyCurrent"),
+    outcome: LocalModelSyncOutcomeSchema,
   }),
   Schema.TaggedStruct("HuggingFace", {
     repository: HuggingFaceRepositoryIdSchema,
@@ -347,17 +395,26 @@ export type PullResult = typeof PullResultSchema.Type
 const drafterDownloads = (drafter: Option.Option<DrafterCandidate>) =>
   Option.exists(drafter, (candidate) => !candidate.onThisComputer && candidate.reference._tag !== "Embedded")
 
+const syncStarted = (modelId: string, outcome: Exclude<LocalModelSyncOutcome, "AlreadyCurrent">): string => {
+  const started = {
+    Installing: `Downloading ${modelId}.`,
+    Updating: `Updating ${modelId}.`,
+    DownloadingDrafter: `Downloading the drafter for ${modelId}.`,
+  }[outcome]
+  return `${started}\nCheck progress: magnitude models status ${modelId}\n`
+}
+
 export const renderPull = (result: PullResult): string => {
   if (result._tag === "Catalog") return result.outcome === "AlreadyCurrent"
     ? `${result.modelId} is already installed and up to date.\n`
-    : `Downloading or updating ${result.modelId}.\nCheck progress: magnitude models status ${result.modelId}\n`
+    : syncStarted(result.modelId, result.outcome)
   if (result._tag === "Custom") return result.outcome === "AlreadyCurrent"
     ? `${result.modelId} is up to date.\n`
-    : `Updating ${result.modelId}.\nCheck progress: magnitude models status ${result.modelId}\n`
+    : syncStarted(result.modelId, result.outcome)
   const { added } = result
   const name = `${result.repository}:${added.version}`
   const choice = result.versionRequested ? "" : " (the recommended version)"
-  const drafter = `Drafter: ${Option.match(added.drafter, { onNone: () => "none", onSome: ({ label }) => label })}`
+  const drafter = `Drafter: ${Option.match(added.drafter, { onNone: () => "none", onSome: ({ name }) => name })}`
   const progress = `Check progress: magnitude models status ${added.modelId}`
   if (added.outcome === "Started") return ensureTrailingNewline([
     `Downloading ${name}${choice}.`,

@@ -3,10 +3,10 @@ import { Cause, Option } from "effect"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { WarningIcon } from "@phosphor-icons/react"
 import {
-  drafterCandidateDownloadBytes, drafterCandidateLabel, drafterCandidateSelectable, drafterCandidateWarning,
+  drafterCandidateDownloadBytes, drafterCandidateSelectable, drafterCandidateWarning,
   formatStorageSize, preselectedDrafterCandidate, useAgentClient,
 } from "@magnitudedev/client-common"
-import type { CustomLocalModel, DrafterCandidate, DrafterChoice, DrafterReference, DrafterTarget, LocalModel } from "@magnitudedev/sdk"
+import type { CustomLocalModel, DrafterCandidate, DrafterChoice, DrafterReference, DrafterTarget } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 import { Input } from "./ui/input"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog"
@@ -55,18 +55,11 @@ export const attachedDrafterSelection = (model: CustomLocalModel, candidates: re
 
 const rowClass = "flex items-start gap-3 px-3 py-2.5"
 
-/** "58% accepted" once this model has served requests with the candidate. */
-export const drafterCandidateAcceptance = (candidate: DrafterCandidate): Option.Option<string> =>
-  Option.map(candidate.measuredAcceptance, ({ acceptanceRate }) => `${Math.round(acceptanceRate * 100)}% accepted`)
+const recommendedBadge = "shrink-0 rounded-full border border-blue-300 px-2 py-0.5 text-xs text-blue-700 dark:border-blue-700 dark:text-blue-400"
 
-/** A measured candidate that made responses slower than running without a drafter. */
-export const drafterCandidateSlower = (candidate: DrafterCandidate): boolean =>
-  Option.exists(candidate.measuredAcceptance, ({ slower }) => slower)
-
-/** The drafter choices in preselection order, then "Use a different drafter…", then No drafter. */
-export function DrafterList({ candidates, models, selection, onSelect, otherPending = false, otherFailure, onCheckOther }: {
+/** The drafter choices in preselection order, each named with its note once, then "Use a different drafter…", then No drafter. */
+export function DrafterList({ candidates, selection, onSelect, otherPending = false, otherFailure, onCheckOther }: {
   candidates: readonly DrafterCandidate[]
-  models: readonly LocalModel[]
   selection: DrafterSelection
   onSelect: (selection: DrafterSelection) => void
   otherPending?: boolean
@@ -78,6 +71,7 @@ export function DrafterList({ candidates, models, selection, onSelect, otherPend
   const [other, setOther] = useState("")
   const selected = selectedDrafterCandidate(selection, candidates)
   const selectedKey = Option.match(selected, { onNone: () => "none", onSome: drafterKey })
+  const recommendedKey = Option.map(preselectedDrafterCandidate(candidates), drafterKey)
   return <div>
     <div role="radiogroup" aria-label="Drafter" className="divide-y divide-slate-200 overflow-hidden rounded-lg border border-slate-200 dark:divide-slate-750 dark:border-slate-750">
       {candidates.map(candidate => {
@@ -85,13 +79,14 @@ export function DrafterList({ candidates, models, selection, onSelect, otherPend
         const selectable = drafterCandidateSelectable(candidate)
         const warning = drafterCandidateWarning(candidate)
         const bytes = drafterCandidateDownloadBytes(candidate)
-        const acceptance = drafterCandidateAcceptance(candidate)
         return <label key={key} className={`${rowClass} ${selectable ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800" : "opacity-60"}`}>
           <input type="radio" name={name} className="mt-1 accent-blue-600" checked={selectedKey === key} disabled={!selectable} onChange={() => onSelect({ _tag: "Candidate", key })} />
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-medium">{candidate.label}</span>
-            <span className="block truncate text-xs text-slate-500">{drafterCandidateLabel(candidate, models)}{candidate.reference._tag === "HuggingFace" ? ` · ${candidate.reference.repository}` : ""}{Option.isSome(acceptance) ? ` · ${acceptance.value}` : ""}</span>
-            {drafterCandidateSlower(candidate) && <span className="mt-0.5 flex items-center gap-1 text-xs text-orange-600 dark:text-orange-400"><WarningIcon aria-hidden="true" className="size-3.5 shrink-0" />Slower than no drafter on this computer</span>}
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-sm font-medium" title={candidate.name}>{candidate.name}</span>
+              {Option.contains(recommendedKey, key) && <span className={recommendedBadge}>Recommended</span>}
+            </span>
+            <span className="block truncate text-xs text-slate-500">{candidate.label}</span>
             {Option.isSome(warning) && <span className={`mt-0.5 flex items-center gap-1 text-xs ${selectable ? "text-orange-600 dark:text-orange-400" : "text-slate-500"}`}>{selectable && <WarningIcon aria-hidden="true" className="size-3.5 shrink-0" />}{warning.value}</span>}
           </span>
           <span className="shrink-0 text-xs tabular-nums text-slate-500">{bytes > 0 ? formatStorageSize(bytes) : "No download"}</span>
@@ -130,25 +125,24 @@ export function useDrafterCandidates(target: DrafterTarget) {
 }
 
 /** Change for a custom model's drafter, from the same list as the repository step. */
-export function DrafterPickerDialog({ model, models, open, onOpenChange, onChoose }: {
+export function DrafterPickerDialog({ model, open, onOpenChange, onChoose }: {
   model: CustomLocalModel
-  models: readonly LocalModel[]
   open: boolean
   onOpenChange: (open: boolean) => void
   onChoose: (choice: DrafterChoice) => void
 }) {
   return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+    <DialogContent className="max-h-[85vh] grid-cols-[minmax(0,1fr)] overflow-y-auto sm:max-w-lg">
       <DialogHeader>
         <DialogTitle>Drafter</DialogTitle>
         <DialogDescription>A small model that drafts tokens for this one to verify, for faster responses.</DialogDescription>
       </DialogHeader>
-      {open && <DrafterPicker model={model} models={models} onCancel={() => onOpenChange(false)} onChoose={choice => { onOpenChange(false); onChoose(choice) }} />}
+      {open && <DrafterPicker model={model} onCancel={() => onOpenChange(false)} onChoose={choice => { onOpenChange(false); onChoose(choice) }} />}
     </DialogContent>
   </Dialog>
 }
 
-function DrafterPicker({ model, models, onCancel, onChoose }: { model: CustomLocalModel; models: readonly LocalModel[]; onCancel: () => void; onChoose: (choice: DrafterChoice) => void }) {
+function DrafterPicker({ model, onCancel, onChoose }: { model: CustomLocalModel; onCancel: () => void; onChoose: (choice: DrafterChoice) => void }) {
   const { candidates, otherPending, otherFailure, checkOther } = useDrafterCandidates({ _tag: "Model", modelId: model.modelId })
   const [picked, setPicked] = useState(Option.none<DrafterSelection>())
   const list = Result.isSuccess(candidates) ? candidates.value.candidates : []
@@ -156,8 +150,8 @@ function DrafterPicker({ model, models, onCancel, onChoose }: { model: CustomLoc
   const choice = drafterChoice(selection, list)
   return <>
     {Result.isFailure(candidates) ? <ErrorNotice title="Couldn’t list drafters" description="Check your connection, then try again." />
-      : !Result.isSuccess(candidates) ? <div className="space-y-2"><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
-      : <DrafterList candidates={list} models={models} selection={selection} onSelect={next => setPicked(Option.some(next))} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />}
+      : !Result.isSuccess(candidates) ? <div aria-busy="true" aria-label="Finding drafters" className="space-y-2"><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
+      : <DrafterList candidates={list} selection={selection} onSelect={next => setPicked(Option.some(next))} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />}
     <DialogFooter>
       <Button variant="outline" onClick={onCancel}>Cancel</Button>
       <Button disabled={!Result.isSuccess(candidates)} onClick={() => onChoose(choice)}>{choice._tag === "None" ? "Turn off drafter" : "Use this drafter"}</Button>

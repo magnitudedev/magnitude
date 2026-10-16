@@ -1,7 +1,7 @@
 //! Candidates: files not yet added (a Hugging Face repository at a commit, or a local path), and
 //! the drafters any model can use. Inspection groups a candidate's GGUFs into versions and asks
-//! the engine for each version's verdict from its headers alone; drafter enumeration lists every
-//! drafter known for a target in the product's category order, each with the engine's binding
+//! the engine for each version's verdict from its headers alone; drafter enumeration lists the
+//! drafters offered for a target in automatic-choice order, each with the engine's binding
 //! verdict. Assessments here are cached by the exact header material they read, like every
 //! assessment.
 
@@ -21,10 +21,9 @@ use magnitude_service_contracts::models::{
     CandidateSource, CandidateVersion, CatalogModelState, CatalogModels, CustomModel,
     CustomModelOrigin, CustomModelState, DrafterCandidate, DrafterCandidatesRequest,
     DrafterCandidatesResponse, DrafterCategory, DrafterLineage, DrafterReference, DrafterVerdict,
-    HuggingFaceRepositoryId, InstalledModelPackages, LocalModels, ModelAssessment,
-    ModelAssessmentProfile, ModelAssessmentSubject, ModelBundleInput, ModelCandidate,
-    ModelCandidates, ModelFileRole, ModelFingerprint, ModelId, ModelPackage, ModelPackageOperand,
-    ModelPackageSource, ParsedModelId, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
+    HuggingFaceRepositoryId, LocalModels, ModelAssessment, ModelAssessmentProfile,
+    ModelAssessmentSubject, ModelCandidate, ModelCandidates, ModelFileRole, ModelFingerprint,
+    ModelId, ModelPackage, ModelPackageSource, ParsedModelId, ServableModelBundle, ServingProfile, SpeculativeDraftSource,
     SpeculativeMethod,
 };
 use magnitude_service_contracts::{
@@ -34,10 +33,10 @@ use magnitude_service_contracts::{
 };
 use magnitude_service_models::candidate_files::{
     CandidateFileRole, CandidateGguf, GgufGroup, RecognizedArchitectures, display_name,
-    group_ggufs, header_base_repositories, header_inspection, hugging_face_repository_from_url,
+    group_ggufs, header_base_repositories, hugging_face_repository_from_url,
     is_q4_k_class, local_directory, local_header_digest, version_label,
 };
-use magnitude_service_models::lineage::{CatalogLineage, CatalogLineageMatch};
+use magnitude_service_models::lineage::{CatalogLineage, CatalogLineageMatch, CatalogShape, CatalogShapes};
 use magnitude_service_models::{
     CachedModelAssessment, CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts,
     ManagedModelStore, ModelDomainResolver, ServableModelBundleKey,
@@ -48,15 +47,12 @@ use sha2::{Digest, Sha256};
 use super::assessor::{ModelAssessor, model_assessment, performance_depths, preparation_error};
 
 /// Concurrent header requests while classifying a repository's files.
-const HEADER_CONCURRENCY: usize = 6;
-/// Concurrent engine assessments of one request's versions or drafters.
-const ASSESSMENT_CONCURRENCY: usize = 3;
+const HEADER_CONCURRENCY: usize = 12;
+/// The most concurrent engine assessments of one request's versions or drafters; fewer on
+/// machines with fewer cores.
+const MAX_ASSESSMENT_CONCURRENCY: usize = 6;
 const MAX_LOCAL_SCAN_DEPTH: usize = 2;
 const MAX_LOCAL_SCAN_FILES: usize = 512;
-const MAX_ON_THIS_COMPUTER_DRAFTERS: usize = 8;
-const MAX_HUB_DRAFTER_BASES: usize = 3;
-const MAX_HUB_DRAFTER_REPOSITORIES: usize = 4;
-const MAX_HUB_DRAFTER_FILES: usize = 2;
 /// How long a custom model whose enrichment failed waits before it is tried again.
 const ENRICHMENT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -98,6 +94,13 @@ struct ClassifiedGroup {
     quantization: Option<String>,
 }
 
+/// What the release headers say about each catalog model, for matching models without lineage.
+#[derive(Default)]
+struct CatalogFacts {
+    fingerprints: Vec<(ModelId, ModelFingerprint)>,
+    shapes: Vec<CatalogShape>,
+}
+
 /// Computed lineage hints and recommended drafters, keyed by model and exact target package.
 #[derive(Default)]
 struct CandidateEnrichment {
@@ -105,7 +108,7 @@ struct CandidateEnrichment {
 }
 
 impl CandidateEnrichment {
-    fn knows(&self, key: &(ModelId, String)) -> bool {
+    fn knows_key(&self, key: &(ModelId, String)) -> bool {
         self.results
             .read()
             .is_ok_and(|results| results.contains_key(key))
@@ -139,6 +142,10 @@ impl CustomModelEnrichment for CandidateEnrichment {
             })
             .unwrap_or_default()
     }
+
+    fn knows(&self, model: &CustomModelFacts<'_>) -> bool {
+        self.knows_key(&(model.model_id.clone(), model.target.id.0.clone()))
+    }
 }
 
 pub struct ManagedModelCandidates {
@@ -147,7 +154,7 @@ pub struct ManagedModelCandidates {
     architectures: RecognizedArchitectures,
     catalog: Arc<dyn CatalogModels>,
     local: Arc<dyn LocalModels>,
-    catalog_fingerprints: tokio::sync::OnceCell<Vec<(ModelId, ModelFingerprint)>>,
+    catalog_facts: tokio::sync::OnceCell<CatalogFacts>,
     gates: tokio::sync::Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
@@ -172,7 +179,7 @@ impl ManagedModelCandidates {
             architectures,
             catalog,
             local,
-            catalog_fingerprints: tokio::sync::OnceCell::new(),
+            catalog_facts: tokio::sync::OnceCell::new(),
             gates: tokio::sync::Mutex::new(BTreeMap::new()),
         })
     }
@@ -187,11 +194,7 @@ impl ManagedModelCandidates {
         model_id: &ModelId,
     ) -> Result<Option<DrafterCandidate>, InventoryError> {
         let target = self.model_target(model_id).await?;
-        Ok(self
-            .enumerate_drafters(target, None, true)
-            .await?
-            .into_iter()
-            .find(|candidate| matches!(candidate.verdict, DrafterVerdict::Bound { .. })))
+        Ok(recommended(self.enumerate_drafters(target, None, true).await?))
     }
 
     /// A custom model's lineage hint and recommended drafter.
@@ -211,11 +214,7 @@ impl ManagedModelCandidates {
             .catalog_match(exact, &target.lineage, plain.fingerprint.as_ref())
             .await
             .map(|(matched, _)| matched.model_id);
-        let recommended_drafter = self
-            .enumerate_drafters(target, None, true)
-            .await?
-            .into_iter()
-            .find(|candidate| matches!(candidate.verdict, DrafterVerdict::Bound { .. }));
+        let recommended_drafter = recommended(self.enumerate_drafters(target, None, true).await?);
         Ok(CustomModelEnrichmentResult {
             variant_of,
             recommended_drafter,
@@ -227,6 +226,10 @@ impl ManagedModelCandidates {
     /// time, keyed by the model and its exact target package, and the list is republished when
     /// they change.
     pub fn start_enrichment(self: &Arc<Self>, resolver: Arc<ModelDomainResolver>) {
+        let warmed = Arc::clone(self);
+        tokio::spawn(async move {
+            warmed.catalog_facts().await;
+        });
         let enrichment = Arc::new(CandidateEnrichment::default());
         resolver.set_custom_model_enrichment(enrichment.clone());
         let candidates = Arc::clone(self);
@@ -259,7 +262,7 @@ impl ManagedModelCandidates {
                         continue;
                     };
                     let key = (model_id.clone(), bundle_target(&configuration.bundle).id.0.clone());
-                    if enrichment.knows(&key)
+                    if enrichment.knows_key(&key)
                         || failed
                             .get(&key)
                             .is_some_and(|at| at.elapsed() < ENRICHMENT_RETRY_DELAY)
@@ -299,14 +302,11 @@ impl ManagedModelCandidates {
         method: ModelMethod,
     ) -> Result<CachedModelAssessment, InventoryError> {
         let environment = Arc::clone(self.assessor.environment());
-        let evidence = serde_json::to_string(&(
-            "candidate-assessment-v1",
-            &environment.id.0,
+        let evidence = self.assessment_evidence(
             &target.identity,
             drafter.map(|drafter| drafter.identity.as_str()),
-            format!("{method:?}"),
-        ))
-        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+            &method,
+        )?;
         if let Some(cached) = self.models().read_model_assessment(&evidence) {
             return Ok(cached);
         }
@@ -362,6 +362,50 @@ impl ManagedModelCandidates {
         Ok(cached)
     }
 
+    /// The cache key of an assessment: the environment, the exact header material and the
+    /// method.
+    fn assessment_evidence(
+        &self,
+        target: &str,
+        drafter: Option<&str>,
+        method: &ModelMethod,
+    ) -> Result<String, InventoryError> {
+        serde_json::to_string(&(
+            "candidate-assessment-v2",
+            &self.assessor.environment().id.0,
+            target,
+            drafter,
+            format!("{method:?}"),
+        ))
+        .map_err(|error| InventoryError::Internal(error.to_string()))
+    }
+
+    /// The identity `hugging_face_target` would give a version's material, from cached header
+    /// digests alone, or `None` when a header was never fetched.
+    fn cached_hugging_face_identity(
+        &self,
+        snapshot: &HuggingFaceRepositorySnapshot,
+        group: &GgufGroup,
+        projector: Option<&Path>,
+    ) -> Option<String> {
+        let mut headers = Vec::new();
+        for path in group
+            .files
+            .iter()
+            .map(|file| file.path.as_path())
+            .chain(projector)
+        {
+            let file = snapshot_file(snapshot, path).ok()?;
+            let digest = self.models().cached_hugging_face_header_digest(
+                &snapshot.repository,
+                &snapshot.commit,
+                file,
+            )?;
+            headers.push((path_string(path), digest));
+        }
+        Some(header_identity(headers))
+    }
+
     async fn gate(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut gates = self.gates.lock().await;
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -414,12 +458,12 @@ impl ManagedModelCandidates {
             .prepare_preview_from_repository_snapshot(&source, snapshot)
             .await?;
         let (target, projector) = resolved_paths(&prepared.model)?;
-        let identity = prepared
-            .headers
-            .iter()
-            .map(|header| format!("{}={}", header.path.display(), header.digest))
-            .collect::<Vec<_>>()
-            .join(",");
+        let identity = header_identity(
+            prepared
+                .headers
+                .iter()
+                .map(|header| (path_string(&header.path), header.digest.clone())),
+        );
         Ok(TargetMaterial {
             target,
             projector,
@@ -529,22 +573,12 @@ impl ManagedModelCandidates {
         }))
     }
 
-    async fn installed_package_material(
-        &self,
-        package: &ModelPackage,
-    ) -> Result<magnitude_service_contracts::models::ResolvedServableModelBundle, InventoryError>
-    {
-        self.models()
-            .resolve_bundle(ModelBundleInput::Standalone {
-                package: ModelPackageOperand::SourceBacked {
-                    package: package.clone(),
-                },
-            })
-            .await
-    }
-
     // Classification -------------------------------------------------------------------------
 
+    /// Every complete GGUF of a snapshot, classified from its header. Classifications are cached
+    /// by header, so only files never seen before are read: one whole header first, whose
+    /// tokenizer the others then share (see the store's `hugging_face_gguf_header`), read
+    /// concurrently.
     async fn classify_hugging_face(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
@@ -557,35 +591,75 @@ impl ManagedModelCandidates {
                 size_bytes: file.size_bytes,
             })
             .collect::<Vec<_>>();
-        let mut pending = Vec::new();
+        let mut cached = Vec::new();
+        let mut uncached = Vec::new();
         for group in group_ggufs(&files) {
-            pending.push(self.classify_hugging_face_group(snapshot, group));
+            let file = snapshot_file(snapshot, &group.primary().path)?;
+            match self.models().cached_hugging_face_classification(
+                &snapshot.repository,
+                &snapshot.commit,
+                file,
+                &self.architectures,
+            ) {
+                Some((digest, classification)) => {
+                    cached.push(classified_group(group, digest, classification));
+                }
+                None => uncached.push(group),
+            }
         }
-        let classified = futures_util::stream::iter(pending)
-            .buffered(HEADER_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-        classified.into_iter().collect()
+        let mut classified = cached;
+        if uncached.is_empty() {
+            return Ok(classified);
+        }
+        // Read a likely model file whole: a projector shares no tokenizer. Names only order the
+        // requests; headers decide every role.
+        let probe = uncached
+            .iter()
+            .position(|group| !path_string(&group.primary().path).to_lowercase().contains("mmproj"))
+            .unwrap_or(0);
+        let probe = uncached.remove(probe);
+        let probe_file = snapshot_file(snapshot, &probe.primary().path)?;
+        let sibling = self
+            .models()
+            .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, probe_file, None)
+            .await?;
+        classified.push(self.classify_hugging_face_group(snapshot, probe, None).await?);
+        let rest = futures_util::stream::iter(uncached.into_iter().map(|group| {
+            self.classify_hugging_face_group(snapshot, group, Some(&sibling.bytes))
+        }))
+        .buffered(HEADER_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+        for group in rest {
+            classified.push(group?);
+        }
+        let order = files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| (file.path.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        classified.sort_by_key(|group| order.get(&group.group.primary().path).copied());
+        Ok(classified)
     }
 
     async fn classify_hugging_face_group(
         &self,
         snapshot: &HuggingFaceRepositorySnapshot,
         group: GgufGroup,
+        sibling: Option<&[u8]>,
     ) -> Result<ClassifiedGroup, InventoryError> {
         let file = snapshot_file(snapshot, &group.primary().path)?;
-        let header = self
+        let (header_digest, classification) = self
             .models()
-            .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, file)
+            .classify_hugging_face_gguf(
+                &snapshot.repository,
+                &snapshot.commit,
+                file,
+                &self.architectures,
+                sibling,
+            )
             .await?;
-        let (directory, inspection) = header_inspection(&header.bytes)?;
-        Ok(ClassifiedGroup {
-            role: CandidateFileRole::of(&directory, &self.architectures),
-            base_repositories: header_base_repositories(&directory),
-            quantization: inspection.quantization,
-            header_digest: header.digest,
-            group,
-        })
+        Ok(classified_group(group, header_digest, classification))
     }
 
     /// A version's verdict, when its architecture is one the engine runs. A failure to read its
@@ -593,10 +667,17 @@ impl ManagedModelCandidates {
     async fn version_assessment(
         &self,
         recognized: bool,
+        identity: Option<String>,
         material: impl std::future::Future<Output = Result<TargetMaterial, InventoryError>>,
     ) -> Option<CachedModelAssessment> {
         if !recognized {
             return None;
+        }
+        if let Some(cached) = identity
+            .and_then(|identity| self.assessment_evidence(&identity, None, &ModelMethod::Auto).ok())
+            .and_then(|evidence| self.models().read_model_assessment(&evidence))
+        {
+            return Some(cached);
         }
         let material = material
             .await
@@ -608,22 +689,18 @@ impl ManagedModelCandidates {
             .ok()
     }
 
-    fn classify_local(&self, root: &Path, files: &[CandidateGguf]) -> Vec<ClassifiedGroup> {
-        group_ggufs(files)
-            .into_iter()
-            .filter_map(|group| {
-                let path = root.join(&group.primary().path);
-                let directory = local_directory(&path).ok()?;
-                let inspection = magnitude_service_models::gguf::inspect(&path).ok()?;
-                Some(ClassifiedGroup {
-                    role: CandidateFileRole::of(&directory, &self.architectures),
-                    base_repositories: header_base_repositories(&directory),
-                    quantization: inspection.quantization,
-                    header_digest: local_header_digest(&path).ok()?,
-                    group,
-                })
-            })
-            .collect()
+    /// A local folder's GGUFs, found and classified off the async runtime: reading headers is
+    /// file I/O and hashing.
+    async fn scan_local(&self, root: &Path, depth: usize) -> (Vec<CandidateGguf>, Vec<ClassifiedGroup>) {
+        let root = root.to_path_buf();
+        let architectures = self.architectures.clone();
+        crate::spawn_blocking_traced(move || {
+            let files = scan_ggufs(&root, depth);
+            let classified = classify_local(&root, &files, &architectures);
+            (files, classified)
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // Inspection -----------------------------------------------------------------------------
@@ -648,6 +725,7 @@ impl ManagedModelCandidates {
         for group in &targets {
             pending.push(self.version_assessment(
                 self.recognized(group),
+                self.cached_hugging_face_identity(&snapshot, &group.group, projector_path.as_deref()),
                 self.hugging_face_target(
                     &snapshot,
                     &group.group.primary().path,
@@ -656,7 +734,7 @@ impl ManagedModelCandidates {
             ));
         }
         let assessments = futures_util::stream::iter(pending)
-            .buffered(ASSESSMENT_CONCURRENCY)
+            .buffered(assessment_concurrency())
             .collect::<Vec<_>>()
             .await;
         let versions = targets
@@ -704,6 +782,7 @@ impl ManagedModelCandidates {
             .catalog_match(None, &lineage, fingerprint.as_ref())
             .await
             .map(|(matched, _)| matched.model_id);
+        let projector_bytes = projector.map_or(0, |projector| projector.group.size_bytes());
         Ok(CandidateInspection {
             source: CandidateSource::HuggingFace {
                 repository: HuggingFaceRepositoryId::new(snapshot.repository.clone())
@@ -713,7 +792,7 @@ impl ManagedModelCandidates {
             display_name: display_name(&snapshot.repository),
             license: snapshot.license.clone(),
             variant_of,
-            versions: candidate_versions(versions),
+            versions: candidate_versions(versions, Some(projector_bytes)),
             projector: projector.map(|projector| candidate_file(projector.group.primary())),
             unsupported_architecture,
         })
@@ -736,8 +815,7 @@ impl ManagedModelCandidates {
             (path.clone(), None)
         };
         let depth = if selected.is_some() { 1 } else { MAX_LOCAL_SCAN_DEPTH };
-        let files = scan_ggufs(&root, depth);
-        let classified = self.classify_local(&root, &files);
+        let (_, classified) = self.scan_local(&root, depth).await;
         let projector = choose_projector(&classified);
         let targets = classified
             .iter()
@@ -763,10 +841,20 @@ impl ManagedModelCandidates {
                 root.join(&group.group.primary().path),
                 projector_path.clone(),
             );
-            pending.push(self.version_assessment(self.recognized(group), async { material }));
+            let unreadable = unreadable_local_group(&root, &group.group);
+            let recognized = self.recognized(group);
+            pending.push(async move {
+                match unreadable {
+                    Some(assessment) => Some(assessment),
+                    None => {
+                        self.version_assessment(recognized, None, async { material })
+                            .await
+                    }
+                }
+            });
         }
         let assessments = futures_util::stream::iter(pending)
-            .buffered(ASSESSMENT_CONCURRENCY)
+            .buffered(assessment_concurrency())
             .collect::<Vec<_>>()
             .await;
         let versions = targets
@@ -811,7 +899,7 @@ impl ManagedModelCandidates {
             display_name: display_name(name),
             license: None,
             variant_of,
-            versions: candidate_versions(versions),
+            versions: candidate_versions(versions, None),
             projector: projector.map(|projector| candidate_file(projector.group.primary())),
             unsupported_architecture,
         })
@@ -880,36 +968,57 @@ impl ManagedModelCandidates {
     // Catalog matching ----------------------------------------------------------------------
 
     /// Each catalog model's shape fingerprint, from its release header material, computed once.
-    async fn catalog_fingerprints(&self) -> &[(ModelId, ModelFingerprint)] {
-        self.catalog_fingerprints
+    /// Each catalog model's shape fingerprint, architecture and parameter count, computed once and
+    /// concurrently from the release header bundle.
+    async fn catalog_facts(&self) -> &CatalogFacts {
+        self.catalog_facts
             .get_or_init(|| async {
-                let mut fingerprints = Vec::new();
-                for candidate in self.lineage.representatives().collect::<Vec<_>>() {
-                    let resolved = match self
+                let representatives = self.lineage.representatives().collect::<Vec<_>>();
+                let facts = futures_util::stream::iter(representatives.into_iter().map(|candidate| async move {
+                    let resolved = self
                         .assessor
                         .resolve_material(candidate.model.configuration.bundle.clone())
                         .await
-                    {
-                        Ok(resolved) => resolved,
-                        Err(error) => {
-                            tracing::warn!(%error, model.id = %candidate.model_id.as_str(), "catalog fingerprint material is unavailable");
-                            continue;
-                        }
-                    };
-                    let fingerprint = crate::spawn_blocking_traced(move || {
+                        .map_err(|error| tracing::warn!(%error, model.id = %candidate.model_id.as_str(), "catalog fingerprint material is unavailable"))
+                        .ok()?;
+                    let model_id = candidate.model_id;
+                    crate::spawn_blocking_traced(move || {
                         let target = resolved_paths(&resolved.target_model).ok()?.0;
-                        EngineModelFingerprint::from_path(&target)
+                        let fingerprint = EngineModelFingerprint::from_path(&target)
                             .ok()
-                            .map(super::assessor::model_fingerprint)
+                            .map(super::assessor::model_fingerprint);
+                        let shape = local_directory(&target).ok().and_then(|directory| {
+                            Some(CatalogShape {
+                                model_id: model_id.clone(),
+                                architecture: directory
+                                    .value("general.architecture")
+                                    .and_then(|value| value.string())?
+                                    .to_owned(),
+                                parameters: directory
+                                    .tensors
+                                    .iter()
+                                    .map(|tensor| tensor.shape.iter().product::<u64>())
+                                    .sum(),
+                            })
+                        });
+                        Some((model_id, fingerprint, shape))
                     })
                     .await
                     .ok()
-                    .flatten();
+                    .flatten()
+                }))
+                .buffered(assessment_concurrency())
+                .filter_map(std::future::ready)
+                .collect::<Vec<_>>()
+                .await;
+                let mut catalog = CatalogFacts::default();
+                for (model_id, fingerprint, shape) in facts {
                     if let Some(fingerprint) = fingerprint {
-                        fingerprints.push((candidate.model_id, fingerprint));
+                        catalog.fingerprints.push((model_id, fingerprint));
                     }
+                    catalog.shapes.extend(shape);
                 }
-                fingerprints
+                catalog
             })
             .await
     }
@@ -932,8 +1041,9 @@ impl ManagedModelCandidates {
         }
         let fingerprint = fingerprint?;
         let model_id = self
-            .catalog_fingerprints()
+            .catalog_facts()
             .await
+            .fingerprints
             .iter()
             .find(|(_, candidate)| candidate == fingerprint)
             .map(|(model_id, _)| model_id.clone())?;
@@ -1083,6 +1193,9 @@ impl ManagedModelCandidates {
 
     // Drafter enumeration --------------------------------------------------------------------
 
+    /// The drafters offered for a target, in automatic-choice order (see `in_choice_order`), each
+    /// with the engine's verdict, then the explicit `other` reference when one is given. With
+    /// `stop_at_first_bound`, sources after the first one that binds are not assessed.
     async fn enumerate_drafters(
         &self,
         target: DrafterTarget,
@@ -1109,30 +1222,27 @@ impl ManagedModelCandidates {
                     .await
             }
         };
-        let mut related = target.lineage.clone();
-        if let Some((matched, _)) = &matched {
-            related.extend(self.lineage.lineage_of(&matched.model_id).await);
-        }
-        let mut candidates = Vec::new();
-        let mut seen = BTreeSet::new();
-        let done = |candidates: &[DrafterCandidate]| {
-            stop_at_first_bound
-                && candidates
-                    .iter()
-                    .any(|candidate| matches!(candidate.verdict, DrafterVerdict::Bound { .. }))
-        };
-
-        if let Some((matched, lineage)) = &matched {
-            if let Some(candidate) = self.catalog_drafter(&target, matched, *lineage).await {
-                seen.insert(reference_key(&candidate.reference));
-                if let Some(path) = catalog_draft_key(&matched.model) {
-                    seen.insert(path);
-                }
-                candidates.push(candidate);
-            }
-        }
         if target.catalog.is_some() {
-            return Ok(candidates);
+            let Some((matched, lineage)) = &matched else {
+                return Ok(Vec::new());
+            };
+            return Ok(self
+                .catalog_drafter(&target, matched, *lineage)
+                .await
+                .into_iter()
+                .collect());
+        }
+        let done = |candidates: &[DrafterCandidate]| {
+            stop_at_first_bound && candidates.iter().any(|candidate| is_bound(&candidate.verdict))
+        };
+        let catalog_file = matched
+            .as_ref()
+            .and_then(|(matched, _)| catalog_draft_key(&matched.model));
+        let mut candidates = self.next_to_model(&target, catalog_file.as_deref()).await;
+        if !done(&candidates)
+            && let Some((matched, lineage)) = &matched
+        {
+            candidates.extend(self.catalog_drafter(&target, matched, *lineage).await);
         }
         let embedded_catalog = matched.as_ref().is_some_and(|(matched, _)| {
             matches!(
@@ -1149,6 +1259,7 @@ impl ManagedModelCandidates {
                 candidates.push(DrafterCandidate {
                     category: DrafterCategory::BuiltIn,
                     reference: DrafterReference::Embedded,
+                    name: embedded_drafter_name(bound_method(&verdict).as_ref()),
                     label: "Built into this model".to_owned(),
                     size_bytes: 0,
                     lineage: DrafterLineage::Exact,
@@ -1158,25 +1269,19 @@ impl ManagedModelCandidates {
                 });
             }
         }
-        if !done(&candidates) {
-            let next_to = self.next_to_model(&target, &mut seen).await;
-            candidates.extend(sorted(next_to));
-        }
-        if !done(&candidates) {
-            let on_computer = self.on_this_computer(&target, &related, &mut seen).await;
-            candidates.extend(sorted(on_computer));
-        }
-        if !done(&candidates) {
-            let hub = self.hub_drafters(&target, &related, &mut seen).await;
-            candidates.extend(sorted(hub));
-        }
+        let mut candidates = in_choice_order(candidates);
         if let Some(other) = other {
-            match self.other_drafter(&target, &related, other).await {
-                Ok(candidate) if !seen.contains(&reference_key(&candidate.reference)) => {
-                    candidates.push(candidate);
-                }
-                Ok(_) => {}
-                Err(error) => return Err(error),
+            let mut related = target.lineage.clone();
+            if let Some((matched, _)) = &matched {
+                related.extend(self.lineage.lineage_of(&matched.model_id).await);
+            }
+            let candidate = self.other_drafter(&target, &related, other).await?;
+            let key = reference_key(&candidate.reference);
+            if !candidates
+                .iter()
+                .any(|listed| reference_key(&listed.reference) == key)
+            {
+                candidates.push(candidate);
             }
         }
         Ok(candidates)
@@ -1224,7 +1329,8 @@ impl ManagedModelCandidates {
             reference: DrafterReference::Catalog {
                 model_id: matched.model_id.clone(),
             },
-            label: format!("Recommended · Trained for {}", matched.model.display_name),
+            name: catalog_drafter_name(method, &matched.model.display_name),
+            label: format!("Trained for {}", matched.model.display_name),
             size_bytes,
             lineage,
             method: bound_method(&verdict).or(Some(method.clone())),
@@ -1233,157 +1339,73 @@ impl ManagedModelCandidates {
         })
     }
 
-    /// Drafter files in the target's repository or folder.
+    /// The separate drafters in the target's own repository snapshot, or its own folder when it
+    /// has no repository snapshot: GGUFs whose header declares a drafter role. The catalog
+    /// drafter's own file is left to the catalog candidate.
     async fn next_to_model(
         &self,
         target: &DrafterTarget,
-        seen: &mut BTreeSet<String>,
+        catalog_file: Option<&str>,
     ) -> Vec<DrafterCandidate> {
-        let mut found = Vec::new();
         if let Some(snapshot) = &target.snapshot {
             let Ok(classified) = self.classify_hugging_face(snapshot).await else {
-                return found;
+                return Vec::new();
             };
-            let drafters = classified
+            let pending = classified
                 .into_iter()
                 .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
                 .filter(|group| group.group.files.len() == 1)
-                .filter(|group| {
-                    seen.insert(reference_key(&DrafterReference::HuggingFace {
+                .map(|group| group.group.primary().path.clone())
+                .filter(|path| {
+                    let key = reference_key(&DrafterReference::HuggingFace {
                         repository: hugging_face_id(&snapshot.repository),
                         commit: snapshot.commit.clone(),
-                        path: path_string(&group.group.primary().path),
-                    }))
+                        path: path_string(path),
+                    });
+                    catalog_file != Some(key.as_str())
                 })
+                .map(|path| self.hugging_face_drafter_candidate(target, snapshot, path))
                 .collect::<Vec<_>>();
-            let mut pending = Vec::new();
-            for group in drafters {
-                pending.push(self.hugging_face_drafter_candidate(
-                    target,
-                    snapshot,
-                    group.group.primary().path.clone(),
-                    DrafterCategory::NextToModel,
-                    "In this repository".to_owned(),
-                ));
-            }
-            found = collect_candidates(pending).await;
+            return collect_candidates(pending).await;
         }
-        if let Some(folder) = &target.folder {
-            let files = scan_ggufs(folder, MAX_LOCAL_SCAN_DEPTH);
-            let drafters = self
-                .classify_local(folder, &files)
-                .into_iter()
-                .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
-                .filter(|group| group.group.files.len() == 1)
-                .map(|group| (folder.join(&group.group.primary().path), group.group.size_bytes()))
-                .filter(|(path, _)| {
-                    seen.insert(reference_key(&DrafterReference::Local { path: path.clone() }))
-                })
-                .collect::<Vec<_>>();
-            let mut pending = Vec::new();
-            for (path, size_bytes) in drafters {
-                pending.push(self.local_drafter_candidate(target, path, size_bytes));
-            }
-            let local = collect_candidates(pending).await;
-            found.extend(local);
-        }
-        found
-    }
-
-    /// Installed drafters in any location whose lineage matches the target.
-    async fn on_this_computer(
-        &self,
-        target: &DrafterTarget,
-        related: &BTreeSet<String>,
-        seen: &mut BTreeSet<String>,
-    ) -> Vec<DrafterCandidate> {
-        let Ok(installed) = self.models().list_installed().await else {
+        let Some(folder) = &target.folder else {
             return Vec::new();
         };
-        let mut packages = Vec::new();
-        for installed in installed.packages {
-            let package = installed.package;
-            let architecture = package.properties.architecture.as_str();
-            let drafter = (self.architectures.drafters.contains(architecture)
-                && !self.architectures.targets.contains(architecture))
-                || package
-                    .files
-                    .iter()
-                    .any(|file| matches!(file.role, ModelFileRole::Draft | ModelFileRole::Mtp));
-            if !drafter || !seen.insert(format!("package:{}", package.id.0)) {
-                continue;
-            }
-            let Some(reference) = installed_reference(&package, &installed.path) else {
-                continue;
-            };
-            if !seen.insert(reference_key(&reference)) {
-                continue;
-            }
-            packages.push((package, reference));
-        }
-        let mut pending = Vec::new();
-        for (package, reference) in packages {
-            pending.push(self.installed_drafter_candidate(target, related, package, reference));
-        }
-        let mut found = collect_candidates(pending).await;
-        found.truncate(MAX_ON_THIS_COMPUTER_DRAFTERS);
-        found
+        let (_, classified) = self.scan_local(folder, MAX_LOCAL_SCAN_DEPTH).await;
+        let pending = classified
+            .into_iter()
+            .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
+            .filter(|group| group.group.files.len() == 1)
+            .map(|group| {
+                self.local_drafter_candidate(
+                    target,
+                    folder.join(&group.group.primary().path),
+                    group.group.size_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        collect_candidates(pending).await
     }
 
-    async fn installed_drafter_candidate(
-        &self,
-        target: &DrafterTarget,
-        related: &BTreeSet<String>,
-        package: ModelPackage,
-        reference: DrafterReference,
-    ) -> Option<DrafterCandidate> {
-        let resolved = self.installed_package_material(&package).await.ok()?;
-        let path = resolved_paths(&resolved.target_model).ok()?.0;
-        let mut lineage = header_lineage(&path);
-        if let ModelPackageSource::HuggingFace { repository, .. } = &package.source {
-            lineage.extend(self.lineage.hub().lineage(repository, None).await);
-        }
-        if lineage.is_disjoint(related) {
-            return None;
-        }
-        let material = DrafterMaterial {
-            path,
-            identity: format!("package:{}", package.id.0),
-            _guards: vec![Arc::new(resolved)],
-        };
-        let verdict = self.drafter_verdict(target, &material).await?;
-        Some(DrafterCandidate {
-            category: DrafterCategory::OnThisComputer,
-            reference,
-            label: "On this computer".to_owned(),
-            size_bytes: package_bytes(&package),
-            lineage: DrafterLineage::Lineage,
-            method: bound_method(&verdict),
-            verdict,
-            on_this_computer: true,
-        })
-    }
-
-    /// A drafter file of a Hugging Face snapshot, with the engine's verdict for the target.
+    /// A drafter file in the target's Hugging Face repository, with the engine's verdict.
     async fn hugging_face_drafter_candidate(
         &self,
         target: &DrafterTarget,
         snapshot: &HuggingFaceRepositorySnapshot,
         path: PathBuf,
-        category: DrafterCategory,
-        label: String,
     ) -> Option<DrafterCandidate> {
         let file = snapshot_file(snapshot, &path).ok()?;
         let material = self.hugging_face_drafter(snapshot, &path).await.ok()?;
         let verdict = self.drafter_verdict(target, &material).await?;
         Some(DrafterCandidate {
-            category,
+            category: DrafterCategory::NextToModel,
             reference: DrafterReference::HuggingFace {
                 repository: hugging_face_id(&snapshot.repository),
                 commit: snapshot.commit.clone(),
                 path: path_string(&path),
             },
-            label,
+            name: format!("{}/{}", snapshot.repository, file_name(&path)),
+            label: "In this repository".to_owned(),
             size_bytes: file.size_bytes,
             lineage: DrafterLineage::Lineage,
             method: bound_method(&verdict),
@@ -1393,6 +1415,7 @@ impl ManagedModelCandidates {
         })
     }
 
+    /// A drafter file in the target's folder, with the engine's verdict.
     async fn local_drafter_candidate(
         &self,
         target: &DrafterTarget,
@@ -1403,6 +1426,7 @@ impl ManagedModelCandidates {
         let verdict = self.drafter_verdict(target, &material).await?;
         Some(DrafterCandidate {
             category: DrafterCategory::NextToModel,
+            name: file_name(&path),
             reference: DrafterReference::Local { path },
             label: "In this folder".to_owned(),
             size_bytes,
@@ -1411,82 +1435,6 @@ impl ManagedModelCandidates {
             verdict,
             on_this_computer: true,
         })
-    }
-
-    /// Third-party drafters on Hugging Face for the target's bases, found by `base_model` and the
-    /// `speculative-decoding` tag.
-    async fn hub_drafters(
-        &self,
-        target: &DrafterTarget,
-        related: &BTreeSet<String>,
-        seen: &mut BTreeSet<String>,
-    ) -> Vec<DrafterCandidate> {
-        let catalog_repositories = self.lineage.repositories();
-        let own = target
-            .repository
-            .as_ref()
-            .map(|(repository, _)| repository.to_lowercase());
-        let bases = related
-            .iter()
-            .filter(|base| Some(*base) != own.as_ref() && !catalog_repositories.contains(*base))
-            .take(MAX_HUB_DRAFTER_BASES)
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut repositories = Vec::new();
-        for base in bases {
-            match self.models().search_speculative_drafters(&base).await {
-                Ok(found) => repositories.extend(found),
-                Err(error) => tracing::warn!(%error, base = %base, "Hugging Face drafter search failed"),
-            }
-        }
-        let mut unique = BTreeSet::new();
-        let repositories = repositories
-            .into_iter()
-            .filter(|repository| {
-                let key = repository.to_lowercase();
-                Some(&key) != own.as_ref()
-                    && !catalog_repositories.contains(&key)
-                    && unique.insert(key)
-            })
-            .take(MAX_HUB_DRAFTER_REPOSITORIES)
-            .collect::<Vec<_>>();
-        let mut files = Vec::new();
-        for repository in repositories {
-            let Ok(snapshot) = self.snapshot(&repository, "main").await else {
-                continue;
-            };
-            let Ok(classified) = self.classify_hugging_face(&snapshot).await else {
-                continue;
-            };
-            let mut drafters = classified
-                .into_iter()
-                .filter(|group| matches!(group.role, CandidateFileRole::Drafter { .. }))
-                .filter(|group| group.group.files.len() == 1)
-                .collect::<Vec<_>>();
-            drafters.sort_by_key(|group| group.group.size_bytes());
-            for group in drafters.into_iter().take(MAX_HUB_DRAFTER_FILES) {
-                let reference = DrafterReference::HuggingFace {
-                    repository: hugging_face_id(&snapshot.repository),
-                    commit: snapshot.commit.clone(),
-                    path: path_string(&group.group.primary().path),
-                };
-                if seen.insert(reference_key(&reference)) {
-                    files.push((snapshot.clone(), group.group.primary().path.clone()));
-                }
-            }
-        }
-        let mut pending = Vec::new();
-        for (snapshot, path) in &files {
-            let owner = snapshot.repository.split('/').next().unwrap_or_default();
-            pending.push(self.hugging_face_drafter_candidate(
-                target,
-                snapshot,
-                path.clone(),
-                DrafterCategory::HuggingFace,
-                format!("By {owner}"),
-            ));
-        }
-        collect_candidates(pending).await
     }
 
     /// An explicit drafter: a Hugging Face reference (`owner/repo`, `owner/repo:path`,
@@ -1501,7 +1449,7 @@ impl ManagedModelCandidates {
         let local = Path::new(reference);
         if local.is_absolute() {
             let material = self.local_drafter(local.to_path_buf())?;
-            let lineage = header_lineage(&material.path);
+            let lineage = lineage_kind(&header_lineage(&material.path), related);
             let verdict = self
                 .drafter_verdict(target, &material)
                 .await
@@ -1511,9 +1459,10 @@ impl ManagedModelCandidates {
                 reference: DrafterReference::Local {
                     path: local.to_path_buf(),
                 },
-                label: local.display().to_string(),
+                name: file_name(local),
+                label: other_drafter_label(lineage),
                 size_bytes: std::fs::metadata(local).map(|metadata| metadata.len()).unwrap_or(0),
-                lineage: lineage_kind(&lineage, related),
+                lineage,
                 method: bound_method(&verdict),
                 verdict,
                 on_this_computer: true,
@@ -1546,6 +1495,7 @@ impl ManagedModelCandidates {
             .lineage(&snapshot.repository, Some(snapshot.base_models.clone()))
             .await;
         lineage.extend(header_lineage(&material.path));
+        let lineage = lineage_kind(&lineage, related);
         let verdict = self
             .drafter_verdict(target, &material)
             .await
@@ -1557,9 +1507,10 @@ impl ManagedModelCandidates {
                 commit: snapshot.commit.clone(),
                 path: path_string(&path),
             },
-            label: format!("{}:{}", snapshot.repository, path.display()),
+            name: format!("{}/{}", snapshot.repository, file_name(&path)),
+            label: other_drafter_label(lineage),
             size_bytes: file.size_bytes,
-            lineage: lineage_kind(&lineage, related),
+            lineage,
             method: bound_method(&verdict),
             verdict,
             on_this_computer: sha256_of(file)
@@ -1674,6 +1625,12 @@ impl ManagedModelCandidates {
             }
             DrafterReference::Local { .. } => Ok(None),
         }
+    }
+}
+
+impl CatalogShapes for ManagedModelCandidates {
+    fn catalog_shapes(&self) -> BoxFuture<'_, Vec<CatalogShape>> {
+        Box::pin(async move { self.catalog_facts().await.shapes.clone() })
     }
 }
 
@@ -1796,10 +1753,15 @@ async fn collect_candidates(
     pending: Vec<impl std::future::Future<Output = Option<DrafterCandidate>>>,
 ) -> Vec<DrafterCandidate> {
     futures_util::stream::iter(pending)
-        .buffered(ASSESSMENT_CONCURRENCY)
+        .buffered(assessment_concurrency())
         .filter_map(|candidate| async move { candidate })
         .collect()
         .await
+}
+
+fn assessment_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |cores| cores.get().min(MAX_ASSESSMENT_CONCURRENCY))
 }
 
 fn is_commit(revision: &str) -> bool {
@@ -1845,18 +1807,57 @@ fn lineage_kind(drafter: &BTreeSet<String>, related: &BTreeSet<String>) -> Draft
     }
 }
 
-/// Within one category: a lineage match before a fingerprint-only match, then the smaller
-/// download, then the label for a deterministic order.
-fn sorted(mut candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
-    candidates.sort_by(|left, right| {
-        (left.category, left.lineage, left.size_bytes, &left.label).cmp(&(
-            right.category,
-            right.lineage,
-            right.size_bytes,
-            &right.label,
-        ))
+fn is_bound(verdict: &DrafterVerdict) -> bool {
+    matches!(verdict, DrafterVerdict::Bound { .. })
+}
+
+/// Candidates in automatic-choice order: by category (`DrafterCategory`'s order), then by method
+/// (DFlash2, DSpark, DFlash, MTP; one with no known method last), then the smaller download, and
+/// otherwise in enumeration order. The first bound candidate in this order is the recommendation.
+fn in_choice_order(mut candidates: Vec<DrafterCandidate>) -> Vec<DrafterCandidate> {
+    candidates.sort_by_key(|candidate| {
+        (
+            candidate.category,
+            candidate.method.as_ref().map_or(usize::MAX, method_rank),
+            download_bytes(candidate),
+        )
     });
     candidates
+}
+
+/// The speculation order of the model radar: DFlash2, DSpark, DFlash, then MTP.
+fn method_rank(method: &SpeculativeMethod) -> usize {
+    match method {
+        SpeculativeMethod::DFlash2 => 0,
+        SpeculativeMethod::DSpark => 1,
+        SpeculativeMethod::DFlash => 2,
+        SpeculativeMethod::Mtp => 3,
+    }
+}
+
+fn download_bytes(candidate: &DrafterCandidate) -> u64 {
+    if candidate.on_this_computer {
+        0
+    } else {
+        candidate.size_bytes
+    }
+}
+
+/// The first candidate, in choice order, that the engine binds; a user-entered drafter is never
+/// chosen automatically.
+fn recommended(candidates: Vec<DrafterCandidate>) -> Option<DrafterCandidate> {
+    candidates.into_iter().find(|candidate| {
+        candidate.category != DrafterCategory::Other && is_bound(&candidate.verdict)
+    })
+}
+
+fn other_drafter_label(lineage: DrafterLineage) -> String {
+    match lineage {
+        DrafterLineage::None => "Untested".to_owned(),
+        DrafterLineage::Exact | DrafterLineage::Lineage | DrafterLineage::Fingerprint => {
+            "Entered by you".to_owned()
+        }
+    }
 }
 
 fn reference_key(reference: &DrafterReference) -> String {
@@ -1902,6 +1903,44 @@ fn catalog_draft_key(model: &magnitude_service_contracts::models::RecommendableM
     }))
 }
 
+/// The name Magnitude gives the drafter it ships for a catalog model, such as "Magnitude DFlash
+/// for Qwen3.5 4B".
+fn catalog_drafter_name(method: &SpeculativeMethod, model: &str) -> String {
+    format!("Magnitude {} for {model}", method_name(method))
+}
+
+fn embedded_drafter_name(method: Option<&SpeculativeMethod>) -> String {
+    match method {
+        Some(SpeculativeMethod::Mtp) | None => "MTP heads".to_owned(),
+        Some(method) => format!("{} heads", method_name(method)),
+    }
+}
+
+fn method_name(method: &SpeculativeMethod) -> &'static str {
+    match method {
+        SpeculativeMethod::Mtp => "MTP",
+        SpeculativeMethod::DFlash => "DFlash",
+        SpeculativeMethod::DFlash2 => "DFlash2",
+        SpeculativeMethod::DSpark => "DSpark",
+    }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map_or_else(|| path_string(path), |name| name.to_string_lossy().into_owned())
+}
+
+/// The identity of exact header material: each file's path and header digest, in path order.
+fn header_identity(headers: impl IntoIterator<Item = (String, String)>) -> String {
+    let mut headers = headers.into_iter().collect::<Vec<_>>();
+    headers.sort();
+    headers
+        .into_iter()
+        .map(|(path, digest)| format!("{path}={digest}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn hugging_face_id(repository: &str) -> HuggingFaceRepositoryId {
     HuggingFaceRepositoryId::new(repository.to_owned())
         .unwrap_or_else(|_| HuggingFaceRepositoryId::new("invalid/repository").expect("valid id"))
@@ -1909,33 +1948,6 @@ fn hugging_face_id(repository: &str) -> HuggingFaceRepositoryId {
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn installed_reference(package: &ModelPackage, root: &Path) -> Option<DrafterReference> {
-    let path = package
-        .files
-        .iter()
-        .filter(|file| {
-            matches!(
-                file.role,
-                ModelFileRole::Weights | ModelFileRole::Draft | ModelFileRole::Mtp
-            )
-        })
-        .map(|file| file.path.clone())
-        .min()?;
-    Some(match &package.source {
-        ModelPackageSource::HuggingFace {
-            repository,
-            revision,
-        } => DrafterReference::HuggingFace {
-            repository: HuggingFaceRepositoryId::new(repository.clone()).ok()?,
-            commit: revision.clone(),
-            path: path_string(&path),
-        },
-        ModelPackageSource::Local { .. } => DrafterReference::Local {
-            path: if path.is_absolute() { path } else { root.join(path) },
-        },
-    })
 }
 
 fn package_bytes(package: &ModelPackage) -> u64 {
@@ -2005,6 +2017,42 @@ fn header_lineage(path: &Path) -> BTreeSet<String> {
 
 /// GGUFs beneath `root`, relative to it, at most `depth` directories deep. Partial downloads and
 /// hidden files are skipped.
+fn classified_group(
+    group: GgufGroup,
+    header_digest: String,
+    classification: magnitude_service_models::candidate_files::HeaderClassification,
+) -> ClassifiedGroup {
+    ClassifiedGroup {
+        role: classification.role,
+        base_repositories: classification.base_repositories,
+        quantization: classification.quantization,
+        header_digest,
+        group,
+    }
+}
+
+fn classify_local(
+    root: &Path,
+    files: &[CandidateGguf],
+    architectures: &RecognizedArchitectures,
+) -> Vec<ClassifiedGroup> {
+    group_ggufs(files)
+        .into_iter()
+        .filter_map(|group| {
+            let path = root.join(&group.primary().path);
+            let directory = local_directory(&path).ok()?;
+            let inspection = magnitude_service_models::gguf::inspect(&path).ok()?;
+            Some(ClassifiedGroup {
+                role: CandidateFileRole::of(&directory, architectures),
+                base_repositories: header_base_repositories(&directory),
+                quantization: inspection.quantization,
+                header_digest: local_header_digest(&path).ok()?,
+                group,
+            })
+        })
+        .collect()
+}
+
 fn scan_ggufs(root: &Path, depth: usize) -> Vec<CandidateGguf> {
     let mut found = Vec::new();
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
@@ -2115,7 +2163,24 @@ fn on_this_computer(
 
 /// Versions with their verdicts. The recommended version is the largest fitting Q4_K-class
 /// version, else the largest fitting version.
-fn candidate_versions(versions: Vec<AssessedVersion<'_>>) -> Vec<CandidateVersion> {
+/// The verdict of a local file shorter than its header declares, which the engine never reads.
+fn unreadable_local_group(root: &Path, group: &GgufGroup) -> Option<CachedModelAssessment> {
+    let detail = group.files.iter().find_map(|file| {
+        magnitude_service_models::gguf::inspect_complete(&root.join(&file.path))
+            .err()
+            .map(|error| error.to_string())
+    })?;
+    let context = magnitude_service_models::gguf::inspect(&root.join(&group.primary().path))
+        .ok()?
+        .training_context_length?;
+    Some(super::assessor::unreadable_assessment(context, detail))
+}
+
+/// `projector_bytes` is the projector a download adds, or `None` for local files used in place.
+fn candidate_versions(
+    versions: Vec<AssessedVersion<'_>>,
+    projector_bytes: Option<u64>,
+) -> Vec<CandidateVersion> {
     let fits = |assessment: &Option<CachedModelAssessment>| {
         matches!(
             assessment.as_ref().map(|assessment| &assessment.profile),
@@ -2153,6 +2218,10 @@ fn candidate_versions(versions: Vec<AssessedVersion<'_>>) -> Vec<CandidateVersio
                 model_id: version.model_id,
                 files: group.group.files.iter().map(candidate_file).collect(),
                 size_bytes: group.group.size_bytes(),
+                download_bytes: match (projector_bytes, &version.on_this_computer) {
+                    (Some(projector_bytes), None) => group.group.size_bytes() + projector_bytes,
+                    _ => 0,
+                },
                 assessment: version.assessment.map(|assessment| assessment.profile),
                 recommended: Some(index) == recommended,
                 on_this_computer: version.on_this_computer,
@@ -2209,6 +2278,63 @@ mod hub_tests;
 mod tests {
     use super::*;
 
+    fn minimal_gguf() -> Vec<u8> {
+        let string = |bytes: &mut Vec<u8>, value: &str| {
+            bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(value.as_bytes());
+        };
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&2_u64.to_le_bytes());
+        string(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        string(&mut bytes, "llama");
+        string(&mut bytes, "llama.context_length");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&4096_u32.to_le_bytes());
+        string(&mut bytes, "token_embd.weight");
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&32_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.resize(bytes.len().next_multiple_of(32), 0);
+        bytes.resize(bytes.len() + 128, 0);
+        bytes
+    }
+
+    #[test]
+    fn a_truncated_local_candidate_is_unreadable_and_a_whole_one_is_assessed() {
+        let root = tempfile::tempdir().unwrap();
+        let whole = minimal_gguf();
+        std::fs::write(root.path().join("whole.gguf"), &whole).unwrap();
+        std::fs::write(
+            root.path().join("truncated.gguf"),
+            &whole[..whole.len() - 1],
+        )
+        .unwrap();
+        let group = |name: &str| GgufGroup {
+            files: vec![CandidateGguf {
+                path: PathBuf::from(name),
+                size_bytes: 0,
+            }],
+        };
+
+        assert!(unreadable_local_group(root.path(), &group("whole.gguf")).is_none());
+        let truncated = unreadable_local_group(root.path(), &group("truncated.gguf")).unwrap();
+        let ModelAssessment::Unsupported {
+            profile, reasons, ..
+        } = truncated.profile
+        else {
+            panic!("a truncated file is unsupported");
+        };
+        assert_eq!(profile.context_length, 4096);
+        assert_eq!(
+            reasons,
+            [magnitude_service_contracts::models::UnsupportedReason::Unreadable]
+        );
+    }
+
     #[test]
     fn hugging_face_references_parse_every_accepted_form() {
         assert_eq!(
@@ -2237,26 +2363,109 @@ mod tests {
         assert!(parse_hugging_face_reference("not a reference").is_err());
     }
 
-    #[test]
-    fn within_a_category_lineage_precedes_fingerprint_then_the_smaller_download() {
-        let candidate = |lineage, size_bytes, label: &str| DrafterCandidate {
-            category: DrafterCategory::OnThisComputer,
-            reference: DrafterReference::Embedded,
-            label: label.to_owned(),
+    fn candidate(
+        category: DrafterCategory,
+        method: Option<SpeculativeMethod>,
+        size_bytes: u64,
+        name: &str,
+    ) -> DrafterCandidate {
+        DrafterCandidate {
+            category,
+            reference: DrafterReference::Local {
+                path: PathBuf::from(format!("/{name}")),
+            },
+            name: name.to_owned(),
+            label: name.to_owned(),
             size_bytes,
-            lineage,
-            verdict: DrafterVerdict::None,
-            on_this_computer: true,
-            method: None,
-        };
-        let ordered = sorted(vec![
-            candidate(DrafterLineage::Fingerprint, 1, "a"),
-            candidate(DrafterLineage::Lineage, 9, "b"),
-            candidate(DrafterLineage::Lineage, 3, "c"),
+            lineage: DrafterLineage::Lineage,
+            verdict: match &method {
+                Some(method) => DrafterVerdict::Bound {
+                    method: method.clone(),
+                    memory_bytes: 1,
+                },
+                None => DrafterVerdict::Rejected {
+                    reasons: Vec::new(),
+                    detail: "rejected".to_owned(),
+                },
+            },
+            on_this_computer: false,
+            method,
+        }
+    }
+
+    fn names(candidates: &[DrafterCandidate]) -> Vec<&str> {
+        candidates.iter().map(|candidate| candidate.name.as_str()).collect()
+    }
+
+    #[test]
+    fn repository_drafters_order_by_method_then_the_smaller_download() {
+        use SpeculativeMethod::{DFlash, DFlash2, DSpark, Mtp};
+        let ordered = in_choice_order(vec![
+            candidate(DrafterCategory::NextToModel, Some(Mtp), 1, "mtp"),
+            candidate(DrafterCategory::NextToModel, Some(DFlash), 9, "dflash-large"),
+            candidate(DrafterCategory::NextToModel, None, 1, "rejected"),
+            candidate(DrafterCategory::NextToModel, Some(DSpark), 5, "dspark"),
+            candidate(DrafterCategory::NextToModel, Some(DFlash), 3, "dflash-small"),
+            candidate(DrafterCategory::NextToModel, Some(DFlash2), 7, "dflash2"),
         ]);
         assert_eq!(
-            ordered.iter().map(|candidate| candidate.label.as_str()).collect::<Vec<_>>(),
-            ["c", "b", "a"]
+            names(&ordered),
+            ["dflash2", "dspark", "dflash-small", "dflash-large", "mtp", "rejected"]
         );
+        assert_eq!(recommended(ordered).unwrap().name, "dflash2");
+    }
+
+    #[test]
+    fn a_repository_drafter_of_any_method_precedes_the_catalog_drafter_and_built_in_heads() {
+        use SpeculativeMethod::{DFlash2, Mtp};
+        let ordered = in_choice_order(vec![
+            candidate(DrafterCategory::BuiltIn, Some(Mtp), 0, "heads"),
+            candidate(DrafterCategory::CatalogDrafter, Some(DFlash2), 1, "catalog"),
+            candidate(DrafterCategory::NextToModel, Some(Mtp), 9, "mtp-file"),
+        ]);
+        assert_eq!(names(&ordered), ["mtp-file", "catalog", "heads"]);
+        assert_eq!(recommended(ordered).unwrap().name, "mtp-file");
+    }
+
+    #[test]
+    fn the_catalog_drafter_precedes_built_in_heads_and_any_separate_drafter_beats_heads() {
+        use SpeculativeMethod::{DFlash, Mtp};
+        let catalog = in_choice_order(vec![
+            candidate(DrafterCategory::BuiltIn, Some(Mtp), 0, "heads"),
+            candidate(DrafterCategory::CatalogDrafter, Some(DFlash), 9, "catalog"),
+        ]);
+        assert_eq!(recommended(catalog).unwrap().name, "catalog");
+        let built_in = in_choice_order(vec![candidate(DrafterCategory::BuiltIn, Some(Mtp), 0, "heads")]);
+        assert_eq!(recommended(built_in).unwrap().name, "heads");
+    }
+
+    #[test]
+    fn rejected_and_user_entered_drafters_are_never_recommended() {
+        use SpeculativeMethod::Mtp;
+        let ordered = in_choice_order(vec![
+            candidate(DrafterCategory::NextToModel, None, 1, "rejected-repository"),
+            candidate(DrafterCategory::CatalogDrafter, None, 1, "rejected-catalog"),
+            candidate(DrafterCategory::Other, Some(Mtp), 1, "entered"),
+        ]);
+        assert_eq!(recommended(ordered.clone()), None);
+        let with_heads = in_choice_order(
+            ordered
+                .into_iter()
+                .chain([candidate(DrafterCategory::BuiltIn, Some(Mtp), 0, "heads")])
+                .collect(),
+        );
+        assert_eq!(recommended(with_heads).unwrap().name, "heads");
+    }
+
+    #[test]
+    fn a_drafter_already_here_counts_as_no_download() {
+        use SpeculativeMethod::DFlash;
+        let mut here = candidate(DrafterCategory::NextToModel, Some(DFlash), 9, "here");
+        here.on_this_computer = true;
+        let ordered = in_choice_order(vec![
+            candidate(DrafterCategory::NextToModel, Some(DFlash), 3, "remote"),
+            here,
+        ]);
+        assert_eq!(names(&ordered), ["here", "remote"]);
     }
 }

@@ -29,9 +29,12 @@ inference advertisement, not management state.
 
 Each row already carries a valid canonical `ModelId`. Catalog rows exist without local material and
 have `NotInstalled` or `Installed` local state. Custom-model rows exist because material was
-observed or declared and have exactly one truthful state: `Ready` or `Unavailable`; both contain the
-selected resolved installation. An added model whose download has not completed is projected from
-its download.
+observed or declared. Observed material has exactly one truthful state, `Ready` or `Unavailable`,
+both containing the selected resolved installation. An added model whose target has not landed in
+the store is a `NotInstalled` row from its declaration, so ACN projects its download as installation
+progress; it cannot be served until the target lands. Downloads do not outlive the service, so ACN
+restarts the download of every such row when it starts, and the download resumes from its durable
+checkpoint.
 
 ## ACN projection
 
@@ -40,8 +43,11 @@ instances separately, then publishes one `LocalModel` union:
 
 - `Catalog` contains catalog membership and managed acquisition state.
 - `Custom` carries its `origin` (`Added`, `Imported`, or `Found` with its source), the catalog model
-  it is a variant of, its attached and recommended drafters, measured drafter acceptance, serving
-  state, and, for `Added` only, managed acquisition state.
+  it is a variant of, its attached and recommended drafters, serving
+  state, and, for `Added` only, managed acquisition state. ICN names it: the repository's name when
+  the file has a Hub identity (as the repository step does), else the GGUF's `general.name`, else
+  the file name, each without the quantization and with separators as spaces, and the quantization
+  its file names (`Q4_K_M`) as the variant label; without one, ACN labels it by bit width.
 
 `LocalModelsState` separately lists unsupported local models: display name, origin, location, the
 complete list of structured reasons, and developer detail. It combines the groups ICN could not
@@ -63,6 +69,7 @@ Actions follow who owns the files:
 | Added | Deletes Magnitude-owned files | New repository commit | Add, Change, Turn off |
 | Imported | Forgets the declaration; never touches the file | None | Add, Change, Turn off |
 | Found | Hide from Magnitude; never touches the files | None | Add, Change, Turn off |
+| Catalog, files only in an external location | Hide from Magnitude; Remove explains where the files are | New catalog revision | The catalog's |
 
 Adding a drafter to a model whose target is present downloads only the drafter. When a catalog
 drafter gets a new revision, every model using it shows Update.
@@ -124,7 +131,9 @@ remain authoritative.
 - `Unsupported` assessment outcomes (custom models only) never become offerings; for found and
   imported models they appear only in the unsupported list, with every reason; targets whose
   assessment attempt fails are omitted.
-- Hidden models appear only in the hidden list, are never assessed, and are never offered.
+- Hidden models appear only in the hidden list, are never assessed, and are never offered. A catalog
+  model whose installation is entirely externally owned is a found copy: ACN keeps it in the same
+  hidden list when the user hides it, and shows it again once Magnitude owns any of its files.
 - Catalog rows carry their catalog support level unchanged; support and assessment stay separate
   facts in the projection.
 - Found and imported models can be selected and loaded but cannot be installed, updated, or deleted;

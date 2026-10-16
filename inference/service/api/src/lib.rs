@@ -22,7 +22,7 @@ use magnitude_service_contracts::models::{
     CatalogInstallations, CatalogInstallationsResponse, CatalogModel, CatalogModelState,
     CatalogModels, CatalogModelsResponse, CustomModel, CustomModelOrigin, CustomModelState,
     DrafterCandidatesRequest, DrafterCandidatesResponse, EffectiveModel, FoundSource, LocalModels,
-    LocalModelRemoval, LocalModelsConfiguration, LocalModelsResponse, ModelAssessment,
+    DrafterPruning, LocalModelRemoval, LocalModelsConfiguration, LocalModelsResponse, ModelAssessment,
     ModelAssessmentDomainSnapshot,
     ModelAssessmentEntryState, ModelAssessmentSubject, ModelAssessments, ModelAssessmentsSnapshot,
     ModelCandidate, ModelCandidates, ModelCapabilities, ModelDownload, ModelDownloadId,
@@ -321,6 +321,7 @@ pub fn app(state: AppState, serving: magnitude_serving::Serving) -> Router {
             "/api/v1/local-models/{model_id}/files",
             axum::routing::delete(remove_local_model_files),
         )
+        .route("/api/v1/local-models/drafters/prune", post(prune_local_drafters))
         .route("/api/v1/candidates/inspect", post(inspect_model_candidate))
         .route("/api/v1/candidates/drafters", post(drafter_candidates))
         .route("/api/v1/candidates/bundle", post(candidate_bundle))
@@ -1229,6 +1230,24 @@ async fn remove_local_model_files(
     Ok(Json(result))
 }
 
+#[utoipa::path(post, path = "/api/v1/local-models/drafters/prune", operation_id = "pruneLocalDrafters", tag = "local-models",
+    responses(
+        (status = 200, description = "Magnitude-owned drafter packages no model uses were removed; drafters in other locations are never touched", body = DrafterPruning),
+        (status = 500, description = "Removal failed", body = ErrorResponse)
+    )
+)]
+#[tracing::instrument(name = "icn.local_models.prune_drafters", skip_all, err(Debug))]
+async fn prune_local_drafters(State(state): State<AppState>) -> Result<Json<DrafterPruning>, ApiError> {
+    let result = local_models_domain(&state)?
+        .prune_drafters()
+        .await
+        .map_err(ApiError::from_inventory)?;
+    if !result.removed.is_empty() {
+        state.invalidate_resources([InferenceResourceTopic::LocalModels]);
+    }
+    Ok(Json(result))
+}
+
 #[utoipa::path(post, path = "/api/v1/candidates/inspect", operation_id = "inspectModelCandidate", tag = "candidates",
     request_body(content = CandidateInspectionRequest, content_type = "application/json"),
     responses(
@@ -1609,6 +1628,7 @@ fn open_ai_model(
         local_models,
         refresh_local_models,
         remove_local_model_files,
+        prune_local_drafters,
         inspect_model_candidate,
         drafter_candidates,
         candidate_bundle,
@@ -1641,6 +1661,7 @@ fn open_ai_model(
         LocalModelsConfiguration,
         LocalModelsResponse,
         LocalModelRemoval,
+        DrafterPruning,
         CandidateInspectionRequest,
         CandidateInspection,
         DrafterCandidatesRequest,
@@ -2564,6 +2585,7 @@ mod tests {
             model_id,
             origin,
             display_name: "Fine Tune".to_owned(),
+            variant_label: Some("Q4_K_M".to_owned()),
             variant_of: Some("qwen3.6-35b-a3b:gguf:q4".parse().unwrap()),
             files: vec![CustomModelFile {
                 path: "/models/fine-tune.gguf".into(),
@@ -2681,6 +2703,15 @@ mod tests {
             })
         }
 
+        fn prune_drafters(&self) -> BoxFuture<'_, Result<DrafterPruning, InventoryError>> {
+            Box::pin(async {
+                Ok(DrafterPruning {
+                    removed: Vec::new(),
+                    freed_bytes: 0,
+                })
+            })
+        }
+
         fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation> {
             Box::pin(futures_util::stream::empty())
         }
@@ -2737,6 +2768,7 @@ mod tests {
                             size_bytes: 100,
                         }],
                         size_bytes: 100,
+                        download_bytes: 100,
                         assessment: Some(fits_assessment()),
                         recommended: true,
                         on_this_computer: None,
@@ -2758,6 +2790,7 @@ mod tests {
                         reference: DrafterReference::Catalog {
                             model_id: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
                         },
+                        name: "Magnitude DFlash for Qwen3.6 35B-A3B".to_owned(),
                         label: "Trained for Qwen3.6 35B-A3B".to_owned(),
                         size_bytes: 900,
                         lineage: DrafterLineage::Lineage,

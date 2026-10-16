@@ -1,4 +1,4 @@
-import { Context, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Context, Effect, Fiber, Layer, Option, Schema, Stream } from "effect"
 import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
@@ -6,6 +6,7 @@ import {
   ModelSlotMutationRejected,
   PRIMARY_SLOT_ID,
   type LocalInferenceError,
+  type LocalModelSyncOutcome,
   type ModelId,
   type CatalogFormModelId,
   type ModelLoadPlan,
@@ -16,9 +17,8 @@ import { projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
 import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"
-import { CustomModelCommands } from "./custom-model-commands"
+import { CustomModelCommands, externalCatalogRemovalRefusal } from "./custom-model-commands"
 
-export type LocalModelSyncOutcome = "Started" | "AlreadyCurrent"
 /** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
 export interface ModelCommandsApi {
   readonly sync: (modelId: ModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError>
@@ -93,11 +93,16 @@ export const ModelCommandsLive: Layer.Layer<
   ) => Schema.is(CatalogFormModelIdSchema)(modelId)
     ? catalogCommand(modelId)
     : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))
-  const catalogSync = (modelId: CatalogFormModelId) => client.catalog.installCatalogModel({ path: { model_id: modelId } }).pipe(
+  const catalogSync = (modelId: CatalogFormModelId) => Effect.gen(function* () {
+    const installed = (yield* catalog.get).state.models
+      .some((model) => model.id === modelId && model.localState._tag === "Installed")
+    const admission = yield* client.catalog.installCatalogModel({ path: { model_id: modelId } }).pipe(
       Effect.mapError((cause) => modelCommandFailure("sync", cause)),
-      Effect.tap(() => Effect.all([catalog.refresh, installations.refresh], { discard: true }).pipe(Effect.ignore)),
-      Effect.map((admission) => ({ outcome: admission._tag === "Current" ? "AlreadyCurrent" as const : "Started" as const })),
     )
+    yield* Effect.all([catalog.refresh, installations.refresh], { discard: true }).pipe(Effect.ignore)
+    const outcome: LocalModelSyncOutcome = admission._tag === "Current" ? "AlreadyCurrent" : installed ? "Updating" : "Installing"
+    return { outcome }
+  })
   const catalogCancel = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
       Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
       Effect.flatMap((operation) => operation === undefined
@@ -118,11 +123,18 @@ export const ModelCommandsLive: Layer.Layer<
             Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
           )),
     )
+  // Remove never deletes files Magnitude doesn't own; a catalog model found only elsewhere is hidden instead.
+  const catalogRemove = (modelId: CatalogFormModelId) => custom.externalCatalogFiles(modelId).pipe(
+    Effect.flatMap(Option.match({
+      onSome: (files) => Effect.fail(externalCatalogRemovalRefusal(modelId, files)),
+      onNone: () => stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId))),
+    })),
+  )
   return ModelCommands.of({
     sync: (modelId) => byForm(modelId, catalogSync, custom.sync),
     cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
     acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
-    remove: (modelId) => stopModel(modelId).pipe(Effect.zipRight(byForm(modelId, removals.remove, custom.remove))),
+    remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(modelId).pipe(Effect.zipRight(custom.remove(id)))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap(requestLoad),
       Effect.tap(() => slots.refresh),

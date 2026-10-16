@@ -605,6 +605,25 @@ fn unsupported_model(
     fingerprint: Option<ModelFingerprint>,
 ) -> CachedModelAssessment {
     let (reasons, detail) = unsupported_reasons(unsupported);
+    unsupported_assessment(requested.profile, reasons, detail, fingerprint)
+}
+
+/// A file on disk shorter than its header declares: refused before the engine sees it.
+pub(crate) fn unreadable_assessment(context_length: u32, detail: String) -> CachedModelAssessment {
+    unsupported_assessment(
+        magnitude_service_contracts::models::ServingProfile { context_length },
+        vec![UnsupportedReason::Unreadable],
+        detail,
+        None,
+    )
+}
+
+fn unsupported_assessment(
+    profile: magnitude_service_contracts::models::ServingProfile,
+    reasons: Vec<UnsupportedReason>,
+    detail: String,
+    fingerprint: Option<ModelFingerprint>,
+) -> CachedModelAssessment {
     CachedModelAssessment {
         capabilities: ModelCapabilities {
             vision: false,
@@ -619,7 +638,7 @@ fn unsupported_model(
         template_fingerprint: String::new(),
         fingerprint,
         profile: ModelAssessment::Unsupported {
-            profile: requested.profile,
+            profile,
             reasons,
             detail,
         },

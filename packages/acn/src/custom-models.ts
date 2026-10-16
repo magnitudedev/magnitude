@@ -11,6 +11,7 @@ import {
   SubscriptionRef,
 } from "effect"
 import {
+  CatalogFormModelIdSchema,
   LocalModelMutationFailed,
   type DrafterReference,
   type SpeculativeMethod,
@@ -129,7 +130,7 @@ export const localModelsConfiguration = (
     target: [...declaration.target],
     projector: declaration.projector,
   })) as unknown as LocalModelsConfiguration["declarations"],
-  hidden: [...config.hidden],
+  hidden: config.hidden.filter((modelId) => !Schema.is(CatalogFormModelIdSchema)(modelId)),
   drafters: Object.entries(config.drafters).flatMap(([modelId, choice]): readonly unknown[] => {
     if (choice._tag !== "Reference") return [{ modelId, drafter: { _tag: choice._tag } }]
     return Option.match(methodOf(choice.reference), {

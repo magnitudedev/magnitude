@@ -23,6 +23,13 @@ export interface ServerReach {
 
 const host = (address: string) => address.includes(":") ? `[${address}]` : address
 
+/** The SSH tunnel to the loopback endpoint, forwarding the same port on the other device. */
+const sshTunnel = (endpoint: string) => {
+  const url = new URL(endpoint)
+  const port = url.port.length > 0 ? url.port : url.protocol === "https:" ? "443" : "80"
+  return `ssh -N -L ${port}:${url.hostname}:${port} <you>@<this machine>`
+}
+
 /**
  * How to reach a ready server, shared by `serve` and `status`. It never includes the network
  * access key: service output goes to logs other accounts can read.
@@ -41,7 +48,7 @@ export const renderServerReach = (reach: ServerReach): readonly string[] => {
     lines.push(
       "Only this computer can reach it. To use it from other devices, turn on network access in",
       `Settings → Network access, or set "network": { "enabled": true } in ${reach.configPath} and restart.`,
-      "Or reach it through an SSH tunnel: ssh -N -L 10100:127.0.0.1:10100 <you>@<this machine>",
+      `Or reach it through an SSH tunnel: ${sshTunnel(reach.endpoint)}`,
     )
   }
   if (network?.pending) lines.push("A network access change applies when Magnitude restarts.")

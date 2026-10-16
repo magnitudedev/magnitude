@@ -908,12 +908,15 @@ export const DrafterReferenceSchema = Schema.Union(
 )
 export type DrafterReference = typeof DrafterReferenceSchema.Type
 
+/**
+ * Where a drafter candidate comes from, in automatic-choice order: a separate drafter in the model's
+ * own repository or folder, the matched catalog model's drafter, MTP heads built into the model, then
+ * a drafter the user entered, which is never chosen automatically.
+ */
 export const DrafterCandidateCategorySchema = Schema.Literal(
+  "NextToModel",
   "CatalogDrafter",
   "BuiltIn",
-  "NextToModel",
-  "OnThisComputer",
-  "HuggingFace",
   "Other",
 )
 export type DrafterCandidateCategory = typeof DrafterCandidateCategorySchema.Type
@@ -921,27 +924,26 @@ export type DrafterCandidateCategory = typeof DrafterCandidateCategorySchema.Typ
 export const DrafterLineageSchema = Schema.Literal("Exact", "Lineage", "Fingerprint", "None")
 export type DrafterLineage = typeof DrafterLineageSchema.Type
 
-/** Acceptance and decode speed measured for one model and drafter pair once it has served requests. */
-export const MeasuredDrafterAcceptanceSchema = Schema.Struct({
-  acceptanceRate: Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)),
-  tokensPerSecond: FiniteNonNegative,
-  withoutDrafterTokensPerSecond: Schema.optionalWith(FiniteNonNegative, { as: "Option", exact: true }),
-  slower: Schema.Boolean,
-})
-export type MeasuredDrafterAcceptance = typeof MeasuredDrafterAcceptanceSchema.Type
-
 export const DrafterCandidateSchema = Schema.Struct({
   category: DrafterCandidateCategorySchema,
   reference: DrafterReferenceSchema,
+  name: NonEmptyString,
   label: NonEmptyString,
   sizeBytes: NonNegativeSafeInteger,
   lineage: DrafterLineageSchema,
   verdict: DrafterVerdictSchema,
   onThisComputer: Schema.Boolean,
   method: Schema.optionalWith(SpeculativeMethodSchema, { as: "Option", exact: true }),
-  measuredAcceptance: Schema.optionalWith(MeasuredDrafterAcceptanceSchema, { as: "Option", exact: true }),
 })
 export type DrafterCandidate = typeof DrafterCandidateSchema.Type
+
+/**
+ * What a sync started: the first download of a model not installed (or the resumption of one that
+ * failed or was interrupted), an update of an installed model or its drafter to a newer revision,
+ * a missing drafter of an installed model, or nothing because the model is current.
+ */
+export const LocalModelSyncOutcomeSchema = Schema.Literal("Installing", "Updating", "DownloadingDrafter", "AlreadyCurrent")
+export type LocalModelSyncOutcome = typeof LocalModelSyncOutcomeSchema.Type
 
 /** A requested drafter: the preselected one, none, or a specific reference. */
 export const DrafterChoiceSchema = Schema.Union(
@@ -962,6 +964,7 @@ export type AttachedDrafterAvailability = typeof AttachedDrafterAvailabilitySche
 /** The drafter attached to a custom model; `updateAvailable` means a newer catalog drafter revision exists. */
 export const AttachedDrafterSchema = Schema.Struct({
   reference: DrafterReferenceSchema,
+  name: NonEmptyString,
   label: NonEmptyString,
   sizeBytes: NonNegativeSafeInteger,
   verdict: DrafterVerdictSchema,
@@ -1024,7 +1027,6 @@ export const CustomLocalModelSchema = Schema.TaggedStruct("Custom", {
   presentation: CustomModelPresentationSchema,
   drafter: Schema.optionalWith(AttachedDrafterSchema, { as: "Option", exact: true }),
   recommendedDrafter: Schema.optionalWith(DrafterCandidateSchema, { as: "Option", exact: true }),
-  measuredAcceptance: Schema.optionalWith(MeasuredDrafterAcceptanceSchema, { as: "Option", exact: true }),
   acquisitionState: CustomModelAcquisitionStateSchema,
   servingState: CustomLocalModelServingStateSchema,
   storageBytes: NonNegativeSafeInteger,
@@ -1072,12 +1074,15 @@ export const LocalModelPreparationSchema = Schema.Struct({
 }))
 export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
 
-/** `hidden` lists custom models the user hid; they are never in `models` and never offered. */
+/**
+ * `hidden` lists found models the user hid: custom models, and catalog models whose files are only in
+ * an external location. They are never in `models` and never offered.
+ */
 export const LocalModelsStateSchema = Schema.Struct({
   preparation: LocalModelPreparationSchema,
   models: Schema.Array(LocalModelSchema),
   unsupported: Schema.Array(UnsupportedLocalModelSchema),
-  hidden: Schema.Array(CustomLocalModelSchema),
+  hidden: Schema.Array(LocalModelSchema),
 }).pipe(Schema.filter(({ models, hidden }) => {
   const identities = [...models, ...hidden].map(({ modelId }) => modelId)
   return new Set(identities).size === identities.length
@@ -1119,6 +1124,7 @@ export const CandidateVersionSchema = Schema.Struct({
   modelId: CustomFormModelIdSchema,
   files: Schema.NonEmptyArray(NonEmptyString),
   sizeBytes: NonNegativeSafeInteger,
+  downloadBytes: NonNegativeSafeInteger,
   assessment: Schema.optionalWith(LocalModelAssessmentSchema, { as: "Option", exact: true }),
   recommended: Schema.Boolean,
   onThisComputer: Schema.optionalWith(ModelIdSchema, { as: "Option", exact: true }),
@@ -1283,7 +1289,7 @@ const ModelCatalogSnapshotFields = {
   failures: Schema.Array(ProviderCatalogFailureSchema),
   localModelPreparation: LocalModelPreparationSchema,
   unsupportedLocalModels: Schema.Array(UnsupportedLocalModelSchema),
-  hiddenLocalModels: Schema.Array(CustomLocalModelSchema),
+  hiddenLocalModels: Schema.Array(LocalModelSchema),
 } as const
 
 export const ModelCatalogStateSchema = Schema.Union(

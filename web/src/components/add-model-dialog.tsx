@@ -3,10 +3,10 @@ import { Cause, Exit, Option } from "effect"
 import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { ArrowLeftIcon, ArrowUpRightIcon, DownloadSimpleIcon, LinkIcon, MagnifyingGlassIcon, PlusIcon } from "@phosphor-icons/react"
 import {
-  catalogVariantOfName, drafterCandidateDownloadBytes, formatStorageSize, unsupportedReasonMessages, useAgentClient,
+  candidateDownloadBytes, catalogVariantOfName, formatStorageSize, unsupportedReasonMessages, useAgentClient,
   type AddModelRequest,
 } from "@magnitudedev/client-common"
-import type { CandidateInspection, CandidateVersion, HuggingFaceSearchResponse, HuggingFaceSearchResult, LocalModel } from "@magnitudedev/sdk"
+import type { CandidateInspection, CandidateVersion, DrafterCandidate, HuggingFaceSearchResponse, HuggingFaceSearchResult, LocalModel, UnsupportedReason } from "@magnitudedev/sdk"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { Input } from "./ui/input"
@@ -55,7 +55,7 @@ export function AddModelDialog({ request, models, onClose, onAdded }: {
   onAdded: () => void
 }) {
   return <Dialog open={Option.isSome(request)} onOpenChange={open => { if (!open) onClose() }}>
-    <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-xl">
+    <DialogContent className="max-h-[85vh] grid-cols-[minmax(0,1fr)] overflow-y-auto sm:max-w-xl">
       {Option.isSome(request) && <AddModelFlow key={JSON.stringify(request.value)} request={request.value} models={models} onAdded={onAdded} />}
     </DialogContent>
   </Dialog>
@@ -175,7 +175,7 @@ function SearchResultRow({ result, models, onOpen }: { result: HuggingFaceSearch
       <span className="block truncate text-sm font-medium" title={result.repository}>{result.displayName}</span>
       <span className="block truncate text-xs text-slate-500">{result.uploader}{Option.isSome(variantOf) ? ` · Variant of ${variantOf.value}` : ""}</span>
     </span>
-    <span className="shrink-0 text-xs tabular-nums text-slate-500">{formatDownloads(result.downloads)}</span>
+    <span className="shrink-0 whitespace-nowrap text-xs tabular-nums text-slate-500">{formatDownloads(result.downloads)}</span>
   </button>
 }
 
@@ -189,7 +189,10 @@ function RepositoryStep({ reference, file, models, onBack, onAdded }: { referenc
     <DialogHeader><DialogTitle className="flex items-center gap-2">{onBack && <BackButton onBack={onBack} />}{reference}</DialogTitle></DialogHeader>
     {Result.isFailure(inspection)
       ? <InspectionFailure error={Cause.failureOption(inspection.cause)} onRetry={retry} />
-      : <div aria-busy="true" aria-label="Reading the repository" className="space-y-2">{[0, 1, 2, 3].map(index => <SkeletonLine key={index} className="h-9" width="100%" />)}</div>}
+      : <div aria-busy="true" aria-label="Reading the repository" className="space-y-2">
+        <p className="text-xs text-slate-500">Reading the repository and checking each version against this machine…</p>
+        {[0, 1, 2, 3].map(index => <SkeletonLine key={index} className="h-9" width="100%" />)}
+      </div>}
   </>
 }
 
@@ -202,12 +205,22 @@ function BackButton({ onBack }: { onBack: () => void }) {
   return <Button variant="ghost" size="icon-sm" aria-label="Back to search" onClick={onBack}><ArrowLeftIcon /></Button>
 }
 
-/** A version's engine verdict, never read from its file name. */
-export const versionVerdict = (version: CandidateVersion): { readonly label: string; readonly selectable: boolean; readonly recommended: boolean } => {
+const plannedSupport = new Set<UnsupportedReason["_tag"]>([
+  "WeightTypes", "RopeScaling", "UnrecognizedTensor", "UnrecognizedMetadata", "TiedOutputHead", "Tokenizer", "KernelDomain", "Backend",
+])
+
+/** The short verdict for versions the engine can't run: damaged, planned support, or not supported. */
+export const unsupportedVersionLabel = (reasons: readonly UnsupportedReason[]): string =>
+  reasons.some(reason => reason._tag === "Unreadable") ? "File is damaged"
+    : reasons.length > 0 && reasons.every(reason => plannedSupport.has(reason._tag)) ? "Not supported yet"
+    : "Not supported"
+
+/** A version's engine verdict, never read from its file name; `detail` is the full reason behind a short label. */
+export const versionVerdict = (version: CandidateVersion): { readonly label: string; readonly detail?: string; readonly selectable: boolean; readonly recommended: boolean } => {
   if (Option.isNone(version.assessment)) return { label: "Not checked yet", selectable: true, recommended: false }
   const assessment = version.assessment.value
   switch (assessment._tag) {
-    case "Unsupported": return { label: unsupportedReasonMessages(assessment.reasons)[0] ?? "Magnitude can’t run this version", selectable: false, recommended: false }
+    case "Unsupported": return { label: unsupportedVersionLabel(assessment.reasons), detail: unsupportedReasonMessages(assessment.reasons).join(". "), selectable: false, recommended: false }
     case "DoesNotFit": return { label: "Too large for this machine", selectable: false, recommended: false }
     case "Fits": return version.recommended
       ? { label: "Recommended", selectable: true, recommended: true }
@@ -224,12 +237,13 @@ export const initialVersion = (inspection: CandidateInspection, file: Option.Opt
   return Option.fromNullable(preferred?.label)
 }
 
-/** Download names everything fetched; a version already here, or a local file, only adds its drafter. */
-export const confirmAction = (inspection: CandidateInspection, version: CandidateVersion, drafterBytes: number): { readonly label: string; readonly download: boolean } => {
-  const inPlace = inspection.source._tag === "Local" || Option.isSome(version.onThisComputer)
-  if (inPlace) return { label: drafterBytes > 0 ? `Add (${formatStorageSize(drafterBytes)})` : "Add", download: false }
-  const projector = Option.match(inspection.projector, { onNone: () => 0, onSome: file => file.sizeBytes })
-  return { label: `Download (${formatStorageSize(version.sizeBytes + drafterBytes + projector)})`, download: true }
+/** Download names everything fetched: the version's target and projector bytes still to download, plus the chosen drafter. */
+export const confirmAction = (inspection: CandidateInspection, version: CandidateVersion, drafter: Option.Option<DrafterCandidate>): { readonly label: string; readonly download: boolean } => {
+  const { totalBytes, drafterBytes } = candidateDownloadBytes(version, inspection.projector, drafter)
+  if (inspection.source._tag === "Local" || totalBytes === drafterBytes) {
+    return { label: drafterBytes > 0 ? `Add (${formatStorageSize(drafterBytes)})` : "Add", download: false }
+  }
+  return { label: `Download (${formatStorageSize(totalBytes)})`, download: true }
 }
 
 function InspectedRepository({ inspection, file, models, onBack, onAdded }: { inspection: CandidateInspection; file: Option.Option<string>; models: readonly LocalModel[]; onBack?: () => void; onAdded: () => void }) {
@@ -245,17 +259,17 @@ function VersionWithDrafters({ version, header, onAdded }: {
   header: Omit<Parameters<typeof RepositoryView>[0], "drafters" | "footer">
   onAdded: () => void
 }) {
-  const { drafters, footer } = useVersionConfirmation(header.inspection, version, header.models, onAdded)
+  const { drafters, footer } = useVersionConfirmation(header.inspection, version, onAdded)
   return <RepositoryView {...header} drafters={drafters} footer={footer} />
 }
 
 /** The drafter choices for one version and the footer that adds it with the chosen drafter. */
-function useVersionConfirmation(inspection: CandidateInspection, version: CandidateVersion, models: readonly LocalModel[], onAdded: () => void) {
+function useVersionConfirmation(inspection: CandidateInspection, version: CandidateVersion, onAdded: () => void) {
   const client = useAgentClient()
   const { candidates, otherPending, otherFailure, checkOther } = useDrafterCandidates({ _tag: "Candidate", source: inspection.source, files: version.files })
   const [selection, setSelection] = useState<DrafterSelection>({ _tag: "Auto" })
   const list = Result.isSuccess(candidates) ? candidates.value.candidates : []
-  const drafterBytes = Option.match(selectedDrafterCandidate(selection, list), { onNone: () => 0, onSome: drafterCandidateDownloadBytes })
+  const findingDrafters = !Result.isSuccess(candidates) && !Result.isFailure(candidates)
   const add = useAtomSet(client.Models.AddHuggingFaceModel, { mode: "promiseExit" })
   const adding = useAtomValue(client.Models.AddHuggingFaceModel)
   const importFile = useAtomSet(client.Models.ImportModelFile, { mode: "promiseExit" })
@@ -273,9 +287,9 @@ function useVersionConfirmation(inspection: CandidateInspection, version: Candid
   }
   return {
     drafters: Result.isFailure(candidates) ? <ErrorNotice severity="warning" title="Couldn’t list drafters" description="The recommended drafter is still used when you add this model." />
-      : !Result.isSuccess(candidates) ? <div aria-busy="true" aria-label="Finding drafters" className="space-y-2"><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
-      : <DrafterList candidates={list} models={models} selection={selection} onSelect={setSelection} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />,
-    footer: <RepositoryFooter local={source._tag === "Local"} action={confirmAction(inspection, version, drafterBytes)} pending={state.waiting} failure={failure} onConfirm={confirm} />,
+      : findingDrafters ? <div aria-busy="true" aria-label="Finding drafters" className="space-y-2"><p className="text-xs text-slate-500">Finding drafters for this version…</p><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
+      : <DrafterList candidates={list} selection={selection} onSelect={setSelection} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />,
+    footer: <RepositoryFooter local={source._tag === "Local"} action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={state.waiting || findingDrafters} failure={failure} onConfirm={confirm} />,
   }
 }
 
@@ -319,7 +333,7 @@ function LocalFileInspection({ path, models, onAdded }: { path: string; models: 
 }
 
 function LocalFileVersion({ inspection, version, models, onAdded }: { inspection: CandidateInspection; version: CandidateVersion; models: readonly LocalModel[]; onAdded: () => void }) {
-  const { drafters, footer } = useVersionConfirmation(inspection, version, models, onAdded)
+  const { drafters, footer } = useVersionConfirmation(inspection, version, onAdded)
   return <LocalFileSummary inspection={inspection} models={models} drafters={drafters} footer={footer} />
 }
 
@@ -339,7 +353,7 @@ export function LocalFileSummary({ inspection, models, drafters, footer }: { ins
       {version !== undefined && <span className="shrink-0 text-xs tabular-nums text-slate-500">{formatStorageSize(version.sizeBytes)}</span>}
       {verdict !== undefined && Option.isNone(inspection.unsupportedArchitecture) && (verdict.recommended
         ? <span className="shrink-0 rounded-full border border-blue-300 px-2 py-0.5 text-xs text-blue-700 dark:border-blue-700 dark:text-blue-400">Recommended</span>
-        : <span className="shrink-0 text-xs text-slate-500">{verdict.label}</span>)}
+        : <span className="shrink-0 text-xs text-slate-500" title={verdict.detail}>{verdict.label}</span>)}
     </section>
     {Option.isSome(inspection.unsupportedArchitecture)
       ? <ErrorNotice severity="info" title="Magnitude can’t run this model" description={`${unsupportedReasonMessages(inspection.unsupportedArchitecture.value).join(". ")}.`} />
@@ -362,8 +376,8 @@ export function RepositoryFooter({ local, action, pending, failure, onConfirm }:
   return <div className="space-y-3 border-t border-slate-200 pt-4 dark:border-slate-750">
     {failure && <ErrorNotice {...failure} />}
     <DialogFooter className="items-center sm:justify-between">
-      <p className="text-xs text-slate-500">{local ? localFileNote : "Pinned to the current version of this repository"}</p>
-      <Button disabled={pending} onClick={onConfirm}>{action.download ? <DownloadSimpleIcon /> : <PlusIcon />}{action.label}</Button>
+      <p className="min-w-0 text-xs text-slate-500">{local ? localFileNote : "Pinned to the current version of this repository"}</p>
+      <Button className="shrink-0" disabled={pending} onClick={onConfirm}>{action.download ? <DownloadSimpleIcon /> : <PlusIcon />}{action.label}</Button>
     </DialogFooter>
   </div>
 }
@@ -410,13 +424,13 @@ export function RepositoryView({ inspection, models, selectedVersion, onSelectVe
                 const verdict = versionVerdict(version)
                 return <label key={version.label} className={`flex items-center gap-3 px-3 py-2 text-sm ${verdict.selectable ? "cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-800" : "opacity-60"}`}>
                   <input type="radio" name={name} className="accent-blue-600" checked={Option.contains(selectedVersion, version.label)} disabled={!verdict.selectable} onChange={() => onSelectVersion(version.label)} />
-                  <span className="w-28 shrink-0 truncate font-medium" title={version.files.join("\n")}>{version.label}</span>
-                  <span className="w-20 shrink-0 tabular-nums text-slate-500">{formatStorageSize(version.sizeBytes)}</span>
-                  <span className="min-w-0 flex-1 text-right text-xs">
-                    {Option.isSome(version.onThisComputer) && <span className="mr-2 text-green-700 dark:text-green-400">Already on this computer</span>}
+                  <span className="w-24 shrink-0 truncate font-medium sm:w-28" title={version.files.join("\n")}>{version.label}</span>
+                  <span className="w-16 shrink-0 tabular-nums text-slate-500 sm:w-20">{formatStorageSize(version.sizeBytes)}</span>
+                  <span className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-x-2 gap-y-0.5 text-right text-xs">
+                    {Option.isSome(version.onThisComputer) && <span className="text-green-700 dark:text-green-400">Already on this computer</span>}
                     {verdict.recommended
                       ? <span className="rounded-full border border-blue-300 px-2 py-0.5 text-blue-700 dark:border-blue-700 dark:text-blue-400">Recommended</span>
-                      : <span className="text-slate-500">{verdict.label}</span>}
+                      : <span className="text-slate-500" title={verdict.detail}>{verdict.label}</span>}
                   </span>
                 </label>
               })}

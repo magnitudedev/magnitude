@@ -4,6 +4,7 @@ import {
   CatalogModelsResponse,
   LocalModelsResponse,
   ModelAssessmentsSnapshot,
+  type DrafterPruning,
   type LocalModelRemoval,
   type LocalModelsConfiguration,
 } from "@magnitudedev/icn-protocol/schemas"
@@ -16,6 +17,7 @@ type LocalModelsReadError = Effect.Effect.Error<ReturnType<IcnClientService["loc
 type LocalModelsRefreshError = Effect.Effect.Error<ReturnType<IcnClientService["localModels"]["refreshLocalModels"]>>
 export type LocalModelFilesRemovalError = Effect.Effect.Error<ReturnType<IcnClientService["localModels"]["removeLocalModelFiles"]>>
 export type LocalModelsConfigureError = Effect.Effect.Error<ReturnType<IcnClientService["localModels"]["configureLocalModels"]>>
+export type DrafterPruningError = Effect.Effect.Error<ReturnType<IcnClientService["localModels"]["pruneLocalDrafters"]>>
 type CatalogInstallationsReadError = Effect.Effect.Error<ReturnType<IcnClientService["catalog"]["listCatalogInstallations"]>>
 type AssessmentsReadError = Effect.Effect.Error<ReturnType<IcnClientService["models"]["getModelAssessments"]>>
 
@@ -26,7 +28,8 @@ export class IcnCatalog extends Context.Tag("@magnitudedev/icn/IcnCatalog")<IcnC
 /**
  * Custom and unsupported local models ICN found in the configured locations and declarations.
  * `configure` replaces the whole local-models configuration (the same snapshot twice is a no-op);
- * `removeFiles` deletes Magnitude's copy of an added model and never touches other locations.
+ * `removeFiles` deletes Magnitude's copy of an added model and never touches other locations;
+ * `pruneDrafters` deletes Magnitude's drafter packages that no model uses any more.
  */
 export interface IcnLocalModelsService
   extends IcnObservedState<typeof LocalModelsResponse.Type, LocalModelsReadError> {
@@ -35,6 +38,7 @@ export interface IcnLocalModelsService
     configuration: LocalModelsConfiguration,
   ) => Effect.Effect<void, LocalModelsConfigureError | LocalModelsReadError>
   readonly removeFiles: (modelId: string) => Effect.Effect<LocalModelRemoval, LocalModelFilesRemovalError>
+  readonly pruneDrafters: Effect.Effect<DrafterPruning, DrafterPruningError>
 }
 export class IcnLocalModels extends Context.Tag("@magnitudedev/icn/IcnLocalModels")<IcnLocalModels, IcnLocalModelsService>() {}
 
@@ -98,6 +102,9 @@ export const makeIcnLocalModels = (
     ),
     removeFiles: (modelId) => client.localModels.removeLocalModelFiles({ path: { model_id: modelId } }).pipe(
       Effect.tap(() => observed.refresh.pipe(Effect.ignore)),
+    ),
+    pruneDrafters: Effect.suspend(() => client.localModels.pruneLocalDrafters({})).pipe(
+      Effect.tap(({ removed }) => removed.length > 0 ? observed.refresh.pipe(Effect.ignore) : Effect.void),
     ),
   })
 }))

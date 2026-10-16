@@ -110,8 +110,8 @@ Custom models follow [the local-model product projection](../model-management/lo
   lineage resolves, and downloads; a footer counts results hidden for unsupported architectures, and
   repositories the catalog uses are never listed as new models. The repository step shows the
   repository link, Variant of, and license; one row per version (shards grouped) with its size and
-  the engine's verdict (Recommended, Fits your machine, Too large for this machine, or uses weight
-  types Magnitude doesn't support), never a verdict from the file name; the drafter choices
+  the engine's verdict (Recommended, Fits your machine, Too large for this machine, Not supported
+  yet with the reason on hover, Not supported for an architecture without kernels, or File is damaged), never a verdict from the file name; the drafter choices
   preselected per [drafter selection](../model-management/drafter-selection.md) with "Use a different
   drafter…"; and "Pinned to the current version of this repository" with Download and its total size
   (target, drafter, projector). A version already on this computer is marked so and Download becomes
@@ -124,11 +124,10 @@ Custom models follow [the local-model product projection](../model-management/lo
   the catalog, "Hugging Face", "Ollama", "LM Studio", "Hugging Face cache", or the folder name), and
   actions that follow who owns the files: Remove deletes catalog and added files, forgets an
   imported file, and is "Hide from Magnitude" for found models. Details show Source (an added
-  model's repository pinned to its commit), Variant of, the Drafter with Change for every custom
-  model, and measured acceptance once the model has served requests. A custom model with no drafter,
+  model's repository pinned to its commit), Variant of, and the drafter's name with Change and Turn
+  off for every custom model. A custom model with no drafter,
   when one is recommended, shows "Faster with a drafter · Add (size)" on its card and in Details;
-  one click downloads only the drafter. A drafter that slows decoding is reported with Change and
-  Turn off. Catalog models never offer a drafter change. Add GGUF file… adds one file in place
+  one click downloads only the drafter. Catalog models never offer a drafter change. Add GGUF file… adds one file in place
   through the same repository step, with a file picker in place of the version list.
 - **Models that can't run** never get disabled cards. One collapsed line at the bottom of My Models
   ("N other models on this computer can't run in Magnitude") expands to dimmed rows with name,
@@ -263,12 +262,14 @@ and no old browser preference is imported. Renderer reloads reread the host pref
 of ACN readiness. The browser client retains its own persistence adapter around shared appearance
 rendering.
 
-Settings is a flat list of rows in three groups, General, Model locations and About, each row a
-label with its control on the right and a one-line hint only when the state needs explaining: Theme
-(segmented control), Launch at login (switch), Model storage, and Automatic updates (switch); then
-the automatic locations Magnitude found, each with a switch to turn it off, and the user's own
-folders with Add and Remove; then one About row with the application version, update status, and the
-single update action for the current state. The version is the running service's, from its health.
+Settings is a flat list of rows in two groups, General and About, each row a label with its control
+on the right and a one-line hint only when the state needs explaining: Theme (segmented control),
+Launch at login (switch), Model storage, Model locations, and Automatic updates (switch); then one
+About row with the application version, update status, and the single update action for the current
+state. Model locations is one row summarizing what is scanned (the found, enabled locations and the
+folder count) with a Manage action; Manage opens a modal listing found automatic locations with a
+switch and their path, not-found locations folded away, and the user's folders with Add folder… and
+Remove. The version is the running service's, from its health.
 Folders are chosen with the app's own folder picker; a folder is watched, so files added or deleted
 later appear or disappear.
 

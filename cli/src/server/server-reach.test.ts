@@ -31,6 +31,12 @@ describe("serve ready output", () => {
     expect(server).toContain("ssh -N -L 10100:127.0.0.1:10100")
     expect(renderServeReady(reach({ network: off }))).toContain("/home/ada/.magnitude/config.json")
   })
+  it("tunnels to the port the service actually listens on", () => {
+    const off = Option.some({ enabled: false, bind: Option.none(), port: 10100, pending: false, interfaces: [] })
+    const output = renderServeReady(reach({ endpoint: "http://127.0.0.1:11188", network: off }))
+    expect(output).toContain("ssh -N -L 11188:127.0.0.1:11188 <you>@<this machine>")
+    expect(output).not.toContain("10100")
+  })
   it("tells the service how to stop instead of Ctrl+C", () => {
     const linux = renderServeReady(reach({ service: true }), "linux")
     expect(linux).not.toContain("Ctrl+C")

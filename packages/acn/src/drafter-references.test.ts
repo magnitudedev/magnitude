@@ -1,58 +1,20 @@
 import { Effect, Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { DrafterCandidateSchema, DrafterReferenceSchema, type DrafterCandidate } from "@magnitudedev/acn-protocol"
+import {
+  CatalogFormModelIdSchema,
+  DrafterReferenceSchema,
+} from "@magnitudedev/acn-protocol"
+import type { CatalogModelSource } from "./local-model-sources"
 import {
   DrafterMethods,
   DrafterMethodsLive,
   drafterReferenceKey,
-  orderDrafterCandidates,
+  drafterReferenceNaming,
   productDrafterCandidate,
 } from "./drafter-references"
 
 const reference = (path: string) => Schema.decodeUnknownSync(DrafterReferenceSchema)({
   _tag: "HuggingFace", repository: "z-lab/drafters", commit: "abc", path,
-})
-
-const candidate = (path: string, overrides: Partial<Schema.Schema.Encoded<typeof DrafterCandidateSchema>> = {}, rate?: number): DrafterCandidate => ({
-  ...Schema.decodeUnknownSync(DrafterCandidateSchema)({
-    category: "HuggingFace",
-    reference: reference(path),
-    label: path,
-    sizeBytes: 100,
-    lineage: "Lineage",
-    verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1 },
-    onThisComputer: false,
-    ...overrides,
-  }),
-  measuredAcceptance: rate === undefined
-    ? Option.none()
-    : Option.some({ acceptanceRate: rate, tokensPerSecond: 10, withoutDrafterTokensPerSecond: Option.none(), slower: false }),
-})
-
-describe("drafter candidate order", () => {
-  it("keeps category order and breaks ties by lineage, measured acceptance, then size", () => {
-    const ordered = orderDrafterCandidates([
-      candidate("fingerprint.gguf", { lineage: "Fingerprint", sizeBytes: 1 }),
-      candidate("unmeasured.gguf", { sizeBytes: 1 }),
-      candidate("measured-low.gguf", {}, 0.3),
-      candidate("measured-high.gguf", {}, 0.7),
-      candidate("catalog.gguf", { category: "CatalogDrafter", lineage: "None", sizeBytes: 999 }),
-      candidate("big.gguf", { sizeBytes: 5 }),
-    ])
-    expect(ordered.map(({ label }) => label)).toEqual([
-      "catalog.gguf",
-      "measured-high.gguf",
-      "measured-low.gguf",
-      "unmeasured.gguf",
-      "big.gguf",
-      "fingerprint.gguf",
-    ])
-  })
-
-  it("is deterministic for equal candidates", () => {
-    const input = [candidate("a.gguf"), candidate("b.gguf")]
-    expect(orderDrafterCandidates(input).map(({ label }) => label)).toEqual(["a.gguf", "b.gguf"])
-  })
 })
 
 describe("drafter identity", () => {
@@ -66,13 +28,14 @@ describe("drafter identity", () => {
     const product = productDrafterCandidate({
       category: "Other",
       reference: { _tag: "Local", path: "/d.gguf" },
+      name: "d.gguf",
       label: "d",
       lineage: "None",
       method: Option.none(),
       onThisComputer: true,
       sizeBytes: 1,
       verdict: { _tag: "Rejected", reasons: [], detail: "mismatch" },
-    } as never)
+    } as never, [])
     expect(Option.map(product, ({ verdict }) => verdict)).toEqual(Option.some({
       _tag: "Rejected",
       reasons: [{ _tag: "Unknown", kind: "Unknown", detail: "mismatch" }],
@@ -93,5 +56,50 @@ describe("drafter identity", () => {
       after: Option.some({ _tag: "DSpark" }),
       embedded: Option.some({ _tag: "Mtp" }),
     })
+  })
+})
+
+describe("drafter naming", () => {
+  const catalogId = CatalogFormModelIdSchema.make("qwen3.6-35b-a3b:gguf:q4")
+  const catalog = [{
+    id: catalogId,
+    source: { displayName: "Qwen3.5 4B", desired: { speculativeMethod: Option.some({ _tag: "DFlash" }) } },
+  }] as unknown as readonly CatalogModelSource[]
+
+  it("names a catalog drafter from the catalog, as ICN does, before ICN describes it", () => {
+    expect(drafterReferenceNaming({ _tag: "Catalog", modelId: catalogId }, catalog)).toEqual({
+      name: "Magnitude DFlash for Qwen3.5 4B",
+      label: "Trained for Qwen3.5 4B",
+    })
+  })
+
+  it("names embedded heads, and Hugging Face and local files the user chose", () => {
+    expect(drafterReferenceNaming({ _tag: "Embedded" }, [])).toEqual({ name: "MTP heads", label: "Built into this model" })
+    expect(drafterReferenceNaming(reference("sub/dflash.gguf"), [])).toEqual({
+      name: "z-lab/drafters/dflash.gguf",
+      label: "Chosen by you",
+    })
+    expect(drafterReferenceNaming({ _tag: "Local", path: "/models/mtp.gguf" }, [])).toEqual({
+      name: "mtp.gguf",
+      label: "Chosen by you",
+    })
+  })
+
+  it("gives a catalog candidate the catalog name whatever ICN called it", () => {
+    const product = productDrafterCandidate({
+      category: "CatalogDrafter",
+      reference: { _tag: "Catalog", modelId: catalogId },
+      name: "Something else",
+      label: "Something",
+      lineage: "Lineage",
+      method: Option.none(),
+      onThisComputer: false,
+      sizeBytes: 1,
+      verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1 },
+    } as never, catalog)
+    expect(Option.map(product, ({ name, label }) => ({ name, label }))).toEqual(Option.some({
+      name: "Magnitude DFlash for Qwen3.5 4B",
+      label: "Trained for Qwen3.5 4B",
+    }))
   })
 })

@@ -18,18 +18,18 @@ import {
   type ModelDownload,
 } from "@magnitudedev/icn-protocol/schemas"
 import {
+  CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
   HuggingFaceRepositoryIdSchema,
   type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
-import { CustomModelCommands, CustomModelCommandsLive } from "./custom-model-commands"
+import { CustomModelCommands, CustomModelCommandsLive, externalCatalogRemovalRefusal } from "./custom-model-commands"
 import { CustomModelReconciler } from "./custom-model-reconciler"
 import { CustomModels } from "./custom-models"
 import { DrafterMethodsLive } from "./drafter-references"
-import { LocalModelSources } from "./local-model-sources"
+import { LocalModelSources, type CatalogModelSource } from "./local-model-sources"
 import { LocalModels, customModel } from "./local-models"
 import { makeModelLocations } from "./model-locations"
-import { ServingUsage } from "./serving-usage"
 import {
   addedId,
   customModelsConfig,
@@ -50,6 +50,7 @@ const bound = { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 900 }
 const nativeCandidate = (overrides: Record<string, unknown> = {}) => Schema.decodeUnknownSync(NativeDrafterCandidate)({
   category: "CatalogDrafter",
   reference: drafterReference,
+  name: "Magnitude DFlash for Model",
   label: "Magnitude DFlash",
   lineage: "Lineage",
   method: { _tag: "DFlash" },
@@ -68,6 +69,7 @@ const inspection = (onThisComputer?: string) => Schema.decodeUnknownSync(Candida
       modelId: "hf:owner/model-GGUF/model-Q4_K_M.gguf",
       files: [{ path: "model-Q4_K_M.gguf", sizeBytes: 100 }],
       sizeBytes: 100,
+      downloadBytes: 100,
       recommended: true,
       ...(onThisComputer === undefined ? {} : { onThisComputer }),
     },
@@ -76,6 +78,7 @@ const inspection = (onThisComputer?: string) => Schema.decodeUnknownSync(Candida
       modelId: "hf:owner/model-GGUF/model-Q2_K.gguf",
       files: [{ path: "model-Q2_K.gguf", sizeBytes: 50 }],
       sizeBytes: 50,
+      downloadBytes: 50,
       recommended: false,
       assessment: { _tag: "Unsupported", profile: { contextLength: 4096 }, reasons: [{ _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }] }], detail: "" },
     },
@@ -90,6 +93,7 @@ interface Recorded {
   readonly removedFiles: string[]
   readonly drafterRequests: unknown[]
   pushes: number
+  prunes: number
 }
 
 const harness = (options: {
@@ -98,9 +102,11 @@ const harness = (options: {
   readonly drafters?: readonly NativeDrafterCandidate[]
   readonly downloads?: readonly ModelDownload[]
   readonly customModels?: ReturnType<typeof nativeCustomModel>[]
+  readonly catalog?: readonly CatalogModelSource[]
+  readonly catalogRows?: readonly LocalModelsState["models"][number][]
 } = {}) => {
   const recorded: Recorded = {
-    bundles: [], started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], pushes: 0,
+    bundles: [], started: [], cancelled: [], acknowledged: [], removedFiles: [], drafterRequests: [], pushes: 0, prunes: 0,
   }
   const sourceModels = (options.customModels ?? [nativeCustomModel()]).map(customSource)
   const candidates: IcnCandidatesService = {
@@ -136,11 +142,11 @@ const harness = (options: {
   const layer = Effect.gen(function* () {
     const custom = yield* makeTestCustomModels(options.config ?? customModelsConfig())
     const rows = sourceModels.flatMap((entry) => Option.toArray(customModel({
-      entry, assessment: undefined, instances: [], related: [], acceptance: [], catalog: [],
+      entry, assessment: undefined, instances: [], related: [], catalog: options.catalog ?? [],
     })))
     const localState: LocalModelsState = {
       preparation: { discovery: { complete: true, modelsFound: rows.length }, assessment: { complete: true, settledModels: 0, totalModels: 0 } },
-      models: rows,
+      models: [...(options.catalogRows ?? []), ...rows],
       unsupported: [],
       hidden: [],
     }
@@ -164,18 +170,17 @@ const harness = (options: {
           recorded.removedFiles.push(modelId)
           return { modelId, removed: true, freedBytes: 1 }
         }),
+        pruneDrafters: Effect.sync(() => {
+          recorded.prunes += 1
+          return { removed: [], freedBytes: 0 }
+        }),
       } as never),
-      Layer.succeed(LocalModelSources, { state: Effect.succeed({ customModels: sourceModels }) } as never),
+      Layer.succeed(LocalModelSources, {
+        state: Effect.succeed({ customModels: sourceModels, catalogModels: options.catalog ?? [] }),
+      } as never),
       Layer.succeed(LocalModels, { state: Effect.succeed(localState) } as never),
       Layer.succeed(CustomModels, custom),
       Layer.succeed(CustomModelReconciler, { push: Effect.sync(() => { recorded.pushes += 1 }) }),
-      Layer.succeed(ServingUsage, {
-        acceptance: Effect.succeed([{
-          model: foundId,
-          drafter: "embedded",
-          acceptance: { acceptanceRate: 0.9, tokensPerSecond: 10, withoutDrafterTokensPerSecond: Option.none(), slower: false },
-        }]),
-      } as never),
       DrafterMethodsLive,
       makeModelLocations({ platform: "linux", env: { OLLAMA_MODELS: "/nonexistent/ollama" }, home: "/nonexistent-home" })
         .pipe(Layer.provide(BunFileSystem.layer)),
@@ -227,18 +232,17 @@ describe("finding models", () => {
     expect(result._tag === "Left" && result.left._tag).toBe("InvalidModelReference")
   })
 
-  it("orders drafter candidates and passes a different drafter to the engine", async () => {
+  it("keeps ICN's drafter order and passes a different drafter to the engine", async () => {
     const { run, recorded } = harness({
       drafters: [
-        nativeCandidate({ category: "BuiltIn", reference: { _tag: "Embedded" }, label: "Built in", lineage: "Exact", sizeBytes: 0 }),
-        nativeCandidate({ category: "OnThisComputer", reference: { _tag: "Local", path: "/d/large.gguf" }, label: "Large", sizeBytes: 9 }),
-        nativeCandidate({ category: "OnThisComputer", reference: { _tag: "Local", path: "/d/small.gguf" }, label: "Small", sizeBytes: 1 }),
+        nativeCandidate({ category: "NextToModel", reference: { _tag: "Local", path: "/d/large.gguf" }, label: "Large", sizeBytes: 9 }),
+        nativeCandidate({ category: "NextToModel", reference: { _tag: "Local", path: "/d/small.gguf" }, label: "Small", sizeBytes: 1 }),
         nativeCandidate(),
+        nativeCandidate({ category: "BuiltIn", reference: { _tag: "Embedded" }, label: "Built in", lineage: "Exact", sizeBytes: 0 }),
       ],
     })
     const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: foundId }, Option.some("z-lab/d:dflash.gguf")))
-    expect(result.map(({ label }) => label)).toEqual(["Magnitude DFlash", "Built in", "Small", "Large"])
-    expect(result[1]?.measuredAcceptance.pipe(Option.map(({ acceptanceRate }) => acceptanceRate))).toEqual(Option.some(0.9))
+    expect(result.map(({ label }) => label)).toEqual(["Large", "Small", "Magnitude DFlash", "Built in"])
     expect(recorded.drafterRequests[0]).toMatchObject({ _tag: "Model", modelId: foundId, other: Option.some("z-lab/d:dflash.gguf") })
   })
 })
@@ -287,7 +291,7 @@ describe("adding models", () => {
       inspect: Schema.decodeUnknownSync(CandidateInspection)({
         source: { _tag: "Local", path: "/models/imported.gguf" },
         displayName: "Imported",
-        versions: [{ label: "Q4_0", modelId: importedId, files: [{ path: "/models/imported.gguf", sizeBytes: 1 }], sizeBytes: 1, recommended: true }],
+        versions: [{ label: "Q4_0", modelId: importedId, files: [{ path: "/models/imported.gguf", sizeBytes: 1 }], sizeBytes: 1, downloadBytes: 0, recommended: true }],
       }),
       config: customModelsConfig({ declarations: {} }),
     })
@@ -339,6 +343,7 @@ describe("removal by origin", () => {
     }))
     expect(recorded.cancelled).toEqual(["active"])
     expect(recorded.removedFiles).toEqual([addedId])
+    expect(recorded.prunes).toBe(2)
     expect(Object.keys(config.declarations)).toEqual([])
     expect(config.hidden).toEqual([foundId])
   })
@@ -372,8 +377,36 @@ describe("drafter and download recovery", () => {
       })],
     })
     const result = await run((commands) => commands.sync(addedId))
-    expect(result.outcome).toBe("Started")
+    expect(result.outcome).toBe("Installing")
     expect(recorded.bundles[0]).toMatchObject({ target: ["model-Q4_K_M.gguf"] })
+  })
+
+  it("resumes an added model's interrupted download when the service starts", async () => {
+    const { run, recorded } = harness({
+      customModels: [nativeCustomModel(), nativeCustomModel({
+        modelId: addedId,
+        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+        state: { _tag: "NotInstalled" },
+      })],
+    })
+    await run(() => Effect.sleep("50 millis"))
+    expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: addedId }])
+  })
+
+  it("lists an added model's drafters from its declared repository file while it downloads", async () => {
+    const { run, recorded } = harness({
+      customModels: [nativeCustomModel({
+        modelId: addedId,
+        origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+        state: { _tag: "NotInstalled" },
+      })],
+    })
+    const result = await run((commands) => commands.listDrafterCandidates({ _tag: "Model", modelId: addedId }, Option.none()))
+    expect(result.map(({ label }) => label)).toEqual(["Magnitude DFlash"])
+    expect(recorded.drafterRequests.at(-1)).toMatchObject({
+      _tag: "Candidate",
+      candidate: { source: { _tag: "HuggingFace", repository: "owner/model-GGUF", commit: "c0ffee" }, target: ["model-Q4_K_M.gguf"] },
+    })
   })
 
   it("downloads a missing attached drafter on Sync", async () => {
@@ -381,9 +414,69 @@ describe("drafter and download recovery", () => {
       customModels: [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: drafterReference, state: { _tag: "NotInstalled" } } })],
     })
     const result = await run((commands) => commands.sync(foundId))
-    expect(result.outcome).toBe("Started")
+    expect(result.outcome).toBe("DownloadingDrafter")
     expect(recorded.bundles[0]).toMatchObject({ drafter: Option.some({ reference: drafterReference }) })
     expect(recorded.started).toEqual([{ bundle: { _tag: "Standalone", package: { id: "bundle" } }, forModel: foundId }])
+  })
+})
+
+describe("drafter updates", () => {
+  const catalogDrafter = { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" } as const
+  const catalog = (updateState: string) => [{
+    id: "qwen3.6-35b-a3b:gguf:q4",
+    source: {
+      displayName: "Qwen3.6 35B-A3B",
+      desired: { speculativeMethod: Option.some({ _tag: "DFlash" }) },
+      localState: { _tag: "Installed", updateState: { _tag: updateState } },
+    },
+  }] as unknown as readonly CatalogModelSource[]
+
+  it("updates a catalog drafter with a newer revision, and is current otherwise", async () => {
+    const customModels = [nativeCustomModel({ drafter: { method: { _tag: "DFlash" }, reference: catalogDrafter, state: { _tag: "Ready" } } })]
+    const updating = harness({ customModels, catalog: catalog("Available") })
+    expect((await updating.run((commands) => commands.sync(foundId))).outcome).toBe("Updating")
+    const current = harness({ customModels, catalog: catalog("Current") })
+    expect((await current.run((commands) => commands.sync(foundId))).outcome).toBe("AlreadyCurrent")
+    expect(current.recorded.started).toEqual([])
+  })
+})
+
+describe("catalog models found elsewhere", () => {
+  const catalogRow = (modelId: string, ownership: string, primaryPath: string) => ({
+    _tag: "Catalog",
+    modelId,
+    acquisitionState: {
+      _tag: "Installed",
+      installation: { _tag: "Resolved", installedBytes: 1, primaryPath, ownership },
+      residencyState: { _tag: "Unloaded" },
+    },
+  }) as unknown as LocalModelsState["models"][number]
+  const external = CatalogFormModelIdSchema.make("qwen3.6-35b-a3b:gguf:q4")
+  const owned = CatalogFormModelIdSchema.make("qwen3.6-27b:gguf:q4")
+  const cachePath = "/nonexistent-home/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf"
+
+  it("hides a catalog model whose files are only in an external location, and refuses one Magnitude owns", async () => {
+    const { run } = harness({
+      catalogRows: [catalogRow(external, "External", cachePath), catalogRow(owned, "Magnitude", "/store/m.gguf")],
+    })
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const files = yield* commands.externalCatalogFiles(external)
+      yield* commands.hide(external)
+      const refused = yield* commands.hide(owned).pipe(Effect.flip)
+      const hidden = (yield* models.get).hidden
+      yield* commands.unhide(external)
+      return { files, refused, hidden, afterUnhide: (yield* models.get).hidden }
+    }))
+    expect(result.files).toEqual(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") }))
+    expect(result.hidden).toEqual([external])
+    expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude catalog remove ${owned}\` instead.`)
+    expect(result.afterUnhide).toEqual([])
+  })
+
+  it("explains that Remove never deletes files in another tool's location", () => {
+    expect(externalCatalogRemovalRefusal(external, { path: "/o/models/blob", location: Option.some("Ollama") }).message)
+      .toBe(`${external} uses files in Ollama's models folder (/o/models/blob), which Magnitude never deletes. `
+        + `Hide it with \`magnitude models hide ${external}\`, or delete it with \`ollama rm\`.`)
   })
 })
 

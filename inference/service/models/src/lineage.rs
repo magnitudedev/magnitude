@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use magnitude_service_contracts::models::{
     ModelFileRole, ModelId, ModelPackage, ModelPackageSource, RecommendableModel,
     RecommendableModelCatalog, ServableModelBundle,
@@ -267,6 +268,45 @@ async fn pinned_repository_base_models(
         .collect())
 }
 
+/// A catalog model's architecture and parameter count, read from its release header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogShape {
+    pub model_id: ModelId,
+    pub architecture: String,
+    pub parameters: u64,
+}
+
+/// The catalog's shapes, computed by whoever holds the release headers.
+pub trait CatalogShapes: Send + Sync {
+    fn catalog_shapes(&self) -> BoxFuture<'_, Vec<CatalogShape>>;
+}
+
+/// Parameter counts within this fraction of a catalog model's are the same size: a GGUF with or
+/// without its MTP layers differs by about 3%, while neighbouring sizes of one family differ by
+/// far more.
+const SHAPE_TOLERANCE: f64 = 0.05;
+
+/// The catalog model of the same architecture whose parameter count is closest to `parameters`,
+/// within `SHAPE_TOLERANCE`. The weakest lineage signal: a display hint for repositories that
+/// declare no lineage at all.
+#[must_use]
+pub fn shape_match<'a>(
+    shapes: &'a [CatalogShape],
+    architecture: &str,
+    parameters: u64,
+) -> Option<&'a CatalogShape> {
+    shapes
+        .iter()
+        .filter(|shape| shape.architecture == architecture && shape.parameters > 0)
+        .map(|shape| {
+            let difference = shape.parameters.abs_diff(parameters) as f64 / shape.parameters as f64;
+            (shape, difference)
+        })
+        .filter(|(_, difference)| *difference <= SHAPE_TOLERANCE)
+        .min_by(|left, right| left.1.total_cmp(&right.1))
+        .map(|(shape, _)| shape)
+}
+
 /// Hub lineage of arbitrary repositories, cached in memory and fetched with bounded concurrency.
 pub struct HubLineage {
     models: Arc<ManagedModelStore>,
@@ -412,6 +452,27 @@ pub(crate) fn hub_base_model_ids(value: &serde_json::Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shape_matches_the_closest_catalog_model_of_its_architecture_within_tolerance() {
+        let shape = |model_id: &str, architecture: &str, parameters| CatalogShape {
+            model_id: model_id.parse().unwrap(),
+            architecture: architecture.to_owned(),
+            parameters,
+        };
+        let shapes = [
+            shape("qwen3.5-4b:gguf:q4", "qwen35", 4_326_350_848),
+            shape("qwen3.5-9b:gguf:q4", "qwen35", 8_953_803_264),
+            shape("other-4b:gguf:q4", "llama", 4_205_751_296),
+        ];
+        assert_eq!(
+            shape_match(&shapes, "qwen35", 4_205_751_296).map(|shape| shape.model_id.as_str()),
+            Some("qwen3.5-4b:gguf:q4"),
+            "the same model without its MTP layers"
+        );
+        assert_eq!(shape_match(&shapes, "qwen35", 2_000_000_000), None);
+        assert_eq!(shape_match(&shapes, "gemma4", 4_205_751_296), None);
+    }
 
     #[test]
     fn hub_base_models_parse_both_shapes() {

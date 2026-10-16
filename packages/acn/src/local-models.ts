@@ -15,6 +15,7 @@ import {
   customModelSourceLabel,
   parseModelId,
   type AttachedDrafter,
+  type CatalogLocalModel,
   type CustomLocalModel,
   type CustomLocalModelServingState,
   type CustomModelAcquisitionState,
@@ -28,7 +29,6 @@ import {
   type LocalModel,
   type LocalModelsState,
   type LocalModelPreparation,
-  type MeasuredDrafterAcceptance,
   type ModelId,
   type ModelFailure,
   type ModelResidency,
@@ -59,8 +59,13 @@ import {
   type LocalModelSourcesState,
 } from "./local-model-sources"
 import { CustomModels } from "./custom-models"
-import { ServingUsage, type DrafterAcceptanceMeasurement } from "./serving-usage"
-import { drafterReferenceKey, productDrafterCandidate, productDrafterReference } from "./drafter-references"
+import {
+  drafterReferenceKey,
+  drafterReferenceNaming,
+  productDrafterCandidate,
+  productDrafterReference,
+} from "./drafter-references"
+import { productUnsupportedReasons } from "./unsupported-reasons"
 import {
   acquisitionFailure,
   currentDownload,
@@ -129,10 +134,6 @@ export const assessmentTargetVisible = (
   assessment: CoordinatedLocalModelAssessment | undefined,
 ): assessment is VisibleCoordinatedLocalModelAssessment | undefined => assessment?._tag !== "Dropped"
 
-/** Engine reasons in product form; an empty list still states that the model cannot run. */
-const productReasons = (reasons: readonly unknown[], detail: string) =>
-  reasons.length > 0 ? reasons : [{ _tag: "Unknown", kind: "Unknown", detail }]
-
 export const projectAssessment = (environmentId: string, assessment: ModelAssessment): LocalModelAssessment => {
   if (assessment._tag === "Fits") {
     const totalRequiredBytes = assessment.memory.reduce((total, item) => total + item.requiredBytes, 0)
@@ -158,7 +159,7 @@ export const projectAssessment = (environmentId: string, assessment: ModelAssess
   }
   return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
     _tag: "Unsupported", environmentId, profile: assessment.profile,
-    reasons: productReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
+    reasons: productUnsupportedReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
   })
 }
 
@@ -186,7 +187,7 @@ export const coordinatedAssessment = (
 
 export const productDrafterVerdict = (verdict: NativeDrafterVerdict): DrafterVerdict | undefined =>
   Option.getOrUndefined(Schema.decodeUnknownOption(DrafterVerdictSchema)(
-    verdict._tag === "Rejected" ? { ...verdict, reasons: productReasons(verdict.reasons, verdict.detail) } : verdict,
+    verdict._tag === "Rejected" ? { ...verdict, reasons: productUnsupportedReasons(verdict.reasons, verdict.detail) } : verdict,
   ))
 
 const residencyFor = (modelId: string, instances: readonly ModelInstance[]): ModelResidency => {
@@ -386,16 +387,6 @@ const sourceUrls = (modelId: ModelId): readonly string[] => {
 
 const fileStem = (path: string) => (path.split(/[\\/]/).at(-1) ?? path).replace(/\.gguf$/i, "")
 
-/** A drafter's label when no candidate describes it. */
-export const drafterReferenceLabel = (reference: DrafterReference): string => {
-  switch (reference._tag) {
-    case "Catalog": return "Magnitude drafter"
-    case "Embedded": return "Built into this model"
-    case "HuggingFace": return `${reference.repository} · ${fileStem(reference.path)}`
-    case "Local": return fileStem(reference.path)
-  }
-}
-
 const catalogUpdateAvailable = (catalog: readonly CatalogModelSource[], reference: DrafterReference): boolean =>
   reference._tag === "Catalog" && catalog.some(({ id, source }) => id === reference.modelId
     && source.localState._tag === "Installed" && source.localState.updateState._tag === "Available")
@@ -405,21 +396,13 @@ export interface CustomModelInputs {
   readonly assessment: CoordinatedLocalModelAssessment | undefined
   readonly instances: readonly ModelInstance[]
   readonly related: readonly RelatedDownload[]
-  readonly acceptance: readonly DrafterAcceptanceMeasurement[]
   readonly catalog: readonly CatalogModelSource[]
 }
-
-const measured = (
-  acceptance: readonly DrafterAcceptanceMeasurement[],
-  modelId: ModelId,
-  reference: DrafterReference,
-): Option.Option<MeasuredDrafterAcceptance> => Option.fromNullable(acceptance.find((row) =>
-  row.model === modelId && row.drafter === drafterReferenceKey(reference))?.acceptance)
 
 export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<AttachedDrafter> => {
   const { entry, assessment, related, catalog } = inputs
   return Option.flatMap(entry.source.drafter, (native) => Option.map(productDrafterReference(native.reference), (reference) => {
-    const recommended = Option.flatMap(entry.source.recommendedDrafter, (candidate) => productDrafterCandidate(candidate))
+    const recommended = Option.flatMap(entry.source.recommendedDrafter, (candidate) => productDrafterCandidate(candidate, catalog))
       .pipe(Option.filter((candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
     const assessedVerdict = assessment?._tag === "Assessed" ? assessment.drafter : undefined
     const verdict: DrafterVerdict = native.state._tag === "Rejected"
@@ -443,9 +426,14 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
         })
       },
     })
+    const { name, label } = Option.match(recommended, {
+      onNone: () => drafterReferenceNaming(reference, catalog),
+      onSome: (candidate) => candidate,
+    })
     return {
       reference,
-      label: Option.match(recommended, { onNone: () => drafterReferenceLabel(reference), onSome: ({ label }) => label }),
+      name,
+      label,
       sizeBytes: Option.match(recommended, { onNone: () => 0, onSome: ({ sizeBytes }) => sizeBytes }),
       verdict,
       availability,
@@ -499,7 +487,7 @@ const externalUnsupportedAssessment = (inputs: CustomModelInputs, origin: Custom
 
 /** One custom row, or none when it has nothing to show: absent external files, a failed assessment, or no support. */
 export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLocalModel> => {
-  const { entry, assessment, instances, related, acceptance } = inputs
+  const { entry, assessment, instances, related, catalog } = inputs
   const origin = Schema.decodeUnknownSync(CustomModelOriginSchema)(entry.source.origin)
   if (assessment?._tag === "Dropped" && origin._tag !== "Added") return Option.none()
   if (Option.isSome(externalUnsupportedAssessment(inputs, origin))) return Option.none()
@@ -519,9 +507,10 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
       displayName: entry.source.displayName.trim().length > 0
         ? entry.source.displayName
         : fileStem(entry.source.files[0]?.path ?? entry.id),
-      variantLabel: Schema.decodeUnknownSync(ModelVariantLabelSchema)(
-        ready !== undefined && ready.metadata.quantizationName.length > 0 ? ready.metadata.quantizationName : "GGUF",
-      ),
+      variantLabel: Schema.decodeUnknownSync(ModelVariantLabelSchema)(Option.getOrElse(
+        Option.filter(entry.source.variantLabel, (label) => label.length > 0),
+        () => ready !== undefined && ready.metadata.quantizationName.length > 0 ? ready.metadata.quantizationName : "GGUF",
+      )),
       sourceLabel: customModelSourceLabel(origin),
       variantOf: Option.flatMap(entry.source.variantOf, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
       license: Option.none(),
@@ -530,9 +519,8 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
     drafter,
     recommendedDrafter: Option.flatMap(entry.source.recommendedDrafter, (candidate) => Option.flatMap(
       productDrafterReference(candidate.reference),
-      (reference) => productDrafterCandidate(candidate, measured(acceptance, entry.id, reference)),
+      (reference) => productDrafterCandidate(candidate, catalog),
     )),
-    measuredAcceptance: Option.flatMap(drafter, ({ reference }) => measured(acceptance, entry.id, reference)),
     acquisitionState: acquisitionState.value,
     servingState,
     storageBytes: entry.source.sizeBytes,
@@ -545,7 +533,7 @@ export const unsupportedCustomModel = (inputs: CustomModelInputs): Option.Option
   const origin = Schema.decodeUnknownSync(CustomModelOriginSchema)(entry.source.origin)
   return Option.flatMap(externalUnsupportedAssessment(inputs, origin), (unsupported) => {
     const path = entry.source.files[0]?.path ?? (origin._tag === "Imported" ? origin.path : entry.id)
-    return Schema.decodeUnknownOption(UnsupportedLocalModelSchema)({
+    return Schema.validateOption(UnsupportedLocalModelSchema)({
       displayName: entry.source.displayName.trim().length > 0 ? entry.source.displayName : fileStem(path),
       origin,
       path,
@@ -559,7 +547,7 @@ export const unsupportedLocalModel = (model: NativeUnsupportedLocalModel): Optio
   Schema.decodeUnknownOption(UnsupportedLocalModelSchema)({
     ...model,
     displayName: model.displayName.trim().length > 0 ? model.displayName : fileStem(model.path),
-    reasons: productReasons(model.reasons, model.detail),
+    reasons: productUnsupportedReasons(model.reasons, model.detail),
   })
 export interface LocalModelsApi {
   readonly state: Effect.Effect<LocalModelsState>
@@ -578,7 +566,6 @@ export const LocalModelsLive: Layer.Layer<
   | IcnDownloads
   | LocalModelRemovals
   | CustomModels
-  | ServingUsage
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const sources = yield* LocalModelSources
   const assessments = yield* IcnModelAssessments
@@ -587,7 +574,6 @@ export const LocalModelsLive: Layer.Layer<
   const downloads = yield* IcnDownloads
   const removalService = yield* LocalModelRemovals
   const customModels = yield* CustomModels
-  const usage = yield* ServingUsage
   const project = Effect.gen(function* () {
     const source = yield* sources.state
     const assessment = (yield* assessments.get).state
@@ -596,8 +582,7 @@ export const LocalModelsLive: Layer.Layer<
     const removals = yield* removalService.state
     const config = yield* customModels.get
     const nativeDownloads = (yield* downloads.get).state.downloads
-    const acceptance = yield* usage.acceptance
-    return projectLocalModels({ source, assessment, operations, runtime, removals, config, downloads: nativeDownloads, acceptance })
+    return projectLocalModels({ source, assessment, operations, runtime, removals, config, downloads: nativeDownloads })
   })
   const projection = yield* materializeProjection({
     project,
@@ -605,7 +590,7 @@ export const LocalModelsLive: Layer.Layer<
       sources.changes.pipe(Stream.map(() => undefined)), assessments.changes.pipe(Stream.map(() => undefined)),
       installations.changes.pipe(Stream.map(() => undefined)), instances.changes.pipe(Stream.map(() => undefined)),
       downloads.changes.pipe(Stream.map(() => undefined)), customModels.changes.pipe(Stream.map(() => undefined)),
-      usage.changes, removalService.changes,
+      removalService.changes,
     ], { concurrency: "unbounded" }),
     equivalent: Schema.equivalence(LocalModelsStateSchema),
   })
@@ -624,54 +609,51 @@ export interface LocalModelsInputs {
   readonly removals: ReadonlyMap<string, LocalModelRemovalState>
   readonly config: CustomModelsConfig
   readonly downloads: readonly ModelDownload[]
-  readonly acceptance: readonly DrafterAcceptanceMeasurement[]
 }
 
+/** A catalog model whose files are all in an external location: a found copy, hidden rather than removed. */
+export const catalogFilesExternal = (model: CatalogLocalModel): boolean =>
+  "installation" in model.acquisitionState && model.acquisitionState.installation.ownership === "External"
+
 /**
- * Catalog models stay ranked; custom models are never ranked. ICN lists hidden models apart and never
+ * Catalog models stay ranked; custom models are never ranked. A catalog model found only in an external
+ * location that the user hid is listed apart with hidden custom models. ICN lists hidden models apart and never
  * assesses them. A found or imported model the engine cannot run joins the unsupported list.
  */
 export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState => {
-  const { source, assessment, operations, runtime, removals, config, downloads, acceptance } = inputs
+  const { source, assessment, operations, runtime, removals, config, downloads } = inputs
   const latestOperation = new Map(operations.map((operation) => [operation.modelId, operation]))
   const customInputs = (entry: CustomModelSource, assessed: CoordinatedLocalModelAssessment | undefined): CustomModelInputs => ({
     entry,
     assessment: assessed,
     instances: runtime,
     related: customModelDownloads(entry.id, config, downloads),
-    acceptance,
     catalog: source.catalogModels,
   })
   const custom = source.customModels.map((entry) => customInputs(
     entry,
     coordinatedAssessment(assessment, source.localModelsRevision, "custom", entry.id),
   ))
+  const catalog = source.catalogModels.flatMap((entry) => {
+    const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
+    return assessmentTargetVisible(coordinated)
+      ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime)]
+      : []
+  })
+  const catalogHidden = (model: CatalogLocalModel) => config.hidden.includes(model.modelId) && catalogFilesExternal(model)
   return {
     preparation: projectLocalModelPreparation(source, assessment),
     models: [
-      ...source.catalogModels.flatMap((entry) => {
-        const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
-        return assessmentTargetVisible(coordinated)
-          ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime)]
-          : []
-      }),
+      ...catalog.filter((model) => !catalogHidden(model)),
       ...custom.flatMap((inputs) => Option.toArray(customModel(inputs))),
     ],
     unsupported: [
       ...source.unsupported.flatMap((model) => Option.toArray(unsupportedLocalModel(model))),
       ...custom.flatMap((inputs) => Option.toArray(unsupportedCustomModel(inputs))),
     ],
-    hidden: source.hiddenModels.flatMap((entry) => Option.toArray(customModel(customInputs(entry, undefined)))),
+    hidden: [
+      ...catalog.filter(catalogHidden),
+      ...source.hiddenModels.flatMap((entry) => Option.toArray(customModel(customInputs(entry, undefined)))),
+    ],
   }
-}
-
-/** The drafter attached to a model now, keyed for serving-usage attribution; catalog models use their own. */
-export const localModelDrafterKey = (state: LocalModelsState, modelId: string): Option.Option<string> => {
-  const model = state.models.find((candidate) => candidate.modelId === modelId)
-  if (model === undefined) return Option.none()
-  if (model._tag === "Custom") return Option.map(model.drafter, ({ reference }) => drafterReferenceKey(reference))
-  const serving = model.servingState
-  return serving._tag === "Assessed" && Option.isSome(serving.speculativeMethod)
-    ? Option.some(drafterReferenceKey({ _tag: "Catalog", modelId: model.modelId }))
-    : Option.none()
 }

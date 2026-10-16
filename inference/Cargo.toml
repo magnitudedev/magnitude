@@ -161,6 +161,11 @@ opt-level = 3
 [profile.dev.package.seismic-native-tests]
 opt-level = 3
 
+# Model headers are hashed and parsed on every Hugging Face and local-model path; unoptimized
+# hashing makes development builds several times slower there than release builds.
+[profile.dev.package.sha2]
+opt-level = 3
+
 [profile.release]
 debug = 1
 

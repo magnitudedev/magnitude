@@ -215,10 +215,10 @@ impl Error {
                     detail: self.to_string(),
                 }]
             }
-            Self::Metadata { .. }
-            | Self::MissingWeight(_)
-            | Self::WeightShape { .. }
-            | Self::Definition(_) => Vec::new(),
+            Self::WeightShape { name, .. } => {
+                vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
+            }
+            Self::Metadata { .. } | Self::MissingWeight(_) | Self::Definition(_) => Vec::new(),
         }
     }
 }

@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest"
-import { Effect, Fiber, Layer, Option, Stream } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { BunFileSystem, BunPath } from "@effect/platform-bun"
 import { GlobalStorage, makeGlobalStorage } from "@magnitudedev/storage"
 import { ServingModelId, type ServingUsageRequest } from "@magnitudedev/acn-protocol"
@@ -12,7 +12,7 @@ afterEach(() => { vi.useRealTimers(); roots.splice(0).forEach(root => rmSync(roo
 const root = () => { const value = mkdtempSync(join(tmpdir(), "magnitude-usage-test-")); roots.push(value); return value }
 const layer = (root: string) => ServingUsageLive.pipe(Layer.provide(Layer.mergeAll(BunFileSystem.layer, BunPath.layer, Layer.succeed(GlobalStorage, makeGlobalStorage({ root })))))
 const query: ServingUsageRequest = { period: "AllTime", timeZone: "America/Los_Angeles", model: Option.none() }
-const record = (id: string, overrides: Partial<ServingUsageRecord> = {}): ServingUsageRecord => ({ id: ServingUsageRecord.fields.id.make(id), model: ServingModelId.make("model-a"), completedAt: Date.now(), input: 100, cached: 40, output: 20, generationMs: 1000, firstTokenMs: 200, complete: true, drafter: null, draftTokens: null, acceptedDraftTokens: null, ...overrides })
+const record = (id: string, overrides: Partial<ServingUsageRecord> = {}): ServingUsageRecord => ({ id: ServingUsageRecord.fields.id.make(id), model: ServingModelId.make("model-a"), completedAt: Date.now(), input: 100, cached: 40, output: 20, generationMs: 1000, firstTokenMs: 200, complete: true, ...overrides })
 it("persists once across restarts and filters models without adding cached input twice", async () => {
   const directory = root()
   await Effect.runPromise(Effect.gen(function* () {
@@ -98,50 +98,4 @@ it("handles fractional-offset midnight and the repeated hour at fall DST", async
   vi.restoreAllMocks()
   expect(values[0]).toMatchObject({ dailyActivity: expect.arrayContaining([{ date: "2026-11-01", totalTokens: 480 }]) })
   expect(values[1]).toMatchObject({ dailyActivity: expect.arrayContaining([{ date: "2026-11-01", totalTokens: 360 }, { date: "2026-11-02", totalTokens: 120 }]) })
-})
-it("measures acceptance per model and drafter against plain decoding of the same model", async () => {
-  const value = await Effect.runPromise(Effect.gen(function* () {
-    const store = yield* ServingUsage
-    yield* store.record(record("plain", { output: 40, generationMs: 1000 }))
-    yield* store.record(record("drafted-1", { drafter: "hf:z/d@c/d.gguf", draftTokens: 100, acceptedDraftTokens: 60, output: 60, generationMs: 1000 }))
-    yield* store.record(record("drafted-2", { drafter: "hf:z/d@c/d.gguf", draftTokens: 100, acceptedDraftTokens: 50, output: 60, generationMs: 1000 }))
-    yield* store.record(record("slow", { model: ServingModelId.make("model-b"), drafter: "embedded", draftTokens: 10, acceptedDraftTokens: 1, output: 10, generationMs: 1000 }))
-    yield* store.record(record("plain-b", { model: ServingModelId.make("model-b"), output: 20, generationMs: 1000 }))
-    yield* store.record(record("no-drafting", { drafter: "embedded", draftTokens: null, acceptedDraftTokens: null }))
-    return yield* store.acceptance
-  }).pipe(Effect.provide(layer(root()))))
-  expect(value).toEqual([
-    { model: "model-a", drafter: "hf:z/d@c/d.gguf", acceptance: { acceptanceRate: 0.55, tokensPerSecond: 60, withoutDrafterTokensPerSecond: Option.some(40), slower: false } },
-    { model: "model-b", drafter: "embedded", acceptance: { acceptanceRate: 0.1, tokensPerSecond: 10, withoutDrafterTokensPerSecond: Option.some(20), slower: true } },
-  ])
-})
-it("migrates a version 0 ledger in place and keeps its history", async () => {
-  const directory = root()
-  const { Database } = await import("bun:sqlite")
-  const legacy = new Database(join(directory, "serving-usage.sqlite"), { create: true, strict: true })
-  legacy.exec(`CREATE TABLE usage (
-    id TEXT PRIMARY KEY, model TEXT NOT NULL, completed_at REAL NOT NULL,
-    input INTEGER, cached INTEGER, output INTEGER,
-    generation_ms REAL, first_token_ms REAL, complete INTEGER NOT NULL
-  ); CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id = 1), since REAL NOT NULL);`)
-  legacy.query("INSERT INTO usage VALUES ('old', 'model-a', ?, 10, 0, 5, 100, 10, 1)").run(Date.now())
-  legacy.query("INSERT INTO metadata VALUES (1, ?)").run(Date.now())
-  legacy.close()
-  const value = await Effect.runPromise(Effect.gen(function* () {
-    const store = yield* ServingUsage
-    yield* store.record(record("new", { drafter: "embedded", draftTokens: 4, acceptedDraftTokens: 2 }))
-    return { usage: yield* store.read(query), acceptance: yield* store.acceptance }
-  }).pipe(Effect.provide(layer(directory))))
-  expect(value.usage).toMatchObject({ _tag: "Available", requests: 2 })
-  expect(value.acceptance.map(({ drafter }) => drafter)).toEqual(["embedded"])
-})
-it("signals each newly recorded request", async () => {
-  const signals = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-    const store = yield* ServingUsage
-    const next = yield* store.changes.pipe(Stream.take(1), Stream.runCollect, Effect.fork)
-    yield* Effect.sleep("10 millis")
-    yield* store.record(record("signal"))
-    return yield* Fiber.join(next)
-  }).pipe(Effect.provide(layer(root())))))
-  expect(signals.length).toBe(1)
 })

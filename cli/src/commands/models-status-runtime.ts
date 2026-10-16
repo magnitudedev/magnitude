@@ -1,8 +1,6 @@
 import {
   catalogVariantOfName,
   customModelDrafterOffer,
-  drafterAcceptanceLabel,
-  drafterSlowingWarning,
   formatLocalModelDisplayName,
   formatModelLoadPercentage,
   formatModelOptimization,
@@ -34,7 +32,7 @@ import {
   withClient,
   type CliModelsClient,
 } from "./inference-client"
-import { CustomLocalModelJsonSchema, LocalModelJsonSchema } from "./json-schemas"
+import { LocalModelJsonSchema } from "./json-schemas"
 import { decodeModelId } from "./model-references"
 import {
   ensureTrailingNewline,
@@ -83,14 +81,30 @@ export const cancelDownload = (modelInput: string, options: JsonOption = {}) => 
   options,
 )
 
-export const removeModel = (modelInput: string, options: JsonOption = {}) => modelMutation(
-  modelInput,
-  (client, modelId) => client.models.removeLocalModel({ modelId }),
-  (modelId) => Schema.is(CatalogFormModelIdSchema)(modelId)
-    ? `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
-    : `Removed ${modelId}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`,
-  options,
-)
+/** What removing a model did, which follows who owns its files. */
+export const renderRemoval = (modelId: ModelId, origin: Option.Option<CustomLocalModel["origin"]>): string => {
+  if (Schema.is(CatalogFormModelIdSchema)(modelId)) {
+    return `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
+  }
+  switch (Option.getOrUndefined(origin)?._tag) {
+    case "Imported": return `Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`
+    case "Found": return `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`
+    default: return `Removed ${modelId}.\nMagnitude deleted only its own copy; files other apps manage are untouched.\n`
+  }
+}
+
+export const removeModel = (modelInput: string, options: JsonOption = {}) => runCommand({
+  effect: decodeModelId(modelInput).pipe(Effect.flatMap((modelId) => withClient((client) => Effect.gen(function* () {
+    const origin = Option.flatMap(
+      Option.fromNullable(catalogProducts(yield* readCatalog(client)).find((model) => model.modelId === modelId)),
+      (model) => model._tag === "Custom" ? Option.some(model.origin) : Option.none(),
+    )
+    yield* client.models.removeLocalModel({ modelId })
+    return { modelId, origin }
+  })))),
+  render: ({ modelId, origin }) => renderRemoval(modelId, origin),
+  json: asJson(options, jsonDocument(ModelIdJsonSchema, ({ modelId }: { readonly modelId: ModelId }) => ({ modelId }))),
+})
 
 const unsupportedAssessmentReason = (model: LocalModel): Option.Option<string> => {
   const serving = Option.getOrUndefined(localModelServingState(model))
@@ -158,7 +172,7 @@ const modelsForStatus = (models: readonly LocalModel[]): LocalModel[] => models
 export interface ModelsStatusView {
   readonly models: readonly LocalModel[]
   readonly unsupported: readonly UnsupportedLocalModel[]
-  readonly hidden: readonly CustomLocalModel[]
+  readonly hidden: readonly LocalModel[]
   readonly all: boolean
 }
 
@@ -212,7 +226,7 @@ export const ModelsStatusJsonSchema = Schema.Struct({
   initializing: Schema.Boolean,
   models: Schema.Array(LocalModelJsonSchema),
   unsupported: Schema.Array(UnsupportedLocalModelSchema),
-  hidden: Schema.Array(CustomLocalModelJsonSchema),
+  hidden: Schema.Array(LocalModelJsonSchema),
 })
 
 export const modelsStatusJson = jsonDocument(ModelsStatusJsonSchema, (view: ModelsStatusView) => ({
@@ -260,10 +274,10 @@ const customSourceDetail = (model: CustomLocalModel): string => {
 
 const attachedDrafterLabel = (model: CustomLocalModel): string => Option.match(model.drafter, {
   onNone: () => Option.match(customModelDrafterOffer(model), { onNone: () => "None", onSome: ({ label }) => `None · ${label}` }),
-  onSome: (drafter) => {
-    const transfer = Option.getOrUndefined(drafterTransferStatus(model))
-    return transfer === undefined ? drafter.label : `${drafter.label} · ${transfer}`
-  },
+  onSome: (drafter) => [
+    drafter.name,
+    ...Option.toArray(drafterTransferStatus(model)),
+  ].join(" · "),
 })
 
 export type DrafterChoices =
@@ -290,11 +304,6 @@ const customFields = (model: CustomLocalModel, models: readonly LocalModel[]): r
   ...(drafterUpdateAvailable(model)
     ? [["Update", `A newer drafter is available - magnitude catalog pull ${model.modelId}`]] as const
     : []),
-  ...Option.match(model.measuredAcceptance, {
-    onNone: () => [],
-    onSome: (acceptance) => [["Acceptance", drafterAcceptanceLabel(acceptance)]] as const,
-  }),
-  ...Option.match(drafterSlowingWarning(model), { onNone: () => [], onSome: (warning) => [["Warning", warning]] as const }),
   ...Option.match(unsupportedAssessmentReason(model), { onNone: () => [], onSome: (reason) => [["Can't run", reason]] as const }),
 ]
 
@@ -307,7 +316,7 @@ const drafterSection = (view: ModelDetailView): string[] => {
     case "Unavailable": return ["", `Drafter choices are unavailable: ${view.drafters.message}`, change]
     case "Listed": return [
       "",
-      renderDrafterChoices(view.drafters.candidates, view.models, Option.map(model.drafter, ({ reference }) => reference)),
+      renderDrafterChoices(view.drafters.candidates, Option.map(model.drafter, ({ reference }) => reference)),
       "",
       change,
     ]

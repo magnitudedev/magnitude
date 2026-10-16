@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use magnitude_artifacts::gguf::{Directory, Value};
 use magnitude_service_contracts::InventoryError;
+use serde::{Deserialize, Serialize};
 
 /// The `general.architecture` values the engine recognizes as targets and as separate drafters.
 /// The service holds no list of its own; the server supplies the engine's.
@@ -17,6 +18,16 @@ pub struct RecognizedArchitectures {
 }
 
 impl RecognizedArchitectures {
+    /// A stable key for these sets, for caches of results that depend on them.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{}",
+            self.targets.iter().cloned().collect::<Vec<_>>().join(","),
+            self.drafters.iter().cloned().collect::<Vec<_>>().join(",")
+        )
+    }
+
     #[must_use]
     pub fn new<'a>(
         targets: impl IntoIterator<Item = &'a str>,
@@ -38,21 +49,50 @@ impl RecognizedArchitectures {
             Some(architecture) => self.targets.contains(architecture),
         }
     }
+
+    /// Whether a Hub repository holds a drafter rather than a model: it declares a drafter
+    /// architecture the engine binds, is tagged for speculative decoding, or declares an
+    /// architecture of a drafter kind the engine doesn't bind (EAGLE, assistant and MTP-only
+    /// heads, DFlash variants). Drafters are offered in drafter lists, never as models.
+    #[must_use]
+    pub fn is_drafter_repository(&self, architecture: Option<&str>, tags: &[String]) -> bool {
+        let tagged = tags.iter().any(|tag| {
+            matches!(
+                tag.to_ascii_lowercase().as_str(),
+                "speculative-decoding" | "speculative-decoding-draft" | "draft-model" | "speculator"
+            )
+        });
+        let declared = architecture.is_some_and(|architecture| {
+            let architecture = architecture.to_ascii_lowercase();
+            (self.drafters.contains(&architecture) && !self.targets.contains(&architecture))
+                || (!self.targets.contains(&architecture)
+                    && (architecture.starts_with("eagle")
+                        || architecture.contains("dflash")
+                        || architecture.ends_with("assistant")
+                        || architecture.ends_with("mtp")))
+        });
+        tagged || declared
+    }
 }
 
 const PROJECTOR_ARCHITECTURE: &str = "clip";
 
 /// What a GGUF is for, read from its header.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandidateFileRole {
     Target { architecture: Option<String> },
     Projector,
     Drafter { architecture: String },
+    /// Quantization data that is not a model, such as an importance matrix.
+    Auxiliary,
 }
 
 impl CandidateFileRole {
     #[must_use]
     pub fn of(directory: &Directory, architectures: &RecognizedArchitectures) -> Self {
+        if directory.value("general.type").and_then(Value::string) == Some("imatrix") {
+            return Self::Auxiliary;
+        }
         let architecture = directory
             .value("general.architecture")
             .and_then(Value::string)
@@ -94,18 +134,40 @@ pub fn header_directory(header: &[u8]) -> Result<Directory, InventoryError> {
 }
 
 /// Inspect one GGUF header held in memory for both its directory and its catalog-facing metadata
-/// (the `general.file_type` quantization among them).
+/// (the `general.file_type` quantization among them). The header is parsed once.
 pub fn header_inspection(
     header: &[u8],
 ) -> Result<(Directory, crate::gguf::GgufInspection), InventoryError> {
-    let file =
-        tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
-    std::fs::write(file.path(), header).map_err(|error| InventoryError::Io(error.to_string()))?;
-    let directory = magnitude_artifacts::gguf::inspect_header(file.path())
-        .map_err(|error| InventoryError::Integrity(error.to_string()))?;
-    let inspection = crate::gguf::inspect(file.path())
+    use sha2::Digest;
+    let directory = header_directory(header)?;
+    let digest = format!("{:x}", sha2::Sha256::digest(header));
+    let inspection = crate::gguf::interpret(&directory, digest)
         .map_err(|error| InventoryError::Integrity(error.to_string()))?;
     Ok((directory, inspection))
+}
+
+/// What one GGUF header says about its file, which a candidate needs to group, label and match
+/// it. It is a function of the header bytes and the recognized architectures, so it is cached by
+/// both.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeaderClassification {
+    pub role: CandidateFileRole,
+    pub base_repositories: BTreeSet<String>,
+    pub quantization: Option<String>,
+}
+
+/// Classify one GGUF header held in memory.
+pub fn classify_header(
+    header: &[u8],
+    architectures: &RecognizedArchitectures,
+) -> Result<HeaderClassification, InventoryError> {
+    let (directory, inspection) = header_inspection(header)?;
+    Ok(HeaderClassification {
+        role: CandidateFileRole::of(&directory, architectures),
+        base_repositories: header_base_repositories(&directory),
+        quantization: inspection.quantization,
+    })
 }
 
 /// The header directory of a GGUF on disk (every shard's, for a split file's first shard).
@@ -129,7 +191,9 @@ pub fn local_header_digest(path: &Path) -> Result<String, InventoryError> {
     Ok(format!("{:x}", sha2::Sha256::digest(&header)))
 }
 
-/// The Hugging Face repositories a GGUF names as its base models (`general.base_model.N.repo_url`).
+/// The Hugging Face repositories a GGUF names as its base models: `general.base_model.N.repo_url`,
+/// or else the repository its organization and name spell (`Qwen` and `Qwen3.5 4B` give
+/// `qwen/qwen3.5-4b`), lowercased for lineage comparison.
 #[must_use]
 pub fn header_base_repositories(directory: &Directory) -> BTreeSet<String> {
     let count = directory
@@ -137,12 +201,24 @@ pub fn header_base_repositories(directory: &Directory) -> BTreeSet<String> {
         .and_then(Value::unsigned)
         .unwrap_or(0)
         .min(64);
+    let field = |index: u64, name: &str| {
+        directory
+            .value(&format!("general.base_model.{index}.{name}"))
+            .and_then(Value::string)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
     (0..count)
         .filter_map(|index| {
-            directory
-                .value(&format!("general.base_model.{index}.repo_url"))
-                .and_then(Value::string)
+            field(index, "repo_url")
                 .and_then(hugging_face_repository_from_url)
+                .or_else(|| {
+                    let organization = field(index, "organization")?;
+                    let name = field(index, "name")?;
+                    let repository = format!("{organization}/{}", name.replace(' ', "-"));
+                    (!organization.contains(['/', ' ']) && !name.contains('/'))
+                        .then(|| repository.to_lowercase())
+                })
         })
         .collect()
 }
@@ -316,6 +392,52 @@ pub fn display_name(name: &str) -> String {
     trimmed.replace(['-', '_'], " ")
 }
 
+/// How a model on this computer is named: its display name and, when its file names one, the
+/// quantization label of the variant (`Q4_K_M`, `UD-Q4_K_XL`). The name is the repository's when
+/// the file has a Hub identity (`Qwen3.5 4B` for `lmstudio-community/Qwen3.5-4B-GGUF`), else the
+/// GGUF's `general.name`, else the file name, each without its quantization and with separators as
+/// spaces. Names are presentation only.
+#[must_use]
+pub fn model_presentation(
+    primary: &Path,
+    repository: Option<&str>,
+    header_name: Option<&str>,
+) -> (String, Option<String>) {
+    let stem = primary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.strip_suffix(".gguf")
+                .or_else(|| name.strip_suffix(".GGUF"))
+                .unwrap_or(name)
+        })
+        .unwrap_or_default();
+    let label = quantization_label(stem);
+    let without_label = |text: &str| {
+        let cleaned = match quantization_label(text) {
+            Some(label) => {
+                let lower = text.to_ascii_lowercase();
+                match lower.rfind(&label.to_ascii_lowercase()) {
+                    Some(index) => text[..index].to_owned(),
+                    None => text.to_owned(),
+                }
+            }
+            None => text.to_owned(),
+        };
+        display_name(cleaned.trim_end_matches(['-', '_', '.', ' ']))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let name = repository
+        .map(display_name)
+        .or_else(|| header_name.map(without_label))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| without_label(stem));
+    let name = if name.trim().is_empty() { stem.to_owned() } else { name };
+    (name, label)
+}
+
 /// Whether a version's quantization (the GGUF's `general.file_type` name) is in the Q4_K class,
 /// which the repository step recommends among fitting versions.
 #[must_use]
@@ -389,6 +511,21 @@ mod tests {
     }
 
     #[test]
+    fn drafter_repositories_are_recognized_by_architecture_or_tag() {
+        let architectures =
+            RecognizedArchitectures::new(["qwen35", "qwen4exp"], ["dflash", "gemma4-assistant", "qwen4exp"]);
+        let tags = |tags: &[&str]| tags.iter().map(|tag| (*tag).to_owned()).collect::<Vec<_>>();
+        for architecture in ["dflash", "gemma4-assistant", "eagle3", "qwen35_mtp"] {
+            assert!(architectures.is_drafter_repository(Some(architecture), &[]), "{architecture}");
+        }
+        assert!(architectures.is_drafter_repository(Some("qwen3"), &tags(&["gguf", "speculative-decoding"])));
+        assert!(!architectures.is_drafter_repository(Some("qwen35"), &tags(&["gguf"])));
+        assert!(!architectures.is_drafter_repository(Some("qwen4exp"), &[]));
+        assert!(!architectures.is_drafter_repository(Some("deepseek4"), &[]));
+        assert!(!architectures.is_drafter_repository(None, &[]));
+    }
+
+    #[test]
     fn repository_prefilter_keeps_projector_and_unknown_architectures() {
         let architectures = RecognizedArchitectures::new(["qwen35moe"], ["dflash"]);
         assert!(architectures.admits_repository(Some("qwen35moe")));
@@ -396,5 +533,91 @@ mod tests {
         assert!(architectures.admits_repository(None));
         assert!(!architectures.admits_repository(Some("deepseek4")));
         assert!(!architectures.admits_repository(Some("dflash")));
+    }
+
+    #[test]
+    fn an_importance_matrix_is_auxiliary_not_a_version() {
+        use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar};
+        let directory = |entries: &[(&str, &str)]| Directory {
+            version: 3,
+            byte_order: ByteOrder::Little,
+            alignment: 32,
+            data_offset: 0,
+            metadata: entries
+                .iter()
+                .map(|(name, value)| Metadata {
+                    name: (*name).to_owned(),
+                    value: Value::Scalar(Scalar::String((*value).to_owned())),
+                })
+                .collect(),
+            tensors: Vec::new(),
+        };
+        let architectures = RecognizedArchitectures::new(["qwen35"], ["dflash"]);
+        assert_eq!(
+            CandidateFileRole::of(&directory(&[("general.type", "imatrix")]), &architectures),
+            CandidateFileRole::Auxiliary
+        );
+        assert_eq!(
+            CandidateFileRole::of(
+                &directory(&[("general.type", "model"), ("general.architecture", "qwen35")]),
+                &architectures
+            ),
+            CandidateFileRole::Target {
+                architecture: Some("qwen35".to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn base_repositories_come_from_repo_urls_or_else_organization_and_name() {
+        use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar};
+        let metadata = |name: &str, value: Scalar| Metadata {
+            name: name.to_owned(),
+            value: Value::Scalar(value),
+        };
+        let directory = Directory {
+            version: 3,
+            byte_order: ByteOrder::Little,
+            alignment: 32,
+            data_offset: 0,
+            metadata: vec![
+                metadata("general.base_model.count", Scalar::Unsigned(2)),
+                metadata(
+                    "general.base_model.0.repo_url",
+                    Scalar::String("https://huggingface.co/Qwen/Qwen3.6-35B-A3B".to_owned()),
+                ),
+                metadata("general.base_model.1.organization", Scalar::String("Qwen".to_owned())),
+                metadata("general.base_model.1.name", Scalar::String("Qwen3.5 4B".to_owned())),
+            ],
+            tensors: Vec::new(),
+        };
+        assert_eq!(
+            header_base_repositories(&directory),
+            BTreeSet::from(["qwen/qwen3.6-35b-a3b".to_owned(), "qwen/qwen3.5-4b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn models_are_named_by_repository_then_header_then_file_without_their_quantization() {
+        assert_eq!(
+            model_presentation(
+                Path::new("MiniCPM5-1B-Q3_K_M.gguf"),
+                Some("NANI-Nithin/MiniCPM5-1B-GGUF"),
+                Some("MiniCPM5-1B")
+            ),
+            ("MiniCPM5 1B".to_owned(), Some("Q3_K_M".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(Path::new("blobs/sha256-abc"), None, Some("Qwen3.5-4B-Q4_K_M")),
+            ("Qwen3.5 4B".to_owned(), None)
+        );
+        assert_eq!(
+            model_presentation(Path::new("models/MiniCPM5-1B-q4_k_s.gguf"), None, None),
+            ("MiniCPM5 1B".to_owned(), Some("Q4_K_S".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(Path::new("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"), None, None),
+            ("Qwen3.6 35B A3B".to_owned(), Some("UD-Q4_K_XL".to_owned()))
+        );
     }
 }

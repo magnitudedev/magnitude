@@ -40,10 +40,21 @@ observational queries. Search returns GGUF repositories with immutable commit id
 (`baseModels`, and the catalog model a result is a variant of), and a count of results hidden because
 the engine recognizes none of their architectures; the Hub's repository-level architecture is only
 a prefilter against the engine's recognized-architecture list. Repositories the catalog uses are
-never returned as new models. Resolution returns the requested repository's immutable snapshot and
+never returned as new models, and drafter repositories (a drafter architecture, such as DFlash,
+EAGLE, a Gemma assistant or MTP-only heads, or the Hub's speculative-decoding tags) are neither
+results nor counted as hidden: they are offered only in drafter lists. "Variant of" follows the
+Hub `baseModels` (two hops), and for a repository declaring no lineage the catalog knows, the catalog
+model of the same architecture whose parameter count is within 5% (a display hint only). Resolution returns the requested repository's immutable snapshot and
 GGUF file evidence. Candidate inspection groups a repository's or path's GGUFs into versions (shards
 together) and assesses each through the engine from headers fetched by range request; it never
-reads file names for compatibility or quantization. Each version carries its canonical model ID,
+reads file names for compatibility or quantization. Headers and their classification are cached by
+the file's content identity, so a repository is read once. Quantizations of one model share a
+tokenizer that is nearly all of a header, so after one header is read whole, each sibling is read
+as its own prefix, three verification windows inside the tokenizer compared byte for byte with the
+first header's, and its own remainder; any mismatch, or a result that does not parse, reads that
+header whole. Each version also reports the bytes adding it downloads before any drafter: its
+files and the repository's projector, or nothing when it is already on this computer or is a local
+file used in place. Each version carries its canonical model ID,
 so clients never form identities: a repository file's `hf:` ID, and for a path the ID of the custom
 model already listed with those bytes (a Hugging Face identity when its location gives one), else
 `local:` with the file's header digest. A version whose bytes are already listed also names that
@@ -221,7 +232,7 @@ ICN scans a list of model roots that ACN resolves and supplies (see
 | Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID |
 | LM Studio | Publisher/repository layout gives the `hf:` ID |
 | llama.cpp cache | `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
-| Ollama | Manifests name each model and its GGUF blob, whose `sha256-<hex>` name is its content identity; `hf.co/…` pulls give the `hf:` ID with selector `<tag>.gguf` (Ollama records no file name), library models are `local:` |
+| Ollama | Manifests name each model and its GGUF blob, whose `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
 | User folders | Any GGUFs beneath the folder; `local:` |
 
 Each automatic location is resolved from its environment override and the owning tool's own
@@ -240,7 +251,8 @@ cannot be read is skipped for that reconciliation and never hides another locati
 Each complete independently callable GGUF group is a custom-model candidate. A standalone file is its
 own selector; a complete shard set uses its lexical first shard. Projectors and drafters are
 classified from their tensors, never from file names, and belong to the selected package rather
-than receiving independent model identities. Metadata-only directories, Safetensors-only
+than receiving independent model identities. An importance matrix (`general.type = imatrix`) is
+quantization data, never a candidate version. Metadata-only directories, Safetensors-only
 repositories, and incomplete shard sets produce no model. The `hf:` and `local:` forms follow
 [terminology](./terminology.md); quantization presentation comes from bounded GGUF parsing rather
 than filename parsing.
@@ -256,8 +268,9 @@ identity; failed attribution remains visible as a custom model so the installed 
 disappear from inventory. A found file that matches an added model's declaration is that added
 model; its files remain externally owned.
 
-A complete GGUF group whose header cannot be read is published as an unsupported local model with
-the `Unreadable` reason and its location; it receives no callable identity and is never offered.
+A complete GGUF group whose header cannot be read, or whose file is shorter than the tensor data its
+header declares, is published as an unsupported local model with the `Unreadable` reason and its
+location; a local candidate inspected before adding gets the same verdict; it receives no callable identity and is never offered.
 Every readable group is published as a custom model and assessed, so the engine decides support:
 ACN lists a found or imported custom model whose assessment is `Unsupported` among the unsupported
 local models with the assessment's reasons, never as an offering; an added one keeps its row so it
@@ -434,7 +447,10 @@ every external occurrence.
 Removing an added custom model deletes its Magnitude-owned files under the same rules; any of its
 files that are also present in an external location stay there, and the model remains as found.
 Removing an imported model forgets its declaration and never touches the file. A found model is
-hidden, never deleted.
+hidden, never deleted; so is a catalog model whose files are all in external locations, which is a
+found copy. After a model is removed or stops using its drafter, and after catalog removal, the
+Magnitude-owned drafter packages that no installed catalog model and no custom model uses are
+removed; while any custom model's automatic drafter is not yet worked out, catalog drafters are kept.
 
 Deleting artifacts does not delete slot selection, favorites, or recency. Those are user intent and
 may remain unresolved until the exact catalog configuration and required files are available again.

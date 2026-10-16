@@ -224,9 +224,13 @@ pub struct ManagedModelStore {
     cache_evidence: Arc<RwLock<BTreeMap<InventoryEntryId, CacheEvidence>>>,
     ensure_gate: Arc<tokio::sync::Mutex<()>>,
     ensure_generation: Arc<AtomicU64>,
+    /// Advances only when the published installed packages change, so a rescan that finds
+    /// nothing new leaves every revision derived from them current.
+    packages_revision: Arc<AtomicU64>,
     reconciliation_running: Arc<AtomicBool>,
     reconciliation_complete: Arc<AtomicBool>,
     installed_packages_observer: Arc<RwLock<Option<Weak<dyn InstalledPackagesObserver>>>>,
+    ollama_hub_resolution: Arc<AtomicBool>,
 }
 
 pub(crate) trait InstalledPackagesObserver: Send + Sync {
@@ -261,9 +265,11 @@ impl Clone for ManagedModelStore {
             cache_evidence: Arc::clone(&self.cache_evidence),
             ensure_gate: Arc::clone(&self.ensure_gate),
             ensure_generation: Arc::clone(&self.ensure_generation),
+            packages_revision: Arc::clone(&self.packages_revision),
             reconciliation_running: Arc::clone(&self.reconciliation_running),
             reconciliation_complete: Arc::clone(&self.reconciliation_complete),
             installed_packages_observer: Arc::clone(&self.installed_packages_observer),
+            ollama_hub_resolution: Arc::clone(&self.ollama_hub_resolution),
         }
     }
 }
@@ -287,7 +293,7 @@ impl ManagedModelStore {
             .ok()
             .and_then(|observer| observer.as_ref().and_then(Weak::upgrade));
         if let Some(observer) = observer {
-            observer.installed_packages_changed(self.ensure_generation.load(Ordering::Acquire));
+            observer.installed_packages_changed(self.packages_revision.load(Ordering::Acquire));
         }
     }
 
@@ -301,7 +307,7 @@ impl ManagedModelStore {
             })
             .map(|snapshot| {
                 snapshot.response(
-                    self.ensure_generation.load(Ordering::Acquire),
+                    self.packages_revision.load(Ordering::Acquire),
                     self.reconciliation_complete.load(Ordering::Acquire),
                 )
             })
@@ -359,12 +365,36 @@ impl ManagedModelStore {
             cache_evidence: Arc::new(RwLock::new(BTreeMap::new())),
             ensure_gate: Arc::new(tokio::sync::Mutex::new(())),
             ensure_generation: Arc::new(AtomicU64::new(0)),
+            packages_revision: Arc::new(AtomicU64::new(0)),
             reconciliation_running: Arc::new(AtomicBool::new(false)),
             reconciliation_complete: Arc::new(AtomicBool::new(false)),
             installed_packages_observer: Arc::new(RwLock::new(None)),
+            ollama_hub_resolution: Arc::new(AtomicBool::new(false)),
         };
         manager.request_installed_model_reconciliation();
         Ok(manager)
+    }
+
+    /// Resolves the Hub files of unresolved `hf.co` Ollama pulls in the background, and rescans the
+    /// Ollama locations when any resolved, so their models take their Hub identity.
+    fn request_ollama_hub_resolution(&self) {
+        if self
+            .ollama_hub_resolution
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let store = self.clone();
+        tokio::spawn(async move {
+            let _lease = ReconciliationLease(Arc::clone(&store.ollama_hub_resolution));
+            let roots = store.resolve_ollama_hub_files().await;
+            if !roots.is_empty()
+                && let Err(error) = store.rescan_model_roots(roots).await
+            {
+                tracing::warn!(%error, "rescanning Ollama after resolving Hub files failed");
+            }
+        });
     }
 
     pub(crate) fn request_installed_model_reconciliation(&self) {
@@ -590,14 +620,18 @@ impl ManagedModelStore {
             *current = installed_packages;
             changed
         };
-        let revision = self.ensure_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.ensure_generation.fetch_add(1, Ordering::AcqRel);
+        self.request_ollama_hub_resolution();
         let became_authoritative = !self.reconciliation_complete.swap(true, Ordering::AcqRel);
-        if (installed_packages_changed || became_authoritative)
-            && let Some(observer) = self
-                .installed_packages_observer
-                .read()
-                .ok()
-                .and_then(|observer| observer.as_ref().and_then(Weak::upgrade))
+        if !(installed_packages_changed || became_authoritative) {
+            return Ok(());
+        }
+        let revision = self.packages_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Some(observer) = self
+            .installed_packages_observer
+            .read()
+            .ok()
+            .and_then(|observer| observer.as_ref().and_then(Weak::upgrade))
         {
             observer.installed_packages_changed(revision);
         }
@@ -720,6 +754,7 @@ impl ManagedModelStore {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.packages_revision.fetch_add(1, Ordering::Release);
         self.notify_installed_packages_changed();
         Ok(model)
     }
@@ -763,6 +798,7 @@ impl ManagedModelStore {
             InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
         })? = installed;
         self.ensure_generation.fetch_add(1, Ordering::Release);
+        self.packages_revision.fetch_add(1, Ordering::Release);
         self.notify_installed_packages_changed();
         Ok(())
     }
@@ -1624,7 +1660,7 @@ pub(crate) fn build_model(
         .read_index::<CachedModelMetadata>(ModelIndexKind::InventoryMetadata, &metadata_evidence);
     let inspected = match cached_metadata {
         Some(inspection) => inspection,
-        None => match gguf::inspect(primary) {
+        None => match gguf::inspect_complete(primary) {
             Ok(inspection) => {
                 let evidence = fingerprint(&inspection.fingerprint_material);
                 let name = inspection.name.clone().unwrap_or_else(|| {
@@ -1830,11 +1866,11 @@ impl DeclaredProjectors {
 /// time so an unchanged location is rescanned without rereading headers.
 pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::GgufInspection> {
     let metadata = path.metadata().ok()?;
-    let evidence = format!("gguf-file-v1\0{}", file_identity(path, &metadata));
+    let evidence = format!("gguf-file-v2\0{}", file_identity(path, &metadata));
     if let Some(inspection) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Some(inspection);
     }
-    let inspection = gguf::inspect(path).ok()?;
+    let inspection = gguf::inspect_complete(path).ok()?;
     cache.write_index(ModelIndexKind::GgufInspection, &evidence, &inspection);
     Some(inspection)
 }

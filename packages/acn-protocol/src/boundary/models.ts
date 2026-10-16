@@ -22,6 +22,7 @@ import {
   HuggingFaceRepositoryIdSchema,
   HuggingFaceSearchResponseSchema,
   LocalInferenceHardwareSchema,
+  LocalModelSyncOutcomeSchema,
   ModelIdSchema,
   ModelLocationSchema,
   ModelCatalogStateSchema,
@@ -77,7 +78,7 @@ const SetFavorite = Rpc.make("SetModelFavorite", {
 
 const SyncLocalModel = Rpc.make("SyncLocalModel", {
   payload: Schema.Struct({ modelId: ModelIdSchema }),
-  success: Schema.Struct({ outcome: Schema.Literal("Started", "AlreadyCurrent") }),
+  success: Schema.Struct({ outcome: LocalModelSyncOutcomeSchema }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
@@ -208,13 +209,13 @@ const SetModelDrafter = Rpc.make("SetModelDrafter", {
 }).pipe(atMostOnce)
 
 const HideModel = Rpc.make("HideModel", {
-  payload: Schema.Struct({ modelId: CustomFormModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalModelMutationFailed,
 }).pipe(atMostOnce)
 
 const UnhideModel = Rpc.make("UnhideModel", {
-  payload: Schema.Struct({ modelId: CustomFormModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalModelMutationFailed,
 }).pipe(atMostOnce)

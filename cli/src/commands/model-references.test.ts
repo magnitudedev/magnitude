@@ -1,5 +1,6 @@
 import { Effect, Either, Option } from "effect"
 import { describe, expect, it } from "vitest"
+import { drafterReferenceMatches } from "./hugging-face-runtime"
 import {
   absolutePath,
   decodeCustomModelId,
@@ -66,5 +67,22 @@ describe("model references", () => {
     const result = Effect.runSync(Effect.either(decodeCustomModelId("qwen-test:gguf:q4", (id) => `no ${id}`)))
     expect(result).toMatchObject(Either.left({ message: "no qwen-test:gguf:q4" }))
     expect(Effect.runSync(Effect.either(decodeCustomModelId(`local:${"e".repeat(64)}`, () => "")))).toEqual(Either.right(`local:${"e".repeat(64)}`))
+  })
+})
+
+describe("drafterReferenceMatches", () => {
+  const hub = { _tag: "HuggingFace", repository: "owner/Model-GGUF", commit: "abc", path: "MTP/mtp-Model-Q8_0.gguf" } as const
+  it("matches a listed Hub drafter by repository and file", () => {
+    expect(drafterReferenceMatches("owner/model-gguf:MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
+    expect(drafterReferenceMatches("owner/Model-GGUF@main:MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
+    expect(drafterReferenceMatches("https://huggingface.co/owner/Model-GGUF/blob/main/MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
+  })
+  it("rejects other files, repositories, and kinds", () => {
+    expect(drafterReferenceMatches("owner/Model-GGUF:other.gguf", hub as never)).toBe(false)
+    expect(drafterReferenceMatches("other/Model-GGUF:MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(false)
+    expect(drafterReferenceMatches("owner/Model-GGUF:MTP/mtp-Model-Q8_0.gguf", { _tag: "Embedded" } as never)).toBe(false)
+  })
+  it("matches a local drafter by absolute path", () => {
+    expect(drafterReferenceMatches("/models/draft.gguf", { _tag: "Local", path: "/models/draft.gguf" } as never)).toBe(true)
   })
 })

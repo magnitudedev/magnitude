@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import type { DirectoryListing, ModelLocation } from "@magnitudedev/sdk"
-import { ModelLocationRows } from "./model-locations"
+import { ModelLocationsManager, modelLocationsSummary } from "./model-locations"
 import { DirectoryEntries } from "./folder-picker"
 import { candidateErrorNotice, modelLocationErrorNotice } from "./candidate-errors"
 import { DirectoryNotFound, InvalidModelReference, ModelSourceUnavailable } from "@magnitudedev/sdk"
@@ -15,23 +15,32 @@ const locations: ModelLocation[] = [
 ]
 
 describe("model locations", () => {
-  const html = renderToStaticMarkup(<ModelLocationRows locations={locations} busy={false} onToggle={() => {}} onRemove={() => {}} onAdd={() => {}} />)
-  it("lists automatic locations with their path and an on/off switch when found", () => {
+  const manager = (entries: readonly ModelLocation[]) => renderToStaticMarkup(<ModelLocationsManager locations={entries} busy={false} notice={undefined} onToggle={() => {}} onRemove={() => {}} onAdd={() => {}} />)
+  const html = manager(locations)
+  it("summarizes the locations found and on, then the folder count, in one row", () => {
+    expect(modelLocationsSummary(locations)).toBe("Hugging Face cache · 1 folder")
+    expect(modelLocationsSummary([...locations, { ...locations[3]!, path: "/models" }])).toBe("Hugging Face cache · 2 folders")
+    expect(modelLocationsSummary([{ ...locations[1]!, enabled: true }])).toBe("LM Studio")
+    expect(modelLocationsSummary([locations[2]!])).toBe("Magnitude isn’t looking anywhere else for models")
+  })
+  it("lists found automatic locations with their path and an on/off switch, and tucks away the ones not found", () => {
     expect(html).toContain("Hugging Face cache")
     expect(html).toContain("/Users/me/.cache/huggingface/hub")
     expect(html).toContain('aria-label="Look for models in LM Studio"')
-    expect(html).toContain("Not found · /Users/me/.ollama/models")
     expect(html).not.toContain('aria-label="Look for models in Ollama"')
     expect(html.match(/role="switch"/g)).toHaveLength(2)
+    expect(html).toMatch(/<details[^>]*><summary[^>]*>Not found on this computer \(1\)<\/summary>.*Ollama.*\/Users\/me\/.ollama\/models/)
   })
-  it("lists your folders with Remove, then Add folder…", () => {
+  it("lists your folders with Remove under the Your folders heading, beside Add folder…", () => {
     expect(html).toContain(">models<")
     expect(html).toContain('aria-label="Remove /Volumes/External/models"')
-    expect(html).toContain("Add folder…")
-    expect(html.indexOf("Remove /Volumes")).toBeLessThan(html.indexOf("Add folder…"))
+    expect(html.indexOf("Your folders")).toBeLessThan(html.indexOf("Add folder…"))
+    expect(html.indexOf("Add folder…")).toBeLessThan(html.indexOf("Remove /Volumes"))
+    expect(html.indexOf("Not found on this computer")).toBeLessThan(html.indexOf("Your folders"))
   })
   it("explains a first folder before any exist", () => {
-    expect(renderToStaticMarkup(<ModelLocationRows locations={locations.slice(0, 1)} busy onToggle={() => {}} onRemove={() => {}} onAdd={() => {}} />)).toContain("Add a folder of GGUF files no other app manages")
+    expect(manager(locations.slice(0, 1))).toContain("Add a folder of GGUF files no other app manages")
+    expect(manager(locations.slice(0, 1))).not.toContain("<details")
   })
   it("words folder and reference failures without service text", () => {
     expect(modelLocationErrorNotice(new DirectoryNotFound({ path: "/x" })).title).toBe("This folder doesn’t exist")

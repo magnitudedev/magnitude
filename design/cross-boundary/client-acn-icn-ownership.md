@@ -68,7 +68,7 @@ ACN also owns stable ranking scores, warnings, provider status, favorites, Slot 
 integrity, and the atomic configuration admitted to agent work. It persists every custom-model
 choice (declarations, hidden models, attached drafters, user folders, disabled automatic
 locations), resolves location paths, delivers the whole configuration to ICN, and orders drafter
-candidates by measured acceptance. It may project ICN facts into
+candidates. It may project ICN facts into
 application semantics, but it does not become the authority for the native resource.
 
 The public resources remain separate because they have different identities and failure causes.

@@ -88,28 +88,33 @@ impl fmt::Display for HeaderError {
 impl error::Error for HeaderError {}
 
 impl HeaderError {
-    /// The unsupported features this error names: unknown keys, unbound
-    /// tensors and rope scaling outside the admitted ranges. A malformed
-    /// header names none.
+    /// The unsupported features this error names: unknown keys, keys or
+    /// tensors stored in a form the family doesn't read (such as a weight
+    /// with an extra unit dimension), unbound tensors and rope scaling outside
+    /// the admitted ranges. A header missing what the family needs names none.
     pub fn reasons(&self) -> Vec<UnsupportedReason> {
         match self {
             Self::UnknownMetadata(keys) => keys
                 .iter()
                 .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
                 .collect(),
+            Self::MetadataType { key, .. } => {
+                vec![UnsupportedReason::UnrecognizedMetadata { key: key.clone() }]
+            }
             Self::UnboundWeights(names) => names
                 .iter()
                 .map(|name| UnsupportedReason::UnrecognizedTensor { name: name.clone() })
                 .collect(),
+            Self::WeightShape { name, .. }
+            | Self::NotMatrix { name, .. }
+            | Self::CompanionScale { name, .. } => {
+                vec![UnsupportedReason::UnrecognizedTensor { name: name.clone() }]
+            }
             Self::Yarn => vec![UnsupportedReason::RopeScaling {
                 kind: "yarn".into(),
             }],
             Self::MissingMetadata(_)
-            | Self::MetadataType { .. }
             | Self::MissingWeight(_)
-            | Self::WeightShape { .. }
-            | Self::NotMatrix { .. }
-            | Self::CompanionScale { .. }
             | Self::Rotary { .. }
             | Self::Definition(_) => Vec::new(),
         }
@@ -125,5 +130,26 @@ impl From<HeaderError> for FamilyError {
 impl From<DefinitionError> for HeaderError {
     fn from(error: DefinitionError) -> Self {
         Self::Definition(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_weight_in_a_form_the_family_does_not_read_names_that_tensor() {
+        let error = HeaderError::WeightShape {
+            name: "blk.0.ffn_gate_inp_shexp.weight".into(),
+            expected: vec![2048],
+            received: vec![1, 2048],
+        };
+        assert_eq!(
+            error.reasons(),
+            [UnsupportedReason::UnrecognizedTensor {
+                name: "blk.0.ffn_gate_inp_shexp.weight".into()
+            }]
+        );
+        assert!(HeaderError::MissingWeight("output.weight".into()).reasons().is_empty());
     }
 }

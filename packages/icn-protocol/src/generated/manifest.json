@@ -1,7 +1,7 @@
 {
   "generator": "@magnitudedev/openapi-effect",
   "generatorVersion": "0.0.1",
-  "protocolHash": "bc16fde72ce027289b455606f4e03c317b25514339b4e333c09a39377f880d98",
+  "protocolHash": "55869619c2765e29fad3f2f51b2503f9b88ce2135c8161faa080476d559e898f",
   "configHash": "35eaa09ad05c284228c67845b4e6f4db4aa545ca4a74ee0d812d04c6af53ee75",
   "files": [
     "api.ts",
@@ -43,6 +43,7 @@
     "listModelDownloads",
     "listServableModels",
     "previewModelLoad",
+    "pruneLocalDrafters",
     "refreshLocalModels",
     "removeCatalogModelInstallation",
     "removeLocalModelFiles",

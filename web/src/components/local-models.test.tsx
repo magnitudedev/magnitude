@@ -45,6 +45,15 @@ describe("removing by origin", () => {
     expect(render(customModel(imported))).toContain('aria-label="Remove Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
     expect(render(customModel(foundIn({ _tag: "Ollama" })))).toContain('aria-label="Hide Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
   })
+  it("never offers deleting a catalog model whose files are only in another app's location", () => {
+    const external = catalogModel()
+    const found = { ...external, acquisitionState: { _tag: "Installed" as const, installation: { _tag: "Resolved" as const, installedBytes: 24_000_000_000, primaryPath: "/Users/me/.cache/huggingface/hub/qwen.gguf", ownership: "External" as const }, residencyState: { _tag: "Unloaded" as const } } }
+    expect(removalKind(found)).toBe("hide")
+    expect(render(found)).toContain('aria-label="Hide Qwen3.6 35B-A3B (Q4) from Magnitude"')
+    expect(render(found)).not.toContain("Remove download")
+    expect(renderToStaticMarkup(<ModelRemoveAction model={found} running={false} disabled={false} onRemove={() => {}} />)).toBe("")
+    expect(removalKind({ ...found, acquisitionState: { ...found.acquisitionState, installation: { ...found.acquisitionState.installation, ownership: "Mixed" as const } } })).toBe("delete")
+  })
   it("offers no hide action without a hide handler", () => {
     expect(renderToStaticMarkup(<ModelRemoveAction model={customModel(foundIn({ _tag: "Ollama" }))} running={false} disabled={false} onRemove={() => {}} />)).toBe("")
   })

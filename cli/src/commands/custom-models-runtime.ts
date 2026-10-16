@@ -1,11 +1,13 @@
 import {
   AutomaticModelLocationKindSchema,
   CustomFormModelIdSchema,
+  ModelIdSchema,
   ModelLocationSchema,
   Models,
   type AutomaticModelLocationKind,
   type CustomFormModelId,
   type DrafterCandidate,
+  type ModelId,
   type ModelLocation,
   type ModelLocationKind,
 } from "@magnitudedev/sdk"
@@ -15,6 +17,7 @@ import { withClient, type CliModelsClient } from "./inference-client"
 import {
   absolutePath,
   decodeCustomModelId,
+  decodeModelId,
   ModelCommandError,
   parseDrafterArgument,
   type DrafterArgument,
@@ -32,7 +35,7 @@ const drafterDownloads = (drafter: Option.Option<DrafterCandidate>) =>
   Option.exists(drafter, (candidate) => !candidate.onThisComputer && candidate.reference._tag !== "Embedded")
 
 const drafterLine = (drafter: Option.Option<DrafterCandidate>) =>
-  `Drafter: ${Option.match(drafter, { onNone: () => "none", onSome: ({ label }) => label })}`
+  `Drafter: ${Option.match(drafter, { onNone: () => "none", onSome: ({ name }) => name })}`
 
 export const ImportResultSchema = Schema.extend(
   Schema.Struct({ path: Schema.String }),
@@ -81,10 +84,12 @@ export const SetDrafterResultSchema = Schema.extend(
 )
 export type SetDrafterResult = typeof SetDrafterResultSchema.Type
 
-export const renderSetDrafter = (result: SetDrafterResult): string => Option.match(result.drafter, {
-  onNone: () => `Turned off the drafter for ${result.modelId}.\n`,
+export const renderSetDrafter = (result: SetDrafterResult, requested: DrafterArgument["_tag"] = "None"): string => Option.match(result.drafter, {
+  onNone: () => requested === "None"
+    ? `Turned off the drafter for ${result.modelId}.\n`
+    : `No drafter is known to work with ${result.modelId}, so it runs without one.\n`,
   onSome: (drafter) => ensureTrailingNewline([
-    `Drafter for ${result.modelId}: ${drafter.label}.`,
+    `Drafter for ${result.modelId}: ${drafter.name}.`,
     ...(drafterDownloads(result.drafter)
       ? ["Downloading the drafter.", `Check progress: magnitude models status ${result.modelId}`]
       : []),
@@ -102,30 +107,29 @@ export const setModelDrafter = (modelInput: string, drafterInput: string, option
   effect: Effect.gen(function* () {
     const modelId = yield* decodeCustomModelId(modelInput.trim(), catalogDrafterRefusal)
     const argument = yield* parseDrafterArgument(drafterInput)
-    return yield* withClient((client) => setDrafter(client, modelId, argument))
+    const result = yield* withClient((client) => setDrafter(client, modelId, argument))
+    return { result, requested: argument._tag }
   }),
-  render: renderSetDrafter,
-  json: asJson(options, jsonDocument(SetDrafterResultSchema, (result: SetDrafterResult) => result)),
+  render: ({ result, requested }) => renderSetDrafter(result, requested),
+  json: asJson(options, jsonDocument(SetDrafterResultSchema, ({ result }: { readonly result: SetDrafterResult }) => result)),
 })
 
-const hideRefusal = (modelId: string) =>
-  `${modelId} is a catalog model. Remove it with \`magnitude catalog remove ${modelId}\` instead.`
+const ModelIdJsonSchema = Schema.Struct({ modelId: ModelIdSchema })
+const modelIdJson = jsonDocument(ModelIdJsonSchema, (modelId: ModelId) => ({ modelId }))
 
-const CustomModelIdJsonSchema = Schema.Struct({ modelId: CustomFormModelIdSchema })
-const customModelIdJson = jsonDocument(CustomModelIdJsonSchema, (modelId: CustomFormModelId) => ({ modelId }))
-
+/** Found models, including a catalog model whose files are only in an external location; the service refuses others. */
 export const hideModel = (modelInput: string, options: JsonOption = {}) => runCommand({
-  effect: decodeCustomModelId(modelInput.trim(), hideRefusal).pipe(Effect.flatMap((modelId) =>
+  effect: decodeModelId(modelInput.trim()).pipe(Effect.flatMap((modelId) =>
     withClient((client) => client.models.hideModel({ modelId }).pipe(Effect.as(modelId))))),
   render: (modelId) => `Hid ${modelId} from Magnitude. Its files are untouched.\nUnhide it: magnitude models unhide ${modelId}\n`,
-  json: asJson(options, customModelIdJson),
+  json: asJson(options, modelIdJson),
 })
 
 export const unhideModel = (modelInput: string, options: JsonOption = {}) => runCommand({
-  effect: decodeCustomModelId(modelInput.trim(), hideRefusal).pipe(Effect.flatMap((modelId) =>
+  effect: decodeModelId(modelInput.trim()).pipe(Effect.flatMap((modelId) =>
     withClient((client) => client.models.unhideModel({ modelId }).pipe(Effect.as(modelId))))),
   render: (modelId) => `${modelId} is visible in Magnitude again.\n`,
-  json: asJson(options, customModelIdJson),
+  json: asJson(options, modelIdJson),
 })
 
 const LOCATION_NAMES: Record<ModelLocationKind, string> = {

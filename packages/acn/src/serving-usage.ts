@@ -1,12 +1,7 @@
 import { FileSystem, Path } from "@effect/platform"
 import { Database } from "bun:sqlite"
-import { Context, DateTime, Effect, Layer, Option, PubSub, Schema, Stream } from "effect"
-import {
-  ServingModelId,
-  ServingUsageRequest,
-  ServingUsageSnapshot,
-  type MeasuredDrafterAcceptance,
-} from "@magnitudedev/acn-protocol"
+import { Context, DateTime, Effect, Layer, Option, Schema } from "effect"
+import { ServingModelId, ServingUsageRequest, ServingUsageSnapshot } from "@magnitudedev/acn-protocol"
 import { GlobalStorage } from "@magnitudedev/storage"
 
 const Count = Schema.Number.pipe(Schema.int(), Schema.nonNegative())
@@ -20,68 +15,16 @@ export const ServingUsageRecord = Schema.Struct({
   generationMs: Schema.NullOr(Schema.Number.pipe(Schema.positive())),
   firstTokenMs: Schema.NullOr(Schema.Number.pipe(Schema.nonNegative())),
   complete: Schema.Boolean,
-  drafter: Schema.NullOr(Schema.NonEmptyString),
-  draftTokens: Schema.NullOr(Count),
-  acceptedDraftTokens: Schema.NullOr(Count),
 })
 export type ServingUsageRecord = typeof ServingUsageRecord.Type
-
-/** Measured acceptance and decode speed for one model and drafter pair. */
-export interface DrafterAcceptanceMeasurement {
-  readonly model: string
-  readonly drafter: string
-  readonly acceptance: MeasuredDrafterAcceptance
-}
 export class ServingUsageFailed extends Schema.TaggedError<ServingUsageFailed>()("ServingUsageFailed", { message: Schema.String }) {}
 export interface ServingUsage {
   readonly record: (record: ServingUsageRecord) => Effect.Effect<void>
   readonly read: (request: ServingUsageRequest) => Effect.Effect<ServingUsageSnapshot>
-  readonly acceptance: Effect.Effect<readonly DrafterAcceptanceMeasurement[]>
-  readonly changes: Stream.Stream<void>
 }
 export const ServingUsage = Context.GenericTag<ServingUsage>("@magnitudedev/acn/ServingUsage")
 
 const operation = <A>(run: () => A) => Effect.try({ try: run, catch: () => new ServingUsageFailed({ message: "Local usage history could not be read or saved." }) })
-
-interface DrafterRow { readonly model: string; readonly drafter: string; readonly acceptanceRate: number | null; readonly tokensPerSecond: number | null }
-interface BaselineRow { readonly model: string; readonly tokensPerSecond: number | null }
-
-/** A pair needs drafted tokens and a decode-speed sample; plain decoding of the same model is the baseline. */
-export const projectDrafterAcceptance = (
-  drafted: readonly DrafterRow[],
-  baseline: readonly BaselineRow[],
-): readonly DrafterAcceptanceMeasurement[] => {
-  const plain = new Map(baseline.flatMap(({ model, tokensPerSecond }) =>
-    tokensPerSecond !== null && Number.isFinite(tokensPerSecond) ? [[model, tokensPerSecond] as const] : []))
-  return drafted.flatMap(({ model, drafter, acceptanceRate, tokensPerSecond }) => {
-    if (acceptanceRate === null || tokensPerSecond === null || !Number.isFinite(tokensPerSecond)) return []
-    const without = Option.fromNullable(plain.get(model))
-    return [{
-      model,
-      drafter,
-      acceptance: {
-        acceptanceRate: Math.min(1, Math.max(0, acceptanceRate)),
-        tokensPerSecond,
-        withoutDrafterTokensPerSecond: without,
-        slower: Option.exists(without, (value) => tokensPerSecond < value),
-      },
-    }]
-  })
-}
-
-/** Version 1 adds the drafter identity and its drafted and accepted tokens to every observation. */
-const migrate = (db: Database) => {
-  const { user_version: version } = db.query("PRAGMA user_version").get() as { readonly user_version: number }
-  if (version >= 1) return
-  db.transaction(() => {
-    const columns = new Set((db.query("PRAGMA table_info(usage)").all() as Array<{ readonly name: string }>).map(({ name }) => name))
-    if (!columns.has("drafter")) db.exec("ALTER TABLE usage ADD COLUMN drafter TEXT")
-    if (!columns.has("draft_tokens")) db.exec("ALTER TABLE usage ADD COLUMN draft_tokens INTEGER")
-    if (!columns.has("accepted_draft_tokens")) db.exec("ALTER TABLE usage ADD COLUMN accepted_draft_tokens INTEGER")
-    db.exec("CREATE INDEX IF NOT EXISTS usage_model_drafter ON usage(model, drafter)")
-    db.exec("PRAGMA user_version = 1")
-  })()
-}
 
 /** Completed observations are durable independently of the renderer and model residency. */
 export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* () {
@@ -91,7 +34,6 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
   let database: Database | undefined
   let recordingFailures = 0
   const lock = yield* Effect.makeSemaphore(1)
-  const recorded = yield* PubSub.sliding<void>(1)
   yield* Effect.addFinalizer(() => Effect.sync(() => database?.close()))
   const open = Effect.gen(function* () {
     if (database) return database
@@ -108,7 +50,6 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
           CREATE INDEX IF NOT EXISTS usage_date ON usage(completed_at);
           CREATE INDEX IF NOT EXISTS usage_model_date ON usage(model, completed_at);
           CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY CHECK(id = 1), since REAL NOT NULL);`)
-        migrate(db)
         db.query("INSERT OR IGNORE INTO metadata VALUES (1, ?)").run(Date.now())
         database = db
         return db
@@ -118,15 +59,10 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
   const record = (value: ServingUsageRecord) => lock.withPermits(1)(Effect.gen(function* () {
     const db = yield* open
     const record = yield* Schema.decodeUnknown(ServingUsageRecord)(value).pipe(Effect.mapError(() => new ServingUsageFailed({ message: "Invalid usage evidence." })))
-    yield* operation(() => db.query(`INSERT OR IGNORE INTO usage
-      (id, model, completed_at, input, cached, output, generation_ms, first_token_ms, complete,
-        drafter, draft_tokens, accepted_draft_tokens)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    yield* operation(() => db.query("INSERT OR IGNORE INTO usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
       record.id, record.model, record.completedAt, record.input, record.cached, record.output,
       record.generationMs, record.firstTokenMs, Number(record.complete),
-      record.drafter, record.draftTokens, record.acceptedDraftTokens,
     ))
-    yield* PubSub.publish(recorded, undefined)
   })).pipe(Effect.catchAll(error => Effect.sync(() => { recordingFailures++ }).pipe(Effect.zipRight(Effect.logError(error.message)))))
   const read = (request: ServingUsageRequest) => lock.withPermits(1)(Effect.gen(function* () {
     const db = yield* open
@@ -164,23 +100,5 @@ export const ServingUsageLive = Layer.scoped(ServingUsage, Effect.gen(function* 
       return Schema.decodeUnknownSync(ServingUsageSnapshot)({ _tag: "Available", ...metadata!, ...totals!, dailyActivity, models, recordingFailures })
     })
   })).pipe(Effect.catchAll(error => Effect.succeed({ _tag: "Unavailable" as const, message: error.message })))
-  const acceptance = lock.withPermits(1)(Effect.gen(function* () {
-    const db = yield* open
-    return yield* operation(() => projectDrafterAcceptance(
-      db.query(`SELECT model, drafter,
-        SUM(accepted_draft_tokens) * 1.0 / SUM(draft_tokens) AS acceptanceRate,
-        SUM(CASE WHEN generation_ms > 0 THEN output END) * 1000.0 / SUM(CASE WHEN output IS NOT NULL THEN generation_ms END) AS tokensPerSecond
-        FROM usage WHERE drafter IS NOT NULL AND draft_tokens > 0 AND accepted_draft_tokens IS NOT NULL
-        GROUP BY model, drafter ORDER BY model, drafter`).all() as DrafterRow[],
-      db.query(`SELECT model,
-        SUM(CASE WHEN generation_ms > 0 THEN output END) * 1000.0 / SUM(CASE WHEN output IS NOT NULL THEN generation_ms END) AS tokensPerSecond
-        FROM usage WHERE drafter IS NULL GROUP BY model`).all() as BaselineRow[],
-    ))
-  })).pipe(Effect.catchAll((error) => Effect.logWarning(error.message).pipe(Effect.as([]))))
-  return ServingUsage.of({
-    record,
-    read,
-    acceptance,
-    changes: Stream.fromPubSub(recorded),
-  })
+  return ServingUsage.of({ record, read })
 }))

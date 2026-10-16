@@ -261,6 +261,42 @@ fn dflash(hidden: u64) -> Gguf {
     gguf
 }
 
+/// A DSpark drafter: a DFlash drafter with a Markov head and a confidence head.
+fn dspark() -> Gguf {
+    const RANK: u64 = 32;
+    let mut gguf = dflash(HIDDEN);
+    gguf.tensor("markov_w1.weight", &[VOCABULARY, RANK], Encoding::F32);
+    gguf.tensor("markov_w2.weight", &[VOCABULARY, RANK], Encoding::F32);
+    gguf.tensor("conf_proj.weight", &[HIDDEN + RANK], Encoding::F32);
+    gguf.tensor("conf_proj.bias", &[1], Encoding::F32);
+    gguf
+}
+
+/// A DFlash2 drafter: a DFlash drafter with convolutions around its layer and a candidate
+/// selector.
+fn dflash2() -> Gguf {
+    const KERNEL: u64 = 4;
+    const GROUP: u64 = 128;
+    const RANK: u64 = 32;
+    let mut gguf = dflash(HIDDEN);
+    gguf.set("dflash.conv_kernel_size", Meta::U32(KERNEL as u32));
+    gguf.set("dflash.conv_group_size", Meta::U32(GROUP as u32));
+    gguf.set("dflash.selector_rank", Meta::U32(RANK as u32));
+    gguf.set("dflash.selector_top_k", Meta::U32(4));
+    for sublayer in ["attn", "ffn"] {
+        gguf.tensor(&format!("blk.0.{sublayer}_conv_base"), &[2, KERNEL, HIDDEN], Encoding::F32);
+        gguf.tensor(
+            &format!("blk.0.{sublayer}_conv_proj.weight"),
+            &[2 * KERNEL * (HIDDEN / GROUP), HIDDEN],
+            Encoding::F32,
+        );
+    }
+    gguf.tensor("selector_hidden.weight", &[RANK, HIDDEN], Encoding::F32);
+    gguf.tensor("selector_predecessor.weight", &[VOCABULARY, RANK], Encoding::F32);
+    gguf.tensor("selector_successor.weight", &[VOCABULARY, RANK], Encoding::F32);
+    gguf
+}
+
 fn projector() -> Gguf {
     let mut gguf = Gguf::default();
     gguf.set("general.architecture", Meta::Str("clip".into()));
@@ -307,7 +343,7 @@ struct StubRepository {
 struct StubHub {
     repositories: BTreeMap<String, StubRepository>,
     search: Vec<serde_json::Value>,
-    drafter_search: Vec<String>,
+    drafter_searches: AtomicUsize,
     header_requests: AtomicUsize,
 }
 
@@ -379,12 +415,8 @@ impl StubHub {
         match segments {
             [api, models] if api == "api" && models == "models" => {
                 if query.contains("base_model") {
-                    json(serde_json::Value::Array(
-                        self.drafter_search
-                            .iter()
-                            .map(|id| serde_json::json!({ "id": id }))
-                            .collect(),
-                    ))
+                    self.drafter_searches.fetch_add(1, Ordering::SeqCst);
+                    json(serde_json::Value::Array(Vec::new()))
                 } else {
                     json(serde_json::Value::Array(self.search.clone()))
                 }
@@ -496,6 +528,12 @@ impl LocalModels for StubLocal {
         Box::pin(async move { Err(InventoryError::NotFound(model_id.as_str().to_owned())) })
     }
 
+    fn prune_drafters(
+        &self,
+    ) -> BoxFuture<'_, Result<magnitude_service_contracts::models::DrafterPruning, InventoryError>> {
+        Box::pin(async { Err(InventoryError::Unsupported("no drafters".to_owned())) })
+    }
+
     fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation> {
         Box::pin(futures_util::stream::empty())
     }
@@ -541,6 +579,9 @@ const CATALOG_TARGET: &str = "catalog/Llama-GGUF";
 const CATALOG_DRAFT: &str = "catalog/Llama-DFlash-GGUF";
 const COMMUNITY: &str = "community/Llama-Finetune-GGUF";
 const THIRD_PARTY: &str = "thirdparty/Llama-DFlash-GGUF";
+const SPECULATIVE: &str = "community/Llama-Speculative-GGUF";
+const REJECTED: &str = "community/Llama-Rejected-GGUF";
+const PLAIN: &str = "community/Llama-Plain-GGUF";
 
 fn repository(seed: char, files: Vec<StubFile>, base_models: &[&str]) -> StubRepository {
     StubRepository {
@@ -606,6 +647,34 @@ fn hub() -> StubHub {
         repository('f', vec![StubFile::new("deepseek-Q8_0.gguf", &deepseek)], &[]),
     );
     repositories.insert(
+        SPECULATIVE.to_owned(),
+        repository(
+            '1',
+            vec![
+                StubFile::new("llama-Q8_0.gguf", &q8),
+                StubFile::new("drafters/dflash.gguf", &dflash(HIDDEN)),
+                StubFile::new("dspark.gguf", &dspark()),
+                StubFile::new("dflash2.gguf", &dflash2()),
+            ],
+            &["community/Llama-Finetune"],
+        ),
+    );
+    repositories.insert(
+        REJECTED.to_owned(),
+        repository(
+            '2',
+            vec![
+                StubFile::new("llama-Q8_0.gguf", &q8),
+                StubFile::new("dflash-narrow.gguf", &dflash(HIDDEN / 2)),
+            ],
+            &["community/Llama-Finetune"],
+        ),
+    );
+    repositories.insert(
+        PLAIN.to_owned(),
+        repository('3', vec![StubFile::new("llama-Q8_0.gguf", &q8)], &["community/Llama-Finetune"]),
+    );
+    repositories.insert(
         THIRD_PARTY.to_owned(),
         repository('9', vec![StubFile::new("draft.gguf", &dflash(HIDDEN))], &["base/Llama"]),
     );
@@ -630,7 +699,7 @@ fn hub() -> StubHub {
             search_result("vision/Llama-Vision-GGUF", 'e', "clip", &[]),
             search_result(COMMUNITY, 'c', "llama", &["community/Llama-Finetune"]),
         ],
-        drafter_search: vec![THIRD_PARTY.to_owned(), CATALOG_DRAFT.to_owned()],
+        drafter_searches: AtomicUsize::new(0),
         header_requests: AtomicUsize::new(0),
     }
 }
@@ -888,6 +957,7 @@ fn custom_model(model_id: ModelId, size_bytes: u64) -> CustomModel {
             source: magnitude_service_contracts::models::FoundSource::HuggingFaceCache,
         },
         display_name: "Found".to_owned(),
+        variant_label: None,
         variant_of: None,
         files: Vec::new(),
         size_bytes,
@@ -948,8 +1018,41 @@ async fn inspection_selects_the_smallest_projector_and_explains_unknown_architec
     assert!(deepseek.versions.iter().all(|version| version.assessment.is_none()));
 }
 
+/// The drafters offered for a Hugging Face candidate, with no explicit reference.
+async fn candidate_drafters(
+    fixture: &Fixture,
+    repository: &str,
+    seed: char,
+) -> Vec<magnitude_service_contracts::models::DrafterCandidate> {
+    fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: hugging_face_candidate(repository, seed, "llama-Q8_0.gguf"),
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates
+}
+
+fn preselected(
+    candidates: &[magnitude_service_contracts::models::DrafterCandidate],
+) -> &magnitude_service_contracts::models::DrafterCandidate {
+    candidates
+        .iter()
+        .find(|candidate| matches!(candidate.verdict, DrafterVerdict::Bound { .. }))
+        .expect("a bound drafter")
+}
+
+fn hugging_face_path(candidate: &magnitude_service_contracts::models::DrafterCandidate) -> &str {
+    match &candidate.reference {
+        DrafterReference::HuggingFace { path, .. } => path,
+        other => panic!("not a Hugging Face drafter: {other:?}"),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn drafter_candidates_follow_the_category_order_with_engine_verdicts() {
+async fn a_drafter_in_the_model_repository_precedes_the_catalog_drafter() {
     let fixture = fixture(Vec::new()).await;
     let response = fixture
         .candidates
@@ -967,14 +1070,36 @@ async fn drafter_candidates_follow_the_category_order_with_engine_verdicts() {
     assert_eq!(
         categories,
         [
+            DrafterCategory::NextToModel,
+            DrafterCategory::NextToModel,
             DrafterCategory::CatalogDrafter,
-            DrafterCategory::NextToModel,
-            DrafterCategory::NextToModel,
-            DrafterCategory::HuggingFace,
+            DrafterCategory::Other,
         ],
         "{candidates:#?}"
     );
-    let catalog = &candidates[0];
+    let own = &candidates[0];
+    assert_eq!(hugging_face_path(own), "dflash-draft.gguf");
+    assert_eq!(own.label, "In this repository");
+    assert!(matches!(
+        own.verdict,
+        DrafterVerdict::Bound {
+            method: SpeculativeMethod::DFlash,
+            ..
+        }
+    ));
+    assert_eq!(preselected(&candidates), own);
+    let narrow = &candidates[1];
+    assert_eq!(
+        hugging_face_path(narrow),
+        "dflash-narrow.gguf",
+        "a rejected drafter follows the bound ones, though it is the smaller download"
+    );
+    assert!(matches!(
+        &narrow.verdict,
+        DrafterVerdict::Rejected { reasons, .. }
+            if matches!(reasons.as_slice(), [UnsupportedReason::TargetMismatch { .. }])
+    ));
+    let catalog = &candidates[2];
     assert_eq!(
         catalog.reference,
         DrafterReference::Catalog {
@@ -989,20 +1114,109 @@ async fn drafter_candidates_follow_the_category_order_with_engine_verdicts() {
             ..
         }
     ));
-    assert_eq!(catalog.label, "Recommended · Trained for Llama Test");
-    let narrow = &candidates[1];
-    assert!(
-        matches!(&narrow.reference, DrafterReference::HuggingFace { path, .. } if path == "dflash-narrow.gguf"),
-        "the smaller download sorts first within its category"
-    );
-    assert!(matches!(
-        &narrow.verdict,
-        DrafterVerdict::Rejected { reasons, .. }
-            if matches!(reasons.as_slice(), [UnsupportedReason::TargetMismatch { .. }])
-    ));
-    assert!(matches!(candidates[2].verdict, DrafterVerdict::Bound { .. }));
-    assert_eq!(candidates[3].label, "By thirdparty");
+    assert_eq!(catalog.name, "Magnitude DFlash for Llama Test");
+    assert_eq!(catalog.label, "Trained for Llama Test");
+    assert_eq!(candidates[3].label, "Entered by you");
     assert!(matches!(candidates[3].verdict, DrafterVerdict::Bound { .. }));
+    assert_eq!(
+        fixture.hub.drafter_searches.load(Ordering::SeqCst),
+        0,
+        "Hugging Face is never searched for drafters"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repository_drafters_follow_the_method_order_at_any_path() {
+    let fixture = fixture(Vec::new()).await;
+    let candidates = candidate_drafters(&fixture, SPECULATIVE, '1').await;
+    let listed = candidates
+        .iter()
+        .map(|candidate| (candidate.category, candidate.method.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            (DrafterCategory::NextToModel, Some(SpeculativeMethod::DFlash2)),
+            (DrafterCategory::NextToModel, Some(SpeculativeMethod::DSpark)),
+            (DrafterCategory::NextToModel, Some(SpeculativeMethod::DFlash)),
+            (DrafterCategory::CatalogDrafter, Some(SpeculativeMethod::DFlash)),
+        ],
+        "{candidates:#?}"
+    );
+    assert_eq!(hugging_face_path(&candidates[2]), "drafters/dflash.gguf");
+    assert_eq!(hugging_face_path(preselected(&candidates)), "dflash2.gguf");
+    assert_eq!(fixture.hub.drafter_searches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_repository_drafter_the_catalog_drafter_is_preselected() {
+    let fixture = fixture(Vec::new()).await;
+    let candidates = candidate_drafters(&fixture, PLAIN, '3').await;
+    assert_eq!(candidates.len(), 1, "{candidates:#?}");
+    assert_eq!(preselected(&candidates).category, DrafterCategory::CatalogDrafter);
+
+    let rejected = candidate_drafters(&fixture, REJECTED, '2').await;
+    assert_eq!(
+        rejected
+            .iter()
+            .map(|candidate| candidate.category)
+            .collect::<Vec<_>>(),
+        [DrafterCategory::NextToModel, DrafterCategory::CatalogDrafter]
+    );
+    assert!(matches!(rejected[0].verdict, DrafterVerdict::Rejected { .. }));
+    assert_eq!(
+        preselected(&rejected).category,
+        DrafterCategory::CatalogDrafter,
+        "a rejected repository drafter is listed but never preselected"
+    );
+    assert_eq!(fixture.hub.drafter_searches.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drafters_in_a_local_model_folder_precede_the_fingerprint_matched_catalog_drafter() {
+    let fixture = fixture(Vec::new()).await;
+    let folder = tempfile::tempdir().expect("model folder");
+    let write = |name: &str, gguf: &Gguf| std::fs::write(folder.path().join(name), gguf.bytes().0).unwrap();
+    write("model.gguf", &llama(7, Encoding::Q8_0));
+    write("dflash.gguf", &dflash(HIDDEN));
+    write("dflash-narrow.gguf", &dflash(HIDDEN / 2));
+    let candidates = fixture
+        .candidates
+        .drafters(DrafterCandidatesRequest::Candidate {
+            candidate: ModelCandidate {
+                source: CandidateSource::Local {
+                    path: folder.path().to_path_buf(),
+                },
+                target: vec!["model.gguf".to_owned()],
+                projector: None,
+                drafter: None,
+            },
+            other: None,
+        })
+        .await
+        .expect("drafter candidates")
+        .candidates;
+    let listed = candidates
+        .iter()
+        .map(|candidate| (candidate.category, candidate.label.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        listed,
+        [
+            (DrafterCategory::NextToModel, "In this folder"),
+            (DrafterCategory::NextToModel, "In this folder"),
+            (DrafterCategory::CatalogDrafter, "Trained for Llama Test"),
+        ],
+        "{candidates:#?}"
+    );
+    assert_eq!(
+        preselected(&candidates).reference,
+        DrafterReference::Local {
+            path: folder.path().join("dflash.gguf")
+        }
+    );
+    assert!(candidates[0].on_this_computer);
+    assert_eq!(candidates[2].lineage, DrafterLineage::Fingerprint);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1079,6 +1293,32 @@ async fn the_exact_catalog_target_and_a_catalog_model_use_only_the_catalog_draft
         .candidates;
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].category, DrafterCategory::CatalogDrafter);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeated_inspection_reads_each_header_once_and_reports_download_sizes() {
+    let fixture = fixture(Vec::new()).await;
+    let request = CandidateInspectionRequest::HuggingFace {
+        repository: HuggingFaceRepositoryId::new("vision/Llama-Vision-GGUF".to_owned()).unwrap(),
+        revision: commit('e'),
+    };
+    let first = fixture
+        .candidates
+        .inspect(request.clone())
+        .await
+        .expect("inspection");
+    let requests = fixture.hub.header_requests.load(Ordering::SeqCst);
+    let version = version(&first, "llama-Q8_0.gguf");
+    let projector = first.projector.as_ref().expect("projector");
+    assert_eq!(version.download_bytes, version.size_bytes + projector.size_bytes);
+
+    let second = fixture.candidates.inspect(request).await.expect("cached inspection");
+    assert_eq!(first, second);
+    assert_eq!(
+        fixture.hub.header_requests.load(Ordering::SeqCst),
+        requests,
+        "a repeated inspection reads no header again"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

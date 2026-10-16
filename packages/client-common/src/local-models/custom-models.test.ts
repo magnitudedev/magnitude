@@ -2,9 +2,8 @@ import { Option, Schema } from "effect"
 import { describe, expect, it } from "vitest"
 import {
   CatalogFormModelIdSchema,
-  HuggingFaceArtifactSelectorSchema,
-  HuggingFaceRepositoryIdSchema,
   UnsupportedReasonSchema,
+  type CandidateVersion,
   type DrafterCandidate,
   type LocalModelsState,
   type UnsupportedReason,
@@ -14,12 +13,11 @@ import { activeLocalModel } from "../application/session"
 import { localModelsFromCatalog } from "../model-catalog/projection"
 import { catalogVariantOfName, localModelSourceTag, unsupportedLocalModelSourceTag } from "../utils/model-presentation"
 import {
+  candidateDownloadBytes,
   customModelDrafterOffer,
-  drafterAcceptanceLabel,
   drafterCandidateLabel,
   drafterCandidateSelectable,
   drafterCandidateWarning,
-  drafterSlowingWarning,
 } from "./drafter-presentation"
 import { unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
 import {
@@ -85,56 +83,65 @@ const bound = { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 900_000_
 const candidate = (overrides: Partial<DrafterCandidate>): DrafterCandidate => ({
   category: "CatalogDrafter",
   reference: { _tag: "Catalog", modelId: providerModelId },
-  label: "Magnitude DFlash for Setup Model",
+  name: "Magnitude DFlash for Setup Model",
+  label: "Trained for Setup Model",
   sizeBytes: 900_000_000,
   lineage: "Lineage",
   verdict: bound,
   onThisComputer: false,
   method: Option.some({ _tag: "DFlash" }),
-  measuredAcceptance: Option.none(),
   ...overrides,
 })
 
 describe("drafter presentation", () => {
-  const models = [makeSetupModel(false)]
-
-  it("labels each category as the product specifies", () => {
-    expect(drafterCandidateLabel(candidate({}), models)).toBe("Recommended · Trained for Setup Model")
-    expect(drafterCandidateLabel(candidate({ category: "BuiltIn", reference: { _tag: "Embedded" } }), models))
+  it("shows ICN's label, marked Recommended only on the preselected choice", () => {
+    expect(drafterCandidateLabel(candidate({}), true)).toBe("Recommended · Trained for Setup Model")
+    expect(drafterCandidateLabel(candidate({}), false)).toBe("Trained for Setup Model")
+    expect(drafterCandidateLabel(candidate({ category: "BuiltIn", reference: { _tag: "Embedded" }, label: "Built into this model" }), false))
       .toBe("Built into this model")
-    expect(drafterCandidateLabel(candidate({
-      category: "NextToModel",
-      reference: {
-        _tag: "HuggingFace",
-        repository: HuggingFaceRepositoryIdSchema.make("owner/repo"),
-        commit: "abc",
-        path: HuggingFaceArtifactSelectorSchema.make("mtp-Q8_0.gguf"),
-      },
-    }), models)).toBe("In this repository")
-    expect(drafterCandidateLabel(candidate({ category: "OnThisComputer", reference: { _tag: "Local", path: "/d.gguf" } }), models))
-      .toBe("On this computer")
-    expect(drafterCandidateLabel(candidate({
-      category: "HuggingFace",
-      reference: {
-        _tag: "HuggingFace",
-        repository: HuggingFaceRepositoryIdSchema.make("z-lab/Qwen3.6-35B-A3B-DFlash"),
-        commit: "abc",
-        path: HuggingFaceArtifactSelectorSchema.make("dflash.gguf"),
-      },
-    }), models)).toBe("z-lab")
+    expect(drafterCandidateLabel(candidate({ category: "NextToModel", label: "In this repository" }), true))
+      .toBe("Recommended · In this repository")
+    expect(drafterCandidateLabel(candidate({ category: "Other", lineage: "None", label: "Untested" }), false)).toBe("Untested")
   })
 
-  it("never offers a rejected drafter and warns about an untested one", () => {
+  it("totals a candidate's download: model, projector, and a drafter not already here", () => {
+    const version = {
+      label: "Q4_K_M",
+      modelId: customModelId,
+      files: ["model.gguf"],
+      sizeBytes: 3_010_000_000,
+      downloadBytes: 3_680_000_000,
+      assessment: Option.none(),
+      recommended: true,
+      onThisComputer: Option.none(),
+    } satisfies CandidateVersion
+    const projector = Option.some({ path: "mmproj.gguf", sizeBytes: 670_000_000 })
+    expect(candidateDownloadBytes(version, projector, Option.some(candidate({ sizeBytes: 685_000_000 })))).toEqual({
+      totalBytes: 4_365_000_000,
+      modelBytes: 3_010_000_000,
+      projectorBytes: 670_000_000,
+      drafterBytes: 685_000_000,
+    })
+    expect(candidateDownloadBytes({ ...version, downloadBytes: 0 }, projector, Option.some(candidate({ onThisComputer: true }))))
+      .toEqual({ totalBytes: 0, modelBytes: 0, projectorBytes: 0, drafterBytes: 0 })
+  })
+
+  it("never offers a rejected drafter and explains why", () => {
     const rejected = candidate({
-      category: "Other",
+      category: "NextToModel",
       verdict: { _tag: "Rejected", reasons: [reason({ _tag: "TargetMismatch", detail: "" })], detail: "" },
     })
     expect(drafterCandidateSelectable(rejected)).toBe(false)
     expect(drafterCandidateWarning(rejected)).toEqual(Option.some("Its drafter wasn't built for this model"))
-    expect(drafterCandidateWarning(candidate({ category: "Other", lineage: "None" })))
-      .toEqual(Option.some("Untested with this model"))
+    expect(drafterCandidateWarning(candidate({ category: "Other", lineage: "None", label: "Untested" }))).toEqual(Option.none())
     expect(preselectedDrafterCandidate([rejected, candidate({ category: "BuiltIn" })]).pipe(Option.map(({ category }) => category)))
       .toEqual(Option.some("BuiltIn"))
+  })
+
+  it("preselects the first bound candidate in ICN's order, never one the user entered", () => {
+    const repository = candidate({ category: "NextToModel", label: "In this repository" })
+    expect(preselectedDrafterCandidate([repository, candidate({})])).toEqual(Option.some(repository))
+    expect(preselectedDrafterCandidate([candidate({ category: "Other", lineage: "None", label: "Untested" })])).toEqual(Option.none())
   })
 
   it("offers the recommended drafter to a model without one", () => {
@@ -144,13 +151,6 @@ describe("drafter presentation", () => {
       recommendedDrafter: Option.some(candidate({ onThisComputer: true })),
     })).pipe(Option.map(({ label }) => label))).toEqual(Option.some("Faster with a drafter · Add"))
     expect(customModelDrafterOffer(makeFoundModel())).toEqual(Option.none())
-  })
-
-  it("reports measured acceptance and a drafter that slows responses", () => {
-    const measured = { acceptanceRate: 0.58, tokensPerSecond: 30, withoutDrafterTokensPerSecond: Option.some(40), slower: true }
-    expect(drafterAcceptanceLabel(measured)).toBe("58% of drafted tokens accepted")
-    expect(drafterSlowingWarning(makeFoundModel({ measuredAcceptance: Option.some(measured) })))
-      .toEqual(Option.some("This drafter is slowing responses"))
   })
 })
 

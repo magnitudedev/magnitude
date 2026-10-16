@@ -17,7 +17,7 @@ use futures_util::stream::BoxStream;
 use magnitude_service_contracts::models::{
     AttachedDrafter, AttachedDrafterState, CustomModel, CustomModelCatalogAttribution,
     CustomModelDeclaration, CustomModelDeclarationOrigin, CustomModelFile, CustomModelOrigin,
-    CustomModelState, DrafterCandidate, DrafterChoice, DrafterReference, EffectiveModel,
+    CustomModelState, DrafterCandidate, DrafterChoice, DrafterPruning, DrafterReference, EffectiveModel,
     FoundSource, HuggingFaceArtifactSelector, HuggingFaceRepositoryId, InstalledCatalogAttribution,
     InstalledModelPackage, LocalModelDigest, LocalModelRemoval, LocalModels,
     LocalModelsConfiguration, LocalModelsResponse, ModelDomainInvalidation, ModelFailure,
@@ -70,6 +70,10 @@ pub struct CustomModelEnrichmentResult {
 /// whose drafter choice is `Auto` uses `recommended_drafter`.
 pub trait CustomModelEnrichment: Send + Sync + 'static {
     fn enrich(&self, model: &CustomModelFacts<'_>) -> CustomModelEnrichmentResult;
+    /// Whether `enrich` answers from knowledge rather than from not having computed it yet.
+    fn knows(&self, _model: &CustomModelFacts<'_>) -> bool {
+        true
+    }
 }
 
 struct NoEnrichment;
@@ -155,6 +159,67 @@ impl ModelDomainResolver {
         Ok(projection)
     }
 
+    /// The Magnitude-owned drafter packages no model uses: not the drafter of an installed
+    /// catalog model, and not the drafter any custom model serves with.
+    fn unused_drafter_packages(&self) -> Result<Vec<ModelPackageId>, InventoryError> {
+        let projection = self.local_projection()?;
+        let installed = self.inventory.installed_packages_response()?;
+        let present = installed
+            .packages
+            .iter()
+            .map(|entry| &entry.package.id)
+            .collect::<BTreeSet<_>>();
+        let separate_draft = |bundle: &ServableModelBundle| match bundle {
+            ServableModelBundle::SpeculativeDecoding {
+                draft_source: SpeculativeDraftSource::Separate { draft },
+                ..
+            } => Some(draft.id.clone()),
+            _ => None,
+        };
+        // A model whose automatic drafter isn't worked out yet may be about to use any catalog
+        // drafter, so none is pruned until it is.
+        let drafter_pending = projection
+            .models
+            .iter()
+            .chain(&projection.hidden)
+            .any(|projected| projected.drafter_pending);
+        let mut used = self
+            .catalog
+            .models
+            .iter()
+            .filter(|definition| {
+                drafter_pending
+                    || present.contains(&crate::lineage::catalog_target(definition).id)
+            })
+            .filter_map(|definition| separate_draft(&definition.configuration.bundle))
+            .collect::<BTreeSet<_>>();
+        used.extend(
+            projection
+                .models
+                .iter()
+                .chain(&projection.hidden)
+                .filter_map(|projected| projected.configuration.as_ref().ok())
+                .filter_map(|configuration| separate_draft(&configuration.bundle)),
+        );
+        let records = self.inventory.installed_packages.read().map_err(|_| {
+            InventoryError::Internal("installed package lock poisoned".to_owned())
+        })?;
+        let unused = records
+            .records
+            .values()
+            .filter(|record| record.installed.origin == ModelPackageInstallationOrigin::Magnitude)
+            .filter(|record| {
+                record
+                    .primary
+                    .as_ref()
+                    .is_some_and(|evidence| matches!(evidence.role, GgufRole::Drafter { .. }))
+            })
+            .map(|record| record.installed.package.id.clone())
+            .filter(|package_id| !used.contains(package_id))
+            .collect::<BTreeSet<_>>();
+        Ok(unused.into_iter().collect())
+    }
+
     pub(crate) fn custom_serving_configuration(
         &self,
         model_id: &ModelId,
@@ -201,6 +266,7 @@ struct ProjectedModel {
     model: CustomModel,
     configuration: Result<ModelServingConfiguration, ModelFailure>,
     managed_packages: Vec<ModelPackageId>,
+    drafter_pending: bool,
 }
 
 #[derive(Clone)]
@@ -575,6 +641,25 @@ fn project(
             projection.models.push(projected);
         }
     }
+    let listed = projection
+        .models
+        .iter()
+        .chain(&projection.hidden)
+        .map(|projected| projected.model.model_id.clone())
+        .collect::<BTreeSet<_>>();
+    for declaration in &configuration.declarations {
+        if listed.contains(&declaration.model_id) {
+            continue;
+        }
+        let Some(projected) = context.pending_added(declaration) else {
+            continue;
+        };
+        if hidden.contains(&projected.model.model_id) {
+            projection.hidden.push(projected);
+        } else {
+            projection.models.push(projected);
+        }
+    }
     projection
 }
 
@@ -664,12 +749,18 @@ impl ModelContext<'_> {
         };
         let installed = &representative.record.installed;
         let evidence = representative.evidence?;
-        let display_name = match representative.ollama_name {
-            Some(name) => name.to_owned(),
-            None => file_stem(&representative.primary),
+        let hub = group.hub();
+        let (presented_name, variant_label) = crate::candidate_files::model_presentation(
+            &hub.map_or_else(|| representative.primary.clone(), |hub| PathBuf::from(&hub.selector)),
+            hub.map(|hub| hub.repository.as_str()),
+            evidence.name.as_deref(),
+        );
+        let display_name = match (representative.ollama_name, hub) {
+            (Some(name), None) => name.to_owned(),
+            _ => presented_name,
         };
         let embedded_mtp = matches!(evidence.role, GgufRole::Model { embedded_mtp: true });
-        let enriched = enrichment.enrich(&CustomModelFacts {
+        let facts = CustomModelFacts {
             model_id: &model_id,
             origin: &origin,
             display_name: &display_name,
@@ -683,7 +774,9 @@ impl ModelContext<'_> {
             architecture: evidence.architecture.as_deref(),
             base_models: &evidence.base_models,
             embedded_mtp,
-        });
+        };
+        let enriched = enrichment.enrich(&facts);
+        let enrichment_known = enrichment.knows(&facts);
 
         let choice = configuration
             .drafters
@@ -769,6 +862,7 @@ impl ModelContext<'_> {
             .map(|file| file.size_bytes)
             .sum();
         Some(ProjectedModel {
+            drafter_pending: matches!(choice, DrafterChoice::Auto) && !enrichment_known,
             managed_packages: group
                 .occurrences
                 .iter()
@@ -781,6 +875,7 @@ impl ModelContext<'_> {
                 model_id,
                 origin,
                 display_name,
+                variant_label,
                 variant_of: enriched.variant_of,
                 files,
                 size_bytes,
@@ -791,6 +886,75 @@ impl ModelContext<'_> {
                 state,
             },
             configuration,
+        })
+    }
+}
+
+impl ModelContext<'_> {
+    /// An added model whose target is not in the store yet: its row exists from the declaration,
+    /// so its download shows as installation progress, and it cannot be served until it lands.
+    fn pending_added(&self, declaration: &CustomModelDeclaration) -> Option<ProjectedModel> {
+        let CustomModelDeclarationOrigin::Added { repository, commit } = &declaration.origin else {
+            return None;
+        };
+        let primary = declaration.target.first()?;
+        let drafter = self
+            .configuration
+            .drafters
+            .iter()
+            .find(|attachment| attachment.model_id == declaration.model_id)
+            .and_then(|attachment| match &attachment.drafter {
+                DrafterChoice::Reference { reference, method } => Some(
+                    resolve_drafter(
+                        reference.clone(),
+                        method.clone(),
+                        false,
+                        self.catalog,
+                        self.occurrences,
+                    )
+                    .attached,
+                ),
+                DrafterChoice::Auto | DrafterChoice::None => None,
+            });
+        let (display_name, variant_label) = crate::candidate_files::model_presentation(
+            Path::new(primary),
+            Some(repository.as_str()),
+            None,
+        );
+        Some(ProjectedModel {
+            model: CustomModel {
+                model_id: declaration.model_id.clone(),
+                origin: CustomModelOrigin::Added {
+                    repository: repository.clone(),
+                    commit: commit.clone(),
+                },
+                display_name,
+                variant_label,
+                variant_of: None,
+                files: declaration
+                    .target
+                    .iter()
+                    .map(|path| CustomModelFile {
+                        path: PathBuf::from(path),
+                        size_bytes: 0,
+                    })
+                    .collect(),
+                size_bytes: 0,
+                projector: None,
+                drafter,
+                recommended_drafter: None,
+                profile: ServingProfile {
+                    context_length: DEFAULT_EXTERNAL_CONTEXT,
+                },
+                state: CustomModelState::NotInstalled,
+            },
+            configuration: Err(ModelFailure {
+                code: "model_not_installed".to_owned(),
+                message: format!("{} has not finished downloading", declaration.model_id),
+                retryable: true,
+            }),
+            managed_packages: Vec::new(),
+            drafter_pending: false,
         })
     }
 }
@@ -1090,6 +1254,27 @@ impl LocalModels for ManagedLocalModels {
         })
     }
 
+    fn prune_drafters(&self) -> BoxFuture<'_, Result<DrafterPruning, InventoryError>> {
+        Box::pin(async move {
+            use magnitude_service_contracts::models::InstalledModelPackages as _;
+            self.inventory().ensure_installed_model_inventory().await?;
+            let unused = self.resolver.unused_drafter_packages()?;
+            let mut removed = Vec::new();
+            let mut freed_bytes = 0_u64;
+            for package_id in unused {
+                let removal = self.inventory().remove_installed(&package_id).await?;
+                if removal.removed {
+                    freed_bytes = freed_bytes.saturating_add(removal.freed_bytes);
+                    removed.push(package_id);
+                }
+            }
+            Ok(DrafterPruning {
+                removed,
+                freed_bytes,
+            })
+        })
+    }
+
     fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation> {
         domain_changes(
             self.resolver.local_revision().unwrap_or_default(),
@@ -1126,17 +1311,18 @@ mod tests {
     }
 
     impl Fixture {
+        /// A fixture whose Hugging Face endpoint refuses every request.
         async fn new() -> Self {
+            Self::with_hub("http://127.0.0.1:9".to_owned()).await
+        }
+
+        async fn with_hub(endpoint: String) -> Self {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().canonicalize().unwrap();
             let store = root.join("store");
-            let inventory = Arc::new(
-                ManagedModelStore::open(
-                    InventoryConfig::with_roots(store.clone(), root.join("cache")).unwrap(),
-                )
-                .await
-                .unwrap(),
-            );
+            let mut config = InventoryConfig::with_roots(store.clone(), root.join("cache")).unwrap();
+            config.hub_endpoint = Some(endpoint);
+            let inventory = Arc::new(ManagedModelStore::open(config).await.unwrap());
             inventory.ensure_installed_model_inventory().await.unwrap();
             let resolver = ModelDomainResolver::new(
                 inventory,
@@ -1390,6 +1576,15 @@ mod tests {
             Some(llama.join("ggml-org_gemma_3-1b_it_mmproj-model-f16.gguf")),
             "the manifest pairs the projector although the directory holds two"
         );
+        assert_eq!(gemma.display_name, "gemma 3 1b it");
+        assert_eq!(gemma.variant_label.as_deref(), Some("Q4_K_M"));
+        let qwen = listed
+            .models
+            .iter()
+            .find(|model| model.model_id.as_str().contains("Qwen3-8B"))
+            .unwrap();
+        assert_eq!(qwen.display_name, "Qwen3 8B");
+        assert_eq!(qwen.variant_label.as_deref(), Some("Q4_K_M"));
     }
 
     fn write_ollama(
@@ -1496,10 +1691,99 @@ mod tests {
             .find(|model| model.display_name == "hf.co/unsloth/Qwen3-8B-GGUF:Q4_K_M")
             .unwrap();
         assert_eq!(
-            hub_pull.model_id.as_str(),
-            "hf:unsloth/Qwen3-8B-GGUF/Q4_K_M.gguf"
+            hub_pull.model_id,
+            local_id(&ollama.join(format!("blobs/sha256-{}", sha256(&pulled)))),
+            "an unresolved pull is identified by its header, never by Ollama's tag"
         );
         assert!(listed.unsupported.is_empty());
+    }
+
+    /// A Hub serving one repository's file listing at `main`.
+    fn serve_repository(repository: &'static str, files: Vec<(&'static str, Vec<u8>)>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "id": repository,
+            "sha": "c".repeat(40),
+            "tags": ["gguf"],
+            "siblings": files.iter().map(|(path, bytes)| serde_json::json!({
+                "rfilename": path,
+                "size": bytes.len(),
+                "lfs": { "sha256": sha256(bytes), "size": bytes.len() },
+            })).collect::<Vec<_>>(),
+        }))
+        .unwrap();
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let found = request_line.contains(&format!("/api/models/{repository}/revision/main"));
+                let (status, body) = if found { ("200 OK", body.as_slice()) } else { ("404 Not Found", &b""[..]) };
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = connection.write_all(body);
+            }
+        });
+        endpoint
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ollama_hub_pull_takes_the_id_of_the_same_file_in_the_hugging_face_cache() {
+        let pulled = model_bytes("hub pull");
+        let endpoint = serve_repository(
+            "unsloth/Qwen3-8B-GGUF",
+            vec![("Qwen3-8B-Q4_K_M.gguf", pulled.clone()), ("Qwen3-8B-Q8_0.gguf", model_bytes("other"))],
+        );
+        let fixture = Fixture::with_hub(endpoint).await;
+        let ollama = fixture.root.join("ollama");
+        write_ollama(
+            &ollama,
+            "hf.co",
+            "unsloth",
+            "Qwen3-8B-GGUF",
+            "Q4_K_M",
+            &[("application/vnd.ollama.image.model", &pulled)],
+        );
+        let expected = "hf:unsloth/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf";
+        let mut listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await;
+        for _ in 0..100 {
+            if ids(&listed.models) == [expected] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            listed = fixture.local.refresh_local().await.unwrap();
+        }
+        assert_eq!(ids(&listed.models), [expected], "Ollama alone resolves the real file name");
+
+        let hub = fixture.root.join("hf/hub");
+        publish_hf_cache(&hub, "unsloth/Qwen3-8B-GGUF", &"c".repeat(40), &[("Qwen3-8B-Q4_K_M.gguf", pulled)]);
+        let both = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::Ollama, &ollama),
+                root(ModelRootKind::HuggingFaceCache, &hub),
+            ]))
+            .await;
+        assert_eq!(ids(&both.models), [expected], "the same bytes in two locations are one model with one ID");
+        let cache_only = fixture
+            .apply(roots(vec![root(ModelRootKind::HuggingFaceCache, &hub)]))
+            .await;
+        assert_eq!(ids(&cache_only.models), [expected]);
     }
 
     #[tokio::test]
@@ -1681,6 +1965,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_truncated_gguf_with_a_whole_header_is_unreadable() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        fs::create_dir_all(&folder).unwrap();
+        let whole = model_bytes("Whole");
+        fs::write(folder.join("whole.gguf"), &whole).unwrap();
+        fs::write(folder.join("truncated.gguf"), &whole[..whole.len() - 1]).unwrap();
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+
+        assert_eq!(
+            ids(&listed.models),
+            [local_id(&folder.join("whole.gguf")).to_string()]
+        );
+        assert_eq!(listed.unsupported.len(), 1);
+        assert_eq!(listed.unsupported[0].path, folder.join("truncated.gguf"));
+        assert_eq!(
+            listed.unsupported[0].reasons,
+            [UnsupportedReason::Unreadable]
+        );
+    }
+
+    #[tokio::test]
     async fn an_unreadable_location_does_not_hide_the_others() {
         let fixture = Fixture::new().await;
         let folder = fixture.root.join("models");
@@ -1825,6 +2134,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_added_model_is_listed_not_installed_until_its_download_lands() {
+        let fixture = Fixture::new().await;
+        let commit = "c".repeat(40);
+        let repository = "owner/Pending-GGUF";
+        let id: ModelId = "hf:owner/Pending-GGUF/Pending-Q4_K_M.gguf".parse().unwrap();
+        let drafter = DrafterReference::HuggingFace {
+            repository: HuggingFaceRepositoryId::new("owner/Pending-DFlash-GGUF").unwrap(),
+            commit: "d".repeat(40),
+            path: "dflash.gguf".to_owned(),
+        };
+        let configuration = LocalModelsConfiguration {
+            declarations: vec![CustomModelDeclaration {
+                model_id: id.clone(),
+                origin: CustomModelDeclarationOrigin::Added {
+                    repository: HuggingFaceRepositoryId::new(repository).unwrap(),
+                    commit: commit.clone(),
+                },
+                target: vec!["Pending-Q4_K_M.gguf".to_owned()],
+                projector: None,
+            }],
+            drafters: vec![DrafterAttachment {
+                model_id: id.clone(),
+                drafter: DrafterChoice::Reference {
+                    reference: drafter.clone(),
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+
+        let pending = fixture.apply(configuration).await;
+        assert_eq!(ids(&pending.models), [id.to_string()]);
+        let model = &pending.models[0];
+        assert_eq!(model.state, CustomModelState::NotInstalled);
+        assert_eq!(model.display_name, "Pending");
+        assert_eq!(model.variant_label.as_deref(), Some("Q4_K_M"));
+        assert_eq!(
+            model
+                .drafter
+                .as_ref()
+                .map(|attached| (&attached.reference, &attached.state)),
+            Some((&drafter, &AttachedDrafterState::NotInstalled))
+        );
+        assert!(
+            fixture
+                .local
+                .resolver
+                .custom_serving_configuration(&id)
+                .is_err()
+        );
+
+        publish_managed(
+            &fixture.store,
+            repository,
+            &commit,
+            &[("Pending-Q4_K_M.gguf", model_bytes("pending"))],
+        );
+        let landed = fixture.local.refresh_local().await.unwrap();
+        assert_eq!(ids(&landed.models), [id.to_string()]);
+        assert!(matches!(
+            landed.models[0].state,
+            CustomModelState::Ready { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rescan_that_finds_nothing_new_keeps_the_catalog_revision() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("model.gguf"), "model");
+        fixture
+            .apply(roots(vec![root(ModelRootKind::Folder, &folder)]))
+            .await;
+        let before = fixture.local.resolver.revision().unwrap();
+        fixture.local.refresh_local().await.unwrap();
+        fixture.local.refresh_local().await.unwrap();
+        assert_eq!(fixture.local.resolver.revision().unwrap(), before);
+
+        write_model(&folder.join("other.gguf"), "other");
+        fixture.local.refresh_local().await.unwrap();
+        assert!(fixture.local.resolver.revision().unwrap() > before);
+    }
+
+    #[tokio::test]
     async fn external_files_are_never_deleted() {
         let fixture = Fixture::new().await;
         let cache = fixture.root.join("hf");
@@ -1922,6 +2315,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_drafter_no_model_uses_is_pruned_and_one_in_use_is_kept() {
+        let fixture = Fixture::new().await;
+        let commit = "e".repeat(40);
+        let snapshot = publish_managed(
+            &fixture.store,
+            "magnitudedev/Model-DFlash-GGUF",
+            &commit,
+            &[("Model-DFlash-Q8_0.gguf", drafter_bytes("drafter"))],
+        );
+        let folder = fixture.root.join("models");
+        write_model(&folder.join("target.gguf"), "target");
+        let target = local_id(&folder.join("target.gguf"));
+        let attached = LocalModelsConfiguration {
+            roots: vec![root(ModelRootKind::Folder, &folder)],
+            drafters: vec![DrafterAttachment {
+                model_id: target,
+                drafter: DrafterChoice::Reference {
+                    reference: DrafterReference::HuggingFace {
+                        repository: HuggingFaceRepositoryId::new("magnitudedev/Model-DFlash-GGUF")
+                            .unwrap(),
+                        commit,
+                        path: "Model-DFlash-Q8_0.gguf".to_owned(),
+                    },
+                    method: SpeculativeMethod::DFlash,
+                },
+            }],
+            ..LocalModelsConfiguration::default()
+        };
+        fixture.apply(attached.clone()).await;
+        let kept = fixture.local.prune_drafters().await.unwrap();
+        assert!(kept.removed.is_empty(), "a drafter a model serves with is kept");
+        assert!(snapshot.join("Model-DFlash-Q8_0.gguf").exists());
+
+        fixture
+            .apply(LocalModelsConfiguration {
+                drafters: Vec::new(),
+                ..attached
+            })
+            .await;
+        let pruned = fixture.local.prune_drafters().await.unwrap();
+        assert_eq!(pruned.removed.len(), 1);
+        assert!(pruned.freed_bytes > 0);
+        assert!(!snapshot.join("Model-DFlash-Q8_0.gguf").exists());
+        assert!(folder.join("target.gguf").exists(), "the model's own files are never touched");
+    }
+
+    #[tokio::test]
     async fn embedded_prediction_heads_attach_only_to_models_that_have_them() {
         let fixture = Fixture::new().await;
         let folder = fixture.root.join("models");
@@ -1991,6 +2431,7 @@ mod tests {
                     reference: DrafterReference::Local {
                         path: self.drafter.clone(),
                     },
+                    name: "drafter.gguf".to_owned(),
                     label: "In this folder".to_owned(),
                     size_bytes: 1,
                     lineage: DrafterLineage::Lineage,

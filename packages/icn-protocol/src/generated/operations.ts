@@ -1150,6 +1150,28 @@ export const previewModelLoadOperation = {
   pathParameters: S.Struct({ model_id: S.String }),
 } as const
 
+export const pruneLocalDraftersOperation = {
+  operationId: "pruneLocalDrafters",
+  transport: "http",
+  method: "POST",
+  path: "/api/v1/local-models/drafters/prune",
+  group: "local-models",
+  successes: [
+    {
+      status: 200,
+      schema: S.suspend((): S.Schema<Schemas.DrafterPruning, Schemas.DrafterPruningEncoded> => Schemas.DrafterPruning),
+      mediaType: "application/json",
+    },
+  ],
+  errors: [
+    {
+      status: 500,
+      schema: S.suspend((): S.Schema<Schemas.ErrorResponse, Schemas.ErrorResponseEncoded> => Schemas.ErrorResponse),
+      mediaType: "application/json",
+    },
+  ],
+} as const
+
 export const refreshLocalModelsOperation = {
   operationId: "refreshLocalModels",
   transport: "http",

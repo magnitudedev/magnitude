@@ -3,18 +3,18 @@ import {
   DrafterCandidateSchema,
   DrafterReferenceSchema,
   type DrafterCandidate,
-  type DrafterLineage,
   type DrafterReference,
-  type MeasuredDrafterAcceptance,
   type SpeculativeMethod,
 } from "@magnitudedev/acn-protocol"
 import type * as Native from "@magnitudedev/icn-protocol/schemas"
+import type { CatalogModelSource } from "./local-model-sources"
+import { productUnsupportedReasons } from "./unsupported-reasons"
 
 /** An encoded optional field: present with its value, or absent; never present and undefined. */
 export const presentField = <K extends string, A>(key: K, value: Option.Option<A>): { readonly [P in K]?: A } =>
   Option.match(value, { onNone: () => ({}), onSome: (present) => ({ [key]: present }) as { readonly [P in K]?: A } })
 
-/** A stable identity for one drafter, used to attribute serving usage and match candidates. */
+/** A stable identity for one drafter, used to match candidates and remember binding methods. */
 export const drafterReferenceKey = (reference: DrafterReference): string => {
   switch (reference._tag) {
     case "Catalog": return `catalog:${reference.modelId}`
@@ -30,51 +30,76 @@ export const nativeDrafterReference = (reference: DrafterReference): Native.Draf
 export const productDrafterReference = (reference: Native.DrafterReference): Option.Option<DrafterReference> =>
   Schema.decodeUnknownOption(DrafterReferenceSchema)(reference)
 
-/** ICN's candidate in product form; a candidate the protocol cannot represent is dropped. */
+export interface DrafterNaming {
+  readonly name: string
+  readonly label: string
+}
+
+const methodName = (method: SpeculativeMethod): string => method._tag === "Mtp" ? "MTP" : method._tag
+
+const fileName = (path: string): string => path.split(/[\\/]/).at(-1) ?? path
+
+/**
+ * The name and label of the drafter a catalog model ships, such as "Magnitude DFlash for Qwen3.5 4B"
+ * and "Trained for Qwen3.5 4B": the same form ICN gives a catalog drafter candidate.
+ */
+export const catalogDrafterNaming = (
+  catalog: readonly CatalogModelSource[],
+  modelId: string,
+): Option.Option<DrafterNaming> => Option.map(
+  Option.fromNullable(catalog.find(({ id }) => id === modelId)),
+  ({ source }) => ({
+    name: Option.match(source.desired.speculativeMethod, {
+      onNone: () => `Magnitude drafter for ${source.displayName}`,
+      onSome: (method) => `Magnitude ${methodName(method)} for ${source.displayName}`,
+    }),
+    label: `Trained for ${source.displayName}`,
+  }),
+)
+
+/**
+ * How an attached drafter reads when no candidate describes it: a catalog drafter is named from the
+ * catalog, and any other separate drafter, not being the recommendation, was chosen by the user.
+ */
+export const drafterReferenceNaming = (
+  reference: DrafterReference,
+  catalog: readonly CatalogModelSource[],
+): DrafterNaming => {
+  switch (reference._tag) {
+    case "Catalog": return Option.getOrElse(catalogDrafterNaming(catalog, reference.modelId), () => ({
+      name: "Magnitude drafter",
+      label: "Trained by Magnitude",
+    }))
+    case "Embedded": return { name: "MTP heads", label: "Built into this model" }
+    case "HuggingFace": return { name: `${reference.repository}/${fileName(reference.path)}`, label: "Chosen by you" }
+    case "Local": return { name: fileName(reference.path), label: "Chosen by you" }
+  }
+}
+
+/**
+ * ICN's candidate in product form; a candidate the protocol cannot represent is dropped. A catalog
+ * drafter takes its name from the catalog, so it reads the same as the drafter once attached.
+ */
 export const productDrafterCandidate = (
   candidate: Native.DrafterCandidate,
-  measuredAcceptance: Option.Option<MeasuredDrafterAcceptance> = Option.none(),
-): Option.Option<DrafterCandidate> => Schema.decodeUnknownOption(DrafterCandidateSchema)({
+  catalog: readonly CatalogModelSource[],
+):Option.Option<DrafterCandidate> => Schema.decodeUnknownOption(DrafterCandidateSchema)({
   category: candidate.category,
   reference: candidate.reference,
-  label: candidate.label,
+  ...Option.getOrElse(
+    candidate.reference._tag === "Catalog"
+      ? catalogDrafterNaming(catalog, candidate.reference.modelId)
+      : Option.none<DrafterNaming>(),
+    (): DrafterNaming => ({ name: candidate.name, label: candidate.label }),
+  ),
   sizeBytes: candidate.sizeBytes,
   lineage: candidate.lineage,
   onThisComputer: candidate.onThisComputer,
   ...presentField("method", candidate.method),
-  verdict: candidate.verdict._tag === "Rejected" && candidate.verdict.reasons.length === 0
-    ? { ...candidate.verdict, reasons: [{ _tag: "Unknown", kind: "Unknown", detail: candidate.verdict.detail }] }
+  verdict: candidate.verdict._tag === "Rejected"
+    ? { ...candidate.verdict, reasons: productUnsupportedReasons(candidate.verdict.reasons, candidate.verdict.detail) }
     : candidate.verdict,
-}).pipe(Option.map((decoded) => ({ ...decoded, measuredAcceptance })))
-
-const categoryOrder: Record<DrafterCandidate["category"], number> = {
-  CatalogDrafter: 0, BuiltIn: 1, NextToModel: 2, OnThisComputer: 3, HuggingFace: 4, Other: 5,
-}
-
-const lineageOrder: Record<DrafterLineage, number> = { Exact: 0, Lineage: 0, Fingerprint: 1, None: 2 }
-
-/**
- * Candidates in category order; within a category a lineage match precedes a fingerprint-only
- * match, then the higher measured acceptance (a measured pair before an unmeasured one), then the
- * smaller download. Equal candidates keep ICN's order.
- */
-export const orderDrafterCandidates = (candidates: readonly DrafterCandidate[]): readonly DrafterCandidate[] =>
-  candidates
-    .map((candidate, index) => ({ candidate, index }))
-    .sort((left, right) => {
-      const a = left.candidate
-      const b = right.candidate
-      const acceptance = (candidate: DrafterCandidate) => Option.match(candidate.measuredAcceptance, {
-        onNone: () => -1,
-        onSome: ({ acceptanceRate }) => acceptanceRate,
-      })
-      return categoryOrder[a.category] - categoryOrder[b.category]
-        || lineageOrder[a.lineage] - lineageOrder[b.lineage]
-        || acceptance(b) - acceptance(a)
-        || a.sizeBytes - b.sizeBytes
-        || left.index - right.index
-    })
-    .map(({ candidate }) => candidate)
+})
 
 /** The method each drafter binds with, learned from the engine; MTP heads are always MTP. */
 export interface DrafterMethodsApi {

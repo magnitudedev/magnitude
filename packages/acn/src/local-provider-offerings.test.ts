@@ -68,7 +68,6 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       },
       drafter: Option.none(),
       recommendedDrafter: Option.none(),
-      measuredAcceptance: Option.none(),
       acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
       servingState,
       storageBytes: 1_000,

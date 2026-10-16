@@ -455,7 +455,9 @@ fn validated_package_from_resolved_with(
 pub(crate) fn validated_package_from_resolved(
     resolved: &ResolvedModel,
 ) -> Result<ValidatedModelPackage, InventoryError> {
-    validated_package_from_resolved_with(resolved, |path, _| crate::gguf::inspect(path).ok())
+    validated_package_from_resolved_with(resolved, |path, _| {
+        crate::gguf::inspect_complete(path).ok()
+    })
 }
 
 fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
@@ -739,7 +741,7 @@ impl ManagedModelStore {
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v2", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v3", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }
@@ -753,7 +755,7 @@ impl ManagedModelStore {
         if let Some(inspection) = self.cache.read_index(ModelIndexKind::GgufInspection, &key) {
             return Some(inspection);
         }
-        let inspection = crate::gguf::inspect(path).ok()?;
+        let inspection = crate::gguf::inspect_complete(path).ok()?;
         self.cache
             .write_index(ModelIndexKind::GgufInspection, &key, &inspection);
         Some(inspection)

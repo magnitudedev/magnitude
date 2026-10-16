@@ -144,19 +144,21 @@ is likewise independent of background assessment.
 it adds that model pinned to the repository's current commit: with no quant it picks the
 recommended version, with no `--drafter` it uses `auto` (the preselected drafter), and it prints
 what it chose and the model ID to load. A version already on this computer downloads only the
-drafter, and says so. Pull acknowledges admitted download or update work and directs the caller to
+drafter, and says so. Pull acknowledges admitted work by what it is, from the sync outcome: a first
+or resumed download, an update to a newer revision, or a missing drafter, and directs the caller to
 focused model status. Pull, cancel, and removal validate only argument syntax before delegating
 directly to their authoritative mutations.
 
 `models import` adds one GGUF file in place, with the same drafter choice. `models drafter` adds,
 changes, or turns off the drafter of a custom model and is refused for catalog models. `models hide`
-and `unhide` apply to found models. `models folders list` shows the automatic locations and the
+and `unhide` apply to found models, including a catalog model whose files are only in an external
+location; `catalog remove` on such a model explains where the files are and points at `models hide`. `models folders list` shows the automatic locations and the
 user's folders; `add` and `remove` manage the folders.
 
 `models status` lists catalog models on the computer or with relevant acquisition/removal work and
 every visible custom model, with its source, followed by a footer counting models that can't run and
-hidden models; `--all` lists those with their reasons and lists hidden models marked hidden. The addressed form adds Source, Variant of, Drafter, measured
-acceptance, and the drafter candidates with their labels and verdicts. Addressed model commands
+hidden models; `--all` lists those with their reasons and lists hidden models marked hidden. The addressed form adds Source, Variant of, Drafter,
+and the drafter candidates with their labels and verdicts. Addressed model commands
 accept every canonical model ID. One status field applies product priority:
 removal, transfer, failures, load/stop, ready, update availability, then unloaded. An optimizing
 model reports `Optimizing` with its percentage once tuning is measured. The addressed

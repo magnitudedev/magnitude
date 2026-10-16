@@ -1402,6 +1402,36 @@
         }
       }
     },
+    "/api/v1/local-models/drafters/prune": {
+      "post": {
+        "tags": [
+          "local-models"
+        ],
+        "operationId": "pruneLocalDrafters",
+        "responses": {
+          "200": {
+            "description": "Magnitude-owned drafter packages no model uses were removed; drafters in other locations are never touched",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrafterPruning"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Removal failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/local-models/refresh": {
       "post": {
         "tags": [
@@ -2653,11 +2683,13 @@
       },
       "CandidateVersion": {
         "type": "object",
+        "description": "One version of a candidate. `download_bytes` is what adding it downloads before any drafter:\nits files and the repository's projector, or nothing when it is already on this computer or\nis a local file used in place.",
         "required": [
           "label",
           "modelId",
           "files",
           "sizeBytes",
+          "downloadBytes",
           "recommended"
         ],
         "properties": {
@@ -2674,6 +2706,11 @@
             }
           },
           "sizeBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "downloadBytes": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
@@ -4234,6 +4271,9 @@
           "displayName": {
             "type": "string"
           },
+          "variantLabel": {
+            "type": "string"
+          },
           "variantOf": {
             "$ref": "#/components/schemas/ModelId"
           },
@@ -4684,6 +4724,7 @@
         "required": [
           "category",
           "reference",
+          "name",
           "label",
           "sizeBytes",
           "lineage",
@@ -4696,6 +4737,9 @@
           },
           "reference": {
             "$ref": "#/components/schemas/DrafterReference"
+          },
+          "name": {
+            "type": "string"
           },
           "label": {
             "type": "string"
@@ -4784,12 +4828,11 @@
       },
       "DrafterCategory": {
         "type": "string",
+        "description": "Where a drafter candidate comes from, in the order automatic choice prefers: a separate drafter\nin the model's own repository or folder, the matched catalog model's drafter, MTP heads built\ninto the model, then a drafter the user entered, which is never chosen automatically.",
         "enum": [
+          "NextToModel",
           "CatalogDrafter",
           "BuiltIn",
-          "NextToModel",
-          "OnThisComputer",
-          "HuggingFace",
           "Other"
         ]
       },
@@ -4856,6 +4899,28 @@
           "Fingerprint",
           "None"
         ]
+      },
+      "DrafterPruning": {
+        "type": "object",
+        "description": "Magnitude-owned drafter packages removed because no model uses them any more.",
+        "required": [
+          "removed",
+          "freedBytes"
+        ],
+        "properties": {
+          "removed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelPackageId"
+            }
+          },
+          "freedBytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "DrafterReference": {
         "oneOf": [

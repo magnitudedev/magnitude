@@ -72,9 +72,13 @@ export const acquisitionFailure = (download: ModelDownload): Option.Option<Model
     ? Option.some(download.state.failure as ModelAcquisitionFailure)
     : Option.none()
 
-/** The newest related download of a kind whose state still matters: running, or failed and unacknowledged. */
+/**
+ * The newest related download of a kind, when its state still matters: running, or failed and
+ * unacknowledged. A newer attempt supersedes an older failure.
+ */
 export const currentDownload = (
   related: readonly RelatedDownload[],
   kind: RelatedDownload["kind"],
-): Option.Option<ModelDownload> => Option.fromNullable(related.findLast((entry) => entry.kind === kind
-  && (downloadIsActive(entry.download) || downloadHasUnacknowledgedFailure(entry.download)))?.download)
+): Option.Option<ModelDownload> => Option.fromNullable(related.findLast((entry) => entry.kind === kind)?.download).pipe(
+  Option.filter((download) => downloadIsActive(download) || downloadHasUnacknowledgedFailure(download)),
+)

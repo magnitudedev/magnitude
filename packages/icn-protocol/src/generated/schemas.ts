@@ -232,6 +232,7 @@ export const CandidateVersion = S.Struct({
     S.suspend((): S.Schema<ModelAssessment, ModelAssessmentEncoded> => ModelAssessment),
     { exact: true, as: "Option" },
   ),
+  downloadBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   files: S.Array(S.suspend((): S.Schema<CandidateFile, CandidateFileEncoded> => CandidateFile)),
   label: S.String,
   modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
@@ -934,6 +935,7 @@ export const CustomModel = S.Struct({
   ),
   sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
   state: S.suspend((): S.Schema<CustomModelState, CustomModelStateEncoded> => CustomModelState),
+  variantLabel: S.optionalWith(S.String, { exact: true, as: "Option" }),
   variantOf: S.optionalWith(
     S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
     { exact: true, as: "Option" },
@@ -1101,6 +1103,7 @@ export const DrafterCandidate = S.Struct({
     S.suspend((): S.Schema<SpeculativeMethod, SpeculativeMethodEncoded> => SpeculativeMethod),
     { exact: true, as: "Option" },
   ),
+  name: S.String,
   onThisComputer: S.Boolean,
   reference: S.suspend((): S.Schema<DrafterReference, DrafterReferenceEncoded> => DrafterReference),
   sizeBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
@@ -1135,11 +1138,9 @@ export type DrafterCandidatesResponse = S.Schema.Type<typeof DrafterCandidatesRe
 export type DrafterCandidatesResponseEncoded = S.Schema.Encoded<typeof DrafterCandidatesResponse>
 
 export const DrafterCategory = S.Union(
+  S.Literal("NextToModel"),
   S.Literal("CatalogDrafter"),
   S.Literal("BuiltIn"),
-  S.Literal("NextToModel"),
-  S.Literal("OnThisComputer"),
-  S.Literal("HuggingFace"),
   S.Literal("Other"),
 )
 export type DrafterCategory = S.Schema.Type<typeof DrafterCategory>
@@ -1167,6 +1168,13 @@ export const DrafterLineage = S.Union(
 )
 export type DrafterLineage = S.Schema.Type<typeof DrafterLineage>
 export type DrafterLineageEncoded = S.Schema.Encoded<typeof DrafterLineage>
+
+export const DrafterPruning = S.Struct({
+  freedBytes: S.Number.pipe(S.int(), S.greaterThanOrEqualTo(0)),
+  removed: S.Array(S.suspend((): S.Schema<ModelPackageId, ModelPackageIdEncoded> => ModelPackageId)),
+})
+export type DrafterPruning = S.Schema.Type<typeof DrafterPruning>
+export type DrafterPruningEncoded = S.Schema.Encoded<typeof DrafterPruning>
 
 export const DrafterReference = S.Union(
   S.extend(

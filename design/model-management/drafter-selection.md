@@ -5,7 +5,8 @@ applies_to:
   - inference/service/models/src/custom_models.rs
   - inference/service/server/src/assessment/**
   - packages/acn/src/local-model*
-  - packages/acn/src/serving-usage*
+  - packages/acn/src/drafter-references*
+  - packages/client-common/src/local-models/drafter-presentation*
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/storage/src/types/custom-models*
 ---
@@ -25,9 +26,11 @@ is configuration of a model, never part of its `ModelId`.
 ## Ownership
 
 ICN computes catalog targets' shape fingerprints from the release header bundle, enumerates drafter
-candidates for a target (a candidate or a model ID), and assesses each candidate's binding. ACN
-orders candidates by measured acceptance, persists attached drafters as declarations, and exposes
-the choice. Clients present the list and never judge compatibility.
+candidates for a target (a candidate or a model ID), assesses each candidate's binding, and orders
+them for automatic choice; the recommended drafter of a custom model is the first candidate ICN's
+order binds. ACN keeps ICN's order, persists attached drafters as declarations, and exposes the
+choice. Clients present the list, preselect the first bound candidate that the user did not enter,
+and never judge compatibility.
 
 ## Matching a model to its catalog parent
 
@@ -52,24 +55,34 @@ verdict alone decides compatibility.
 
 ## Candidates
 
-Candidates are listed in this order, and the first that binds is preselected (`auto`):
+Only these sources are offered automatically:
 
-1. **The catalog drafter of the matched catalog model** ("Recommended · Trained for <model>").
-2. **Built-in MTP heads**, detected from the selected file's tensors, never its name ("Built into
-   this model").
-3. **Drafter files next to the model** in the same repository or folder ("In this repository").
-4. **Drafters already on this computer** in any model location whose lineage matches and which bind
-   ("On this computer"); no download.
-5. **Third-party drafters on Hugging Face** for the matched base, found by `base_model` and the
-   `speculative-decoding` tag, labelled by uploader.
-6. **A different drafter**: any Hugging Face reference or local file. It is shown with the engine's
-   verdict, cannot be chosen when rejected, and is warned as untested when its lineage does not
-   match.
-7. **No drafter.**
+- **Separate drafters in the model's own repository (any path in it) or folder**: GGUFs whose header declares a
+  drafter role ("In this repository", or "In this folder" for local files).
+- **The catalog drafter of the matched catalog model** ("Trained for <model>").
+- **Built-in MTP heads**, detected from the selected file's tensors, never its name ("Built into this model").
 
-Within one category, a lineage match precedes a fingerprint-only match, then higher measured
-acceptance, then the smaller download. A rejected candidate is never preselected or offered as a
-choice.
+Magnitude never searches Hugging Face for drafters and never offers loose drafter files from other locations. A
+user may enter **a different drafter** (a Hugging Face file or a local path); it is checked like every candidate,
+cannot be chosen when rejected, is labelled "Untested" when its lineage does not match, and is never chosen
+automatically. **No drafter** is always available. The preselected candidate's label reads "Recommended · ",
+followed by its source label.
+
+## Automatic choice
+
+Method order matches the speculation axis of the model radar: DFlash2, DSpark, DFlash, a separate MTP file, then
+built-in MTP heads. The first candidate that binds, in this order, is preselected:
+
+1. a separate drafter in the model's own repository or folder, any method, by method order, because it was
+   built for those exact weights;
+2. the catalog drafter, whatever its method;
+3. built-in MTP heads;
+4. no drafter.
+
+Ties within one method go to the smaller download (nothing, when its files are already here), then ICN's
+enumeration order. Candidates are listed in this same order: by source, then method, then download. A
+rejected candidate is listed but never preselected.
+Catalog models always use their catalog drafter.
 
 ## Controls
 
@@ -83,14 +96,6 @@ choice.
   drafter in an external location remains externally owned.
 - When a catalog drafter gets a new revision, every model using it, catalog or custom, shows
   Update.
-
-## Measured acceptance
-
-Once a model with a drafter has served requests, ACN records the acceptance rate and decode speed for
-that model and drafter pair with [local serving usage](../acn/local-serving-usage.md). Details show
-the measured rate. When a drafter makes decoding slower than plain decoding, the model reports that
-the drafter is slowing responses and offers Change and Turn off. Ordering uses these measurements
-where they exist; assessment never models acceptance.
 
 ## Conformance
 

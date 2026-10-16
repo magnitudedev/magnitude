@@ -3,8 +3,8 @@ import type { ReactNode } from "react"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Dialog } from "./ui/dialog"
-import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, confirmAction, formatDownloads, initialVersion, parseModelReference, versionVerdict, type FindTab } from "./add-model-dialog"
-import { catalogId, catalogModel, inspection, repository, version, doesNotFit, unsupported } from "../../test/models/fixtures"
+import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, confirmAction, formatDownloads, initialVersion, parseModelReference, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
+import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
 const models = [catalogModel()]
@@ -66,7 +66,15 @@ describe("repository step", () => {
     expect(versionVerdict(version("Q4_K_P", { recommended: true }))).toMatchObject({ label: "Recommended", selectable: true })
     expect(versionVerdict(version("Q5_K_P"))).toMatchObject({ label: "Fits your machine", selectable: true })
     expect(versionVerdict(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toMatchObject({ label: "Too large for this machine", selectable: false })
-    expect(versionVerdict(version("IQ2_M", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "IQ2_S", tensorCount: 100 }] })) }))).toMatchObject({ label: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false })
+    expect(versionVerdict(version("IQ2_M", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "IQ2_S", tensorCount: 100 }] })) }))).toMatchObject({ label: "Not supported yet", detail: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false })
+  })
+  it("words unsupported versions briefly: planned support, not supported, or damaged", () => {
+    expect(unsupportedVersionLabel([{ _tag: "RopeScaling", kind: "yarn" }, { _tag: "TiedOutputHead" }])).toBe("Not supported yet")
+    expect(unsupportedVersionLabel([{ _tag: "Backend", backend: "metal" }])).toBe("Not supported yet")
+    expect(unsupportedVersionLabel([{ _tag: "Architecture", architecture: "deepseek4" }])).toBe("Not supported")
+    expect(unsupportedVersionLabel([{ _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }, { _tag: "Architecture", architecture: "deepseek4" }])).toBe("Not supported")
+    expect(unsupportedVersionLabel([{ _tag: "Unknown", kind: "Sliding", detail: "x" }])).toBe("Not supported")
+    expect(unsupportedVersionLabel([{ _tag: "Unreadable" }, { _tag: "WeightTypes", types: [{ ggmlType: "IQ1_M", tensorCount: 1 }] }])).toBe("File is damaged")
   })
   it("starts on a linked file, then the pasted version, then the recommended one", () => {
     expect(initialVersion(inspection(), Option.some("Q8_K_P.gguf"))).toEqual(Option.some("Q8_K_P"))
@@ -74,13 +82,17 @@ describe("repository step", () => {
     expect(initialVersion(inspection(), Option.none())).toEqual(Option.some("Q4_K_P"))
     expect(initialVersion(inspection({ versions: [version("Q5_K_P")] }), Option.none())).toEqual(Option.some("Q5_K_P"))
   })
-  it("totals the target, drafter, and projector for Download, and only the drafter for a version already here", () => {
+  it("totals the version's download (target and projector) with the chosen drafter, and only the drafter for a version already here", () => {
     const withProjector = inspection({ projector: Option.some({ path: "mmproj.gguf", sizeBytes: 1_000_000_000 }) })
-    expect(confirmAction(withProjector, version("Q4_K_P"), 900_000_000)).toEqual({ label: "Download (25.3 GB)", download: true })
-    const here = version("Q4_K_P", { onThisComputer: Option.some(catalogId) })
-    expect(confirmAction(withProjector, here, 900_000_000)).toEqual({ label: "Add (900 MB)", download: false })
-    expect(confirmAction(withProjector, here, 0)).toEqual({ label: "Add", download: false })
-    expect(confirmAction(inspection({ source: { _tag: "Local", path: "/models/a.gguf" } }), version("a"), 0).label).toBe("Add")
+    const toDownload = version("Q4_K_P", { downloadBytes: 24_400_000_000 })
+    const drafter = Option.some(drafterCandidate())
+    expect(confirmAction(withProjector, toDownload, drafter)).toEqual({ label: "Download (25.3 GB)", download: true })
+    expect(confirmAction(withProjector, toDownload, Option.none())).toEqual({ label: "Download (24.4 GB)", download: true })
+    expect(confirmAction(withProjector, toDownload, Option.some(drafterCandidate({ onThisComputer: true })))).toEqual({ label: "Download (24.4 GB)", download: true })
+    const here = version("Q4_K_P", { onThisComputer: Option.some(catalogId), downloadBytes: 0 })
+    expect(confirmAction(withProjector, here, drafter)).toEqual({ label: "Add (900 MB)", download: false })
+    expect(confirmAction(withProjector, here, Option.none())).toEqual({ label: "Add", download: false })
+    expect(confirmAction(inspection({ source: { _tag: "Local", path: "/models/a.gguf" } }), version("a"), Option.none()).label).toBe("Add")
   })
   it("shows the repository link, lineage, license, and every version with its verdict", () => {
     const html = inDialog(<RepositoryView inspection={inspection({ versions: [...inspection().versions, version("Q6_K_P", { onThisComputer: Option.some(catalogId) })] })} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} onBack={() => {}} drafters={<p>drafter list</p>} />)
@@ -89,7 +101,7 @@ describe("repository step", () => {
     expect(html).toContain("apache-2.0")
     expect(html).toContain("Too large for this machine")
     expect(html).toContain("Recommended")
-    expect(html).toContain("Uses Q2_K weights, which Magnitude doesn&#x27;t support yet")
+    expect(html).toContain('title="Uses Q2_K weights, which Magnitude doesn&#x27;t support yet">Not supported yet<')
     expect(html).toContain("Already on this computer")
     expect(html).toContain("drafter list")
     expect(html).toContain('aria-label="Back to search"')

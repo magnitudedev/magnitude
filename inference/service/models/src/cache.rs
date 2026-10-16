@@ -35,6 +35,8 @@ pub enum ModelIndexKind {
     HuggingFaceGgufHeader,
     RecommendableModelCatalog,
     ModelAssessment,
+    CandidateClassification,
+    OllamaHubFile,
 }
 
 impl ModelIndexKind {
@@ -47,6 +49,8 @@ impl ModelIndexKind {
             Self::HuggingFaceGgufHeader => "sources/hugging-face/gguf-headers",
             Self::RecommendableModelCatalog => "catalogs/recommendable-models",
             Self::ModelAssessment => "assessments/model-configurations",
+            Self::CandidateClassification => "inspections/candidate-classification",
+            Self::OllamaHubFile => "sources/hugging-face/ollama-files",
         }
     }
 }
@@ -161,6 +165,12 @@ impl ModelCache {
             .then(|| read_bytes(&self.blob_path(kind, digest), MAX_BLOB_BYTES))
             .flatten()
             .filter(|bytes| hex_sha256(bytes) == digest)
+    }
+
+    /// Whether a blob is stored, without reading or verifying it; `read_blob` still verifies.
+    #[must_use]
+    pub fn has_blob(&self, kind: ModelBlobKind, digest: &str) -> bool {
+        valid_digest(digest) && self.blob_path(kind, digest).is_file()
     }
 
     pub fn write_blob(&self, kind: ModelBlobKind, digest: &str, bytes: &[u8]) {
