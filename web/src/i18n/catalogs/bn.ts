@@ -649,4 +649,7 @@ export const bn = {
   korean: "কোরীয়",
   vietnamese: "ভিয়েতনামি",
   indonesian: "ইন্দোনেশীয়",
+  noModelsDownloaded: "এখনও কোনো মডেল ডাউনলোড করা হয়নি। Discover-এ একটি খুঁজুন।",
+  couldNotCheckAvailableModels: "উপলভ্য মডেল পরীক্ষা করা যায়নি",
+  restartServerToApply: "{reason} পরিবর্তনগুলি প্রয়োগ করতে Magnitude সার্ভার পুনরায় চালু করুন।",
 } satisfies typeof en
