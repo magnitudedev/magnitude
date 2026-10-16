@@ -649,4 +649,7 @@ export const fr = {
   korean: "Coréen",
   vietnamese: "Vietnamien",
   indonesian: "Indonésien",
+  noModelsDownloaded: "Aucun modèle téléchargé pour le moment. Trouvez-en un dans Découvrir.",
+  couldNotCheckAvailableModels: "Impossible de vérifier les modèles disponibles",
+  restartServerToApply: "{reason} Redémarrez le serveur Magnitude pour appliquer les modifications.",
 } satisfies typeof en
