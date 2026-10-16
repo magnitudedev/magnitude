@@ -639,4 +639,8 @@ export const de = {
   reloadWindowRestart: "Laden Sie dieses Fenster neu. Wenn es sich weiterhin nicht öffnet, starten Sie Magnitude neu.",
   quitAndReopen: "Beenden Sie Magnitude und öffnen Sie es erneut.",
   savedAppearanceReadError: "Das gespeicherte Erscheinungsbild konnte nicht gelesen werden. Das System-Erscheinungsbild wird verwendet.",
+  chineseTraditional: "Traditionelles Chinesisch",
+  korean: "Koreanisch",
+  vietnamese: "Vietnamesisch",
+  indonesian: "Indonesisch",
 } satisfies typeof en
