@@ -92,13 +92,13 @@ export function useSignInRecheck(): Effect.Effect<boolean> {
 
 export type DisconnectWarning = "TurnOffNetworkAccess" | "RegenerateKey" | "StopRequiringKey" | "ChangeAddress" | "Restart"
 
-const warnings: Record<DisconnectWarning, { title: string; description: string; confirmLabel: string }> = {
+const getWarnings = (): Record<DisconnectWarning, { title: string; description: string; confirmLabel: string }> => ({
   TurnOffNetworkAccess: { title: tr("turnOffNetworkQuestion"), description: tr("turnOffNetworkDescription"), confirmLabel: tr("turnOff") },
   RegenerateKey: { title: tr("regenerateKeyQuestion"), description: tr("regenerateKeyDescription"), confirmLabel: tr("regenerate") },
   StopRequiringKey: { title: tr("stopRequiringKeyQuestion"), description: tr("stopRequiringKeyDescription"), confirmLabel: tr("stopRequiring") },
   ChangeAddress: { title: tr("changeAddressQuestion"), description: tr("changeAddressDescription"), confirmLabel: tr("changeAddress") },
   Restart: { title: tr("restartMagnitudeQuestion"), description: tr("restartDisconnectDescription"), confirmLabel: tr("restart") },
-}
+})
 
 /**
  * Runs an action that can cut this browser off. From another device it first asks in an
@@ -107,7 +107,7 @@ const warnings: Record<DisconnectWarning, { title: string; description: string; 
 export function useDisconnectWarning(): { readonly warn: (warning: DisconnectWarning, action: () => void) => void; readonly dialog: ReactNode } {
   const { remote } = useRemoteAccess()
   const [pending, setPending] = useState<{ warning: DisconnectWarning; action: () => void } | null>(null)
-  const copy = pending === null ? null : warnings[pending.warning]
+  const copy = pending === null ? null : getWarnings()[pending.warning]
   return {
     warn: (warning, action) => remote ? setPending({ warning, action }) : action(),
     dialog: copy && <ConfirmDialog open onOpenChange={open => { if (!open) setPending(null) }} title={copy.title} description={copy.description}
