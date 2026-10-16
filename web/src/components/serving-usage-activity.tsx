@@ -64,7 +64,7 @@ export function UsageActivity({ days }: { days: Activity | null }) {
             const month = week.find(day => day.date.endsWith("-01"))
             return <th key={column} scope="col" className="h-6 overflow-visible whitespace-nowrap text-left text-xs font-normal text-slate-500">{month && new Date(`${month.date}T12:00:00Z`).toLocaleDateString(locale(), { timeZone: "UTC", month: "short" })}</th>
           })}</tr></thead>
-          <tbody>{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((weekday, row) => <tr key={weekday}>
+          <tbody>{Array.from({ length: 7 }, (_, row) => new Date(Date.UTC(2023, 0, row + 1)).toLocaleDateString(locale(), { timeZone: "UTC", weekday: "short" })).map((weekday, row) => <tr key={weekday}>
             <th scope="row" className="text-left text-[10px] font-normal text-slate-500"><span className={row % 2 === 0 ? "sr-only" : ""}>{weekday}</span></th>
             {weeks.map((week, column) => {
               const day = week[row]
