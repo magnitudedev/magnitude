@@ -1,6 +1,6 @@
 import { Option } from "effect"
 import type { ModelAcquisitionFailure, ModelInstanceFailure, ModelFailure } from "@magnitudedev/sdk"
-import { MEMORY_SHORTAGE_TITLE, describeMemoryShortage, formatStorageSize, memoryShortageTitle, type LocalModelCommandFailure } from "@magnitudedev/client-common"
+import { formatStorageSize, type LocalModelCommandFailure } from "@magnitudedev/client-common"
 import { ErrorNotice, type NoticeContent } from "./error-notice"
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip"
 import { WarningCircleIcon } from "@phosphor-icons/react"
@@ -10,7 +10,15 @@ import { readLanguage, translate } from "../i18n"
 const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
 
 export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent => {
-  if ("_tag" in failure) return { title: memoryShortageTitle(failure.shortage), description: describeMemoryShortage(failure.shortage) }
+  if ("_tag" in failure) {
+    if (failure.shortage._tag === "Blocked") return {
+      title: tr("notEnoughMemoryRightNow"),
+      description: tr("blockedMemoryDescription")
+        .replace("{required}", formatStorageSize(failure.shortage.requiredBytes, { rounding: "up" }))
+        .replace("{available}", formatStorageSize(failure.shortage.availableBytes)),
+    }
+    return { title: tr("memoryPressureTitle"), description: tr("memoryPressureDescription") }
+  }
   return { title: tr("modelCouldNotStart"), description: tr("tryLoadAnother") }
 }
 
@@ -40,7 +48,7 @@ export const downloadNotice = (failure: ModelAcquisitionFailure): NoticeContent 
     case "NetworkUnavailable": return { title: tr("cannotReachSource"), description: tr("checkInternet") }
     case "LocalStorageFailure": return { title: tr("couldNotSaveModel"), description: tr("checkModelFolder") }
     case "CorruptDownload": return { title: tr("downloadNotVerified"), description: tr("retryDownloadAgain") }
-    case "Internal": return { title: tr("downloadCouldNotFinish"), description: "Try the download again." }
+    case "Internal": return { title: tr("downloadCouldNotFinish"), description: tr("retryDownloadAgain") }
   }
 }
 
@@ -59,8 +67,14 @@ export const modelCommandNotice = (failure: LocalModelCommandFailure): NoticeCon
   if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_does_not_fit") return {
     title: tr("modelDoesNotFit"), description: tr("needsMoreMemory"),
   }
-  if (Option.isSome(failure.rejection) && failure.rejection.value.code === "memory_shortage") return {
-    title: MEMORY_SHORTAGE_TITLE, description: tr("quitUnusedApps"),
+  if (Option.isSome(failure.rejection) && failure.rejection.value.code === "memory_shortage") {
+    const shortage = failure.rejection.value.shortage
+    return shortage._tag === "Blocked" ? {
+      title: tr("notEnoughMemoryRightNow"),
+      description: tr("blockedMemoryDescription")
+        .replace("{required}", formatStorageSize(shortage.requiredBytes, { rounding: "up" }))
+        .replace("{available}", formatStorageSize(shortage.availableBytes)),
+    } : { title: tr("memoryPressureTitle"), description: tr("memoryPressureDescription") }
   }
   switch (failure.operation) {
     case "load": return { title: tr("modelCouldNotLoad"), description: tr("tryLoadOrChoose") }
