@@ -1,6 +1,6 @@
 import type { en } from "./en"
 
-export const id: { [K in keyof typeof en]: string } = {
+export const id: Partial<typeof en> = {
   settings: "Pengaturan",
   general: "Umum",
   about: "Tentang",
