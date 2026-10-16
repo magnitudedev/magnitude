@@ -6,15 +6,21 @@ import { zhCN } from "./catalogs/zh-CN"
 import { hi } from "./catalogs/hi"
 import { ur } from "./catalogs/ur"
 import { bn } from "./catalogs/bn"
+import { fr } from "./catalogs/fr"
+import { de } from "./catalogs/de"
+import { ja } from "./catalogs/ja"
 
 describe("i18n catalogs", () => {
-  test("supports English, Spanish, Simplified Chinese, Hindi, Urdu and Bengali", () => {
+  test("supports English, Spanish, Simplified Chinese, Hindi, Urdu, Bengali, French, German and Japanese", () => {
     expect(translate("en", "settings")).toBe("Settings")
     expect(translate("es", "settings")).toBe("Ajustes")
     expect(translate("zh-CN", "settings")).toBe("设置")
     expect(translate("hi", "settings")).toBe("सेटिंग्स")
     expect(translate("ur", "settings")).toBe("ترتیبات")
     expect(translate("bn", "settings")).toBe("সেটিংস")
+    expect(translate("fr", "settings")).toBe("Paramètres")
+    expect(translate("de", "settings")).toBe("Einstellungen")
+    expect(translate("ja", "settings")).toBe("設定")
   })
 
   test("translates exact known messages but preserves unknown diagnostics", () => {
@@ -28,7 +34,10 @@ describe("i18n catalogs", () => {
     expect(isLanguage("hi")).toBe(true)
     expect(isLanguage("ur")).toBe(true)
     expect(isLanguage("bn")).toBe(true)
-    expect(isLanguage("fr")).toBe(false)
+    expect(isLanguage("fr")).toBe(true)
+    expect(isLanguage("de")).toBe(true)
+    expect(isLanguage("ja")).toBe(true)
+    expect(isLanguage("xx")).toBe(false)
     expect(isLanguage(null)).toBe(false)
   })
 
@@ -50,6 +59,9 @@ describe("i18n catalogs", () => {
       expect(placeholders(hi[key]), `Hindi placeholders: ${key}`).toEqual(placeholders(en[key]))
       expect(placeholders(ur[key]), `Urdu placeholders: ${key}`).toEqual(placeholders(en[key]))
       expect(placeholders(bn[key]), `Bengali placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(fr[key]), `French placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(de[key]), `German placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(ja[key]), `Japanese placeholders: ${key}`).toEqual(placeholders(en[key]))
     }
   })
 
@@ -59,6 +71,9 @@ describe("i18n catalogs", () => {
     expect(Object.keys(hi).sort()).toEqual(Object.keys(en).sort())
     expect(Object.keys(ur).sort()).toEqual(Object.keys(en).sort())
     expect(Object.keys(bn).sort()).toEqual(Object.keys(en).sort())
+    expect(Object.keys(fr).sort()).toEqual(Object.keys(en).sort())
+    expect(Object.keys(de).sort()).toEqual(Object.keys(en).sort())
+    expect(Object.keys(ja).sort()).toEqual(Object.keys(en).sort())
     for (const key of Object.keys(en) as Array<keyof typeof en>) {
       expect(en[key], `English: ${key}`).toBeTruthy()
       expect(es[key], `Spanish: ${key}`).toBeTruthy()
@@ -66,6 +81,9 @@ describe("i18n catalogs", () => {
       expect(hi[key], `Hindi: ${key}`).toBeTruthy()
       expect(ur[key], `Urdu: ${key}`).toBeTruthy()
       expect(bn[key], `Bengali: ${key}`).toBeTruthy()
+      expect(fr[key], `French: ${key}`).toBeTruthy()
+      expect(de[key], `German: ${key}`).toBeTruthy()
+      expect(ja[key], `Japanese: ${key}`).toBeTruthy()
     }
   })
 })
