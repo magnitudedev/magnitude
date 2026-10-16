@@ -569,4 +569,10 @@ export const en = {
   blockedMemoryDescription: "This model needs {required} and {available} is available. Quit apps you aren’t using, or choose a smaller model.",
   memoryPressureDescription: "Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment.",
   modelStoppedForMemory: "Stopped because your computer ran low on memory",
+  waitingForMemory: "Waiting for memory…",
+  loadingWeights: "Loading weights…",
+  finalizing: "Finalizing…",
+  optimizingEllipsis: "Optimizing…",
+  preparingToOptimize: "Preparing to optimize…",
+  optimizingForDevice: "Optimizing for {device}…",
 } as const
