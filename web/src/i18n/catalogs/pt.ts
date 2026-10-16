@@ -639,4 +639,8 @@ export const pt = {
   reloadWindowRestart: "Recarregue esta janela. Se continuar sem abrir, reinicie o Magnitude.",
   quitAndReopen: "Feche o Magnitude e abra-o novamente.",
   savedAppearanceReadError: "Não foi possível ler a aparência guardada. Será usada a aparência do sistema.",
+  chineseTraditional: "Chinês tradicional",
+  korean: "Coreano",
+  vietnamese: "Vietnamita",
+  indonesian: "Indonésio",
 } satisfies typeof en
