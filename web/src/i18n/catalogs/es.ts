@@ -415,7 +415,6 @@ export const es: { [K in keyof typeof en]: string } = {
   cannotReadMemoryUsage: "Magnitude no puede leer el uso de memoria del modelo ahora mismo.",
   resident: "En memoria",
   installedOnMachine: "Instalado en tu equipo",
-  statusUnavailable: "Estado no disponible",
   connectionNeedsRepair: "La conexión necesita reparación",
   notConnected: "No conectado",
   refreshConnection: "Actualizar conexión",
