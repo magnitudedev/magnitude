@@ -1,5 +1,3 @@
-import { en } from "./en"
-
 import type { en } from "./en"
 
 export const zhCN: { [K in keyof typeof en]: string } = {
