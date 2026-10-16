@@ -5,20 +5,20 @@ import { Option } from "effect"
 import { useMemo } from "react"
 import { Result, useAtomValue } from "@effect-atom/atom-react"
 import { MemoryIcon, CircuitryIcon, CpuIcon, InfoIcon } from "@phosphor-icons/react"
-import { useAgentClient, localModelRadarAxes, localModelSpeedTooltip, useLocalInferenceHardware } from "@magnitudedev/client-common"
+import { useAgentClient, localModelRadarAxes, useLocalInferenceHardware } from "@magnitudedev/client-common"
 import { ActionTooltip } from "./ui/tooltip"
 import { type HardwarePhoto } from "./hardware-photos"
 import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
 
-import { readLanguage, translate } from "../i18n"
+import { readLanguage, translate, type MessageKey } from "../i18n"
 
 const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
 
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
-  return <ActionTooltip label={localModelSpeedTooltip} trigger={<button type="button" aria-label={localModelSpeedTooltip} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
+  return <ActionTooltip label={tr("speedEstimateTooltip")} trigger={<button type="button" aria-label={tr("speedEstimateTooltip")} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
 }
 
 export function ModelRadar({ model }: { model: CatalogLocalModel }) {
@@ -37,7 +37,8 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
       <path d={profilePath} style={{ d: `path("${profilePath}")` }} className="motion-safe:transition-[d] motion-safe:duration-300 motion-safe:ease-out" fill="currentColor" fillOpacity="0.13" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
       {axes.value.map((axis,index) => {
         const [x,y] = [[180,20],[290,83],[258,238],[102,238],[70,83]][index]!
-        const label = axis.label.charAt(0)+axis.label.slice(1).toLowerCase()
+        const axisKeys: Record<string, MessageKey> = { INTELLIGENCE: "intelligence", SPEED: "speed", SPECULATION: "speculation", FIT: "fit", FIDELITY: "fidelity" }
+        const label = tr(axisKeys[axis.label] ?? "notAssessed")
         // Speed's label carries its estimate marker and info icon: an HTML row centered on the
         // axis, occupying the label line's box above the detail's baseline.
         return <g key={axis.label}>
