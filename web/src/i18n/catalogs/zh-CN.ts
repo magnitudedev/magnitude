@@ -631,4 +631,7 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   snug: "紧凑",
   tight: "紧张",
   none: "无",
+  capabilityProfile: "{name} 的能力概况",
+  harnessModel: "{name} 模型",
+  cacheNotReportedForRequests: "未报告 {count} 次请求的数据",
 }
