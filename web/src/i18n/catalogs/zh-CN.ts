@@ -514,4 +514,10 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   fasterRepliesSmarterAnswers: "更快的回复或更聪明的回答。选择对你更重要的方面。",
   tokensLabel: "令牌",
   streakLabel: "连续 {count}{days}",
+  modelPreference: "模型偏好",
+  fastest: "最快",
+  faster: "更快",
+  balanced: "均衡",
+  smarter: "更智能",
+  smartest: "最智能",
 }
