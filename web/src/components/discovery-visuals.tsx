@@ -12,6 +12,10 @@ import { hardwareDetails } from "./hardware-details"
 import type { MachineIdentityObservation } from "@magnitudedev/sdk/desktop-host"
 import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sdk"
 
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
   return <ActionTooltip label={localModelSpeedTooltip} trigger={<button type="button" aria-label={localModelSpeedTooltip} className="inline-flex rounded-sm text-slate-400 hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-500 dark:hover:text-slate-300"><InfoIcon aria-hidden="true" className="size-3" /></button>} />
@@ -19,7 +23,7 @@ export function SpeedInfo() {
 
 export function ModelRadar({ model }: { model: CatalogLocalModel }) {
   const axes = localModelRadarAxes(model)
-  if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{model.servingState._tag === "Assessing" ? "Waiting for model assessment" : "No performance profile is available for this configuration."}</p>
+  if (Option.isNone(axes)) return <p className="py-12 text-center text-sm text-slate-500">{model.servingState._tag === "Assessing" ? tr("waitingAssessment") : tr("noPerformanceProfile")}</p>
   const point = (index: number, radius: number) => {
     const angle = -Math.PI / 2 + index * Math.PI * 2 / 5
     return [180 + Math.cos(angle) * radius, 138 + Math.sin(angle) * radius]
@@ -67,25 +71,25 @@ export function HardwarePhotograph({ photo }: { photo: HardwarePhoto }) {
 function HardwareCard({ identity }: { identity: MachineIdentityObservation | null }) {
   const hardware = useLocalInferenceHardware()
   if (Result.isInitial(hardware)) return <HardwarePending />
-  if (Result.isFailure(hardware)) return <ErrorNotice title="Couldn’t read your hardware" description="Recommendations will return when hardware information is available." className="my-6" />
-  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{"Getting to know your machine…"}</div>
+  if (Result.isFailure(hardware)) return <ErrorNotice title={tr("couldNotReadHardware")} description={tr("hardwareInfoReturns")} className="my-6" />
+  if (!Result.isSuccess(hardware)) return <div className="my-6 rounded-2xl border border-slate-200 p-6 text-sm text-slate-500 dark:border-slate-750">{tr("gettingToKnowMachine")}</div>
   return <HardwareSummary identity={identity} value={hardware.value} />
 }
 export function HardwareSummary({ identity, value }: { identity: MachineIdentityObservation | null; value: LocalInferenceHardware }) {
   const presentation = hardwareDetails(identity, value)
-  return <section aria-label="Your hardware" className={pageLayout.hardware}>
+  return <section aria-label={tr("yourHardware")} className={pageLayout.hardware}>
     <div className={`grid items-center gap-6 ${Option.isSome(presentation.photo) ? pageLayout.hardwareGrid : ""}`}>
       {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
       <div className="min-w-0">
-        <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{presentation.category}{presentation.cpuInference ? " · CPU inference" : ""}</p>
-        <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => "Your computer") : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
+        <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{presentation.category}{presentation.cpuInference ? ` · ${tr("cpuInference")}` : ""}</p>
+        <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => tr("yourComputer")) : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
         <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
           {presentation.groups.map(group => {
             const Icon = group.label === "Memory" ? MemoryIcon : group.label.startsWith("GPU") ? CircuitryIcon : CpuIcon
             return <div key={group.label} className="min-w-0">
               <div className="flex items-center gap-2">
                 <Icon aria-hidden="true" className="size-4 shrink-0 text-blue-600 dark:text-blue-400" />
-                <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label}</p>
+                <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label === "Memory" ? tr("memory") : group.label}</p>
               </div>
               <div className="min-w-0">
                 <p title={group.truncateName ? group.name : undefined} className={`mb-0 mt-1 text-sm font-semibold leading-snug ${group.truncateName ? "truncate" : "break-words"}`}>{group.name}</p>
