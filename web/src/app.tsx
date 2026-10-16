@@ -267,7 +267,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
     </div>
     {transferring && <div className="col-span-full mt-1"><DownloadProgress layout="row" modelName={formatLocalModelDisplayName(model)} acquisition={acquisition} pending={command.pending} onCancel={() => cancel(model.modelId)} /></div>}
     {fit !== null && (doesNotFit || !loadFailure) && !downloadFailure && <ErrorNotice severity="info" title={fit} className="col-span-full mt-3" />}
-    {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description={tr("modelStoppedForApps")} className="col-span-full mt-3" />}
+    {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={tr("modelStoppedForMemory")} description={tr("modelStoppedForApps")} className="col-span-full mt-3" />}
     {model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title={tr("modelUnavailable")} description={tr("chooseAnotherFromCatalog")} className="col-span-full mt-3" />}
     {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>
       {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}><T k="retryDownload" /></NoticeAction>}
