@@ -400,7 +400,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const [search, setSearch] = useState("")
   const filterOptions = installedOnly
     ? [{ value: "all", label: tr("allModels") }, { value: "downloaded", label: tr("downloaded") }, { value: "downloading", label: tr("downloading") }]
-    : [{ value: "all", label: "All models" }, { value: "fits", label: tr("fitsMyMachine") }]
+    : [{ value: "all", label: tr("allModels") }, { value: "fits", label: tr("fitsMyMachine") }]
   const sortOptions = [
     ...(!installedOnly ? [{ value: "recommended", label: tr("recommended") }] : []),
     { value: "name", label: tr("nameAZ") }, { value: "smallest", label: tr("smallestDownload") }, { value: "largest", label: tr("largestDownload") },
