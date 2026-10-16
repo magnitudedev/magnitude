@@ -493,4 +493,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   remoteCopyKeyIntro: "请从网络访问设置中复制密钥：",
   otherDeviceKeyIntro: "其他设备使用网络访问设置中的地址和 API 密钥：",
   turnOnNetworkIntro: "若要从其他设备使用，请在以下位置开启网络访问：",
+  secondsWord: "秒",
 }
