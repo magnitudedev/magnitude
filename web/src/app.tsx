@@ -107,7 +107,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
       <div className="min-w-0 space-y-5">
         <dl className="flex flex-wrap gap-x-8 gap-y-3">
           <div><dt className="text-xs text-slate-500"><T k="license" /></dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => tr("licenseNotSpecified"))}</dd></div>
-          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500"><T k="contextWindow" /></dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
+          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500"><T k="contextWindow" /></dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} {tr("tokensLabel")}</dd></div>}
           {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label={tr("supportsVision")} trigger={<button type="button" aria-label={tr("supportsVision")} className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
         </dl>
         {model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500"><T k="sources" /></p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
@@ -315,7 +315,7 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware }: {
   const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}><T k="details" /><CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
-  const statusLabel = acquisition._tag === "Removing" ? tr("removing") : acquisition._tag === "RemoveFailed" ? tr("removalFailed") : residency?._tag === "Ready" ? tr("loaded") : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? tr("downloaded") : residency?._tag === "Failed" ? tr("notLoaded") : residency?._tag === "Requested" ? tr("preparingEllipsis") : residency?._tag === "Loading" ? localizeModelText(describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? tr("notDownloaded") : acquisition._tag === "UpdateFailed" ? tr("updateIncomplete") : acquisition._tag === "UpdateAvailable" ? tr("updateAvailable") : acquisition._tag)
+  const statusLabel = acquisition._tag === "Removing" ? tr("removing") : acquisition._tag === "RemoveFailed" ? tr("removalFailed") : residency?._tag === "Ready" ? tr("loaded") : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? tr("downloaded") : residency?._tag === "Failed" ? tr("notLoaded") : residency?._tag === "Requested" ? tr("preparingEllipsis") : residency?._tag === "Stopping" ? tr("stoppingEllipsis") : residency?._tag === "Loading" ? localizeModelText(describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? tr("notDownloaded") : acquisition._tag === "UpdateFailed" ? tr("updateIncomplete") : acquisition._tag === "UpdateAvailable" ? tr("updateAvailable") : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} {tr("memory")}</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
@@ -399,7 +399,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const hardware = useLocalInferenceHardware()
   const [search, setSearch] = useState("")
   const filterOptions = installedOnly
-    ? [{ value: "all", label: "All models" }, { value: "downloaded", label: tr("downloaded") }, { value: "downloading", label: "Downloading" }]
+    ? [{ value: "all", label: tr("allModels") }, { value: "downloaded", label: tr("downloaded") }, { value: "downloading", label: tr("downloading") }]
     : [{ value: "all", label: "All models" }, { value: "fits", label: tr("fitsMyMachine") }]
   const sortOptions = [
     ...(!installedOnly ? [{ value: "recommended", label: tr("recommended") }] : []),
@@ -636,13 +636,13 @@ function StatusOverview() {
   const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
   return <section aria-label={tr("activity")} className={`${pageLayout.card} grid grid-cols-1 gap-2 p-3 md:grid-cols-3`}>
     <StatusTile label={tr("today")} onClick={() => navigate("usage")}
-      value={today ? `${compact.format(today.totalTokens)} tokens` : Result.isInitial(usage) ? loading : "Unavailable"}
-      detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? "request" : "requests"}` : null} />
+      value={today ? `${compact.format(today.totalTokens)} ${tr("tokensLabel")}` : Result.isInitial(usage) ? loading : tr("unavailable")}
+      detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? tr("request") : tr("requests")}` : null} />
     <StatusTile label={tr("agents")} onClick={() => navigate("connections")}
-      value={connected !== undefined ? `${connected} connected` : Result.isInitial(rows) ? loading : "Unavailable"}
-      detail={installed ? `${installed.length} installed` : null} />
+      value={connected !== undefined ? `${connected} ${tr("connected")}` : Result.isInitial(rows) ? loading : tr("unavailable")}
+      detail={installed ? `${installed.length} ${tr("installed")}` : null} />
     <StatusTile label={tr("networkAccess")} onClick={() => navigate("settings")}
-      value={Result.isSuccess(network) ? network.value.enabled ? "On" : "Off" : Result.isInitial(network) ? loading : "Unavailable"}
+      value={Result.isSuccess(network) ? network.value.enabled ? tr("on") : tr("off") : Result.isInitial(network) ? loading : tr("unavailable")}
       detail={Result.isSuccess(network) ? address ?? tr("thisComputerOnly") : null} />
   </section>
 }
