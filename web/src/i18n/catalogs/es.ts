@@ -483,5 +483,5 @@ export const es: { [K in keyof typeof en]: string } = {
   anthropicApiHint: "Las aplicaciones compatibles con Anthropic utilizan /inference/anthropic.",
   copyExampleRequest: "Copiar solicitud de ejemplo",
   copyPrompt: "Copiar las instrucciones de {name} mostradas",
-  setupPromptCopied: "Setup prompt for {name} copied",
+  setupPromptCopied: "Se ha copiado la instrucción de configuración de {name}",
 }
