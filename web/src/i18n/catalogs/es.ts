@@ -467,7 +467,7 @@ export const es: { [K in keyof typeof en]: string } = {
   stopRequiringKeyQuestion: "¿Dejar de exigir la clave?",
   stopRequiringKeyDescription: "当 Magnitude 重启后，任何能访问这台电脑的设备都可以无需密钥使用推理服务。仅在可信网络中这样做。此浏览器登录仍需要密钥。",
   stopRequiring: "不再要求",
-  changeAddressQuestion: "¿Cambiar la地址?",
+  changeAddressQuestion: "¿Cambiar la dirección?",
   changeAddressDescription: "Cuando Magnitude se reinicie, solo aceptará conexiones en la dirección que elijas. Es posible que este navegador no pueda volver a conectarse.",
   restartMagnitudeQuestion: "¿Reiniciar Magnitude?",
   restartDisconnectDescription: "Magnitude 重启期间此浏览器会断开连接，之后将自动重新连接。",
