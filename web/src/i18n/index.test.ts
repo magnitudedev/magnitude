@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { isLanguage, readLanguage, STORAGE_KEY, translate, translateKnownMessage } from "./index"
+import { isLanguage, LANGUAGES, readLanguage, STORAGE_KEY, translate, translateKnownMessage } from "./index"
 import { en } from "./catalogs/en"
 import { es } from "./catalogs/es"
 import { zhCN } from "./catalogs/zh-CN"
@@ -46,6 +46,11 @@ describe("i18n catalogs", () => {
     expect(isLanguage("pt")).toBe(true)
     expect(isLanguage("it")).toBe(true)
     expect(isLanguage("uk")).toBe(true)
+    expect(isLanguage("zh-TW")).toBe(false)
+    expect(isLanguage("id")).toBe(false)
+    expect(isLanguage("ko")).toBe(false)
+    expect(isLanguage("vi")).toBe(false)
+    expect(LANGUAGES).toEqual(["en", "es", "zh-CN", "hi", "ur", "bn", "fr", "de", "ja", "pt", "it", "uk"])
     expect(isLanguage("xx")).toBe(false)
     expect(isLanguage(null)).toBe(false)
   })
@@ -135,7 +140,7 @@ describe("i18n catalogs", () => {
       "stopRequiringKeyDescription", "changeAddressDescription", "restartDisconnectDescription",
       "cpuCoreOptionsSpec", "neuralEngineCoresSpec", "gpuArchitectureSpec",
       "capabilityProfile", "harnessModel", "cacheNotReportedForRequests", "requireApiKey", "cancel", "close",
-      "magnitudeCouldNotOpen", "reloadWindowRestart", "quitAndReopen", "savedAppearanceReadError",
+      "magnitudeCouldNotOpen", "reloadWindowRestart", "quitAndReopen", "savedAppearanceReadError", "appearanceCouldNotBeSaved",
       "on", "off", "request", "allModels", "downloading", "connected", "installed", "stoppingEllipsis",
     ] as const
     for (const [locale, catalog] of catalogs) {
