@@ -1,8 +1,5 @@
-import { en } from "./en"
-
 /** Japanese UI translations; untranslated long-tail messages fall back to English. */
 export const ja = {
-  ...en,
   settings: "設定",
   general: "一般",
   about: "このアプリについて",
@@ -633,4 +630,4 @@ export const ja = {
   stopRequiringKeyDescription: "Magnitude を再起動すると、このコンピューターに接続できるすべてのデバイスがキーなしで推論を利用できます。信頼できるネットワークでのみ有効にしてください。このブラウザーへのサインインには引き続きキーが必要です。",
   changeAddressDescription: "Magnitude を再起動すると、選択したアドレスでのみ接続を受け付けます。このブラウザーが再接続できなくなる場合があります。",
   restartDisconnectDescription: "Magnitude の再起動中、このブラウザーは切断され、その後自動的に再接続します。",
-} satisfies Partial<typeof en>
+} satisfies typeof en
