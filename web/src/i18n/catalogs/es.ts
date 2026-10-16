@@ -484,4 +484,6 @@ export const es: { [K in keyof typeof en]: string } = {
   copyExampleRequest: "Copiar solicitud de ejemplo",
   copyPrompt: "Copiar las instrucciones de {name} mostradas",
   setupPromptCopied: "Se ha copiado la instrucción de configuración de {name}",
+  includes: "Incluye",
+  copyHarnessCommand: "Copiar comando de {name}",
 }
