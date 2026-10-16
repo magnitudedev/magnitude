@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** Portuguese translations; remaining long-tail messages fall back to English. */
+/** Catálogo completo de português; todas as mensagens são traduzidas explicitamente. */
 export const pt = {
   settings: "Configurações",
   general: "Geral",
