@@ -641,6 +641,7 @@ export const fr = {
   on: "Activé",
   off: "Désactivé",
   request: "requête",
+  appearanceCouldNotBeSaved: "L’apparence n’a pas pu être enregistrée dans ce navigateur.",
   savedAppearanceReadError: "L’apparence enregistrée n’a pas pu être lue. L’apparence du système sera utilisée.",
   chineseTraditional: "Chinois traditionnel",
   korean: "Coréen",
