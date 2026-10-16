@@ -134,7 +134,8 @@ describe("i18n catalogs", () => {
       "existingDownloadsPreviousFolder", "turnOffNetworkDescription", "regenerateKeyDescription",
       "stopRequiringKeyDescription", "changeAddressDescription", "restartDisconnectDescription",
       "cpuCoreOptionsSpec", "neuralEngineCoresSpec", "gpuArchitectureSpec",
-      "capabilityProfile", "harnessModel", "cacheNotReportedForRequests", "requireApiKey",\n      "magnitudeCouldNotOpen", "reloadWindowRestart", "quitAndReopen", "savedAppearanceReadError",
+      "capabilityProfile", "harnessModel", "cacheNotReportedForRequests", "requireApiKey",
+      "magnitudeCouldNotOpen", "reloadWindowRestart", "quitAndReopen", "savedAppearanceReadError",
     ] as const
     for (const [locale, catalog] of catalogs) {
       for (const key of keys) {
