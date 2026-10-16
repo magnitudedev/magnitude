@@ -415,7 +415,6 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   cannotReadMemoryUsage: "Magnitude 目前无法读取模型的内存用量。",
   resident: "驻留",
   installedOnMachine: "已安装在你的设备上",
-  statusUnavailable: "状态不可用",
   connectionNeedsRepair: "连接需要修复",
   notConnected: "未连接",
   refreshConnection: "刷新连接",
