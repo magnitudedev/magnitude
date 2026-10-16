@@ -563,4 +563,9 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   loadConfirmationTitle: "加载 {name}？",
   loadConfirmationDescription: "加载 {name} 将停止 {replacing}。",
   downloadWithSize: "下载（{size}）",
+  notEnoughMemoryRightNow: "当前内存不足",
+  memoryPressureTitle: "电脑内存压力过大",
+  blockedMemoryDescription: "此模型需要 {required}，当前可用 {available}。请退出未使用的应用，或选择较小的模型。",
+  memoryPressureDescription: "为了让其他应用保持响应，加载已停止。请退出未使用的应用，或稍后重试。",
+  modelStoppedForMemory: "由于电脑内存不足，模型已停止",
 }
