@@ -384,4 +384,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   restart: "重启",
   configured: "已配置",
   availableStatus: "可用",
+  minutesShort: "分钟",
 }
