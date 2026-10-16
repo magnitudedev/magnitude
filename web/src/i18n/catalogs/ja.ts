@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 /** Japanese UI translations; untranslated long-tail messages fall back to English. */
 export const ja = {
   settings: "設定",
