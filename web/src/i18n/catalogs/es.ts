@@ -571,4 +571,10 @@ export const es: { [K in keyof typeof en]: string } = {
   blockedMemoryDescription: "Este modelo necesita {required} y hay {available} disponibles. Cierra las aplicaciones que no uses o elige un modelo más pequeño.",
   memoryPressureDescription: "La carga se detuvo para que las demás aplicaciones sigan respondiendo. Cierra aplicaciones que no uses o vuelve a intentarlo en un momento.",
   modelStoppedForMemory: "Se detuvo porque tu equipo se quedó sin memoria",
+  waitingForMemory: "Esperando memoria…",
+  loadingWeights: "Cargando pesos…",
+  finalizing: "Finalizando…",
+  optimizingEllipsis: "Optimizando…",
+  preparingToOptimize: "Preparando la optimización…",
+  optimizingForDevice: "Optimizando para {device}…",
 }
