@@ -641,6 +641,7 @@ export const pt = {
   on: "Ligado",
   off: "Desligado",
   request: "pedido",
+  appearanceCouldNotBeSaved: "Não foi possível guardar a aparência neste navegador.",
   savedAppearanceReadError: "Não foi possível ler a aparência guardada. Será usada a aparência do sistema.",
   chineseTraditional: "Chinês tradicional",
   korean: "Coreano",
