@@ -2,7 +2,6 @@ import { en } from "./en"
 
 /** Ukrainian translations; remaining long-tail messages fall back to English. */
 export const uk = {
-  ...en,
   settings: "Налаштування",
   general: "Загальні",
   about: "Про програму",
@@ -634,4 +633,4 @@ export const uk = {
   stopRequiringKeyDescription: "Після перезапуску Magnitude будь-який пристрій, що має доступ до цього комп’ютера, зможе використовувати інференс без ключа. Робіть це лише в довіреній мережі. Для входу в цей браузер ключ усе одно потрібен.",
   changeAddressDescription: "Після перезапуску Magnitude прийматиме з’єднання лише за вибраною адресою. Цей браузер може не підключитися повторно.",
   restartDisconnectDescription: "Цей браузер буде відключено під час перезапуску Magnitude, після чого він автоматично підключиться знову.",
-} satisfies Partial<typeof en>
+} satisfies typeof en
