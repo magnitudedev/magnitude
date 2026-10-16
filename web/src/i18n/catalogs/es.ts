@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 import type { en } from "./en"
 
 export const es: { [K in keyof typeof en]: string } = {
