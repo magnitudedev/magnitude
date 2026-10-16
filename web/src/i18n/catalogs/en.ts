@@ -484,4 +484,6 @@ export const en = {
   setupPromptCopied: "Setup prompt for {name} copied",
   includes: "Includes",
   copyHarnessCommand: "Copy {name} command",
+  terminal: "your terminal",
+  setupPromptInstruction: "Copy an agent’s setup prompt and paste it into that agent, or any coding agent, on the computer you’re using now.",
 } as const
