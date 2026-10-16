@@ -13,7 +13,7 @@ struct NoMarkers;
 
 impl MarkerTokens for NoMarkers {
     fn marker(&self, text: &str) -> Result<TokenId, FamilyError> {
-        Err(FamilyError(format!("no marker {text:?}")))
+        Err(FamilyError::invalid(format!("no marker {text:?}")))
     }
 }
 

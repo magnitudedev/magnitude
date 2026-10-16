@@ -5,7 +5,7 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use magnitude_chat::{ChatError, output::JournalError};
-use magnitude_engine::error::{LoadError, RequestError, UnloadCause, UnsupportedModel};
+use magnitude_engine::error::{LoadError, RequestError, UnloadCause};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use utoipa::ToSchema;
@@ -311,12 +311,7 @@ fn request_class(error: &RequestError) -> Class {
 /// Load failures surfaced to a request that triggered the load.
 fn load_class(error: &LoadError) -> Class {
     match error {
-        LoadError::Unsupported(UnsupportedModel::Family { .. })
-        | LoadError::Unsupported(UnsupportedModel::Representation { .. })
-        | LoadError::Unsupported(UnsupportedModel::Backend { .. })
-        | LoadError::Unsupported(UnsupportedModel::KernelDomain { .. }) => {
-            (StatusCode::CONFLICT, MODEL, "unsupported_model", false)
-        }
+        LoadError::Unsupported(_) => (StatusCode::CONFLICT, MODEL, "unsupported_model", false),
         LoadError::Artifact(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             INVALID,
@@ -388,6 +383,7 @@ fn model_class(error: &ModelUnavailable) -> Class {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnitude_engine::error::UnsupportedModel;
 
     #[test]
     fn transient_unavailability_asks_clients_to_retry_in_words_and_headers() {
@@ -454,9 +450,7 @@ mod tests {
             assert!(error.body.retryable);
         }
         let unsupported = ApiError::from(ServingError::Load(LoadError::Unsupported(
-            UnsupportedModel::Family {
-                reason: "unknown".into(),
-            },
+            UnsupportedModel::invalid("unknown"),
         )));
         assert_eq!(unsupported.status, StatusCode::CONFLICT);
         assert_eq!(unsupported.body.code, "unsupported_model");

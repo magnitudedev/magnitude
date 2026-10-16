@@ -14,7 +14,7 @@ use magnitude_artifacts::{
     gguf::{Directory, Value},
     Package, PackageIdentity,
 };
-use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
+use magnitude_family_common::{rotary, Metadata, Tensors};
 use magnitude_family_contracts::{
     checked_product, ActivationDType, ActivationFunction, Attention, AttentionGate, Block,
     Decoder, DenseFfn, EmbeddingScale, EntryForm, ExitForm, ExitNorm, ExpertSelection, FamilyId,
@@ -24,7 +24,6 @@ use magnitude_family_contracts::{
     ScoreFunction, ShortConv, Sublayer, ValueNorm, ValueSource,
     WeightDescriptor,
 };
-use std::{error, fmt};
 
 /// LFM2 architecture recognized from literal artifact metadata.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,31 +85,12 @@ impl Architecture {
     }
 }
 
-/// Failure to recognize or interpret an LFM2 artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        match error {
-            HeaderError::UnknownMetadata(key) => {
-                invalid(format!("LFM2 metadata {key:?} is not understood"))
-            }
-            error => invalid(error.to_string()),
-        }
-    }
-}
+/// Failure to recognize or interpret an LFM2 artifact: the family error,
+/// which names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 fn invalid(message: impl Into<String>) -> Error {
-    Error(message.into())
+    Error::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, Error> {

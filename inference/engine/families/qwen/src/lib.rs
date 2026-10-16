@@ -10,8 +10,10 @@ mod projector;
 
 pub use projector::describe_projector;
 
-use magnitude_artifacts::gguf::{Directory, Scalar, Value};
-use magnitude_family_common::HeaderError;
+use magnitude_artifacts::{
+    gguf::{Directory, Scalar, Value},
+    UnsupportedReason,
+};
 use magnitude_family_contracts::{
     ActivationFunction, Attention, AttentionGate, DenseFfn, ExpertSelection, FeedForwardUp,
     GateFunction, GatedDelta, HeadNorm, HistoryDomain, HistoryReads, KeyValue, MediaRowAttention,
@@ -19,31 +21,10 @@ use magnitude_family_contracts::{
     RouterInput, ScoreFunction, SharedExpert, SharedExpertGate, ValueNorm, ValueSource,
     WeightDescriptor, checked_product,
 };
-use std::{error, fmt};
 
-/// Failure to recognize or interpret a Qwen artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl Error {
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        Error::invalid(error.to_string())
-    }
-}
+/// Failure to recognize or interpret a Qwen artifact: the family error,
+/// which names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 pub fn product(dimensions: &[u64]) -> Result<u64, Error> {
     checked_product(dimensions).map_err(|error| Error::invalid(error.to_string()))
@@ -183,10 +164,13 @@ pub struct Geometry {
 
 impl Geometry {
     pub fn read(m: &Metadata, routed: bool) -> Result<Self, Error> {
-        if m.optional("rope.scaling.type")
-            .is_some_and(|v| v.string() != Some("none"))
+        if let Some(scaling) = m
+            .optional("rope.scaling.type")
+            .filter(|v| v.string() != Some("none"))
         {
-            return Err(Error::invalid(
+            let kind = scaling.string().unwrap_or("unspecified").to_owned();
+            return Err(Error::unsupported(
+                vec![UnsupportedReason::RopeScaling { kind }],
                 "scaled Qwen rotary definitions are not yet qualified",
             ));
         }

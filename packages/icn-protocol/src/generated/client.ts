@@ -16,6 +16,11 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         countAnthropicMessageTokens: makeHttpOperation(http, options, Operations.countAnthropicMessageTokensOperation),
         createAnthropicMessage: makeHttpOperation(http, options, Operations.createAnthropicMessageOperation),
       },
+      candidates: {
+        buildCandidateBundle: makeHttpOperation(http, options, Operations.buildCandidateBundleOperation),
+        inspectModelCandidate: makeHttpOperation(http, options, Operations.inspectModelCandidateOperation),
+        listDrafterCandidates: makeHttpOperation(http, options, Operations.listDrafterCandidatesOperation),
+      },
       catalog: {
         acknowledgeCatalogInstallationFailure: makeHttpOperation(
           http,
@@ -39,9 +44,15 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         createChatCompletion: makeStreamOperation(http, options, Operations.createChatCompletionOperation),
         createChatCompletionHttp: makeHttpOperation(http, options, Operations.createChatCompletionHttpOperation),
       },
-      discovery: {
-        listDiscoveredModels: makeHttpOperation(http, options, Operations.listDiscoveredModelsOperation),
-        refreshDiscoveredModels: makeHttpOperation(http, options, Operations.refreshDiscoveredModelsOperation),
+      downloads: {
+        acknowledgeModelDownloadFailure: makeHttpOperation(
+          http,
+          options,
+          Operations.acknowledgeModelDownloadFailureOperation,
+        ),
+        cancelModelDownload: makeHttpOperation(http, options, Operations.cancelModelDownloadOperation),
+        listModelDownloads: makeHttpOperation(http, options, Operations.listModelDownloadsOperation),
+        startModelDownload: makeHttpOperation(http, options, Operations.startModelDownloadOperation),
       },
       huggingFace: {
         resolveHuggingFaceRepository: makeHttpOperation(
@@ -56,7 +67,15 @@ export const makeIcnApiClient = (options: GeneratedClientOptions) =>
         createResponse: makeStreamOperation(http, options, Operations.createResponseOperation),
         createResponseHttp: makeHttpOperation(http, options, Operations.createResponseHttpOperation),
       },
+      localModels: {
+        configureLocalModels: makeHttpOperation(http, options, Operations.configureLocalModelsOperation),
+        getLocalModelsConfiguration: makeHttpOperation(http, options, Operations.getLocalModelsConfigurationOperation),
+        listLocalModels: makeHttpOperation(http, options, Operations.listLocalModelsOperation),
+        refreshLocalModels: makeHttpOperation(http, options, Operations.refreshLocalModelsOperation),
+        removeLocalModelFiles: makeHttpOperation(http, options, Operations.removeLocalModelFilesOperation),
+      },
       models: {
+        assessModelCandidate: makeHttpOperation(http, options, Operations.assessModelCandidateOperation),
         ensureModelInstance: makeHttpOperation(http, options, Operations.ensureModelInstanceOperation),
         getModelAssessments: makeHttpOperation(http, options, Operations.getModelAssessmentsOperation),
         getModelInstance: makeHttpOperation(http, options, Operations.getModelInstanceOperation),

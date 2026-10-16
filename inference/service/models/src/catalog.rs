@@ -250,6 +250,22 @@ pub struct GeneratedReleaseCatalog {
     headers: BTreeMap<String, Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleasePackageRole {
+    Target,
+    Draft,
+}
+
+/// One package component of a release catalog bundle and its exact GGUF header.
+#[derive(Clone, Debug)]
+pub struct ReleaseComponentHeader {
+    pub model_id: CatalogBaseId,
+    pub variant_id: CatalogVariantId,
+    pub package: ReleasePackageRole,
+    pub component: ModelComponent,
+    pub header: Vec<u8>,
+}
+
 #[derive(Clone)]
 pub struct ReleaseCatalog {
     catalog: RecommendableModelCatalog,
@@ -1006,6 +1022,31 @@ impl ReleaseCatalog {
         &self.catalog
     }
 
+    /// Every bundled package component with its exact GGUF header, bundle by bundle and in
+    /// package order. Each header is reassembled and verified when its item is reached.
+    pub fn component_headers(
+        &self,
+    ) -> impl Iterator<Item = Result<ReleaseComponentHeader, InventoryError>> + '_ {
+        self.planner_inputs.values().flat_map(move |input| {
+            let packages = std::iter::once((ReleasePackageRole::Target, &input.target))
+                .chain(input.draft.iter().map(|draft| (ReleasePackageRole::Draft, draft)));
+            packages.flat_map(move |(package, planner)| {
+                planner.components.iter().map(move |component| {
+                    Ok(ReleaseComponentHeader {
+                        model_id: input.model_id.clone(),
+                        variant_id: input.variant_id.clone(),
+                        package,
+                        component: component.component.clone(),
+                        header: self
+                            .planner_bundle
+                            .input(&component.header_digest)
+                            .map_err(InventoryError::Integrity)?,
+                    })
+                })
+            })
+        })
+    }
+
     pub fn resolve_bundle(
         &self,
         bundle_key: &ServableModelBundleKey,
@@ -1034,6 +1075,26 @@ impl ReleaseCatalog {
                     .map_err(InventoryError::Integrity)
             },
         )?))
+    }
+}
+
+impl ReleaseCatalog {
+    /// A release catalog of `catalog`'s declarations without release assessment material: every
+    /// bundle resolves from installed files or its pinned source instead. For tests and tools
+    /// that carry no planner bundle.
+    pub fn without_material(catalog: RecommendableModelCatalog) -> Result<Self, InventoryError> {
+        let manifest = serde_json::to_vec(&ReleasePlannerManifest {
+            planner_inputs: BTreeMap::new(),
+        })
+        .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        let bytes = planner_bundle::encode(&manifest, &BTreeMap::new(), |_, _| {})
+            .map_err(InventoryError::Integrity)?;
+        let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        Ok(Self {
+            catalog,
+            planner_inputs: Arc::new(BTreeMap::new()),
+            planner_bundle: Arc::new(PlannerBundle::parse(bytes).map_err(InventoryError::Integrity)?),
+        })
     }
 }
 

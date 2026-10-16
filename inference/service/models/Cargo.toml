@@ -16,6 +16,7 @@ hf-hub.workspace = true
 magnitude-artifacts = { path = "../../engine/artifacts" }
 magnitude-service-contracts.workspace = true
 magnitude-service-utils.workspace = true
+notify.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

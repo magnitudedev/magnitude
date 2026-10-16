@@ -7,7 +7,9 @@ use magnitude_family_contracts::{
     ActivationFunction, AttentionGate, FeedForwardUp, HeadNorm, HistoryDomain, ImportTransform,
     InputNorm, KeyValue, ModelDefinition, ModelFamily, Operator, OutputForm, Rotary,
 };
-use magnitude_family_llama::{inspect_components, recognize, Error, LlamaFamily};
+use magnitude_artifacts::UnsupportedReason;
+use magnitude_family_contracts::FamilyError;
+use magnitude_family_llama::{admit, inspect_components, Error, Feature, LlamaFamily};
 
 const VARIANTS: [&str; 2] = [
     "minicpm5-2b__target-gguf_q4.json",
@@ -132,7 +134,7 @@ fn claims_no_other_catalog_component() {
 }
 
 #[test]
-fn features_outside_the_admitted_set_are_not_recognized() {
+fn features_outside_the_admitted_set_are_each_refused_by_name() {
     let mut scaled = minicpm5();
     set_metadata(
         &mut scaled,
@@ -140,8 +142,8 @@ fn features_outside_the_admitted_set_are_not_recognized() {
         Value::Scalar(Scalar::String("yarn".into())),
     );
     assert_eq!(
-        recognize(&scaled),
-        Err(Error::UnknownMetadata("llama.rope.scaling.type".into()))
+        admit(&scaled),
+        Err(Error::Unadmitted(vec![Feature::RopeScaling("yarn".into())]))
     );
 
     let mut per_layer = minicpm5();
@@ -151,10 +153,10 @@ fn features_outside_the_admitted_set_are_not_recognized() {
         Value::Array(vec![Scalar::Unsigned(2); 42]),
     );
     assert_eq!(
-        recognize(&per_layer),
-        Err(Error::PerLayerMetadata(
+        admit(&per_layer),
+        Err(Error::Unadmitted(vec![Feature::PerLayerMetadata(
             "llama.attention.head_count_kv".into()
-        ))
+        )]))
     );
 
     let mut foreign = minicpm5();
@@ -164,8 +166,10 @@ fn features_outside_the_admitted_set_are_not_recognized() {
         Value::Scalar(Scalar::Float(12.0)),
     );
     assert_eq!(
-        recognize(&foreign),
-        Err(Error::UnknownMetadata("minicpm.scale_emb".into()))
+        admit(&foreign),
+        Err(Error::Unadmitted(vec![Feature::UnknownMetadata(
+            "minicpm.scale_emb".into()
+        )]))
     );
 
     for role in [
@@ -176,12 +180,42 @@ fn features_outside_the_admitted_set_are_not_recognized() {
     ] {
         let mut extra = minicpm5();
         add_tensor(&mut extra, role, &[128]);
-        assert_eq!(recognize(&extra), Err(Error::UnboundWeight(role.into())));
+        assert_eq!(
+            admit(&extra),
+            Err(Error::Unadmitted(vec![Feature::Tensor(role.into())]))
+        );
     }
 
     let mut tied = minicpm5();
     tied.tensors.retain(|tensor| tensor.name != "output.weight");
-    assert_eq!(recognize(&tied), Err(Error::TiedOutput));
+    assert_eq!(admit(&tied), Err(Error::Unadmitted(vec![Feature::TiedOutput])));
+
+    // Every refused feature is named at once, and the family error carries
+    // each as a reason.
+    let mut several = minicpm5();
+    add_tensor(&mut several, "rope_freqs.weight", &[64]);
+    several.tensors.retain(|tensor| tensor.name != "output.weight");
+    set_metadata(
+        &mut several,
+        "llama.rope.scaling.type",
+        Value::Scalar(Scalar::String("llama3".into())),
+    );
+    let error = FamilyError::from(inspect(&several).unwrap_err());
+    assert_eq!(
+        error.reasons,
+        [
+            UnsupportedReason::RopeScaling {
+                kind: "llama3".into()
+            },
+            UnsupportedReason::UnrecognizedTensor {
+                name: "rope_freqs.weight".into()
+            },
+            UnsupportedReason::TiedOutputHead,
+        ]
+    );
+    // The family still claims the architecture, so the refusal names the
+    // features instead of disowning the file.
+    assert!(LlamaFamily.recognizes(&several));
 
     let mut other = minicpm5();
     set_metadata(
@@ -190,7 +224,7 @@ fn features_outside_the_admitted_set_are_not_recognized() {
         Value::Scalar(Scalar::String("mistral3".into())),
     );
     assert_eq!(
-        recognize(&other),
+        admit(&other),
         Err(Error::Architecture(Some("mistral3".into())))
     );
 }
@@ -226,7 +260,7 @@ fn recognized_packages_are_bound_strictly() {
     add_tensor(&mut beyond, "blk.42.attn_norm.weight", &[2048]);
     assert_eq!(
         inspect(&beyond),
-        Err(Error::UnboundWeight("blk.42.attn_norm.weight".into()))
+        Err(Error::UnboundWeights(vec!["blk.42.attn_norm.weight".into()]))
     );
 
     let mut unsized_vocabulary = minicpm5();

@@ -1,3 +1,4 @@
+use magnitude_artifacts::UnsupportedReason;
 use magnitude_generation::TokenId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -52,12 +53,10 @@ pub enum SpecialTokens {
 /// Why a container's tokenizer cannot be adapted or constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenizerError {
-    /// The container declares a tokenizer scheme (`tokenizer.ggml.model`
-    /// and `tokenizer.ggml.pre`) that no implemented profile defines.
-    UnsupportedProfile { model: String, pre: Option<String> },
-    /// The container sets tokenizer metadata whose semantics the engine does
-    /// not implement.
-    UnsupportedMetadata { key: String },
+    /// The container declares a tokenizer scheme no implemented profile
+    /// defines, or sets metadata whose semantics the engine does not
+    /// implement: every such cause at once.
+    Unsupported(Vec<UnsupportedReason>),
     /// The tokenizer payload or configuration is malformed or inconsistent.
     Invalid(String),
 }
@@ -65,12 +64,15 @@ pub enum TokenizerError {
 impl std::fmt::Display for TokenizerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnsupportedProfile { model, pre } => write!(
-                formatter,
-                "unsupported GGUF tokenizer profile: model {model:?}, pre-tokenizer {pre:?}"
-            ),
-            Self::UnsupportedMetadata { key } => {
-                write!(formatter, "unsupported GGUF tokenizer metadata: {key}")
+            Self::Unsupported(reasons) => {
+                formatter.write_str("unsupported GGUF tokenizer: ")?;
+                for (index, reason) in reasons.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    reason.fmt(formatter)?;
+                }
+                Ok(())
             }
             Self::Invalid(message) => formatter.write_str(message),
         }

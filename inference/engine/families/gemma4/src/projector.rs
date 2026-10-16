@@ -103,7 +103,7 @@ impl Reader<'_> {
         let vision =
             |name: &&str| name.starts_with("v.") || (name.starts_with("mm.") && !name.starts_with("mm.a."));
         if let Some(name) = self.tensors.unbound().find(vision) {
-            return Err(HeaderError::UnboundWeight(name.to_owned()).into());
+            return Err(HeaderError::UnboundWeights(vec![name.to_owned()]).into());
         }
         Ok(())
     }

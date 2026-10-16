@@ -227,6 +227,7 @@ impl ManagedCatalogInstallations {
             .downloads
             .start(StartModelDownloadRequest {
                 bundle: definition.configuration.bundle.clone(),
+                for_model: Some(id.clone()),
             })
             .await?;
         let Some(download) = started.download else {

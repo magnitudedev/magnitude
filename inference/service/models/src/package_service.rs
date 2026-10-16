@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -15,8 +13,8 @@ use magnitude_service_contracts::models::{
     ServingProfile,
 };
 use magnitude_service_contracts::{
-    ComponentRelationship, ComponentRole, ContentIdentity, InventoryError, InventoryModel,
-    InventoryProperties, ModelAvailability, ModelInventory, ModelLocation,
+    ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, InventoryError,
+    InventoryModel, InventoryProperties, ModelAvailability, ModelInventory, ModelLocation,
     ModelPreviewComponentSource, ModelPreviewSource, ModelSource, ResolvedModel,
 };
 use sha2::{Digest, Sha256};
@@ -25,7 +23,7 @@ use crate::PreparedPreview;
 use crate::cache::{CachedModelAssessment, ModelIndexKind};
 use crate::inventory::{
     InstalledPackageRecord, InstalledPackageSnapshot, ManagedModelStore, catalog_packages,
-    catalog_target,
+    catalog_target, origin_precedence,
 };
 
 struct ResolvedPackageOperand {
@@ -45,25 +43,50 @@ pub struct ServableModelBundleKey(pub String);
 pub(crate) struct ValidatedModelPackage {
     pub(crate) package: ModelPackage,
     pub(crate) validation: PackageValidation,
+    pub(crate) primary: Option<PrimaryEvidence>,
 }
 
-fn digest_file(path: &Path) -> Result<String, InventoryError> {
-    let file = fs::File::open(path).map_err(|error| {
-        InventoryError::Io(format!("failed to open {}: {error}", path.display()))
-    })?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).map_err(|error| {
-            InventoryError::Io(format!("failed to read {}: {error}", path.display()))
-        })?;
-        if read == 0 {
-            break;
+/// Header facts of a package's primary weights file that local-model identity and lineage need.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PrimaryEvidence {
+    pub(crate) header_digest: String,
+    pub(crate) role: crate::gguf::GgufRole,
+    pub(crate) name: Option<String>,
+    pub(crate) architecture: Option<String>,
+    pub(crate) base_models: Vec<crate::gguf::GgufBaseModel>,
+}
+
+impl PrimaryEvidence {
+    fn from_inspection(inspection: &crate::gguf::GgufInspection) -> Self {
+        Self {
+            header_digest: inspection.header_digest.clone(),
+            role: inspection.role.clone(),
+            name: inspection.name.clone(),
+            architecture: inspection.architecture.clone(),
+            base_models: inspection.base_models.clone(),
         }
-        digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+}
+
+/// The file identity of external content whose SHA-256 is unknown. It is derived from the header
+/// digest and size, so building a package never reads tensor data.
+fn header_file_digest(header_digest: &str, size_bytes: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"magnitude-header-file-v1\0");
+    digest.update(header_digest.as_bytes());
+    digest.update(b"\0");
+    digest.update(size_bytes.to_le_bytes());
+    format!("{:x}", digest.finalize())
+}
+
+/// The file identity of external content that cannot be inspected: its observed identity, so an
+/// unreadable file still forms one stable, invalid package.
+fn unreadable_file_digest(content: &ContentIdentity, size_bytes: u64) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"magnitude-unreadable-file-v1\0");
+    digest.update(serde_json::to_vec(content).unwrap_or_default());
+    digest.update(size_bytes.to_le_bytes());
+    format!("{:x}", digest.finalize())
 }
 
 fn file_id(sha256: &str) -> ModelFileId {
@@ -141,21 +164,22 @@ fn package_source(model: &InventoryModel, resolved: &ResolvedModel) -> ModelPack
             revision: commit.clone(),
         },
         ModelSource::Local { .. } => {
-            let root = match &model.location {
-                ModelLocation::Directory { root, .. } => root.clone(),
-                ModelLocation::File { path, .. } => path
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| PathBuf::from(".")),
-                ModelLocation::MagnitudeCache { .. } | ModelLocation::HuggingFaceCache { .. } => {
-                    resolved
+            let root =
+                match &model.location {
+                    ModelLocation::Directory { root, .. }
+                    | ModelLocation::External { root, .. } => root.clone(),
+                    ModelLocation::File { path, .. } => path
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                    ModelLocation::MagnitudeCache { .. }
+                    | ModelLocation::HuggingFaceCache { .. } => resolved
                         .components
                         .first()
                         .and_then(|component| component.path.parent())
                         .map(Path::to_path_buf)
-                        .unwrap_or_else(|| PathBuf::from("."))
-                }
-            };
+                        .unwrap_or_else(|| PathBuf::from(".")),
+                };
             ModelPackageSource::Local { path: root }
         }
     }
@@ -221,9 +245,8 @@ fn package_relationship(
 
 fn package_from_resolved_with(
     resolved: &ResolvedModel,
-    digest: impl Fn(&Path) -> Result<String, InventoryError>,
     inspect: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
-) -> Result<ModelPackage, InventoryError> {
+) -> Result<(ModelPackage, Option<crate::gguf::GgufInspection>), InventoryError> {
     let model = &resolved.model;
     let source = package_source(model, resolved);
     let declared_components = model.location.components();
@@ -256,7 +279,12 @@ fn package_from_resolved_with(
             {
                 value.clone()
             }
-            _ => digest(absolute)?,
+            content => match inspection.as_ref() {
+                Some(inspection) => {
+                    header_file_digest(&inspection.header_digest, declared.size_bytes)
+                }
+                None => unreadable_file_digest(content, declared.size_bytes),
+            },
         };
         let id = file_id(&sha256);
         ids_by_declared_path.insert(declared.path.clone(), id.clone());
@@ -307,13 +335,20 @@ fn package_from_resolved_with(
     relationships.sort_by_key(|relationship| format!("{relationship:?}"));
     let properties = package_properties(resolved, &inspections);
     let id = canonical_package_id(&files, &relationships);
-    Ok(ModelPackage {
-        id,
-        source,
-        files,
-        relationships,
-        properties,
-    })
+    let primary = inspections
+        .iter()
+        .find(|(role, _)| matches!(role, ComponentRole::Weights | ComponentRole::Shard))
+        .map(|(_, inspection)| inspection.clone());
+    Ok((
+        ModelPackage {
+            id,
+            source,
+            files,
+            relationships,
+            properties,
+        },
+        primary,
+    ))
 }
 
 fn shard_count(indices: impl IntoIterator<Item = Option<u32>>) -> u32 {
@@ -406,28 +441,28 @@ fn package_validation_for(model: &InventoryModel, package: &ModelPackage) -> Pac
 
 fn validated_package_from_resolved_with(
     resolved: &ResolvedModel,
-    digest: impl Fn(&Path) -> Result<String, InventoryError>,
     inspect_gguf: impl Fn(&Path, &ContentIdentity) -> Option<crate::gguf::GgufInspection>,
 ) -> Result<ValidatedModelPackage, InventoryError> {
-    let package = package_from_resolved_with(resolved, digest, inspect_gguf)?;
+    let (package, primary) = package_from_resolved_with(resolved, inspect_gguf)?;
     let validation = package_validation_for(&resolved.model, &package);
     Ok(ValidatedModelPackage {
         package,
         validation,
+        primary: primary.map(|inspection| PrimaryEvidence::from_inspection(&inspection)),
     })
 }
 
 pub(crate) fn validated_package_from_resolved(
     resolved: &ResolvedModel,
 ) -> Result<ValidatedModelPackage, InventoryError> {
-    validated_package_from_resolved_with(resolved, digest_file, |path, _| {
-        crate::gguf::inspect(path).ok()
-    })
+    validated_package_from_resolved_with(resolved, |path, _| crate::gguf::inspect(path).ok())
 }
 
 fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
     match &model.location {
-        ModelLocation::Directory { root, .. } => root.clone(),
+        ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. } => {
+            root.clone()
+        }
         ModelLocation::File { path, .. } => path.clone(),
         ModelLocation::HuggingFaceCache { cache_root, .. } => cache_root.clone(),
         ModelLocation::MagnitudeCache { .. } => resolved
@@ -436,6 +471,25 @@ fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
             .and_then(|component| component.path.parent())
             .map(Path::to_path_buf)
             .unwrap_or_default(),
+    }
+}
+
+/// Who owns an observed occurrence. Only the managed store is Magnitude's; every other location,
+/// an imported file and the process's active file are external.
+fn installation_origin(location: &ModelLocation) -> ModelPackageInstallationOrigin {
+    match location {
+        ModelLocation::MagnitudeCache { .. } => ModelPackageInstallationOrigin::Magnitude,
+        ModelLocation::HuggingFaceCache { .. } => ModelPackageInstallationOrigin::HuggingFaceCache,
+        ModelLocation::External { origin, .. } => match origin {
+            ExternalOrigin::LmStudio { .. } => ModelPackageInstallationOrigin::LmStudio,
+            ExternalOrigin::LlamaCpp { .. } => ModelPackageInstallationOrigin::LlamaCpp,
+            ExternalOrigin::Ollama { .. } => ModelPackageInstallationOrigin::Ollama,
+            ExternalOrigin::Folder => ModelPackageInstallationOrigin::Folder,
+            ExternalOrigin::Imported => ModelPackageInstallationOrigin::Imported,
+        },
+        ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
+            ModelPackageInstallationOrigin::Imported
+        }
     }
 }
 
@@ -674,120 +728,18 @@ impl ManagedModelStore {
         }
     }
 
-    fn seed_package_digests_from_snapshot(
-        &self,
-        resolved: &ResolvedModel,
-    ) -> Result<(), InventoryError> {
-        let cached = self
-            .installed_packages
-            .read()
-            .map_err(|_| {
-                InventoryError::Internal("installed package snapshot lock poisoned".to_owned())
-            })?
-            .records
-            .values()
-            .find(|record| {
-                record.model.id == resolved.model.id
-                    && record.model.content_id == resolved.model.content_id
-            })
-            .cloned();
-        let Some(cached) = cached else {
-            return Ok(());
-        };
-        let files = cached
-            .installed
-            .package
-            .files
-            .iter()
-            .map(|file| (&file.path, file))
-            .collect::<BTreeMap<_, _>>();
-        let mut digests = self.package_digests.write().map_err(|_| {
-            InventoryError::Internal("package digest cache lock poisoned".to_owned())
-        })?;
-        for (declared, component) in resolved
-            .model
-            .location
-            .components()
-            .iter()
-            .zip(&resolved.components)
-        {
-            let Some(file) = files.get(&declared.path) else {
-                continue;
-            };
-            if file.size_bytes != declared.size_bytes
-                || file.id != file_id(&file.sha256)
-                || file.sha256.len() != 64
-                || !file
-                    .sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                continue;
-            }
-            let Ok(metadata) = fs::metadata(&component.path) else {
-                continue;
-            };
-            let Ok(modified) = metadata.modified() else {
-                continue;
-            };
-            if metadata.len() == file.size_bytes {
-                digests.insert(
-                    component.path.clone(),
-                    (metadata.len(), modified, file.sha256.clone()),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn inspect_package_from_resolved(
+    pub(crate) fn inspect_package_from_resolved(
         &self,
         resolved: &ResolvedModel,
     ) -> Result<ValidatedModelPackage, InventoryError> {
-        validated_package_from_resolved_with(
-            resolved,
-            |path| {
-                let metadata = fs::metadata(path).map_err(|error| {
-                    InventoryError::Io(format!("failed to inspect {}: {error}", path.display()))
-                })?;
-                let modified = metadata.modified().map_err(|error| {
-                    InventoryError::Io(format!(
-                        "failed to inspect modification time for {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                if let Some((_, _, digest)) = self
-                    .package_digests
-                    .read()
-                    .map_err(|_| {
-                        InventoryError::Internal("package digest cache lock poisoned".to_owned())
-                    })?
-                    .get(path)
-                    .filter(|(size, cached_modified, _)| {
-                        *size == metadata.len() && *cached_modified == modified
-                    })
-                {
-                    return Ok(digest.clone());
-                }
-                let digest = digest_file(path)?;
-                self.package_digests
-                    .write()
-                    .map_err(|_| {
-                        InventoryError::Internal("package digest cache lock poisoned".to_owned())
-                    })?
-                    .insert(
-                        path.to_path_buf(),
-                        (metadata.len(), modified, digest.clone()),
-                    );
-                Ok(digest)
-            },
-            |path, content| self.inspect_gguf(path, content),
-        )
+        validated_package_from_resolved_with(resolved, |path, content| {
+            self.inspect_gguf(path, content)
+        })
     }
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v1", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v2", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }
@@ -826,10 +778,10 @@ impl ManagedModelStore {
                 components: crate::service::resolve_components(&self.config.root, model)?,
                 model: model.clone(),
             };
-            self.seed_package_digests_from_snapshot(&resolved)?;
             let ValidatedModelPackage {
                 package,
                 validation,
+                primary,
             } = self.inspect_package_from_resolved(&resolved)?;
             for catalog_model in &self.config.catalog_models {
                 for (catalog_package, role) in catalog_packages(catalog_model) {
@@ -840,17 +792,7 @@ impl ManagedModelStore {
             }
             let installed = InstalledModelPackage {
                 path: installed_path(model, &resolved),
-                origin: match &model.location {
-                    ModelLocation::MagnitudeCache { .. } => {
-                        ModelPackageInstallationOrigin::Magnitude
-                    }
-                    ModelLocation::HuggingFaceCache { .. } => {
-                        ModelPackageInstallationOrigin::HuggingFaceCache
-                    }
-                    ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
-                        ModelPackageInstallationOrigin::Magnitude
-                    }
-                },
+                origin: installation_origin(&model.location),
                 validation,
                 catalog_attribution: self.installed_catalog_attribution(model, &package),
                 package,
@@ -860,6 +802,7 @@ impl ManagedModelStore {
                 InstalledPackageRecord {
                     installed,
                     model: model.clone(),
+                    primary,
                 },
             );
         }
@@ -918,12 +861,7 @@ impl ManagedModelStore {
             .records
             .values()
             .filter(|record| record.installed.package.id == *package_id)
-            .min_by_key(|record| {
-                (
-                    record.installed.origin == ModelPackageInstallationOrigin::HuggingFaceCache,
-                    &record.model.id,
-                )
-            })
+            .min_by_key(|record| (origin_precedence(record.installed.origin), &record.model.id))
             .cloned()
             .ok_or_else(|| InventoryError::NotFound(package_id.0.clone()))?;
         let resolved = ResolvedModel {

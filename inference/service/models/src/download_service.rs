@@ -7,7 +7,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use getrandom::fill;
 use magnitude_service_contracts::models::{
-    ModelDownload, ModelDownloadId, ModelDownloadState, ModelDownloads, ModelDownloadsInvalidation,
+    ModelDownload, ModelDownloadId, ModelDownloadState, ModelId, ModelDownloads, ModelDownloadsInvalidation,
     ModelDownloadsResponse, ModelPackage, ModelPackageId, ModelPackageSource, ServableModelBundle,
     StartModelDownloadRequest, StartModelDownloadResponse,
 };
@@ -72,6 +72,7 @@ struct AttemptRecord {
 struct DownloadRecord {
     id: ModelDownloadId,
     bundle: ServableModelBundle,
+    for_model: Option<ModelId>,
     attempt_ids: Vec<DownloadAttemptId>,
     cancelled: bool,
     failure_acknowledged: bool,
@@ -395,6 +396,7 @@ fn model_download(
     ModelDownload {
         id: record.id.clone(),
         bundle: record.bundle.clone(),
+        for_model: record.for_model.clone(),
         state,
     }
 }
@@ -622,6 +624,7 @@ impl ModelDownloads for ManagedModelDownloads {
                 let mut record = DownloadRecord {
                     id: id.clone(),
                     bundle: request.bundle,
+                    for_model: request.for_model,
                     attempt_ids: admitted
                         .iter()
                         .map(|attempt| attempt_identity(attempt).0)
@@ -913,6 +916,7 @@ mod tests {
         let record = DownloadRecord {
             id: id.clone(),
             bundle: paired_bundle(target, draft),
+            for_model: None,
             attempt_ids: vec![attempt_id],
             cancelled: false,
             failure_acknowledged: false,
@@ -956,6 +960,7 @@ mod tests {
         let record = DownloadRecord {
             id: ModelDownloadId("model_download_test".to_owned()),
             bundle: ServableModelBundle::Standalone { package },
+            for_model: None,
             attempt_ids: vec![attempt_id],
             cancelled: false,
             failure_acknowledged: false,
@@ -982,6 +987,7 @@ mod tests {
             bundle: ServableModelBundle::Standalone {
                 package: package("package_test", 10),
             },
+            for_model: None,
             attempt_ids: vec![DownloadAttemptId("attempt_missing".to_owned())],
             cancelled: false,
             failure_acknowledged: false,
@@ -1019,6 +1025,7 @@ mod tests {
             bundle: ServableModelBundle::Standalone {
                 package: package.clone(),
             },
+            for_model: None,
             attempt_ids: vec![attempt_id.clone()],
             cancelled: false,
             failure_acknowledged: false,
@@ -1094,6 +1101,7 @@ mod tests {
             DownloadRecord {
                 id: bundle_id.clone(),
                 bundle: paired_bundle(target.clone(), draft.clone()),
+                for_model: None,
                 attempt_ids: vec![target_id.clone(), draft_id.clone()],
                 cancelled: false,
                 failure_acknowledged: false,
@@ -1114,6 +1122,7 @@ mod tests {
                 bundle: ServableModelBundle::Standalone {
                     package: target.clone(),
                 },
+                for_model: None,
                 attempt_ids: vec![target_id.clone()],
                 cancelled: false,
                 failure_acknowledged: false,
@@ -1150,6 +1159,7 @@ mod tests {
         let record = DownloadRecord {
             id: ModelDownloadId("model_download_test".to_owned()),
             bundle: ServableModelBundle::Standalone { package },
+            for_model: None,
             attempt_ids: vec![attempt_id],
             cancelled: true,
             failure_acknowledged: false,

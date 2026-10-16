@@ -391,7 +391,7 @@ fn an_unbound_or_foreign_weight_is_refused() {
     });
     assert_eq!(
         recognize(&directory).unwrap_err(),
-        Error::UnboundWeight("foreign.weight".into())
+        Error::Unadmitted { metadata: Vec::new(), tensors: vec!["foreign.weight".into()] }
     );
     // A layer beyond `block_count` is a known role no layer binds.
     let (mut directory, _) = qwen_draft();
@@ -404,7 +404,7 @@ fn an_unbound_or_foreign_weight_is_refused() {
     });
     assert_eq!(
         inspect_qwen(&directory, &model).unwrap_err(),
-        Error::UnboundWeight("blk.6.attn_norm.weight".into())
+        Error::Unadmitted { metadata: Vec::new(), tensors: vec!["blk.6.attn_norm.weight".into()] }
     );
 }
 
@@ -417,7 +417,7 @@ fn unknown_metadata_is_refused() {
     });
     assert_eq!(
         inspect_qwen(&directory, &model).unwrap_err(),
-        Error::UnknownMetadata("dflash.rope.dimension_count".into())
+        Error::Unadmitted { metadata: vec!["dflash.rope.dimension_count".into()], tensors: Vec::new() }
     );
 }
 
@@ -834,5 +834,5 @@ fn orphan_output_scale_is_refused() {
         offset: 0,
         nbytes: 0,
     });
-    assert_eq!(inspect_qwen(&directory, &model).unwrap_err(), Error::UnboundWeight("output.scale".into()));
+    assert_eq!(inspect_qwen(&directory, &model).unwrap_err(), Error::Unadmitted { metadata: Vec::new(), tensors: vec!["output.scale".into()] });
 }

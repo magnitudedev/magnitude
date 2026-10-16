@@ -108,6 +108,46 @@ impl Encoding {
         Self::Q1_0,
     ];
 
+    /// The ggml type name (`ggml_type_name`), as GGUF tooling prints it.
+    pub fn ggml_name(self) -> &'static str {
+        match self {
+            Self::F32 => "F32",
+            Self::F16 => "F16",
+            Self::Q4_0 => "Q4_0",
+            Self::Q4_1 => "Q4_1",
+            Self::Q5_0 => "Q5_0",
+            Self::Q5_1 => "Q5_1",
+            Self::Q8_0 => "Q8_0",
+            Self::Q8_1 => "Q8_1",
+            Self::Q2K => "Q2_K",
+            Self::Q3K => "Q3_K",
+            Self::Q4K => "Q4_K",
+            Self::Q5K => "Q5_K",
+            Self::Q6K => "Q6_K",
+            Self::Q8K => "Q8_K",
+            Self::Iq2Xxs => "IQ2_XXS",
+            Self::Iq2Xs => "IQ2_XS",
+            Self::Iq3Xxs => "IQ3_XXS",
+            Self::Iq1S => "IQ1_S",
+            Self::Iq4Nl => "IQ4_NL",
+            Self::Iq3S => "IQ3_S",
+            Self::Iq2S => "IQ2_S",
+            Self::Iq4Xs => "IQ4_XS",
+            Self::I8 => "I8",
+            Self::I16 => "I16",
+            Self::I32 => "I32",
+            Self::I64 => "I64",
+            Self::F64 => "F64",
+            Self::Iq1M => "IQ1_M",
+            Self::BF16 => "BF16",
+            Self::Tq1_0 => "TQ1_0",
+            Self::Tq2_0 => "TQ2_0",
+            Self::Mxfp4 => "MXFP4",
+            Self::Nvfp4 => "NVFP4",
+            Self::Q1_0 => "Q1_0",
+        }
+    }
+
     pub fn block_elements(self) -> u64 {
         match self {
             Self::F32
@@ -400,6 +440,12 @@ pub fn read_directory<R: Read + Seek>(
     header_limit: u64,
 ) -> Result<Directory, Error> {
     read_directory_with_payload(source, header_limit, true)
+}
+
+/// Read a GGUF header held in memory (every byte through the aligned data
+/// offset); tensor payloads need not follow it.
+pub fn read_header(bytes: &[u8]) -> Result<Directory, Error> {
+    read_directory_with_payload(&mut std::io::Cursor::new(bytes), DEFAULT_HEADER_LIMIT, false)
 }
 
 /// Inspect one downloaded GGUF file header before weight payloads exist.

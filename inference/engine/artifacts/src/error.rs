@@ -25,6 +25,18 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// Whether the material itself is truncated or not a valid container,
+    /// as opposed to a source that could not be read.
+    pub fn unreadable(&self) -> bool {
+        match self {
+            Self::Invalid(_) => true,
+            Self::Io(error) => error.kind() == io::ErrorKind::UnexpectedEof,
+            Self::AmbiguousProjectors(_) => false,
+        }
+    }
+}
+
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {

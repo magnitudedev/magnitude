@@ -125,6 +125,7 @@ getrandom = "0.4.3"
 hf-hub = { version = "1.0.0", features = ["rustls-tls"] }
 http-body-util = "0.1.3"
 libc = "0.2.180"
+notify = "8.2.0"
 opentelemetry = { version = "0.32.0", features = ["logs", "trace"] }
 opentelemetry-appender-tracing = "0.32.0"
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["http-json", "logs", "reqwest-blocking-client", "trace"] }

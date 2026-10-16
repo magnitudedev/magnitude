@@ -359,7 +359,10 @@ fn rejects_unknown_metadata_and_unbound_tensors() {
         name: "nemotron_h_moe.expert_gating_func".into(),
         value: Value::Scalar(Scalar::Unsigned(1)),
     });
-    assert!(matches!(inspect(&directory), Err(Error::Metadata(_))));
+    assert_eq!(
+        inspect(&directory).unwrap_err(),
+        Error::UnknownMetadata(vec!["nemotron_h_moe.expert_gating_func".into()])
+    );
 
     let mut directory = lightning_q8();
     directory.tensors.push(TensorDescriptor {
@@ -371,9 +374,7 @@ fn rejects_unknown_metadata_and_unbound_tensors() {
     });
     assert_eq!(
         inspect(&directory).unwrap_err(),
-        Error::Weight(
-            "Nemotron-H artifact contains unbound weight role \"blk.0.ssm_extra.weight\"".into()
-        )
+        Error::UnboundWeights(vec!["blk.0.ssm_extra.weight".into()])
     );
 }
 

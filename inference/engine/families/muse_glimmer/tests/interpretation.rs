@@ -198,7 +198,7 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
     );
     rejected(
         &|d| headers::add_tensor(d, "blk.0.attn_sinks.weight", &[32]),
-        "unbound weight role \"blk.0.attn_sinks.weight\"",
+        "unbound weight roles [\"blk.0.attn_sinks.weight\"]",
     );
     rejected(
         &|d| {
@@ -208,7 +208,7 @@ fn rejects_missing_misshapen_unbound_and_unknown_roles() {
                 Value::Scalar(Scalar::String("yarn".into())),
             )
         },
-        "unknown metadata \"muse-glimmer.rope.scaling.type\"",
+        "unknown metadata [\"muse-glimmer.rope.scaling.type\"]",
     );
     rejected(
         &|d| {

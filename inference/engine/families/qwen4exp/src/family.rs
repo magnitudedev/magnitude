@@ -1,6 +1,6 @@
 //! Qwen4 experimental as a registered model family.
 
-use crate::{FAMILY_ID, FAMILY_IDS, inspect_components, recognize};
+use crate::{FAMILY_ID, FAMILY_IDS, inspect_components};
 use magnitude_artifacts::{PackageIdentity, gguf::Directory};
 use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, MarkerTokens, ModelDefinition, ModelFamily,
@@ -19,8 +19,8 @@ impl ModelFamily for Qwen4ExpFamily {
         FAMILY_ID
     }
 
-    fn recognizes(&self, target: &Directory) -> bool {
-        recognize(target).is_ok()
+    fn architectures(&self) -> &'static [&'static str] {
+        FAMILY_IDS
     }
 
     fn inspect(
@@ -30,7 +30,6 @@ impl ModelFamily for Qwen4ExpFamily {
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
         inspect_components(target, projector, identity)
-            .map_err(|error| FamilyError(error.to_string()))
     }
 
     fn input_adapter(
@@ -47,7 +46,7 @@ impl ModelFamily for Qwen4ExpFamily {
                     markers.marker("<|vision_start|>")?,
                     markers.marker("<|vision_end|>")?,
                 )
-                .map_err(|error| FamilyError(error.to_string()))
+                .map_err(|error| FamilyError::invalid(error.to_string()))
             })
             .transpose()?;
         Ok(Box::new(QwenInputAdapter::new(FAMILY_IDS, image_tokens)))

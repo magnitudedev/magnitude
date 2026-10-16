@@ -12,7 +12,9 @@ use magnitude_service_models::{
     managed_model_services,
 };
 use magnitude_service_server::assessment::ManagedModelAssessments;
+use magnitude_service_models::lineage::CatalogLineage;
 use magnitude_service_server::assessment::assessor::ModelAssessor;
+use magnitude_service_server::assessment::candidates::{ManagedModelCandidates, engine_architectures};
 use magnitude_service_server::assessment::environment::AssessmentEnvironment;
 use magnitude_service_server::build_identity;
 use magnitude_service_server::configurations::ResolvedConfigurations;
@@ -64,9 +66,10 @@ enum Command {
         /// Magnitude-owned root for all disposable derived cache data, including formed kernels.
         #[arg(long)]
         cache_root: Option<PathBuf>,
-        /// Additional read-only Hugging Face hub cache roots.
-        #[arg(long = "hf-cache", visible_alias = "hf-cache-dir")]
-        hf_caches: Vec<PathBuf>,
+        /// JSON local-models configuration (roots, declarations, hidden models, drafters) in
+        /// effect before the first scan; the owner replaces it at runtime.
+        #[arg(long)]
+        local_models_config: Option<PathBuf>,
         /// Verified release or prepared development installation.
         #[arg(long)]
         installation: PathBuf,
@@ -122,7 +125,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
             auth_token,
             model_store,
             cache_root,
-            hf_caches,
+            local_models_config,
             installation,
         } => {
             let installation = installation::Installation::load(&installation)
@@ -159,7 +162,9 @@ async fn run(command: Command) -> anyhow::Result<()> {
             };
             let mut inventory_config = InventoryConfig::with_roots(inventory_root, cache_root)
                 .context("invalid model inventory configuration")?;
-            inventory_config.hf_cache_dirs.extend(hf_caches);
+            if let Some(path) = local_models_config {
+                inventory_config.local_models = read_local_models_configuration(&path)?;
+            }
             inventory_config.catalog_models = release_catalog.catalog().models.clone();
             let inventory = Arc::new(
                 ManagedModelStore::open(inventory_config)
@@ -197,21 +202,36 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 instance_id_namespace: instance_id.clone(),
             });
             let model_services = managed_model_services(
-                model_variants,
+                model_variants.clone(),
                 model_downloads.clone(),
                 Arc::new(instances.clone()),
                 Arc::new(instances.clone()),
             )
             .context("failed to initialize model domains")?;
+            let architectures = engine_architectures();
+            let lineage = CatalogLineage::new(inventory.clone(), release_catalog.catalog().clone());
+            let candidates = ManagedModelCandidates::new(
+                assessor.clone(),
+                lineage.clone(),
+                architectures.clone(),
+                model_services.catalog.clone(),
+                model_services.local.clone(),
+            );
+            candidates.start_enrichment(model_variants.clone());
             let assessments = ManagedModelAssessments::start(
                 assessor,
                 model_services.catalog.clone(),
-                model_services.discovered.clone(),
+                model_services.local.clone(),
             );
             instances.attach_assessments(assessments.clone());
             let mut state = AppState::new()
                 .with_model_downloads(model_downloads)
-                .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(inventory.clone())))
+                .with_hugging_face_catalog(Arc::new(HuggingFaceDiscovery::new(
+                    inventory.clone(),
+                    architectures,
+                    lineage,
+                )))
+                .with_model_candidates(candidates)
                 .with_identity(ServerIdentity {
                     instance_id: instance_id.clone(),
                     api_version: 1,
@@ -219,7 +239,7 @@ async fn run(command: Command) -> anyhow::Result<()> {
                 })
                 .with_model_domains(
                     model_services.catalog.clone(),
-                    model_services.discovered.clone(),
+                    model_services.local.clone(),
                     model_services.installations.clone(),
                 )
                 .with_model_assessments(assessments)
@@ -285,6 +305,15 @@ async fn run(command: Command) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_local_models_configuration(
+    path: &std::path::Path,
+) -> anyhow::Result<magnitude_service_contracts::models::LocalModelsConfiguration> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read local-models configuration {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid local-models configuration {}", path.display()))
+}
+
 #[cfg(unix)]
 async fn interrupt_signal() {
     use tokio::signal::unix::{SignalKind, signal};
@@ -313,20 +342,66 @@ mod tests {
             "/tmp/installation.json",
             "--models-dir",
             "/tmp/models",
-            "--hf-cache-dir",
-            "/tmp/hf",
         ])
         .expect("documented inventory flag aliases should parse");
-        let Command::Serve {
-            model_store,
-            hf_caches,
-            ..
-        } = aliases.command
-        else {
+        let Command::Serve { model_store, .. } = aliases.command else {
             panic!("expected serve command")
         };
         assert_eq!(model_store, Some(PathBuf::from("/tmp/models")));
-        assert_eq!(hf_caches, vec![PathBuf::from("/tmp/hf")]);
+    }
+
+    #[test]
+    fn hugging_face_caches_come_only_from_the_local_models_configuration() {
+        assert!(
+            Cli::try_parse_from([
+                env!("CARGO_BIN_NAME"),
+                "serve",
+                "--installation",
+                "/tmp/installation.json",
+                "--hf-cache",
+                "/tmp/hf",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_models_configuration_is_read_before_the_first_scan() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("local-models.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "roots": [{ "kind": "Ollama", "path": "/home/u/.ollama/models", "enabled": true }],
+                "declarations": [],
+                "hidden": [],
+                "drafters": []
+            })
+            .to_string(),
+        )
+        .expect("configuration file");
+        let parsed = Cli::try_parse_from([
+            env!("CARGO_BIN_NAME"),
+            "serve",
+            "--installation",
+            "/tmp/installation.json",
+            "--local-models-config",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .expect("the local-models configuration flag parses");
+        let Command::Serve {
+            local_models_config: Some(configured),
+            ..
+        } = parsed.command
+        else {
+            panic!("expected serve command with a local-models configuration")
+        };
+        let configuration =
+            read_local_models_configuration(&configured).expect("valid configuration");
+        assert_eq!(configuration.roots.len(), 1);
+
+        std::fs::write(&path, b"{\"roots\": 3}").expect("invalid configuration file");
+        assert!(read_local_models_configuration(&path).is_err());
     }
 
     #[test]

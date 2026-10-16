@@ -135,7 +135,8 @@ impl PackageHeaders {
     }
 
     /// Add a separate draft model's header as a component of the package.
-    pub fn with_draft(mut self, draft: &Path) -> Result<Self, Error> {
+    /// On failure the package keeps its target and projector.
+    pub fn add_draft(&mut self, draft: &Path) -> Result<(), Error> {
         let component = HeaderComponent::inspect(draft)?;
         let others = self
             .target
@@ -150,7 +151,7 @@ impl PackageHeaders {
             }
         }
         self.draft = Some((component, ArtifactIdentity::for_open()));
-        Ok(self)
+        Ok(())
     }
 
     pub fn target(&self) -> &Directory {

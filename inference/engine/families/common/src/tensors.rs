@@ -134,11 +134,13 @@ impl<'a> Tensors<'a> {
             .filter(|name| !self.bound.contains(name))
     }
 
-    /// Proves every stored tensor was bound.
+    /// Proves every stored tensor was bound, naming every one that was not.
     pub fn finish(self) -> Result<(), HeaderError> {
-        match self.unbound().next() {
-            Some(name) => Err(HeaderError::UnboundWeight(name.to_owned())),
-            None => Ok(()),
+        let unbound = self.unbound().map(str::to_owned).collect::<Vec<_>>();
+        if unbound.is_empty() {
+            Ok(())
+        } else {
+            Err(HeaderError::UnboundWeights(unbound))
         }
     }
 }

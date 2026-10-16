@@ -1,7 +1,7 @@
 //! Muse Glimmer as a registered model family.
 
 use crate::inputs::{input_adapter, IMAGE_PLACEHOLDER};
-use crate::{inspect_components, recognize};
+use crate::{inspect_components, ARCHITECTURE};
 use magnitude_artifacts::{gguf::Directory, PackageIdentity};
 use magnitude_family_contracts::{
     FamilyError, FamilyInputAdapter, ImageMarkers, MarkerTokens, ModelDefinition, ModelFamily,
@@ -14,8 +14,8 @@ impl ModelFamily for MuseGlimmerFamily {
         "muse-glimmer"
     }
 
-    fn recognizes(&self, target: &Directory) -> bool {
-        recognize(target)
+    fn architectures(&self) -> &'static [&'static str] {
+        &[ARCHITECTURE]
     }
 
     fn inspect(
@@ -25,7 +25,6 @@ impl ModelFamily for MuseGlimmerFamily {
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
         inspect_components(target, projector, identity)
-            .map_err(|error| FamilyError(error.to_string()))
     }
 
     fn input_adapter(
@@ -42,7 +41,7 @@ impl ModelFamily for MuseGlimmerFamily {
                     markers.marker("<|patch|>")?,
                     markers.marker("<|image_end|>")?,
                 )
-                .map_err(|error| FamilyError(error.to_string()))
+                .map_err(|error| FamilyError::invalid(error.to_string()))
             })
             .transpose()?;
         Ok(Box::new(input_adapter(markers)))

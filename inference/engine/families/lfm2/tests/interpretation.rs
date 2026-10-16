@@ -275,14 +275,14 @@ fn rejects_unknown_and_malformed_metadata() {
         "lfm2.attention.sliding_window",
         Value::Scalar(Scalar::Unsigned(4096)),
     );
-    assert!(inspect(&sliding).unwrap_err().contains("not understood"));
+    assert!(inspect(&sliding).unwrap_err().contains("unknown metadata"));
 
     let scaled = with_metadata(
         variant("lfm2.5-8b-a1b"),
         "lfm2moe.expert_weights_scale",
         Value::Scalar(Scalar::Float(2.5)),
     );
-    assert!(inspect(&scaled).unwrap_err().contains("not understood"));
+    assert!(inspect(&scaled).unwrap_err().contains("unknown metadata"));
 
     // Expert keys belong to the routed architecture only.
     let routed_key = with_metadata(
@@ -290,7 +290,7 @@ fn rejects_unknown_and_malformed_metadata() {
         "lfm2.expert_count",
         Value::Scalar(Scalar::Unsigned(32)),
     );
-    assert!(inspect(&routed_key).unwrap_err().contains("not understood"));
+    assert!(inspect(&routed_key).unwrap_err().contains("unknown metadata"));
 
     let scalar_kv = with_metadata(
         variant("lfm2.5-2.6b"),

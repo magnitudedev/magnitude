@@ -45,10 +45,16 @@ pub struct CatalogVariantId(String);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HuggingFaceRepositoryId(String);
 
-/// The repository-relative GGUF weights selector used in a discovered model identity.
+/// The repository-relative GGUF weights selector used in a Hugging Face model identity.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HuggingFaceArtifactSelector(String);
+
+/// The lowercase hex sha256 of a primary GGUF file's header bytes, through the aligned tensor-data
+/// offset. It identifies a custom model with no Hugging Face identity.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema), schema(value_type = String))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalModelDigest(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("invalid model ID: {message}")]
@@ -93,9 +99,9 @@ impl CatalogBaseId {
     pub fn new(value: impl Into<String>) -> Result<Self, ModelIdError> {
         let value = value.into();
         validate_normalized_component(&value, "catalog base")?;
-        if value == "hf" || value.contains(':') || value.contains('/') {
+        if matches!(value.as_str(), "hf" | "local") || value.contains(':') || value.contains('/') {
             return Err(model_id_error(
-                "catalog base must be one non-hf identity component",
+                "catalog base must be one identity component other than hf or local",
             ));
         }
         Ok(Self(value))
@@ -141,6 +147,33 @@ impl CatalogVariantId {
 }
 
 impl fmt::Display for CatalogVariantId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl LocalModelDigest {
+    pub fn new(value: impl Into<String>) -> Result<Self, ModelIdError> {
+        let value = value.into();
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(model_id_error(
+                "local model digest must be 64 lowercase hex characters",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for LocalModelDigest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
     }
@@ -258,6 +291,9 @@ pub enum ParsedModelId {
         repository_id: HuggingFaceRepositoryId,
         artifact_selector: HuggingFaceArtifactSelector,
     },
+    Local {
+        digest: LocalModelDigest,
+    },
 }
 
 impl ModelId {
@@ -272,6 +308,11 @@ impl ModelId {
         artifact_selector: &HuggingFaceArtifactSelector,
     ) -> Self {
         Self(format!("hf:{}/{}", repository_id.0, artifact_selector.0))
+    }
+
+    #[must_use]
+    pub fn local(digest: &LocalModelDigest) -> Self {
+        Self(format!("local:{}", digest.0))
     }
 
     #[must_use]
@@ -303,6 +344,12 @@ fn parse_model_id(value: &str) -> Result<ParsedModelId, ModelIdError> {
         return Ok(ParsedModelId::HuggingFace {
             repository_id: HuggingFaceRepositoryId::new(format!("{owner}/{repository}"))?,
             artifact_selector: HuggingFaceArtifactSelector::new(selector)?,
+        });
+    }
+
+    if let Some(digest) = value.strip_prefix("local:") {
+        return Ok(ParsedModelId::Local {
+            digest: LocalModelDigest::new(digest)?,
         });
     }
 
@@ -365,12 +412,13 @@ macro_rules! impl_validated_string {
 
 impl_validated_string!(CatalogBaseId, CatalogBaseId::new);
 impl_validated_string!(CatalogVariantId, CatalogVariantId::new);
+impl_validated_string!(LocalModelDigest, LocalModelDigest::new);
 
 #[cfg(test)]
 mod model_id_tests {
     use std::str::FromStr;
 
-    use super::{CatalogBaseId, CatalogVariantId, ModelId, ParsedModelId};
+    use super::{CatalogBaseId, CatalogVariantId, LocalModelDigest, ModelId, ParsedModelId};
 
     #[test]
     fn parses_and_round_trips_standalone_and_nested_artifacts() {
@@ -422,6 +470,43 @@ mod model_id_tests {
                 variant_id: variant,
             }
         );
+    }
+
+    #[test]
+    fn composes_parses_and_round_trips_local_identity() {
+        let digest = LocalModelDigest::new("0123456789abcdef".repeat(4)).expect("digest");
+        let id = ModelId::local(&digest);
+        assert_eq!(
+            id.as_str(),
+            format!("local:{}", "0123456789abcdef".repeat(4))
+        );
+        assert_eq!(id.parsed(), ParsedModelId::Local { digest });
+        let encoded = serde_json::to_string(&id).expect("serialize");
+        assert_eq!(
+            serde_json::from_str::<ModelId>(&encoded).expect("deserialize"),
+            id
+        );
+    }
+
+    #[test]
+    fn rejects_non_canonical_local_identities() {
+        for value in [
+            "local:".to_owned(),
+            format!("local:{}", "A".repeat(64)),
+            format!("local:{}", "a".repeat(63)),
+            format!("local:{}", "a".repeat(65)),
+            format!("local:{}", "g".repeat(64)),
+            format!("LOCAL:{}", "a".repeat(64)),
+        ] {
+            assert!(ModelId::from_str(&value).is_err(), "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn reserves_local_and_hf_as_catalog_bases() {
+        assert!(CatalogBaseId::new("local").is_err());
+        assert!(CatalogBaseId::new("hf").is_err());
+        assert!(ModelId::from_str("local:gguf:q4").is_err());
     }
 }
 
@@ -830,6 +915,11 @@ pub enum PackageValidation {
 pub enum ModelPackageInstallationOrigin {
     Magnitude,
     HuggingFaceCache,
+    LmStudio,
+    LlamaCpp,
+    Ollama,
+    Folder,
+    Imported,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -992,7 +1082,7 @@ pub enum EffectiveModel {
 #[serde(rename_all = "PascalCase")]
 pub enum ModelInstallationOwnership {
     Magnitude,
-    ExternalHuggingFace,
+    External,
     Mixed,
 }
 
@@ -1156,10 +1246,52 @@ pub struct CatalogModelsResponse {
     pub models: Vec<CatalogModel>,
 }
 
+/// Where a scanned custom model was found.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum FoundSource {
+    HuggingFaceCache,
+    LmStudio,
+    LlamaCpp,
+    Ollama,
+    Folder {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
+}
+
+/// How a custom model came to be on this computer, which decides who owns its files.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DiscoveredModelCatalogAttribution {
+pub enum CustomModelOrigin {
+    Added {
+        repository: HuggingFaceRepositoryId,
+        commit: String,
+    },
+    Imported {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
+    Found {
+        source: FoundSource,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustomModelFile {
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub path: PathBuf,
+    pub size_bytes: u64,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CustomModelCatalogAttribution {
     NotInCatalog,
     Failed { failure: ModelFailure },
 }
@@ -1167,12 +1299,13 @@ pub enum DiscoveredModelCatalogAttribution {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
-pub enum DiscoveredModelState {
+pub enum CustomModelState {
+    NotInstalled,
     #[serde(rename_all = "camelCase")]
     Ready {
         installation: ResolvedModelInstallation,
         model: ReadyModel,
-        catalog_attribution: DiscoveredModelCatalogAttribution,
+        catalog_attribution: CustomModelCatalogAttribution,
     },
     #[serde(rename_all = "camelCase")]
     Unavailable {
@@ -1181,21 +1314,453 @@ pub enum DiscoveredModelState {
     },
 }
 
+/// Why the engine cannot execute a model, typed where the engine raises it. Clients render a case
+/// they do not know with `detail`.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DiscoveredModel {
-    pub id: ModelId,
-    pub state: DiscoveredModelState,
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum UnsupportedReason {
+    Architecture {
+        architecture: String,
+    },
+    WeightTypes {
+        types: Vec<WeightTypeCount>,
+    },
+    RopeScaling {
+        kind: String,
+    },
+    UnrecognizedTensor {
+        name: String,
+    },
+    UnrecognizedMetadata {
+        key: String,
+    },
+    Tokenizer {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        pre: Option<String>,
+    },
+    ChatTemplate,
+    KernelDomain {
+        backend: String,
+        entry: String,
+        statics: Vec<KernelStatic>,
+    },
+    Backend {
+        backend: String,
+    },
+    TargetMismatch {
+        detail: String,
+    },
+    TiedOutputHead,
+    Unreadable,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DiscoveredModelsResponse {
+pub struct WeightTypeCount {
+    pub ggml_type: String,
+    pub tensor_count: u32,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KernelStatic {
+    pub name: String,
+    pub value: u64,
+}
+
+/// The shape a drafter binds to. Requantizations, finetunes and abliterations keep it, so it
+/// matches a model to its parent catalog model when nothing else does.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelFingerprint {
+    pub architecture: String,
+    pub block_count: u32,
+    pub embedding_length: u32,
+    pub head_count: u32,
+    pub head_count_kv: u32,
+    pub key_length: u32,
+    pub vocab_size: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub expert_count: Option<u32>,
+    pub tokenizer_digest: String,
+}
+
+/// Whether the engine binds a model's drafter. `None` means no drafter was configured.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum DrafterVerdict {
+    None,
+    #[serde(rename_all = "camelCase")]
+    Bound {
+        method: SpeculativeMethod,
+        memory_bytes: u64,
+    },
+    Rejected {
+        reasons: Vec<UnsupportedReason>,
+        detail: String,
+    },
+}
+
+/// A drafter's files, independent of which model uses it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum DrafterReference {
+    #[serde(rename_all = "camelCase")]
+    Catalog {
+        model_id: ModelId,
+    },
+    Embedded,
+    HuggingFace {
+        repository: HuggingFaceRepositoryId,
+        commit: String,
+        path: String,
+    },
+    Local {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum DrafterCategory {
+    CatalogDrafter,
+    BuiltIn,
+    NextToModel,
+    OnThisComputer,
+    HuggingFace,
+    Other,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum DrafterLineage {
+    Exact,
+    Lineage,
+    Fingerprint,
+    None,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DrafterCandidate {
+    pub category: DrafterCategory,
+    pub reference: DrafterReference,
+    pub label: String,
+    pub size_bytes: u64,
+    pub lineage: DrafterLineage,
+    pub verdict: DrafterVerdict,
+    pub on_this_computer: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub method: Option<SpeculativeMethod>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum AttachedDrafterState {
+    Ready,
+    NotInstalled,
+    Rejected {
+        reasons: Vec<UnsupportedReason>,
+        detail: String,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachedDrafter {
+    pub reference: DrafterReference,
+    pub method: SpeculativeMethod,
+    pub state: AttachedDrafterState,
+}
+
+/// The drafter a custom model should use: the recommended one, none, or an exact reference.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum DrafterChoice {
+    Auto,
+    None,
+    Reference {
+        reference: DrafterReference,
+        method: SpeculativeMethod,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DrafterAttachment {
+    pub model_id: ModelId,
+    pub drafter: DrafterChoice,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustomModel {
+    pub model_id: ModelId,
+    pub origin: CustomModelOrigin,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub variant_of: Option<ModelId>,
+    pub files: Vec<CustomModelFile>,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub projector: Option<CustomModelFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub drafter: Option<AttachedDrafter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub recommended_drafter: Option<DrafterCandidate>,
+    pub profile: ServingProfile,
+    pub state: CustomModelState,
+}
+
+/// A GGUF found on this computer that the engine cannot execute.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnsupportedLocalModel {
+    pub display_name: String,
+    pub origin: CustomModelOrigin,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub path: PathBuf,
+    pub reasons: Vec<UnsupportedReason>,
+    pub detail: String,
+}
+
+/// `models` are the custom models to offer and assess; `hidden` are the ones the configuration
+/// hides, listed so a client can unhide them, and never assessed. `unsupported` are GGUF groups
+/// that cannot be read at all; a readable model the engine rejects stays in `models` with an
+/// `Unsupported` assessment.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalModelsResponse {
     pub revision: u64,
     pub reconciliation_complete: bool,
-    pub models: Vec<DiscoveredModel>,
+    pub models: Vec<CustomModel>,
+    pub hidden: Vec<CustomModel>,
+    pub unsupported: Vec<UnsupportedLocalModel>,
+}
+
+/// The result of removing an added model's Magnitude-owned files. Files in external locations
+/// are never touched, so the model may remain as found.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalModelRemoval {
+    pub model_id: ModelId,
+    pub removed: bool,
+    pub freed_bytes: u64,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ModelRootKind {
+    HuggingFaceCache,
+    LmStudio,
+    LlamaCpp,
+    Ollama,
+    Folder,
+}
+
+/// One resolved location ICN scans. ACN resolves the paths; ICN never guesses them.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelRoot {
+    pub kind: ModelRootKind,
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
+    pub path: PathBuf,
+    pub enabled: bool,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CustomModelDeclarationOrigin {
+    Added {
+        repository: HuggingFaceRepositoryId,
+        commit: String,
+    },
+    Imported {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
+}
+
+/// The persisted record of an added or imported model. For `Added`, `target` and `projector` are
+/// repository-relative paths at the pinned commit; for `Imported` they are absolute file paths,
+/// with the imported file first.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CustomModelDeclaration {
+    pub model_id: ModelId,
+    pub origin: CustomModelDeclarationOrigin,
+    pub target: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub projector: Option<String>,
+}
+
+/// The whole local-models configuration ACN owns and hands to ICN, at spawn and after every
+/// change. Applying it is idempotent.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalModelsConfiguration {
+    pub roots: Vec<ModelRoot>,
+    pub declarations: Vec<CustomModelDeclaration>,
+    pub hidden: Vec<ModelId>,
+    pub drafters: Vec<DrafterAttachment>,
+}
+
+/// Files not yet added: a Hugging Face repository at a commit, or a local directory.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CandidateSource {
+    HuggingFace {
+        repository: HuggingFaceRepositoryId,
+        commit: String,
+    },
+    Local {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateFile {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateDrafter {
+    pub reference: DrafterReference,
+    pub method: SpeculativeMethod,
+}
+
+/// A target (shards in order), projector and drafter, by paths relative to `source`.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelCandidate {
+    pub source: CandidateSource,
+    pub target: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub projector: Option<CandidateFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub drafter: Option<CandidateDrafter>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum CandidateInspectionRequest {
+    HuggingFace {
+        repository: HuggingFaceRepositoryId,
+        revision: String,
+    },
+    Local {
+        #[cfg_attr(feature = "openapi", schema(value_type = String))]
+        path: PathBuf,
+    },
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateVersion {
+    pub label: String,
+    pub model_id: ModelId,
+    pub files: Vec<CandidateFile>,
+    pub size_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub assessment: Option<ModelAssessment>,
+    pub recommended: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub on_this_computer: Option<ModelId>,
+}
+
+/// The repository step: every version with the engine's verdict, or why none can run.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateInspection {
+    pub source: CandidateSource,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub variant_of: Option<ModelId>,
+    pub versions: Vec<CandidateVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub projector: Option<CandidateFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub unsupported_architecture: Option<Vec<UnsupportedReason>>,
+}
+
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+pub enum DrafterCandidatesRequest {
+    Candidate {
+        candidate: ModelCandidate,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        other: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    Model {
+        model_id: ModelId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        other: Option<String>,
+    },
+}
+
+/// Drafter candidates for one target, in the product's category order.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DrafterCandidatesResponse {
+    pub candidates: Vec<DrafterCandidate>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1378,14 +1943,14 @@ pub enum ModelAssessmentSubject {
         selection: CatalogModelSelection,
     },
     #[serde(rename_all = "camelCase")]
-    Discovery { model_id: ModelId },
+    Custom { model_id: ModelId },
 }
 
 impl ModelAssessmentSubject {
     #[must_use]
     pub fn model_id(&self) -> &ModelId {
         match self {
-            Self::Catalog { model_id, .. } | Self::Discovery { model_id } => model_id,
+            Self::Catalog { model_id, .. } | Self::Custom { model_id } => model_id,
         }
     }
 }
@@ -1422,6 +1987,7 @@ pub enum ModelAssessment {
         assessment_id: ModelAssessmentId,
         memory: Vec<MemoryAssessment>,
         performance: Vec<PerformanceEvidence>,
+        drafter: DrafterVerdict,
     },
     #[serde(rename_all = "camelCase")]
     DoesNotFit {
@@ -1430,14 +1996,15 @@ pub enum ModelAssessment {
         memory: Vec<MemoryAssessment>,
         limiting_resource: String,
         deficit_bytes: u64,
+        drafter: DrafterVerdict,
     },
-    /// The engine cannot execute a discovered model. A catalog model is
-    /// never unsupported: the pool drops a catalog target the engine cannot
-    /// execute as a release defect.
-    #[serde(rename_all = "camelCase")]
+    /// The engine cannot execute a custom model, with every reason it found. A catalog model is
+    /// never unsupported: the pool drops a catalog target the engine cannot execute as a release
+    /// defect.
     Unsupported {
         profile: ServingProfile,
-        failure: ModelFailure,
+        reasons: Vec<UnsupportedReason>,
+        detail: String,
     },
 }
 
@@ -1450,6 +2017,9 @@ pub enum ModelAssessmentEntryState {
     Assessed {
         capabilities: ModelCapabilities,
         template_fingerprint: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false))]
+        fingerprint: Option<ModelFingerprint>,
         profiles: Vec<ModelAssessment>,
     },
     Dropped,
@@ -1463,7 +2033,7 @@ pub struct ModelAssessmentEntry {
     pub state: ModelAssessmentEntryState,
 }
 
-/// One source's assessments. `Pending` until the source has been read (and, for discovery,
+/// One source's assessments. `Pending` until the source has been read (and, for custom models,
 /// reconciled).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1486,7 +2056,7 @@ pub struct ModelAssessmentsSnapshot {
     pub revision: u64,
     pub environment_id: AssessmentEnvironmentId,
     pub catalog: ModelAssessmentDomainSnapshot,
-    pub discovered: ModelAssessmentDomainSnapshot,
+    pub custom: ModelAssessmentDomainSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1494,10 +2064,16 @@ pub struct ModelAssessmentsInvalidation {
     pub revision: u64,
 }
 
+/// A bundle to download; `for_model` names the model the download serves, such as the model a
+/// drafter is fetched for, and is echoed in every `ModelDownload` it produces.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StartModelDownloadRequest {
     pub bundle: ServableModelBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub for_model: Option<ModelId>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1538,6 +2114,9 @@ pub enum ModelDownloadState {
 pub struct ModelDownload {
     pub id: ModelDownloadId,
     pub bundle: ServableModelBundle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub for_model: Option<ModelId>,
     pub state: ModelDownloadState,
 }
 
@@ -1664,10 +2243,40 @@ pub trait CatalogModels: Send + Sync + 'static {
     fn watch_catalog(&self) -> BoxStream<'static, ModelDomainInvalidation>;
 }
 
-pub trait DiscoveredModels: Send + Sync + 'static {
-    fn list_discovered(&self) -> BoxFuture<'_, Result<DiscoveredModelsResponse, InventoryError>>;
-    fn refresh_discovery(&self) -> BoxFuture<'_, Result<DiscoveredModelsResponse, InventoryError>>;
-    fn watch_discovery(&self) -> BoxStream<'static, ModelDomainInvalidation>;
+/// Custom models: the configuration ACN hands over, the models it yields, and rescans.
+pub trait LocalModels: Send + Sync + 'static {
+    fn configuration(&self) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>>;
+    fn configure(
+        &self,
+        configuration: LocalModelsConfiguration,
+    ) -> BoxFuture<'_, Result<LocalModelsConfiguration, InventoryError>>;
+    fn list_local(&self) -> BoxFuture<'_, Result<LocalModelsResponse, InventoryError>>;
+    fn refresh_local(&self) -> BoxFuture<'_, Result<LocalModelsResponse, InventoryError>>;
+    fn remove_local(
+        &self,
+        model_id: &ModelId,
+    ) -> BoxFuture<'_, Result<LocalModelRemoval, InventoryError>>;
+    fn watch_local(&self) -> BoxStream<'static, ModelDomainInvalidation>;
+}
+
+/// Files not yet added: inspection, drafter enumeration and assessment, all header-only.
+pub trait ModelCandidates: Send + Sync + 'static {
+    fn inspect(
+        &self,
+        request: CandidateInspectionRequest,
+    ) -> BoxFuture<'_, Result<CandidateInspection, InventoryError>>;
+    fn drafters(
+        &self,
+        request: DrafterCandidatesRequest,
+    ) -> BoxFuture<'_, Result<DrafterCandidatesResponse, InventoryError>>;
+    fn assess_candidate(
+        &self,
+        candidate: ModelCandidate,
+    ) -> BoxFuture<'_, Result<ModelAssessment, InventoryError>>;
+    fn bundle(
+        &self,
+        candidate: ModelCandidate,
+    ) -> BoxFuture<'_, Result<ServableModelBundle, InventoryError>>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1735,4 +2344,175 @@ pub trait ModelDownloads: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelDownloadsInvalidation {
     pub revision: u64,
+}
+
+#[cfg(test)]
+mod custom_model_wire_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn unsupported_reasons_are_pascal_tagged_with_camel_case_fields() {
+        let reasons = vec![
+            UnsupportedReason::Architecture {
+                architecture: "deepseek4".to_owned(),
+            },
+            UnsupportedReason::WeightTypes {
+                types: vec![WeightTypeCount {
+                    ggml_type: "Q2_K".to_owned(),
+                    tensor_count: 2,
+                }],
+            },
+            UnsupportedReason::Tokenizer {
+                model: "gpt2".to_owned(),
+                pre: None,
+            },
+            UnsupportedReason::KernelDomain {
+                backend: "metal".to_owned(),
+                entry: "matmul".to_owned(),
+                statics: vec![KernelStatic {
+                    name: "head_dim".to_owned(),
+                    value: 80,
+                }],
+            },
+            UnsupportedReason::TargetMismatch {
+                detail: "hidden size".to_owned(),
+            },
+            UnsupportedReason::TiedOutputHead,
+            UnsupportedReason::Unreadable,
+        ];
+        let encoded = serde_json::to_value(&reasons).expect("serialize");
+        assert_eq!(
+            encoded,
+            json!([
+                { "_tag": "Architecture", "architecture": "deepseek4" },
+                { "_tag": "WeightTypes", "types": [{ "ggmlType": "Q2_K", "tensorCount": 2 }] },
+                { "_tag": "Tokenizer", "model": "gpt2" },
+                {
+                    "_tag": "KernelDomain",
+                    "backend": "metal",
+                    "entry": "matmul",
+                    "statics": [{ "name": "head_dim", "value": 80 }]
+                },
+                { "_tag": "TargetMismatch", "detail": "hidden size" },
+                { "_tag": "TiedOutputHead" },
+                { "_tag": "Unreadable" }
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<UnsupportedReason>>(encoded).expect("deserialize"),
+            reasons
+        );
+    }
+
+    #[test]
+    fn unsupported_assessment_carries_reasons_and_detail() {
+        let assessment = ModelAssessment::Unsupported {
+            profile: ServingProfile {
+                context_length: 4096,
+            },
+            reasons: vec![UnsupportedReason::UnrecognizedTensor {
+                name: "rope_freqs.weight".to_owned(),
+            }],
+            detail: "unrecognized tensor".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_value(&assessment).expect("serialize"),
+            json!({
+                "_tag": "Unsupported",
+                "profile": { "contextLength": 4096 },
+                "reasons": [{ "_tag": "UnrecognizedTensor", "name": "rope_freqs.weight" }],
+                "detail": "unrecognized tensor"
+            })
+        );
+    }
+
+    #[test]
+    fn local_models_configuration_round_trips() {
+        let digest = "ab".repeat(32);
+        let configuration: LocalModelsConfiguration = serde_json::from_value(json!({
+            "roots": [
+                { "kind": "LmStudio", "path": "/home/u/.lmstudio/models", "enabled": true },
+                { "kind": "Folder", "path": "/models", "enabled": false }
+            ],
+            "declarations": [
+                {
+                    "modelId": "hf:owner/repo/model-Q4_K_M.gguf",
+                    "origin": { "_tag": "Added", "repository": "owner/repo", "commit": "c".repeat(40) },
+                    "target": ["model-Q4_K_M.gguf"],
+                    "projector": "mmproj.gguf"
+                },
+                {
+                    "modelId": format!("local:{digest}"),
+                    "origin": { "_tag": "Imported", "path": "/models/a.gguf" },
+                    "target": ["/models/a.gguf"]
+                }
+            ],
+            "hidden": [format!("local:{digest}")],
+            "drafters": [
+                { "modelId": "hf:owner/repo/model-Q4_K_M.gguf", "drafter": { "_tag": "Auto" } },
+                {
+                    "modelId": format!("local:{digest}"),
+                    "drafter": {
+                        "_tag": "Reference",
+                        "reference": { "_tag": "Catalog", "modelId": "qwen3.6-35b-a3b:gguf:q4" },
+                        "method": { "_tag": "DFlash" }
+                    }
+                }
+            ]
+        }))
+        .expect("deserialize configuration");
+        assert_eq!(configuration.roots[0].kind, ModelRootKind::LmStudio);
+        assert!(matches!(
+            configuration.declarations[1].origin,
+            CustomModelDeclarationOrigin::Imported { .. }
+        ));
+        let encoded = serde_json::to_value(&configuration).expect("serialize");
+        assert_eq!(
+            serde_json::from_value::<LocalModelsConfiguration>(encoded).expect("round trip"),
+            configuration
+        );
+    }
+
+    #[test]
+    fn custom_model_origins_name_their_found_source() {
+        let origin = CustomModelOrigin::Found {
+            source: FoundSource::Folder {
+                path: "/models".into(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&origin).expect("serialize"),
+            json!({ "_tag": "Found", "source": { "_tag": "Folder", "path": "/models" } })
+        );
+        assert_eq!(
+            serde_json::to_value(CustomModelOrigin::Found {
+                source: FoundSource::Ollama
+            })
+            .expect("serialize"),
+            json!({ "_tag": "Found", "source": { "_tag": "Ollama" } })
+        );
+    }
+
+    #[test]
+    fn drafter_verdicts_and_subjects_use_the_custom_vocabulary() {
+        assert_eq!(
+            serde_json::to_value(DrafterVerdict::Bound {
+                method: SpeculativeMethod::Mtp,
+                memory_bytes: 10
+            })
+            .expect("serialize"),
+            json!({ "_tag": "Bound", "method": { "_tag": "Mtp" }, "memoryBytes": 10 })
+        );
+        let subject = ModelAssessmentSubject::Custom {
+            model_id: format!("local:{}", "0".repeat(64))
+                .parse()
+                .expect("model ID"),
+        };
+        assert_eq!(
+            serde_json::to_value(&subject).expect("serialize")["_tag"],
+            "Custom"
+        );
+    }
 }

@@ -32,7 +32,6 @@ use magnitude_family_contracts::{
     ScoreFunction, Sublayer, SublayerIndex,
     UnweightedRms, ValueNorm, ValueSource, WeightDescriptor,
 };
-use std::{error, fmt};
 
 /// The GGUF architecture and family identity.
 pub const ARCHITECTURE: &str = "gemma4";
@@ -78,40 +77,12 @@ const FULL_ROTATED_PAIR_FRACTION: u64 = 4;
 /// (the released model maps every non-text id to row 0).
 const PER_LAYER_MEDIA_ROW: u64 = 0;
 
-/// Failure to recognize or interpret a Gemma 4 artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        invalid(match error {
-            HeaderError::UnknownMetadata(key) => {
-                format!("Gemma artifact carries uninterpreted metadata {key}")
-            }
-            HeaderError::MissingWeight(name) => format!("missing Gemma weight {name:?}"),
-            HeaderError::WeightShape {
-                name,
-                expected,
-                received,
-            } => format!("Gemma weight {name:?}: expected {expected:?}, received {received:?}"),
-            HeaderError::UnboundWeight(name) => {
-                format!("Gemma artifact contains unbound weight role {name:?}")
-            }
-            error => error.to_string(),
-        })
-    }
-}
+/// Failure to recognize or interpret a Gemma 4 artifact: the family error,
+/// which names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 fn invalid(message: impl Into<String>) -> Error {
-    Error(message.into())
+    Error::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, Error> {

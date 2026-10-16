@@ -2177,7 +2177,7 @@ mod tests {
             .await
             .expect("installed model");
         let mut config = InventoryConfig::with_roots(root, cache_root).expect("inventory config");
-        config.hf_cache_dirs.push(hf_cache);
+        config.add_hugging_face_caches([hf_cache]);
         let manager = ManagedModelStore::open(config)
             .await
             .expect("model manager");
@@ -2229,6 +2229,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_drafter_for_an_installed_target_fetches_only_the_drafter_and_cancels() {
+        use crate::download_service::ManagedModelDownloads;
+        use magnitude_service_contracts::models::{
+            ModelDownloadState, ModelDownloads, ServableModelBundle, SpeculativeDraftSource,
+            SpeculativeMethod, StartModelDownloadRequest,
+        };
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let hf_cache = directory.path().join("hugging-face");
+        let snapshot = hf_cache
+            .join("models--owner--repository")
+            .join("snapshots")
+            .join("a".repeat(40));
+        tokio::fs::create_dir_all(&snapshot)
+            .await
+            .expect("snapshot directory");
+        let mut gguf = Vec::new();
+        gguf.extend_from_slice(b"GGUF");
+        gguf.extend_from_slice(&3_u32.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.extend_from_slice(&0_u64.to_le_bytes());
+        gguf.resize(32, 0);
+        tokio::fs::write(snapshot.join("model.gguf"), gguf)
+            .await
+            .expect("installed target");
+        let mut config = InventoryConfig::with_roots(
+            directory.path().join("models"),
+            directory.path().join("cache"),
+        )
+        .expect("inventory config");
+        config.add_hugging_face_caches([hf_cache]);
+        let manager = Arc::new(ManagedModelStore::open(config).await.expect("model manager"));
+        manager
+            .ensure_installed_model_inventory()
+            .await
+            .expect("initial inventory");
+        let model = manager
+            .models
+            .read()
+            .expect("inventory lock")
+            .values()
+            .next()
+            .cloned()
+            .expect("installed target model");
+        let target = validated_package_from_resolved(&ResolvedModel {
+            components: crate::service::resolve_components(manager.root(), &model)
+                .expect("resolved components"),
+            model,
+        })
+        .expect("installed package")
+        .package;
+        let mut draft = exact_package("draft.gguf", b"draft");
+        draft.id = ModelPackageId("package_draft".to_owned());
+        // The drafter's package work is live so nothing reaches the network.
+        let draft_work = Arc::new(DownloadOperation::new(ModelDownloadEvent::Resolving {
+            operation_id: "download_package_draft".to_owned(),
+            repository: "owner/repository".to_owned(),
+            revision: "a".repeat(40),
+        }));
+        manager
+            .operations
+            .lock()
+            .await
+            .insert(package_download_key(&draft), Arc::clone(&draft_work));
+        let downloads = ManagedModelDownloads::open(Arc::clone(&manager))
+            .await
+            .expect("model downloads");
+        let started = downloads
+            .start(StartModelDownloadRequest {
+                bundle: ServableModelBundle::SpeculativeDecoding {
+                    target,
+                    draft_source: SpeculativeDraftSource::Separate { draft },
+                    method: SpeculativeMethod::DFlash,
+                },
+                for_model: Some(format!("local:{}", "a".repeat(64)).parse().unwrap()),
+            })
+            .await
+            .expect("drafter-only download")
+            .download
+            .expect("the drafter is missing");
+        assert!(matches!(
+            started.state,
+            ModelDownloadState::Pending { total_bytes: 5, .. }
+        ));
+        let listed = downloads.list().await.unwrap().downloads;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].for_model.as_ref().map(|model| model.as_str().to_owned()),
+            Some(format!("local:{}", "a".repeat(64))),
+            "the model a drafter is fetched for is echoed in its download"
+        );
+        let cancelled = downloads.cancel(&started.id).await.expect("cancellation");
+        assert!(matches!(cancelled.state, ModelDownloadState::Cancelled { .. }));
+        assert!(draft_work.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn a_failed_bundle_stops_its_other_package_and_a_retry_admits_fresh_work() {
         use crate::download_service::ManagedModelDownloads;
         use magnitude_service_contracts::models::{
@@ -2276,6 +2372,7 @@ mod tests {
                 },
                 method: SpeculativeMethod::DSpark,
             },
+            for_model: None,
         };
         downloads.start(request()).await.expect("download");
 

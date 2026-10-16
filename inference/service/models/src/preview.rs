@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,11 +14,14 @@ use magnitude_service_contracts::{
     Integrity, InventoryEntryId, InventoryError, ModelComponent, ModelLocation,
     ModelPreviewSource, ModelSource, ResolvedComponent, ResolvedModel,
 };
+use magnitude_service_contracts::models::{ModelId, ModelPackage, UnsupportedReason};
 use reqwest::header::{CONTENT_RANGE, ETAG, IF_NONE_MATCH, RANGE};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::cache::{ModelBlobKind, ModelCacheWorkspace, ModelIndexKind};
+use crate::candidate_files::RecognizedArchitectures;
+use crate::lineage::CatalogLineage;
 use crate::hugging_face::{require_requested_revision, revision_metadata_url};
 use crate::identity::content_id;
 use crate::inventory::{ManagedModelStore, build_model, now};
@@ -35,26 +38,140 @@ const MAX_MODEL_COMPONENTS: u32 = 256;
 const MAX_COMPONENT_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const HUB_REQUEST_ATTEMPTS: usize = 3;
 const HUB_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const SEARCH_LINEAGE_CONCURRENCY: usize = 4;
+const MAX_DRAFTER_SEARCH_RESULTS: u32 = 8;
 
-/// Live Hub discovery for the service's search and immutable-resolution API.
-/// Catalog publication and managed inventory do not depend on these queries.
+/// Live Hub search and immutable resolution for the service's API. Catalog publication and
+/// managed inventory do not depend on these queries.
 pub struct HuggingFaceDiscovery {
     models: Arc<ManagedModelStore>,
+    architectures: RecognizedArchitectures,
+    lineage: Arc<CatalogLineage>,
     searches: tokio::sync::Mutex<BTreeMap<String, (Instant, HuggingFaceModelSearchResults)>>,
 }
 
 impl HuggingFaceDiscovery {
     #[must_use]
-    pub fn new(models: Arc<ManagedModelStore>) -> Self {
+    pub fn new(
+        models: Arc<ManagedModelStore>,
+        architectures: RecognizedArchitectures,
+        lineage: Arc<CatalogLineage>,
+    ) -> Self {
         Self {
             models,
+            architectures,
+            lineage,
             searches: tokio::sync::Mutex::new(BTreeMap::new()),
         }
+    }
+
+    async fn search_uncached(
+        &self,
+        query: &str,
+        request: &HuggingFaceModelSearchRequest,
+    ) -> Result<HuggingFaceModelSearchResults, InventoryError> {
+        let mut url = reqwest::Url::parse(self.models.client.endpoint())
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?
+            .pop_if_empty()
+            .push("api")
+            .push("models");
+        url.query_pairs_mut()
+            .append_pair("search", query)
+            .append_pair("filter", "gguf")
+            .append_pair("sort", "downloads")
+            .append_pair("direction", "-1")
+            .append_pair("limit", &request.limit.to_string());
+        for field in [
+            "sha",
+            "lastModified",
+            "downloads",
+            "likes",
+            "tags",
+            "private",
+            "gated",
+            "gguf",
+            "baseModels",
+        ] {
+            url.query_pairs_mut().append_pair("expand", field);
+        }
+        let response = send_hub_get(&self.models.http, url).await?;
+        if !response.status().is_success() {
+            return Err(InventoryError::Upstream(format!(
+                "Hugging Face search returned HTTP {}",
+                response.status()
+            )));
+        }
+        let metadata: Vec<HubSearchModel> = serde_json::from_slice(
+            &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
+        )
+        .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+        let catalog_repositories = self.lineage.repositories();
+        let mut hidden_count = 0_u32;
+        let mut kept = Vec::new();
+        for model in metadata {
+            let Some(mut result) = model.into_contract() else {
+                continue;
+            };
+            if catalog_repositories.contains(&result.repository.to_lowercase()) {
+                continue;
+            }
+            if !self
+                .architectures
+                .admits_repository(result.architecture.as_deref())
+            {
+                hidden_count = hidden_count.saturating_add(1);
+                if !request.include_unsupported {
+                    continue;
+                }
+                result.unsupported = vec![UnsupportedReason::Architecture {
+                    architecture: result.architecture.clone().unwrap_or_default(),
+                }];
+            }
+            kept.push(result);
+        }
+        let results = futures_util::stream::iter(kept)
+            .map(|mut result| async move {
+                if result.unsupported.is_empty() {
+                    result.variant_of = self.variant_of(&result).await;
+                }
+                result
+            })
+            .buffered(SEARCH_LINEAGE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        Ok(HuggingFaceModelSearchResults {
+            results,
+            hidden_count,
+        })
+    }
+
+    /// The catalog model a result derives from: its repository and direct base models first,
+    /// then one more hop through finetunes.
+    async fn variant_of(&self, result: &HuggingFaceModelSearchResult) -> Option<ModelId> {
+        let mut direct = BTreeSet::from([result.repository.to_lowercase()]);
+        direct.extend(result.base_models.iter().map(|base| base.to_lowercase()));
+        if let Some(matched) = self.lineage.match_lineage(&direct).await {
+            return Some(matched.model_id);
+        }
+        let lineage = self
+            .lineage
+            .hub()
+            .lineage(&result.repository, Some(result.base_models.clone()))
+            .await;
+        self.lineage
+            .match_lineage(&lineage)
+            .await
+            .map(|matched| matched.model_id)
     }
 }
 
 impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
-    fn search(&self, request: HuggingFaceModelSearchRequest) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
+    fn search(
+        &self,
+        request: HuggingFaceModelSearchRequest,
+    ) -> BoxFuture<'_, Result<HuggingFaceModelSearchResults, InventoryError>> {
         Box::pin(async move {
             let query = request.query.trim();
             if query.is_empty()
@@ -66,7 +183,12 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
                     "Hugging Face search requires a non-empty query of at most {MAX_HUB_SEARCH_QUERY_BYTES} bytes and a limit between 1 and {MAX_HUB_SEARCH_RESULTS}"
                 )));
             }
-            let cache_key = format!("{}:{}", query.to_lowercase(), request.limit);
+            let cache_key = format!(
+                "{}:{}:{}",
+                query.to_lowercase(),
+                request.limit,
+                request.include_unsupported
+            );
             {
                 let mut searches = self.searches.lock().await;
                 searches.retain(|_, (captured, _)| captured.elapsed() <= HUB_SEARCH_TTL);
@@ -74,58 +196,25 @@ impl HuggingFaceModelCatalog for HuggingFaceDiscovery {
                     return Ok(result.clone());
                 }
             }
-            let mut url = reqwest::Url::parse(self.models.client.endpoint())
-                .map_err(|error| InventoryError::Internal(error.to_string()))?;
-            url.path_segments_mut()
-                .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?
-                .pop_if_empty()
-                .push("api")
-                .push("models");
-            url.query_pairs_mut()
-                .append_pair("search", query)
-                .append_pair("filter", "gguf")
-                .append_pair("sort", "downloads")
-                .append_pair("direction", "-1")
-                .append_pair("limit", &request.limit.to_string())
-                .append_pair("expand", "sha")
-                .append_pair("expand", "lastModified")
-                .append_pair("expand", "downloads")
-                .append_pair("expand", "likes")
-                .append_pair("expand", "tags")
-                .append_pair("expand", "private")
-                .append_pair("expand", "gated");
-            let mut outbound = self.models.http.get(url);
-            if let Some(token) = hub_token() {
-                outbound = outbound.bearer_auth(token);
-            }
-            let response = outbound.send().await
-                .map_err(|error| InventoryError::Upstream(error.to_string()))?;
-            if !response.status().is_success() {
-                return Err(InventoryError::Upstream(format!(
-                    "Hugging Face search returned HTTP {}", response.status()
-                )));
-            }
-            let metadata: Vec<HubSearchModel> = serde_json::from_slice(
-                &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
-            ).map_err(|error| InventoryError::Upstream(error.to_string()))?;
-            let result = HuggingFaceModelSearchResults {
-                models: metadata.into_iter().filter_map(HubSearchModel::into_contract).collect(),
-            };
+            let result = self.search_uncached(query, &request).await?;
             let mut searches = self.searches.lock().await;
             searches.insert(cache_key, (Instant::now(), result.clone()));
-            if searches.len() > MAX_HUB_SEARCH_CACHE_ENTRIES {
-                if let Some(oldest) = searches.iter()
+            if searches.len() > MAX_HUB_SEARCH_CACHE_ENTRIES
+                && let Some(oldest) = searches
+                    .iter()
                     .min_by_key(|(_, (captured, _))| *captured)
                     .map(|(key, _)| key.clone())
-                {
-                    searches.remove(&oldest);
-                }
+            {
+                searches.remove(&oldest);
             }
             Ok(result)
         })
     }
 
-    fn resolve(&self, request: HuggingFaceRepositoryRequest) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>> {
+    fn resolve(
+        &self,
+        request: HuggingFaceRepositoryRequest,
+    ) -> BoxFuture<'_, Result<HuggingFaceRepositorySnapshot, InventoryError>> {
         Box::pin(refresh_hugging_face_repository(&self.models, request))
     }
 }
@@ -252,10 +341,25 @@ struct HubSearchModel {
     private: Option<bool>,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    gguf: Option<serde_json::Value>,
+    #[serde(default, rename = "baseModels")]
+    base_models: Option<serde_json::Value>,
 }
 
 impl HubSearchModel {
     fn into_contract(self) -> Option<HuggingFaceModelSearchResult> {
+        let architecture = self
+            .gguf
+            .as_ref()
+            .and_then(|gguf| gguf.get("architecture"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let base_models = self
+            .base_models
+            .as_ref()
+            .map(crate::lineage::hub_base_model_ids)
+            .unwrap_or_default();
         Some(HuggingFaceModelSearchResult {
             repository: self.id,
             commit: immutable_commit(self.sha?)?,
@@ -265,6 +369,10 @@ impl HubSearchModel {
             gated: hub_gated(self.gated.as_ref()),
             private: self.private.unwrap_or(false),
             tags: self.tags,
+            architecture,
+            base_models,
+            variant_of: None,
+            unsupported: Vec::new(),
         })
     }
 }
@@ -683,22 +791,23 @@ impl ManagedModelStore {
         let selected = select_repository_snapshot_components(&snapshot.gguf_files, source)?;
         let fetched = futures_util::stream::iter(selected.into_iter().enumerate())
             .map(|(index, component)| async move {
-                let header = fetch_header(
-                    &self.http,
-                    self.client.endpoint(),
-                    &source.repository,
-                    &snapshot.commit,
-                    &component.path,
-                    component.size_bytes,
-                )
-                .await?;
-                let header_digest = format!("{:x}", Sha256::digest(&header));
+                let header = self
+                    .hugging_face_gguf_header(
+                        &source.repository,
+                        &snapshot.commit,
+                        &HuggingFaceRepositoryFile {
+                            path: component.path.clone(),
+                            size_bytes: component.size_bytes,
+                            content: component.content.clone(),
+                        },
+                    )
+                    .await?;
                 Ok::<_, InventoryError>((
                     index,
                     CachedComponent {
                         component,
-                        header_digest,
-                        acquired_header: Some(header),
+                        header_digest: header.digest,
+                        acquired_header: Some(header.bytes),
                     },
                 ))
             })
@@ -1190,7 +1299,7 @@ fn validate_component_size(path: &str, size: u64) -> Result<(), InventoryError> 
     Ok(())
 }
 
-async fn bounded_response_bytes(
+pub(crate) async fn bounded_response_bytes(
     mut response: reqwest::Response,
     maximum_bytes: usize,
 ) -> Result<Vec<u8>, InventoryError> {
@@ -1373,6 +1482,200 @@ fn hub_token() -> Option<String> {
         .filter(|token| !token.trim().is_empty())
 }
 
+/// A Hub metadata GET with the explicit `HF_TOKEN` when present, retried on rate limits and server
+/// failures. A rejected credential (401) falls back to an anonymous request, so an expired token
+/// never hides public repositories.
+pub(crate) async fn send_hub_get(
+    http: &reqwest::Client,
+    url: reqwest::Url,
+) -> Result<reqwest::Response, InventoryError> {
+    let token = hub_token();
+    let response = send_hub_request(|| {
+        let request = http.get(url.clone());
+        match &token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    })
+    .await?;
+    if token.is_some() && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return send_hub_request(|| http.get(url.clone())).await;
+    }
+    Ok(response)
+}
+
+/// A repository snapshot. An immutable commit already cached is served without a request, since
+/// its files and lineage can never change; anything else is refreshed.
+pub async fn pinned_hugging_face_repository(
+    models: &Arc<ManagedModelStore>,
+    request: HuggingFaceRepositoryRequest,
+) -> Result<HuggingFaceRepositorySnapshot, InventoryError> {
+    validate_repository_request(&request)?;
+    if immutable_commit(request.revision.clone()).is_some() {
+        let cache_key = repository_cache_key(models.client.endpoint(), &request);
+        if let Some(cached) = models
+            .cache
+            .read_index::<CachedHuggingFaceRepositorySnapshot>(
+                ModelIndexKind::HuggingFaceRepositorySnapshot,
+                &cache_key,
+            )
+            .filter(|cached| cached.snapshot.commit == request.revision)
+        {
+            return Ok(cached.snapshot);
+        }
+    }
+    refresh_hugging_face_repository(models, request).await
+}
+
+/// One remote GGUF header: every byte through the aligned tensor-data offset, and its sha256.
+#[derive(Clone, Debug)]
+pub struct RemoteGgufHeader {
+    pub digest: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CachedRemoteGgufHeader {
+    content: ContentIdentity,
+    header_digest: String,
+}
+
+impl ManagedModelStore {
+    /// The header of one file of an immutable repository snapshot, fetched by range request once
+    /// and then served from the header cache.
+    pub async fn hugging_face_gguf_header(
+        &self,
+        repository: &str,
+        commit: &str,
+        file: &HuggingFaceRepositoryFile,
+    ) -> Result<RemoteGgufHeader, InventoryError> {
+        let evidence = format!(
+            "{}:{repository}@{commit}/{}",
+            self.client.endpoint(),
+            file.path.display()
+        );
+        if let Some(bytes) = self
+            .cache
+            .read_index::<CachedRemoteGgufHeader>(ModelIndexKind::HuggingFaceGgufHeader, &evidence)
+            .filter(|cached| cached.content == file.content)
+            .and_then(|cached| {
+                self.cache
+                    .read_blob(ModelBlobKind::GgufHeader, &cached.header_digest)
+                    .map(|bytes| (cached.header_digest, bytes))
+            })
+        {
+            return Ok(RemoteGgufHeader {
+                digest: bytes.0,
+                bytes: bytes.1,
+            });
+        }
+        let bytes = fetch_header(
+            &self.http,
+            self.client.endpoint(),
+            repository,
+            commit,
+            &file.path,
+            file.size_bytes,
+        )
+        .await?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        self.cache
+            .write_blob(ModelBlobKind::GgufHeader, &digest, &bytes);
+        self.cache.write_index(
+            ModelIndexKind::HuggingFaceGgufHeader,
+            &evidence,
+            &CachedRemoteGgufHeader {
+                content: file.content.clone(),
+                header_digest: digest.clone(),
+            },
+        );
+        Ok(RemoteGgufHeader { digest, bytes })
+    }
+
+    /// The exact package a repository-snapshot preview describes, identified as the same package
+    /// a rescan of its downloaded files produces.
+    pub async fn hugging_face_package(
+        &self,
+        source: &ModelPreviewSource,
+        snapshot: &HuggingFaceRepositorySnapshot,
+    ) -> Result<(ModelPackage, PreparedPreview), InventoryError> {
+        let prepared = self
+            .prepare_preview_from_repository_snapshot(source, snapshot)
+            .await?;
+        let package = self.inspect_package_from_resolved(&prepared.model)?.package;
+        Ok((package, prepared))
+    }
+
+    /// GGUF repositories on the Hub tagged for speculative decoding whose base model is `base`,
+    /// most downloaded first.
+    pub async fn search_speculative_drafters(
+        &self,
+        base: &str,
+    ) -> Result<Vec<String>, InventoryError> {
+        let mut url = reqwest::Url::parse(self.client.endpoint())
+            .map_err(|error| InventoryError::Internal(error.to_string()))?;
+        url.path_segments_mut()
+            .map_err(|()| InventoryError::Internal("invalid hub endpoint".to_owned()))?
+            .pop_if_empty()
+            .push("api")
+            .push("models");
+        url.query_pairs_mut()
+            .append_pair("filter", &format!("base_model:{base}"))
+            .append_pair("filter", "speculative-decoding")
+            .append_pair("filter", "gguf")
+            .append_pair("sort", "downloads")
+            .append_pair("direction", "-1")
+            .append_pair("limit", &MAX_DRAFTER_SEARCH_RESULTS.to_string());
+        let response = send_hub_get(&self.http, url).await?;
+        if !response.status().is_success() {
+            return Err(InventoryError::Upstream(format!(
+                "Hugging Face drafter search returned HTTP {}",
+                response.status()
+            )));
+        }
+        #[derive(Deserialize)]
+        struct Found {
+            id: String,
+        }
+        let found: Vec<Found> = serde_json::from_slice(
+            &bounded_response_bytes(response, MAX_HUB_METADATA_BYTES).await?,
+        )
+        .map_err(|error| InventoryError::Upstream(error.to_string()))?;
+        Ok(found
+            .into_iter()
+            .map(|found| found.id)
+            .filter(|id| valid_repository(id))
+            .collect())
+    }
+
+    /// Whether an installed package, in any location, holds a file with this content digest.
+    #[must_use]
+    pub fn has_installed_file(&self, sha256: &str) -> bool {
+        self.installed_packages.read().is_ok_and(|snapshot| {
+            snapshot.records.values().any(|record| {
+                record
+                    .installed
+                    .package
+                    .files
+                    .iter()
+                    .any(|file| file.sha256 == sha256)
+            })
+        })
+    }
+
+    /// Whether an installed package, in any location, is exactly `package_id`.
+    #[must_use]
+    pub fn has_installed_package(&self, package_id: &magnitude_service_contracts::models::ModelPackageId) -> bool {
+        self.installed_packages.read().is_ok_and(|snapshot| {
+            snapshot
+                .records
+                .values()
+                .any(|record| record.installed.package.id == *package_id)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1526,7 +1829,7 @@ mod tests {
         let mut config =
             crate::inventory::InventoryConfig::with_roots(store.clone(), cache_root.clone())
                 .unwrap();
-        config.hf_cache_dirs.clear();
+        config.local_models.roots.clear();
         let manager = ManagedModelStore::open(config).await.unwrap();
         let _ = fs::remove_dir_all(&cache_root);
         fs::write(&cache_root, b"not a directory").unwrap();
@@ -1709,7 +2012,7 @@ mod tests {
             temporary.path().join("cache"),
         )
         .unwrap();
-        config.hf_cache_dirs.clear();
+        config.local_models.roots.clear();
         let manager = ManagedModelStore::open(config).await.unwrap();
 
         for (index, fixture) in fixtures.into_iter().enumerate() {
@@ -1779,5 +2082,306 @@ mod tests {
                 fixture.display()
             );
         }
+    }
+
+    /// A minimal Hub: search, commit-pinned repository metadata and lineage, from a route table.
+    fn serve_hub(
+        routes: impl Fn(&str, &str) -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("hub listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("hub address"));
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        let routes = Arc::new(routes);
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let target = request_line.split_whitespace().nth(1).unwrap_or("/").to_owned();
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                let (status, body) = match routes(path, query) {
+                    Some(body) => ("200 OK", serde_json::to_vec(&body).unwrap()),
+                    None => ("404 Not Found", Vec::new()),
+                };
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = connection.write_all(&body);
+            }
+        });
+        (endpoint, requests)
+    }
+
+    async fn stub_store(endpoint: String) -> (tempfile::TempDir, Arc<ManagedModelStore>) {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = crate::inventory::InventoryConfig::with_roots(
+            temporary.path().join("model-store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.local_models.roots.clear();
+        config.hub_endpoint = Some(endpoint);
+        let store = Arc::new(ManagedModelStore::open(config).await.unwrap());
+        (temporary, store)
+    }
+
+    fn catalog_with_target(repository: &str, commit: &str) -> magnitude_service_contracts::models::RecommendableModelCatalog {
+        use magnitude_service_contracts::models::*;
+        let package = ModelPackage {
+            id: ModelPackageId("package_catalog".to_owned()),
+            source: ModelPackageSource::HuggingFace {
+                repository: repository.to_owned(),
+                revision: commit.to_owned(),
+            },
+            files: vec![ModelFile {
+                id: ModelFileId("file_catalog".to_owned()),
+                path: PathBuf::from("llama-Q8_0.gguf"),
+                role: ModelFileRole::Weights,
+                size_bytes: 1,
+                tensor_storage_bytes: None,
+                sha256: "a".repeat(64),
+            }],
+            relationships: Vec::new(),
+            properties: ModelPackageProperties {
+                format: "gguf".to_owned(),
+                quantization: "Q8_0".to_owned(),
+                quantization_name: "8-bit".to_owned(),
+                architecture: "llama".to_owned(),
+                maximum_context_length: Some(8192),
+                intrinsic_model_id: None,
+                intrinsic_quality_id: None,
+            },
+        };
+        RecommendableModelCatalog {
+            models: vec![RecommendableModel {
+                model_id: CatalogBaseId::new("llama-test").unwrap(),
+                variant_id: CatalogVariantId::new("gguf:q8").unwrap(),
+                configuration: ModelServingConfiguration {
+                    bundle: ServableModelBundle::Standalone { package },
+                    profile: ServingProfile { context_length: 8192 },
+                },
+                display_name: "Llama Test".to_owned(),
+                variant_label: "Q8".to_owned(),
+                description: "A test model".to_owned(),
+                release_date: ModelReleaseDate::new("2026-01-01").unwrap(),
+                license: "apache-2.0".to_owned(),
+                parameterization: ModelParameterization::Dense { total_parameters: 1 },
+                intelligence: 1,
+                support: CatalogSupport::Supported,
+                fidelity_rank: 1,
+                quantization_aware: false,
+            }],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    fn revision_metadata(repository: &str, commit: &str, base_models: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "id": repository,
+            "sha": commit,
+            "tags": ["gguf"],
+            "cardData": { "base_model": base_models },
+            "siblings": [{
+                "rfilename": "llama-Q8_0.gguf",
+                "size": 10,
+                "lfs": { "sha256": "b".repeat(64), "size": 10 },
+            }],
+        })
+    }
+
+    fn search_hub() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        serve_hub(|path, query| {
+            let result = |id: &str, seed: char, architecture: &str, base: &[&str]| {
+                serde_json::json!({
+                    "id": id,
+                    "sha": seed.to_string().repeat(40),
+                    "downloads": 7,
+                    "tags": ["gguf"],
+                    "gguf": { "architecture": architecture },
+                    "baseModels": {
+                        "relation": "quantized",
+                        "models": base.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>(),
+                    },
+                })
+            };
+            match path {
+                "/api/models" if query.contains("search=") => Some(serde_json::json!([
+                    result("catalog/Llama-GGUF", 'a', "llama", &["base/Llama"]),
+                    result("unsloth/DeepSeek-V4-GGUF", 'f', "deepseek4", &[]),
+                    result("vision/Llama-Vision-GGUF", 'e', "clip", &[]),
+                    result("community/Llama-Finetune-GGUF", 'c', "llama", &["community/Llama-Finetune"]),
+                ])),
+                path if path.starts_with("/api/models/catalog/Llama-GGUF/revision/") => {
+                    Some(revision_metadata("catalog/Llama-GGUF", &"a".repeat(40), &["base/Llama"]))
+                }
+                "/api/models/community/Llama-Finetune" => Some(serde_json::json!({
+                    "id": "community/Llama-Finetune",
+                    "baseModels": { "relation": "finetune", "models": [{ "id": "base/Llama" }] },
+                })),
+                path if path.starts_with("/api/models/") && !path.contains("/revision/") => {
+                    Some(serde_json::json!({ "id": path.trim_start_matches("/api/models/") }))
+                }
+                _ => None,
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn search_hides_unknown_architectures_excludes_the_catalog_and_resolves_lineage() {
+        let (endpoint, _) = search_hub();
+        let (_temporary, store) = stub_store(endpoint).await;
+        let catalog = catalog_with_target("catalog/Llama-GGUF", &"a".repeat(40));
+        let discovery = HuggingFaceDiscovery::new(
+            Arc::clone(&store),
+            RecognizedArchitectures::new(["llama"], ["dflash"]),
+            CatalogLineage::new(Arc::clone(&store), catalog),
+        );
+        let results = discovery
+            .search(HuggingFaceModelSearchRequest {
+                query: "llama".to_owned(),
+                limit: 10,
+                include_unsupported: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.hidden_count, 1);
+        assert_eq!(
+            results
+                .results
+                .iter()
+                .map(|result| result.repository.as_str())
+                .collect::<Vec<_>>(),
+            ["vision/Llama-Vision-GGUF", "community/Llama-Finetune-GGUF"]
+        );
+        let community = &results.results[1];
+        assert_eq!(community.architecture.as_deref(), Some("llama"));
+        assert_eq!(community.base_models, ["community/Llama-Finetune"]);
+        assert_eq!(
+            community.variant_of.as_ref().map(ModelId::as_str),
+            Some("llama-test:gguf:q8"),
+            "lineage follows a second hop through the finetune"
+        );
+        assert_eq!(results.results[0].variant_of, None);
+
+        let all = discovery
+            .search(HuggingFaceModelSearchRequest {
+                query: "llama".to_owned(),
+                limit: 10,
+                include_unsupported: true,
+            })
+            .await
+            .unwrap();
+        assert_eq!(all.hidden_count, 1);
+        let deepseek = all
+            .results
+            .iter()
+            .find(|result| result.repository == "unsloth/DeepSeek-V4-GGUF")
+            .expect("unsupported results are listed on request");
+        assert_eq!(
+            deepseek.unsupported,
+            [UnsupportedReason::Architecture {
+                architecture: "deepseek4".to_owned()
+            }]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_undecodable_cached_snapshot_is_a_miss_and_a_pinned_one_needs_no_request() {
+        let (endpoint, requests) = search_hub();
+        let (_temporary, store) = stub_store(endpoint).await;
+        let request = HuggingFaceRepositoryRequest {
+            repository: "catalog/Llama-GGUF".to_owned(),
+            revision: "a".repeat(40),
+        };
+        let key = repository_cache_key(store.client.endpoint(), &request);
+        store.cache.write_index(
+            ModelIndexKind::HuggingFaceRepositorySnapshot,
+            &key,
+            &serde_json::json!({
+                "captured_at": 1,
+                "snapshot": {
+                    "repository": "catalog/Llama-GGUF",
+                    "commit": "a".repeat(40),
+                    "license_url": null,
+                    "base_models": [],
+                    "gguf_files": [],
+                },
+            }),
+        );
+        let snapshot = pinned_hugging_face_repository(&store, request.clone())
+            .await
+            .expect("an old cache entry is refetched");
+        assert_eq!(snapshot.base_models, ["base/Llama"]);
+        let observed = requests.load(std::sync::atomic::Ordering::SeqCst);
+        pinned_hugging_face_repository(&store, request).await.unwrap();
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), observed);
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_cached_assessment_is_a_miss() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut config = crate::inventory::InventoryConfig::with_roots(
+            temporary.path().join("model-store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.local_models.roots.clear();
+        let store = ManagedModelStore::open(config).await.unwrap();
+        store.cache.write_index(
+            ModelIndexKind::ModelAssessment,
+            "old evidence",
+            &serde_json::json!({
+                "capabilities": {
+                    "vision": false,
+                    "tools": false,
+                    "structuredOutput": false,
+                    "reasoning": { "supported": false, "efforts": [] },
+                },
+                "template_fingerprint": "",
+                "profile": {
+                    "_tag": "Unsupported",
+                    "profile": { "contextLength": 8192 },
+                    "failure": { "code": "unsupported", "message": "old", "retryable": false },
+                },
+            }),
+        );
+        assert!(store.read_model_assessment("old evidence").is_none());
+        store.cache.write_index(
+            ModelIndexKind::ModelAssessment,
+            "fits without a drafter verdict",
+            &serde_json::json!({
+                "capabilities": {
+                    "vision": false,
+                    "tools": false,
+                    "structuredOutput": false,
+                    "reasoning": { "supported": false, "efforts": [] },
+                },
+                "template_fingerprint": "",
+                "profile": {
+                    "_tag": "Fits",
+                    "profile": { "contextLength": 8192 },
+                    "assessmentId": "assessment_old",
+                    "memory": [],
+                    "performance": [],
+                },
+            }),
+        );
+        assert!(store.read_model_assessment("fits without a drafter verdict").is_none());
     }
 }

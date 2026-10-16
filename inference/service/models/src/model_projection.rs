@@ -9,25 +9,6 @@ use magnitude_service_contracts::models::{
 
 const MINIMUM_EXTERNAL_CONTEXT: u32 = 4_096;
 
-pub(crate) fn effective_model(
-    installed: &InstalledModelPackage,
-    profile: ServingProfile,
-) -> (EffectiveModel, ResolvedModelInstallation) {
-    let configuration = ModelServingConfiguration {
-        bundle: ServableModelBundle::Standalone {
-            package: installed.package.clone(),
-        },
-        profile,
-    };
-    (
-        effective_configuration_model(
-            &configuration,
-            &BTreeMap::from([(installed.package.id.clone(), installed)]),
-        ),
-        resolved_installation(installed),
-    )
-}
-
 pub(crate) fn resolved_installation(
     installed: &InstalledModelPackage,
 ) -> ResolvedModelInstallation {
@@ -42,9 +23,12 @@ pub(crate) fn resolved_installation(
         primary_path: primary_model_path(installed),
         ownership: match installed.origin {
             ModelPackageInstallationOrigin::Magnitude => ModelInstallationOwnership::Magnitude,
-            ModelPackageInstallationOrigin::HuggingFaceCache => {
-                ModelInstallationOwnership::ExternalHuggingFace
-            }
+            ModelPackageInstallationOrigin::HuggingFaceCache
+            | ModelPackageInstallationOrigin::LmStudio
+            | ModelPackageInstallationOrigin::LlamaCpp
+            | ModelPackageInstallationOrigin::Ollama
+            | ModelPackageInstallationOrigin::Folder
+            | ModelPackageInstallationOrigin::Imported => ModelInstallationOwnership::External,
         },
     }
 }

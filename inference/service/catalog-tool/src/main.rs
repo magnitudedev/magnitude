@@ -1,3 +1,5 @@
+mod headers;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -64,6 +66,14 @@ enum Command {
         #[arg(long)]
         cache_root: Option<PathBuf>,
     },
+    /// Dump every catalog component's GGUF header from a planner bundle as the JSON the engine
+    /// family tests read, replacing the contents of `--output`.
+    DumpHeaders {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 async fn update_lock(
@@ -95,7 +105,7 @@ async fn open_catalog_models(
 ) -> anyhow::Result<Arc<ManagedModelStore>> {
     let mut config = InventoryConfig::with_roots(model_store, cache_root)
         .context("invalid catalog-build inventory configuration")?;
-    config.hf_cache_dirs.extend(hf_caches);
+    config.add_hugging_face_caches(hf_caches);
     Ok(Arc::new(ManagedModelStore::open(config).await?))
 }
 
@@ -286,6 +296,11 @@ async fn main() -> anyhow::Result<()> {
             model_store,
             cache_root,
         } => acquire(model, model_store, cache_root).await,
+        Command::DumpHeaders { bundle, output } => {
+            let count = headers::dump(&bundle, &output)?;
+            println!("dumped {count} component headers into {}", output.display());
+            Ok(())
+        }
     }
 }
 

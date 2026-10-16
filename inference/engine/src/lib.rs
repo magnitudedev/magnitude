@@ -10,6 +10,7 @@ pub mod error;
 mod execution;
 pub use execution::{build_native_domain, load_native_domain, LoadAttempt};
 pub mod families;
+pub mod fingerprint;
 pub mod generation;
 pub mod host;
 pub mod inputs;

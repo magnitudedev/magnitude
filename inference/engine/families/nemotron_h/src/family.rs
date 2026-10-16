@@ -1,6 +1,6 @@
 //! Nemotron-H as a registered model family.
 
-use crate::{inspect_components, recognize};
+use crate::{inspect_components, ARCHITECTURE};
 use magnitude_artifacts::{gguf::Directory, PackageIdentity};
 use magnitude_family_common::TextInput;
 use magnitude_family_contracts::{
@@ -14,8 +14,8 @@ impl ModelFamily for NemotronHFamily {
         "nemotron_h"
     }
 
-    fn recognizes(&self, target: &Directory) -> bool {
-        recognize(target).is_ok()
+    fn architectures(&self) -> &'static [&'static str] {
+        &[ARCHITECTURE]
     }
 
     fn inspect(
@@ -25,7 +25,7 @@ impl ModelFamily for NemotronHFamily {
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
         inspect_components(target, projector, identity)
-            .map_err(|error| FamilyError(error.to_string()))
+            .map_err(FamilyError::from)
     }
 
     /// The model is text only and has no rotary embedding, so a row's single
@@ -58,7 +58,7 @@ impl ModelFamily for NemotronHFamily {
         match usize::try_from(layer) {
             Ok(index) if index < sublayers.len() => Ok(TapPoint::Sublayer(sublayers[index])),
             Ok(index) if index == sublayers.len() => Ok(TapPoint::Exit),
-            _ => Err(FamilyError(format!(
+            _ => Err(FamilyError::invalid(format!(
                 "target layer {layer} is beyond the model's {} layers",
                 sublayers.len()
             ))),

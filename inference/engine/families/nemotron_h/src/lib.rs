@@ -18,7 +18,7 @@ mod family;
 pub use family::NemotronHFamily;
 
 use magnitude_artifacts::{
-    PackageIdentity,
+    PackageIdentity, UnsupportedReason,
     gguf::{Directory, Value},
 };
 use magnitude_family_common::{HeaderError, Metadata, Tensors};
@@ -30,7 +30,7 @@ use magnitude_family_contracts::{
     LatentExperts, LayerNorm, MediaRowAttention, ModelDefinition, Operator, OutputForm,
     ResidualForm, RmsNorm, Rotary, RouteNormalization, RoutedFfn, Router, RouterInput,
     ScoreFunction, SharedExpert, SharedExpertGate, StateSpace, Sublayer, ValueNorm, ValueSource,
-    VocabularyProjection, WeightDescriptor, checked_product,
+    VocabularyProjection, WeightDescriptor, FamilyError, checked_product,
 };
 use std::{error, fmt};
 
@@ -77,10 +77,14 @@ const KNOWN_KEYS: &[&str] = &[
 pub enum Error {
     /// The artifact is not a `nemotron_h_moe` target.
     Architecture(String),
-    /// Missing, malformed or unknown metadata.
+    /// Missing or malformed metadata.
     Metadata(String),
-    /// A missing, misshapen or unbound tensor.
+    /// Every architecture key the family does not interpret.
+    UnknownMetadata(Vec<String>),
+    /// A missing or misshapen tensor.
     Weight(String),
+    /// Every stored tensor no role binds.
+    UnboundWeights(Vec<String>),
     /// A layer sequence the family cannot form into blocks.
     Structure(String),
     /// The assembled definition failed contract validation.
@@ -95,11 +99,43 @@ impl fmt::Display for Error {
             | Self::Weight(message)
             | Self::Structure(message)
             | Self::Definition(message) => formatter.write_str(message),
+            Self::UnknownMetadata(keys) => write!(formatter, "unknown Nemotron-H metadata {keys:?}"),
+            Self::UnboundWeights(names) => write!(
+                formatter,
+                "Nemotron-H artifact contains unbound weight roles {names:?}"
+            ),
         }
     }
 }
 
 impl error::Error for Error {}
+
+impl Error {
+    /// The unsupported features this error names.
+    pub fn reasons(&self) -> Vec<UnsupportedReason> {
+        match self {
+            Self::UnknownMetadata(keys) => keys
+                .iter()
+                .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
+                .collect(),
+            Self::UnboundWeights(names) => names
+                .iter()
+                .map(|name| UnsupportedReason::UnrecognizedTensor { name: name.clone() })
+                .collect(),
+            Self::Architecture(_)
+            | Self::Metadata(_)
+            | Self::Weight(_)
+            | Self::Structure(_)
+            | Self::Definition(_) => Vec::new(),
+        }
+    }
+}
+
+impl From<Error> for FamilyError {
+    fn from(error: Error) -> Self {
+        FamilyError::unsupported(error.reasons(), error.to_string())
+    }
+}
 
 impl From<DefinitionError> for Error {
     fn from(error: DefinitionError) -> Self {
@@ -110,9 +146,7 @@ impl From<DefinitionError> for Error {
 impl From<HeaderError> for Error {
     fn from(error: HeaderError) -> Self {
         match error {
-            HeaderError::UnknownMetadata(key) => {
-                metadata_error(format!("unknown Nemotron-H metadata {key:?}"))
-            }
+            HeaderError::UnknownMetadata(keys) => Self::UnknownMetadata(keys),
             HeaderError::MissingWeight(name) => {
                 Self::Weight(format!("missing Nemotron-H weight {name:?}"))
             }
@@ -123,9 +157,7 @@ impl From<HeaderError> for Error {
             } => Self::Weight(format!(
                 "Nemotron-H weight {name:?}: expected {expected:?}, received {received:?}"
             )),
-            HeaderError::UnboundWeight(name) => Self::Weight(format!(
-                "Nemotron-H artifact contains unbound weight role {name:?}"
-            )),
+            HeaderError::UnboundWeights(names) => Self::UnboundWeights(names),
             HeaderError::Definition(error) => error.into(),
             error @ (HeaderError::NotMatrix { .. } | HeaderError::CompanionScale { .. }) => {
                 Self::Weight(error.to_string())

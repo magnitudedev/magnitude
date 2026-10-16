@@ -1,6 +1,6 @@
 //! LFM2 (dense and routed) as a registered model family.
 
-use crate::{inspect_components, recognize};
+use crate::inspect_components;
 use magnitude_artifacts::{gguf::Directory, PackageIdentity};
 use magnitude_family_common::TextInput;
 use magnitude_family_contracts::{
@@ -14,8 +14,8 @@ impl ModelFamily for Lfm2Family {
         "lfm2"
     }
 
-    fn recognizes(&self, target: &Directory) -> bool {
-        recognize(target).is_ok()
+    fn architectures(&self) -> &'static [&'static str] {
+        &["lfm2", "lfm2moe"]
     }
 
     fn inspect(
@@ -24,7 +24,7 @@ impl ModelFamily for Lfm2Family {
         projector: Option<&Directory>,
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
-        inspect_components(target, projector, identity).map_err(|error| FamilyError(error.to_string()))
+        inspect_components(target, projector, identity)
     }
 
     /// LFM2 is text-only: a prompt's rows carry their absolute positions.

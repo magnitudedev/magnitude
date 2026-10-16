@@ -1,7 +1,9 @@
 //! The registered model families (integration spec §4.3). Recognition runs
-//! over every family; exactly one must claim a package.
+//! over every family; exactly one must claim a package's architecture.
+//! Whether that family admits the file's feature set is its inspection's
+//! decision, which names every feature it refuses.
 
-use crate::error::UnsupportedModel;
+use crate::error::{UnsupportedModel, UnsupportedReason};
 use magnitude_artifacts::gguf::{Directory, Value};
 use magnitude_family_contracts::ModelFamily;
 use magnitude_family_gemma4::Gemma4Family;
@@ -9,8 +11,8 @@ use magnitude_family_lfm2::Lfm2Family;
 use magnitude_family_llama::LlamaFamily;
 use magnitude_family_muse_glimmer::MuseGlimmerFamily;
 use magnitude_family_nemotron_h::NemotronHFamily;
-use magnitude_family_qwen4exp::Qwen4ExpFamily;
 use magnitude_family_qwen35::Qwen35Family;
+use magnitude_family_qwen4exp::Qwen4ExpFamily;
 
 static FAMILIES: &[&dyn ModelFamily] = &[
     &Qwen35Family,
@@ -22,35 +24,57 @@ static FAMILIES: &[&dyn ModelFamily] = &[
     &MuseGlimmerFamily,
 ];
 
-/// The one family that recognizes `target`.
+/// The architectures a separate drafter's GGUF may declare: a DFlash-family
+/// block drafter, a Gemma 4 assistant and a Qwen4 prediction head
+/// ([`crate::host::bind_draft`] interprets each).
+const DRAFTER_ARCHITECTURES: &[&str] = &[
+    magnitude_family_dflash::ARCHITECTURE,
+    magnitude_family_gemma4::ASSISTANT_ARCHITECTURE,
+    magnitude_family_qwen4exp::FAMILY_ID,
+];
+
+/// The `general.architecture` values the engine recognizes, as targets and
+/// as separate drafters. Recognition is not admission: a recognized file
+/// may still be refused for its feature set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Architectures {
+    pub targets: Vec<&'static str>,
+    pub drafters: Vec<&'static str>,
+}
+
+pub fn architectures() -> Architectures {
+    Architectures {
+        targets: FAMILIES
+            .iter()
+            .flat_map(|family| family.architectures().iter().copied())
+            .collect(),
+        drafters: DRAFTER_ARCHITECTURES.to_vec(),
+    }
+}
+
+/// The one family that claims `target`'s architecture.
 pub fn recognize(target: &Directory) -> Result<&'static dyn ModelFamily, UnsupportedModel> {
+    let architecture = target
+        .value("general.architecture")
+        .and_then(Value::string)
+        .unwrap_or_default();
     let mut matches = FAMILIES
         .iter()
         .copied()
         .filter(|family| family.recognizes(target));
-    let architecture = || {
-        target
-            .value("general.architecture")
-            .and_then(Value::string)
-            .unwrap_or("<missing>")
-            .to_owned()
-    };
     match (matches.next(), matches.next()) {
         (Some(family), None) => Ok(family),
-        (None, _) => Err(UnsupportedModel::Family {
-            reason: format!(
-                "no registered model family recognizes architecture {:?}",
-                architecture()
-            ),
-        }),
-        (Some(first), Some(second)) => Err(UnsupportedModel::Family {
-            reason: format!(
-                "architecture {:?} is claimed by both the {} and {} families",
-                architecture(),
-                first.name(),
-                second.name()
-            ),
-        }),
+        (None, _) => Err(UnsupportedModel::reason(
+            UnsupportedReason::Architecture {
+                architecture: architecture.to_owned(),
+            },
+            format!("no registered model family recognizes architecture {architecture:?}"),
+        )),
+        (Some(first), Some(second)) => Err(UnsupportedModel::invalid(format!(
+            "architecture {architecture:?} is claimed by both the {} and {} families",
+            first.name(),
+            second.name()
+        ))),
     }
 }
 
@@ -59,25 +83,46 @@ mod tests {
     use super::*;
     use magnitude_artifacts::gguf::{ByteOrder, Metadata, Scalar};
 
-    #[test]
-    fn an_unrecognized_architecture_names_the_family_once() {
-        let directory = Directory {
+    fn declaring(architecture: &str) -> Directory {
+        Directory {
             version: 3,
             byte_order: ByteOrder::Little,
             alignment: 32,
             data_offset: 0,
             metadata: vec![Metadata {
                 name: "general.architecture".into(),
-                value: Value::Scalar(Scalar::String("deepseek4".into())),
+                value: Value::Scalar(Scalar::String(architecture.into())),
             }],
             tensors: Vec::new(),
-        };
-        let Err(unsupported) = recognize(&directory) else {
-            panic!("no family recognizes deepseek4");
-        };
-        assert_eq!(
-            unsupported.to_string(),
-            "unsupported model family: no registered model family recognizes architecture \"deepseek4\""
-        );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_architecture_is_named() {
+        for architecture in ["deepseek4", "qwen3"] {
+            let Err(unsupported) = recognize(&declaring(architecture)) else {
+                panic!("no family recognizes {architecture}");
+            };
+            assert_eq!(
+                unsupported.reasons,
+                [UnsupportedReason::Architecture {
+                    architecture: architecture.into()
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn every_listed_architecture_is_recognized_by_exactly_one_family() {
+        let architectures = architectures();
+        for architecture in &architectures.targets {
+            assert!(
+                recognize(&declaring(architecture)).is_ok(),
+                "{architecture}"
+            );
+        }
+        assert!(architectures.targets.contains(&"llama"));
+        assert!(architectures.drafters.contains(&"dflash"));
+        assert!(!architectures.targets.contains(&"dflash"));
     }
 }

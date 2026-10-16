@@ -6,16 +6,42 @@
 //! trait only, so adding a family changes nothing above this contract.
 
 use crate::{ModelDefinition, ModelInputAdapter, SublayerIndex, TapPoint};
-use magnitude_artifacts::{gguf::Directory, PackageIdentity, TokenId};
+use magnitude_artifacts::{
+    gguf::{Directory, Value},
+    PackageIdentity, TokenId, UnsupportedReason,
+};
 use std::{error, fmt};
 
-/// A registered family rejected material it recognized.
+/// A registered family rejected material it recognized: every unsupported
+/// feature it can name, and the developer text that describes the refusal.
+/// `reasons` is empty when the material is malformed rather than outside a
+/// supported feature set.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FamilyError(pub String);
+pub struct FamilyError {
+    pub reasons: Vec<UnsupportedReason>,
+    pub detail: String,
+}
+
+impl FamilyError {
+    /// A refusal with no typed cause.
+    pub fn invalid(detail: impl Into<String>) -> Self {
+        Self {
+            reasons: Vec::new(),
+            detail: detail.into(),
+        }
+    }
+
+    pub fn unsupported(reasons: Vec<UnsupportedReason>, detail: impl Into<String>) -> Self {
+        Self {
+            reasons,
+            detail: detail.into(),
+        }
+    }
+}
 
 impl fmt::Display for FamilyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.detail)
     }
 }
 
@@ -34,9 +60,19 @@ pub trait ModelFamily: Send + Sync {
     /// Stable family name, for diagnostics.
     fn name(&self) -> &'static str;
 
-    /// Whether this family claims the target from its header metadata alone.
-    /// Recognition interprets no geometry.
-    fn recognizes(&self, target: &Directory) -> bool;
+    /// The `general.architecture` values this family claims. Claiming an
+    /// architecture is recognition only: whether the family admits the
+    /// file's feature set is decided by [`Self::inspect`], so a refusal names
+    /// what it does not admit instead of disowning the file.
+    fn architectures(&self) -> &'static [&'static str];
+
+    /// Whether this family claims the target's architecture.
+    fn recognizes(&self, target: &Directory) -> bool {
+        target
+            .value("general.architecture")
+            .and_then(Value::string)
+            .is_some_and(|architecture| self.architectures().contains(&architecture))
+    }
 
     /// Build the numerical definition of a recognized package from headers.
     fn inspect(
@@ -72,11 +108,11 @@ pub trait ModelFamily: Send + Sync {
         match layer.cmp(&blocks) {
             std::cmp::Ordering::Less => Ok(TapPoint::Sublayer(SublayerIndex {
                 block: u32::try_from(layer)
-                    .map_err(|_| FamilyError(format!("target layer {layer} exceeds u32")))?,
+                    .map_err(|_| FamilyError::invalid(format!("target layer {layer} exceeds u32")))?,
                 sublayer: 0,
             })),
             std::cmp::Ordering::Equal => Ok(TapPoint::Exit),
-            std::cmp::Ordering::Greater => Err(FamilyError(format!(
+            std::cmp::Ordering::Greater => Err(FamilyError::invalid(format!(
                 "target layer {layer} is beyond the target's {blocks} layers"
             ))),
         }

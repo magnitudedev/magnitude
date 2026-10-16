@@ -4,11 +4,11 @@
 //! preparation, host-only operations (count, template apply, properties) and
 //! loads all share that value. They never open a device.
 
-use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel};
+use crate::error::{ArtifactError, RequestError, ResolveError, UnsupportedModel, UnsupportedReason};
 use crate::families;
 use crate::options::InputModalities;
 use magnitude_artifacts::{
-    ImageProcessor, InputLayout, Package, TokenId,
+    ImageProcessor, InputLayout, Package, TokenId, TokenizerPayload,
     gguf::{Directory, Value},
 };
 use magnitude_chat::{
@@ -49,12 +49,12 @@ impl MarkerTokens for TokenizerMarkers<'_> {
         let tokens = self
             .0
             .encode(text, SpecialTokens::Recognize)
-            .map_err(FamilyError)?;
+            .map_err(FamilyError::invalid)?;
         let [token] = tokens.as_slice() else {
-            return Err(FamilyError(format!("special token {text:?} is not atomic")));
+            return Err(FamilyError::invalid(format!("special token {text:?} is not atomic")));
         };
-        if self.0.piece(*token, false).map_err(FamilyError)? != text.as_bytes() {
-            return Err(FamilyError(format!(
+        if self.0.piece(*token, false).map_err(FamilyError::invalid)? != text.as_bytes() {
+            return Err(FamilyError::invalid(format!(
                 "special token {text:?} has a different vocabulary value"
             )));
         }
@@ -62,7 +62,11 @@ impl MarkerTokens for TokenizerMarkers<'_> {
     }
 }
 
-/// Host admission retains optional-component failures outside the numerical model.
+/// Host admission retains optional-component failures outside the numerical
+/// model. A load whose draft does not bind serves the target without it; the
+/// same binding makes assessment report that drafter `Rejected`. A drafter
+/// assessment rejects for any other reason (its weight encodings, its plan)
+/// is one the host leaves out of the load it requests.
 pub struct AdmittedDefinition {
     pub definition: ModelDefinition,
     pub draft_unavailable: Option<DraftUnavailable>,
@@ -86,7 +90,9 @@ impl AdmittedDefinition {
 
 /// Why a package's separate draft is not bound: the drafter family its
 /// `general.architecture` names could not interpret it against the target,
-/// or it names none. The target serves without it.
+/// or it names none. The target serves without it. A refusal naming no
+/// unsupported feature is a draft that does not fit its target
+/// ([`Self::unsupported`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum DraftUnavailable {
     /// A DFlash-family block drafter (`dflash`).
@@ -97,6 +103,26 @@ pub enum DraftUnavailable {
     PredictionHead(magnitude_family_qwen4exp::Error),
     /// An architecture no drafter family interprets.
     Architecture(Option<String>),
+}
+
+impl DraftUnavailable {
+    /// The refusal as the engine reports it for a drafter.
+    pub fn unsupported(&self) -> UnsupportedModel {
+        let detail = self.to_string();
+        let mut reasons = match self {
+            Self::Block(error) => error.reasons(),
+            Self::Assistant(error) | Self::PredictionHead(error) => error.reasons.clone(),
+            Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
+                architecture: architecture.clone().unwrap_or_default(),
+            }],
+        };
+        if reasons.is_empty() {
+            reasons.push(UnsupportedReason::TargetMismatch {
+                detail: detail.clone(),
+            });
+        }
+        UnsupportedModel::new(reasons, detail)
+    }
 }
 
 impl fmt::Display for DraftUnavailable {
@@ -120,8 +146,6 @@ impl fmt::Display for DraftUnavailable {
 pub fn package_definition(
     package: &Package,
 ) -> Result<(&'static dyn ModelFamily, AdmittedDefinition), ResolveError> {
-    let unsupported =
-        |reason: String| ResolveError::Unsupported(UnsupportedModel::Representation { reason });
     let target = package.target().directory();
     let family = families::recognize(target).map_err(ResolveError::Unsupported)?;
     let declared = family
@@ -130,7 +154,7 @@ pub fn package_definition(
             package.projector().map(|projector| projector.directory()),
             package.identity(),
         )
-        .map_err(|error| unsupported(error.0))?;
+        .map_err(|error| ResolveError::Unsupported(error.into()))?;
     let declared = bind_draft(
         family,
         declared,
@@ -211,8 +235,7 @@ impl HostArtifacts {
         let mut definition = declared.clone();
         definition.decoder.context_limit =
             resolve_served_context(served_context, declared.decoder.context_limit)?;
-        let unsupported =
-            |reason: String| ResolveError::Unsupported(UnsupportedModel::Representation { reason });
+        let unsupported = |detail: String| ResolveError::Unsupported(UnsupportedModel::invalid(detail));
         if let Some(launch_rows) = launch_rows {
             let cells = image_cell_limit(&definition, launch_rows)
                 .map_err(|error| unsupported(error.to_string()))?;
@@ -228,16 +251,18 @@ impl HostArtifacts {
                 definition.artifact_identity.target.to_string(),
             )
             .and_then(ByteBpeTokenizer::new)
-            .map_err(|error| unsupported(error.to_string()))?,
+            .map_err(|error| ResolveError::Unsupported(error.into()))?,
         );
         if u64::try_from(tokenizer.vocabulary()).ok() != Some(definition.decoder.vocabulary) {
-            return Err(unsupported(
-                "tokenizer vocabulary differs from model vocabulary".into(),
-            ));
+            return Err(ResolveError::Unsupported(vocabulary_mismatch(
+                package.tokenizer(),
+            )));
         }
-        let templates =
-            gguf_templates(package.templates(), package.tokenizer()).map_err(unsupported)?;
-        let inspection = templates.inspect().map_err(unsupported)?;
+        let templates = gguf_templates(package.templates(), package.tokenizer())
+            .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::chat_template(detail)))?;
+        let inspection = templates
+            .inspect()
+            .map_err(|detail| ResolveError::Unsupported(UnsupportedModel::chat_template(detail)))?;
         let media = definition
             .vision
             .as_ref()
@@ -250,7 +275,7 @@ impl HostArtifacts {
             .transpose()?;
         let input_adapter = family
             .input_adapter(&definition, &TokenizerMarkers(&tokenizer))
-            .map_err(|error| unsupported(error.0))?;
+            .map_err(|error| ResolveError::Unsupported(error.into()))?;
         Ok(Self {
             package: Arc::new(package),
             family,
@@ -377,6 +402,19 @@ impl HostArtifacts {
             .prepare(definition, token_plan, &media)
             .map_err(|error| invalid(error.to_string()))
     }
+}
+
+/// A tokenizer whose vocabulary is not the model's: the package's tokenizer
+/// scheme is one this model cannot use.
+pub(crate) fn vocabulary_mismatch(payload: &TokenizerPayload) -> UnsupportedModel {
+    let text = |key: &str| payload.value(key).and_then(Value::string).map(str::to_owned);
+    UnsupportedModel::reason(
+        UnsupportedReason::Tokenizer {
+            model: text("tokenizer.ggml.model").unwrap_or_default(),
+            pre: text("tokenizer.ggml.pre"),
+        },
+        "tokenizer vocabulary differs from model vocabulary",
+    )
 }
 
 fn resolve_served_context(
@@ -518,6 +556,54 @@ mod tests {
         assert_eq!(
             bind_draft(&gemma, gemma_target, Some(&unknown)).draft_unavailable,
             Some(DraftUnavailable::Architecture(Some("eagle3".into())))
+        );
+    }
+
+    #[test]
+    fn draft_refusals_name_their_reasons_and_otherwise_a_target_mismatch() {
+        use magnitude_family_dflash::Error;
+        let reasons = |unavailable: DraftUnavailable| unavailable.unsupported().reasons;
+        assert_eq!(
+            reasons(DraftUnavailable::Architecture(Some("eagle3".into()))),
+            [UnsupportedReason::Architecture {
+                architecture: "eagle3".into()
+            }]
+        );
+        assert_eq!(
+            reasons(DraftUnavailable::Block(Error::Unadmitted {
+                metadata: vec!["dflash.rope.dimension_count".into()],
+                tensors: vec!["d2t".into()],
+            })),
+            [
+                UnsupportedReason::UnrecognizedMetadata {
+                    key: "dflash.rope.dimension_count".into()
+                },
+                UnsupportedReason::UnrecognizedTensor { name: "d2t".into() },
+            ]
+        );
+        for error in [
+            Error::Target("draft width 1024 differs from the target's 2048".into()),
+            Error::Geometry("draft taps no target layer".into()),
+            Error::MissingCausality,
+            Error::MissingWeight("fc.weight".into()),
+        ] {
+            let expected = error.to_string();
+            let reasons = reasons(DraftUnavailable::Block(error));
+            assert!(
+                matches!(
+                    reasons.as_slice(),
+                    [UnsupportedReason::TargetMismatch { detail }] if detail.contains(&expected)
+                ),
+                "{reasons:?}"
+            );
+        }
+        assert_eq!(
+            reasons(DraftUnavailable::PredictionHead(FamilyError::invalid(
+                "not a head of this target"
+            ))),
+            [UnsupportedReason::TargetMismatch {
+                detail: "prediction head: not a head of this target".into()
+            }]
         );
     }
 

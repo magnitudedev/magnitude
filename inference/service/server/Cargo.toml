@@ -41,6 +41,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+magnitude-artifacts = { path = "../../engine/artifacts" }
 tempfile = "3.24.0"
 tower = { workspace = true, features = ["util"] }
 tokio = { workspace = true, features = ["test-util"] }

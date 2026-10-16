@@ -10,25 +10,29 @@ use magnitude_service_contracts::models::{
 use crate::ManagedModelDownloads;
 use crate::catalog_installations::ManagedCatalogInstallations;
 use crate::catalog_models::ManagedCatalogModels;
-use crate::discovered_models::ManagedDiscoveredModels;
+use crate::custom_models::{LocalModelsContext, ManagedLocalModels};
 use crate::inventory::{InstalledPackagesObserver, ManagedModelStore};
 
-#[derive(Clone)]
 pub struct ModelDomainResolver {
     pub(crate) inventory: Arc<ManagedModelStore>,
     pub(crate) catalog: RecommendableModelCatalog,
+    pub(crate) local: LocalModelsContext,
 }
 
 impl ModelDomainResolver {
     #[must_use]
     pub fn new(inventory: Arc<ManagedModelStore>, catalog: RecommendableModelCatalog) -> Arc<Self> {
-        Arc::new(Self { inventory, catalog })
+        Arc::new(Self {
+            inventory,
+            catalog,
+            local: LocalModelsContext::new(),
+        })
     }
 }
 
 struct ModelInventoryObserver {
     catalog: Weak<ManagedCatalogModels>,
-    discovered: Weak<ManagedDiscoveredModels>,
+    local: Weak<ManagedLocalModels>,
 }
 
 impl InstalledPackagesObserver for ModelInventoryObserver {
@@ -36,15 +40,15 @@ impl InstalledPackagesObserver for ModelInventoryObserver {
         if let Some(catalog) = self.catalog.upgrade() {
             catalog.installed_packages_changed(revision);
         }
-        if let Some(discovered) = self.discovered.upgrade() {
-            discovered.installed_packages_changed(revision);
+        if let Some(local) = self.local.upgrade() {
+            local.installed_packages_changed(revision);
         }
     }
 }
 
 pub struct ManagedModelServices {
     pub catalog: Arc<ManagedCatalogModels>,
-    pub discovered: Arc<ManagedDiscoveredModels>,
+    pub local: Arc<ManagedLocalModels>,
     pub installations: Arc<ManagedCatalogInstallations>,
 }
 
@@ -56,15 +60,10 @@ pub fn managed_model_services(
 ) -> Result<ManagedModelServices, InventoryError> {
     let installations =
         ManagedCatalogInstallations::new(resolver.clone(), downloads, remover, optimizer);
-    let discovered = ManagedDiscoveredModels::new(resolver.clone());
+    let local = ManagedLocalModels::new(resolver.clone());
     let catalog = ManagedCatalogModels::new(resolver, installations.clone(), {
-        let discovered = Arc::downgrade(&discovered);
-        move |catalog| {
-            Arc::new(ModelInventoryObserver {
-                catalog,
-                discovered,
-            })
-        }
+        let local = Arc::downgrade(&local);
+        move |catalog| Arc::new(ModelInventoryObserver { catalog, local })
     });
     catalog
         .resolver()
@@ -72,7 +71,7 @@ pub fn managed_model_services(
         .set_installed_packages_observer(Arc::downgrade(catalog.inventory_observer()))?;
     Ok(ManagedModelServices {
         catalog,
-        discovered,
+        local,
         installations,
     })
 }

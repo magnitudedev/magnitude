@@ -1,18 +1,22 @@
 //! Durable local model inventory, storage, and Hugging Face acquisition.
 
 mod cache;
+pub mod candidate_files;
 mod catalog;
 mod catalog_acquisition;
 mod catalog_affiliations;
 mod catalog_installations;
 mod catalog_models;
-mod discovered_models;
+mod custom_models;
 mod download;
 mod download_service;
 pub mod gguf;
 mod hugging_face;
 mod identity;
 mod inventory;
+mod local_roots;
+mod local_watch;
+pub mod lineage;
 mod model_domains;
 mod model_projection;
 mod package_service;
@@ -20,20 +24,25 @@ mod preview;
 mod service;
 mod snapshot_blobs;
 mod store_fs;
+#[cfg(test)]
+mod test_gguf;
 mod validation;
 
 pub use cache::{
     CachedModelAssessment, ModelBlobKind, ModelCache, ModelCacheWorkspace, ModelIndexKind,
 };
 pub use catalog::{
-    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseRecommendableCatalog,
+    CatalogLockAdvance, GeneratedReleaseCatalog, ReleaseCatalog, ReleaseComponentHeader,
+    ReleasePackageRole, ReleaseRecommendableCatalog,
     ResolvingRecommendableCatalog, advance_model_catalog_lock, load_release_catalog,
     model_catalog_lock,
 };
 pub use catalog_acquisition::{AcquiredCatalogModel, AcquiredDrafter, AcquiredFile};
 pub use catalog_installations::ManagedCatalogInstallations;
 pub use catalog_models::{CatalogRemovalPlan, ManagedCatalogModels};
-pub use discovered_models::ManagedDiscoveredModels;
+pub use custom_models::{
+    CustomModelEnrichment, CustomModelEnrichmentResult, CustomModelFacts, ManagedLocalModels,
+};
 pub use download_service::ManagedModelDownloads;
 pub use inventory::{InventoryConfig, ManagedModelStore};
 pub use model_domains::{ManagedModelServices, ModelDomainResolver, managed_model_services};
@@ -42,4 +51,7 @@ pub use package_service::{
     servable_model_bundle_key_for_bundle, serving_configuration_fingerprint,
     speculative_servable_model_bundle_key,
 };
-pub use preview::{HuggingFaceDiscovery, PreparedPreview, refresh_hugging_face_repository};
+pub use preview::{
+    HuggingFaceDiscovery, PreparedPreview, PreparedPreviewHeader, RemoteGgufHeader,
+    pinned_hugging_face_repository, refresh_hugging_face_repository,
+};

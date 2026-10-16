@@ -20,6 +20,8 @@ context from its GGUF metadata, which is the context the engine resolves, serves
 cargo run --release -p magnitude-service-catalog-tool -- update-lock ...   # advance the commit map
 cargo run --release -p magnitude-service-catalog-tool -- build-bundle ...  # build the header bundle
 cargo run --release -p magnitude-service-catalog-tool -- acquire --model qwen3.5-4b:gguf:q4 --model-store DIR
+cargo run --release -p magnitude-service-catalog-tool -- dump-headers \
+  --bundle target/catalog-inputs/model-planner-inputs.bundle --output catalog/headers
 ```
 
 `acquire` resolves one catalog model at its locked revisions, downloads into a managed model store
@@ -34,3 +36,15 @@ downloaded. Repeated references to the same immutable package share one package 
 set of bundled headers. The bundle is derived release output and is not committed. It is the only
 catalog-related file shipped alongside the service; catalog definitions and pins are compiled into
 the executable.
+
+`dump-headers` writes the bundle's headers as the JSON the engine family tests read
+(`catalog/headers/`, not committed), replacing that directory. `index.json` lists every component
+as `{model, role, file}`. A target is `<model>__target-<variant>.json` (the variant ID with `:`
+as `_`), a separate draft package `<model>__draft.json` and a projector `<model>__projector.json`;
+a draft or projector must be identical across the model's variants. Each file holds the
+component's metadata and its tensor directory (`name`, GGML `type`, `shape` in GGML storage
+order). Metadata arrays longer than 1024 entries, such as tokenizer vocabularies and merges, keep
+only `{"head": [first 64], "length": total}`; shorter arrays, including every per-layer array,
+are complete. A split target's file is its first shard, and `<file>-allshards.json` beside it
+holds the first shard's metadata with every shard's tensors. Build the bundle first when it is
+absent (`bun run catalog:build-bundle`).

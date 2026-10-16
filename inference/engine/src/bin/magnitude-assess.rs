@@ -8,8 +8,8 @@
 
 use magnitude_engine::{
     assessment::{
-        AssessmentSetup, ModelAssessment, ModelPackagePaths, PreparedModelAssessment,
-        finish_model_assessment, prepare_model_assessment,
+        AssessmentSetup, DrafterVerdict, ModelAssessment, ModelPackagePaths,
+        PreparedModelAssessment, finish_model_assessment, prepare_model_assessment,
     },
     error::UnsupportedModel,
     options::{ModelMethod, ModelPolicy, standard_service_limits},
@@ -202,17 +202,14 @@ fn print_breakdown(
 
 fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
     let (facts, execution) = match assessment {
-        ModelAssessment::Unsupported(unsupported) => {
-            let code = match unsupported {
-                UnsupportedModel::Family { .. } => "unsupported_family",
-                UnsupportedModel::Representation { .. } => "unsupported_representation",
-                UnsupportedModel::Backend { .. } => "unsupported_backend",
-                UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
-            };
-            return json!({
-                "_tag": "Unsupported",
-                "failure": { "code": code, "message": unsupported.to_string(), "retryable": false },
-            });
+        ModelAssessment::Unsupported {
+            unsupported,
+            fingerprint,
+        } => {
+            let mut object = unsupported_json(unsupported);
+            object["_tag"] = json!("Unsupported");
+            object["fingerprint"] = json!(fingerprint);
+            return object;
         }
         ModelAssessment::Assessed { facts, execution } => (facts, execution),
     };
@@ -268,7 +265,37 @@ fn render(setup: &AssessmentSetup, assessment: &ModelAssessment) -> Value {
     });
     object["templateFingerprint"] = json!(facts.template_fingerprint);
     object["contextLimit"] = json!(facts.context_limit);
+    object["fingerprint"] = json!(facts.fingerprint);
+    object["drafter"] = match &facts.drafter {
+        DrafterVerdict::None => json!({ "_tag": "None" }),
+        DrafterVerdict::Bound {
+            method,
+            memory_bytes,
+        } => json!({
+            "_tag": "Bound",
+            "method": format!("{method:?}"),
+            "memoryBytes": memory_bytes,
+        }),
+        DrafterVerdict::Rejected(unsupported) => {
+            let mut object = unsupported_json(unsupported);
+            object["_tag"] = json!("Rejected");
+            object
+        }
+    };
     object
+}
+
+/// The reasons (by their debug form, developer output) and detail of a
+/// refusal.
+fn unsupported_json(unsupported: &UnsupportedModel) -> Value {
+    json!({
+        "reasons": unsupported
+            .reasons
+            .iter()
+            .map(|reason| format!("{reason:?}"))
+            .collect::<Vec<_>>(),
+        "detail": unsupported.detail,
+    })
 }
 
 /// Host RAM is the `system` domain; a dedicated device's memory is named by

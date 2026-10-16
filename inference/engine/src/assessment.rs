@@ -1,20 +1,27 @@
 //! Metadata-only model assessment from a package path.
 //!
-//! Opens only the GGUF headers of the target and optional projector, derives
-//! the family definition, resolves the execution manifest exactly as engine
-//! configuration does, plans it through [`crate::planning::plan_execution`]
-//! (the production planning inputs) and assesses the draft against stable
-//! memory capacity and the selected device's memory bandwidth. Chat
-//! capabilities come from the engine's own tokenizer validation and
-//! template and reasoning inspection over header metadata. No device is
-//! opened, no weight payload is read and nothing is decoded.
+//! Opens only the GGUF headers of the target, its optional projector and
+//! drafter. Independent header checks (weight encodings, the family's
+//! interpretation, the tokenizer and the chat templates) each run and their
+//! refusals are reported together. An admitted target is planned plain
+//! through [`crate::planning::plan_execution`] (the production planning
+//! inputs), which decides whether it runs here; its drafter is then planned
+//! with it, and a drafter that does not bind or plan is `Rejected` without
+//! affecting the target. The selected plan is assessed against stable memory
+//! capacity and the selected device's memory bandwidth. No device is opened,
+//! no weight payload is read and nothing is decoded.
 
 use crate::error::{
     classify_catalog, classify_graph, classify_plan, PlanOutcome, UnsupportedModel,
+    UnsupportedReason, WeightTypeCount,
 };
-use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy};
+use crate::fingerprint::ModelFingerprint;
+use crate::host::{bind_draft, vocabulary_mismatch};
+use crate::options::{ExecutionManifest, ModelMethod, ModelPolicy, ResolvedMethod};
 use crate::planning::{plan_backend, plan_execution, ExecutionPlanningError};
-use magnitude_artifacts::PackageHeaders;
+use magnitude_artifacts::{
+    gguf::TensorDescriptor, PackageHeaders, PackageManifest, TemplatePayload, TokenizerPayload,
+};
 use magnitude_chat::{
     artifacts::{gguf_templates, gguf_tokenizer_vocabulary},
     TemplateInspection,
@@ -26,29 +33,28 @@ use magnitude_executor::{
         PreparedExecutionAssessment,
     },
     platform::{self, DeviceRequest, MemoryReserves, PlatformError, SelectedDevice},
-    ExecutionPath, ExecutionPlanDraft,
+    resident_element, resident_layout, source_element, ExecutionPath, ExecutionPlanDraft,
 };
-use magnitude_family_contracts::ModelDefinition;
+use magnitude_family_contracts::{DraftVariant, ModelDefinition, ModelFamily};
 use magnitude_scheduler::ServiceLimits;
-use seismic::{DeviceCatalog, DeviceTopology, HostMemoryStatus};
+use seismic::{DType, DeviceCatalog, DeviceTopology, HostMemoryStatus, Layout};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The package components to assess and the generation method the bundle
-/// declares. Only their headers are read.
+/// declares (`Auto` for a standalone package). Only their headers are read.
+/// `target` is the target GGUF or the first shard of a split GGUF (the other
+/// shards are found beside it by the split naming convention); `draft` is a
+/// separate drafter (DFlash, DSpark, DFlash2, a Gemma assistant or a
+/// prediction head). A drafter the method cannot draft with is `Rejected`
+/// and the target is assessed without it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelPackagePaths {
-    /// The target GGUF, or the first shard of a split GGUF (the remaining
-    /// shards are found beside it by the split naming convention).
     pub target: PathBuf,
     pub projector: Option<PathBuf>,
-    /// A separate draft model (DFlash, DSpark, DFlash2).
     pub draft: Option<PathBuf>,
-    /// The bundle's method: `Auto` for a standalone package, the declared
-    /// method otherwise. A declared separate-draft method the draft does
-    /// not implement, or the executor cannot run, makes the bundle
-    /// unsupported or incompatible; it is never assessed as plain.
     pub method: ModelMethod,
 }
 
@@ -124,44 +130,69 @@ pub struct ModelCapabilities {
     pub reasoning: ReasoningCapabilities,
 }
 
+/// The speculative method a bound drafter runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpeculativeMethod {
+    Mtp,
+    DFlash,
+    DSpark,
+    DFlash2,
+}
+
+/// Whether the engine binds the package's drafter: none was declared or
+/// present (`None`), it binds and plans with the target (`Bound`, with the
+/// device memory it adds to the target served alone), or it does not
+/// (`Rejected`, with every reason; the target is assessed and loads without
+/// it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrafterVerdict {
+    None,
+    Bound {
+        method: SpeculativeMethod,
+        memory_bytes: u64,
+    },
+    Rejected(UnsupportedModel),
+}
+
 /// Host-side model facts established from headers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelFacts {
-    /// Why an optional separate drafter was disabled; target admission still succeeded.
-    pub draft_unavailable: Option<String>,
     pub capabilities: ModelCapabilities,
     /// [`magnitude_chat::TemplateInspection::fingerprint`] of the package's
     /// chat templates and reasoning profile.
     pub template_fingerprint: String,
     /// The model's supported context, which assessment serves.
     pub context_limit: u32,
+    pub fingerprint: Option<ModelFingerprint>,
+    pub drafter: DrafterVerdict,
 }
 
 /// A complete assessment of one package on one execution environment.
+/// `Assessed` assesses the drafted plan when the drafter is `Bound`, the
+/// plain one otherwise. `Unsupported` is a target the engine cannot execute,
+/// with every reason its header checks found, or the planner's or a kernel
+/// domain's first refusal of an admitted definition, and the target's
+/// fingerprint when its header has one.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ModelAssessment {
     Assessed {
         facts: ModelFacts,
         execution: ExecutionAssessment,
     },
-    /// The engine cannot execute the package: no family recognizes it, its
-    /// definition, tokenizer or templates are outside what the engine
-    /// executes, the planner refuses it on the backend, or its program calls
-    /// a kernel outside the kernel's domain. The same classification a load
-    /// makes.
-    Unsupported(UnsupportedModel),
+    Unsupported {
+        unsupported: UnsupportedModel,
+        fingerprint: Option<ModelFingerprint>,
+    },
 }
 
-/// An operational failure: no result is produced for the package.
+/// An operational failure: no result is produced for the package. A
+/// truncated or invalid GGUF is not one (it is `Unsupported` with
+/// [`UnsupportedReason::Unreadable`]); a file that cannot be opened is.
 #[derive(Debug)]
 pub enum ModelAssessmentError {
-    /// A header could not be read or is not a valid GGUF component.
     Artifact(magnitude_artifacts::Error),
-    /// The model's context limit is outside the assessment domain.
     ContextLimit(u64),
-    /// The engine configuration could not be resolved for the model.
     Configuration(String),
-    /// Planning or graph construction failed in the engine itself.
     Planning(String),
     Platform(PlatformError),
     Assessment(AssessmentError),
@@ -189,7 +220,10 @@ impl std::error::Error for ModelAssessmentError {}
 
 /// Evidence from the exact package and selected execution configuration.
 pub enum PreparedModelAssessment {
-    Unsupported(UnsupportedModel),
+    Unsupported {
+        unsupported: UnsupportedModel,
+        fingerprint: Option<ModelFingerprint>,
+    },
     Planned {
         facts: ModelFacts,
         draft: ExecutionPlanDraft,
@@ -205,8 +239,14 @@ pub fn finish_model_assessment(
     performance_depths: &[u32],
 ) -> Result<ModelAssessment, ModelAssessmentError> {
     let (facts, draft, preparation) = match prepared {
-        PreparedModelAssessment::Unsupported(unsupported) => {
-            return Ok(ModelAssessment::Unsupported(unsupported.clone()));
+        PreparedModelAssessment::Unsupported {
+            unsupported,
+            fingerprint,
+        } => {
+            return Ok(ModelAssessment::Unsupported {
+                unsupported: unsupported.clone(),
+                fingerprint: fingerprint.clone(),
+            });
         }
         PreparedModelAssessment::Planned {
             facts,
@@ -244,49 +284,85 @@ pub fn assess_model(
 }
 
 /// Prepare one package from its headers on the selected execution
-/// configuration: recognition, the
-/// family definition, capabilities from the engine's own chat inspection,
-/// the execution manifest and its allocation-free plan, then decode demand
-/// and the checked memory charge. A tokenizer or template the engine cannot
-/// prepare makes the package unsupported whatever its plan.
+/// configuration: admission (every header refusal at once), the target's
+/// plain plan and its decode demand and checked memory charge, then the
+/// drafter's plan when one is admitted. A drafter is `Bound` with the
+/// serving bytes its plan adds to the plain plan's
+/// ([`magnitude_executor::AssessmentMemoryCharge::serving_bytes`], the
+/// device's allocation domain at the fit depth: the drafter's weights, state
+/// and prepared resources), and the drafted plan is the one assessed.
 pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
     setup: &AssessmentSetup,
 ) -> Result<PreparedModelAssessment, ModelAssessmentError> {
-    let (facts, manifest) = match resolve_package(
-        package,
-        &setup.policy,
-        &setup.service,
-        setup.device,
-        setup.reserves,
-    )? {
-        ResolvedPackage::Unsupported(unsupported) => {
-            return Ok(PreparedModelAssessment::Unsupported(unsupported))
+    let layout = resident_layout(ExecutionPath::Native, setup.selected.info.backend);
+    let admitted = match admit(package, layout)? {
+        Admission::Unsupported {
+            unsupported,
+            fingerprint,
+        } => {
+            return Ok(PreparedModelAssessment::Unsupported {
+                unsupported,
+                fingerprint,
+            });
         }
-        ResolvedPackage::Resolved { facts, manifest } => (facts, manifest),
+        Admission::Admitted(admitted) => *admitted,
     };
-    // Planner refusals and kernel domains classify exactly as a load's do.
-    let refused = |outcome: PlanOutcome| match outcome {
-        PlanOutcome::Unsupported(unsupported) => {
-            Ok(PreparedModelAssessment::Unsupported(unsupported))
-        }
-        PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
+    let environment = Environment {
+        policy: &setup.policy,
+        service: &setup.service,
+        device: setup.device,
+        reserves: setup.reserves,
     };
-    let draft = match plan_execution(&manifest, &setup.selected) {
-        Ok(draft) => draft,
-        Err(ExecutionPlanningError::Plan(error)) => {
-            return refused(classify_plan(error, setup.selected.info.backend));
-        }
-        Err(error) => return Err(ModelAssessmentError::Planning(error.to_string())),
-    };
-    let execution =
-        match prepare_execution_assessment(&manifest.definition, &draft, facts.context_limit) {
-            Ok(execution) => execution,
-            Err(AssessmentError::Graph(error)) => return refused(classify_graph(error)),
-            Err(error) => return Err(ModelAssessmentError::Assessment(error)),
+    let plain = environment
+        .plain(&admitted)
+        .map_err(ModelAssessmentError::Configuration)?;
+    let (plain_draft, plain_execution) =
+        match prepare_plan(&plain, &setup.selected, admitted.context_limit) {
+            Ok(planned) => planned,
+            Err(Refusal::Unsupported(unsupported)) => {
+                return Ok(PreparedModelAssessment::Unsupported {
+                    unsupported,
+                    fingerprint: admitted.fingerprint,
+                });
+            }
+            Err(Refusal::Failed(error)) => return Err(error),
         };
+    let drafted = match &admitted.drafter {
+        DrafterAdmission::None => Err(DrafterVerdict::None),
+        DrafterAdmission::Rejected(unsupported) => Err(rejected(unsupported.clone())),
+        DrafterAdmission::Candidate { definition, method } => environment
+            .drafted(&admitted, definition, *method)
+            .and_then(|(manifest, method)| {
+                match prepare_plan(&manifest, &setup.selected, admitted.context_limit) {
+                    Ok((draft, execution)) => Ok((method, draft, execution)),
+                    Err(Refusal::Unsupported(unsupported)) => Err(unsupported),
+                    Err(Refusal::Failed(error)) => {
+                        Err(UnsupportedModel::invalid(error.to_string()))
+                    }
+                }
+            })
+            .map_err(rejected),
+    };
+    let (drafter, draft, execution) = match drafted {
+        Ok((method, draft, execution)) => {
+            let memory_bytes = execution
+                .memory_charge()
+                .serving_bytes
+                .saturating_sub(plain_execution.memory_charge().serving_bytes);
+            (
+                DrafterVerdict::Bound {
+                    method,
+                    memory_bytes,
+                },
+                draft,
+                execution,
+            )
+        }
+        Err(verdict) => (verdict, plain_draft, plain_execution),
+    };
     Ok(PreparedModelAssessment::Planned {
-        facts,
+        facts: admitted.facts(drafter),
         draft,
         execution,
     })
@@ -294,7 +370,8 @@ pub fn prepare_model_assessment(
 
 /// The native kernels a load of one package prepares on a backend, or why
 /// the engine cannot execute the package there: the classification
-/// assessment makes.
+/// assessment makes. A declared drafter the engine rejects makes the
+/// package's inventory unsupported, since the load it describes drafts.
 pub enum KernelInventory {
     Unsupported(UnsupportedModel),
     Requests(Vec<seismic::KernelRequest>),
@@ -308,163 +385,461 @@ pub fn kernel_inventory(
     service: &ServiceLimits,
     backend: seismic::BackendName,
 ) -> Result<KernelInventory, ModelAssessmentError> {
-    let manifest = match resolve_package(
-        package,
+    let layout = resident_layout(ExecutionPath::Native, backend);
+    let admitted = match admit(package, layout)? {
+        Admission::Unsupported { unsupported, .. } => {
+            return Ok(KernelInventory::Unsupported(unsupported));
+        }
+        Admission::Admitted(admitted) => *admitted,
+    };
+    let environment = Environment {
         policy,
         service,
-        DeviceRequest::Backend(backend),
-        MemoryReserves::standard(),
-    )? {
-        ResolvedPackage::Unsupported(unsupported) => {
-            return Ok(KernelInventory::Unsupported(unsupported))
-        }
-        ResolvedPackage::Resolved { manifest, .. } => manifest,
+        device: DeviceRequest::Backend(backend),
+        reserves: MemoryReserves::standard(),
     };
+    let plain = environment
+        .plain(&admitted)
+        .map_err(ModelAssessmentError::Configuration)?;
+    let requests = match inventory(&plain, backend)? {
+        Ok(requests) => requests,
+        Err(unsupported) => return Ok(KernelInventory::Unsupported(unsupported)),
+    };
+    let drafted = match &admitted.drafter {
+        DrafterAdmission::None => return Ok(KernelInventory::Requests(requests)),
+        DrafterAdmission::Rejected(unsupported) => Err(unsupported.clone()),
+        DrafterAdmission::Candidate { definition, method } => environment
+            .drafted(&admitted, definition, *method)
+            .and_then(|(manifest, _)| {
+                inventory(&manifest, backend)
+                    .unwrap_or_else(|error| Err(UnsupportedModel::invalid(error.to_string())))
+            }),
+    };
+    Ok(match drafted {
+        Ok(requests) => KernelInventory::Requests(requests),
+        Err(unsupported) => {
+            KernelInventory::Unsupported(drafter_refusal(rejected_model(unsupported)))
+        }
+    })
+}
+
+/// The kernels `manifest`'s load prepares on `backend`, or the planner's or
+/// a kernel domain's refusal.
+fn inventory(
+    manifest: &ExecutionManifest,
+    backend: seismic::BackendName,
+) -> Result<Result<Vec<seismic::KernelRequest>, UnsupportedModel>, ModelAssessmentError> {
     let refused = |outcome: PlanOutcome| match outcome {
-        PlanOutcome::Unsupported(unsupported) => Ok(KernelInventory::Unsupported(unsupported)),
+        PlanOutcome::Unsupported(unsupported) => Ok(Err(unsupported)),
         PlanOutcome::Internal(reason) => Err(ModelAssessmentError::Planning(reason)),
     };
-    let plan = match plan_backend(&manifest, backend) {
+    let plan = match plan_backend(manifest, backend) {
         Ok(plan) => plan,
-        Err(ExecutionPlanningError::Plan(error)) => {
-            return refused(classify_plan(error, backend));
-        }
+        Err(ExecutionPlanningError::Plan(error)) => return refused(classify_plan(error, backend)),
         Err(error) => return Err(ModelAssessmentError::Planning(error.to_string())),
     };
     match magnitude_executor::kernel_inventory(&manifest.definition, &plan) {
-        Ok(requests) => Ok(KernelInventory::Requests(requests)),
+        Ok(requests) => Ok(Ok(requests)),
         Err(error) => refused(classify_catalog(error)),
     }
 }
 
-/// A package resolved from its headers: the manifest a load of it executes
-/// and its host-side facts, or why the engine cannot execute it.
-enum ResolvedPackage {
-    Unsupported(UnsupportedModel),
-    Resolved {
-        facts: ModelFacts,
-        manifest: ExecutionManifest,
-    },
+/// A rejected drafter, reported as a package refusal.
+fn drafter_refusal(unsupported: UnsupportedModel) -> UnsupportedModel {
+    UnsupportedModel::new(
+        unsupported.reasons,
+        format!("the drafter is rejected: {}", unsupported.detail),
+    )
 }
 
-/// Recognition, the family definition, capabilities from the engine's own
-/// chat inspection and the execution manifest of `package` under `policy`
-/// (its method from the package).
-fn resolve_package(
-    package: &ModelPackagePaths,
-    policy: &ModelPolicy,
-    service: &ServiceLimits,
-    device: DeviceRequest,
-    reserves: MemoryReserves,
-) -> Result<ResolvedPackage, ModelAssessmentError> {
-    let headers = PackageHeaders::open(&package.target, package.projector.as_deref())
-        .and_then(|headers| match &package.draft {
-            Some(draft) => headers.with_draft(draft),
-            None => Ok(headers),
-        })
-        .map_err(ModelAssessmentError::Artifact)?;
-    let family = match crate::families::recognize(headers.target()) {
-        Ok(family) => family,
-        Err(unsupported) => return Ok(ResolvedPackage::Unsupported(unsupported)),
+/// A drafter refusal always names a reason: one naming no unsupported
+/// feature is a drafter that does not fit its target.
+fn rejected_model(mut unsupported: UnsupportedModel) -> UnsupportedModel {
+    if unsupported.reasons.is_empty() {
+        unsupported.reasons.push(UnsupportedReason::TargetMismatch {
+            detail: unsupported.detail.clone(),
+        });
+    }
+    unsupported
+}
+
+fn rejected(unsupported: UnsupportedModel) -> DrafterVerdict {
+    DrafterVerdict::Rejected(rejected_model(unsupported))
+}
+
+/// Why a manifest has no plan here: the material is refused on this
+/// execution path, or the engine itself failed.
+enum Refusal {
+    Unsupported(UnsupportedModel),
+    Failed(ModelAssessmentError),
+}
+
+/// Plan `manifest` on the selected device, then its decode demand and
+/// checked memory charge, which builds every graph a load prepares. Planner
+/// refusals and kernel domains classify exactly as a load's do.
+fn prepare_plan(
+    manifest: &ExecutionManifest,
+    selected: &SelectedDevice,
+    context_limit: u32,
+) -> Result<(ExecutionPlanDraft, PreparedExecutionAssessment), Refusal> {
+    let refused = |outcome: PlanOutcome| match outcome {
+        PlanOutcome::Unsupported(unsupported) => Refusal::Unsupported(unsupported),
+        PlanOutcome::Internal(reason) => Refusal::Failed(ModelAssessmentError::Planning(reason)),
     };
-    let admitted = match family
-        .inspect(headers.target(), headers.projector(), headers.identity())
-        .map_err(|error| error.0)
-        .map(|declared| crate::host::bind_draft(family, declared, headers.draft()))
-    {
-        Ok(definition) => definition,
-        Err(reason) => {
-            return Ok(ResolvedPackage::Unsupported(
-                UnsupportedModel::Representation { reason },
-            ));
+    let draft = match plan_execution(manifest, selected) {
+        Ok(draft) => draft,
+        Err(ExecutionPlanningError::Plan(error)) => {
+            return Err(refused(classify_plan(error, selected.info.backend)));
+        }
+        Err(error) => {
+            return Err(Refusal::Failed(ModelAssessmentError::Planning(
+                error.to_string(),
+            )));
         }
     };
-    let definition = admitted.definition;
-    let context_limit = u32::try_from(definition.decoder.context_limit)
-        .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
-    let mut facts = match model_facts(&headers, package, &definition, context_limit) {
-        Ok(facts) => facts,
-        Err(unsupported) => return Ok(ResolvedPackage::Unsupported(unsupported)),
-    };
-    facts.draft_unavailable = admitted.draft_unavailable.as_ref().map(ToString::to_string);
-    let policy = ModelPolicy {
-        method: package.method,
-        ..policy.clone()
-    };
-    // A method the package cannot run (a declared draft of another variant)
-    // is an invalid configuration of the bundle, as it is for a load.
-    let model = policy
-        .resolve_admitted(&definition, admitted.draft_unavailable.as_ref())
-        .map_err(ModelAssessmentError::Configuration)?;
-    let manifest = ExecutionManifest::new(
-        headers.manifest(),
-        definition,
-        model,
-        service.clone(),
-        ExecutionPath::Native,
-        device,
-        None,
-        reserves,
-    )
-    .map_err(ModelAssessmentError::Configuration)?;
-    Ok(ResolvedPackage::Resolved { facts, manifest })
+    match prepare_execution_assessment(&manifest.definition, &draft, context_limit) {
+        Ok(execution) => Ok((draft, execution)),
+        Err(AssessmentError::Graph(error)) => Err(refused(classify_graph(error))),
+        Err(error) => Err(Refusal::Failed(ModelAssessmentError::Assessment(error))),
+    }
 }
 
-/// The package's host-side facts: capabilities and template fingerprint
-/// from the engine's own chat inspection over header metadata.
-fn model_facts(
-    headers: &PackageHeaders,
-    package: &ModelPackagePaths,
-    definition: &ModelDefinition,
+/// The serving configuration manifests are resolved under.
+struct Environment<'a> {
+    policy: &'a ModelPolicy,
+    service: &'a ServiceLimits,
+    device: DeviceRequest,
+    reserves: MemoryReserves,
+}
+
+impl Environment<'_> {
+    /// The target served alone: plain generation, without the drafter's
+    /// component.
+    fn plain(&self, admitted: &AdmittedPackage) -> Result<ExecutionManifest, String> {
+        let policy = ModelPolicy {
+            method: ModelMethod::Plain,
+            draft_policy: None,
+            mtp_proposals: None,
+            ..self.policy.clone()
+        };
+        let model = policy.resolve(&admitted.definition)?;
+        let package = PackageManifest {
+            draft: None,
+            ..admitted.headers.manifest()
+        };
+        self.manifest(package, admitted.definition.clone(), model)
+    }
+
+    /// The target with its admitted drafter, under the method that drafts
+    /// with it, and that method.
+    fn drafted(
+        &self,
+        admitted: &AdmittedPackage,
+        definition: &ModelDefinition,
+        method: ModelMethod,
+    ) -> Result<(ExecutionManifest, SpeculativeMethod), UnsupportedModel> {
+        let policy = ModelPolicy {
+            method,
+            ..self.policy.clone()
+        };
+        let model = policy
+            .resolve(definition)
+            .map_err(UnsupportedModel::invalid)?;
+        let method = match model.method {
+            ResolvedMethod::Mtp { .. } => SpeculativeMethod::Mtp,
+            ResolvedMethod::DFlash { .. } => {
+                match definition
+                    .draft
+                    .as_ref()
+                    .map(|draft| draft.method.variant())
+                {
+                    Some(DraftVariant::DSpark) => SpeculativeMethod::DSpark,
+                    Some(DraftVariant::DFlash2) => SpeculativeMethod::DFlash2,
+                    Some(DraftVariant::DFlash) | None => SpeculativeMethod::DFlash,
+                }
+            }
+            ResolvedMethod::Plain => {
+                return Err(UnsupportedModel::invalid(
+                    "the drafter resolves to plain generation",
+                ));
+            }
+        };
+        let manifest = self
+            .manifest(admitted.headers.manifest(), definition.clone(), model)
+            .map_err(UnsupportedModel::invalid)?;
+        Ok((manifest, method))
+    }
+
+    fn manifest(
+        &self,
+        package: PackageManifest,
+        definition: ModelDefinition,
+        model: crate::options::ResolvedModelPolicy,
+    ) -> Result<ExecutionManifest, String> {
+        ExecutionManifest::new(
+            package,
+            definition,
+            model,
+            self.service.clone(),
+            ExecutionPath::Native,
+            self.device,
+            None,
+            self.reserves,
+        )
+    }
+}
+
+enum Admission {
+    Unsupported {
+        unsupported: UnsupportedModel,
+        fingerprint: Option<ModelFingerprint>,
+    },
+    Admitted(Box<AdmittedPackage>),
+}
+
+/// A target the engine admits from its headers, with what its drafter's
+/// headers decided.
+struct AdmittedPackage {
+    headers: PackageHeaders,
+    definition: ModelDefinition,
+    chat: TemplateInspection,
     context_limit: u32,
-) -> Result<ModelFacts, UnsupportedModel> {
-    let chat = inspect_chat(headers, package, definition)?;
-    Ok(ModelFacts {
-        draft_unavailable: None,
-        capabilities: ModelCapabilities {
-            vision: definition.vision.is_some(),
-            tools: chat.tools,
-            structured_output: chat.structured_output,
-            reasoning: ReasoningCapabilities {
-                efforts: chat
-                    .reasoning
-                    .mappings
-                    .iter()
-                    .map(|mapping| mapping.effort.clone())
-                    .collect(),
-                default_effort: chat.reasoning.default_effort.clone(),
+    fingerprint: Option<ModelFingerprint>,
+    drafter: DrafterAdmission,
+}
+
+impl AdmittedPackage {
+    fn facts(self, drafter: DrafterVerdict) -> ModelFacts {
+        ModelFacts {
+            capabilities: ModelCapabilities {
+                vision: self.definition.vision.is_some(),
+                tools: self.chat.tools,
+                structured_output: self.chat.structured_output,
+                reasoning: ReasoningCapabilities {
+                    efforts: self
+                        .chat
+                        .reasoning
+                        .mappings
+                        .iter()
+                        .map(|mapping| mapping.effort.clone())
+                        .collect(),
+                    default_effort: self.chat.reasoning.default_effort.clone(),
+                },
             },
-        },
-        template_fingerprint: chat.fingerprint,
+            template_fingerprint: self.chat.fingerprint,
+            context_limit: self.context_limit,
+            fingerprint: self.fingerprint,
+            drafter,
+        }
+    }
+}
+
+/// What a drafter's headers decide: nothing to draft with, a definition
+/// with the drafter bound and the method that drafts with it, or why it
+/// cannot draft.
+enum DrafterAdmission {
+    None,
+    Candidate {
+        definition: Box<ModelDefinition>,
+        method: ModelMethod,
+    },
+    Rejected(UnsupportedModel),
+}
+
+/// A header that is truncated or not a valid GGUF container.
+fn unreadable(error: &magnitude_artifacts::Error) -> UnsupportedModel {
+    UnsupportedModel::reason(UnsupportedReason::Unreadable, error.to_string())
+}
+
+/// Admit `package` from its headers: the target's weight encodings, family
+/// interpretation, tokenizer and chat templates are independent checks,
+/// and every refusal among them is reported together. An admitted target's
+/// drafter is admitted the same way, against the target's definition.
+fn admit(package: &ModelPackagePaths, layout: Layout) -> Result<Admission, ModelAssessmentError> {
+    let mut headers = match PackageHeaders::open(&package.target, package.projector.as_deref()) {
+        Ok(headers) => headers,
+        Err(error) if error.unreadable() => {
+            return Ok(Admission::Unsupported {
+                unsupported: unreadable(&error),
+                fingerprint: None,
+            });
+        }
+        Err(error) => return Err(ModelAssessmentError::Artifact(error)),
+    };
+    let target = headers.target();
+    let fingerprint = ModelFingerprint::from_directory(target).ok();
+    let mut refusals = Vec::new();
+    let weights = target
+        .tensors
+        .iter()
+        .map(|tensor| (tensor, Residency::Packed))
+        .chain(
+            headers
+                .projector()
+                .into_iter()
+                .flat_map(|projector| &projector.tensors)
+                .map(|tensor| (tensor, Residency::Dequantized)),
+        );
+    refusals.extend(unsupported_weights(weights, layout));
+    let interpreted = crate::families::recognize(target).and_then(|family| {
+        family
+            .inspect(target, headers.projector(), headers.identity())
+            .map(|definition| (family, definition))
+            .map_err(UnsupportedModel::from)
+    });
+    let tokenizer = TokenizerPayload::from_directory(target);
+    // Support and vocabulary are header facts; a load builds the tokenizer.
+    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer).map_err(UnsupportedModel::from);
+    let chat = TemplatePayload::from_directory(target, &package.target.display().to_string())
+        .map_err(|error| error.to_string())
+        .and_then(|templates| gguf_templates(&templates, &tokenizer))
+        .and_then(|bundle| bundle.inspect_cached())
+        .map_err(UnsupportedModel::chat_template);
+    if let (Ok((_, definition)), Ok(vocabulary)) = (&interpreted, &vocabulary) {
+        if u64::try_from(*vocabulary).ok() != Some(definition.decoder.vocabulary) {
+            refusals.push(vocabulary_mismatch(&tokenizer));
+        }
+    }
+    let (interpreted, chat) = match (interpreted, vocabulary, chat) {
+        (Ok(interpreted), Ok(_), Ok(chat)) if refusals.is_empty() => (interpreted, chat),
+        (interpreted, vocabulary, chat) => {
+            refusals.extend(interpreted.err());
+            refusals.extend(vocabulary.err());
+            refusals.extend(chat.err());
+            return Ok(Admission::Unsupported {
+                unsupported: UnsupportedModel::union(refusals)
+                    .expect("a refused admission has a refusal"),
+                fingerprint,
+            });
+        }
+    };
+    let (family, definition) = interpreted;
+    let context_limit = u32::try_from(definition.decoder.context_limit)
+        .map_err(|_| ModelAssessmentError::ContextLimit(definition.decoder.context_limit))?;
+    let drafter = admit_drafter(package, &mut headers, family, &definition, layout)?;
+    Ok(Admission::Admitted(Box::new(AdmittedPackage {
+        headers,
+        definition,
+        chat,
         context_limit,
+        fingerprint,
+        drafter,
+    })))
+}
+
+/// The package's drafter: its separate draft bound against the target
+/// definition (its weight encodings and binding checked together), or the
+/// target's own draft head. A plain package drafts with nothing; a method
+/// that needs a drafter the package does not have is rejected.
+fn admit_drafter(
+    package: &ModelPackagePaths,
+    headers: &mut PackageHeaders,
+    family: &dyn ModelFamily,
+    definition: &ModelDefinition,
+    layout: Layout,
+) -> Result<DrafterAdmission, ModelAssessmentError> {
+    let rejected = |detail: &str| {
+        Ok(DrafterAdmission::Rejected(UnsupportedModel::invalid(
+            detail,
+        )))
+    };
+    let Some(path) = &package.draft else {
+        return match package.method {
+            ModelMethod::Plain => Ok(DrafterAdmission::None),
+            ModelMethod::Auto | ModelMethod::Mtp if definition.head.is_some() => {
+                Ok(DrafterAdmission::Candidate {
+                    definition: Box::new(definition.clone()),
+                    method: ModelMethod::Mtp,
+                })
+            }
+            ModelMethod::Auto => Ok(DrafterAdmission::None),
+            ModelMethod::Mtp => rejected("MTP was requested but the target has no draft head"),
+            ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => {
+                rejected("a separate-draft method was requested but the package has no draft")
+            }
+        };
+    };
+    if package.method == ModelMethod::Plain {
+        return Ok(DrafterAdmission::None);
+    }
+    match headers.add_draft(path) {
+        Ok(()) => {}
+        Err(error) if error.unreadable() => {
+            return Ok(DrafterAdmission::Rejected(unreadable(&error)));
+        }
+        Err(error) => return Err(ModelAssessmentError::Artifact(error)),
+    }
+    let draft = headers.draft().expect("the draft component was just added");
+    let mut refusals = Vec::new();
+    refusals.extend(unsupported_weights(
+        draft
+            .tensors
+            .iter()
+            .map(|tensor| (tensor, Residency::Packed)),
+        layout,
+    ));
+    let bound = bind_draft(family, definition.clone(), Some(draft));
+    refusals.extend(bound.draft_unavailable.map(|reason| reason.unsupported()));
+    if let Some(unsupported) = UnsupportedModel::union(refusals) {
+        return Ok(DrafterAdmission::Rejected(unsupported));
+    }
+    // An unspecified method drafts with whatever the draft bound as: a
+    // separate block drafter, or a draft head.
+    let method = match package.method {
+        ModelMethod::Auto if bound.definition.draft.is_none() => ModelMethod::Mtp,
+        method => method,
+    };
+    Ok(DrafterAdmission::Candidate {
+        definition: Box::new(bound.definition),
+        method,
     })
 }
 
-/// The engine's own tokenizer and template construction over header
-/// metadata, then the bundle's capability and reasoning inspection. A
-/// tokenizer or template the engine cannot prepare is an unsupported
-/// representation, as it is when a load resolves the package.
-fn inspect_chat(
-    headers: &PackageHeaders,
-    package: &ModelPackagePaths,
-    definition: &magnitude_family_contracts::ModelDefinition,
-) -> Result<TemplateInspection, UnsupportedModel> {
-    let unsupported = |reason: String| UnsupportedModel::Representation { reason };
-    let tokenizer_payload = magnitude_artifacts::TokenizerPayload::from_directory(headers.target());
-    // Support and vocabulary are header facts; a load builds the tokenizer.
-    let vocabulary = gguf_tokenizer_vocabulary(&tokenizer_payload)
-        .map_err(|error| unsupported(error.to_string()))?;
-    if u64::try_from(vocabulary).ok() != Some(definition.decoder.vocabulary) {
-        return Err(unsupported(
-            "tokenizer vocabulary differs from model vocabulary".into(),
-        ));
+/// How a stored tensor is held: packed in the backend's resident layout, or
+/// (a projector's) dequantized on the host into a dense form.
+#[derive(Clone, Copy)]
+enum Residency {
+    Packed,
+    Dequantized,
+}
+
+/// Every tensor whose stored encoding has no import here, counted per GGML
+/// type: the same element maps weight planning applies
+/// ([`source_element`], and [`resident_element`] in `layout`), so a type
+/// added to them is admitted here with no other change.
+fn unsupported_weights<'a>(
+    tensors: impl IntoIterator<Item = (&'a TensorDescriptor, Residency)>,
+    layout: Layout,
+) -> Option<UnsupportedModel> {
+    let mut counts = BTreeMap::<&'static str, u32>::new();
+    for (tensor, residency) in tensors {
+        let width = tensor.shape.last().copied().unwrap_or(1);
+        let imported = source_element(tensor.encoding, width).is_some()
+            && match residency {
+                Residency::Packed => {
+                    resident_element(tensor.encoding, width, DType::F32, layout).is_some()
+                }
+                Residency::Dequantized => true,
+            };
+        if !imported {
+            *counts.entry(tensor.encoding.ggml_name()).or_default() += 1;
+        }
     }
-    let templates = magnitude_artifacts::TemplatePayload::from_directory(
-        headers.target(),
-        &package.target.display().to_string(),
-    )
-    .map_err(|error| unsupported(error.to_string()))?;
-    gguf_templates(&templates, &tokenizer_payload)
-        .and_then(|bundle| bundle.inspect_cached())
-        .map_err(unsupported)
+    if counts.is_empty() {
+        return None;
+    }
+    let reason = UnsupportedReason::WeightTypes {
+        types: counts
+            .into_iter()
+            .map(|(ggml_type, tensor_count)| WeightTypeCount {
+                ggml_type: ggml_type.to_owned(),
+                tensor_count,
+            })
+            .collect(),
+    };
+    let detail = format!(
+        "{reason} have no import into the `{}` layout",
+        layout.as_str()
+    );
+    Some(UnsupportedModel::reason(reason, detail))
 }

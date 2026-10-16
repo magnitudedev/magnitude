@@ -64,15 +64,13 @@ impl ModelInventory for ManagedModelStore {
                 ModelLocation::MagnitudeCache { components, .. } => {
                     plan_managed_delete(&self.config.root, &model, components)
                 }
-                ModelLocation::HuggingFaceCache { cache_root, .. } => {
-                    plan_hf_cache_delete(&model, cache_root)
-                }
-                ModelLocation::Directory { .. } | ModelLocation::File { .. } => Ok(DeletePlan {
+                ModelLocation::HuggingFaceCache { .. }
+                | ModelLocation::External { .. }
+                | ModelLocation::Directory { .. }
+                | ModelLocation::File { .. } => Ok(DeletePlan {
                     model_id: id,
                     supported: false,
-                    reason: Some(
-                        "configured directories and ad-hoc files are read-only".to_owned(),
-                    ),
+                    reason: Some(EXTERNAL_READ_ONLY.to_owned()),
                     reclaimable_bytes: 0,
                     retained_shared_bytes: 0,
                     paths: Vec::new(),
@@ -112,35 +110,13 @@ impl ModelInventory for ManagedModelStore {
                 .cloned()
                 .ok_or_else(|| InventoryError::NotFound(id.0.clone()))?;
             ensure_deletable_status(&model)?;
-            let plan = match &model.location {
-                ModelLocation::MagnitudeCache { components, .. } => {
-                    plan_managed_delete(&self.config.root, &model, components)?
-                }
-                ModelLocation::HuggingFaceCache { cache_root, .. } => {
-                    plan_hf_cache_delete(&model, cache_root)?
-                }
-                ModelLocation::Directory { .. } | ModelLocation::File { .. } => {
-                    return Err(InventoryError::Unsupported(
-                        "configured directories and ad-hoc files are read-only".to_owned(),
-                    ));
-                }
+            // Magnitude deletes only from its own store. Every other location belongs to the
+            // user or another tool, whatever the request.
+            let ModelLocation::MagnitudeCache { components, .. } = &model.location else {
+                return Err(InventoryError::Unsupported(EXTERNAL_READ_ONLY.to_owned()));
             };
-            if !plan.supported {
-                return Err(InventoryError::Unsupported(
-                    plan.reason
-                        .clone()
-                        .unwrap_or_else(|| "deletion unsupported".to_owned()),
-                ));
-            }
-            let freed_bytes = match &model.location {
-                ModelLocation::MagnitudeCache { components, .. } => {
-                    delete_managed(&self.config.root, &model, components)?
-                }
-                ModelLocation::HuggingFaceCache { cache_root, .. } => {
-                    delete_hf_cache(&model, cache_root)?
-                }
-                ModelLocation::Directory { .. } | ModelLocation::File { .. } => unreachable!(),
-            };
+            let plan = plan_managed_delete(&self.config.root, &model, components)?;
+            let freed_bytes = delete_managed(&self.config.root, &model, components)?;
             drop(lock);
             self.remove_published_model(&id).await?;
             Ok(DeletedModel {
@@ -212,7 +188,9 @@ pub(crate) fn resolve_components(
         (ModelLocation::HuggingFaceCache { cache_root, .. }, _) => {
             (cache_root.clone(), hf_repo_root(cache_root)?)
         }
-        (ModelLocation::Directory { root, .. }, _) => (root.clone(), root.clone()),
+        (ModelLocation::Directory { root, .. } | ModelLocation::External { root, .. }, _) => {
+            (root.clone(), root.clone())
+        }
         (ModelLocation::File { path, .. }, _) => {
             let parent = path
                 .parent()
@@ -369,11 +347,11 @@ fn delete_managed(
         if link.symlink_metadata().is_ok() {
             fs::remove_file(&link).map_err(io_error)?;
         }
-        if !referenced.contains(&blob) {
-            if let Ok(metadata) = blob.metadata() {
-                fs::remove_file(blob).map_err(io_error)?;
-                freed = freed.saturating_add(metadata.len());
-            }
+        if !referenced.contains(&blob)
+            && let Ok(metadata) = blob.metadata()
+        {
+            fs::remove_file(blob).map_err(io_error)?;
+            freed = freed.saturating_add(metadata.len());
         }
     }
     remove_empty_parents(&snapshot, &repo_root.join("snapshots"));
@@ -457,58 +435,8 @@ fn collect_other_snapshot_blobs(
     Ok(())
 }
 
-fn plan_hf_cache_delete(
-    model: &InventoryModel,
-    snapshot: &Path,
-) -> Result<DeletePlan, InventoryError> {
-    let repo_root = hf_repo_root(snapshot)?;
-    let (target_blobs, remaining_blobs) = hf_blob_reference_sets(&repo_root, snapshot)?;
-    let mut reclaimable = 0_u64;
-    let mut retained = 0_u64;
-    let mut paths = vec![snapshot.to_path_buf()];
-    for blob in target_blobs {
-        let size = blob.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-        if remaining_blobs.contains(&blob) {
-            retained = retained.saturating_add(size);
-        } else {
-            reclaimable = reclaimable.saturating_add(size);
-            paths.push(blob);
-        }
-    }
-    Ok(DeletePlan {
-        model_id: model.id.clone(),
-        supported: true,
-        reason: None,
-        reclaimable_bytes: reclaimable,
-        retained_shared_bytes: retained,
-        paths,
-    })
-}
-
-fn delete_hf_cache(model: &InventoryModel, snapshot: &Path) -> Result<u64, InventoryError> {
-    let repo_root = hf_repo_root(snapshot)?;
-    let plan = plan_hf_cache_delete(model, snapshot)?;
-    let commit = snapshot
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| InventoryError::DeletionUnsafe("snapshot has no commit name".to_owned()))?;
-    remove_refs_to_commit(&repo_root.join("refs"), commit)?;
-    let (target_blobs, remaining_blobs) = hf_blob_reference_sets(&repo_root, snapshot)?;
-    fs::remove_dir_all(snapshot).map_err(io_error)?;
-    let mut freed = 0_u64;
-    for blob in target_blobs.difference(&remaining_blobs) {
-        if let Ok(metadata) = blob.metadata() {
-            fs::remove_file(blob).map_err(io_error)?;
-            freed = freed.saturating_add(metadata.len());
-        }
-    }
-    let snapshots = repo_root.join("snapshots");
-    if fs::read_dir(&snapshots).map_err(io_error)?.next().is_none() {
-        let _ = fs::remove_dir_all(&repo_root);
-    }
-    let _ = plan;
-    Ok(freed)
-}
+const EXTERNAL_READ_ONLY: &str =
+    "files outside Magnitude's model store are read-only and are never deleted";
 
 fn hf_repo_root(snapshot: &Path) -> Result<PathBuf, InventoryError> {
     let canonical = snapshot.canonicalize().map_err(io_error)?;
@@ -524,66 +452,6 @@ fn hf_repo_root(snapshot: &Path) -> Result<PathBuf, InventoryError> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| InventoryError::DeletionUnsafe("snapshot has no repository root".to_owned()))
-}
-
-fn hf_blob_reference_sets(
-    repo_root: &Path,
-    target_snapshot: &Path,
-) -> Result<(BTreeSet<PathBuf>, BTreeSet<PathBuf>), InventoryError> {
-    let mut target = BTreeSet::new();
-    let mut remaining = BTreeSet::new();
-    let snapshots = repo_root.join("snapshots");
-    for entry in fs::read_dir(&snapshots).map_err(io_error)? {
-        let snapshot = entry.map_err(io_error)?.path();
-        let destination = if snapshot == target_snapshot {
-            &mut target
-        } else {
-            &mut remaining
-        };
-        collect_snapshot_blobs(&snapshot, repo_root, destination)?;
-    }
-    Ok((target, remaining))
-}
-
-fn collect_snapshot_blobs(
-    path: &Path,
-    repo_root: &Path,
-    output: &mut BTreeSet<PathBuf>,
-) -> Result<(), InventoryError> {
-    for entry in fs::read_dir(path).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        let kind = entry.file_type().map_err(io_error)?;
-        if kind.is_dir() {
-            collect_snapshot_blobs(&path, repo_root, output)?;
-        } else if kind.is_symlink() || kind.is_file() {
-            let canonical = path.canonicalize().map_err(io_error)?;
-            if !canonical.starts_with(repo_root.join("blobs")) {
-                return Err(InventoryError::DeletionUnsafe(format!(
-                    "snapshot entry does not resolve to repository blobs: {}",
-                    path.display()
-                )));
-            }
-            output.insert(canonical);
-        }
-    }
-    Ok(())
-}
-
-fn remove_refs_to_commit(refs: &Path, commit: &str) -> Result<(), InventoryError> {
-    if !refs.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(refs).map_err(io_error)? {
-        let entry = entry.map_err(io_error)?;
-        let path = entry.path();
-        if entry.file_type().map_err(io_error)?.is_dir() {
-            remove_refs_to_commit(&path, commit)?;
-        } else if fs::read_to_string(&path).is_ok_and(|value| value.trim() == commit) {
-            fs::remove_file(path).map_err(io_error)?;
-        }
-    }
-    Ok(())
 }
 
 fn remove_empty_parents(path: &Path, stop: &Path) {

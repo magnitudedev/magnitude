@@ -17,7 +17,7 @@
 
 use magnitude_artifacts::{
     gguf::{Directory, Scalar, Value},
-    TokenId,
+    TokenId, UnsupportedReason,
 };
 use magnitude_family_common::{
     rotary::{self, Yarn},
@@ -129,8 +129,13 @@ pub enum Error {
     Architecture(Option<String>),
     /// No explicit checkpoint attention semantics were published.
     MissingCausality,
-    /// A metadata key outside the admitted feature set.
-    UnknownMetadata(String),
+    /// Every metadata key and stored tensor outside the admitted feature set.
+    Unadmitted {
+        metadata: Vec<String>,
+        tensors: Vec<String>,
+    },
+    /// A rope scaling the draft family does not execute.
+    RopeScaling(String),
     /// A required key is missing or not of its admitted type.
     Metadata {
         key: String,
@@ -146,8 +151,6 @@ pub enum Error {
         expected: Vec<u64>,
         received: Vec<u64>,
     },
-    /// A stored tensor that no admitted role binds.
-    UnboundWeight(String),
     Definition(DefinitionError),
 }
 
@@ -162,10 +165,11 @@ impl fmt::Display for Error {
             Self::MissingCausality => formatter.write_str(
                 "missing dflash.attention.causal; drafting requires explicit attention semantics",
             ),
-            Self::UnknownMetadata(key) => write!(
+            Self::Unadmitted { metadata, tensors } => write!(
                 formatter,
-                "draft metadata {key:?} names a feature outside the admitted set"
+                "draft features outside the admitted set: metadata {metadata:?}, tensors {tensors:?}"
             ),
+            Self::RopeScaling(kind) => write!(formatter, "draft rope scaling {kind:?} is not admitted"),
             Self::Metadata { key, expected } => {
                 write!(formatter, "draft metadata {key:?} must be {expected}")
             }
@@ -180,9 +184,6 @@ impl fmt::Display for Error {
                 formatter,
                 "draft weight {name:?}: expected {expected:?}, received {received:?}"
             ),
-            Self::UnboundWeight(name) => {
-                write!(formatter, "draft contains unbound weight role {name:?}")
-            }
             Self::Definition(error) => write!(formatter, "draft definition: {error}"),
         }
     }
@@ -190,10 +191,45 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
+impl Error {
+    /// The unsupported features this error names. A draft that disagrees
+    /// with its target, or whose geometry or attention semantics are outside
+    /// what drafting admits, does not fit the target it was bound to.
+    pub fn reasons(&self) -> Vec<UnsupportedReason> {
+        match self {
+            Self::Architecture(architecture) => vec![UnsupportedReason::Architecture {
+                architecture: architecture.clone().unwrap_or_default(),
+            }],
+            Self::Unadmitted { metadata, tensors } => metadata
+                .iter()
+                .map(|key| UnsupportedReason::UnrecognizedMetadata { key: key.clone() })
+                .chain(
+                    tensors
+                        .iter()
+                        .map(|name| UnsupportedReason::UnrecognizedTensor { name: name.clone() }),
+                )
+                .collect(),
+            Self::RopeScaling(kind) => vec![UnsupportedReason::RopeScaling { kind: kind.clone() }],
+            Self::MissingCausality | Self::Geometry(_) | Self::Target(_) => {
+                vec![UnsupportedReason::TargetMismatch {
+                    detail: self.to_string(),
+                }]
+            }
+            Self::Metadata { .. }
+            | Self::MissingWeight(_)
+            | Self::WeightShape { .. }
+            | Self::Definition(_) => Vec::new(),
+        }
+    }
+}
+
 impl From<HeaderError> for Error {
     fn from(error: HeaderError) -> Self {
         match error {
-            HeaderError::UnknownMetadata(key) => Self::UnknownMetadata(key),
+            HeaderError::UnknownMetadata(metadata) => Self::Unadmitted {
+                metadata,
+                tensors: Vec::new(),
+            },
             HeaderError::MissingMetadata(key) => Self::Metadata {
                 key,
                 expected: "present",
@@ -209,7 +245,10 @@ impl From<HeaderError> for Error {
                 expected,
                 received,
             },
-            HeaderError::UnboundWeight(name) => Self::UnboundWeight(name),
+            HeaderError::UnboundWeights(tensors) => Self::Unadmitted {
+                metadata: Vec::new(),
+                tensors,
+            },
             HeaderError::Definition(error) => Self::Definition(error),
             error @ (HeaderError::NotMatrix { .. }
             | HeaderError::CompanionScale { .. }
@@ -247,35 +286,37 @@ pub fn recognize(directory: &Directory) -> Result<(), Error> {
         Some(ARCHITECTURE) => {}
         architecture => return Err(Error::Architecture(architecture.map(str::to_owned))),
     }
-    for metadata in &directory.metadata {
-        match metadata.name.strip_prefix(PREFIX) {
-            Some(key) if !ADMITTED_KEYS.contains(&key) => {
-                return Err(Error::UnknownMetadata(metadata.name.clone()));
-            }
+    let mut metadata = Vec::new();
+    for entry in &directory.metadata {
+        match entry.name.strip_prefix(PREFIX) {
+            Some(key) if !ADMITTED_KEYS.contains(&key) => metadata.push(entry.name.clone()),
             Some(key)
                 if key != "attention.causal"
-                    && matches!(metadata.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) =>
+                    && matches!(entry.value, Value::Array(_)) != ARRAY_KEYS.contains(&key) =>
             {
                 return Err(Error::Metadata {
-                    key: metadata.name.clone(),
+                    key: entry.name.clone(),
                     expected: "of its admitted arity",
                 });
             }
             Some(_) => {}
             None if CONTAINER_NAMESPACES
                 .iter()
-                .any(|namespace| metadata.name.starts_with(namespace)) => {}
-            None => return Err(Error::UnknownMetadata(metadata.name.clone())),
+                .any(|namespace| entry.name.starts_with(namespace)) => {}
+            None => metadata.push(entry.name.clone()),
         }
     }
-    if let Some(tensor) = directory
+    let tensors = directory
         .tensors
         .iter()
-        .find(|tensor| !known_role(&tensor.name))
-    {
-        return Err(Error::UnboundWeight(tensor.name.clone()));
+        .filter(|tensor| !known_role(&tensor.name))
+        .map(|tensor| tensor.name.clone())
+        .collect::<Vec<_>>();
+    if metadata.is_empty() && tensors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Unadmitted { metadata, tensors })
     }
-    Ok(())
 }
 
 /// Whether the family claims `directory` as a draft component.
@@ -332,9 +373,7 @@ fn rotary_table(m: &Metadata, width: u64) -> Result<Rotary, Error> {
             }
             Ok(yarn.table(width, width, base)?)
         }
-        Some(scaling) => Err(Error::Geometry(format!(
-            "rope scaling {scaling:?} is not admitted"
-        ))),
+        Some(scaling) => Err(Error::RopeScaling(scaling.to_owned())),
     }
 }
 

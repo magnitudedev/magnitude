@@ -104,7 +104,7 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
     let pool = ManagedModelAssessments::start(
         assessor,
         services.catalog.clone(),
-        services.discovered.clone(),
+        services.local.clone(),
     );
     let pool_started = Instant::now();
     let snapshot = loop {
@@ -154,10 +154,10 @@ async fn assess_catalog(arguments: Vec<String>, process_started: Instant) -> any
                     "limitingResource": limiting_resource,
                     "deficitBytes": deficit_bytes,
                 }),
-                [ModelAssessment::Unsupported { failure, .. }] => json!({
+                [ModelAssessment::Unsupported { reasons, detail, .. }] => json!({
                     "result": "Unsupported",
-                    "code": failure.code,
-                    "message": failure.message.chars().take(160).collect::<String>(),
+                    "reasons": reasons,
+                    "detail": detail.chars().take(160).collect::<String>(),
                 }),
                 other => json!({ "result": "unexpected", "profiles": other.len() }),
             },

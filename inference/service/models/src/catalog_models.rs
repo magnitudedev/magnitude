@@ -16,11 +16,10 @@ use magnitude_service_contracts::models::{
 };
 
 use crate::catalog_installations::ManagedCatalogInstallations;
-use crate::discovered_models::{discovered_profile, selected_discovered_packages};
 use crate::inventory::{InstalledPackagesObserver, catalog_packages, catalog_target};
 use crate::model_domains::{ModelDomainResolver, domain_changes};
 use crate::model_projection::{
-    bundle_packages, effective_configuration_model, effective_model, primary_model_path,
+    bundle_packages, effective_configuration_model, primary_model_path,
     ready_model,
 };
 
@@ -82,35 +81,8 @@ impl ModelDomainResolver {
                 reject_unavailable(model_id, self.catalog_definition(model_id)?)?;
                 self.effective_catalog_configuration(model_id)
             }
-            ParsedModelId::HuggingFace { .. } => {
-                let installed = self.inventory.installed_packages.read().map_err(|_| {
-                    InventoryError::Internal("installed package lock poisoned".to_owned())
-                })?;
-                let selected = selected_discovered_packages(&installed)
-                    .remove(model_id)
-                    .ok_or_else(|| InventoryError::NotFound(model_id.to_string()))?;
-                if matches!(
-                    selected.catalog_attribution,
-                    InstalledCatalogAttribution::Attributed { .. }
-                ) {
-                    return Err(InventoryError::NotFound(model_id.to_string()));
-                }
-                let profile = discovered_profile(&selected);
-                match effective_model(&selected, profile.clone()).0 {
-                    EffectiveModel::Ready { .. } => Ok(ModelServingConfiguration {
-                        bundle: ServableModelBundle::Standalone {
-                            package: selected.package,
-                        },
-                        profile,
-                    }),
-                    EffectiveModel::Unavailable { failure } => {
-                        Err(InventoryError::ModelOperation {
-                            code: failure.code,
-                            message: failure.message,
-                            retryable: failure.retryable,
-                        })
-                    }
-                }
+            ParsedModelId::HuggingFace { .. } | ParsedModelId::Local { .. } => {
+                self.custom_serving_configuration(model_id)
             }
         }
     }
@@ -131,7 +103,7 @@ impl ModelDomainResolver {
                     self.effective_catalog_configuration(model_id)
                 }
             },
-            ModelAssessmentSubject::Discovery { model_id } => self.serving_configuration(model_id),
+            ModelAssessmentSubject::Custom { model_id } => self.serving_configuration(model_id),
         }
     }
 
@@ -275,7 +247,7 @@ impl ModelDomainResolver {
             .values()
             .filter(|record| {
                 ids.contains(&record.installed.package.id)
-                    && record.installed.origin == ModelPackageInstallationOrigin::HuggingFaceCache
+                    && record.installed.origin != ModelPackageInstallationOrigin::Magnitude
             })
             .map(|record| record.installed.package.id.clone())
             .collect::<BTreeSet<_>>();
@@ -541,7 +513,12 @@ impl InstallationOrigins {
     fn include(&mut self, origin: ModelPackageInstallationOrigin) {
         match origin {
             ModelPackageInstallationOrigin::Magnitude => self.magnitude = true,
-            ModelPackageInstallationOrigin::HuggingFaceCache => self.external = true,
+            ModelPackageInstallationOrigin::HuggingFaceCache
+            | ModelPackageInstallationOrigin::LmStudio
+            | ModelPackageInstallationOrigin::LlamaCpp
+            | ModelPackageInstallationOrigin::Ollama
+            | ModelPackageInstallationOrigin::Folder
+            | ModelPackageInstallationOrigin::Imported => self.external = true,
         }
     }
 }
@@ -678,7 +655,7 @@ fn catalog_resolution<'a>(
     }
 }
 
-fn catalog_id(definition: &RecommendableModel) -> ModelId {
+pub(crate) fn catalog_id(definition: &RecommendableModel) -> ModelId {
     ModelId::catalog(&definition.model_id, &definition.variant_id)
 }
 
@@ -711,7 +688,7 @@ fn installation(
         });
     let ownership = match (origins.magnitude, origins.external) {
         (true, false) => ModelInstallationOwnership::Magnitude,
-        (false, true) => ModelInstallationOwnership::ExternalHuggingFace,
+        (false, true) => ModelInstallationOwnership::External,
         (true, true) => ModelInstallationOwnership::Mixed,
         (false, false) => unreachable!("an installation contains at least one package"),
     };

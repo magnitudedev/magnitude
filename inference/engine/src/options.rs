@@ -237,7 +237,8 @@ impl ModelPolicy {
     /// Optional draft admission is host policy, never a numerical model
     /// property: when the package's separate draft is unavailable, a method
     /// that would draft with it (a separate-draft method, or MTP on a target
-    /// without its own draft head) resolves as plain generation.
+    /// without its own draft head) resolves as plain generation. Assessment
+    /// reports that drafter `Rejected` from the same binding.
     pub(crate) fn resolve_admitted(
         &self,
         definition: &ModelDefinition,
@@ -500,7 +501,8 @@ fn resolve_method(
         return Ok(ResolvedMethod::DFlash { proposals });
     }
     let use_mtp = match requested {
-        // A head this executor does not run leaves the model plain.
+        // A head this executor does not run leaves the model plain, as
+        // assessment reports by rejecting that head as the drafter.
         ModelMethod::Auto => magnitude_executor::head_admitted(definition),
         ModelMethod::Plain | ModelMethod::DFlash | ModelMethod::DSpark | ModelMethod::DFlash2 => {
             false

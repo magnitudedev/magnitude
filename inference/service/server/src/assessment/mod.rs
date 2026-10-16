@@ -1,8 +1,9 @@
-//! The automatic assessment pool: one revisioned snapshot over the current catalog and discovery
+//! The automatic assessment pool: one revisioned snapshot over the current catalog and custom-model
 //! sources in the service's one environment, with exact-work reconciliation, deduplication,
 //! per-target deadlines, publication guards and one-attempt `Dropped` semantics.
 
 pub mod assessor;
+pub mod candidates;
 pub mod catalog_kernels;
 pub mod environment;
 
@@ -11,8 +12,8 @@ use std::sync::{Arc, Mutex, Weak};
 use futures_util::{StreamExt, future::BoxFuture, stream::BoxStream};
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels, DiscoveredModel,
-    DiscoveredModelState, DiscoveredModels, EffectiveModel, ModelAssessment,
+    CatalogModel, CatalogModelSelection, CatalogModelState, CatalogModels, CustomModel,
+    CustomModelState, EffectiveModel, LocalModels, ModelAssessment,
     ModelAssessmentDomainSnapshot, ModelAssessmentEntry, ModelAssessmentEntryState,
     ModelAssessmentSubject, ModelAssessments, ModelAssessmentsInvalidation,
     ModelAssessmentsSnapshot, ModelFailure as DomainModelFailure, ModelId,
@@ -70,7 +71,7 @@ impl PreparationCoordinator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum AssessmentDomain {
     Catalog,
-    Discovered,
+    Custom,
 }
 
 fn catalog_candidates(models: Vec<CatalogModel>) -> Vec<(ModelAssessmentSubject, ServingProfile)> {
@@ -101,17 +102,19 @@ fn catalog_candidates(models: Vec<CatalogModel>) -> Vec<(ModelAssessmentSubject,
         .collect()
 }
 
-fn discovered_candidates(
-    models: Vec<DiscoveredModel>,
+fn custom_candidates(
+    models: Vec<CustomModel>,
 ) -> Vec<(ModelAssessmentSubject, ServingProfile)> {
     models
         .into_iter()
         .filter_map(|model| {
-            let DiscoveredModelState::Ready { model: ready, .. } = model.state else {
+            let CustomModelState::Ready { model: ready, .. } = model.state else {
                 return None;
             };
             Some((
-                ModelAssessmentSubject::Discovery { model_id: model.id },
+                ModelAssessmentSubject::Custom {
+                    model_id: model.model_id,
+                },
                 ready.profile,
             ))
         })
@@ -135,20 +138,20 @@ fn assessment_domain_entries(domain: &ModelAssessmentDomainSnapshot) -> &[ModelA
 
 impl AssessmentPoolCurrent {
     fn domains(&self) -> [&ModelAssessmentDomainSnapshot; 2] {
-        [&self.snapshot.catalog, &self.snapshot.discovered]
+        [&self.snapshot.catalog, &self.snapshot.custom]
     }
 
     fn domain(&self, domain: AssessmentDomain) -> &ModelAssessmentDomainSnapshot {
         match domain {
             AssessmentDomain::Catalog => &self.snapshot.catalog,
-            AssessmentDomain::Discovered => &self.snapshot.discovered,
+            AssessmentDomain::Custom => &self.snapshot.custom,
         }
     }
 
     fn domain_mut(&mut self, domain: AssessmentDomain) -> &mut ModelAssessmentDomainSnapshot {
         match domain {
             AssessmentDomain::Catalog => &mut self.snapshot.catalog,
-            AssessmentDomain::Discovered => &mut self.snapshot.discovered,
+            AssessmentDomain::Custom => &mut self.snapshot.custom,
         }
     }
 
@@ -264,7 +267,7 @@ impl AssessmentPoolCurrent {
         let mut applied = AppliedAssessmentOutcome::default();
         for (domain_kind, domain) in [
             (AssessmentDomain::Catalog, &mut self.snapshot.catalog),
-            (AssessmentDomain::Discovered, &mut self.snapshot.discovered),
+            (AssessmentDomain::Custom, &mut self.snapshot.custom),
         ] {
             let ModelAssessmentDomainSnapshot::Available { entries, .. } = domain else {
                 continue;
@@ -278,16 +281,21 @@ impl AssessmentPoolCurrent {
                         // A catalog model the engine cannot execute is a release defect,
                         // never a verdict.
                         Ok(CachedModelAssessment {
-                            profile: ModelAssessment::Unsupported { failure, .. },
+                            profile: ModelAssessment::Unsupported { detail, .. },
                             ..
-                        }) if catalog => Some(failure),
+                        }) if catalog => Some(DomainModelFailure {
+                            code: "unsupported".to_owned(),
+                            message: detail.clone(),
+                            retryable: false,
+                        }),
                         Ok(_) => None,
-                        Err(failure) => Some(failure),
+                        Err(failure) => Some(failure.clone()),
                     };
-                    entry.state = match (&outcome.result, dropped) {
+                    entry.state = match (&outcome.result, &dropped) {
                         (Ok(assessment), None) => ModelAssessmentEntryState::Assessed {
                             capabilities: assessment.capabilities.clone(),
                             template_fingerprint: assessment.template_fingerprint.clone(),
+                            fingerprint: assessment.fingerprint.clone(),
                             profiles: vec![assessment.profile.clone()],
                         },
                         _ => ModelAssessmentEntryState::Dropped,
@@ -296,7 +304,7 @@ impl AssessmentPoolCurrent {
                     if let (true, Some(failure)) = (catalog, dropped) {
                         applied
                             .dropped_catalog_models
-                            .push((entry.subject.model_id().clone(), failure.clone()));
+                            .push((entry.subject.model_id().clone(), failure));
                     }
                 }
             }
@@ -315,7 +323,7 @@ struct AppliedAssessmentOutcome {
 pub struct ManagedModelAssessments {
     assessor: Arc<ModelAssessor>,
     catalog: Arc<dyn CatalogModels>,
-    discovery: Arc<dyn DiscoveredModels>,
+    local: Arc<dyn LocalModels>,
     current: std::sync::RwLock<AssessmentPoolCurrent>,
     changes: tokio::sync::broadcast::Sender<ModelAssessmentsInvalidation>,
     active: Mutex<ActiveAssessments>,
@@ -388,7 +396,7 @@ impl ManagedModelAssessments {
     pub fn start(
         assessor: Arc<ModelAssessor>,
         catalog: Arc<dyn CatalogModels>,
-        discovery: Arc<dyn DiscoveredModels>,
+        local: Arc<dyn LocalModels>,
     ) -> Arc<Self> {
         let (changes, _) = tokio::sync::broadcast::channel(64);
         let concurrency = assessment_concurrency();
@@ -396,13 +404,13 @@ impl ManagedModelAssessments {
         let service = Arc::new(Self {
             assessor,
             catalog,
-            discovery,
+            local,
             current: std::sync::RwLock::new(AssessmentPoolCurrent {
                 snapshot: ModelAssessmentsSnapshot {
                     revision: 0,
                     environment_id,
                     catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-                    discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+                    custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
                 },
                 entry_keys: std::collections::BTreeMap::new(),
                 failed_reads: std::collections::BTreeSet::new(),
@@ -510,22 +518,22 @@ impl ManagedModelAssessments {
         Ok(())
     }
 
-    async fn reconcile_discovered(self: &Arc<Self>) -> Result<(), InventoryError> {
-        let source = self.discovery.list_discovered().await?;
+    async fn reconcile_custom(self: &Arc<Self>) -> Result<(), InventoryError> {
+        let source = self.local.list_local().await?;
         if !source.reconciliation_complete {
             self.publish(|current| {
-                current.set_domain_pending(AssessmentDomain::Discovered, source.revision)
+                current.set_domain_pending(AssessmentDomain::Custom, source.revision)
             });
             self.cancel_unreferenced();
             return Ok(());
         }
-        let targets = discovered_candidates(source.models)
+        let targets = custom_candidates(source.models)
             .into_iter()
             .map(|(subject, profile)| {
-                self.target_entry(AssessmentDomain::Discovered, subject, profile)
+                self.target_entry(AssessmentDomain::Custom, subject, profile)
             })
             .collect::<Vec<_>>();
-        self.replace_domain(AssessmentDomain::Discovered, source.revision, targets);
+        self.replace_domain(AssessmentDomain::Custom, source.revision, targets);
         Ok(())
     }
 
@@ -534,7 +542,7 @@ impl ManagedModelAssessments {
     async fn read_source(self: &Arc<Self>, domain: AssessmentDomain) {
         let read = match domain {
             AssessmentDomain::Catalog => self.reconcile_catalog().await,
-            AssessmentDomain::Discovered => self.reconcile_discovered().await,
+            AssessmentDomain::Custom => self.reconcile_custom().await,
         };
         let mut current = self
             .current
@@ -660,9 +668,9 @@ impl ManagedModelAssessments {
         // Subscribe before the initial reads so a source revision published between a read and
         // entering the select loop is buffered and reconciled rather than missed.
         let mut catalog = self.catalog.watch_catalog().skip(1);
-        let mut discovered = self.discovery.watch_discovery().skip(1);
+        let mut discovered = self.local.watch_local().skip(1);
         self.read_source(AssessmentDomain::Catalog).await;
-        self.read_source(AssessmentDomain::Discovered).await;
+        self.read_source(AssessmentDomain::Custom).await;
         let mut source_retry = tokio::time::interval(MODEL_ASSESSMENT_SOURCE_RETRY_DELAY);
         source_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         source_retry.tick().await;
@@ -673,7 +681,7 @@ impl ManagedModelAssessments {
                     None => return,
                 },
                 event = discovered.next() => match event {
-                    Some(_) => self.read_source(AssessmentDomain::Discovered).await,
+                    Some(_) => self.read_source(AssessmentDomain::Custom).await,
                     None => return,
                 },
                 _ = source_retry.tick() => {
@@ -813,7 +821,7 @@ mod tests {
                 revision: 0,
                 environment_id: AssessmentEnvironmentId("test-environment".to_owned()),
                 catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
-                discovered: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+                custom: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
             },
             entry_keys: std::collections::BTreeMap::new(),
             failed_reads: std::collections::BTreeSet::new(),
@@ -876,7 +884,7 @@ mod tests {
     #[test]
     fn assessment_pool_reuses_exact_terminal_evidence_across_source_slices() {
         let catalog = assessment_subject("pool-shared", CatalogModelSelection::Desired);
-        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Discovery {
+        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Custom {
             model_id: catalog.model_id().clone(),
         };
         let key = AssessmentWorkKey("shared".to_owned());
@@ -899,11 +907,11 @@ mod tests {
                 .changed
         );
         current.replace_domain(
-            AssessmentDomain::Discovered,
+            AssessmentDomain::Custom,
             3,
             &[assessment_target(discovered, "shared")],
         );
-        let discovered = current.domain(AssessmentDomain::Discovered);
+        let discovered = current.domain(AssessmentDomain::Custom);
         assert!(matches!(
             discovered,
             ModelAssessmentDomainSnapshot::Available { entries, .. }
@@ -942,13 +950,13 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_catalog_model_is_dropped_and_a_discovered_one_is_assessed() {
+    fn an_unsupported_catalog_model_is_dropped_and_a_custom_one_is_assessed() {
         let catalog = assessment_subject("pool-unsupported", CatalogModelSelection::Desired);
-        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Discovery {
+        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Custom {
             model_id: catalog.model_id().clone(),
         };
         let failure = DomainModelFailure {
-            code: "unsupported_kernel_domain".to_owned(),
+            code: "unsupported".to_owned(),
             message: "`routed_output` has no admissible metal configuration".to_owned(),
             retryable: false,
         };
@@ -959,7 +967,7 @@ mod tests {
             &[assessment_target(catalog.clone(), "unsupported")],
         );
         current.replace_domain(
-            AssessmentDomain::Discovered,
+            AssessmentDomain::Custom,
             1,
             &[assessment_target(discovered, "unsupported")],
         );
@@ -977,9 +985,11 @@ mod tests {
                     },
                 },
                 template_fingerprint: String::new(),
+                fingerprint: None,
                 profile: ModelAssessment::Unsupported {
                     profile: test_configuration(catalog.model_id().as_str()).profile,
-                    failure: failure.clone(),
+                    reasons: Vec::new(),
+                    detail: failure.message.clone(),
                 },
             }),
         });
@@ -996,7 +1006,7 @@ mod tests {
             ModelAssessmentEntryState::Dropped
         ));
         assert!(matches!(
-            state(AssessmentDomain::Discovered),
+            state(AssessmentDomain::Custom),
             ModelAssessmentEntryState::Assessed {
                 profiles,
                 ..
@@ -1021,7 +1031,7 @@ mod tests {
     #[test]
     fn a_source_slice_updates_without_disturbing_the_other_slice() {
         let catalog = assessment_subject("pool-source", CatalogModelSelection::Desired);
-        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Discovery {
+        let discovered = magnitude_service_contracts::models::ModelAssessmentSubject::Custom {
             model_id: catalog.model_id().clone(),
         };
         let mut current = assessment_pool_current();
@@ -1031,16 +1041,16 @@ mod tests {
             &[assessment_target(catalog, "catalog")],
         );
         current.replace_domain(
-            AssessmentDomain::Discovered,
+            AssessmentDomain::Custom,
             3,
             &[assessment_target(discovered.clone(), "discovered")],
         );
-        assert!(current.set_domain_pending(AssessmentDomain::Discovered, 4));
-        assert!(!current.set_domain_pending(AssessmentDomain::Discovered, 4));
+        assert!(current.set_domain_pending(AssessmentDomain::Custom, 4));
+        assert!(!current.set_domain_pending(AssessmentDomain::Custom, 4));
         assert!(current.references_assessing(&AssessmentWorkKey("catalog".to_owned())));
         assert!(!current.references_assessing(&AssessmentWorkKey("discovered".to_owned())));
         assert!(current.replace_domain(
-            AssessmentDomain::Discovered,
+            AssessmentDomain::Custom,
             5,
             &[assessment_target(discovered, "discovered")],
         ));

@@ -339,7 +339,7 @@ fn assessed_fit(
     model_id: &ModelId,
     profile: &ServingProfile,
 ) -> Option<InventoryError> {
-    [&snapshot.catalog, &snapshot.discovered]
+    [&snapshot.catalog, &snapshot.custom]
         .into_iter()
         .flat_map(|domain| match domain {
             ModelAssessmentDomainSnapshot::Available { entries, .. } => entries.as_slice(),
@@ -889,7 +889,7 @@ mod tests {
                     },
                 }],
             },
-            "discovered": { "_tag": "Pending", "sourceRevision": 0 },
+            "custom": { "_tag": "Pending", "sourceRevision": 0 },
         }))
         .expect("assessment snapshot")
     }
@@ -902,6 +902,7 @@ mod tests {
             "memory": [],
             "limitingResource": "gpu",
             "deficitBytes": deficit_bytes,
+            "drafter": { "_tag": "None" },
         })
     }
 
@@ -934,6 +935,7 @@ mod tests {
             "assessmentId": "assessment",
             "memory": [],
             "performance": [],
+            "drafter": { "_tag": "None" },
         });
         let profile = ServingProfile { context_length: 262_144 };
         assert!(assessed_fit(&snapshot(MODEL, fits), &model_id(MODEL), &profile).is_none());

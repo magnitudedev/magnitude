@@ -351,9 +351,7 @@ fn load(
         ))
     };
     let host = move || -> Result<(GenerationBinding, ChatIdentity), Stopped> {
-        let unsupported = |reason: String| {
-            LoadError::Unsupported(crate::error::UnsupportedModel::Representation { reason })
-        };
+        use crate::error::UnsupportedModel;
         // The worker's own reading of its package's chat semantics, which the
         // host verifies against its resolution.
         let family = crate::families::recognize(host_package.target().directory())
@@ -361,7 +359,7 @@ fn load(
         let chat = ChatIdentity {
             template_fingerprint: gguf_templates(host_package.templates(), host_package.tokenizer())
                 .and_then(|templates| templates.inspect())
-                .map_err(unsupported)?
+                .map_err(|detail| LoadError::Unsupported(UnsupportedModel::chat_template(detail)))?
                 .fingerprint,
             modalities: InputModalities::of(family, &definition),
         };
@@ -371,12 +369,13 @@ fn load(
                 definition.artifact_identity.target.to_string(),
             )
             .and_then(ByteBpeTokenizer::new)
-            .map_err(|error| unsupported(error.to_string()))?,
+            .map_err(|error| LoadError::Unsupported(error.into()))?,
         );
         let projection = usize::try_from(definition.decoder.vocabulary)
             .map_err(|_| internal("model vocabulary exceeds the host domain"))?;
         let binding =
-            GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE).map_err(unsupported)?;
+            GenerationBinding::new(tokenizer, projection, CONSTRAINT_CACHE)
+                .map_err(|detail| LoadError::Unsupported(UnsupportedModel::invalid(detail)))?;
         Ok((binding, chat))
     };
     let (

@@ -23,7 +23,7 @@ use magnitude_executor::platform::MemoryReserves;
 use magnitude_service_api::{AppState, app};
 use magnitude_service_contracts::HardwareProvider;
 use magnitude_service_contracts::models::{
-    CatalogModelState, CatalogModels as _, DiscoveredModelState, DiscoveredModels as _,
+    CatalogModelState, CatalogModels as _, CustomModelState, LocalModels as _,
     EffectiveModel, ModelInstance, ModelInstanceFailure, ModelInstanceId, ModelInstanceLifecycle,
     ModelReleaseReason,
 };
@@ -98,9 +98,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         PathBuf::from(flag(&arguments, "--model-store")),
         PathBuf::from(flag(&arguments, "--cache-root")),
     )?;
-    config
-        .hf_cache_dirs
-        .push(PathBuf::from(flag(&arguments, "--hf-cache")));
+    config.add_hugging_face_caches([PathBuf::from(flag(&arguments, "--hf-cache"))]);
     config.catalog_models = release.catalog().models.clone();
     let inventory = Arc::new(ManagedModelStore::open(config).await?);
     let resolver = ModelDomainResolver::new(inventory.clone(), release.catalog().clone());
@@ -141,18 +139,18 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
         Arc::new(main.instances.clone()),
         Arc::new(main.instances.clone()),
     )?;
-    // Local packages are catalog models when the catalog names them, discovered models otherwise;
+    // Local packages are catalog models when the catalog names them, custom models otherwise;
     // either becomes ready once its validation completes.
     let started = Instant::now();
-    services.discovered.refresh_discovery().await?;
+    services.local.refresh_local().await?;
     let ready_models = loop {
-        let discovered = services.discovered.list_discovered().await?;
+        let discovered = services.local.list_local().await?;
         let catalog = services.catalog.list_catalog().await?;
         let ready = discovered
             .models
             .iter()
-            .filter(|model| matches!(model.state, DiscoveredModelState::Ready { .. }))
-            .map(|model| model.id.to_string())
+            .filter(|model| matches!(model.state, CustomModelState::Ready { .. }))
+            .map(|model| model.model_id.to_string())
             .chain(catalog.models.iter().filter_map(|model| {
                 matches!(
                     &model.local_state,
@@ -173,7 +171,7 @@ async fn lifecycle(arguments: Vec<String>) -> anyhow::Result<()> {
             discovered
                 .models
                 .iter()
-                .map(|model| (model.id.to_string(), format!("{:?}", model.state)))
+                .map(|model| (model.model_id.to_string(), format!("{:?}", model.state)))
                 .collect::<Vec<_>>(),
             catalog
                 .models

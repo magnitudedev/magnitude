@@ -11,20 +11,26 @@ pub struct Metadata<'a> {
 }
 
 impl<'a> Metadata<'a> {
-    /// Reads `architecture.*` keys, rejecting any outside `keys`.
+    /// Reads `architecture.*` keys, rejecting every one outside `keys`.
     pub fn new(
         directory: &'a Directory,
         architecture: &str,
         keys: &[&str],
     ) -> Result<Self, HeaderError> {
         let prefix = format!("{architecture}.");
-        if let Some(unknown) = directory.metadata.iter().find(|entry| {
-            entry
-                .name
-                .strip_prefix(&prefix)
-                .is_some_and(|key| !keys.contains(&key))
-        }) {
-            return Err(HeaderError::UnknownMetadata(unknown.name.clone()));
+        let unknown = directory
+            .metadata
+            .iter()
+            .filter(|entry| {
+                entry
+                    .name
+                    .strip_prefix(&prefix)
+                    .is_some_and(|key| !keys.contains(&key))
+            })
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        if !unknown.is_empty() {
+            return Err(HeaderError::UnknownMetadata(unknown));
         }
         Ok(Self { directory, prefix })
     }

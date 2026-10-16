@@ -204,6 +204,8 @@ pub struct HubMetadata {
     pub last_modified: Option<String>,
 }
 
+/// Where an observed model's files are. `External` is a read-only location other than the Hugging
+/// Face cache, or an imported file; its component paths are relative to `root`, which bounds them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelLocation {
@@ -232,6 +234,33 @@ pub enum ModelLocation {
         component: ModelComponent,
         integrity: Integrity,
     },
+    External {
+        origin: ExternalOrigin,
+        root: PathBuf,
+        components: Vec<ModelComponent>,
+        total_bytes: u64,
+        integrity: Integrity,
+    },
+}
+
+/// Which read-only location an external file was observed in, with the Hugging Face file it is
+/// known to be when the location's layout or manifest says so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalOrigin {
+    LmStudio { hub: Option<HubFile> },
+    LlamaCpp { hub: Option<HubFile> },
+    Ollama { name: String, hub: Option<HubFile> },
+    Folder,
+    Imported,
+}
+
+/// A repository-relative GGUF file on the Hugging Face Hub.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubFile {
+    pub repository: String,
+    pub selector: String,
 }
 
 impl ModelLocation {
@@ -239,7 +268,8 @@ impl ModelLocation {
         match self {
             Self::MagnitudeCache { components, .. }
             | Self::HuggingFaceCache { components, .. }
-            | Self::Directory { components, .. } => components,
+            | Self::Directory { components, .. }
+            | Self::External { components, .. } => components,
             Self::File { component, .. } => std::slice::from_ref(component),
         }
     }
@@ -604,36 +634,57 @@ impl ModelPreviewComponentRole {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchRequest {
     pub query: String,
     pub limit: u32,
+    #[serde(default)]
+    pub include_unsupported: bool,
 }
 
+/// One repository. `unsupported` is empty for a repository whose architecture the engine runs;
+/// unsupported repositories are listed only when the request includes them.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResult {
     pub repository: String,
     pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub downloads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub likes: Option<u64>,
     pub gated: bool,
     pub private: bool,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub architecture: Option<String>,
+    pub base_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub variant_of: Option<crate::models::ModelId>,
+    pub unsupported: Vec<crate::models::UnsupportedReason>,
 }
 
+/// Supported results, catalog repositories excluded. `hidden_count` counts the results left out
+/// because the engine does not run their architecture.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceModelSearchResults {
-    pub models: Vec<HuggingFaceModelSearchResult>,
+    pub results: Vec<HuggingFaceModelSearchResult>,
+    pub hidden_count: u32,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceRepositoryRequest {
     pub repository: String,
     pub revision: String,
@@ -641,7 +692,7 @@ pub struct HuggingFaceRepositoryRequest {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceRepositoryFile {
     #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub path: PathBuf,
@@ -651,16 +702,26 @@ pub struct HuggingFaceRepositoryFile {
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HuggingFaceRepositorySnapshot {
     pub repository: String,
     pub commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub last_modified: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub downloads: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub likes: Option<u64>,
     pub gated: bool,
     pub private: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub license: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub license_url: Option<String>,
     pub base_models: Vec<String>,
     pub tags: Vec<String>,
@@ -822,7 +883,7 @@ pub trait HardwareProvider: Send + Sync + 'static {
     fn snapshot(&self) -> BoxFuture<'_, Result<HardwareSnapshot, InventoryError>>;
 }
 
-/// Live Hugging Face discovery. Resolved commits are immutable snapshots for a
+/// Live Hugging Face search and resolution. Resolved commits are immutable snapshots for a
 /// subsequent preview or download, not catalog pins.
 pub trait HuggingFaceModelCatalog: Send + Sync + 'static {
     fn search(

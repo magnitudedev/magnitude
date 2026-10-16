@@ -304,7 +304,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
         .retain(|tensor| tensor.name != "blk.3.attn_k_norm.weight");
     assert_eq!(
         inspect(&missing).unwrap_err(),
-        "missing Gemma weight \"blk.3.attn_k_norm.weight\""
+        "missing weight \"blk.3.attn_k_norm.weight\""
     );
 
     let mut unknown = target("e2b");
@@ -314,7 +314,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
     });
     assert_eq!(
         inspect(&unknown).unwrap_err(),
-        "Gemma artifact carries uninterpreted metadata gemma4.attn_logit_softcapping"
+        "unknown metadata [\"gemma4.attn_logit_softcapping\"]"
     );
 
     let mut wrong = target("e2b");
@@ -326,7 +326,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
     query.shape = vec![2048, 1536];
     assert!(inspect(&wrong)
         .unwrap_err()
-        .starts_with("Gemma weight \"blk.4.attn_q.weight\": expected [4096, 1536]"));
+        .starts_with("weight \"blk.4.attn_q.weight\": expected [4096, 1536]"));
 
     let mut unbound = target("e2b");
     let mut extra = unbound.tensors[0].clone();
@@ -334,7 +334,7 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
     unbound.tensors.push(extra);
     assert_eq!(
         inspect(&unbound).unwrap_err(),
-        "Gemma artifact contains unbound weight role \"blk.20.attn_k.weight\""
+        "artifact contains unbound weight roles [\"blk.20.attn_k.weight\"]"
     );
 
     let mut pattern = target("e2b");

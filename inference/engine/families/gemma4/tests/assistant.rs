@@ -376,7 +376,7 @@ fn an_assistant_of_another_target_is_rejected() {
     headers::add_tensor(&mut keys, "blk.0.attn_k.weight", &[512, 256]);
     assert_eq!(
         error(&keys, &e4b),
-        "Gemma artifact contains unbound weight role \"blk.0.attn_k.weight\""
+        "artifact contains unbound weight roles [\"blk.0.attn_k.weight\"]"
     );
     let mut partial = assistant(published("e4b"));
     headers::set(
@@ -394,7 +394,7 @@ fn an_assistant_of_another_target_is_rejected() {
         &key("final_logit_softcapping"),
         Value::Scalar(Scalar::Float(30.0)),
     );
-    assert!(error(&unknown, &e4b).contains("uninterpreted metadata"));
+    assert!(error(&unknown, &e4b).contains("unknown metadata"));
     let mut other = assistant(published("e4b"));
     other.metadata[0].value = Value::Scalar(Scalar::String("dflash".into()));
     assert!(error(&other, &e4b).contains("unsupported Gemma assistant GGUF architecture"));

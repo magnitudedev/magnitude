@@ -94,9 +94,9 @@ impl MarkerTokens for Markers {
             _ if text.len() == 1 => {
                 200 + text
                     .parse::<u32>()
-                    .map_err(|_| FamilyError("unknown marker".into()))?
+                    .map_err(|_| FamilyError::invalid("unknown marker"))?
             }
-            _ => return Err(FamilyError("non-atomic marker".into())),
+            _ => return Err(FamilyError::invalid("non-atomic marker")),
         };
         Ok(TokenId(id))
     }

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use magnitude_engine::assessment::ModelPackagePaths;
 use magnitude_engine::composition::EngineConfiguration;
-use magnitude_engine::error::{ResolveError, UnsupportedModel};
+use magnitude_engine::error::ResolveError;
 use magnitude_engine::host::HostArtifacts;
 use magnitude_engine::options::{
     ExecutionManifest, ModelPolicy, PackageOptions, ProjectorSelection, standard_service_limits,
@@ -226,10 +226,7 @@ fn installed_bundle(bundle: &ServableModelBundle) -> (ModelBundleInput, Vec<Mode
 /// A resolution failure as the service reports it.
 pub fn resolve_failure(error: ResolveError) -> InventoryError {
     let code = match &error {
-        ResolveError::Unsupported(UnsupportedModel::Family { .. })
-        | ResolveError::Unsupported(UnsupportedModel::Representation { .. })
-        | ResolveError::Unsupported(UnsupportedModel::Backend { .. })
-        | ResolveError::Unsupported(UnsupportedModel::KernelDomain { .. }) => "unsupported_model",
+        ResolveError::Unsupported(_) => "unsupported_model",
         ResolveError::Artifact(_) => "invalid_model_package",
         ResolveError::InvalidConfiguration { .. } => "invalid_model_configuration",
     };

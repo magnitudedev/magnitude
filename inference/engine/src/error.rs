@@ -9,6 +9,8 @@ use magnitude_executor::platform::{
 };
 use magnitude_executor::{CatalogError, CatalogFailure, GraphError, PlanError};
 use crate::census::MemoryDomain;
+pub use magnitude_artifacts::{UnsupportedReason, WeightTypeCount};
+use magnitude_family_contracts::FamilyError;
 use seismic::{DeviceSelector, ResolveError as SeismicResolveError};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -70,52 +72,79 @@ impl fmt::Display for ArtifactError {
     }
 }
 
-/// Material this engine cannot execute here. Never retryable.
+/// Material this engine cannot execute here, with every cause the engine
+/// names and the developer text describing the refusal. `reasons` is empty
+/// only when the refusal has no typed cause (a malformed definition, a
+/// planner topology refusal); `detail` always describes it. Never retryable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UnsupportedModel {
-    /// No registered model family recognizes the target.
-    Family { reason: String },
-    /// The family recognizes it, but a representation, topology, tokenizer or
-    /// template is outside what the engine executes.
-    Representation { reason: String },
-    /// The selected backend cannot execute the model's program plan.
-    Backend { backend: String, reason: String },
-    /// A kernel call of the model's program has statics outside the
-    /// kernel's domain on the backend: no configuration executes them.
-    KernelDomain {
-        backend: String,
-        entry: String,
-        /// The call's static dimensions, by name.
-        statics: Vec<(String, u64)>,
-    },
+pub struct UnsupportedModel {
+    pub reasons: Vec<UnsupportedReason>,
+    pub detail: String,
+}
+
+impl UnsupportedModel {
+    pub fn new(reasons: Vec<UnsupportedReason>, detail: impl Into<String>) -> Self {
+        Self {
+            reasons,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn reason(reason: UnsupportedReason, detail: impl Into<String>) -> Self {
+        Self::new(vec![reason], detail)
+    }
+
+    /// A refusal with no typed cause.
+    pub fn invalid(detail: impl Into<String>) -> Self {
+        Self::new(Vec::new(), detail)
+    }
+
+    /// The refusals of independent checks as one: every distinct reason in
+    /// order, and every detail. `None` when nothing was refused.
+    pub fn union(refusals: Vec<Self>) -> Option<Self> {
+        if refusals.is_empty() {
+            return None;
+        }
+        let mut reasons = Vec::new();
+        let mut details = Vec::with_capacity(refusals.len());
+        for refusal in refusals {
+            for reason in refusal.reasons {
+                if !reasons.contains(&reason) {
+                    reasons.push(reason);
+                }
+            }
+            details.push(refusal.detail);
+        }
+        Some(Self::new(reasons, details.join("; ")))
+    }
+}
+
+impl UnsupportedModel {
+    /// Chat templates the engine cannot read or render.
+    pub fn chat_template(detail: impl Into<String>) -> Self {
+        Self::reason(UnsupportedReason::ChatTemplate, detail)
+    }
+}
+
+impl From<magnitude_chat::TokenizerError> for UnsupportedModel {
+    fn from(error: magnitude_chat::TokenizerError) -> Self {
+        let detail = error.to_string();
+        match error {
+            magnitude_chat::TokenizerError::Unsupported(reasons) => Self::new(reasons, detail),
+            magnitude_chat::TokenizerError::Invalid(_) => Self::invalid(detail),
+        }
+    }
+}
+
+impl From<FamilyError> for UnsupportedModel {
+    fn from(error: FamilyError) -> Self {
+        Self::new(error.reasons, error.detail)
+    }
 }
 
 impl fmt::Display for UnsupportedModel {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Family { reason } => write!(formatter, "unsupported model family: {reason}"),
-            Self::Representation { reason } => {
-                write!(formatter, "unsupported model representation: {reason}")
-            }
-            Self::Backend { backend, reason } => {
-                write!(formatter, "unsupported on the {backend} backend: {reason}")
-            }
-            Self::KernelDomain {
-                backend,
-                entry,
-                statics,
-            } => {
-                let statics = statics
-                    .iter()
-                    .map(|(name, value)| format!("{name}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                write!(
-                    formatter,
-                    "`{entry}` has no admissible {backend} configuration at {statics}"
-                )
-            }
-        }
+        formatter.write_str(&self.detail)
     }
 }
 
@@ -510,18 +539,18 @@ impl From<magnitude_scheduler::worker::Panicked> for UnloadCause {
 /// resource failures of the engine itself.
 pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> PlanOutcome {
     match error {
-        PlanError::Unsupported(reason) => PlanOutcome::Unsupported(UnsupportedModel::Backend {
-            backend: backend.as_str().to_owned(),
-            reason: reason.to_string(),
-        }),
+        PlanError::Unsupported(reason) => PlanOutcome::Unsupported(UnsupportedModel::reason(
+            UnsupportedReason::Backend {
+                backend: backend.as_str().to_owned(),
+            },
+            format!("unsupported on the {} backend: {reason}", backend.as_str()),
+        )),
         error @ (PlanError::InvalidDefinition(_)
         | PlanError::Topology(_)
         | PlanError::UnsupportedOperator { .. }
         | PlanError::Deferred(_)
         | PlanError::UnportedScale(_)) => {
-            PlanOutcome::Unsupported(UnsupportedModel::Representation {
-                reason: error.to_string(),
-            })
+            PlanOutcome::Unsupported(UnsupportedModel::invalid(error.to_string()))
         }
         error @ (PlanError::Arithmetic(_)
         | PlanError::ResourcePlanning(_)
@@ -534,13 +563,11 @@ pub(crate) fn classify_plan(error: PlanError, backend: seismic::BackendName) -> 
 /// engine defect.
 pub(crate) fn classify_graph(error: GraphError) -> PlanOutcome {
     match error {
-        GraphError::KernelDomain(violation) => {
-            PlanOutcome::Unsupported(UnsupportedModel::KernelDomain {
-                backend: violation.backend.as_str().to_owned(),
-                entry: violation.entry.to_owned(),
-                statics: violation.statics,
-            })
-        }
+        GraphError::KernelDomain(violation) => PlanOutcome::Unsupported(kernel_domain(
+            violation.backend.as_str(),
+            violation.entry,
+            violation.statics,
+        )),
         GraphError::Invalid(reason) => PlanOutcome::Internal(reason),
     }
 }
@@ -550,11 +577,7 @@ pub(crate) fn classify_graph(error: GraphError) -> PlanOutcome {
 pub(crate) fn classify_catalog(error: CatalogError) -> PlanOutcome {
     match error.failure {
         CatalogFailure::KernelDomain { entry, statics } => {
-            PlanOutcome::Unsupported(UnsupportedModel::KernelDomain {
-                backend: error.backend.as_str().to_owned(),
-                entry: entry.to_owned(),
-                statics,
-            })
+            PlanOutcome::Unsupported(kernel_domain(error.backend.as_str(), entry, statics))
         }
         // A load that stops unprepared is taken as its own outcome before
         // any failure is classified; one that reaches here was not asked for.
@@ -563,6 +586,18 @@ pub(crate) fn classify_catalog(error: CatalogError) -> PlanOutcome {
         | CatalogFailure::Qualification { .. }
         | CatalogFailure::Unprepared { .. } => PlanOutcome::Internal(error.to_string()),
     }
+}
+
+/// A kernel call of the model's program with statics outside the kernel's
+/// domain on the backend: no configuration executes them.
+fn kernel_domain(backend: &str, entry: &str, statics: Vec<(String, u64)>) -> UnsupportedModel {
+    let reason = UnsupportedReason::KernelDomain {
+        backend: backend.to_owned(),
+        entry: entry.to_owned(),
+        statics,
+    };
+    let detail = format!("no admissible configuration for {reason}");
+    UnsupportedModel::reason(reason, detail)
 }
 
 pub(crate) enum PlanOutcome {
@@ -587,10 +622,12 @@ pub(crate) fn classify_platform(error: PlatformError) -> PlatformOutcome {
             PlatformOutcome::MemoryObservationUnavailable(error.to_string())
         }
         PlatformError::Policy { path, outcome } => {
-            PlatformOutcome::Unsupported(UnsupportedModel::Backend {
-                backend: path.to_string(),
-                reason: outcome,
-            })
+            PlatformOutcome::Unsupported(UnsupportedModel::reason(
+                UnsupportedReason::Backend {
+                    backend: path.to_string(),
+                },
+                format!("unsupported on the {path} backend: {outcome}"),
+            ))
         }
         error @ (PlatformError::Memory(_)
         | PlatformError::Open(_)

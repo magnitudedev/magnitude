@@ -9,16 +9,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use magnitude_engine::assessment::{
-    ModelAssessment as EngineAssessment, ModelAssessmentError,
-    ModelCapabilities as EngineCapabilities, ModelPackagePaths, PreparedModelAssessment,
+    DrafterVerdict as EngineDrafterVerdict, ModelAssessment as EngineAssessment,
+    ModelAssessmentError, ModelCapabilities as EngineCapabilities, ModelPackagePaths,
+    PreparedModelAssessment, SpeculativeMethod as EngineSpeculativeMethod,
     finish_model_assessment, prepare_model_assessment,
 };
-use magnitude_engine::error::UnsupportedModel;
+use magnitude_engine::error::{UnsupportedModel, UnsupportedReason as EngineUnsupportedReason};
+use magnitude_engine::fingerprint::ModelFingerprint as EngineModelFingerprint;
 use magnitude_engine::options::ModelMethod;
 use magnitude_executor::assessment::{DomainFit, ExecutionAssessment, PerformanceEstimate};
 use magnitude_service_contracts::models::{
     AssessmentEnvironmentId, InstalledModelPackages as _, MemoryAssessment, ModelAssessment,
-    ModelAssessmentId, ModelAssessmentProfile, ModelBundleInput, ModelCapabilities, ModelFailure,
+    DrafterVerdict, KernelStatic, ModelAssessmentId, ModelFingerprint, WeightTypeCount, ModelAssessmentProfile, ModelBundleInput,
+    ModelCapabilities, ModelFailure, UnsupportedReason,
     ModelPackageOperand, ModelReasoningCapabilities, ModelServingConfiguration,
     PerformanceEvidence, ResolvedServableModelBundle, ServableModelBundle,
     SpeculativeDraftSource, SpeculativeDraftSourceInput, SpeculativeMethod,
@@ -61,11 +64,23 @@ fn preparation_task_failure(error: impl std::fmt::Display) -> ModelFailure {
 }
 
 fn preparation_failure(error: ModelAssessmentError) -> ModelFailure {
-    inventory_model_failure(InventoryError::ModelOperation {
-        code: "assessment_failed".to_owned(),
+    inventory_model_failure(preparation_error(error))
+}
+
+/// An engine failure that produced no verdict. Material that is truncated or not a GGUF is never
+/// worth retrying; other failures may be.
+pub(crate) fn preparation_error(error: ModelAssessmentError) -> InventoryError {
+    let (code, retryable) = match &error {
+        ModelAssessmentError::Artifact(artifact) if artifact.unreadable() => {
+            ("unreadable_artifact", false)
+        }
+        _ => ("assessment_failed", true),
+    };
+    InventoryError::ModelOperation {
+        code: code.to_owned(),
         message: error.to_string(),
-        retryable: true,
-    })
+        retryable,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -117,6 +132,24 @@ impl ModelAssessor {
     /// The environment every model is assessed in.
     pub fn environment(&self) -> &Arc<AssessmentEnvironment> {
         &self.environment
+    }
+
+    pub fn models(&self) -> &Arc<ManagedModelStore> {
+        &self.models
+    }
+
+    pub fn release_catalog(&self) -> &Arc<ReleaseCatalog> {
+        &self.release_catalog
+    }
+
+    /// Resolve a bundle's exact material: release headers for a catalog bundle, installed files
+    /// or source-backed previews for everything else.
+    pub async fn resolve_material(
+        &self,
+        bundle: ServableModelBundle,
+    ) -> Result<ResolvedServableModelBundle, InventoryError> {
+        let bundle_key = servable_model_bundle_key_for_bundle(&bundle);
+        self.resolve(&bundle_key, bundle).await
     }
 
     pub fn configuration_for(
@@ -386,21 +419,22 @@ async fn assess_prepared(
 }
 
 /// Map the engine's complete result onto the service contract.
-fn model_assessment(
+pub(crate) fn model_assessment(
     assessed: EngineAssessment,
     bundle_key: &ServableModelBundleKey,
     requested: ModelAssessmentProfile,
     environment: &AssessmentEnvironment,
 ) -> Result<CachedModelAssessment, InventoryError> {
     let (facts, execution) = match assessed {
-        EngineAssessment::Unsupported(unsupported) => {
-            let code = match &unsupported {
-                UnsupportedModel::Family { .. } => "unsupported_family",
-                UnsupportedModel::Representation { .. } => "unsupported_representation",
-                UnsupportedModel::Backend { .. } => "unsupported_backend",
-                UnsupportedModel::KernelDomain { .. } => "unsupported_kernel_domain",
-            };
-            return Ok(unsupported_model(requested, code, unsupported.to_string()));
+        EngineAssessment::Unsupported {
+            unsupported,
+            fingerprint,
+        } => {
+            return Ok(unsupported_model(
+                requested,
+                unsupported,
+                fingerprint.map(model_fingerprint),
+            ));
         }
         EngineAssessment::Assessed { facts, execution } => (facts, execution),
     };
@@ -414,6 +448,7 @@ fn model_assessment(
             retryable: false,
         });
     }
+    let drafter = drafter_verdict(facts.drafter);
     let assessment_id = assessment_id(bundle_key, &requested, &environment.id);
     let ModelAssessmentProfile {
         profile,
@@ -445,6 +480,7 @@ fn model_assessment(
                 assessment_id,
                 memory: memory_assessments(&domains, environment),
                 performance,
+                drafter,
             }
         }
         ExecutionAssessment::DoesNotFit {
@@ -458,21 +494,117 @@ fn model_assessment(
             memory: memory_assessments(&domains, environment),
             limiting_resource: domain_id(limiting, environment).as_str().to_owned(),
             deficit_bytes,
+            drafter,
         },
     };
     Ok(CachedModelAssessment {
         capabilities: capabilities(facts.capabilities),
         template_fingerprint: facts.template_fingerprint,
+        fingerprint: facts.fingerprint.map(model_fingerprint),
         profile: assessment,
     })
 }
 
 /// A package the engine cannot execute has no engine-derived capabilities or template.
+fn unsupported_reason(reason: EngineUnsupportedReason) -> UnsupportedReason {
+    match reason {
+        EngineUnsupportedReason::Architecture { architecture } => {
+            UnsupportedReason::Architecture { architecture }
+        }
+        EngineUnsupportedReason::WeightTypes { types } => UnsupportedReason::WeightTypes {
+            types: types
+                .into_iter()
+                .map(|count| WeightTypeCount {
+                    ggml_type: count.ggml_type,
+                    tensor_count: count.tensor_count,
+                })
+                .collect(),
+        },
+        EngineUnsupportedReason::RopeScaling { kind } => UnsupportedReason::RopeScaling { kind },
+        EngineUnsupportedReason::UnrecognizedTensor { name } => {
+            UnsupportedReason::UnrecognizedTensor { name }
+        }
+        EngineUnsupportedReason::UnrecognizedMetadata { key } => {
+            UnsupportedReason::UnrecognizedMetadata { key }
+        }
+        EngineUnsupportedReason::Tokenizer { model, pre } => {
+            UnsupportedReason::Tokenizer { model, pre }
+        }
+        EngineUnsupportedReason::ChatTemplate => UnsupportedReason::ChatTemplate,
+        EngineUnsupportedReason::KernelDomain {
+            backend,
+            entry,
+            statics,
+        } => UnsupportedReason::KernelDomain {
+            backend,
+            entry,
+            statics: statics
+                .into_iter()
+                .map(|(name, value)| KernelStatic { name, value })
+                .collect(),
+        },
+        EngineUnsupportedReason::Backend { backend } => UnsupportedReason::Backend { backend },
+        EngineUnsupportedReason::Unreadable => UnsupportedReason::Unreadable,
+        EngineUnsupportedReason::TargetMismatch { detail } => {
+            UnsupportedReason::TargetMismatch { detail }
+        }
+        EngineUnsupportedReason::TiedOutputHead => UnsupportedReason::TiedOutputHead,
+    }
+}
+
+fn unsupported_reasons(unsupported: UnsupportedModel) -> (Vec<UnsupportedReason>, String) {
+    (
+        unsupported
+            .reasons
+            .into_iter()
+            .map(unsupported_reason)
+            .collect(),
+        unsupported.detail,
+    )
+}
+
+fn drafter_verdict(verdict: EngineDrafterVerdict) -> DrafterVerdict {
+    match verdict {
+        EngineDrafterVerdict::None => DrafterVerdict::None,
+        EngineDrafterVerdict::Bound {
+            method,
+            memory_bytes,
+        } => DrafterVerdict::Bound {
+            method: match method {
+                EngineSpeculativeMethod::Mtp => SpeculativeMethod::Mtp,
+                EngineSpeculativeMethod::DFlash => SpeculativeMethod::DFlash,
+                EngineSpeculativeMethod::DFlash2 => SpeculativeMethod::DFlash2,
+                EngineSpeculativeMethod::DSpark => SpeculativeMethod::DSpark,
+            },
+            memory_bytes,
+        },
+        EngineDrafterVerdict::Rejected(unsupported) => {
+            let (reasons, detail) = unsupported_reasons(unsupported);
+            DrafterVerdict::Rejected { reasons, detail }
+        }
+    }
+}
+
+pub(crate) fn model_fingerprint(fingerprint: EngineModelFingerprint) -> ModelFingerprint {
+    ModelFingerprint {
+        architecture: fingerprint.architecture,
+        block_count: fingerprint.block_count,
+        embedding_length: fingerprint.embedding_length,
+        head_count: fingerprint.head_count,
+        head_count_kv: fingerprint.head_count_kv,
+        key_length: fingerprint.key_length,
+        vocab_size: fingerprint.vocab_size,
+        expert_count: fingerprint.expert_count,
+        tokenizer_digest: fingerprint.tokenizer_digest,
+    }
+}
+
 fn unsupported_model(
     requested: ModelAssessmentProfile,
-    code: &str,
-    message: String,
+    unsupported: UnsupportedModel,
+    fingerprint: Option<ModelFingerprint>,
 ) -> CachedModelAssessment {
+    let (reasons, detail) = unsupported_reasons(unsupported);
     CachedModelAssessment {
         capabilities: ModelCapabilities {
             vision: false,
@@ -485,13 +617,11 @@ fn unsupported_model(
             },
         },
         template_fingerprint: String::new(),
+        fingerprint,
         profile: ModelAssessment::Unsupported {
             profile: requested.profile,
-            failure: ModelFailure {
-                code: code.to_owned(),
-                message,
-                retryable: false,
-            },
+            reasons,
+            detail,
         },
     }
 }
@@ -812,6 +942,22 @@ mod tests {
         });
         assert_eq!(operational.code, "assessment_failed");
         assert!(operational.retryable);
+    }
+
+    #[test]
+    fn unreadable_material_is_not_retried() {
+        let unreadable = preparation_error(ModelAssessmentError::Artifact(
+            magnitude_artifacts::Error::Invalid("truncated header".to_owned()),
+        ));
+        assert!(matches!(
+            unreadable,
+            InventoryError::ModelOperation { retryable: false, ref code, .. } if code == "unreadable_artifact"
+        ));
+        let operational = preparation_error(ModelAssessmentError::Planning("busy".to_owned()));
+        assert!(matches!(
+            operational,
+            InventoryError::ModelOperation { retryable: true, .. }
+        ));
     }
 
     #[test]

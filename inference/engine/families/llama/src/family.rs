@@ -1,6 +1,6 @@
 //! The strict `llama` feature set as a registered model family.
 
-use crate::{inspect_components, recognize};
+use crate::{inspect_components, FAMILY_ID};
 use magnitude_artifacts::{gguf::Directory, PackageIdentity};
 use magnitude_family_common::TextInput;
 use magnitude_family_contracts::{
@@ -14,8 +14,8 @@ impl ModelFamily for LlamaFamily {
         "llama"
     }
 
-    fn recognizes(&self, target: &Directory) -> bool {
-        recognize(target).is_ok()
+    fn architectures(&self) -> &'static [&'static str] {
+        &[FAMILY_ID]
     }
 
     fn inspect(
@@ -24,8 +24,7 @@ impl ModelFamily for LlamaFamily {
         projector: Option<&Directory>,
         identity: PackageIdentity,
     ) -> Result<ModelDefinition, FamilyError> {
-        inspect_components(target, projector, identity)
-            .map_err(|error| FamilyError(error.to_string()))
+        inspect_components(target, projector, identity).map_err(FamilyError::from)
     }
 
     /// Text-only input: every token sits at its absolute position.

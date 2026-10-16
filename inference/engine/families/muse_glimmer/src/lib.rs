@@ -32,10 +32,9 @@ use magnitude_family_contracts::{
     ResidualForm, RmsNorm, Rotary, Sublayer, UnweightedRms, ValueNorm,
     ValueSource, WeightDescriptor,
 };
-use magnitude_family_common::{rotary, HeaderError, Metadata, Tensors};
-use std::{error, fmt};
+use magnitude_family_common::{rotary, Metadata, Tensors};
 
-const ARCHITECTURE: &str = "muse-glimmer";
+pub const ARCHITECTURE: &str = "muse-glimmer";
 
 /// Every `muse-glimmer.*` key the adapter interprets; any other is rejected.
 const KEYS: &[&str] = &[
@@ -66,26 +65,12 @@ const POST_NORM_EPSILON: f64 = 1e-8;
 /// the last layer of each period is full.
 const DEFAULT_WINDOW_PERIOD: u64 = 4;
 
-/// Failure to interpret a Muse Glimmer artifact.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Error(String);
-
-impl fmt::Display for Error {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl error::Error for Error {}
-
-impl From<HeaderError> for Error {
-    fn from(error: HeaderError) -> Self {
-        invalid(error.to_string())
-    }
-}
+/// Failure to interpret a Muse Glimmer artifact: the family error, which
+/// names every unsupported feature a header carries.
+pub use magnitude_family_contracts::FamilyError as Error;
 
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
-    Error(message.into())
+    Error::invalid(message)
 }
 
 fn product(dimensions: &[u64]) -> Result<u64, Error> {

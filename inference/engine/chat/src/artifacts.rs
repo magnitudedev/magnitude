@@ -6,7 +6,7 @@ use super::{
 };
 use magnitude_artifacts::{
     gguf::{Scalar, Value as GgufValue},
-    TemplatePayload, TokenizerPayload,
+    TemplatePayload, TokenizerPayload, UnsupportedReason,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -106,7 +106,7 @@ impl Profile {
     /// The profile the container's `tokenizer.ggml.model` and
     /// `tokenizer.ggml.pre` name. Profiles are container facts, never model
     /// family ownership.
-    fn select(model: &str, pre: Option<&str>) -> Result<Self, TokenizerError> {
+    fn select(model: &str, pre: Option<&str>) -> Result<Self, UnsupportedReason> {
         use SplitBehavior::{Isolated, MergedWithNext};
         let byte_level = |splits, ignore_merges, add_bos| Self {
             normalization: Normalization::None,
@@ -173,7 +173,7 @@ impl Profile {
                 sequence_start: SequenceStart::Always,
             },
             _ => {
-                return Err(TokenizerError::UnsupportedProfile {
+                return Err(UnsupportedReason::Tokenizer {
                     model: model.into(),
                     pre: pre.map(Into::into),
                 })
@@ -292,16 +292,17 @@ pub fn gguf_tokenizer_vocabulary(payload: &TokenizerPayload) -> Result<usize, To
 }
 
 /// The supported profile a tokenizer payload names, and its vocabulary size.
+/// Every unknown key, an unsupported profile and every flag the engine does
+/// not implement are reported together.
 fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), TokenizerError> {
-    if let Some(entry) = payload
+    let mut unsupported = payload
         .metadata
         .iter()
-        .find(|entry| !INTERPRETED_KEYS.contains(&entry.name.as_str()))
-    {
-        return Err(TokenizerError::UnsupportedMetadata {
+        .filter(|entry| !INTERPRETED_KEYS.contains(&entry.name.as_str()))
+        .map(|entry| UnsupportedReason::UnrecognizedMetadata {
             key: entry.name.clone(),
-        });
-    }
+        })
+        .collect::<Vec<_>>();
     let text = |key: &str| match payload.value(key) {
         None => Ok(None),
         Some(value) => value
@@ -312,15 +313,23 @@ fn tokenizer_header(payload: &TokenizerPayload) -> Result<(Profile, usize), Toke
     let profile = Profile::select(
         text("tokenizer.ggml.model")?.ok_or("missing tokenizer.ggml.model")?,
         text("tokenizer.ggml.pre")?,
-    )?;
+    );
     for key in [
         "tokenizer.ggml.add_eos_token",
         "tokenizer.ggml.add_space_prefix",
     ] {
         if flag(payload, key)? == Some(true) {
-            return Err(TokenizerError::UnsupportedMetadata { key: key.into() });
+            unsupported.push(UnsupportedReason::UnrecognizedMetadata { key: key.into() });
         }
     }
+    let profile = match profile {
+        Ok(profile) if unsupported.is_empty() => profile,
+        Ok(_) => return Err(TokenizerError::Unsupported(unsupported)),
+        Err(reason) => {
+            unsupported.push(reason);
+            return Err(TokenizerError::Unsupported(unsupported));
+        }
+    };
     let length = |key: &str| match payload.value(key) {
         Some(GgufValue::Array(values)) => Ok(values.len()),
         _ => Err(TokenizerError::Invalid(format!("missing array {key}"))),
