@@ -300,4 +300,6 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   cantReachMagnitude: "无法连接到 Magnitude",
   signedInFromAnotherDevice: "已在其他设备上登录",
   couldNotSignOutTitle: "无法退出登录",
+  downloading: "正在下载",
+  aboutMinutes: "约",
 }
