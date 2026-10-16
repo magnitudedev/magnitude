@@ -639,4 +639,8 @@ export const ja = {
   reloadWindowRestart: "このウィンドウを再読み込みしてください。それでも開かない場合は Magnitude を再起動してください。",
   quitAndReopen: "Magnitude を終了して、もう一度開いてください。",
   savedAppearanceReadError: "保存した外観設定を読み取れませんでした。システムの外観を使用します。",
+  chineseTraditional: "繁体字中国語",
+  korean: "韓国語",
+  vietnamese: "ベトナム語",
+  indonesian: "インドネシア語",
 } satisfies typeof en
