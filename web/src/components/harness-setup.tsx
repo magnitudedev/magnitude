@@ -11,6 +11,10 @@ import { HarnessLogo } from "./harness-logo"
 import { pageLayout } from "./page-layout"
 import { Button } from "./ui/button"
 
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
 const harnessNames: Record<Brand.Brand.Unbranded<HarnessId>, string> = {
   pi: "Pi",
   opencode: "OpenCode",
@@ -33,14 +37,14 @@ export function HarnessSetupList({ defaultModel, origin, remote, platform }: {
   remote: boolean
   platform: HarnessSetupPlatform
 }) {
-  return <section aria-label="Agents" className="mt-7">
-    <p className="mb-4 text-sm text-slate-500">Copy an agent’s setup prompt and paste it into that agent, or any coding agent, on the computer you’re using now.</p>
+  return <section aria-label={tr("agents")} className="mt-7">
+    <p className="mb-4 text-sm text-slate-500">{tr("setupPromptInstruction")}</p>
     <div className={pageLayout.harnessGrid}>
       {HARNESS_PRIORITY.map(harness => {
         const name = harnessNames[Brand.unbranded(harness)]
         return defaultModel === undefined
           ? <article key={harness} aria-label={name} className={pageLayout.harnessCard}>
-            <SetupHeader harness={harness} name={name}><Button disabled>Copy setup prompt</Button></SetupHeader>
+            <SetupHeader harness={harness} name={name}><Button disabled>{tr("copySetupPrompt")}</Button></SetupHeader>
           </article>
           : <SetupCard key={harness} harness={harness} name={name} model={defaultModel} origin={origin} remote={remote} platform={platform} />
       })}
@@ -82,15 +86,15 @@ function SetupCard({ harness, name, model, origin, remote, platform }: {
   return <article aria-label={name} className={pageLayout.harnessCard}>
     <SetupHeader harness={harness} name={name}>
       {!Result.isFailure(setup) && <>
-        <button type="button" aria-expanded={open} aria-controls={promptId} disabled={!ready} onClick={() => setOpen(value => !value)} className="inline-flex cursor-pointer items-center gap-1 rounded text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 focus-visible:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-default disabled:opacity-50 dark:text-slate-400 dark:hover:text-slate-100 dark:focus-visible:text-slate-100">Show prompt<CaretDownIcon aria-hidden="true" className={`size-3.5 transition-transform ${open ? "rotate-180" : ""}`} /></button>
+        <button type="button" aria-expanded={open} aria-controls={promptId} disabled={!ready} onClick={() => setOpen(value => !value)} className="inline-flex cursor-pointer items-center gap-1 rounded text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 focus-visible:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-default disabled:opacity-50 dark:text-slate-400 dark:hover:text-slate-100 dark:focus-visible:text-slate-100">{tr("showPrompt")}<CaretDownIcon aria-hidden="true" className={`size-3.5 transition-transform ${open ? "rotate-180" : ""}`} /></button>
         <Button aria-label={`Copy ${name} setup prompt`} disabled={!ready} onClick={() => ready && copy(setup.value.prompt)}>
-          {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}{copied ? "Copied" : "Copy setup prompt"}
+          {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}{copied ? tr("copied") : tr("copySetupPrompt")}
         </Button>
       </>}
     </SetupHeader>
-    {Result.isFailure(setup) && <ErrorNotice title="Couldn’t prepare the setup prompt" description="Check that a model is still downloaded, then try again." className="mt-3" />}
-    {copied && <span role="status" className="sr-only">{name} setup prompt copied</span>}
-    {failed && <ErrorNotice title="Couldn’t copy to the clipboard" className="mt-3" />}
-    {open && ready && <div id={promptId} className="mt-4"><CopyCommand multiline command={setup.value.prompt} label={`Copy the ${name} prompt shown`} /></div>}
+    {Result.isFailure(setup) && <ErrorNotice title={tr("couldNotPreparePrompt")} description={tr("checkDownloadedModel")} className="mt-3" />}
+    {copied && <span role="status" className="sr-only">{tr("setupPromptCopied").replace("{name}", name)}</span>}
+    {failed && <ErrorNotice title={tr("couldNotCopyClipboard")} className="mt-3" />}
+    {open && ready && <div id={promptId} className="mt-4"><CopyCommand multiline command={setup.value.prompt} label={tr("copyPrompt").replace("{name}", name)} /></div>}
   </article>
 }
