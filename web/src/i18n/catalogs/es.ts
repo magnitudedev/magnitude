@@ -495,4 +495,6 @@ export const es: { [K in keyof typeof en]: string } = {
   turnOnNetworkIntro: "Para utilizarlo desde otro dispositivo, activa el acceso a la red en ",
   secondsWord: "segundos",
   noKeySetDescription: "En el equipo que ejecuta Magnitude, abre Ajustes → Acceso a la red y elige Regenerar para crear una clave.",
+  reloadPage: "Después, vuelve a cargar esta página.",
+  changeAddress: "Cambiar dirección",
 }
