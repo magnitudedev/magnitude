@@ -533,4 +533,7 @@ export const en = {
   checkingEllipsis: "Checking…",
   openAiBaseUrlHint: "Use this as the OpenAI-compatible base URL on other devices{keyHint}. Anthropic-compatible apps use /inference/anthropic on the same address.",
   withApiKeyAbove: ", with the API key above",
+  starting: "Starting",
+  unavailable: "Unavailable",
+  optimizing: "Optimizing",
 } as const
