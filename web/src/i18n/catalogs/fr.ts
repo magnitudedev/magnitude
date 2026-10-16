@@ -1,8 +1,5 @@
-import { en } from "./en"
-
 /** French UI translations; untranslated long-tail messages fall back to English. */
 export const fr = {
-  ...en,
   settings: "Paramètres",
   general: "Général",
   about: "À propos",
@@ -633,4 +630,4 @@ export const fr = {
   vramLabel: "VRAM",
   cpuLabel: "CPU",
   gpuLabel: "GPU",
-} satisfies Partial<typeof en>
+} satisfies typeof en
