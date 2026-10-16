@@ -104,4 +104,20 @@ describe("i18n catalogs", () => {
       expect(uk[key], `Ukrainian: ${key}`).toBeTruthy()
     }
   })
+
+
+  test("Indic UI and model-error strings do not silently fall back to English", () => {
+    const keys = [
+      "general", "languageHint", "catalog", "myModels", "connections", "status", "theme",
+      "launchAtLogin", "networkAccess", "automaticUpdates", "closeNavigation", "collapseSidebar",
+      "signOut", "retryDownload", "noModelLoaded", "notEnoughDiskSpace", "cannotReachSource",
+      "downloadNotVerified", "loadingStopped", "downloadCouldNotStart", "tryLoadAnother",
+      "noResults", "selectModel", "agents", "unknownProcessor",
+    ] as const
+    for (const key of keys) {
+      expect(hi[key], `Hindi translation: ${key}`).not.toBe(en[key])
+      expect(ur[key], `Urdu translation: ${key}`).not.toBe(en[key])
+      expect(bn[key], `Bengali translation: ${key}`).not.toBe(en[key])
+    }
+  })
 })
