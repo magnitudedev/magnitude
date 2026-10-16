@@ -635,4 +635,8 @@ export const hi = {
   capabilityProfile: "{name} की क्षमता प्रोफ़ाइल",
   harnessModel: "{name} 模型",
   cacheNotReportedForRequests: "{count} अनुरोधों के लिए रिपोर्ट नहीं किया गया",
+  magnitudeCouldNotOpen: "Magnitude 无法打开",
+  reloadWindowRestart: "इस विंडो को फिर से लोड करें। अगर यह फिर भी न खुले, तो Magnitude को दोबारा शुरू करें।",
+  quitAndReopen: "Magnitude को बंद करके फिर से खोलें।",
+  savedAppearanceReadError: "सहेजी गई दिखावट पढ़ी नहीं जा सकी। सिस्टम की दिखावट इस्तेमाल की जा रही है।",
 } satisfies typeof en
