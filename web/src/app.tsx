@@ -544,7 +544,7 @@ function ModelStatus() {
         {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
         <div className="flex min-w-0 items-baseline gap-2">
           <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? tr("modelStatusUnavailable") : tr("readingModelStatus"))}</p>
-          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === tr("ready") ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
+          {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
         </div>
       </div>
       {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon /><T k="stopModel" /></Button>}
@@ -566,7 +566,7 @@ function DownloadActivity() {
   if (Result.isInitial(models)) return null
   if (Result.isSuccess(models) && active.length === 0) return null
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? tr("downloadActivityUnavailable") : tr("readingDownloadActivity")}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? tr("removingFiles") : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
+    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? tr("downloadActivityUnavailable") : tr("readingDownloadActivity")}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? tr("removingFiles") : model.acquisitionState._tag === "Optimizing" ? tr("optimizing") : model.acquisitionState._tag === "Updating" ? tr("update") : tr("downloading")}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
   </div>
 }
 function Status({ observation }: { observation: ServiceObservation }) {
@@ -583,7 +583,7 @@ function Status({ observation }: { observation: ServiceObservation }) {
         <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300"><T k="magnitudeService" /></h2>
         <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
           {ready ? <CheckCircleIcon aria-label={tr("serviceReady")} weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
-          <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? tr("ready") : service?._tag === "CleanupFailed" ? tr("cleanupAttention") : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
+          <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? tr("ready") : service?._tag === "CleanupFailed" ? tr("cleanupAttention") : service?._tag === "Failed" ? tr("unavailable") : tr("starting")}</span>
         </div>
       </div>
       {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500"><T k="startingService" /></p>}
@@ -727,7 +727,7 @@ function RestartRequiredToast() {
   const { supports } = useApplicationOwner()
   const restartApplication = useAtomSet(client.Application.RestartApplication)
   const disconnect = useDisconnectWarning()
-  const relaunch = () => disconnect.warn(tr("restart"), () => restartApplication({}))
+  const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
   const relaunching = useAtomValue(client.Application.RestartApplication)
   if (!storagePending && !networkPending) return null
   const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
@@ -816,7 +816,7 @@ function AboutRow() {
   const download = () => downloadUpdate({})
   const installUpdate = useAtomSet(client.Application.InstallApplicationUpdate)
   const disconnect = useDisconnectWarning()
-  const restart = () => disconnect.warn(tr("restart"), () => installUpdate({}))
+  const restart = () => disconnect.warn("Restart", () => installUpdate({}))
   const checking = useAtomValue(client.Application.CheckApplicationUpdate)
   const downloading = useAtomValue(client.Application.DownloadApplicationUpdate)
   const restarting = useAtomValue(client.Application.InstallApplicationUpdate)
