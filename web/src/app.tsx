@@ -75,6 +75,10 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
 const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
+function localizedPageName(page: ApplicationPage, t: (key: import("./i18n").MessageKey) => string) {
+  const keys = { discover: "discover", catalog: "catalog", models: "myModels", connections: "connections", usage: "usage", status: "status", settings: "settings" } as const
+  return t(keys[page])
+}
 const pageIcons = { discover: StackIcon, catalog: SquaresFourIcon, models: CubeIcon, connections: PlugIcon, usage: ChartBarIcon, status: PulseIcon, settings: SlidersIcon }
 
 function ModelDetails({ model, radar = false, open, contentId, compact = false }: { model: CatalogLocalModel; radar?: boolean; open?: boolean; contentId?: string; compact?: boolean }) {
@@ -390,7 +394,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const session = useSession()
   const preference = useAtomValue(session.rankingPreference)
   const setPreference = useAtomSet(useMemo(() => Atom.fn((index: number) => session.setRankingPreference(index)), [session]))
-  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
+  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{localizedPageName(page, useI18n().t)}</h1>}<ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
   if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
   const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
@@ -653,10 +657,10 @@ function ThemeRow() {
   const save = useAtomSet(saveAppearance)
   const saving = useAtomValue(saveAppearance)
   const readError = useAtomValue(appearanceReadError)
-  return <SettingsRow label="Theme" alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
-    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label="Theme">
+  return <SettingsRow label={useI18n().t("theme")} alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
+    <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label={useI18n().t("theme")}>
       {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
-        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{value[0]!.toUpperCase() + value.slice(1)}</Button> })}
+        return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{useI18n().t(value)}</Button> })}
     </div>} />
 }
 /** The application that owns the service, and whether it supports a request. */
@@ -680,8 +684,8 @@ function LaunchAtLoginRow() {
     : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
     : "Starts in the background with its tray icon."
   const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title="Couldn’t update launch at login" description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title="Couldn’t check launch at login" description="Magnitude can’t confirm whether it will open when you sign in." /> : undefined
-  return <SettingsRow label="Launch at login" hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
-    control={current && <Switch aria-label="Launch at login" checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
+  return <SettingsRow label={useI18n().t("launchAtLogin")} hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
+    control={current && <Switch aria-label={useI18n().t("launchAtLogin")} checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
 }
 function ModelStorageRow() {
   const client = useAgentClient()
@@ -697,7 +701,7 @@ function ModelStorageRow() {
     <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={current ? Option.some(current.path) : Option.none()}
       title="Choose a folder for downloaded models" description="Folders on the computer running Magnitude." confirmLabel="Use this folder"
       onChoose={path => save({ path: Option.some(path) })} />
-    <SettingsRow label="Model storage" alert={!busy && failure ? <ErrorNotice title="The model folder wasn’t saved" description={Option.getOrElse(refusal, () => "Check that the folder is available and writable, then try again.")} /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved model folder can’t be used" description="Magnitude is using the default folder instead. Choose a folder the Magnitude service can write to." /> : undefined}
+    <SettingsRow label={useI18n().t("modelStorage")} alert={!busy && failure ? <ErrorNotice title="The model folder wasn’t saved" description={Option.getOrElse(refusal, () => "Check that the folder is available and writable, then try again.")} /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved model folder can’t be used" description="Magnitude is using the default folder instead. Choose a folder the Magnitude service can write to." /> : undefined}
       hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
       control={<>
         {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
@@ -755,7 +759,7 @@ function NetworkAccessRows() {
   const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
   return <>
     {disconnect.dialog}
-    <SettingsRow label="Network access" hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">Remote server guide<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
+    <SettingsRow label={useI18n().t("networkAccess")} hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300">Remote server guide<ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
       control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
@@ -786,10 +790,10 @@ function AutomaticUpdatesRow() {
   const snapshot = Result.isSuccess(observation) ? observation.value : null
   const preference = snapshot?.preference
   const closed = snapshot?.transfer._tag === "Closed"
-  return <SettingsRow label="Automatic updates"
+  return <SettingsRow label={useI18n().t("automaticUpdates")}
     hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
     alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
-    control={snapshot && <Switch aria-label="Automatic updates" checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
+    control={snapshot && <Switch aria-label={useI18n().t("automaticUpdates")} checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
 const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
 
@@ -857,7 +861,7 @@ function SignOutRow() {
   const signingOut = useAtomValue(action)
   return <SettingsRow label="Signed in from another device" hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
-    control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
+    control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>{useI18n().t("signOut")}</Button>} />
 }
 function LanguageRow() {
   const { language, setLanguage, t } = useI18n()
@@ -967,11 +971,12 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
   </div>
 }
 function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onNavigate?: () => void }) {
+  const { t } = useI18n()
   return <nav id="desktop-navigation" className="flex min-h-0 flex-1 flex-col gap-2 px-4">
     {(Object.keys(pageNames) as ApplicationPage[]).map(key => {
       const Icon = pageIcons[key]
-      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={pageNames[key]} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
-        <Icon className="size-4 shrink-0" />{pageNames[key]}
+      return <Button variant="ghost" key={key} disabled={!navigate} onClick={() => { navigate?.(key); onNavigate?.() }} aria-label={localizedPageName(key, t)} aria-current={page === key ? "page" : undefined} className={`h-10 gap-3 rounded-lg px-3 text-left text-sm font-medium justify-start ${key === "status" ? "mt-auto" : ""} ${page === key ? "bg-blue-50 text-blue-700 dark:bg-slate-800 dark:text-blue-400" : "hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+        <Icon className="size-4 shrink-0" />{localizedPageName(key, t)}
       </Button>
     })}
   </nav>
@@ -979,7 +984,7 @@ function Navigation({ page, navigate, onNavigate }: { page: ApplicationPage; nav
 /** Below `md`: a top bar that opens a navigation drawer over the page, closed by default. */
 function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
   return <header className="flex h-14 shrink-0 items-center gap-3 border-b border-slate-200 px-4 dark:border-slate-750" inert={open}>
-    <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label="Open navigation" aria-expanded={open} aria-controls="desktop-navigation" onClick={onOpen}>
+    <button type="button" className="inline-flex size-10 items-center justify-center rounded-md text-slate-600 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 dark:hover:bg-slate-800" aria-label={useI18n().t("openNavigation")} aria-expanded={open} aria-controls="desktop-navigation" onClick={onOpen}>
       <SidebarSimpleIcon className="size-5" />
     </button>
     <span className="flex items-center gap-2 font-heading text-base font-semibold"><MagnitudeMark className="h-7 w-7 shrink-0" />Magnitude</span>
@@ -987,8 +992,8 @@ function NarrowBar({ open, onOpen }: { open: boolean; onOpen: () => void }) {
 }
 function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; onClose: () => void }) {
   return <div className="fixed inset-0 z-50 flex" onKeyDown={event => { if (event.key === "Escape") onClose() }}>
-    <button type="button" aria-label="Close navigation" className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
-    <aside aria-label="Navigation" className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
+    <button type="button" aria-label={useI18n().t("closeNavigation")} className="absolute inset-0 cursor-default bg-black/45 dark:bg-black/70" onClick={onClose} />
+    <aside aria-label={useI18n().t("navigation")} className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
       <div className="mb-6 flex h-10 items-center justify-between px-4">
         <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
         <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
@@ -1005,7 +1010,7 @@ function DockedSidebar({ page, navigate, platform }: { page: ApplicationPage; na
   return <>
     {integratedControls && <div aria-hidden="true" data-window-drag-region style={{ left: sidebarWidth }} className="absolute right-0 top-0 z-50 h-8 select-none transition-[left] duration-250 ease-in-out motion-reduce:transition-none [-webkit-app-region:drag]" />}
     <div data-window-drag-region={integratedControls ? "" : undefined} style={{ width: collapsed ? (platform === "darwin" ? 128 : 64) : sidebarWidth }} className={`absolute left-0 top-0 z-50 flex h-[42px] items-center justify-end px-4 transition-[width] duration-250 ease-in-out motion-reduce:transition-none ${integratedControls ? "select-none [-webkit-app-region:drag]" : ""}`}>
-      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
+      <button type="button" className="inline-flex size-6 items-center justify-center rounded-sm text-slate-500 hover:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-100 [-webkit-app-region:no-drag]" aria-label={useI18n().t(collapsed ? "expandSidebar" : "collapseSidebar")} aria-expanded={!collapsed} aria-controls="desktop-navigation" onClick={() => setCollapsed(value => !value)}>
         <SidebarSimpleIcon className="size-5" />
       </button>
     </div>
