@@ -629,4 +629,9 @@ export const it = {
   runInProjectFolder: "Esegui questo in {shell} dalla cartella del progetto.",
   downloadCompatibleModel: "Scarica un modello compatibile per ottenere un comando per questo agente.",
   openClawTuiInstruction: "Con il gateway attivo, apri la TUI e inserisci questo comando per selezionare il modello della sessione corrente:",
+  turnOffNetworkDescription: "Questo browser è connesso tramite rete. Al prossimo riavvio di Magnitude, anche durante un aggiornamento automatico, l'accesso remoto verrà interrotto: questo browser e tutti gli altri dispositivi, app e agenti perderanno l'accesso. Solo chi usa il computer con Magnitude potrà riattivarlo.",
+  regenerateKeyDescription: "Al riavvio di Magnitude, la chiave attuale smetterà di funzionare. Uscirai da questo browser e ti servirà la nuova chiave per accedere di nuovo.",
+  stopRequiringKeyDescription: "Al riavvio di Magnitude, qualsiasi dispositivo che raggiunge questo computer potrà usare l'inferenza senza chiave. Fallo solo su una rete fidata. Questo browser avrà comunque bisogno della chiave per accedere.",
+  changeAddressDescription: "Al riavvio, Magnitude accetterà connessioni solo all'indirizzo scelto. Questo browser potrebbe non riuscire a riconnettersi.",
+  restartDisconnectDescription: "Questo browser verrà disconnesso durante il riavvio di Magnitude e si riconnetterà automaticamente.",
 } satisfies Partial<typeof en>
