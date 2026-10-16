@@ -74,7 +74,6 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
-const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 function T({ k }: { k: MessageKey }) { const { t } = useI18n(); return t(k) }
 const tr = (key: MessageKey) => translate(readLanguage(), key)
 function localizedPageName(page: ApplicationPage, t: (key: import("./i18n").MessageKey) => string) {
@@ -352,7 +351,7 @@ function Recommendations({ models, active, preference }: { models: readonly Cata
   if (!selected) return null
   return <section aria-label={tr("topRecommendations")} className="mb-8">
     <TooltipProvider><div className={pageLayout.recommendations}>
-      <div className={pageLayout.recommendationList} aria-label="Recommended models">{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelection({ preference, modelId: model.modelId })} className={`${pageLayout.recommendationRow} focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
+      <div className={pageLayout.recommendationList} aria-label={tr("recommendedModels")}>{models.map((model, rank) => <button key={model.modelId} type="button" aria-pressed={model.modelId === selected.modelId} onClick={() => setSelection({ preference, modelId: model.modelId })} className={`${pageLayout.recommendationRow} focus-visible:outline-2 focus-visible:outline-blue-500 ${model.modelId === selected.modelId ? "border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-slate-800" : "border-transparent hover:bg-slate-100 dark:hover:bg-slate-800"}`}>
         <span className="w-4 shrink-0 text-sm tabular-nums text-slate-500">{rank + 1}</span>
         <ModelLogo model={model} className="size-7" />
         <span className="flex min-w-0 flex-1 items-center text-sm font-medium">
@@ -423,13 +422,13 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   return <>
     {!discover && <>
       <div className={pageLayout.modelHeader}>
-        <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>
+        <h1 className={pageLayout.pageTitle}>{localizedPageName(page, tr)}</h1>
         <span className="text-sm tabular-nums text-slate-500" role="status">{visible.length} {visible.length === 1 ? "model" : "models"}</span>
       </div>
       <div className={pageLayout.catalogToolbar}>
         <div className="flex flex-wrap items-center gap-2">
           <Select items={filterOptions} value={filter} onValueChange={value => { if (value !== null) setFilter(value) }}>
-            <SelectTrigger aria-label="Filter models"><SelectValue /></SelectTrigger>
+            <SelectTrigger aria-label={tr("filterModels")}><SelectValue /></SelectTrigger>
             <SelectContent>{filterOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
           <Select value={lab} onValueChange={setLab}>
@@ -437,11 +436,11 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
             <SelectContent>{[<SelectItem key="any" value={null}><LabOption lab={null} /></SelectItem>, ...labOptions.map(option => <SelectItem key={option.name} value={option}><LabOption lab={option} /></SelectItem>)]}</SelectContent>
           </Select>
           <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
-            <SelectTrigger aria-label="Sort models"><span className="text-slate-500"><T k="sort" /></span><SelectValue /></SelectTrigger>
+            <SelectTrigger aria-label={tr("sortModels")}><span className="text-slate-500"><T k="sort" /></span><SelectValue /></SelectTrigger>
             <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
         </div>
-        <Input aria-label="Search models" placeholder="Search models…" className={pageLayout.modelSearch} value={search} onChange={event => setSearch(event.target.value)} />
+        <Input aria-label={tr("searchModels")} placeholder={tr("searchModelsPlaceholder")} className={pageLayout.modelSearch} value={search} onChange={event => setSearch(event.target.value)} />
       </div>
     </>}
     {discover && <HardwareOverview /> }
@@ -453,7 +452,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       : <Recommendations preference={preference} models={featuredCatalogModels(ranked, 5)} active={Option.fromNullable(active)} />)}
     {!discover && <>
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} hardware={Result.value(hardware)} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
-    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
+    {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "{tr("noModelsMatch")}"}</p>}
     </>}
     {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500"><T k="noRecommendations" /></p>}
   </>
@@ -536,7 +535,7 @@ function ModelStatus() {
   const stopping = useLocalModelStopStatus()
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
-  if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
+  if (Result.isInitial(models)) return <LoadingRegion label={tr("loadingModelStatus")} className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
   if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400"><T k="noModelLoaded" /></p></div>
   return <div className="mt-5">
     <div className="flex min-h-12 items-center justify-between gap-5">
@@ -684,9 +683,9 @@ function LaunchAtLoginRow() {
   const current = Result.isSuccess(state) ? state.value : null
   const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
   const hint = current?._tag === "Unavailable" ? current.message
-    : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
+    : current?._tag === "RequiresApproval" ? tr("startupSettingsEnable")
     : tr("startsInBackground")
-  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title={tr("couldNotUpdateLaunch")} description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title={tr("couldNotCheckLaunch")} description={tr("cannotConfirmSignIn")} /> : undefined
+  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title={tr("couldNotUpdateLaunch")} description=tr("startupSettingsCheck") /> : Result.isFailure(state) ? <ErrorNotice title={tr("couldNotCheckLaunch")} description={tr("cannotConfirmSignIn")} /> : undefined
   return <SettingsRow label={useI18n().t("launchAtLogin")} hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
     control={current && <Switch aria-label={useI18n().t("launchAtLogin")} checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
 }
@@ -702,7 +701,7 @@ function ModelStorageRow() {
   const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(error.message) : Option.none()) : Option.none<string>()
   return <>
     <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={current ? Option.some(current.path) : Option.none()}
-      title="Choose a folder for downloaded models" description={tr("modelFolderDescription")} confirmLabel={tr("useThisFolder")}
+      title={tr("chooseModelsFolder")} description={tr("modelFolderDescription")} confirmLabel={tr("useThisFolder")}
       onChoose={path => save({ path: Option.some(path) })} />
     <SettingsRow label={useI18n().t("modelStorage")} alert={!busy && failure ? <ErrorNotice title={tr("modelFolderNotSaved")} description={Option.getOrElse(refusal, () => tr("checkFolderWritable"))} /> : Result.isFailure(settings) ? <ErrorNotice title={tr("couldNotReadFolderSetting")} description={tr("runningServiceFolderUnchanged")} /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title={tr("savedFolderUnavailable")} description={tr("defaultFolderInstead")} /> : undefined}
       hint={current ? <span className="block truncate" title={current.path}>{tr("currentPathIs")} <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && ` (${tr("defaultLabel").toLowerCase()})`}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
@@ -730,8 +729,8 @@ function RestartRequiredToast() {
   const relaunch = () => disconnect.warn("Restart", () => restartApplication({}))
   const relaunching = useAtomValue(client.Application.RestartApplication)
   if (!storagePending && !networkPending) return null
-  const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
-    : storagePending ? tr("magnitudeStillPreviousFolder") : "Magnitude is still using the previous network settings."
+  const reason = storagePending && networkPending ? tr("previousModelNetworkSettings")
+    : storagePending ? tr("magnitudeStillPreviousFolder") : tr("previousNetworkSettings")
   return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
     {disconnect.dialog}
     <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
@@ -763,13 +762,13 @@ function NetworkAccessRows() {
   return <>
     {disconnect.dialog}
     <SettingsRow label={useI18n().t("networkAccess")} hint={current ? <>{tr("networkInference")} <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300"><T k="remoteServerGuide" /><ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
-      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title={tr("savedAddressInvalid")} description={tr("chooseAddressBelow")} /> : undefined}
+      alert={!busy && failure ? <ErrorNotice title={tr("networkSettingsNotSaved")} description={tr("previousSavedSettings")} /> : Result.isFailure(settings) ? <ErrorNotice title={tr("couldNotReadNetworkSettings")} description={tr("runningServiceNetworkSettingsUnchanged")} /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title={tr("savedAddressInvalid")} description={tr("chooseAddressBelow")} /> : undefined}
       control={current && <Switch aria-label={tr("networkAccess")} checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
       <SettingsRow nested label={tr("address")} hint={current.interfaces.length === 0 ? tr("noNetworkInterfaces") : tr("networkAddressHint")}
         control={<Select items={[{ value: ALL_INTERFACES, label: tr("allInterfaces") }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
           value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => value === ALL_INTERFACES || value === null ? update({ bind: Option.some<NetworkBind>({ _tag: "AllInterfaces" }) }) : disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>({ _tag: "Address", address: String(value) }) }))}>
-          <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
+          <SelectTrigger aria-label={tr("networkAddress")} className="min-w-56"><SelectValue /></SelectTrigger>
           <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}><T k="allInterfacesLabel" /></SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
       <SettingsRow nested label={tr("apiKey")} hint={current.requireApiKey ? tr("otherDevicesBearer") : tr("otherDevicesNoKey")}
@@ -862,7 +861,7 @@ function SignOutRow() {
   const action = useMemo(() => Atom.fn((_: void) => signOut(origin)), [origin])
   const run = useAtomSet(action)
   const signingOut = useAtomValue(action)
-  return <SettingsRow label={tr("signedInFromAnotherDevice")} hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
+  return <SettingsRow label={tr("signedInFromAnotherDevice")} hint={tr("thisBrowserControlsAt").replace("{host}", new URL(origin).host)}
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title={tr("couldNotSignOut")} description={tr("checkDeviceReach")} /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>{useI18n().t("signOut")}</Button>} />
 }
@@ -923,7 +922,7 @@ function CannotReachMagnitude() {
   const reconnect = useAtomSet(reconnectAction)
   const reconnecting = useAtomValue(reconnectAction)
   return <ErrorNotice className="mt-8" title={tr("cantReachMagnitude")}
-    description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
+    description={tr("pageCantConnectService")}
     actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}><T k="reconnect" /></NoticeAction>} />
 }
 /** Messages raised by Electron main while this window exists, such as a link that couldn't open. */
