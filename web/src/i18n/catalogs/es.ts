@@ -634,4 +634,8 @@ export const es: { [K in keyof typeof en]: string } = {
   capabilityProfile: "Perfil de capacidades de {name}",
   harnessModel: "Modelo de {name}",
   cacheNotReportedForRequests: "No informado en {count} solicitudes",
+  magnitudeCouldNotOpen: "Magnitude no se pudo abrir",
+  reloadWindowRestart: "Recarga esta ventana. Si sigue sin abrirse, reinicia Magnitude.",
+  quitAndReopen: "Cierra Magnitude y vuelve a abrirlo.",
+  savedAppearanceReadError: "No se pudo leer la apariencia guardada. Se usará la apariencia del sistema.",
 }
