@@ -635,4 +635,8 @@ export const ja = {
   capabilityProfile: "{name} の能力プロファイル",
   harnessModel: "{name} のモデル",
   cacheNotReportedForRequests: "{count} 件のリクエストでは報告されていません",
+  magnitudeCouldNotOpen: "Magnitude を開けませんでした",
+  reloadWindowRestart: "このウィンドウを再読み込みしてください。それでも開かない場合は Magnitude を再起動してください。",
+  quitAndReopen: "Magnitude を終了して、もう一度開いてください。",
+  savedAppearanceReadError: "保存した外観設定を読み取れませんでした。システムの外観を使用します。",
 } satisfies typeof en
