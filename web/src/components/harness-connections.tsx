@@ -50,7 +50,7 @@ export function HarnessConnections({ connections, busy, canConnect, onConnect, o
             </div>
           </div>
           <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-3">
-            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">{tr("includes")} <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">Pi extension<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
+            {installed && row.id === "pi" && row.plugin._tag === "Some" && <span className="text-sm text-slate-500">{tr("includes")} <a href="https://pi.dev/packages/@magnitudedev/pi-extension" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:underline">{tr("piExtension")}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a></span>}
             {installed ? <>{row.inspection._tag === "Connected"
               ? <ActionTooltip label={tr("refreshConnection")} trigger={<Button variant="ghost" size="icon-sm" aria-label={tr("refreshConnection")} disabled={busy || !canConnect} onClick={() => onConnect(row.id)}><ArrowClockwiseIcon aria-hidden="true" className="size-4" /></Button>} />
               : <Button disabled={busy || !canConnect} onClick={() => onConnect(row.id)}>{needsAttention ? tr("repairConnection") : tr("connect")}</Button>}{!needsAttention && (row.managed || row.inspection._tag === "Connected") && <Button variant="outline" disabled={busy} onClick={() => onDisconnect(row.id)}>{tr("disconnect")}</Button>}</>
