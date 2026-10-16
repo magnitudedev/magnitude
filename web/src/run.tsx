@@ -17,7 +17,7 @@ import { App, AppShell } from "./app"
 import { ModelsSkeleton } from "./components/page-skeletons"
 import { ErrorNotice } from "./components/error-notice"
 import { RemoteAccessProvider, SignIn } from "./remote-access"
-import { useI18n } from "./i18n"
+import { readLanguage, translate, useI18n } from "./i18n"
 
 export interface ApplicationEntry<E> {
   readonly host: ApplicationHost
@@ -68,7 +68,7 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
     window.addEventListener("beforeunload", () => { Runtime.runFork(runtime)(Scope.close(scope, Exit.void)) }, { once: true })
     const connection = yield* makeFirstPartyConnection(MagnitudeClient.layer({ origin, autoStart: false, reconnect: entry.reconnect }).pipe(Layer.provide(FetchHttpClient.layer))).pipe(Effect.provideService(Scope.Scope, scope))
     const client = createAgentClient(connection.client, { host: entry.host, navigation: entry.navigation })
-    const readError = Either.isLeft(appearance) ? useI18n().t("savedAppearanceReadError") : null
+    const readError = Either.isLeft(appearance) ? translate(readLanguage(), "savedAppearanceReadError") : null
     root.render(<RegistryProvider initialValues={[[appearanceReadError, readError]]}><AgentClientProvider tag={client}><ServiceConnectionProvider connection={connection.client.connection}><RemoteAccessProvider access={{ origin, canSignIn: entry.canSignIn, remote }}><SessionGate /></RemoteAccessProvider></ServiceConnectionProvider></AgentClientProvider></RegistryProvider>)
   })
   Effect.runPromise(boot).catch(error => {
