@@ -559,4 +559,8 @@ export const es: { [K in keyof typeof en]: string } = {
   pageCantConnectService: "Esta página no puede conectarse al servicio de Magnitude y sigue intentándolo. Comprueba que Magnitude se esté ejecutando en ese equipo y que este dispositivo pueda conectarse.",
   memoryUsageUnit: "memoria",
   thisBrowserControlsAt: "Este navegador controla Magnitude en {host}.",
+  switchToReplacementDescription: "Cambia a {name} para seguir recibiendo soporte.",
+  loadConfirmationTitle: "¿Cargar {name}?",
+  loadConfirmationDescription: "Al cargar {name}, se detendrá {replacing}.",
+  downloadWithSize: "Descargar ({size})",
 }
