@@ -1,6 +1,6 @@
 import type { en } from "./en"
 
-export const ko: { [K in keyof typeof en]: string } = {
+export const ko: Partial<typeof en> = {
   settings: "설정",
   general: "일반",
   about: "정보",
