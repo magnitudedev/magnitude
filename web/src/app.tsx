@@ -119,7 +119,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
       {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500"><T k="assessment" /></p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
       {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
         <p className="mb-1 flex items-center gap-1.5 font-medium"><T k="estimatedSpeed" /><SpeedInfo /></p>
-        <p className="text-sm tabular-nums">{performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength)}</p>
+        <p className="text-sm tabular-nums">{localizeModelText(performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength))}</p>
         <p className="mt-1 text-xs text-slate-500">{tr("speedEstimateNote")}</p>
       </div>}
       </div>
