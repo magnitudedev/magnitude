@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** Italian translations; remaining long-tail messages fall back to English. */
+/** Catalogo italiano completo; tutti i messaggi sono tradotti esplicitamente. */
 export const it = {
   settings: "Impostazioni",
   general: "Generale",
