@@ -601,4 +601,5 @@ export const es: { [K in keyof typeof en]: string } = {
   allInOne: "Todo en uno",
   server: "Servidor",
   graphicsCard: "Tarjeta gráfica",
+  piExtension: "Extensión de Pi",
 }
