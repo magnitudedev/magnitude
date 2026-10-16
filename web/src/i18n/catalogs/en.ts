@@ -491,4 +491,5 @@ export const en = {
   remoteCopyKeyIntro: "Copy the key from Network access in ",
   otherDeviceKeyIntro: "Other devices use the address and API key under Network access in ",
   turnOnNetworkIntro: "To use it from another device, turn on network access in ",
+  secondsWord: "seconds",
 } as const
