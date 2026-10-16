@@ -495,4 +495,9 @@ export const en = {
   noKeySetDescription: "On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one.",
   reloadPage: "Then reload this page.",
   changeAddress: "Change address",
+  go: "Go",
+  couldNotOpenFolder: "Couldn’t open this folder",
+  checkFolderRead: "Check that it exists and that Magnitude can read it.",
+  parentFolder: "Parent folder",
+  noFoldersInside: "No folders inside",
 } as const
