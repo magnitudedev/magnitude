@@ -642,4 +642,10 @@ export const ko: Partial<typeof en> = {
   reloadWindowRestart: "이 창을 다시 로드하세요. 그래도 열리지 않으면 Magnitude를 다시 시작하세요.",
   quitAndReopen: "Magnitude를 종료한 후 다시 여세요.",
   savedAppearanceReadError: "저장된 모양을 읽을 수 없습니다. 시스템 모양을 사용합니다.",
+  on: "켜짐",
+  off: "꺼짐",
+  request: "요청",
+  appearanceCouldNotBeSaved: "이 브라우저에서 모양 설정을 저장할 수 없습니다.",
+  computer: "컴퓨터",
+  laptopTablet: "노트북 / 태블릿",
 }
