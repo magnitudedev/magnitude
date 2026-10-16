@@ -38,7 +38,7 @@ describe("i18n catalogs", () => {
   })
 
   test("preserves interpolation placeholders in every locale", () => {
-    const placeholders = (message: string) => [...message.matchAll(/\\{[A-Za-z0-9_]+\\}/g)].map(match => match[0]).sort()
+    const placeholders = (message: string) => [...message.matchAll(/\{[A-Za-z0-9_]+\}/g)].map(match => match[0]).sort()
     for (const key of Object.keys(en) as Array<keyof typeof en>) {
       expect(placeholders(es[key]), `Spanish placeholders: ${key}`).toEqual(placeholders(en[key]))
       expect(placeholders(zhCN[key]), `Chinese placeholders: ${key}`).toEqual(placeholders(en[key]))
