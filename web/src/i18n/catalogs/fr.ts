@@ -635,4 +635,8 @@ export const fr = {
   capabilityProfile: "Profil des capacités de {name}",
   harnessModel: "Modèle de {name}",
   cacheNotReportedForRequests: "Non signalé pour {count} requêtes",
+  magnitudeCouldNotOpen: "Magnitude n’a pas pu s’ouvrir",
+  reloadWindowRestart: "Rechargez cette fenêtre. Si elle ne s’ouvre toujours pas, redémarrez Magnitude.",
+  quitAndReopen: "Quittez Magnitude et ouvrez-le à nouveau.",
+  savedAppearanceReadError: "L’apparence enregistrée n’a pas pu être lue. L’apparence du système sera utilisée.",
 } satisfies typeof en
