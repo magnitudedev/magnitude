@@ -628,4 +628,9 @@ export const ja = {
   runInProjectFolder: "プロジェクトフォルダーで {shell} を使ってこれを実行してください。",
   downloadCompatibleModel: "このエージェント用のコマンドを取得するには、互換モデルをダウンロードしてください。",
   openClawTuiInstruction: "ゲートウェイの起動中に TUI を開き、現在のセッションのモデルを選択するために次を入力してください:",
+  turnOffNetworkDescription: "このブラウザーはネットワーク経由で接続されています。次回 Magnitude を再起動すると、自動更新時も含めてリモートアクセスが停止し、このブラウザーや他のすべてのデバイス、アプリ、エージェントがアクセスできなくなります。再度有効にできるのは Magnitude を実行しているコンピューター上のユーザーだけです。",
+  regenerateKeyDescription: "Magnitude を再起動すると、現在のキーは使えなくなります。このブラウザーからサインアウトされ、再度サインインするには新しいキーが必要です。",
+  stopRequiringKeyDescription: "Magnitude を再起動すると、このコンピューターに接続できるすべてのデバイスがキーなしで推論を利用できます。信頼できるネットワークでのみ有効にしてください。このブラウザーへのサインインには引き続きキーが必要です。",
+  changeAddressDescription: "Magnitude を再起動すると、選択したアドレスでのみ接続を受け付けます。このブラウザーが再接続できなくなる場合があります。",
+  restartDisconnectDescription: "Magnitude の再起動中、このブラウザーは切断され、その後自動的に再接続します。",
 } satisfies Partial<typeof en>
