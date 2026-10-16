@@ -1,10 +1,10 @@
 import { Context, Effect, Layer, ParseResult, Schema, Stream } from "effect"
-import { IcnCatalog, IcnDiscovery, type IcnDiscoveryService } from "@magnitudedev/icn"
+import { IcnCatalog, IcnLocalModels, type IcnLocalModelsService } from "@magnitudedev/icn"
 import {
   CatalogFormModelIdSchema,
-  HuggingFaceFormModelIdSchema,
+  CustomFormModelIdSchema,
 } from "@magnitudedev/acn-protocol"
-import type { CatalogModel, DiscoveredModel } from "@magnitudedev/icn-protocol/schemas"
+import type { CatalogModel, CustomModel, UnsupportedLocalModel } from "@magnitudedev/icn-protocol/schemas"
 import { materializeProjection } from "./materialized-projection"
 
 export interface CatalogModelSource {
@@ -12,23 +12,25 @@ export interface CatalogModelSource {
   readonly source: Omit<CatalogModel, "id">
 }
 
-export interface DiscoveredModelSource {
-  readonly id: typeof HuggingFaceFormModelIdSchema.Type
-  readonly source: Omit<DiscoveredModel, "id">
+export interface CustomModelSource {
+  readonly id: typeof CustomFormModelIdSchema.Type
+  readonly source: Omit<CustomModel, "modelId">
 }
 
 export interface LocalModelSourcesState {
   readonly catalogRevision: number
-  readonly discoveryRevision: number
+  readonly localModelsRevision: number
   readonly reconciliationComplete: boolean
   readonly catalogModels: readonly CatalogModelSource[]
-  readonly discoveredModels: readonly DiscoveredModelSource[]
+  readonly customModels: readonly CustomModelSource[]
+  readonly hiddenModels: readonly CustomModelSource[]
+  readonly unsupported: readonly UnsupportedLocalModel[]
 }
 
 export interface LocalModelSourcesApi {
   readonly state: Effect.Effect<LocalModelSourcesState>
   readonly changes: Stream.Stream<LocalModelSourcesState>
-  readonly refreshDiscovery: IcnDiscoveryService["reconcile"]
+  readonly refreshLocalModels: IcnLocalModelsService["reconcile"]
 }
 
 export class LocalModelSources extends Context.Tag("LocalModelSources")<LocalModelSources, LocalModelSourcesApi>() {}
@@ -36,39 +38,48 @@ export class LocalModelSources extends Context.Tag("LocalModelSources")<LocalMod
 const catalogModelId = (value: string): Effect.Effect<typeof CatalogFormModelIdSchema.Type, ParseResult.ParseError> =>
   Schema.decodeUnknown(CatalogFormModelIdSchema)(value)
 
-const discoveredModelId = (value: string): Effect.Effect<typeof HuggingFaceFormModelIdSchema.Type, ParseResult.ParseError> =>
-  Schema.decodeUnknown(HuggingFaceFormModelIdSchema)(value)
+/** A row whose identity the protocol cannot carry is a native contract defect; it is logged, not fatal. */
+const customModelSources = (models: readonly CustomModel[]): Effect.Effect<readonly CustomModelSource[]> =>
+  Effect.forEach(models, ({ modelId, ...source }) =>
+    Schema.decodeUnknown(CustomFormModelIdSchema)(modelId).pipe(
+      Effect.map((id): readonly CustomModelSource[] => [{ id, source }]),
+      Effect.catchAll(() => Effect.logWarning("ICN published a custom model with a non-canonical ID").pipe(
+        Effect.annotateLogs({ modelId }),
+        Effect.as([]),
+      )),
+    )).pipe(Effect.map((rows) => rows.flat()))
 
-export const LocalModelSourcesLive: Layer.Layer<LocalModelSources, never, IcnCatalog | IcnDiscovery> =
+export const LocalModelSourcesLive: Layer.Layer<LocalModelSources, never, IcnCatalog | IcnLocalModels> =
   Layer.scoped(LocalModelSources, Effect.gen(function* () {
     const catalog = yield* IcnCatalog
-    const discovery = yield* IcnDiscovery
-    const project = Effect.all({ catalog: catalog.get, discovery: discovery.get }).pipe(
-      Effect.flatMap(({ catalog, discovery }) => Effect.all({
+    const localModels = yield* IcnLocalModels
+    const project = Effect.all({ catalog: catalog.get, local: localModels.get }).pipe(
+      Effect.flatMap(({ catalog, local }) => Effect.all({
         catalogModels: Effect.forEach(catalog.state.models, ({ id, ...source }) => catalogModelId(id).pipe(
           Effect.map((id): CatalogModelSource => ({ id, source })),
         )),
-        discoveredModels: Effect.forEach(discovery.state.models, ({ id, ...source }) => discoveredModelId(id).pipe(
-          Effect.map((id): DiscoveredModelSource => ({ id, source })),
-        )),
-      }).pipe(Effect.map(({ catalogModels, discoveredModels }): LocalModelSourcesState => ({
+        customModels: customModelSources(local.state.models),
+        hiddenModels: customModelSources(local.state.hidden),
+      }).pipe(Effect.map(({ catalogModels, customModels, hiddenModels }): LocalModelSourcesState => ({
         catalogRevision: catalog.state.revision,
-        discoveryRevision: discovery.state.revision,
-        reconciliationComplete: catalog.state.reconciliationComplete && discovery.state.reconciliationComplete,
+        localModelsRevision: local.state.revision,
+        reconciliationComplete: catalog.state.reconciliationComplete && local.state.reconciliationComplete,
         catalogModels,
-        discoveredModels,
+        customModels,
+        hiddenModels,
+        unsupported: local.state.unsupported,
       })))),
       Effect.orDie,
     )
     const projection = yield* materializeProjection({
       project,
-      invalidations: Stream.merge(catalog.changes, discovery.changes),
+      invalidations: Stream.merge(catalog.changes, localModels.changes),
       equivalent: (left, right) => left.catalogRevision === right.catalogRevision
-        && left.discoveryRevision === right.discoveryRevision,
+        && left.localModelsRevision === right.localModelsRevision,
     })
     return LocalModelSources.of({
       state: projection.get,
       changes: projection.changes,
-      refreshDiscovery: discovery.reconcile,
+      refreshLocalModels: localModels.reconcile,
     })
   }))

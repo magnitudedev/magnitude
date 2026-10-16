@@ -16,10 +16,14 @@ export const localModelsFromCatalog = (catalog: ModelCatalogState): LocalModelsS
           assessment: { complete: false, settledModels: 0, totalModels: 0 },
         },
         models: [],
+        unsupported: [],
+        hidden: [],
       }
     : {
         preparation: catalog.localModelPreparation,
         models: catalog.models.flatMap((entry) => entry._tag === "Local" ? [entry.product] : []),
+        unsupported: catalog.unsupportedLocalModels,
+        hidden: catalog.hiddenLocalModels,
       }
 
 export const providerCatalogFromCatalog = (

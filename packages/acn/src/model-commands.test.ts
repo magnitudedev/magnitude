@@ -1,6 +1,15 @@
 import { Effect, Fiber, Option, Schema, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import { modelCommandFailure, type ModelCommandsApi } from "./model-commands"
+import { CustomModelCommands, type CustomModelCommandsApi } from "./custom-model-commands"
+
+const customCalls: string[] = []
+const customCommands = {
+  remove: (modelId: string) => Effect.sync(() => { customCalls.push(`custom remove ${modelId}`); return {} }),
+  sync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom sync ${modelId}`); return { outcome: "Started" as const } }),
+  cancelSync: (modelId: string) => Effect.sync(() => { customCalls.push(`custom cancel ${modelId}`); return {} }),
+  acknowledgeSyncFailure: (modelId: string) => Effect.sync(() => { customCalls.push(`custom acknowledge ${modelId}`); return {} }),
+} as unknown as CustomModelCommandsApi
 
 describe("modelCommandFailure", () => {
   it("preserves the server's structured remote failure details", () => {
@@ -64,6 +73,7 @@ it("retries active and slot Stop against the exact stopping instance", async () 
     yield* commands.stopSlot(PRIMARY_SLOT_ID)
   }).pipe(
     Effect.provide(ModelCommandsLive),
+    Effect.provideService(CustomModelCommands, customCommands),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
     Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { stopped.push(path.instance_id); return {} }) } } as never),
     Effect.provideService(ModelSlotController, { state: Effect.succeed({ slots: { primary: { _tag: "ConfiguredLocal", selection: { providerModelId: "model-a:gguf:test" } } } }) } as never),
@@ -78,7 +88,6 @@ it("stops a running model before removing it, and removes an idle model without 
   const { Effect, Schema } = await import("effect")
   const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations } = await import("@magnitudedev/icn")
   const { ModelInstancesSnapshot } = await import("@magnitudedev/icn-protocol/schemas")
-  const { CatalogFormModelIdSchema } = await import("@magnitudedev/acn-protocol")
   const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
   const { ModelSlotController } = await import("./model-slot-controller")
   const { LocalModelRemovals } = await import("./local-model-removals")
@@ -87,11 +96,13 @@ it("stops a running model before removing it, and removes an idle model without 
     id: "loaded-instance", modelId: "model-a:gguf:test",
     lifecycle: { _tag: "Loading", fraction: 0.5, stage: "loading_weights" },
   }] })
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
   const remove = (model: string) => Effect.gen(function* () {
     const commands = yield* ModelCommands
-    yield* commands.remove(Schema.decodeUnknownSync(CatalogFormModelIdSchema)(model))
+    yield* commands.remove(Schema.decodeUnknownSync(ModelIdSchema)(model))
   }).pipe(
     Effect.provide(ModelCommandsLive),
+    Effect.provideService(CustomModelCommands, customCommands),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
     Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { calls.push(`stop ${path.instance_id}`); return {} }) } } as never),
     Effect.provideService(LocalModelRemovals, { remove: (modelId: string) => Effect.sync(() => { calls.push(`remove ${modelId}`); return {} }) } as never),
@@ -101,7 +112,9 @@ it("stops a running model before removing it, and removes an idle model without 
   )
   await Effect.runPromise(remove("model-a:gguf:test"))
   await Effect.runPromise(remove("model-b:gguf:test"))
+  await Effect.runPromise(remove("hf:owner/repo/model-Q4_K_M.gguf"))
   expect(calls).toEqual(["stop loaded-instance", "remove model-a:gguf:test", "remove model-b:gguf:test"])
+  expect(customCalls).toContain("custom remove hf:owner/repo/model-Q4_K_M.gguf")
 })
 
 describe("load acknowledgement", () => {
@@ -119,6 +132,8 @@ describe("load acknowledgement", () => {
         Effect.flatMap(use),
         Effect.either,
         Effect.provide(ModelCommandsLive),
+        Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(CustomModelCommands, customCommands),
         Effect.provideService(IcnInstances, { get: SubscriptionRef.get(instances), changes: instances.changes } as never),
         Effect.provideService(IcnClient, { models: { ensureModelInstance: ({ payload }: { payload: { modelId: string } }) => ensure(payload.modelId) } } as never),
         Effect.provideService(ModelSlotController, {

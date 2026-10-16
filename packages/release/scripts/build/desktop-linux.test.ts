@@ -6,7 +6,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { gunzipSync } from "node:zlib"
 import { describe, expect, it } from "vitest"
-import { buildLinuxDesktopInstaller, mtreeFileModes, preferLightTrashHelper, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxPolkitPolicy, validatePacmanMetadataModes } from "./desktop-linux"
+import { buildLinuxDesktopInstaller, linuxDesktopEntry, mtreeFileModes, preferLightTrashHelper, validateLinuxPayloadPermissions, validateLinuxSystemFiles, validateLinuxPolkitPolicy, validatePacmanMetadataModes } from "./desktop-linux"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 import { linuxDesktopInstaller } from "../../src/targets"
 
@@ -44,6 +44,21 @@ describe("Linux package publisher-trust protection", () => {
     ["deb", ""], ["rpm", ""], ["pacman", ""],
   ] as const)("rejects unprotected or missing %s payload: %s", async (format, listing) => {
     await expect(Effect.runPromise(validateLinuxPayloadPermissions(format, listing))).rejects.toThrow("root-owned")
+  })
+})
+
+describe("Linux desktop entry", () => {
+  it("handles magnitude:// links and passes the link to the launcher", () => {
+    const lines = linuxDesktopEntry.split("\n")
+    expect(lines).toContain("Exec=magnitude-desktop %u")
+    expect(lines).toContain("MimeType=x-scheme-handler/magnitude;")
+  })
+  it("refreshes the desktop database after an RPM installs or removes the entry", () => {
+    const spec = readFileSync(join(import.meta.dirname, "../../resources/linux/desktop.spec.ejs"), "utf8")
+    for (const section of ["%post\n", "%postun\n"]) {
+      const body = spec.slice(spec.indexOf(section), spec.indexOf("\n%", spec.indexOf(section) + 1))
+      expect(body).toContain("@MAGNITUDE_REFRESH_DESKTOP_DATABASE@")
+    }
   })
 })
 
@@ -229,6 +244,7 @@ describe.skipIf(process.platform !== "linux" || !hasBsdtar)("pacman package asse
       expect(mtree).toMatch(/^\.\/usr\/lib\/magnitude-desktop\/chrome-sandbox .*mode=4755/m)
       expect(mtree).not.toMatch(/sudoers/)
       expect(read(".INSTALL").toString()).toContain("rm -f /etc/sudoers.d/magnitude")
+      expect(read("usr/share/applications/magnitude-desktop.desktop").toString()).toBe(linuxDesktopEntry)
       expect(read("usr/lib/systemd/system/magnitude.service").toString()).toContain("ExecStart=/usr/bin/env /usr/lib/magnitude-desktop/resources/magnitude serve")
       expect(read("usr/share/polkit-1/actions/dev.magnitude.update.policy").toString()).toContain("<allow_active>yes</allow_active>")
       expect(read("usr/lib/magnitude-desktop/resources/magnitude-install-update").toString()).toContain("_install-application-update")

@@ -249,3 +249,37 @@ export const LocalInferenceError = Schema.Union(
   ModelSlotMutationFailed,
 )
 export type LocalInferenceError = Schema.Schema.Type<typeof LocalInferenceError>
+
+/** A Hugging Face link, repository, version, drafter reference, or local path that names nothing usable. */
+export class InvalidModelReference extends Schema.TaggedError<InvalidModelReference>()(
+  "InvalidModelReference",
+  { reference: Schema.String, message: Schema.String },
+) {}
+
+/** Hugging Face or a local file could not be read; `retryable` when the cause may clear. */
+export class ModelSourceUnavailable extends Schema.TaggedError<ModelSourceUnavailable>()(
+  "ModelSourceUnavailable",
+  { message: Schema.String, retryable: Schema.Boolean },
+) {}
+
+export const ModelCandidateError = Schema.Union(
+  InvalidModelReference,
+  ModelSourceUnavailable,
+)
+export type ModelCandidateError = Schema.Schema.Type<typeof ModelCandidateError>
+
+export const CustomModelMutationError = Schema.Union(
+  InvalidModelReference,
+  ModelSourceUnavailable,
+  LocalModelMutationFailed,
+)
+export type CustomModelMutationError = Schema.Schema.Type<typeof CustomModelMutationError>
+
+export const ModelLocationError = Schema.Union(
+  InvalidDirectoryPath,
+  DirectoryNotFound,
+  DirectoryAccessDenied,
+  PathNotDirectory,
+  LocalModelMutationFailed,
+)
+export type ModelLocationError = Schema.Schema.Type<typeof ModelLocationError>

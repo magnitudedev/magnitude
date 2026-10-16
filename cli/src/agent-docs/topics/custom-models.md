@@ -1,0 +1,77 @@
+# Custom models
+
+Magnitude runs any GGUF whose model family the engine has kernels for, not only catalog models:
+other quantizations, finetunes, merges, and abliterated or uncensored versions. Models come from
+three places:
+
+- **Hugging Face, through Magnitude.** `catalog pull owner/repo[:QUANT]` downloads into Magnitude's
+  own store. `catalog remove` deletes that copy.
+- **A GGUF file.** `models import <path.gguf>` uses the file where it is. Magnitude never moves or
+  deletes it; `catalog remove` only forgets it.
+- **Found on this computer.** The Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and
+  folders you add are scanned for GGUFs. These files belong to their apps; `models hide` hides a
+  model without touching its files.
+
+Model IDs are `hf:<owner>/<repo>/<file>` when a model has a Hugging Face identity and
+`local:<header digest>` otherwise. The same bytes found in two places are one model.
+
+## Find and add a model
+
+```text
+magnitude catalog search "Qwen3.6 35B-A3B"
+magnitude catalog inspect HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive
+magnitude catalog pull HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:Q4_K_P
+magnitude models status <model-id>
+magnitude models load <model-id>
+```
+
+`catalog search` lists only repositories whose architecture Magnitude runs, with the uploader, the
+catalog model each is a variant of, and downloads. A footer counts the results it hid; `--all`
+lists them with the reason. `catalog show <model-id>` prints the search that finds other versions
+of a catalog model.
+
+`catalog inspect` accepts a huggingface.co link, `owner/repo`, `owner/repo:QUANT`, or a local GGUF
+path, and changes nothing. It lists every version with its size and the engine's verdict for this
+computer (`Fits`, `Too large`, or `Unsupported:` with the reason), marks the recommended version and
+any version already on this computer, then lists drafter choices and the exact command to download.
+
+`catalog pull` with no quant picks the recommended version and says so. It pins the repository's
+current commit and prints the model ID. If that version is already on this computer, only the
+drafter downloads. A catalog model ID keeps working exactly as before. A custom model ID updates
+that model: an added model to its repository's newer commit, and any model to a newer revision of
+its catalog drafter.
+
+## Drafters
+
+Every model that runs gets the best drafter known to work with it, from any source. The choices, in
+order: the catalog drafter trained for the matching catalog model, MTP heads built into the model,
+drafter files next to the model, drafters already on this computer, drafters on Hugging Face for the
+same base model, and any drafter you name. The first one the engine binds is preselected.
+
+`--drafter` on `catalog pull` and `models import`, and `models drafter <model-id> <drafter>`, take:
+
+- `auto`: the preselected drafter (the default);
+- `none`: no drafter;
+- `built-in`: MTP heads inside the model;
+- a catalog model ID, which uses that model's drafter;
+- a Hugging Face reference (`owner/repo` or `owner/repo/path.gguf`) or a local GGUF path.
+
+A drafter the engine rejects for the model is refused with the reason. One whose lineage doesn't
+match is allowed and marked untested. Catalog models keep the drafter Magnitude ships with them, so
+`models drafter` refuses them. `models status <model-id>` shows the drafter in use, the measured
+share of drafted tokens accepted once the model has served requests, and every choice with its
+verdict, its measured acceptance, and the argument that selects it. A choice that made responses
+slower than no drafter is marked. When a catalog drafter gets a new revision, `models status` shows
+Update for every model using it; `catalog pull <model-id>` downloads it.
+
+## What's on this computer
+
+`models status` lists catalog models on this computer and every custom model with its source, then
+counts the models that can't run in Magnitude and hidden models. `--all` lists both: models that
+can't run with a plain reason, such as "No kernels for the deepseek4 architecture" or "Uses IQ1_M
+weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`. `models unhide`
+shows a hidden model again.
+
+`models folders list` shows the automatic locations Magnitude found, whether each is scanning, off,
+or not found, and your own folders. `models folders add <path>` watches a folder: GGUFs added later
+appear and deleted ones disappear. `models folders remove <path>` stops watching it.

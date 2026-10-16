@@ -61,6 +61,8 @@ export const projectModelCatalog = (
     models,
     failures,
     localModelPreparation: local.preparation,
+    unsupportedLocalModels: local.unsupported,
+    hiddenLocalModels: local.hidden,
   }
   if (failures.length > 0) return { _tag: "Degraded", ...fields }
   if (providers._tag === "Loading" || providers._tag === "Refreshing" || !local.preparation.discovery.complete) {

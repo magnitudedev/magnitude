@@ -58,4 +58,11 @@ describe("desktop failure presentation", () => {
     expect(html).not.toContain('href=')
     expect(html).not.toContain("truncate")
   })
+  it("words drafter, hide, and unhide failures without service text", () => {
+    const rejection = Option.some(new LocalModelMutationFailed({ code: "unknown", message: "PRIVATE", retryable: true }))
+    expect(modelCommandNotice({ operation: "drafter", rejection }).title).toBe("The drafter wasn’t changed")
+    expect(modelCommandNotice({ operation: "hide", rejection }).title).toBe("Couldn’t hide this model")
+    expect(modelCommandNotice({ operation: "unhide", rejection }).title).toBe("Couldn’t show this model again")
+    for (const operation of ["drafter", "hide", "unhide"] as const) expect(JSON.stringify(modelCommandNotice({ operation, rejection }))).not.toContain("PRIVATE")
+  })
 })

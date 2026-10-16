@@ -4,43 +4,71 @@ import {
   LocalModelAssessmentSchema,
   LocalModelDoesNotFitAssessmentSchema,
   CatalogLocalModelSchema,
-  DiscoveredLocalModelSchema,
-  LocalModelPresentationSchema,
+  CatalogFormModelIdSchema,
+  CustomLocalModelSchema,
+  CustomModelOriginSchema,
+  DrafterVerdictSchema,
   ModelReleaseDateSchema,
   ModelVariantLabelSchema,
   ModelCapabilitiesSchema,
+  UnsupportedLocalModelSchema,
+  customModelSourceLabel,
   parseModelId,
+  type AttachedDrafter,
+  type CustomLocalModel,
+  type CustomLocalModelServingState,
+  type CustomModelAcquisitionState,
+  type CustomModelOrigin,
+  type DrafterReference,
+  type DrafterVerdict,
   type LocalModelAcquisitionState,
   type CatalogLocalModelServingState,
-  type DiscoveredLocalModelServingState,
   type LocalModelRankingScores,
   type LocalModelAssessment,
   type LocalModel,
   type LocalModelsState,
   type LocalModelPreparation,
+  type MeasuredDrafterAcceptance,
   type ModelId,
   type ModelFailure,
   type ModelResidency,
+  type ResolvedModelInstallation,
+  type UnsupportedLocalModel,
 } from "@magnitudedev/acn-protocol"
-import { IcnCatalogInstallations, IcnInstances, IcnModelAssessments } from "@magnitudedev/icn"
+import { IcnCatalogInstallations, IcnDownloads, IcnInstances, IcnModelAssessments } from "@magnitudedev/icn"
 import { projectInferenceLoadDevice, projectInferenceResidency } from "@magnitudedev/acn-protocol"
 import type {
   CatalogInstallationOperation,
   CatalogModel,
   CatalogModelUpdate,
+  ModelDownload,
+  DrafterVerdict as NativeDrafterVerdict,
   ModelAssessment,
   ModelAssessmentDomainSnapshot,
   ModelAssessmentsSnapshot,
   ModelCapabilities,
   ModelInstance,
   ReadyModel,
+  UnsupportedLocalModel as NativeUnsupportedLocalModel,
 } from "@magnitudedev/icn-protocol/schemas"
+import type { CustomModelsConfig } from "@magnitudedev/storage"
 import {
   LocalModelSources,
   type CatalogModelSource,
-  type DiscoveredModelSource,
+  type CustomModelSource,
   type LocalModelSourcesState,
 } from "./local-model-sources"
+import { CustomModels } from "./custom-models"
+import { ServingUsage, type DrafterAcceptanceMeasurement } from "./serving-usage"
+import { drafterReferenceKey, productDrafterCandidate, productDrafterReference } from "./drafter-references"
+import {
+  acquisitionFailure,
+  currentDownload,
+  customModelDownloads,
+  downloadIsActive,
+  transferProgress,
+  type RelatedDownload,
+} from "./custom-model-downloads"
 import { materializeProjection } from "./materialized-projection"
 import { modelRankingScores } from "./local-model-ranking-policy"
 import { LocalModelRemovals, type LocalModelRemovalState } from "./local-model-removals"
@@ -71,16 +99,16 @@ export const projectLocalModelPreparation = (
 ): LocalModelPreparation => {
   const discovery = {
     complete: source.reconciliationComplete,
-    modelsFound: source.discoveredModels.length,
+    modelsFound: source.customModels.length,
   }
   const catalog = assessmentDomainProgress(assessments.catalog, source.catalogRevision)
-  const discovered = assessmentDomainProgress(assessments.discovered, source.discoveryRevision)
+  const custom = assessmentDomainProgress(assessments.custom, source.localModelsRevision)
   return {
     discovery,
     assessment: {
-      complete: catalog.complete && discovered.complete,
-      settledModels: catalog.settledModels + discovered.settledModels,
-      totalModels: catalog.totalModels + discovered.totalModels,
+      complete: catalog.complete && custom.complete,
+      settledModels: catalog.settledModels + custom.settledModels,
+      totalModels: catalog.totalModels + custom.totalModels,
     },
   }
 }
@@ -91,6 +119,7 @@ type CoordinatedLocalModelAssessment =
       readonly _tag: "Assessed"
       readonly assessment: LocalModelAssessment
       readonly capabilities: ModelCapabilities
+      readonly drafter: DrafterVerdict | undefined
     }
   | { readonly _tag: "Dropped" }
 
@@ -100,7 +129,11 @@ export const assessmentTargetVisible = (
   assessment: CoordinatedLocalModelAssessment | undefined,
 ): assessment is VisibleCoordinatedLocalModelAssessment | undefined => assessment?._tag !== "Dropped"
 
-const projectAssessment = (environmentId: string, assessment: ModelAssessment): LocalModelAssessment => {
+/** Engine reasons in product form; an empty list still states that the model cannot run. */
+const productReasons = (reasons: readonly unknown[], detail: string) =>
+  reasons.length > 0 ? reasons : [{ _tag: "Unknown", kind: "Unknown", detail }]
+
+export const projectAssessment = (environmentId: string, assessment: ModelAssessment): LocalModelAssessment => {
   if (assessment._tag === "Fits") {
     const totalRequiredBytes = assessment.memory.reduce((total, item) => total + item.requiredBytes, 0)
     const requiredSystemMemoryBytes = assessment.memory.filter((item) => item.memoryDomainId === "system")
@@ -124,14 +157,15 @@ const projectAssessment = (environmentId: string, assessment: ModelAssessment): 
     })
   }
   return Schema.decodeUnknownSync(LocalModelAssessmentSchema)({
-    _tag: "Unsupported", environmentId, profile: assessment.profile, failure: assessment.failure,
+    _tag: "Unsupported", environmentId, profile: assessment.profile,
+    reasons: productReasons(assessment.reasons, assessment.detail), detail: assessment.detail,
   })
 }
 
 export const coordinatedAssessment = (
   snapshot: ModelAssessmentsSnapshot,
   sourceRevision: number,
-  source: "catalog" | "discovered",
+  source: "catalog" | "custom",
   modelId: ModelId,
 ): CoordinatedLocalModelAssessment | undefined => {
   const domain: ModelAssessmentDomainSnapshot = snapshot[source]
@@ -146,8 +180,14 @@ export const coordinatedAssessment = (
         _tag: "Assessed",
         assessment: projectAssessment(snapshot.environmentId, assessment),
         capabilities: entry.state.capabilities,
+        drafter: assessment._tag === "Unsupported" ? undefined : productDrafterVerdict(assessment.drafter),
       }
 }
+
+export const productDrafterVerdict = (verdict: NativeDrafterVerdict): DrafterVerdict | undefined =>
+  Option.getOrUndefined(Schema.decodeUnknownOption(DrafterVerdictSchema)(
+    verdict._tag === "Rejected" ? { ...verdict, reasons: productReasons(verdict.reasons, verdict.detail) } : verdict,
+  ))
 
 const residencyFor = (modelId: string, instances: readonly ModelInstance[]): ModelResidency => {
   const instance = instances.findLast((candidate) => candidate.modelId === modelId)
@@ -164,13 +204,20 @@ const progress = (operation: CatalogInstallationOperation) => {
   }
 }
 
+type NativeInstallation = Extract<CatalogModel["localState"], { readonly _tag: "Installed" }>["installation"]
+
+export const productInstallation = (installation: NativeInstallation) => installation._tag === "Resolved"
+  ? { _tag: "Resolved" as const, installedBytes: installation.installedBytes, primaryPath: installation.primaryPath,
+      ownership: installation.ownership }
+  : { _tag: "Unresolved" as const, installedBytes: installation.installedBytes, ownership: installation.ownership }
+
 export const catalogAcquisition = (
   model: Omit<CatalogModel, "id">,
   operation: CatalogInstallationOperation | undefined,
   residencyState: ModelResidency,
 ): LocalModelAcquisitionState => {
   const installed = model.localState._tag === "Installed"
-    ? { installation: model.localState.installation, residencyState }
+    ? { installation: productInstallation(model.localState.installation), residencyState }
     : undefined
   if (operation?.state._tag === "Pending" || operation?.state._tag === "Running") {
     const transfer = progress(operation)!
@@ -227,21 +274,6 @@ export const catalogModelServingState = (
     // The service never reports a catalog model as Unsupported; validation rejects that contract violation.
     : { _tag: "Assessed", ...assessed,
         assessment: Schema.validateSync(LocalModelDoesNotFitAssessmentSchema)(assessment.assessment) }
-}
-
-export const discoveredModelServingState = (
-  ready: ReadyModel,
-  assessment: VisibleCoordinatedLocalModelAssessment | undefined,
-): DiscoveredLocalModelServingState => {
-  if (assessment === undefined || assessment._tag === "Assessing") {
-    return { _tag: "Assessing", profile: ready.profile }
-  }
-  const assessed = {
-    metadata: ready.metadata,
-    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
-    speculativeMethod: ready.speculativeMethod,
-  }
-  return { _tag: "Assessed", ...assessed, assessment: assessment.assessment }
 }
 
 const catalogSupport = (support: CatalogModel["support"]) => {
@@ -323,42 +355,212 @@ const catalogModel = (
   })
 }
 
-const discoveredPresentation = (id: ModelId, model: ReadyModel | undefined) => {
-  const parsed = parseModelId(id)
-  const selector = parsed._tag === "HuggingFace" ? parsed.artifactSelector : id
-  return Schema.validateSync(LocalModelPresentationSchema)({
-    displayName: (selector.split("/").at(-1) ?? selector).replace(/\.gguf$/i, ""),
-    variantLabel: Schema.decodeUnknownSync(ModelVariantLabelSchema)(model?.metadata.quantizationName ?? "GGUF"),
-    description: `Discovered in the Hugging Face cache`,
-    license: Option.none<string>(),
-    sourceUrls: parsed._tag === "HuggingFace"
-      ? [`https://huggingface.co/${parsed.repositoryId}`]
-      : [],
-  })
-}
+const unavailableAssessment = failure(
+  "model_assessment_failed",
+  "Magnitude could not assess this model on this computer.",
+  true,
+)
 
-const discoveredModel = (
-  entry: DiscoveredModelSource,
+export const customModelServingState = (
+  source: CustomModelSource["source"],
   assessment: VisibleCoordinatedLocalModelAssessment | undefined,
-  instances: readonly ModelInstance[],
-): Extract<LocalModel, { readonly _tag: "Discovered" }> => {
-  const state = entry.source.state
-  const ready = state._tag === "Ready" ? state.model : undefined
-  return Schema.validateSync(DiscoveredLocalModelSchema)({
-    _tag: "Discovered",
+): CustomLocalModelServingState => {
+  const state = source.state
+  if (state._tag === "Unavailable") return { _tag: "Failed", profile: source.profile, failure: state.failure }
+  if (state._tag === "NotInstalled" || assessment === undefined || assessment._tag === "Assessing") {
+    return { _tag: "Assessing", profile: state._tag === "Ready" ? state.model.profile : source.profile }
+  }
+  return {
+    _tag: "Assessed",
+    metadata: state.model.metadata,
+    capabilities: Schema.validateSync(ModelCapabilitiesSchema)(assessment.capabilities),
+    speculativeMethod: state.model.speculativeMethod,
+    assessment: assessment.assessment,
+  }
+}
+
+const sourceUrls = (modelId: ModelId): readonly string[] => {
+  const parsed = parseModelId(modelId)
+  return parsed._tag === "HuggingFace" ? [`https://huggingface.co/${parsed.repositoryId}`] : []
+}
+
+const fileStem = (path: string) => (path.split(/[\\/]/).at(-1) ?? path).replace(/\.gguf$/i, "")
+
+/** A drafter's label when no candidate describes it. */
+export const drafterReferenceLabel = (reference: DrafterReference): string => {
+  switch (reference._tag) {
+    case "Catalog": return "Magnitude drafter"
+    case "Embedded": return "Built into this model"
+    case "HuggingFace": return `${reference.repository} · ${fileStem(reference.path)}`
+    case "Local": return fileStem(reference.path)
+  }
+}
+
+const catalogUpdateAvailable = (catalog: readonly CatalogModelSource[], reference: DrafterReference): boolean =>
+  reference._tag === "Catalog" && catalog.some(({ id, source }) => id === reference.modelId
+    && source.localState._tag === "Installed" && source.localState.updateState._tag === "Available")
+
+export interface CustomModelInputs {
+  readonly entry: CustomModelSource
+  readonly assessment: CoordinatedLocalModelAssessment | undefined
+  readonly instances: readonly ModelInstance[]
+  readonly related: readonly RelatedDownload[]
+  readonly acceptance: readonly DrafterAcceptanceMeasurement[]
+  readonly catalog: readonly CatalogModelSource[]
+}
+
+const measured = (
+  acceptance: readonly DrafterAcceptanceMeasurement[],
+  modelId: ModelId,
+  reference: DrafterReference,
+): Option.Option<MeasuredDrafterAcceptance> => Option.fromNullable(acceptance.find((row) =>
+  row.model === modelId && row.drafter === drafterReferenceKey(reference))?.acceptance)
+
+export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<AttachedDrafter> => {
+  const { entry, assessment, related, catalog } = inputs
+  return Option.flatMap(entry.source.drafter, (native) => Option.map(productDrafterReference(native.reference), (reference) => {
+    const recommended = Option.flatMap(entry.source.recommendedDrafter, (candidate) => productDrafterCandidate(candidate))
+      .pipe(Option.filter((candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
+    const assessedVerdict = assessment?._tag === "Assessed" ? assessment.drafter : undefined
+    const verdict: DrafterVerdict = native.state._tag === "Rejected"
+      ? productDrafterVerdict(native.state as NativeDrafterVerdict) ?? { _tag: "None" }
+      : assessedVerdict ?? { _tag: "Bound", method: native.method, memoryBytes: 0 }
+    const drafterDownload = currentDownload(related, "Drafter")
+    const targetDownload = currentDownload(related, "Target")
+    const availability: AttachedDrafter["availability"] = Option.match(drafterDownload, {
+      onSome: (download) => downloadIsActive(download)
+        ? { _tag: "Downloading", progress: Option.getOrThrow(transferProgress(download)) }
+        : { _tag: "DownloadFailed", failure: Option.getOrThrow(acquisitionFailure(download)) },
+      onNone: () => {
+        if (native.state._tag !== "NotInstalled") return { _tag: "Present" }
+        // An added model fetches its drafter with its target; any other missing drafter needs Sync.
+        return Option.match(Option.flatMap(targetDownload, transferProgress), {
+          onSome: (progress) => ({ _tag: "Downloading", progress }),
+          onNone: () => ({ _tag: "DownloadFailed", failure: Option.getOrElse(
+            Option.flatMap(targetDownload, acquisitionFailure),
+            () => ({ _tag: "Interrupted" as const }),
+          ) }),
+        })
+      },
+    })
+    return {
+      reference,
+      label: Option.match(recommended, { onNone: () => drafterReferenceLabel(reference), onSome: ({ label }) => label }),
+      sizeBytes: Option.match(recommended, { onNone: () => 0, onSome: ({ sizeBytes }) => sizeBytes }),
+      verdict,
+      availability,
+      updateAvailable: catalogUpdateAvailable(catalog, reference),
+    }
+  }))
+}
+
+export const customAcquisition = (
+  origin: CustomModelOrigin,
+  source: CustomModelSource["source"],
+  related: readonly RelatedDownload[],
+  residencyState: ModelResidency,
+): Option.Option<CustomModelAcquisitionState> => {
+  const state = source.state
+  const installation: ResolvedModelInstallation | undefined = state._tag === "NotInstalled"
+    ? undefined
+    : productInstallation(state.installation) as ResolvedModelInstallation
+  if (origin._tag !== "Added") {
+    if (installation === undefined) return Option.none()
+    return Option.some(state._tag === "Unavailable"
+      ? { _tag: "Unavailable", installation, failure: state.failure }
+      : { _tag: "External", installation, residencyState })
+  }
+  const installed = installation === undefined ? undefined : { installation, residencyState }
+  return Option.some(Option.match(currentDownload(related, "Target"), {
+    onNone: (): CustomModelAcquisitionState => installed === undefined
+      ? { _tag: "NotInstalled" }
+      : { _tag: "Installed", ...installed },
+    onSome: (download): CustomModelAcquisitionState => Option.match(transferProgress(download), {
+      onSome: (progress): CustomModelAcquisitionState => installed === undefined
+        ? { _tag: "Installing", progress }
+        : { _tag: "Updating", ...installed, progress },
+      onNone: (): CustomModelAcquisitionState => {
+        const failed = Option.getOrThrow(acquisitionFailure(download))
+        return installed === undefined
+          ? { _tag: "InstallFailed", failure: failed }
+          : { _tag: "UpdateFailed", ...installed, failure: failed }
+      },
+    }),
+  }))
+}
+
+/** The engine's verdict that an external model cannot run; added models keep their row so they stay removable. */
+const externalUnsupportedAssessment = (inputs: CustomModelInputs, origin: CustomModelOrigin) => {
+  const { assessment } = inputs
+  return origin._tag !== "Added" && assessment?._tag === "Assessed" && assessment.assessment._tag === "Unsupported"
+    ? Option.some(assessment.assessment)
+    : Option.none()
+}
+
+/** One custom row, or none when it has nothing to show: absent external files, a failed assessment, or no support. */
+export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLocalModel> => {
+  const { entry, assessment, instances, related, acceptance } = inputs
+  const origin = Schema.decodeUnknownSync(CustomModelOriginSchema)(entry.source.origin)
+  if (assessment?._tag === "Dropped" && origin._tag !== "Added") return Option.none()
+  if (Option.isSome(externalUnsupportedAssessment(inputs, origin))) return Option.none()
+  const visible = assessment?._tag === "Dropped" ? undefined : assessment
+  const acquisitionState = customAcquisition(origin, entry.source, related, residencyFor(entry.id, instances))
+  if (Option.isNone(acquisitionState)) return Option.none()
+  const ready = entry.source.state._tag === "Ready" ? entry.source.state.model : undefined
+  const drafter = attachedDrafter(inputs)
+  const servingState: CustomLocalModelServingState = assessment?._tag === "Dropped"
+    ? { _tag: "Failed", profile: entry.source.profile, failure: unavailableAssessment }
+    : customModelServingState(entry.source, visible)
+  return Option.some(Schema.validateSync(CustomLocalModelSchema)({
+    _tag: "Custom",
     modelId: entry.id,
-    presentation: discoveredPresentation(entry.id, ready),
-    state: state._tag === "Ready"
-      ? { _tag: "Ready" as const, installation: state.installation,
-          residencyState: residencyFor(entry.id, instances),
-          catalogAttribution: state.catalogAttribution._tag === "NotInCatalog"
-            ? { _tag: "NotInCatalog" as const }
-            : { _tag: "AttributionFailed" as const, failure: state.catalogAttribution.failure },
-          servingState: discoveredModelServingState(state.model, assessment) }
-      : { _tag: "Unavailable" as const, installation: state.installation, failure: state.failure },
+    origin,
+    presentation: {
+      displayName: entry.source.displayName.trim().length > 0
+        ? entry.source.displayName
+        : fileStem(entry.source.files[0]?.path ?? entry.id),
+      variantLabel: Schema.decodeUnknownSync(ModelVariantLabelSchema)(
+        ready !== undefined && ready.metadata.quantizationName.length > 0 ? ready.metadata.quantizationName : "GGUF",
+      ),
+      sourceLabel: customModelSourceLabel(origin),
+      variantOf: Option.flatMap(entry.source.variantOf, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
+      license: Option.none(),
+      sourceUrls: sourceUrls(entry.id),
+    },
+    drafter,
+    recommendedDrafter: Option.flatMap(entry.source.recommendedDrafter, (candidate) => Option.flatMap(
+      productDrafterReference(candidate.reference),
+      (reference) => productDrafterCandidate(candidate, measured(acceptance, entry.id, reference)),
+    )),
+    measuredAcceptance: Option.flatMap(drafter, ({ reference }) => measured(acceptance, entry.id, reference)),
+    acquisitionState: acquisitionState.value,
+    servingState,
+    storageBytes: entry.source.sizeBytes,
+  }))
+}
+
+/** A found or imported model whose assessment is `Unsupported`, listed with every engine reason. */
+export const unsupportedCustomModel = (inputs: CustomModelInputs): Option.Option<UnsupportedLocalModel> => {
+  const { entry } = inputs
+  const origin = Schema.decodeUnknownSync(CustomModelOriginSchema)(entry.source.origin)
+  return Option.flatMap(externalUnsupportedAssessment(inputs, origin), (unsupported) => {
+    const path = entry.source.files[0]?.path ?? (origin._tag === "Imported" ? origin.path : entry.id)
+    return Schema.decodeUnknownOption(UnsupportedLocalModelSchema)({
+      displayName: entry.source.displayName.trim().length > 0 ? entry.source.displayName : fileStem(path),
+      origin,
+      path,
+      reasons: unsupported.reasons,
+      detail: unsupported.detail,
+    })
   })
 }
 
+export const unsupportedLocalModel = (model: NativeUnsupportedLocalModel): Option.Option<UnsupportedLocalModel> =>
+  Schema.decodeUnknownOption(UnsupportedLocalModelSchema)({
+    ...model,
+    displayName: model.displayName.trim().length > 0 ? model.displayName : fileStem(model.path),
+    reasons: productReasons(model.reasons, model.detail),
+  })
 export interface LocalModelsApi {
   readonly state: Effect.Effect<LocalModelsState>
   readonly changes: Stream.Stream<void>
@@ -369,48 +571,107 @@ export class LocalModels extends Context.Tag("LocalModels")<LocalModels, LocalMo
 export const LocalModelsLive: Layer.Layer<
   LocalModels,
   never,
-  LocalModelSources | IcnModelAssessments | IcnCatalogInstallations | IcnInstances | LocalModelRemovals
+  | LocalModelSources
+  | IcnModelAssessments
+  | IcnCatalogInstallations
+  | IcnInstances
+  | IcnDownloads
+  | LocalModelRemovals
+  | CustomModels
+  | ServingUsage
 > = Layer.scoped(LocalModels, Effect.gen(function* () {
   const sources = yield* LocalModelSources
   const assessments = yield* IcnModelAssessments
   const installations = yield* IcnCatalogInstallations
   const instances = yield* IcnInstances
+  const downloads = yield* IcnDownloads
   const removalService = yield* LocalModelRemovals
+  const customModels = yield* CustomModels
+  const usage = yield* ServingUsage
   const project = Effect.gen(function* () {
     const source = yield* sources.state
     const assessment = (yield* assessments.get).state
     const operations = (yield* installations.get).state.operations
     const runtime = (yield* instances.get).instances
     const removals = yield* removalService.state
-    const latestOperation = new Map(operations.map((operation) => [operation.modelId, operation]))
-    return {
-      preparation: projectLocalModelPreparation(source, assessment),
-      models: [
-        ...source.catalogModels.flatMap((entry) => {
-          const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
-          return assessmentTargetVisible(coordinated)
-            ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime)]
-            : []
-        }),
-        ...source.discoveredModels.flatMap((entry) => {
-          const coordinated = coordinatedAssessment(assessment, source.discoveryRevision, "discovered", entry.id)
-          return assessmentTargetVisible(coordinated) ? [discoveredModel(entry, coordinated, runtime)] : []
-        }),
-      ],
-    } satisfies LocalModelsState
+    const config = yield* customModels.get
+    const nativeDownloads = (yield* downloads.get).state.downloads
+    const acceptance = yield* usage.acceptance
+    return projectLocalModels({ source, assessment, operations, runtime, removals, config, downloads: nativeDownloads, acceptance })
   })
   const projection = yield* materializeProjection({
     project,
     invalidations: Stream.mergeAll([
       sources.changes.pipe(Stream.map(() => undefined)), assessments.changes.pipe(Stream.map(() => undefined)),
       installations.changes.pipe(Stream.map(() => undefined)), instances.changes.pipe(Stream.map(() => undefined)),
-      removalService.changes,
+      downloads.changes.pipe(Stream.map(() => undefined)), customModels.changes.pipe(Stream.map(() => undefined)),
+      usage.changes, removalService.changes,
     ], { concurrency: "unbounded" }),
     equivalent: Schema.equivalence(LocalModelsStateSchema),
   })
   return LocalModels.of({
     state: projection.get,
     changes: projection.changes.pipe(Stream.map(() => undefined)),
-    refresh: sources.refreshDiscovery.pipe(Effect.orDie),
+    refresh: sources.refreshLocalModels.pipe(Effect.orDie),
   })
 }))
+
+export interface LocalModelsInputs {
+  readonly source: LocalModelSourcesState
+  readonly assessment: ModelAssessmentsSnapshot
+  readonly operations: readonly CatalogInstallationOperation[]
+  readonly runtime: readonly ModelInstance[]
+  readonly removals: ReadonlyMap<string, LocalModelRemovalState>
+  readonly config: CustomModelsConfig
+  readonly downloads: readonly ModelDownload[]
+  readonly acceptance: readonly DrafterAcceptanceMeasurement[]
+}
+
+/**
+ * Catalog models stay ranked; custom models are never ranked. ICN lists hidden models apart and never
+ * assesses them. A found or imported model the engine cannot run joins the unsupported list.
+ */
+export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState => {
+  const { source, assessment, operations, runtime, removals, config, downloads, acceptance } = inputs
+  const latestOperation = new Map(operations.map((operation) => [operation.modelId, operation]))
+  const customInputs = (entry: CustomModelSource, assessed: CoordinatedLocalModelAssessment | undefined): CustomModelInputs => ({
+    entry,
+    assessment: assessed,
+    instances: runtime,
+    related: customModelDownloads(entry.id, config, downloads),
+    acceptance,
+    catalog: source.catalogModels,
+  })
+  const custom = source.customModels.map((entry) => customInputs(
+    entry,
+    coordinatedAssessment(assessment, source.localModelsRevision, "custom", entry.id),
+  ))
+  return {
+    preparation: projectLocalModelPreparation(source, assessment),
+    models: [
+      ...source.catalogModels.flatMap((entry) => {
+        const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
+        return assessmentTargetVisible(coordinated)
+          ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime)]
+          : []
+      }),
+      ...custom.flatMap((inputs) => Option.toArray(customModel(inputs))),
+    ],
+    unsupported: [
+      ...source.unsupported.flatMap((model) => Option.toArray(unsupportedLocalModel(model))),
+      ...custom.flatMap((inputs) => Option.toArray(unsupportedCustomModel(inputs))),
+    ],
+    hidden: source.hiddenModels.flatMap((entry) => Option.toArray(customModel(customInputs(entry, undefined)))),
+  }
+}
+
+/** The drafter attached to a model now, keyed for serving-usage attribution; catalog models use their own. */
+export const localModelDrafterKey = (state: LocalModelsState, modelId: string): Option.Option<string> => {
+  const model = state.models.find((candidate) => candidate.modelId === modelId)
+  if (model === undefined) return Option.none()
+  if (model._tag === "Custom") return Option.map(model.drafter, ({ reference }) => drafterReferenceKey(reference))
+  const serving = model.servingState
+  return serving._tag === "Assessed" && Option.isSome(serving.speculativeMethod)
+    ? Option.some(drafterReferenceKey({ _tag: "Catalog", modelId: model.modelId }))
+    : Option.none()
+}

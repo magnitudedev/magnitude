@@ -88,7 +88,7 @@ const quantizationBits = (model: LocalModel): Option.Option<number> => {
   return Option.none()
 }
 
-const discoveredFidelityLabel = (bits: Option.Option<number>): string =>
+const customFidelityLabel = (bits: Option.Option<number>): string =>
   Option.match(bits, {
     onNone: () => "Not assessed",
     onSome: (value) =>
@@ -192,7 +192,7 @@ export const localModelRadarAxes = (
       }),
       label: "FIDELITY",
       detail: Option.match(catalog, {
-        onNone: () => `${discoveredFidelityLabel(bits)} (${quantization})`,
+        onNone: () => `${customFidelityLabel(bits)} (${quantization})`,
         onSome: ({ fidelityRank }) =>
           `${fidelityLabel(fidelityRank)} (${shortVariantLabel(model)})`,
       }),

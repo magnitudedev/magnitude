@@ -3,6 +3,7 @@ import cliMarkdown from "./topics/cli.md" with { type: "text" }
 import recommendationsMarkdown from "./topics/recommendations.md" with { type: "text" }
 import speculativeMethodsMarkdown from "./topics/speculative-methods.md" with { type: "text" }
 import remoteAccessMarkdown from "./topics/remote-access.md" with { type: "text" }
+import customModelsMarkdown from "./topics/custom-models.md" with { type: "text" }
 
 export interface DocumentationTopic {
   readonly id: string
@@ -20,6 +21,11 @@ export const documentationTopics: readonly DocumentationTopic[] = [
     id: "recommendations",
     description: "Understand local-model recommendation evidence and ranking",
     markdown: recommendationsMarkdown,
+  },
+  {
+    id: "custom-models",
+    description: "Add models from Hugging Face or disk, choose drafters, and manage model locations",
+    markdown: customModelsMarkdown,
   },
   {
     id: "speculative-methods",

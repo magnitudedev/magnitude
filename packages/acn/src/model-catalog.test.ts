@@ -41,7 +41,9 @@ const local = (overrides: Partial<LocalModelsState> = {}): LocalModelsState => (
     assessment: { complete: true, settledModels: 0, totalModels: 0 },
   },
   models: [],
-  ...overrides,
+  unsupported: [],
+      hidden: [],
+      ...overrides,
 })
 
 describe("ACN model catalog projection", () => {

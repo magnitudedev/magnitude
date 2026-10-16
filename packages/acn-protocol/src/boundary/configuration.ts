@@ -70,9 +70,12 @@ const SetModelStorage = Rpc.make("SetModelStorage", {
   error: ServerSettingsFailed,
 }).pipe(atMostOnce)
 
-/** Child directories on the machine running Magnitude, for choosing the model folder there. */
+/** Child directories on the machine running Magnitude, and with `ggufFiles` its GGUF files, for choosing a model folder or file. */
 const BrowseDirectories = Rpc.make("BrowseDirectories", {
-  payload: Schema.Struct({ path: Schema.optionalWith(Schema.String, { as: "Option", exact: true }) }),
+  payload: Schema.Struct({
+    path: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+    ggufFiles: Schema.Boolean,
+  }),
   success: DirectoryListing,
   error: ServerSettingsFailed,
 }).pipe(replaySafe)

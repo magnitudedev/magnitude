@@ -26,6 +26,8 @@ const localModelsState: LocalModelsState = {
     assessment: { complete: true, settledModels: 0, totalModels: 0 },
   },
   models: [],
+  unsupported: [],
+  hidden: [],
 }
 
 ;(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT: boolean })
@@ -51,6 +53,8 @@ const makeFakeAgentClient = (
         })),
         failures: [],
         localModelPreparation: localModelsState.preparation,
+        unsupportedLocalModels: localModelsState.unsupported,
+        hiddenLocalModels: localModelsState.hidden,
       })
     }
     if (options?.command) return options.command(tag, payload)

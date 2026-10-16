@@ -4,10 +4,10 @@ import { IcnClient, type IcnClientService } from "../client.js"
 import { IcnEvents } from "../events/index.js"
 import {
   IcnCatalog,
-  IcnDiscovery,
+  IcnLocalModels,
   IcnModelAssessments,
   makeIcnCatalog,
-  makeIcnDiscovery,
+  makeIcnLocalModels,
   makeIcnModelAssessments,
 } from "./index.js"
 
@@ -38,41 +38,69 @@ describe("ICN catalog", () => {
   })
 })
 
-describe("ICN discovery", () => {
-  it("exposes discovery immediately without requesting reconciliation", async () => {
-    const incomplete = { revision: 0, reconciliationComplete: false, models: [] }
+describe("ICN local models", () => {
+  const empty = { revision: 0, reconciliationComplete: false, models: [], unsupported: [] }
+
+  it("exposes local models immediately without requesting reconciliation", async () => {
     const reconciliations = { count: 0 }
-    const client = { discovery: {
-      listDiscoveredModels: () => Effect.succeed(incomplete),
-      refreshDiscoveredModels: () => Effect.sync(() => {
+    const client = { localModels: {
+      listLocalModels: () => Effect.succeed(empty),
+      refreshLocalModels: () => Effect.sync(() => {
         reconciliations.count += 1
-        return incomplete
+        return empty
       }),
     } } as unknown as IcnClientService
     const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
-      const discovery = yield* IcnDiscovery
-      return yield* discovery.get
-    }).pipe(Effect.provide(makeIcnDiscovery().pipe(Layer.provide(
+      const localModels = yield* IcnLocalModels
+      return yield* localModels.get
+    }).pipe(Effect.provide(makeIcnLocalModels().pipe(Layer.provide(
       Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
     ))))))
-    expect(result).toEqual({ revision: 1, state: incomplete })
+    expect(result).toEqual({ revision: 1, state: empty })
     expect(reconciliations.count).toBe(0)
   })
 
   it("fails an explicit reconciliation instead of waiting forever", async () => {
-    const complete = { revision: 1, reconciliationComplete: true, models: [] }
-    const client = { discovery: {
-      listDiscoveredModels: () => Effect.succeed(complete),
-      refreshDiscoveredModels: () => Effect.never,
+    const client = { localModels: {
+      listLocalModels: () => Effect.succeed({ ...empty, reconciliationComplete: true }),
+      refreshLocalModels: () => Effect.never,
     } } as unknown as IcnClientService
     const program = Effect.gen(function* () {
-      const discovery = yield* IcnDiscovery
-      return yield* discovery.reconcile.pipe(Effect.exit)
-    }).pipe(Effect.provide(makeIcnDiscovery({ reconciliationTimeout: "10 millis" }).pipe(Layer.provide(
+      const localModels = yield* IcnLocalModels
+      return yield* localModels.reconcile.pipe(Effect.exit)
+    }).pipe(Effect.provide(makeIcnLocalModels({ reconciliationTimeout: "10 millis" }).pipe(Layer.provide(
       Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
     ))))
     const exit = await Effect.runPromise(Effect.scoped(program))
     expect(Exit.isFailure(exit)).toBe(true)
+  })
+
+  it("replaces the whole configuration and rereads the published models", async () => {
+    const configured: unknown[] = []
+    const reconciled = { ...empty, revision: 3, reconciliationComplete: true }
+    const client = { localModels: {
+      listLocalModels: () => Effect.sync(() => configured.length === 0 ? empty : reconciled),
+      refreshLocalModels: () => Effect.succeed(reconciled),
+      configureLocalModels: ({ payload }: { readonly payload: unknown }) => Effect.sync(() => {
+        configured.push(payload)
+        return payload
+      }),
+    } } as unknown as IcnClientService
+    const configuration = {
+      roots: [{ kind: "Folder" as const, path: "/models", enabled: true }],
+      declarations: [],
+      hidden: [],
+      drafters: [],
+    }
+    const result = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const localModels = yield* IcnLocalModels
+      yield* localModels.configure(configuration)
+      return (yield* localModels.get).state
+    }).pipe(Effect.provide(makeIcnLocalModels().pipe(Layer.provide(
+      Layer.merge(Layer.succeed(IcnClient, client), eventsLayer),
+    ))))))
+    expect(configured).toEqual([configuration])
+    expect(result).toEqual(reconciled)
   })
 })
 
@@ -82,7 +110,7 @@ describe("ICN automatic model assessments", () => {
       revision: 4,
       environmentId: "environment",
       catalog: { _tag: "Pending" as const, sourceRevision: 0 },
-      discovered: { _tag: "Pending" as const, sourceRevision: 0 },
+      custom: { _tag: "Pending" as const, sourceRevision: 0 },
     }
     const reads = { count: 0 }
     const client = { models: {

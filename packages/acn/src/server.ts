@@ -61,7 +61,7 @@ import { ModelSlotControllerLive } from "./model-slot-controller"
 import { MagnitudeCloudUsageLive } from "./magnitude-cloud-usage"
 import { ServingUsage, ServingUsageLive } from "./serving-usage"
 import { InferenceActivity, InferenceActivityLive, finishWithBody, type InferenceActivityApi } from "./inference-activity"
-import { makeUsageFetch, makeUsageWebSocket } from "./serving-usage-observer"
+import { attributeDrafters, makeUsageFetch, makeUsageWebSocket } from "./serving-usage-observer"
 import type { InferenceFetch } from "./inference-gateway"
 import {
   ProviderClientRegistryLive,
@@ -83,7 +83,7 @@ import { SessionRuntimeOptionsStoreLive } from "./session-runtime-options"
 import { ModelSelectionLive } from "./model-selection"
 import { makeAcnIcn } from "./icn"
 import { LocalModelSourcesLive } from "./local-model-sources"
-import { LocalModelsLive } from "./local-models"
+import { LocalModels, LocalModelsLive, localModelDrafterKey } from "./local-models"
 import { LocalModelRemovalsLive } from "./local-model-removals"
 import { ModelCatalogLive } from "./model-catalog"
 import { ModelCommandsLive } from "./model-commands"
@@ -93,6 +93,11 @@ import { LocalProviderResolverLive } from "./local-provider-resolver"
 import { LocalInferenceHardwareLive } from "./local-inference-hardware"
 import { CustomEndpointsLive } from "./custom-endpoints"
 import { CustomEndpointReconcilerLive } from "./custom-endpoint-reconciler"
+import { CustomModelsLive } from "./custom-models"
+import { CustomModelReconcilerLive } from "./custom-model-reconciler"
+import { CustomModelCommandsLive } from "./custom-model-commands"
+import { DrafterMethodsLive } from "./drafter-references"
+import { ModelLocationsLive } from "./model-locations"
 import { FileMentionSearcherLive } from "./file-mention-searcher"
 import { FileSystemManagerLive } from "./file-system-manager"
 import { GitInspectorLive } from "./git-inspector"
@@ -326,8 +331,9 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     AcnStorageChangesLive,
     Layer.provideMerge(AcnChangesLive, withSubscriptions),
   )
+  const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withChanges)
   const localServices = addLocalInferenceServices(
-    withChanges,
+    withUsage,
     dataDir
   )
   const withSharedClient = Layer.provideMerge(
@@ -338,8 +344,7 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ProviderModelCatalogLive,
     withSharedClient
   )
-  const withUsage = Layer.provideMerge(Layer.merge(ServingUsageLive, InferenceActivityLive), withCatalog)
-  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withUsage)
+  const withModelCatalog = Layer.provideMerge(ModelCatalogLive, withCatalog)
   const withCredentials = Layer.provideMerge(
     ProviderCredentialsLive,
     withModelCatalog
@@ -352,7 +357,9 @@ const makeAcnServicesBase = (debug: boolean, dataDir: string) => {
     ModelSlotControllerLive,
     withCloudUsage
   )
-  const withModelCommands = Layer.provideMerge(ModelCommandsLive, withModelSlots)
+  const withCustomModelReconciliation = Layer.provideMerge(CustomModelReconcilerLive, withModelSlots)
+  const withCustomModelCommands = Layer.provideMerge(CustomModelCommandsLive, withCustomModelReconciliation)
+  const withModelCommands = Layer.provideMerge(ModelCommandsLive, withCustomModelCommands)
   const withCustomEndpointReconciliation = Layer.provideMerge(
     CustomEndpointReconcilerLive,
     withModelCommands,
@@ -384,7 +391,11 @@ const addLocalInferenceServices = <A, E, R>(
     LocalInferenceHardwareLive,
     withCustomEndpoints
   )
-  const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withHardware)
+  const withCustomModels = Layer.provideMerge(
+    Layer.mergeAll(CustomModelsLive, ModelLocationsLive, DrafterMethodsLive),
+    withHardware,
+  )
+  const withCatalogAdapter = Layer.provideMerge(LocalModelSourcesLive, withCustomModels)
   const withLocalModels = Layer.provideMerge(LocalModelsLive, withCatalogAdapter)
   const withOfferings = Layer.provideMerge(LocalProviderOfferingsLive, withLocalModels)
   const withResolver = Layer.provideMerge(
@@ -857,7 +868,10 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
         yield* installAcnIntrospectionRoutes(router, builtServices.introspector.value)
       }
       const icn = Context.get(applicationContext, IcnProcess)
-      const usage = Context.get(applicationContext, ServingUsage)
+      const localModels = Context.get(applicationContext, LocalModels)
+      const usage = attributeDrafters(Context.get(applicationContext, ServingUsage), (model) => localModels.state.pipe(
+        Effect.map((state) => localModelDrafterKey(state, model)),
+      ))
       yield* installAcnPublicRoutes(router, lifecycle, icn, remote, makeUsageFetch(icn.origin, usage), usage,
         Context.get(applicationContext, InferenceActivity))
       const hardware = yield* Context.get(applicationContext, IcnHardware).get.pipe(

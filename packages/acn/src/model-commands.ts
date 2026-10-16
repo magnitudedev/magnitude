@@ -1,5 +1,7 @@
 import { Context, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import {
+  CatalogFormModelIdSchema,
+  CustomFormModelIdSchema,
   ModelIdSchema,
   ModelSlotMutationRejected,
   PRIMARY_SLOT_ID,
@@ -14,13 +16,15 @@ import { projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
 import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"
+import { CustomModelCommands } from "./custom-model-commands"
 
 export type LocalModelSyncOutcome = "Started" | "AlreadyCurrent"
+/** Commands by canonical model ID: a catalog ID addresses its installation, a custom ID its downloads. */
 export interface ModelCommandsApi {
-  readonly sync: (modelId: CatalogFormModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError>
-  readonly cancelSync: (modelId: CatalogFormModelId) => Effect.Effect<{}, LocalInferenceError>
-  readonly acknowledgeSyncFailure: (modelId: CatalogFormModelId) => Effect.Effect<{}, LocalInferenceError>
-  readonly remove: (modelId: CatalogFormModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly sync: (modelId: ModelId) => Effect.Effect<{ readonly outcome: LocalModelSyncOutcome }, LocalInferenceError>
+  readonly cancelSync: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly acknowledgeSyncFailure: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
+  readonly remove: (modelId: ModelId) => Effect.Effect<{}, LocalInferenceError>
   readonly loadSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
   readonly previewSlotLoad: (slotId: SlotId) => Effect.Effect<ModelLoadPlan, LocalInferenceError>
   readonly stopSlot: (slotId: SlotId) => Effect.Effect<{}, LocalInferenceError>
@@ -35,8 +39,9 @@ export const modelCommandFailure = (operation: string, cause: IcnCommandError) =
 export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
-  IcnClient | IcnCatalog | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals
+  IcnClient | IcnCatalog | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals | CustomModelCommands
 > = Layer.scoped(ModelCommands, Effect.gen(function* () {
+  const custom = yield* CustomModelCommands
   const scope = yield* Effect.scope
   const client = yield* IcnClient
   const catalog = yield* IcnCatalog
@@ -81,13 +86,19 @@ export const ModelCommandsLive: Layer.Layer<
     if (instance !== undefined) yield* client.models.stopModelInstance({ path: { instance_id: instance.id } })
     return {}
   }).pipe(Effect.mapError((cause) => modelCommandFailure("stop", cause)))
-  return ModelCommands.of({
-    sync: (modelId) => client.catalog.installCatalogModel({ path: { model_id: modelId } }).pipe(
+  const byForm = <A>(
+    modelId: ModelId,
+    catalogCommand: (id: CatalogFormModelId) => Effect.Effect<A, LocalInferenceError>,
+    customCommand: (id: typeof CustomFormModelIdSchema.Type) => Effect.Effect<A, LocalInferenceError>,
+  ) => Schema.is(CatalogFormModelIdSchema)(modelId)
+    ? catalogCommand(modelId)
+    : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))
+  const catalogSync = (modelId: CatalogFormModelId) => client.catalog.installCatalogModel({ path: { model_id: modelId } }).pipe(
       Effect.mapError((cause) => modelCommandFailure("sync", cause)),
       Effect.tap(() => Effect.all([catalog.refresh, installations.refresh], { discard: true }).pipe(Effect.ignore)),
       Effect.map((admission) => ({ outcome: admission._tag === "Current" ? "AlreadyCurrent" as const : "Started" as const })),
-    ),
-    cancelSync: (modelId) => operationFor(modelId).pipe(
+    )
+  const catalogCancel = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
       Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
       Effect.flatMap((operation) => operation === undefined
         || (operation.state._tag !== "Pending" && operation.state._tag !== "Running"
@@ -97,8 +108,8 @@ export const ModelCommandsLive: Layer.Layer<
             Effect.mapError((cause) => modelCommandFailure("cancel_sync", cause)),
             Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
           )),
-    ),
-    acknowledgeSyncFailure: (modelId) => operationFor(modelId).pipe(
+    )
+  const catalogAcknowledge = (modelId: CatalogFormModelId) => operationFor(modelId).pipe(
       Effect.mapError((cause) => modelCommandFailure("acknowledge_sync_failure", cause)),
       Effect.flatMap((operation) => operation?.state._tag !== "Failed" || operation.state.acknowledged
         ? Effect.succeed({})
@@ -106,8 +117,12 @@ export const ModelCommandsLive: Layer.Layer<
             Effect.mapError((cause) => modelCommandFailure("acknowledge_sync_failure", cause)),
             Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
           )),
-    ),
-    remove: (modelId) => stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId))),
+    )
+  return ModelCommands.of({
+    sync: (modelId) => byForm(modelId, catalogSync, custom.sync),
+    cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
+    acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
+    remove: (modelId) => stopModel(modelId).pipe(Effect.zipRight(byForm(modelId, removals.remove, custom.remove))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap(requestLoad),
       Effect.tap(() => slots.refresh),

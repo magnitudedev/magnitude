@@ -1,4 +1,4 @@
-import { Data, Effect } from "effect"
+import { Data, Effect, Schema, type ParseResult } from "effect"
 import stringWidth from "string-width"
 
 const messageOf = (error: unknown): string => {
@@ -15,12 +15,34 @@ class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
   readonly message: string
 }> {}
 
+/** How a command's result becomes the one machine-readable document `--json` prints. */
+export interface JsonDocument<A> {
+  readonly encode: (result: A) => Effect.Effect<unknown, ParseResult.ParseError>
+}
+
+export const jsonDocument = <A, J, I>(
+  schema: Schema.Schema<J, I, never>,
+  project: (result: A) => J,
+): JsonDocument<A> => ({ encode: (result) => Schema.encode(schema)(project(result)) })
+
+export interface JsonOption {
+  readonly json?: boolean
+}
+
+/** The document to print when `--json` was given, or nothing for text output. */
+export const asJson = <A>(options: JsonOption, document: JsonDocument<A>): JsonDocument<A> | undefined =>
+  options.json === true ? document : undefined
+
 export const runCommand = <A>(options: {
   readonly effect: Effect.Effect<A, unknown, never>
   readonly render: (result: A) => string
+  readonly json?: JsonDocument<A>
 }): Promise<void> => Effect.runPromise(options.effect.pipe(
-  Effect.tap((result) => Effect.try({
-    try: () => process.stdout.write(options.render(result)),
+  Effect.flatMap((result) => options.json === undefined
+    ? Effect.succeed(options.render(result))
+    : options.json.encode(result).pipe(Effect.map((document) => `${JSON.stringify(document, null, 2)}\n`))),
+  Effect.flatMap((output) => Effect.try({
+    try: () => process.stdout.write(output),
     catch: (error) => new CommandOutputFailed({ message: messageOf(error) }),
   })),
   Effect.catchAll((error) => Effect.sync(() => {

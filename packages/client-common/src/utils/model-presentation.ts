@@ -1,7 +1,9 @@
 import { Option } from "effect"
 import {
+  customModelSourceLabel,
   formatModelDisplayName,
   localModelServingState,
+  type CatalogFormModelId,
   type CatalogDeprecation,
   type CatalogLocalModel,
   type CatalogSupport,
@@ -9,6 +11,7 @@ import {
   type LocalModel,
   type ModelVariantLabel,
   type SpeculativeMethod,
+  type UnsupportedLocalModel,
 } from "@magnitudedev/sdk"
 
 export { formatModelDisplayName }
@@ -62,3 +65,17 @@ export const localModelSpeculativeMethodLabel = (model: LocalModel): Option.Opti
     serving._tag === "Assessed"
       ? Option.map(serving.speculativeMethod, formatSpeculativeMethod)
       : Option.none())
+
+/** The tag showing where a model's files came from; catalog models carry none. */
+export const localModelSourceTag = (model: LocalModel): Option.Option<string> =>
+  model._tag === "Custom" ? Option.some(model.presentation.sourceLabel) : Option.none()
+
+export const unsupportedLocalModelSourceTag = (model: UnsupportedLocalModel): string =>
+  customModelSourceLabel(model.origin)
+
+/** The catalog model's name for "Variant of <model>", when it is listed. */
+export const catalogVariantOfName = (
+  models: readonly LocalModel[],
+  variantOf: Option.Option<CatalogFormModelId>,
+): Option.Option<string> => Option.flatMap(variantOf, (modelId) =>
+  Option.fromNullable(models.find((model) => model.modelId === modelId)?.presentation.displayName))

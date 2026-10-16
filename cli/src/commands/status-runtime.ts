@@ -2,7 +2,7 @@ import { applicationDataDirectory, desktopApplication, desktopIsolatedProfile, d
 import { isServerSetUp } from "../server/serve-owner"
 import { serverLogs, serverNotRunning, serviceFailureLine } from "../server/server-setup"
 import { readServerReach, renderServerReach, type ServerReach } from "../server/server-reach"
-import { formatLocalModelDisplayName } from "@magnitudedev/client-common"
+import { formatLocalModelDisplayName, localModelResidency } from "@magnitudedev/client-common"
 import type { ApplicationOwner } from "@magnitudedev/sdk/desktop-host"
 import { Command, CommandExecutor, FetchHttpClient, FileSystem, HttpClient, HttpClientResponse } from "@effect/platform"
 import { BunContext } from "@effect/platform-bun"
@@ -114,11 +114,7 @@ const readActiveModel = Effect.scoped(Effect.gen(function* () {
   for (const entry of catalog.models) {
     if (entry._tag !== "Local") continue
     const model = entry.product
-    const residency = model._tag === "Discovered"
-      ? model.state._tag === "Ready" ? model.state.residencyState : undefined
-      : "residencyState" in model.acquisitionState
-        ? model.acquisitionState.residencyState
-        : undefined
+    const residency = Option.getOrUndefined(localModelResidency(model))
     if (residency === undefined) continue
     if (residency._tag !== "Requested"
       && residency._tag !== "Loading"

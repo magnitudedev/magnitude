@@ -99,6 +99,14 @@ export class IcnStartupRecordTimedOut extends Data.TaggedError(
   }
 }
 
+export class IcnLocalModelsConfigurationUnwritable extends Data.TaggedError(
+  "IcnLocalModelsConfigurationUnwritable",
+)<{ readonly path: string; readonly detail: string }> {
+  override get message(): string {
+    return `The local-models configuration could not be written to ${this.path}: ${this.detail}`;
+  }
+}
+
 export class IcnStartupIdentityMismatch extends Data.TaggedError(
   "IcnStartupIdentityMismatch",
 )<{
@@ -200,6 +208,7 @@ export type IcnLifecycleError =
   | IcnShutdownTimedOut
   | IcnExitedBeforeReady
   | IcnStartupRecordTimedOut
+  | IcnLocalModelsConfigurationUnwritable
   | IcnStartupIdentityMismatch
   | IcnStartupOriginInvalid
   | IcnStartupOriginNotLoopback

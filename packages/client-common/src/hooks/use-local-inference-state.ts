@@ -60,6 +60,31 @@ export const useCatalogModels = () => {
   return useAtomValue(catalog)
 }
 
+export const useCustomModels = () => {
+  const client = useAgentClient()
+  const service = useMemo(() => client.runtime.atom(LocalModels), [client])
+  const custom = useMemo(() => Atom.make((get) =>
+    Result.flatMap(get(service), (models) => get(models.custom))), [service])
+  return useAtomValue(custom)
+}
+
+export const useUnsupportedLocalModels = () => {
+  const client = useAgentClient()
+  const service = useMemo(() => client.runtime.atom(LocalModels), [client])
+  const unsupported = useMemo(() => Atom.make((get) =>
+    Result.flatMap(get(service), (models) => get(models.unsupported))), [service])
+  return useAtomValue(unsupported)
+}
+
+/** Custom models the user hid, for My Models' Hidden filter with Unhide. */
+export const useHiddenLocalModels = () => {
+  const client = useAgentClient()
+  const service = useMemo(() => client.runtime.atom(LocalModels), [client])
+  const hidden = useMemo(() => Atom.make((get) =>
+    Result.flatMap(get(service), (models) => get(models.hidden))), [service])
+  return useAtomValue(hidden)
+}
+
 export const useModelSlots = () => {
   const client = useAgentClient()
   const service = useMemo(() => client.runtime.atom(ModelSlots), [client])

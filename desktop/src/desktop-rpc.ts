@@ -20,7 +20,7 @@ export type InferenceHostClient = RpcClient.FromGroup<typeof InferenceHostRpcs, 
 export interface DesktopApi {
   readonly platform: string
   readonly observe: (value: (snapshot: typeof ApplicationSnapshot.Encoded) => void, error: (message: string) => void) => () => void
-  readonly actions: (value: (action: typeof ApplicationAction.Type) => void) => () => void
+  readonly actions: (value: (action: typeof ApplicationAction.Encoded) => void, error: (message: string) => void) => () => void
   readonly presentModel: (value: typeof ModelTrayPresentation.Encoded) => Promise<void>
   readonly getAppearance: () => Promise<AppearancePreference>
   readonly setAppearance: (preference: AppearancePreference) => Promise<void>

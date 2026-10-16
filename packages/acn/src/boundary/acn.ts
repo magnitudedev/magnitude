@@ -27,6 +27,7 @@ import { createId } from "@magnitudedev/generate-id";
 import { AcnChanges } from "../changes";
 import { ModelCatalog } from "../model-catalog";
 import { ModelCommands } from "../model-commands";
+import { CustomModelCommands } from "../custom-model-commands";
 import { LocalInferenceHardware } from "../local-inference-hardware";
 import { FileMentionSearcher } from "../file-mention-searcher";
 import { FileSystemManager } from "../file-system-manager";
@@ -71,6 +72,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
     const changes = yield* AcnChanges;
     const modelCatalog = yield* ModelCatalog;
     const modelCommands = yield* ModelCommands;
+    const customModelCommands = yield* CustomModelCommands;
     const localInferenceHardware = yield* LocalInferenceHardware;
     const serverSettings = yield* ServerSettings;
     const harnessConnections = yield* AcnHarnessConnections;
@@ -325,7 +327,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
 
       GetModelStorage: () => observeRpcDefects("GetModelStorage", serverSettings.modelStorage),
       SetModelStorage: ({ path }) => observeRpcDefects("SetModelStorage", serverSettings.setModelStorage(path).pipe(Effect.as({}))),
-      BrowseDirectories: ({ path }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path)),
+      BrowseDirectories: ({ path, ggufFiles }) => observeRpcDefects("BrowseDirectories", serverSettings.browseDirectories(path, ggufFiles)),
       GetNetworkAccess: () => observeRpcDefects("GetNetworkAccess", serverSettings.networkAccess),
       SetNetworkAccess: change => observeRpcDefects("SetNetworkAccess", serverSettings.setNetworkAccess(change).pipe(Effect.as({}))),
       RegenerateNetworkApiKey: () => observeRpcDefects("RegenerateNetworkApiKey", serverSettings.regenerateNetworkApiKey.pipe(Effect.as({}))),
@@ -379,6 +381,48 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
 
       StopModelSlot: ({ slotId }) =>
         observeRpcDefects("StopModelSlot", modelCommands.stopSlot(slotId)),
+
+      SearchHuggingFaceModels: (request) =>
+        observeRpcDefects("SearchHuggingFaceModels", customModelCommands.searchHuggingFace(request)),
+
+      InspectModelCandidate: ({ reference }) =>
+        observeRpcDefects("InspectModelCandidate", customModelCommands.inspectCandidate(reference)),
+
+      ListDrafterCandidates: ({ target, other }) =>
+        observeRpcDefects(
+          "ListDrafterCandidates",
+          customModelCommands.listDrafterCandidates(target, other).pipe(Effect.map((candidates) => ({ candidates }))),
+        ),
+
+      ListModelLocations: () =>
+        observeRpcDefects("ListModelLocations", customModelCommands.listLocations.pipe(Effect.map((locations) => ({ locations })))),
+
+      AddHuggingFaceModel: (request) =>
+        observeRpcDefects("AddHuggingFaceModel", customModelCommands.addHuggingFaceModel(request)),
+
+      ImportModelFile: ({ path, drafter }) =>
+        observeRpcDefects("ImportModelFile", customModelCommands.importModelFile(path, drafter)),
+
+      SetModelDrafter: ({ modelId, drafter }) =>
+        observeRpcDefects(
+          "SetModelDrafter",
+          customModelCommands.setModelDrafter(modelId, drafter).pipe(Effect.map((chosen) => ({ drafter: chosen }))),
+        ),
+
+      HideModel: ({ modelId }) =>
+        observeRpcDefects("HideModel", customModelCommands.hide(modelId).pipe(Effect.as({}))),
+
+      UnhideModel: ({ modelId }) =>
+        observeRpcDefects("UnhideModel", customModelCommands.unhide(modelId).pipe(Effect.as({}))),
+
+      AddModelFolder: ({ path }) =>
+        observeRpcDefects("AddModelFolder", customModelCommands.addFolder(path).pipe(Effect.as({}))),
+
+      RemoveModelFolder: ({ path }) =>
+        observeRpcDefects("RemoveModelFolder", customModelCommands.removeFolder(path).pipe(Effect.as({}))),
+
+      SetModelLocationEnabled: ({ kind, enabled }) =>
+        observeRpcDefects("SetModelLocationEnabled", customModelCommands.setLocationEnabled(kind, enabled).pipe(Effect.as({}))),
 
       AssignModelSlot: ({ slotId, selection }) =>
         observeRpcDefects(

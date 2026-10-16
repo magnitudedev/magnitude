@@ -43,7 +43,7 @@ export class AcnHost extends Context.Tag("AcnHost")<AcnHost, AcnHostApi>() {}
 export interface ServerSettingsApi {
   readonly modelStorage: Effect.Effect<ModelStorageSettings, ServerSettingsFailed>
   readonly setModelStorage: (path: Option.Option<string>) => Effect.Effect<void, ServerSettingsFailed>
-  readonly browseDirectories: (path: Option.Option<string>) => Effect.Effect<DirectoryListing, ServerSettingsFailed>
+  readonly browseDirectories: (path: Option.Option<string>, ggufFiles: boolean) => Effect.Effect<DirectoryListing, ServerSettingsFailed>
   readonly networkAccess: Effect.Effect<NetworkAccessSettings, ServerSettingsFailed>
   readonly setNetworkAccess: (change: NetworkAccessChange) => Effect.Effect<void, ServerSettingsFailed>
   readonly regenerateNetworkApiKey: Effect.Effect<void, ServerSettingsFailed>
@@ -127,19 +127,32 @@ export const ServerSettingsLive = Layer.effect(ServerSettings, Effect.gen(functi
       )
       yield* poke(Configuration.getModelStorage._tag)
     }),
-    browseDirectories: path => Effect.gen(function* () {
+    browseDirectories: (path, ggufFiles) => Effect.gen(function* () {
       const target = normalize(Option.getOrElse(path, () => homedir()))
       if (!isAbsolute(target)) return yield* new ServerSettingsFailed({ message: "Choose a full folder path." })
       const names = yield* fs.readDirectory(target).pipe(Effect.mapError(() => new ServerSettingsFailed({ message: "This folder can't be opened. Check that it exists and that Magnitude can read it." })))
-      const directories = yield* Effect.forEach(names.filter(name => !name.startsWith(".")), name => {
+      const entries = yield* Effect.forEach(names.filter(name => !name.startsWith(".")), name => {
         const child = join(target, name)
-        return fs.stat(child).pipe(Effect.map(info => info.type === "Directory" ? Option.some({ name, path: child }) : Option.none()), Effect.orElseSucceed(() => Option.none()))
+        return fs.stat(child).pipe(
+          Effect.map((info): Option.Option<
+            | { readonly _tag: "Directory"; readonly name: string; readonly path: string }
+            | { readonly _tag: "File"; readonly name: string; readonly path: string; readonly sizeBytes: number }
+          > => info.type === "Directory"
+            ? Option.some({ _tag: "Directory" as const, name, path: child })
+            : ggufFiles && info.type === "File" && name.toLowerCase().endsWith(".gguf")
+              ? Option.some({ _tag: "File" as const, name, path: child, sizeBytes: Number(info.size) })
+              : Option.none()),
+          Effect.orElseSucceed(() => Option.none<never>()),
+        )
       }, { concurrency: 16 })
+      const present = entries.flatMap(entry => Option.isSome(entry) ? [entry.value] : [])
+      const byName = (a: { readonly name: string }, b: { readonly name: string }) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })
       const root = parse(target).root
       return {
         path: target,
         parent: target === root ? Option.none() : Option.some(dirname(target)),
-        directories: directories.flatMap(entry => Option.isSome(entry) ? [entry.value] : []).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: "base" })),
+        directories: present.flatMap(entry => entry._tag === "Directory" ? [{ name: entry.name, path: entry.path }] : []).sort(byName),
+        files: present.flatMap(entry => entry._tag === "File" ? [{ name: entry.name, path: entry.path, sizeBytes: entry.sizeBytes }] : []).sort(byName),
       }
     }),
     networkAccess: readNetwork.pipe(

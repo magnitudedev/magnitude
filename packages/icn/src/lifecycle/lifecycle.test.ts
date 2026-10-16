@@ -1,4 +1,4 @@
-import { Duration, Effect, Layer, Option } from "effect";
+import { Duration, Effect, Layer, Option, Redacted } from "effect";
 import * as FileSystem from "@effect/platform/FileSystem";
 import { SystemError } from "@effect/platform/Error";
 import * as BunContext from "@effect/platform-bun/BunContext";
@@ -24,6 +24,8 @@ import {
   IcnLifecycleConfig,
   IcnStorageConfig,
   renderIcnArguments,
+  icnChildEnvironment,
+  writeLocalModelsConfiguration,
   IcnPreparationReporter,
 } from "./index.js";
 
@@ -43,7 +45,8 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     storage: new IcnStorageConfig({
       modelStore: Option.some("/data/models"),
       cacheRoot: Option.some("/data/cache"),
-      huggingFaceCaches: ["/read-only/hf"],
+      localModelsConfigurationFile: "/data/cache/local-models-configuration.json",
+      localModels: { roots: [], declarations: [], hidden: [], drafters: [] },
     }),
     host,
     startupTimeout: Duration.seconds(30),
@@ -51,6 +54,7 @@ const config = (host: "127.0.0.1" | "::1" = "127.0.0.1") =>
     forceShutdownTimeout: Duration.seconds(2),
     outputLimitBytes: 64 * 1024,
     logFile: Option.none(),
+    huggingFaceToken: Option.none(),
   });
 
 describe("ICN managed launch", () => {
@@ -88,11 +92,51 @@ describe("ICN managed launch", () => {
       "/data/models",
       "--cache-root",
       "/data/cache",
-      "--hf-cache",
-      "/read-only/hf",
+      "--local-models-config",
+      "/data/cache/local-models-configuration.json",
     ]);
     expect(args).not.toContain("--model");
     expect(args).not.toContain("--context-size");
+  });
+
+  it("forwards an explicit Hugging Face token and never an implicit one", () => {
+    const withoutToken = icnChildEnvironment(config(), {}, "secret", {})
+    expect(withoutToken.HF_HUB_DISABLE_IMPLICIT_TOKEN).toBe("1")
+    expect(withoutToken).not.toHaveProperty("HF_TOKEN")
+    const withToken = icnChildEnvironment(
+      new IcnLifecycleConfig({ ...config(), huggingFaceToken: Option.some(Redacted.make("hf_token")) }),
+      {},
+      "secret",
+      {},
+    )
+    expect(withToken.HF_TOKEN).toBe("hf_token")
+    expect(withToken.HF_HUB_DISABLE_IMPLICIT_TOKEN).toBe("1")
+  });
+
+  it("writes the local-models snapshot named at spawn", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "icn-local-models-config-"));
+    try {
+      const file = join(directory, "nested", "local-models.json");
+      await Effect.runPromise(writeLocalModelsConfiguration(new IcnStorageConfig({
+        modelStore: Option.none(),
+        cacheRoot: Option.none(),
+        localModelsConfigurationFile: file,
+        localModels: {
+          roots: [{ kind: "Ollama", path: "/models/ollama", enabled: false }],
+          declarations: [],
+          hidden: ["hf:owner/repo/model.gguf"],
+          drafters: [],
+        },
+      })).pipe(Effect.provide(BunContext.layer)));
+      expect(JSON.parse(await Bun.file(file).text())).toEqual({
+        roots: [{ kind: "Ollama", path: "/models/ollama", enabled: false }],
+        declarations: [],
+        hidden: ["hf:owner/repo/model.gguf"],
+        drafters: [],
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 
   it("brackets IPv6 loopback while retaining port zero", () => {

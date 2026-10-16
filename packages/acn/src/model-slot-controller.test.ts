@@ -17,29 +17,34 @@ import { ModelSlotController, ModelSlotControllerLive } from "./model-slot-contr
 import { ProviderModelCatalog } from "./provider-model-catalog"
 
 describe("model slot reconciliation", () => {
-  it("preserves a local selection while its discovered model is unavailable", async () => {
+  it("preserves a local selection while its custom model is unavailable", async () => {
     const localModels = Schema.validateSync(LocalModelsStateSchema)({
       preparation: {
         discovery: { complete: true, modelsFound: 1 },
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
       },
       models: [{
-        _tag: "Discovered",
+        _tag: "Custom",
         modelId: "hf:owner/repository/model.gguf",
+        origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
         presentation: {
           displayName: "model",
           variantLabel: "GGUF",
-          description: "Discovered in the Hugging Face cache",
+          sourceLabel: "Hugging Face cache",
+          variantOf: Option.none(),
           license: Option.none(),
           sourceUrls: ["https://huggingface.co/owner/repository"],
         },
-        state: {
+        drafter: Option.none(),
+        recommendedDrafter: Option.none(),
+        measuredAcceptance: Option.none(),
+        acquisitionState: {
           _tag: "Unavailable",
           installation: {
             _tag: "Resolved",
             installedBytes: 1,
             primaryPath: "/model.gguf",
-            ownership: "ExternalHuggingFace",
+            ownership: "External",
           },
           failure: {
             code: "invalid_gguf",
@@ -47,7 +52,15 @@ describe("model slot reconciliation", () => {
             retryable: false,
           },
         },
+        servingState: {
+          _tag: "Failed",
+          profile: { contextLength: 4096 },
+          failure: { code: "invalid_gguf", message: "The selected artifact is invalid", retryable: false },
+        },
+        storageBytes: 1,
       }],
+      unsupported: [],
+      hidden: [],
     })
     const selection: SlotSelection = {
       providerId: LOCAL_PROVIDER_ID,

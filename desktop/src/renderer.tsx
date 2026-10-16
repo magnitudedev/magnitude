@@ -1,6 +1,6 @@
 import { Effect, Option, Schema, Stream } from "effect"
 import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
-import { ApplicationHostFailed, ModelTrayPresentation, type ApplicationHost } from "@magnitudedev/client-common"
+import { ApplicationHostFailed, HostAction, ModelTrayPresentation, type ApplicationHost } from "@magnitudedev/client-common"
 import { renderApplication } from "@magnitudedev/web/run"
 import type { DesktopApi } from "./desktop-rpc"
 
@@ -29,7 +29,7 @@ const host: ApplicationHost = {
     save: preference => call(() => bridge.setAppearance(preference)),
   },
   shell: Option.some({
-    actions: Stream.asyncPush(emit => Effect.acquireRelease(Effect.sync(() => bridge.actions(action => emit.single(action))), unsubscribe => Effect.sync(unsubscribe)).pipe(Effect.asVoid)),
+    actions: observe(HostAction, bridge.actions),
     presentModel: value => call(() => bridge.presentModel(Schema.encodeSync(ModelTrayPresentation)(value))),
     resolveQuitFailure: decision => call(() => bridge.resolveQuitFailure(decision)),
     retryService: call(() => bridge.retry()),

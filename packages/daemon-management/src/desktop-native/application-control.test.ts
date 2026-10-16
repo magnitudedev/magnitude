@@ -129,6 +129,18 @@ describe("local application control", () => {
       expect(yield* Effect.promise(() => stat(path).then(() => true, () => false))).toBe(false)
     })))
   })
+  it("forwards an opened link to the owner after replying, and rejects an unbounded one before dispatch", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const path = join(yield* setup, "app.sock")
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
+      yield* serveApplicationControl(path, { snapshot: Effect.succeed(snapshot), update: () => Effect.die("Unexpected update request"), login: () => Effect.succeed({ _tag: "Disabled" }), dispatch: intent => Ref.update(intents, list => [...list, intent]) })
+      const url = "magnitude://open_from_hf?model=owner/repo&file=model-Q4_K_M.gguf"
+      expect((yield* requestApplication(path, { _tag: "OpenUrl", url })).pid).toBe(process.pid)
+      const overlong = yield* requestApplication(path, { _tag: "OpenUrl", url: `magnitude://${"a".repeat(5000)}` }).pipe(Effect.either)
+      expect(overlong._tag).toBe("Left")
+      expect(yield* Ref.get(intents)).toEqual([{ _tag: "OpenUrl", url }])
+    })))
+  })
   it("does not remove ordinary files at the socket path", async () => {
     await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       const path = join(yield* setup, "app.sock")

@@ -65,5 +65,8 @@ export const modelCommandNotice = (failure: LocalModelCommandFailure): NoticeCon
     case "cancel": return { title: "Couldn’t cancel the download", description: "The download may still be running. Check its progress before trying again." }
     case "dismiss": return { title: "Couldn’t dismiss the download error", description: "The previous download error is still available." }
     case "remove": return modelRemovalNotice(Option.getOrElse(failure.rejection, () => ({ code: "unknown", message: "", retryable: true })))
+    case "drafter": return { title: "The drafter wasn’t changed", description: "The model keeps its previous drafter. Check your connection, then try again." }
+    case "hide": return { title: "Couldn’t hide this model", description: "It is still listed. Try again." }
+    case "unhide": return { title: "Couldn’t show this model again", description: "It is still hidden. Try again." }
   }
 }

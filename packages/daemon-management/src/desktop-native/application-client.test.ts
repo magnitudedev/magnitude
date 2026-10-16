@@ -2,7 +2,7 @@ import { NodeContext } from "@effect/platform-node"
 import { FileSystem } from "@effect/platform"
 import { Effect, Fiber, Ref, Schedule, Schema } from "effect"
 import { describe, expect, it } from "vitest"
-import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
 import { ApplicationControlClosed, ApplicationControlFailed, ApplicationControlUnavailable } from "./application-control"
 import { launchApplicationProcess, makeApplicationClient } from "./application-client"
 
@@ -76,7 +76,7 @@ describe("desktop client startup", () => {
   it("observes an existing application without launching or showing another instance", async () => {
     await Effect.runPromise(Effect.gen(function* () {
       const launches = yield* Ref.make(0)
-      const intents = yield* Ref.make<string[]>([])
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
       const client = makeApplicationClient({ launch: (_, observe) => Ref.update(launches, x => x + 1).pipe(Effect.zipRight(observe)),
         request: intent => Ref.update(intents, values => [...values, intent]).pipe(Effect.as(ready)) })
       expect(yield* client.awaitReady(yield* client.ensure(), 1)).toEqual(ready)

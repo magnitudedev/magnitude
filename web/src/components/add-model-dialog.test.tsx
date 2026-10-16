@@ -1,0 +1,150 @@
+import { renderToStaticMarkup } from "react-dom/server"
+import type { ReactNode } from "react"
+import { describe, expect, it } from "vitest"
+import { Option } from "effect"
+import { Dialog } from "./ui/dialog"
+import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, confirmAction, formatDownloads, initialVersion, parseModelReference, versionVerdict, type FindTab } from "./add-model-dialog"
+import { catalogId, catalogModel, inspection, repository, version, doesNotFit, unsupported } from "../../test/models/fixtures"
+
+const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
+const models = [catalogModel()]
+const find = (tab: FindTab, overrides: { results?: ReactNode; pasteInvalid?: boolean } = {}) => inDialog(<FindStepView tab={tab} onTab={() => {}} typed="qwen3.6 35b abliterated" onType={() => {}} onSearch={() => {}}
+  results={overrides.results ?? null} pasted="not a link" pasteInvalid={overrides.pasteInvalid ?? false} onPaste={() => {}} onOpenPasted={() => {}} />)
+
+describe("paste a link", () => {
+  it("accepts a Hugging Face URL, owner/repo, and owner/repo:QUANT", () => {
+    expect(parseModelReference(" https://huggingface.co/unsloth/Qwen3.6-27B-GGUF ")).toEqual(Option.some("https://huggingface.co/unsloth/Qwen3.6-27B-GGUF"))
+    expect(parseModelReference("https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-Q4_K_M.gguf")).toEqual(Option.some("https://huggingface.co/unsloth/Qwen3.6-27B-GGUF/blob/main/Qwen3.6-27B-Q4_K_M.gguf"))
+    expect(parseModelReference("unsloth/Qwen3.6-27B-GGUF")).toEqual(Option.some("unsloth/Qwen3.6-27B-GGUF"))
+    expect(parseModelReference("unsloth/Qwen3.6-27B-GGUF:Q4_K_M")).toEqual(Option.some("unsloth/Qwen3.6-27B-GGUF:Q4_K_M"))
+  })
+  it("refuses anything else before asking the service", () => {
+    for (const text of ["", "qwen", "https://example.com/owner/repo", "owner/repo/extra", "owner/repo:"]) expect(parseModelReference(text)).toEqual(Option.none())
+  })
+})
+
+describe("find step", () => {
+  it("titles the dialog, explains what is accepted, and offers Search and Paste a link", () => {
+    const html = find("search")
+    expect(html).toContain("Add a model from Hugging Face")
+    expect(html).toContain("other quantizations, finetunes, and uncensored versions")
+    expect(html).toMatch(/role="tab"[^>]*aria-selected="true"[^>]*>.*Search/)
+    expect(html).toContain("Paste a link")
+    expect(html).toContain('value="qwen3.6 35b abliterated"')
+    expect(html).toContain("Press Enter to search")
+  })
+  it("explains the accepted forms on the paste tab and flags a link it can't use", () => {
+    expect(find("paste")).toContain("Accepts a Hugging Face link, owner/repo, or owner/repo:QUANT.")
+    const invalid = find("paste", { pasteInvalid: true })
+    expect(invalid).toContain('aria-invalid="true"')
+    expect(invalid).toContain("That isn’t a Hugging Face link.")
+  })
+  it("lists results with uploader, lineage, and downloads, then counts the hidden ones", () => {
+    const html = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: {
+      hiddenCount: 4,
+      results: [{ repository, displayName: "Huihui Qwen3.6 35B A3B abliterated", uploader: "huihui-ai", variantOf: Option.some(catalogId), downloads: 172_100, architecture: Option.some("qwen35moe"), unsupported: Option.none() }],
+    } }} />)
+    expect(html).toContain("Huihui Qwen3.6 35B A3B abliterated")
+    expect(html).toContain("huihui-ai · Variant of Qwen3.6 35B-A3B")
+    expect(html).toContain(formatDownloads(172_100))
+    expect(html).toContain("Qwen logo")
+    expect(html).toContain("4 more results use architectures Magnitude doesn’t run")
+  })
+  it("distinguishes searching, no matches, and a failed search", () => {
+    expect(renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loading" }} />)).toContain('aria-busy="true"')
+    const empty = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Loaded", response: { results: [], hiddenCount: 1 } }} />)
+    expect(empty).toContain("No supported GGUF repositories match this search.")
+    expect(empty).toContain("1 more result uses an architecture Magnitude doesn’t run")
+    const failed = renderToStaticMarkup(<SearchResultsView models={models} onOpen={() => {}} onRetry={() => {}} state={{ _tag: "Failed", notice: { title: "Couldn’t reach Hugging Face" } }} />)
+    expect(failed).toContain("Couldn’t reach Hugging Face")
+    expect(failed).toContain("Try again")
+  })
+})
+
+describe("repository step", () => {
+  it("gives each version one verdict from the engine", () => {
+    expect(versionVerdict(version("Q4_K_P", { recommended: true }))).toMatchObject({ label: "Recommended", selectable: true })
+    expect(versionVerdict(version("Q5_K_P"))).toMatchObject({ label: "Fits your machine", selectable: true })
+    expect(versionVerdict(version("Q8_K_P", { assessment: Option.some(doesNotFit) }))).toMatchObject({ label: "Too large for this machine", selectable: false })
+    expect(versionVerdict(version("IQ2_M", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "IQ2_S", tensorCount: 100 }] })) }))).toMatchObject({ label: "Uses IQ2_S weights, which Magnitude doesn't support yet", selectable: false })
+  })
+  it("starts on a linked file, then the pasted version, then the recommended one", () => {
+    expect(initialVersion(inspection(), Option.some("Q8_K_P.gguf"))).toEqual(Option.some("Q8_K_P"))
+    expect(initialVersion(inspection({ selectedVersion: Option.some("Q2_K_P") }), Option.none())).toEqual(Option.some("Q2_K_P"))
+    expect(initialVersion(inspection(), Option.none())).toEqual(Option.some("Q4_K_P"))
+    expect(initialVersion(inspection({ versions: [version("Q5_K_P")] }), Option.none())).toEqual(Option.some("Q5_K_P"))
+  })
+  it("totals the target, drafter, and projector for Download, and only the drafter for a version already here", () => {
+    const withProjector = inspection({ projector: Option.some({ path: "mmproj.gguf", sizeBytes: 1_000_000_000 }) })
+    expect(confirmAction(withProjector, version("Q4_K_P"), 900_000_000)).toEqual({ label: "Download (25.3 GB)", download: true })
+    const here = version("Q4_K_P", { onThisComputer: Option.some(catalogId) })
+    expect(confirmAction(withProjector, here, 900_000_000)).toEqual({ label: "Add (900 MB)", download: false })
+    expect(confirmAction(withProjector, here, 0)).toEqual({ label: "Add", download: false })
+    expect(confirmAction(inspection({ source: { _tag: "Local", path: "/models/a.gguf" } }), version("a"), 0).label).toBe("Add")
+  })
+  it("shows the repository link, lineage, license, and every version with its verdict", () => {
+    const html = inDialog(<RepositoryView inspection={inspection({ versions: [...inspection().versions, version("Q6_K_P", { onThisComputer: Option.some(catalogId) })] })} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} onBack={() => {}} drafters={<p>drafter list</p>} />)
+    expect(html).toContain(`href="https://huggingface.co/${repository}"`)
+    expect(html).toContain("Variant of Qwen3.6 35B-A3B")
+    expect(html).toContain("apache-2.0")
+    expect(html).toContain("Too large for this machine")
+    expect(html).toContain("Recommended")
+    expect(html).toContain("Uses Q2_K weights, which Magnitude doesn&#x27;t support yet")
+    expect(html).toContain("Already on this computer")
+    expect(html).toContain("drafter list")
+    expect(html).toContain('aria-label="Back to search"')
+    expect(html.match(/type="radio"[^>]*disabled=""/g)).toHaveLength(2)
+    expect(html).toMatch(/type="radio"[^>]*checked=""/)
+  })
+  it("explains an architecture the engine can't run in place of the versions", () => {
+    const html = inDialog(<RepositoryView inspection={inspection({ displayName: "DeepSeek V4 Flash 0731", versions: [], unsupportedArchitecture: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]) })} models={models} selectedVersion={Option.none()} onSelectVersion={() => {}} />)
+    expect(html).toContain("Magnitude can’t run this model")
+    expect(html).toContain("No kernels for the deepseek4 architecture")
+    expect(html).not.toContain('type="radio"')
+  })
+  it("pins Hugging Face downloads and keeps local files in place", () => {
+    const pinned = inDialog(<RepositoryFooter local={false} action={{ label: "Download (24.3 GB)", download: true }} pending={false} failure={undefined} onConfirm={() => {}} />)
+    expect(pinned).toContain("Pinned to the current version of this repository")
+    expect(pinned).toContain("Download (24.3 GB)")
+    const local = inDialog(<RepositoryFooter local action={{ label: "Add", download: false }} pending failure={{ title: "Couldn’t add this model" }} onConfirm={() => {}} />)
+    expect(local).toContain("never moves or deletes it")
+    expect(local).toContain("Couldn’t add this model")
+    expect(local).toMatch(/<button[^>]*disabled=""/)
+  })
+})
+
+describe("add GGUF file", () => {
+  const localFile = (overrides: Parameters<typeof inspection>[0] = {}) => inspection({
+    source: { _tag: "Local", path: "/Users/me/models/qwen.gguf" }, license: Option.none(), versions: [version("Q4_K_P")], ...overrides,
+  })
+  it("opens on the file picker, in place of the version list, until a file is chosen", () => {
+    const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.none()} />)
+    expect(html).toContain("Add a GGUF file")
+    expect(html).toContain("never moves or deletes it")
+    expect(html).toMatch(/aria-label="File".*file browser/)
+    expect(html).toContain("Choose a GGUF file to see whether it runs on this machine.")
+    expect(html).not.toContain('aria-label="Version"')
+  })
+  it("shows the chosen file below the picker", () => {
+    const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.some(<p>chosen file</p>)} />)
+    expect(html.indexOf("file browser")).toBeLessThan(html.indexOf("chosen file"))
+    expect(html).not.toContain("Choose a GGUF file to see")
+  })
+  it("gives the chosen file its engine verdict, lineage, and size, then its drafters and Add", () => {
+    const html = inDialog(<LocalFileSummary inspection={localFile()} models={models} drafters={<p>drafter list</p>} footer={<p>add footer</p>} />)
+    expect(html).toContain("Qwen3.6 35B A3B Uncensored HauhauCS Aggressive")
+    expect(html).toContain("Variant of Qwen3.6 35B-A3B")
+    expect(html).toContain("23.4 GB")
+    expect(html).toContain("Fits your machine")
+    expect(html.indexOf("drafter list")).toBeLessThan(html.indexOf("add footer"))
+    expect(html).not.toContain('type="radio"')
+  })
+  it("explains a file the engine can't run or that doesn't fit, with nothing to add", () => {
+    const tooLarge = inDialog(<LocalFileSummary inspection={localFile({ versions: [version("Q8_K_P", { assessment: Option.some(doesNotFit) })] })} models={models} />)
+    expect(tooLarge).toContain("Too large for this machine")
+    const unsupportedFile = inDialog(<LocalFileSummary inspection={localFile({ unsupportedArchitecture: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]) })} models={models} />)
+    expect(unsupportedFile).toContain("Magnitude can’t run this model")
+    expect(unsupportedFile).toContain("No kernels for the deepseek4 architecture")
+    expect(unsupportedFile).not.toContain("Fits your machine")
+  })
+})

@@ -80,8 +80,8 @@ describe("automatic assessment projection", () => {
       revision: 1,
       environmentId: "environment",
       catalog: { _tag: "Pending", sourceRevision: 1 },
-      discovered: { _tag: "Pending", sourceRevision: 1 },
-    } as ModelAssessmentsSnapshot
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
     expect(coordinatedAssessment(pending, 1, "catalog", modelId)).toBeUndefined()
     expect(coordinatedAssessment(pending, 2, "catalog", modelId)).toBeUndefined()
   })
@@ -98,8 +98,8 @@ describe("automatic assessment projection", () => {
           state: { _tag: "Dropped" },
         }],
       },
-      discovered: { _tag: "Pending", sourceRevision: 1 },
-    } as ModelAssessmentsSnapshot
+      custom: { _tag: "Pending", sourceRevision: 1 },
+    } as unknown as ModelAssessmentsSnapshot
     expect(coordinatedAssessment(targetFailure, 1, "catalog", modelId)).toEqual({ _tag: "Dropped" })
     expect(assessmentTargetVisible({ _tag: "Dropped" })).toBe(false)
   })
@@ -112,10 +112,12 @@ describe("local model preparation projection", () => {
     discoveredModels: number,
   ): LocalModelSourcesState => ({
     catalogRevision: 1,
-    discoveryRevision: 1,
+    localModelsRevision: 1,
     reconciliationComplete,
     catalogModels: Array.from({ length: catalogModels }) as unknown as LocalModelSourcesState["catalogModels"],
-    discoveredModels: Array.from({ length: discoveredModels }) as unknown as LocalModelSourcesState["discoveredModels"],
+    customModels: Array.from({ length: discoveredModels }) as unknown as LocalModelSourcesState["customModels"],
+    hiddenModels: [],
+    unsupported: [],
   })
   const entries = (settled: number, total: number, prefix: string) => Array.from({ length: total }, (_, index) => ({
     subject: {
@@ -139,8 +141,8 @@ describe("local model preparation projection", () => {
           sourceRevision: 1,
           entries: entries(2, 4, "discovering-catalog"),
         },
-        discovered: { _tag: "Pending", sourceRevision: 1 },
-      } as ModelAssessmentsSnapshot,
+        custom: { _tag: "Pending", sourceRevision: 1 },
+      } as unknown as ModelAssessmentsSnapshot,
     )
     const discovered = projectLocalModelPreparation(
       sources(true, 4, 3),
@@ -152,12 +154,12 @@ describe("local model preparation projection", () => {
           sourceRevision: 1,
           entries: entries(4, 4, "discovered-catalog"),
         },
-        discovered: {
+        custom: {
           _tag: "Available",
           sourceRevision: 1,
           entries: entries(1, 3, "discovered-local"),
         },
-      } as ModelAssessmentsSnapshot,
+      } as unknown as ModelAssessmentsSnapshot,
     )
 
     expect(discovering).toEqual({
@@ -181,12 +183,12 @@ describe("local model preparation projection", () => {
           sourceRevision: 1,
           entries: entries(2, 2, "complete-catalog"),
         },
-        discovered: {
+        custom: {
           _tag: "Available",
           sourceRevision: 1,
           entries: entries(1, 1, "complete-local"),
         },
-      } as ModelAssessmentsSnapshot,
+      } as unknown as ModelAssessmentsSnapshot,
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
       assessment: { complete: true, settledModels: 3, totalModels: 3 },
@@ -195,7 +197,7 @@ describe("local model preparation projection", () => {
 
   it("does not unlock on completed assessment state for an older source snapshot", () => {
     expect(projectLocalModelPreparation(
-      { ...sources(true, 2, 1), discoveryRevision: 2 },
+      { ...sources(true, 2, 1), localModelsRevision: 2 },
       {
         revision: 2,
         environmentId: "environment",
@@ -204,12 +206,12 @@ describe("local model preparation projection", () => {
           sourceRevision: 1,
           entries: entries(2, 2, "stale-catalog"),
         },
-        discovered: {
+        custom: {
           _tag: "Available",
           sourceRevision: 1,
           entries: entries(1, 1, "stale-local"),
         },
-      } as ModelAssessmentsSnapshot,
+      } as unknown as ModelAssessmentsSnapshot,
     )).toEqual({
       discovery: { complete: true, modelsFound: 1 },
       assessment: { complete: false, settledModels: 3, totalModels: 3 },

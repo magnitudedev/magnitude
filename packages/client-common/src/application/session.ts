@@ -1,6 +1,6 @@
 import { Atom, Registry, Result } from "@effect-atom/atom-react"
 import { Context, Effect, Layer, Option, Stream } from "effect"
-import { ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
+import { localModelResidency, ModelLoadStageSchema, type LocalModelsState, type ModelResidency } from "@magnitudedev/sdk"
 import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { LocalModels } from "../local-models/service"
 import { LOCAL_MODEL_RANKING_SCALE_VALUES } from "../local-models/options"
@@ -8,14 +8,14 @@ import { formatLocalModelDisplayName } from "../utils/model-presentation"
 import { formatModelLoadPercentage, formatModelLoadStage, formatModelMemory, isMeasuredModelLoadStage } from "../utils/model-load"
 import { ApplicationHost, ApplicationHostFailed } from "./host"
 import { ApplicationRouter } from "./router"
-import type { HostNotice, QuitFailureDecision } from "./contracts"
+import type { AddModelRequest, HostNotice, QuitFailureDecision } from "./contracts"
 import { ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
-export { ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
+export { AddModelRequest, ApplicationPage, HostAction, HostNotice, QuitFailureDecision, ModelTrayPresentation, ModelTrayStatus } from "./contracts"
 
 export const activeLocalModel = (models: LocalModelsState) => {
   for (const model of models.models) {
-    const residency = model._tag === "Catalog" ? ("residencyState" in model.acquisitionState ? model.acquisitionState.residencyState : undefined) : model.state._tag === "Ready" ? model.state.residencyState : undefined
+    const residency = Option.getOrUndefined(localModelResidency(model))
     if (residency && residency._tag !== "Unloaded" && residency._tag !== "Stopped" && residency._tag !== "Failed") {
       return Option.some({ model, residency })
     }
@@ -79,6 +79,10 @@ const makeApplicationSession = Effect.gen(function* () {
   const notices = Atom.keepAlive(Atom.make<ReadonlyArray<HostNotice>>([]))
   const dismissNotice = (notice: HostNotice) => Effect.sync(() => registry.set(notices, registry.get(notices).filter(entry => entry !== notice)))
   const quitFailed = Atom.keepAlive(Atom.make(false))
+  const addModelRequest = Atom.keepAlive(Atom.make(Option.none<AddModelRequest>()))
+  const requestAddModel = (request: AddModelRequest) => router.navigate("catalog").pipe(
+    Effect.zipRight(Effect.sync(() => registry.set(addModelRequest, Option.some(request)))))
+  const clearAddModelRequest = Effect.sync(() => registry.set(addModelRequest, Option.none()))
 
   if (Option.isSome(host.shell)) {
     const shell = host.shell.value
@@ -89,6 +93,7 @@ const makeApplicationSession = Effect.gen(function* () {
           case "StopModel": return models.stop.pipe(Effect.asVoid, Effect.catchAll(Effect.logError))
           case "ShowNotice": return Effect.sync(() => registry.set(notices, [...registry.get(notices), action.notice]))
           case "QuitFailed": return Effect.sync(() => registry.set(quitFailed, true))
+          case "OpenHuggingFaceModel": return requestAddModel({ _tag: "HuggingFace", repository: action.repository, file: action.file })
         }
       }),
       Effect.catchAll(Effect.logError),
@@ -117,6 +122,9 @@ const makeApplicationSession = Effect.gen(function* () {
     notices: notices as Atom.Atom<ReadonlyArray<HostNotice>>,
     dismissNotice,
     quitFailed: quitFailed as Atom.Atom<boolean>,
+    addModelRequest: addModelRequest as Atom.Atom<Option.Option<AddModelRequest>>,
+    requestAddModel,
+    clearAddModelRequest,
     resolveQuitFailure,
     retryService,
     readAppearance: host.appearance.read,

@@ -15,6 +15,7 @@ import { GeneratedClientTransportError } from "@magnitudedev/openapi-effect/clie
 import { FSM } from "@magnitudedev/utils";
 import { openLogFile, type LogFile } from "@magnitudedev/utils/log-file";
 import { dirname, join } from "node:path";
+import { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
 import {
   Context,
   Deferred,
@@ -23,6 +24,7 @@ import {
   Layer,
   Option,
   Random,
+  Redacted,
   Ref,
   Schedule,
   Schema,
@@ -39,6 +41,7 @@ import {
   IcnExitedBeforeReady,
   IcnHealthIdentityMismatch,
   IcnIdentityProbeTimedOut,
+  IcnLocalModelsConfigurationUnwritable,
   IcnNativeBuildIncompatible,
   IcnReadinessCommitRejected,
   IcnReadinessTimedOut,
@@ -98,7 +101,8 @@ export class IcnStorageConfig extends Schema.Class<IcnStorageConfig>(
 )({
   modelStore: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
   cacheRoot: Schema.optionalWith(NonEmpty, { as: "Option", exact: true }),
-  huggingFaceCaches: Schema.Array(NonEmpty),
+  localModelsConfigurationFile: NonEmpty,
+  localModels: LocalModelsConfiguration,
 }) {}
 
 export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
@@ -118,6 +122,7 @@ export class IcnLifecycleConfig extends Schema.Class<IcnLifecycleConfig>(
   ),
   outputLimitBytes: PositiveInt,
   logFile: Schema.optionalWith(Schema.String, { as: "Option", exact: true }),
+  huggingFaceToken: Schema.optionalWith(Schema.Redacted(NonEmpty), { as: "Option", exact: true }),
 }) {}
 
 export interface ResolvedIcnBinary {
@@ -373,8 +378,41 @@ export const renderIcnArguments = (
     onNone: () => [],
     onSome: (value) => ["--cache-root", value],
   }),
-  ...config.storage.huggingFaceCaches.flatMap((value) => ["--hf-cache", value]),
+  "--local-models-config",
+  config.storage.localModelsConfigurationFile,
 ];
+
+/** ICN's first scan reads this snapshot, so it must exist before the child starts. */
+export const writeLocalModelsConfiguration = (storage: IcnStorageConfig) =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const file = storage.localModelsConfigurationFile;
+    const encoded = yield* Schema.encode(Schema.parseJson(LocalModelsConfiguration))(storage.localModels);
+    yield* fs.makeDirectory(dirname(file), { recursive: true });
+    yield* fs.writeFileString(`${file}.pending`, encoded);
+    yield* fs.rename(`${file}.pending`, file);
+  });
+
+/**
+ * ICN's output is recorded, not shown: plain text, and a per-request line only on failure. ICN never
+ * reads a token file; an explicit token reaches gated repositories and raises rate limits.
+ */
+export const icnChildEnvironment = (
+  config: IcnLifecycleConfig,
+  binaryEnvironment: Readonly<Record<string, string>>,
+  authorization: string,
+  inherited: Readonly<Record<string, string | undefined>> = globalThis.process.env,
+): Record<string, string> => ({
+  ...(inherited.RUST_LOG ? {} : { RUST_LOG: "info,tower_http=warn" }),
+  NO_COLOR: "1",
+  ...binaryEnvironment,
+  MAGNITUDE_ICN_AUTH_TOKEN: authorization,
+  HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
+  ...Option.match(config.huggingFaceToken, {
+    onNone: () => ({}),
+    onSome: (token) => ({ HF_TOKEN: Redacted.value(token) }),
+  }),
+});
 
 const acquireIcn = (input: IcnLifecycleConfig) =>
   Effect.gen(function* () {
@@ -383,6 +421,12 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
     const resolver = yield* IcnBinaryResolver;
     const reporter = yield* IcnPreparationReporter;
     const binary = yield* resolver.resolve(config.binary);
+    yield* writeLocalModelsConfiguration(config.storage).pipe(
+      Effect.mapError((cause) => new IcnLocalModelsConfigurationUnwritable({
+        path: config.storage.localModelsConfigurationFile,
+        detail: String(cause),
+      })),
+    );
     yield* reporter.report({ _tag: "Starting" });
     const instanceId = yield* opaqueInstanceId;
     const authorization = yield* opaqueInstanceId;
@@ -395,14 +439,7 @@ const acquireIcn = (input: IcnLifecycleConfig) =>
         const process = yield* children.spawn(new IcnChildLaunch({
           executable: installationNativePath(binary.path),
           arguments: renderIcnArguments(config, instanceId, binary.installation),
-          // Output is recorded, not shown: plain text, and a per-request line only on failure.
-          environment: {
-            ...(globalThis.process.env.RUST_LOG ? {} : { RUST_LOG: "info,tower_http=warn" }),
-            NO_COLOR: "1",
-            ...binary.environment,
-            MAGNITUDE_ICN_AUTH_TOKEN: authorization,
-            HF_HUB_DISABLE_IMPLICIT_TOKEN: "1",
-          },
+          environment: icnChildEnvironment(config, binary.environment, authorization),
           gracefulShutdownTimeout: config.gracefulShutdownTimeout,
           forceShutdownTimeout: config.forceShutdownTimeout,
         }));

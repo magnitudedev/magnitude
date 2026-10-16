@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { describe, expect, it } from "vitest"
-import { renderLinuxMaintainerScripts, renderPacmanInstallScript } from "./linux-maintainer-scripts"
+import { refreshDesktopDatabase, renderLinuxMaintainerScripts, renderPacmanInstallScript } from "./linux-maintainer-scripts"
 
 const resources = join(import.meta.dirname, "../../resources/linux")
 const scripts = renderLinuxMaintainerScripts(
@@ -32,6 +32,12 @@ describe("Debian maintainer scripts", () => {
     const reload = lines.indexOf("if [ -d /run/systemd/system ]; then systemctl daemon-reload || :; fi")
     expect(reload).toBeGreaterThan(0)
     expect(reload).toBeLessThan(lines.findIndex(line => line.includes("|| exit 0") && line.includes("/var/lib/magnitude-desktop")))
+  })
+
+  it.each(["postinst", "postrm"])("%s refreshes the desktop database, for the magnitude:// handler, before the gate check can exit", name => {
+    const body = scripts[name]!
+    expect(body).toContain(refreshDesktopDatabase)
+    expect(body.indexOf(refreshDesktopDatabase)).toBeLessThan(body.indexOf("/var/lib/magnitude-desktop/"))
   })
 
   it("forgets the server only on purge, keeping its account and data", () => {
@@ -64,6 +70,13 @@ describe("pacman install script", () => {
     expect(remove).not.toContain("_server-restore-grant")
     for (const body of [install!, upgrade!, remove!]) expect(body).toContain("systemctl daemon-reload || :")
     expect(upgrade!.indexOf("daemon-reload")).toBeLessThan(upgrade!.indexOf("|| exit 0"))
+  })
+  it("refreshes the desktop database in every scriptlet, guarded for systems without it", () => {
+    for (const name of ["post_install()", "post_upgrade()", "post_remove()"]) {
+      const body = script.slice(script.indexOf(name))
+      expect(body.slice(0, body.indexOf("\n)\n"))).toContain(refreshDesktopDatabase.trimEnd())
+    }
+    expect(refreshDesktopDatabase).toMatch(/^if command -v update-desktop-database .*\|\| :; fi\n$/)
   })
   it("is valid POSIX shell", () => {
     expect(() => execFileSync("sh", ["-n"], { input: script })).not.toThrow()

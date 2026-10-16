@@ -1,5 +1,6 @@
 export * from './config'
 export * from './custom-endpoints'
+export * from './custom-models'
 export * from './model-state'
 export * from './auth'
 export * from './session'

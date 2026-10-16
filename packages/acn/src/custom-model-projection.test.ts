@@ -1,0 +1,297 @@
+import { Option } from "effect"
+import { describe, expect, it } from "vitest"
+import type { ModelAssessmentsSnapshot } from "@magnitudedev/icn-protocol/schemas"
+import { customModel, projectLocalModels, localModelDrafterKey } from "./local-models"
+import { customModelDownloads } from "./custom-model-downloads"
+import type { LocalModelSourcesState } from "./local-model-sources"
+import {
+  addedId,
+  customModelsConfig,
+  customSource,
+  drafterDownload,
+  drafterReference,
+  foundId,
+  importedId,
+  nativeCustomModel,
+  nativeDownload,
+  targetDownload,
+} from "./custom-models.test-support"
+
+const capabilities = {
+  vision: false,
+  tools: true,
+  structuredOutput: true,
+  reasoning: { supported: false, efforts: [], defaultEffort: Option.none() },
+}
+
+const assessed = (assessment: Record<string, unknown>) => ({
+  _tag: "Assessed" as const,
+  assessment: assessment as never,
+  capabilities: capabilities as never,
+  drafter: undefined,
+})
+
+const fits = assessed({
+  _tag: "Fits",
+  assessmentId: "assessment",
+  environmentId: "environment",
+  profile: { contextLength: 32_768 },
+  memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
+  performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }],
+})
+
+const unsupported = assessed({
+  _tag: "Unsupported",
+  environmentId: "environment",
+  profile: { contextLength: 32_768 },
+  reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+  detail: "",
+})
+
+const inputs = (entry = customSource(nativeCustomModel()), overrides: Partial<Parameters<typeof customModel>[0]> = {}) => ({
+  entry,
+  assessment: fits,
+  instances: [],
+  related: [],
+  acceptance: [],
+  catalog: [],
+  ...overrides,
+})
+
+const attachedDrafter = {
+  method: { _tag: "DFlash" },
+  reference: drafterReference,
+  state: { _tag: "Ready" },
+}
+
+describe("custom model rows", () => {
+  it("projects a found model as external, assessed, and unranked with its source tag", () => {
+    const row = Option.getOrThrow(customModel(inputs()))
+    expect(row.origin).toEqual({ _tag: "Found", source: { _tag: "LmStudio" } })
+    expect(row.presentation.sourceLabel).toBe("LM Studio")
+    expect(row.presentation.variantLabel).toBe("Q4_K_M")
+    expect(row.presentation.sourceUrls).toEqual(["https://huggingface.co/other/found-GGUF"])
+    expect(row.acquisitionState._tag).toBe("External")
+    expect(row.servingState._tag).toBe("Assessed")
+    expect(row.servingState).not.toHaveProperty("rankingScores")
+  })
+
+  it("lists unsupported external models apart and keeps an unsupported added model removable", () => {
+    expect(customModel(inputs(undefined, { assessment: unsupported }))).toEqual(Option.none())
+    const added = customSource(nativeCustomModel({
+      modelId: addedId,
+      origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+    }))
+    const row = Option.getOrThrow(customModel(inputs(added, { assessment: unsupported })))
+    expect(row.servingState._tag === "Assessed" && row.servingState.assessment._tag).toBe("Unsupported")
+  })
+
+  it("projects an added model's download as installation progress, then its failure", () => {
+    const added = customSource(nativeCustomModel({
+      modelId: addedId,
+      origin: { _tag: "Added", repository: "owner/model-GGUF", commit: "c0ffee" },
+      state: { _tag: "NotInstalled" },
+    }))
+    const config = customModelsConfig()
+    const downloading = customModelDownloads(addedId, config, [targetDownload("d1", {
+      _tag: "Downloading", completedBytes: 5, totalBytes: 10, stage: "downloading", bytesPerSecond: 2,
+    })])
+    expect(Option.getOrThrow(customModel(inputs(added, { related: downloading }))).acquisitionState).toEqual({
+      _tag: "Installing",
+      progress: { stage: "downloading", completedBytes: 5, totalBytes: 10, bytesPerSecond: Option.some(2) },
+    })
+    expect(Option.getOrThrow(customModel(inputs(added, { related: downloading }))).servingState._tag).toBe("Assessing")
+    const failed = customModelDownloads(addedId, config, [targetDownload("d1", {
+      _tag: "Failed", acknowledged: false, completedBytes: 5, totalBytes: 10, failure: { _tag: "NetworkUnavailable" },
+    })])
+    expect(Option.getOrThrow(customModel(inputs(added, { related: failed }))).acquisitionState).toEqual({
+      _tag: "InstallFailed", failure: { _tag: "NetworkUnavailable" },
+    })
+    expect(Option.getOrThrow(customModel(inputs(added, { related: [] }))).acquisitionState).toEqual({ _tag: "NotInstalled" })
+  })
+
+  it("omits an external model whose files are gone and fails an unreadable one", () => {
+    expect(customModel(inputs(customSource(nativeCustomModel({ state: { _tag: "NotInstalled" } }))))).toEqual(Option.none())
+    const unreadable = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({
+      state: {
+        _tag: "Unavailable",
+        failure: { code: "unreadable", message: "Unreadable", retryable: false },
+        installation: { _tag: "Resolved", installedBytes: 1, ownership: "External", primaryPath: "/m.gguf" },
+      },
+    })))))
+    expect(unreadable.acquisitionState._tag).toBe("Unavailable")
+    expect(unreadable.servingState._tag).toBe("Failed")
+  })
+
+  it("reports a drafter-only download, its failure, a catalog drafter update, and measured acceptance", () => {
+    const config = customModelsConfig()
+    const entry = customSource(nativeCustomModel({ drafter: { ...attachedDrafter, state: { _tag: "NotInstalled" } } }))
+    const downloading = customModelDownloads(foundId, config, [drafterDownload("dd", {
+      _tag: "Pending", completedBytes: 0, totalBytes: 900,
+    })])
+    expect(Option.getOrThrow(customModel(inputs(entry, { related: downloading }))).drafter).toMatchObject(Option.some({
+      availability: { _tag: "Downloading", progress: { stage: "queued", totalBytes: 900 } },
+      updateAvailable: false,
+    }))
+    const failed = customModelDownloads(foundId, config, [drafterDownload("dd", {
+      _tag: "Failed", acknowledged: false, completedBytes: 0, totalBytes: 900, failure: { _tag: "CorruptDownload" },
+    })])
+    expect(Option.getOrThrow(customModel(inputs(entry, { related: failed }))).drafter).toMatchObject(Option.some({
+      availability: { _tag: "DownloadFailed", failure: { _tag: "CorruptDownload" } },
+    }))
+    const measured = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ drafter: attachedDrafter })), {
+      acceptance: [{
+        model: foundId,
+        drafter: "hf:magnitudedev/model-DFlash-GGUF@d1/dflash.gguf",
+        acceptance: { acceptanceRate: 0.58, tokensPerSecond: 40, withoutDrafterTokensPerSecond: Option.some(30), slower: false },
+      }],
+    })))
+    expect(Option.map(measured.measuredAcceptance, ({ acceptanceRate }) => acceptanceRate)).toEqual(Option.some(0.58))
+    expect(Option.map(measured.drafter, ({ availability }) => availability._tag)).toEqual(Option.some("Present"))
+
+    const catalogDrafter = customSource(nativeCustomModel({
+      drafter: { method: { _tag: "DFlash" }, reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" }, state: { _tag: "Ready" } },
+    }))
+    const catalog = [{
+      id: "qwen3.6-35b-a3b:gguf:q4",
+      source: { localState: { _tag: "Installed", updateState: { _tag: "Available" } } },
+    }] as never
+    expect(Option.map(Option.getOrThrow(customModel(inputs(catalogDrafter, { catalog }))).drafter, ({ updateAvailable }) => updateAvailable))
+      .toEqual(Option.some(true))
+  })
+})
+
+describe("custom model downloads", () => {
+  it("relates each download to the model it was started for: an added target, or a drafter alone", () => {
+    const config = customModelsConfig()
+    const target = targetDownload("t", { _tag: "Completed" })
+    const drafter = drafterDownload("d", { _tag: "Completed" })
+    const addedDrafter = drafterDownload("ad", { _tag: "Completed" }, addedId)
+    const downloads = [target, drafter, addedDrafter]
+    expect(customModelDownloads(addedId, config, downloads).map(({ kind, download }) => [kind, download.id]))
+      .toEqual([["Target", "t"], ["Drafter", "ad"]])
+    expect(customModelDownloads(foundId, config, downloads).map(({ kind }) => kind)).toEqual(["Drafter"])
+    expect(customModelDownloads(importedId, config, downloads)).toEqual([])
+  })
+
+  it("follows a catalog drafter's download, whose package names no attached repository file", () => {
+    const catalogDrafter = nativeDownload("catalog", foundId, {
+      repository: "magnitudedev/catalog-drafters", revision: "r1", path: "drafter.gguf",
+    }, { _tag: "Downloading", completedBytes: 3, totalBytes: 9, stage: "downloading" })
+    const config = customModelsConfig({
+      drafters: { [foundId]: { _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen3.6-35b-a3b:gguf:q4" } } },
+    })
+    expect(customModelDownloads(foundId, config, [catalogDrafter]).map(({ kind }) => kind)).toEqual(["Drafter"])
+  })
+})
+
+describe("local models state", () => {
+  const sources = (
+    models: LocalModelSourcesState["customModels"],
+    hiddenModels: LocalModelSourcesState["hiddenModels"] = [],
+  ): LocalModelSourcesState => ({
+    catalogRevision: 1,
+    localModelsRevision: 2,
+    reconciliationComplete: true,
+    catalogModels: [],
+    customModels: models,
+    hiddenModels,
+    unsupported: [{
+      displayName: "",
+      origin: { _tag: "Found", source: { _tag: "Ollama" } },
+      path: "/ollama/blobs/sha256-1",
+      reasons: [],
+      detail: "unknown architecture",
+    } as never],
+  })
+  const assessments = (modelIds: readonly string[]) => ({
+    revision: 1,
+    environmentId: "environment",
+    catalog: { _tag: "Available", sourceRevision: 1, entries: [] },
+    custom: {
+      _tag: "Available",
+      sourceRevision: 2,
+      entries: modelIds.map((modelId) => ({
+        subject: { _tag: "Custom", modelId },
+        state: {
+          _tag: "Assessed",
+          capabilities,
+          fingerprint: Option.none(),
+          templateFingerprint: "t",
+          profiles: [{
+            _tag: "Fits",
+            assessmentId: `a-${modelId}`,
+            drafter: { _tag: "None" },
+            memory: [],
+            performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 30 }],
+            profile: { contextLength: 32_768 },
+          }],
+        },
+      })),
+    },
+  }) as unknown as ModelAssessmentsSnapshot
+
+  it("lists hidden models apart, never as callable rows, and keeps unsupported reasons renderable", () => {
+    const state = projectLocalModels({
+      source: sources([customSource(nativeCustomModel({ drafter: attachedDrafter }))], [customSource(nativeCustomModel({
+        modelId: "hf:other/hidden-GGUF/hidden.gguf",
+        files: [{ path: "/models/hidden.gguf", sizeBytes: 1 }],
+      }))]),
+      assessment: assessments([foundId]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig({ hidden: ["hf:other/hidden-GGUF/hidden.gguf"] }),
+      downloads: [],
+      acceptance: [],
+    })
+    expect(state.models.map(({ modelId }) => modelId)).toEqual([foundId])
+    expect(state.hidden.map(({ modelId }) => modelId)).toEqual(["hf:other/hidden-GGUF/hidden.gguf"])
+    expect(state.unsupported).toEqual([{
+      displayName: "sha256-1",
+      origin: { _tag: "Found", source: { _tag: "Ollama" } },
+      path: "/ollama/blobs/sha256-1",
+      reasons: [{ _tag: "Unknown", kind: "Unknown", detail: "unknown architecture" }],
+      detail: "unknown architecture",
+    }])
+    expect(state.preparation).toEqual({
+      discovery: { complete: true, modelsFound: 1 },
+      assessment: { complete: true, settledModels: 1, totalModels: 1 },
+    })
+    expect(localModelDrafterKey(state, foundId)).toEqual(Option.some("hf:magnitudedev/model-DFlash-GGUF@d1/dflash.gguf"))
+  })
+  it("moves a found model the engine cannot run into the unsupported list with its reasons", () => {
+    const unsupportedId = "hf:other/unsupported-GGUF/unsupported.gguf"
+    const snapshot = assessments([foundId, unsupportedId]) as unknown as {
+      custom: { entries: Array<{ subject: { modelId: string }; state: { profiles: unknown[] } }> }
+    }
+    snapshot.custom.entries[1]!.state.profiles = [{
+      _tag: "Unsupported",
+      profile: { contextLength: 32_768 },
+      reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+      detail: "unknown architecture deepseek4",
+    }]
+    const state = projectLocalModels({
+      source: { ...sources([customSource(nativeCustomModel()), customSource(nativeCustomModel({
+        modelId: unsupportedId,
+        displayName: "Unsupported Model",
+        files: [{ path: "/models/unsupported.gguf", sizeBytes: 1 }],
+      }))]), unsupported: [] },
+      assessment: snapshot as unknown as ModelAssessmentsSnapshot,
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig(),
+      downloads: [],
+      acceptance: [],
+    })
+    expect(state.models.map(({ modelId }) => modelId)).toEqual([foundId])
+    expect(state.unsupported).toEqual([{
+      displayName: "Unsupported Model",
+      origin: { _tag: "Found", source: { _tag: "LmStudio" } },
+      path: "/models/unsupported.gguf",
+      reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+      detail: "unknown architecture deepseek4",
+    }])
+  })
+})

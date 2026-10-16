@@ -67,6 +67,18 @@ describe("Magnitude documentation", () => {
     expect(result.output).not.toContain("75K")
   })
 
+  it("documents custom models, drafters, and model locations", () => {
+    const result = resolveDocumentationCommand("custom-models")
+
+    expect(result._tag).toBe("Success")
+    if (result._tag === "Failure") return
+    for (const command of ["catalog search", "catalog inspect", "catalog pull", "models import", "models drafter", "models hide", "models folders"]) {
+      expect(result.output).toContain(command)
+    }
+    const cli = resolveDocumentationCommand("cli")
+    expect(cli._tag === "Success" && cli.output).toContain("accepts `--json`")
+  })
+
   it("rejects unknown topic IDs and lists the available IDs", () => {
     const result = resolveDocumentationCommand("CUSTOM-ENDPOINTS")
 

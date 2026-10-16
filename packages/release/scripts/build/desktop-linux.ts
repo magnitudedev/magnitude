@@ -9,7 +9,7 @@ import { ReleaseArtifactSchema } from "../../src/contracts"
 import { sha256File } from "../../src/macos-app"
 import { LINUX_GLIBC_MINIMUM, LinuxPackageFormat, linuxPackageArchitecture, linuxPackageVersion, pacmanPackageIdentity } from "../../src/linux-package"
 import { linuxDesktopInstaller } from "../../src/targets"
-import { reloadSystemd, removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript, restoreServerGrant } from "./linux-maintainer-scripts"
+import { refreshDesktopDatabase, reloadSystemd, removeServerGrant, renderLinuxMaintainerScripts, renderPacmanInstallScript, restoreServerGrant } from "./linux-maintainer-scripts"
 import { verifyLinuxElfDirectory } from "./linux-elf"
 import { linuxPolkitActions, linuxSystemFiles } from "./linux-system-files"
 
@@ -32,7 +32,8 @@ const PackageFields = {
 const DebianOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, compression: Schema.Literal("none"), depends: Schema.Array(Schema.String), scripts: Schema.Record({ key: Schema.String, value: Schema.String }) }) })
 const RpmOptions = Schema.Struct({ options: Schema.Struct({ ...PackageFields, requires: Schema.Array(Schema.String), license: Schema.String, specTemplate: Schema.String }) })
 
-const desktopEntry = `[Desktop Entry]\nName=Magnitude\nComment=Discover and run local models\nExec=${LINUX_DESKTOP_PACKAGE_NAME}\nIcon=${LINUX_DESKTOP_PACKAGE_NAME}\nType=Application\nTerminal=false\nStartupNotify=true\nStartupWMClass=${LINUX_DESKTOP_PACKAGE_NAME}\nCategories=Development;\n`
+/** `%u` passes an opened `magnitude://` link, which the MIME type routes here. */
+export const linuxDesktopEntry = `[Desktop Entry]\nName=Magnitude\nComment=Discover and run local models\nExec=${LINUX_DESKTOP_PACKAGE_NAME} %u\nIcon=${LINUX_DESKTOP_PACKAGE_NAME}\nType=Application\nTerminal=false\nStartupNotify=true\nStartupWMClass=${LINUX_DESKTOP_PACKAGE_NAME}\nCategories=Development;\nMimeType=x-scheme-handler/magnitude;\n`
 const packageDescription = "Discover and run local models"
 const packageMaintainer = "Magnitude <founders@magnitude.dev>"
 const packageHomepage = "https://magnitude.dev"
@@ -236,11 +237,11 @@ const buildElectronInstaller = (options: LinuxInstallerOptions & { readonly form
   const specTemplate = join(stage, "desktop.spec.ejs")
   const spec = yield* fs.readFileString(join(root, "packages/release/resources/linux/desktop.spec.ejs"))
   yield* fs.writeFileString(specTemplate, spec.replaceAll("@MAGNITUDE_INSTALL_BEGIN@", begin).replaceAll("@MAGNITUDE_INSTALL_END@", end).replaceAll("@MAGNITUDE_REMOVE_SERVER_GRANT@", removeServerGrant)
-    .replaceAll("@MAGNITUDE_RESTORE_SERVER_GRANT@", restoreServerGrant).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd)
+    .replaceAll("@MAGNITUDE_RESTORE_SERVER_GRANT@", restoreServerGrant).replaceAll("@MAGNITUDE_RELOAD_SYSTEMD@", reloadSystemd).replaceAll("@MAGNITUDE_REFRESH_DESKTOP_DATABASE@", refreshDesktopDatabase)
     .replaceAll("@MAGNITUDE_SYSTEM_INSTALL@", linuxSystemFiles.map(file => `install -D -m ${file.mode.toString(8).padStart(4, "0")} '${file.source}' '%{buildroot}/${file.path}'`).join("\n"))
     .replaceAll("@MAGNITUDE_SYSTEM_FILES@", linuxSystemFiles.map(file => `%attr(${file.mode.toString(8).padStart(4, "0")},root,root) /${file.path}`).join("\n")))
   const desktopTemplate = join(stage, "magnitude.desktop.ejs")
-  yield* fs.writeFileString(desktopTemplate, desktopEntry)
+  yield* fs.writeFileString(desktopTemplate, linuxDesktopEntry)
   const metadata = {
     name: LINUX_DESKTOP_PACKAGE_NAME, productName: "Magnitude", genericName: "Local inference",
     description: packageDescription,
@@ -314,7 +315,7 @@ const buildPacmanPackage = (options: LinuxInstallerOptions, stage: string, paylo
   yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/launch`, join(tree, "usr/bin", LINUX_DESKTOP_PACKAGE_NAME))
   yield* fs.symlink(`../lib/${LINUX_DESKTOP_PACKAGE_NAME}/resources/magnitude`, join(tree, "usr/bin/magnitude"))
   yield* fs.makeDirectory(join(tree, "usr/share/applications"), { recursive: true })
-  yield* fs.writeFileString(join(tree, "usr/share/applications", `${LINUX_DESKTOP_PACKAGE_NAME}.desktop`), desktopEntry)
+  yield* fs.writeFileString(join(tree, "usr/share/applications", `${LINUX_DESKTOP_PACKAGE_NAME}.desktop`), linuxDesktopEntry)
   yield* fs.makeDirectory(join(tree, "usr/share/icons/hicolor/256x256/apps"), { recursive: true })
   yield* fs.copyFile(applicationIcon, join(tree, "usr/share/icons/hicolor/256x256/apps", `${LINUX_DESKTOP_PACKAGE_NAME}.png`))
   yield* fs.makeDirectory(join(tree, "usr/share/libalpm/hooks"), { recursive: true })

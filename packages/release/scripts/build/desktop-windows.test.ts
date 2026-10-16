@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { Cause, ConfigProvider, Effect, Exit, Schema } from "effect"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as NodeContext from "@effect/platform-node/NodeContext"
+import { readFileSync } from "node:fs"
 import { join } from "node:path"
 import { WindowsInstallerInput, WindowsPayloadPath, buildWindowsDesktopInstaller, renderWindowsInstaller, renderWindowsInstallationInventory } from "./desktop-windows"
 const template = "@PAYLOAD_FILES@\n@REMOVE_FILES@\n@REMOVE_DIRECTORIES@"
@@ -49,6 +50,21 @@ describe("Windows installer file contract", () => {
   })
 })
 
+describe("Windows installer link handler", () => {
+  const script = Effect.runSync(renderWindowsInstaller(readFileSync(join(import.meta.dirname, "../../resources/windows/desktop.nsi"), "utf8"), input))
+  const install = script.slice(script.indexOf('Section "Magnitude"'), script.indexOf("SectionEnd"))
+  const uninstall = script.slice(script.indexOf('Section "Uninstall"'))
+  it("registers magnitude:// for the current user on every installation and update", () => {
+    expect(script).toContain('!define PROTOCOLKEY "Software\\Classes\\magnitude"')
+    const registration = install.slice(install.indexOf("installed:"))
+    expect(registration).toContain('WriteRegStr HKCU "${PROTOCOLKEY}" "URL Protocol" ""')
+    expect(registration).toContain(`WriteRegStr HKCU "\${PROTOCOLKEY}\\shell\\open\\command" "" '"$INSTDIR\\Magnitude.exe" "%1"'`)
+  })
+  it("removes the handler on uninstall only while it names this installation", () => {
+    expect(uninstall).toContain(`\${If} $9 == '"$INSTDIR\\Magnitude.exe" "%1"'\n    DeleteRegKey HKCU "\${PROTOCOLKEY}"`)
+    expect(install).not.toContain("DeleteRegKey")
+  })
+})
 
 describe("Windows installer source boundary", () => {
   it.each(["redirected payload", "x64 helper"] as const)("rejects %s before compiler execution", async scenario => {

@@ -1,3 +1,4 @@
+import { Option } from "effect"
 import type { LocalModel } from "@magnitudedev/sdk"
 import qwen from "../../../assets/brand/model-providers/qwen.svg"
 import deepseek from "../../../assets/brand/model-providers/deepseek.svg"
@@ -9,6 +10,7 @@ import zai from "../../../assets/brand/model-providers/zai.svg"
 import prism from "../../../assets/brand/model-providers/prismml.svg"
 import meta from "../../../assets/brand/model-providers/meta.svg"
 import openbmb from "../../../assets/brand/model-providers/openbmb.svg"
+import huggingFace from "../../../assets/brand/hugging-face.svg"
 
 export interface ModelLab {
   readonly name: string
@@ -31,19 +33,44 @@ export const modelLabs: readonly ModelLab[] = [
   { name: "OpenBMB", prefixes: ["minicpm"], src: openbmb, theme: "" },
 ]
 
-export const modelLab = (model: Pick<LocalModel, "modelId">): ModelLab | undefined =>
-  modelLabs.find(lab => lab.prefixes.some(prefix => model.modelId.startsWith(prefix)))
+const labForCatalogId = (modelId: string): ModelLab | undefined =>
+  modelLabs.find(lab => lab.prefixes.some(prefix => modelId.startsWith(prefix)))
+
+/** A lab named anywhere in a free-form model name, for files with no catalog lineage. */
+export const labForName = (name: string): ModelLab | undefined => {
+  const lower = name.toLowerCase()
+  return modelLabs.find(lab => lab.prefixes.some(prefix => lower.includes(prefix)))
+}
+
+/** A catalog model's lab from its ID; a custom model's from the catalog model it varies, else its name. */
+export const modelLab = (model: LocalModel): ModelLab | undefined =>
+  model._tag === "Catalog"
+    ? labForCatalogId(model.modelId)
+    : Option.match(model.presentation.variantOf, {
+      onNone: () => labForName(model.presentation.displayName),
+      onSome: labForCatalogId,
+    })
+
+/** The lab of a Hugging Face result or candidate: its catalog lineage first, then its name. */
+export const variantLab = (variantOf: Option.Option<string>, name: string): ModelLab | undefined =>
+  Option.match(variantOf, { onNone: () => labForName(name), onSome: labForCatalogId })
 
 export function LabLogo({ lab, className = "size-10" }: { readonly lab: ModelLab; readonly className?: string }) {
   return <img src={lab.src} alt={`${lab.name} logo`} className={`shrink-0 object-contain ${className} ${lab.theme}`} />
 }
 
-export function ModelLogo({ model, className = "size-10" }: {
-  readonly model: Pick<LocalModel, "modelId" | "presentation">
-  readonly className?: string
-}) {
-  const lab = modelLab(model)
+/** A lab's logo, or the name's initial when no lab is known. */
+export function NamedLogo({ lab, name, className = "size-10" }: { readonly lab: ModelLab | undefined; readonly name: string; readonly className?: string }) {
   return lab
     ? <LabLogo lab={lab} className={className} />
-    : <span aria-hidden="true" className={`inline-flex shrink-0 items-center justify-center font-heading text-slate-600 dark:text-slate-300 ${className}`}>{model.presentation.displayName.slice(0, 1)}</span>
+    : <span aria-hidden="true" className={`inline-flex shrink-0 items-center justify-center font-heading text-slate-600 dark:text-slate-300 ${className}`}>{name.slice(0, 1)}</span>
+}
+
+export function ModelLogo({ model, className = "size-10" }: { readonly model: LocalModel; readonly className?: string }) {
+  return <NamedLogo lab={modelLab(model)} name={model.presentation.displayName} className={className} />
+}
+
+/** The Hugging Face mark, decorative beside text that already names Hugging Face. */
+export function HuggingFaceLogo({ className = "size-4" }: { readonly className?: string }) {
+  return <img src={huggingFace} alt="" aria-hidden="true" className={`shrink-0 object-contain ${className}`} />
 }

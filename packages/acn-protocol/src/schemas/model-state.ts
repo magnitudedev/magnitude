@@ -215,7 +215,15 @@ export const HuggingFaceArtifactSelectorSchema = NonEmptyString.pipe(
 )
 export type HuggingFaceArtifactSelector = typeof HuggingFaceArtifactSelectorSchema.Type
 
-const modelIdForm = (value: string): "Catalog" | "HuggingFace" | undefined => {
+export const ModelHeaderDigestSchema = Schema.String.pipe(
+  Schema.pattern(/^[0-9a-f]{64}$/, { message: () => "model header digest must be 64 lowercase hex characters" }),
+  Schema.brand("ModelHeaderDigest"),
+)
+export type ModelHeaderDigest = typeof ModelHeaderDigestSchema.Type
+
+type ModelIdForm = "Catalog" | "HuggingFace" | "Local"
+
+const modelIdForm = (value: string): ModelIdForm | undefined => {
   if (value.startsWith("hf:")) {
     const components = value.slice(3).split("/")
     return components.length >= 3
@@ -223,6 +231,9 @@ const modelIdForm = (value: string): "Catalog" | "HuggingFace" | undefined => {
       && Schema.is(HuggingFaceArtifactSelectorSchema)(components.slice(2).join("/"))
       ? "HuggingFace"
       : undefined
+  }
+  if (value.startsWith("local:")) {
+    return Schema.is(ModelHeaderDigestSchema)(value.slice(6)) ? "Local" : undefined
   }
   const components = value.split(":")
   return components.length === 3
@@ -234,7 +245,7 @@ const modelIdForm = (value: string): "Catalog" | "HuggingFace" | undefined => {
 
 export const ModelIdSchema = ProviderModelIdSchema.pipe(
   Schema.filter((value) => modelIdForm(value) !== undefined, {
-    message: () => "model ID must be a canonical catalog or Hugging Face model ID",
+    message: () => "model ID must be a canonical catalog, Hugging Face, or local model ID",
   }),
   Schema.brand("ModelId"),
 )
@@ -247,6 +258,7 @@ export type ParsedModelId =
       readonly repositoryId: HuggingFaceRepositoryId
       readonly artifactSelector: HuggingFaceArtifactSelector
     }
+  | { readonly _tag: "Local"; readonly headerDigest: ModelHeaderDigest }
 
 export const parseModelId = (modelId: ModelId): ParsedModelId => {
   if (modelId.startsWith("hf:")) {
@@ -256,6 +268,9 @@ export const parseModelId = (modelId: ModelId): ParsedModelId => {
       repositoryId: Schema.decodeUnknownSync(HuggingFaceRepositoryIdSchema)(components.slice(0, 2).join("/")),
       artifactSelector: Schema.decodeUnknownSync(HuggingFaceArtifactSelectorSchema)(components.slice(2).join("/")),
     }
+  }
+  if (modelId.startsWith("local:")) {
+    return { _tag: "Local", headerDigest: Schema.decodeUnknownSync(ModelHeaderDigestSchema)(modelId.slice(6)) }
   }
   const [baseId, format, quality] = modelId.split(":")
   return {
@@ -273,9 +288,22 @@ export type CatalogFormModelId = typeof CatalogFormModelIdSchema.Type
 
 export const HuggingFaceFormModelIdSchema = ModelIdSchema.pipe(Schema.filter(
   (modelId) => modelIdForm(modelId) === "HuggingFace",
-  { message: () => "discovered model row requires a Hugging Face model ID" },
+  { message: () => "model ID must be a Hugging Face model ID" },
 ), Schema.brand("HuggingFaceFormModelId"))
 export type HuggingFaceFormModelId = typeof HuggingFaceFormModelIdSchema.Type
+
+export const LocalFormModelIdSchema = ModelIdSchema.pipe(Schema.filter(
+  (modelId) => modelIdForm(modelId) === "Local",
+  { message: () => "model ID must be a local header-digest model ID" },
+), Schema.brand("LocalFormModelId"))
+export type LocalFormModelId = typeof LocalFormModelIdSchema.Type
+
+/** Any non-catalog model: `hf:` when it has a Hugging Face identity, `local:` otherwise. */
+export const CustomFormModelIdSchema = ModelIdSchema.pipe(Schema.filter(
+  (modelId) => modelIdForm(modelId) !== "Catalog",
+  { message: () => "custom model row requires a Hugging Face or local model ID" },
+), Schema.brand("CustomFormModelId"))
+export type CustomFormModelId = typeof CustomFormModelIdSchema.Type
 
 export const ModelAssessmentIdSchema =
   NonEmptyString.pipe(Schema.brand("ModelAssessmentId"))
@@ -389,13 +417,13 @@ export const localModelPerformanceContexts = (contextLength: number): readonly n
 export const ResolvedModelInstallationSchema = Schema.TaggedStruct("Resolved", {
   installedBytes: NonNegativeSafeInteger,
   primaryPath: NonEmptyString,
-  ownership: Schema.Literal("Magnitude", "ExternalHuggingFace", "Mixed"),
+  ownership: Schema.Literal("Magnitude", "External", "Mixed"),
 })
 export type ResolvedModelInstallation = typeof ResolvedModelInstallationSchema.Type
 
 export const UnresolvedModelInstallationSchema = Schema.TaggedStruct("Unresolved", {
   installedBytes: NonNegativeSafeInteger,
-  ownership: Schema.Literal("Magnitude", "ExternalHuggingFace", "Mixed"),
+  ownership: Schema.Literal("Magnitude", "External", "Mixed"),
 })
 export type UnresolvedModelInstallation = typeof UnresolvedModelInstallationSchema.Type
 
@@ -615,13 +643,6 @@ export const LocalModelCatalogDataSchema = Schema.Struct({
 })
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
 
-export const DiscoveredModelCatalogAttributionSchema = Schema.Union(
-  Schema.TaggedStruct("NotInCatalog", {}),
-  Schema.TaggedStruct("AttributionFailed", { failure: ModelFailureSchema }),
-)
-export type DiscoveredModelCatalogAttribution =
-  typeof DiscoveredModelCatalogAttributionSchema.Type
-
 const NormalizedRankingScoreSchema = Schema.Number.pipe(
   Schema.finite(),
   Schema.between(0, 1),
@@ -674,11 +695,72 @@ export const LocalModelDoesNotFitAssessmentSchema = Schema.TaggedStruct("DoesNot
 { message: () => "non-fitting assessment memory total must match its domain evidence" }))
 export type LocalModelDoesNotFitAssessment = typeof LocalModelDoesNotFitAssessmentSchema.Type
 
-/** The engine cannot execute a discovered model; catalog models are never unsupported. */
+export const WeightTypeCountSchema = Schema.Struct({
+  ggmlType: NonEmptyString,
+  tensorCount: PositiveSafeInteger,
+})
+export type WeightTypeCount = typeof WeightTypeCountSchema.Type
+
+/** A reason case this protocol does not know yet; `kind` is the engine's tag. */
+const UnknownUnsupportedReasonSchema = Schema.TaggedStruct("Unknown", { kind: NonEmptyString, detail: Schema.String })
+
+const KnownUnsupportedReasonSchema = Schema.Union(
+  Schema.TaggedStruct("Architecture", { architecture: NonEmptyString }),
+  Schema.TaggedStruct("WeightTypes", { types: Schema.NonEmptyArray(WeightTypeCountSchema) }),
+  Schema.TaggedStruct("RopeScaling", { kind: NonEmptyString }),
+  Schema.TaggedStruct("UnrecognizedTensor", { name: NonEmptyString }),
+  Schema.TaggedStruct("UnrecognizedMetadata", { key: NonEmptyString }),
+  Schema.TaggedStruct("Tokenizer", {
+    model: NonEmptyString,
+    pre: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  }),
+  Schema.TaggedStruct("ChatTemplate", {}),
+  Schema.TaggedStruct("TiedOutputHead", {}),
+  Schema.TaggedStruct("TargetMismatch", { detail: Schema.String }),
+  Schema.TaggedStruct("KernelDomain", {
+    backend: NonEmptyString,
+    entry: NonEmptyString,
+    statics: Schema.Array(Schema.Tuple(NonEmptyString, NonNegativeSafeInteger)),
+  }),
+  Schema.TaggedStruct("Backend", { backend: NonEmptyString }),
+  Schema.TaggedStruct("Unreadable", {}),
+  UnknownUnsupportedReasonSchema,
+)
+
+const knownUnsupportedReasonTags: ReadonlySet<string> = new Set<UnsupportedReason["_tag"]>([
+  "Architecture", "WeightTypes", "RopeScaling", "UnrecognizedTensor", "UnrecognizedMetadata", "Tokenizer",
+  "ChatTemplate", "TiedOutputHead", "TargetMismatch", "KernelDomain", "Backend", "Unreadable", "Unknown",
+])
+
+const UnrecognizedUnsupportedReasonSchema = Schema.transform(
+  Schema.Struct({
+    _tag: NonEmptyString.pipe(Schema.filter((tag) => !knownUnsupportedReasonTags.has(tag))),
+    detail: Schema.optional(Schema.String),
+  }),
+  Schema.typeSchema(UnknownUnsupportedReasonSchema),
+  {
+    strict: true,
+    decode: ({ _tag, detail }) => ({ _tag: "Unknown" as const, kind: _tag, detail: detail ?? "" }),
+    encode: ({ kind, detail }) => ({ _tag: kind, detail }),
+  },
+)
+
+/**
+ * Why the engine cannot run a model, one entry per distinct cause. A case added by a newer engine
+ * decodes as `Unknown` so it still renders.
+ */
+export const UnsupportedReasonSchema = Schema.Union(
+  KnownUnsupportedReasonSchema,
+  UnrecognizedUnsupportedReasonSchema,
+)
+export type UnsupportedReason = typeof UnsupportedReasonSchema.Type
+
+/** The engine cannot execute a custom model or candidate; catalog models are never unsupported. */
 export const LocalModelUnsupportedAssessmentSchema = Schema.TaggedStruct("Unsupported", {
   environmentId: AssessmentEnvironmentIdSchema,
   profile: ServingProfileSchema,
-  failure: ModelFailureSchema,
+  reasons: Schema.NonEmptyArray(UnsupportedReasonSchema),
+  detail: Schema.String,
 })
 export type LocalModelUnsupportedAssessment = typeof LocalModelUnsupportedAssessmentSchema.Type
 
@@ -717,7 +799,7 @@ const LocalModelFailedServingStateSchema = Schema.TaggedStruct("Failed", {
   }),
   failure: ModelFailureSchema,
 })
-const DiscoveredModelFailedServingStateSchema = Schema.TaggedStruct("Failed", {
+const CustomModelFailedServingStateSchema = Schema.TaggedStruct("Failed", {
   profile: ServingProfileSchema,
   failure: ModelFailureSchema,
 })
@@ -738,7 +820,7 @@ const CatalogModelAssessedDoesNotFitServingStateSchema = Schema.TaggedStruct("As
   ...LocalModelAssessedFields,
   assessment: LocalModelDoesNotFitAssessmentSchema,
 })
-const DiscoveredModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
+const CustomModelAssessedServingStateSchema = Schema.TaggedStruct("Assessed", {
   ...LocalModelAssessedFields,
   assessment: LocalModelAssessmentSchema,
 })
@@ -750,38 +832,181 @@ export const CatalogLocalModelServingStateSchema = Schema.Union(
 )
 export type CatalogLocalModelServingState = typeof CatalogLocalModelServingStateSchema.Type
 
-export const DiscoveredLocalModelServingStateSchema = Schema.Union(
+/** Custom models are never ranked; `Unsupported` stays only on added models, whose files remain removable. */
+export const CustomLocalModelServingStateSchema = Schema.Union(
   LocalModelAssessingServingStateSchema,
-  DiscoveredModelFailedServingStateSchema,
-  DiscoveredModelAssessedServingStateSchema,
+  CustomModelFailedServingStateSchema,
+  CustomModelAssessedServingStateSchema,
 )
-export type DiscoveredLocalModelServingState = typeof DiscoveredLocalModelServingStateSchema.Type
+export type CustomLocalModelServingState = typeof CustomLocalModelServingStateSchema.Type
 
 export const LocalModelServingStateSchema = Schema.Union(
   CatalogLocalModelServingStateSchema,
-  DiscoveredLocalModelServingStateSchema,
+  CustomLocalModelServingStateSchema,
 )
 export type LocalModelServingState = typeof LocalModelServingStateSchema.Type
+
+// =============================================================================
+// Custom models: origin, drafters, and candidates
+// =============================================================================
+
+export const FoundModelSourceSchema = Schema.Union(
+  Schema.TaggedStruct("HuggingFaceCache", {}),
+  Schema.TaggedStruct("LmStudio", {}),
+  Schema.TaggedStruct("LlamaCpp", {}),
+  Schema.TaggedStruct("Ollama", {}),
+  Schema.TaggedStruct("Folder", { path: NonEmptyString }),
+)
+export type FoundModelSource = typeof FoundModelSourceSchema.Type
+
+/** Where a custom model's files came from, and therefore who owns them. */
+export const CustomModelOriginSchema = Schema.Union(
+  Schema.TaggedStruct("Added", { repository: HuggingFaceRepositoryIdSchema, commit: NonEmptyString }),
+  Schema.TaggedStruct("Imported", { path: NonEmptyString }),
+  Schema.TaggedStruct("Found", { source: FoundModelSourceSchema }),
+)
+export type CustomModelOrigin = typeof CustomModelOriginSchema.Type
+
+export const ModelLocationKindSchema = Schema.Literal("HuggingFaceCache", "LmStudio", "LlamaCpp", "Ollama", "Folder")
+export type ModelLocationKind = typeof ModelLocationKindSchema.Type
+
+export const AutomaticModelLocationKindSchema = Schema.Literal("HuggingFaceCache", "LmStudio", "LlamaCpp", "Ollama")
+export type AutomaticModelLocationKind = typeof AutomaticModelLocationKindSchema.Type
+
+/** A directory scanned for GGUFs: an automatic location Magnitude resolved, or a user folder. */
+export const ModelLocationSchema = Schema.Struct({
+  kind: ModelLocationKindSchema,
+  path: NonEmptyString,
+  enabled: Schema.Boolean,
+  automatic: Schema.Boolean,
+  found: Schema.Boolean,
+}).pipe(Schema.filter((location) => location.automatic === (location.kind !== "Folder"),
+  { message: () => "only user folders are not automatic locations" }))
+export type ModelLocation = typeof ModelLocationSchema.Type
+
+/** The engine's answer for a drafter paired with a target. */
+export const DrafterVerdictSchema = Schema.Union(
+  Schema.TaggedStruct("None", {}),
+  Schema.TaggedStruct("Bound", { method: SpeculativeMethodSchema, memoryBytes: NonNegativeSafeInteger }),
+  Schema.TaggedStruct("Rejected", {
+    reasons: Schema.NonEmptyArray(UnsupportedReasonSchema),
+    detail: Schema.String,
+  }),
+)
+export type DrafterVerdict = typeof DrafterVerdictSchema.Type
+
+/** Which drafter: a catalog model's own drafter, MTP heads inside the target, or a GGUF elsewhere. */
+export const DrafterReferenceSchema = Schema.Union(
+  Schema.TaggedStruct("Catalog", { modelId: CatalogFormModelIdSchema }),
+  Schema.TaggedStruct("Embedded", {}),
+  Schema.TaggedStruct("HuggingFace", {
+    repository: HuggingFaceRepositoryIdSchema,
+    commit: NonEmptyString,
+    path: HuggingFaceArtifactSelectorSchema,
+  }),
+  Schema.TaggedStruct("Local", { path: NonEmptyString }),
+)
+export type DrafterReference = typeof DrafterReferenceSchema.Type
+
+export const DrafterCandidateCategorySchema = Schema.Literal(
+  "CatalogDrafter",
+  "BuiltIn",
+  "NextToModel",
+  "OnThisComputer",
+  "HuggingFace",
+  "Other",
+)
+export type DrafterCandidateCategory = typeof DrafterCandidateCategorySchema.Type
+
+export const DrafterLineageSchema = Schema.Literal("Exact", "Lineage", "Fingerprint", "None")
+export type DrafterLineage = typeof DrafterLineageSchema.Type
+
+/** Acceptance and decode speed measured for one model and drafter pair once it has served requests. */
+export const MeasuredDrafterAcceptanceSchema = Schema.Struct({
+  acceptanceRate: Schema.Number.pipe(Schema.finite(), Schema.between(0, 1)),
+  tokensPerSecond: FiniteNonNegative,
+  withoutDrafterTokensPerSecond: Schema.optionalWith(FiniteNonNegative, { as: "Option", exact: true }),
+  slower: Schema.Boolean,
+})
+export type MeasuredDrafterAcceptance = typeof MeasuredDrafterAcceptanceSchema.Type
+
+export const DrafterCandidateSchema = Schema.Struct({
+  category: DrafterCandidateCategorySchema,
+  reference: DrafterReferenceSchema,
+  label: NonEmptyString,
+  sizeBytes: NonNegativeSafeInteger,
+  lineage: DrafterLineageSchema,
+  verdict: DrafterVerdictSchema,
+  onThisComputer: Schema.Boolean,
+  method: Schema.optionalWith(SpeculativeMethodSchema, { as: "Option", exact: true }),
+  measuredAcceptance: Schema.optionalWith(MeasuredDrafterAcceptanceSchema, { as: "Option", exact: true }),
+})
+export type DrafterCandidate = typeof DrafterCandidateSchema.Type
+
+/** A requested drafter: the preselected one, none, or a specific reference. */
+export const DrafterChoiceSchema = Schema.Union(
+  Schema.TaggedStruct("Auto", {}),
+  Schema.TaggedStruct("None", {}),
+  Schema.TaggedStruct("Reference", { reference: DrafterReferenceSchema }),
+)
+export type DrafterChoice = typeof DrafterChoiceSchema.Type
+
+/** Whether an attached drafter's files are here; a drafter-only download reports its own progress. */
+export const AttachedDrafterAvailabilitySchema = Schema.Union(
+  Schema.TaggedStruct("Present", {}),
+  Schema.TaggedStruct("Downloading", { progress: ModelTransferProgressSchema }),
+  Schema.TaggedStruct("DownloadFailed", { failure: ModelAcquisitionFailureSchema }),
+)
+export type AttachedDrafterAvailability = typeof AttachedDrafterAvailabilitySchema.Type
+
+/** The drafter attached to a custom model; `updateAvailable` means a newer catalog drafter revision exists. */
+export const AttachedDrafterSchema = Schema.Struct({
+  reference: DrafterReferenceSchema,
+  label: NonEmptyString,
+  sizeBytes: NonNegativeSafeInteger,
+  verdict: DrafterVerdictSchema,
+  availability: AttachedDrafterAvailabilitySchema,
+  updateAvailable: Schema.Boolean,
+})
+export type AttachedDrafter = typeof AttachedDrafterSchema.Type
+
+export const CustomModelPresentationSchema = Schema.Struct({
+  displayName: NonEmptyString,
+  variantLabel: ModelVariantLabelSchema,
+  sourceLabel: NonEmptyString,
+  variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  license: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  sourceUrls: Schema.Array(HttpsUrlSchema),
+}).pipe(Schema.filter((presentation) => new Set(presentation.sourceUrls).size === presentation.sourceUrls.length,
+  { message: () => "custom model source URLs must be unique" }))
+export type CustomModelPresentation = typeof CustomModelPresentationSchema.Type
+
+const ExternalModelAcquisitionStateSchema = Schema.TaggedStruct("External", {
+  installation: ResolvedModelInstallationSchema,
+  residencyState: ModelResidencySchema,
+})
+const UnavailableModelAcquisitionStateSchema = Schema.TaggedStruct("Unavailable", {
+  installation: ResolvedModelInstallationSchema,
+  failure: ModelFailureSchema,
+})
+
+/**
+ * An added model's managed lifecycle, or for imported and found models, files Magnitude references
+ * but never owns: `External` when readable, `Unavailable` when not.
+ */
+export const CustomModelAcquisitionStateSchema = Schema.Union(
+  ...LocalModelAcquisitionStateSchema.members,
+  ExternalModelAcquisitionStateSchema,
+  UnavailableModelAcquisitionStateSchema,
+)
+export type CustomModelAcquisitionState = typeof CustomModelAcquisitionStateSchema.Type
+
+const isManagedAcquisitionState = (state: CustomModelAcquisitionState): state is LocalModelAcquisitionState =>
+  state._tag !== "External" && state._tag !== "Unavailable"
 
 const LocalModelFields = {
   presentation: LocalModelPresentationSchema,
 } as const
-
-const DiscoveredReadyLocalModelStateSchema = Schema.TaggedStruct("Ready", {
-  installation: ResolvedModelInstallationSchema,
-  residencyState: ModelResidencySchema,
-  catalogAttribution: DiscoveredModelCatalogAttributionSchema,
-  servingState: DiscoveredLocalModelServingStateSchema,
-})
-const DiscoveredUnavailableLocalModelStateSchema = Schema.TaggedStruct("Unavailable", {
-  installation: ResolvedModelInstallationSchema,
-  failure: ModelFailureSchema,
-})
-export const DiscoveredLocalModelStateSchema = Schema.Union(
-  DiscoveredReadyLocalModelStateSchema,
-  DiscoveredUnavailableLocalModelStateSchema,
-)
-export type DiscoveredLocalModelState = typeof DiscoveredLocalModelStateSchema.Type
 
 export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   ...LocalModelFields,
@@ -793,15 +1018,41 @@ export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
 })
 export type CatalogLocalModel = typeof CatalogLocalModelSchema.Type
 
-export const DiscoveredLocalModelSchema = Schema.TaggedStruct("Discovered", {
-  ...LocalModelFields,
-  modelId: HuggingFaceFormModelIdSchema,
-  state: DiscoveredLocalModelStateSchema,
-})
-export type DiscoveredLocalModel = typeof DiscoveredLocalModelSchema.Type
+export const CustomLocalModelSchema = Schema.TaggedStruct("Custom", {
+  modelId: CustomFormModelIdSchema,
+  origin: CustomModelOriginSchema,
+  presentation: CustomModelPresentationSchema,
+  drafter: Schema.optionalWith(AttachedDrafterSchema, { as: "Option", exact: true }),
+  recommendedDrafter: Schema.optionalWith(DrafterCandidateSchema, { as: "Option", exact: true }),
+  measuredAcceptance: Schema.optionalWith(MeasuredDrafterAcceptanceSchema, { as: "Option", exact: true }),
+  acquisitionState: CustomModelAcquisitionStateSchema,
+  servingState: CustomLocalModelServingStateSchema,
+  storageBytes: NonNegativeSafeInteger,
+}).pipe(Schema.filter((model) => {
+  const form = modelIdForm(model.modelId)
+  if (model.origin._tag === "Added") {
+    return form === "HuggingFace" && isManagedAcquisitionState(model.acquisitionState)
+  }
+  if (isManagedAcquisitionState(model.acquisitionState)) return false
+  if (model.origin._tag === "Found" && model.origin.source._tag === "HuggingFaceCache") return form === "HuggingFace"
+  return true
+}, {
+  message: () => "added models carry a Hugging Face ID and managed acquisition; imported and found models are external",
+}))
+export type CustomLocalModel = typeof CustomLocalModelSchema.Type
 
-export const LocalModelSchema = Schema.Union(CatalogLocalModelSchema, DiscoveredLocalModelSchema)
+export const LocalModelSchema = Schema.Union(CatalogLocalModelSchema, CustomLocalModelSchema)
 export type LocalModel = typeof LocalModelSchema.Type
+
+/** A complete GGUF in a model location the engine cannot run; never callable, never a row. */
+export const UnsupportedLocalModelSchema = Schema.Struct({
+  displayName: NonEmptyString,
+  origin: CustomModelOriginSchema,
+  path: NonEmptyString,
+  reasons: Schema.NonEmptyArray(UnsupportedReasonSchema),
+  detail: Schema.String,
+})
+export type UnsupportedLocalModel = typeof UnsupportedLocalModelSchema.Type
 
 export const LocalModelPreparationSchema = Schema.Struct({
   discovery: Schema.Struct({
@@ -821,14 +1072,89 @@ export const LocalModelPreparationSchema = Schema.Struct({
 }))
 export type LocalModelPreparation = typeof LocalModelPreparationSchema.Type
 
+/** `hidden` lists custom models the user hid; they are never in `models` and never offered. */
 export const LocalModelsStateSchema = Schema.Struct({
   preparation: LocalModelPreparationSchema,
   models: Schema.Array(LocalModelSchema),
-}).pipe(Schema.filter(({ models }) => {
-  const identities = models.map(({ modelId }) => modelId)
+  unsupported: Schema.Array(UnsupportedLocalModelSchema),
+  hidden: Schema.Array(CustomLocalModelSchema),
+}).pipe(Schema.filter(({ models, hidden }) => {
+  const identities = [...models, ...hidden].map(({ modelId }) => modelId)
   return new Set(identities).size === identities.length
 }, { message: () => "local models must have unique canonical model IDs" }))
 export type LocalModelsState = typeof LocalModelsStateSchema.Type
+
+export const HuggingFaceSearchResultSchema = Schema.Struct({
+  repository: HuggingFaceRepositoryIdSchema,
+  displayName: NonEmptyString,
+  uploader: NonEmptyString,
+  variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  downloads: NonNegativeSafeInteger,
+  architecture: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  unsupported: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), { as: "Option", exact: true }),
+})
+export type HuggingFaceSearchResult = typeof HuggingFaceSearchResultSchema.Type
+
+/** Supported repositories, plus unsupported ones only when every result was requested. */
+export const HuggingFaceSearchResponseSchema = Schema.Struct({
+  results: Schema.Array(HuggingFaceSearchResultSchema),
+  hiddenCount: NonNegativeSafeInteger,
+})
+export type HuggingFaceSearchResponse = typeof HuggingFaceSearchResponseSchema.Type
+
+export const CandidateSourceSchema = Schema.Union(
+  Schema.TaggedStruct("HuggingFace", { repository: HuggingFaceRepositoryIdSchema, commit: NonEmptyString }),
+  Schema.TaggedStruct("Local", { path: NonEmptyString }),
+)
+export type CandidateSource = typeof CandidateSourceSchema.Type
+
+export const CandidateFileSchema = Schema.Struct({
+  path: NonEmptyString,
+  sizeBytes: NonNegativeSafeInteger,
+})
+export type CandidateFile = typeof CandidateFileSchema.Type
+
+export const CandidateVersionSchema = Schema.Struct({
+  label: NonEmptyString,
+  modelId: CustomFormModelIdSchema,
+  files: Schema.NonEmptyArray(NonEmptyString),
+  sizeBytes: NonNegativeSafeInteger,
+  assessment: Schema.optionalWith(LocalModelAssessmentSchema, { as: "Option", exact: true }),
+  recommended: Schema.Boolean,
+  onThisComputer: Schema.optionalWith(ModelIdSchema, { as: "Option", exact: true }),
+})
+export type CandidateVersion = typeof CandidateVersionSchema.Type
+
+/** The repository step: every version with the engine's verdict, before anything downloads. */
+export const CandidateInspectionSchema = Schema.Struct({
+  source: CandidateSourceSchema,
+  displayName: NonEmptyString,
+  license: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  variantOf: Schema.optionalWith(CatalogFormModelIdSchema, { as: "Option", exact: true }),
+  versions: Schema.Array(CandidateVersionSchema),
+  selectedVersion: Schema.optionalWith(NonEmptyString, { as: "Option", exact: true }),
+  projector: Schema.optionalWith(CandidateFileSchema, { as: "Option", exact: true }),
+  unsupportedArchitecture: Schema.optionalWith(Schema.NonEmptyArray(UnsupportedReasonSchema), {
+    as: "Option",
+    exact: true,
+  }),
+}).pipe(Schema.filter((inspection) => Option.match(inspection.selectedVersion, {
+  onNone: () => true,
+  onSome: (label) => inspection.versions.some((version) => version.label === label),
+}) && inspection.versions.filter(({ recommended }) => recommended).length <= 1, {
+  message: () => "a candidate's selected version must be listed and at most one version is recommended",
+}))
+export type CandidateInspection = typeof CandidateInspectionSchema.Type
+
+/** What a drafter list is for: an existing model, or a candidate's chosen files. */
+export const DrafterTargetSchema = Schema.Union(
+  Schema.TaggedStruct("Model", { modelId: ModelIdSchema }),
+  Schema.TaggedStruct("Candidate", {
+    source: CandidateSourceSchema,
+    files: Schema.NonEmptyArray(NonEmptyString),
+  }),
+)
+export type DrafterTarget = typeof DrafterTargetSchema.Type
 
 export const LocalProviderOfferingSchema = Schema.Struct({
   providerModelId: ModelIdSchema,
@@ -956,6 +1282,8 @@ const ModelCatalogSnapshotFields = {
   models: Schema.Array(ModelCatalogEntrySchema),
   failures: Schema.Array(ProviderCatalogFailureSchema),
   localModelPreparation: LocalModelPreparationSchema,
+  unsupportedLocalModels: Schema.Array(UnsupportedLocalModelSchema),
+  hiddenLocalModels: Schema.Array(CustomLocalModelSchema),
 } as const
 
 export const ModelCatalogStateSchema = Schema.Union(

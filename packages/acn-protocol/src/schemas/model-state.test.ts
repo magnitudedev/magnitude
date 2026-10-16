@@ -5,7 +5,10 @@ import {
   CatalogVariantIdSchema,
   CatalogLocalModelServingStateSchema,
   CatalogSupportSchema,
-  DiscoveredLocalModelServingStateSchema,
+  CandidateInspectionSchema,
+  CustomLocalModelServingStateSchema,
+  LocalModelsStateSchema,
+  UnsupportedReasonSchema,
   IntelligenceScoreSchema,
   LocalModelMemorySchema,
   LocalModelPreparationSchema,
@@ -16,6 +19,8 @@ import {
   ModelReleaseDateSchema,
   parseModelId,
 } from "./model-state"
+
+const digest = "a".repeat(32) + "0123456789abcdef".repeat(2)
 
 const catalogModel = {
   _tag: "Catalog",
@@ -38,6 +43,25 @@ const catalogModel = {
   },
 } as const
 
+const foundModel = {
+  _tag: "Custom",
+  modelId: "hf:owner/repository/model.gguf",
+  origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
+  presentation: {
+    displayName: "Model",
+    variantLabel: "Q4_K_M",
+    sourceLabel: "Hugging Face cache",
+    sourceUrls: [],
+  },
+  acquisitionState: {
+    _tag: "External",
+    installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "External" },
+    residencyState: { _tag: "Unloaded" },
+  },
+  servingState: { _tag: "Assessing", profile: { contextLength: 4096 } },
+  storageBytes: 1,
+} as const
+
 describe("CatalogSupportSchema", () => {
   it("requires a disabled reason and a deprecated replacement", () => {
     expect(() => Schema.decodeUnknownSync(CatalogSupportSchema)({ _tag: "Disabled", reason: "" })).toThrow()
@@ -58,6 +82,7 @@ describe("ModelIdSchema", () => {
       "qwen3.5-4b:gguf:q4",
       "hf:owner/repository/model-q4.gguf",
       "hf:owner/repository/subdirectory/model-00001-of-00002.gguf",
+      `local:${digest}`,
     ]) expect(Schema.decodeUnknownSync(ModelIdSchema)(id)).toBe(id)
   })
 
@@ -74,6 +99,10 @@ describe("ModelIdSchema", () => {
       repositoryId: "owner/repository",
       artifactSelector: "sub/model-q4.gguf",
     })
+    expect(parseModelId(Schema.decodeUnknownSync(ModelIdSchema)(`local:${digest}`))).toEqual({
+      _tag: "Local",
+      headerDigest: digest,
+    })
   })
 
   it("rejects aliases, missing selectors, traversal, backslashes, and non-GGUF artifacts", () => {
@@ -85,6 +114,9 @@ describe("ModelIdSchema", () => {
       "hf:owner/repository/model.safetensors",
       "hf:owner/repository/model\n.gguf",
       "owner/repository/model.gguf",
+      "local:abc",
+      `local:${digest.toUpperCase()}`,
+      `local:${digest}0`,
     ]) expect(() => Schema.decodeUnknownSync(ModelIdSchema)(id)).toThrow()
   })
 })
@@ -114,7 +146,7 @@ describe("LocalModelSchema invariants", () => {
     })).not.toThrow()
   })
 
-  it("requires domain-specific catalog and discovery facts", () => {
+  it("requires domain-specific catalog and custom-model facts", () => {
     const { catalogData: _catalogData, ...catalogWithoutData } = catalogModel
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
       ...catalogWithoutData,
@@ -123,74 +155,51 @@ describe("LocalModelSchema invariants", () => {
       ...catalogModel,
       modelId: "hf:owner/repository/model.gguf",
     })).toThrow()
+    const found = Schema.decodeUnknownSync(LocalModelSchema)(foundModel)
+    expect(found._tag).toBe("Custom")
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      _tag: "Discovered",
-      modelId: "hf:owner/repository/model.gguf",
-      presentation: catalogModel.presentation,
-      state: {
-        _tag: "Ready",
-        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "ExternalHuggingFace" },
-        residencyState: { _tag: "Unloaded" },
-        catalogAttribution: { _tag: "NotInCatalog" },
-      },
-    })).toThrow()
-    const unavailable = Schema.decodeUnknownSync(LocalModelSchema)({
-      _tag: "Discovered",
-      modelId: "hf:owner/repository/model.gguf",
-      presentation: catalogModel.presentation,
-      state: {
-        _tag: "Unavailable",
-        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "ExternalHuggingFace" },
-        failure: { code: "invalid", message: "Invalid", retryable: false },
-      },
-    })
-    expect(unavailable._tag).toBe("Discovered")
-    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      ...unavailable,
+      ...foundModel,
       modelId: "model:gguf:q4",
     })).toThrow()
   })
 
-  it("keeps failed serving profiles only on ready discoveries", () => {
-    const discovered = {
-      _tag: "Discovered",
-      modelId: "hf:owner/repository/model.gguf",
-      presentation: catalogModel.presentation,
-    } as const
-    const failure = { code: "failed", message: "Failed", retryable: true } as const
-    const ready = {
-      _tag: "Ready",
-      installation: {
-        _tag: "Resolved", installedBytes: 1, primaryPath: "/model.gguf", ownership: "ExternalHuggingFace",
-      },
-      residencyState: { _tag: "Unloaded" },
-      catalogAttribution: { _tag: "NotInCatalog" },
-    } as const
+  it("ties origin to identity and to who owns the files", () => {
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      ...discovered,
-      state: { ...ready, servingState: { _tag: "Failed", failure } },
+      ...foundModel,
+      modelId: `local:${digest}`,
+      origin: { _tag: "Found", source: { _tag: "Ollama" } },
+    })).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+      ...foundModel,
+      modelId: `local:${digest}`,
     })).toThrow()
     expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
-      ...discovered,
-      state: {
-        ...ready,
-        servingState: { _tag: "Failed", profile: { contextLength: 4096 }, failure },
-      },
+      ...foundModel,
+      origin: { _tag: "Added", repository: "owner/repository", commit: "abc" },
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+      ...foundModel,
+      origin: { _tag: "Added", repository: "owner/repository", commit: "abc" },
+      acquisitionState: { _tag: "Installing", progress: { stage: "downloading", completedBytes: 1, totalBytes: 2 } },
     })).not.toThrow()
-    const unavailable = Schema.decodeUnknownSync(LocalModelSchema)({
-      ...discovered,
-      state: {
-        _tag: "Unavailable",
-        installation: ready.installation,
-        failure,
-        servingState: { _tag: "Failed", profile: { contextLength: 4096 }, failure },
-      },
-    })
-    expect(unavailable._tag === "Discovered" && unavailable.state).toEqual({
-      _tag: "Unavailable",
-      installation: ready.installation,
-      failure,
-    })
+    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+      ...foundModel,
+      modelId: `local:${digest}`,
+      origin: { _tag: "Imported", path: "/models/model.gguf" },
+      acquisitionState: { _tag: "NotInstalled" },
+    })).toThrow()
+  })
+
+  it("keeps a custom model's failed serving state tied to a profile", () => {
+    const failure = { code: "failed", message: "Failed", retryable: true } as const
+    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+      ...foundModel,
+      servingState: { _tag: "Failed", failure },
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(LocalModelSchema)({
+      ...foundModel,
+      servingState: { _tag: "Failed", profile: { contextLength: 4096 }, failure },
+    })).not.toThrow()
   })
 
   it("stores an assessed profile exactly once, in the assessment", () => {
@@ -218,8 +227,7 @@ describe("LocalModelSchema invariants", () => {
     expect(() => Schema.decodeUnknownSync(LocalModelServingStateSchema)(assessed)).not.toThrow()
   })
 
-  it("requires performance for fitting models and admits Unsupported only for discovered models", () => {
-    const failure = { code: "unsupported_family", message: "Unrecognized family", retryable: false }
+  it("requires performance for fitting models and admits Unsupported only for custom models", () => {
     const assessed = {
       _tag: "Assessed",
       metadata: {
@@ -248,13 +256,21 @@ describe("LocalModelSchema invariants", () => {
     const unsupported = {
       ...assessed,
       assessment: {
-        _tag: "Unsupported", environmentId: "environment", profile: { contextLength: 4096 }, failure,
+        _tag: "Unsupported",
+        environmentId: "environment",
+        profile: { contextLength: 4096 },
+        reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+        detail: "unrecognized architecture deepseek4",
       },
     }
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(fits)).not.toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(withoutPerformance)).toThrow()
     expect(() => Schema.decodeUnknownSync(CatalogLocalModelServingStateSchema)(unsupported)).toThrow()
-    expect(() => Schema.decodeUnknownSync(DiscoveredLocalModelServingStateSchema)(unsupported)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)(unsupported)).not.toThrow()
+    expect(() => Schema.decodeUnknownSync(CustomLocalModelServingStateSchema)({
+      ...unsupported,
+      assessment: { ...unsupported.assessment, reasons: [] },
+    })).toThrow()
   })
 
   it("rejects memory totals that disagree with domain evidence", () => {
@@ -268,6 +284,110 @@ describe("LocalModelSchema invariants", () => {
       }],
       totalRequiredBytes: 5,
       requiredSystemMemoryBytes: 4,
+    })).toThrow()
+  })
+})
+
+describe("UnsupportedReasonSchema", () => {
+  it("decodes every known case and round-trips it", () => {
+    for (const reason of [
+      { _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }, { ggmlType: "IQ1_M", tensorCount: 40 }] },
+      { _tag: "Tokenizer", model: "gpt2", pre: "qwen2" },
+      { _tag: "KernelDomain", backend: "metal", entry: "matmul", statics: [["head_dim", 72]] },
+      { _tag: "TargetMismatch", detail: "drafter hidden size 2048 does not match 4096" },
+      { _tag: "TiedOutputHead" },
+      { _tag: "Unreadable" },
+    ]) {
+      const decoded = Schema.decodeUnknownSync(UnsupportedReasonSchema)(reason)
+      expect(decoded._tag).toBe(reason._tag)
+      expect(Schema.decodeUnknownSync(UnsupportedReasonSchema)(Schema.encodeSync(UnsupportedReasonSchema)(decoded)))
+        .toEqual(decoded)
+    }
+    expect(Schema.decodeUnknownSync(UnsupportedReasonSchema)({ _tag: "Tokenizer", model: "gpt2" }))
+      .toEqual({ _tag: "Tokenizer", model: "gpt2", pre: Option.none() })
+  })
+
+  it("decodes a case added by a newer engine as Unknown with its detail", () => {
+    const decoded = Schema.decodeUnknownSync(UnsupportedReasonSchema)({
+      _tag: "SlidingWindow", window: 4096, detail: "sliding window attention",
+    })
+    expect(decoded).toEqual({ _tag: "Unknown", kind: "SlidingWindow", detail: "sliding window attention" })
+    expect(Schema.decodeUnknownSync(UnsupportedReasonSchema)(Schema.encodeSync(UnsupportedReasonSchema)(decoded)))
+      .toEqual(decoded)
+    expect(Schema.decodeUnknownSync(UnsupportedReasonSchema)({ _tag: "Other" }))
+      .toEqual({ _tag: "Unknown", kind: "Other", detail: "" })
+  })
+
+  it("still rejects a malformed known case", () => {
+    expect(() => Schema.decodeUnknownSync(UnsupportedReasonSchema)({ _tag: "Architecture" })).toThrow()
+    expect(() => Schema.decodeUnknownSync(UnsupportedReasonSchema)({ _tag: "WeightTypes", types: [] })).toThrow()
+  })
+})
+
+describe("LocalModelsStateSchema", () => {
+  it("lists unsupported local models apart from callable rows", () => {
+    const state = Schema.decodeUnknownSync(LocalModelsStateSchema)({
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+      },
+      models: [foundModel],
+      unsupported: [{
+        displayName: "DeepSeek V4 Flash",
+        origin: { _tag: "Found", source: { _tag: "Folder", path: "/Volumes/models" } },
+        path: "/Volumes/models/deepseek.gguf",
+        reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+        detail: "",
+      }],
+      hidden: [],
+    })
+    expect(state.unsupported).toHaveLength(1)
+  })
+
+  it("lists hidden custom models apart from callable rows, never twice", () => {
+    const base = {
+      preparation: {
+        discovery: { complete: true, modelsFound: 1 },
+        assessment: { complete: true, settledModels: 1, totalModels: 1 },
+      },
+      unsupported: [],
+    }
+    const state = Schema.decodeUnknownSync(LocalModelsStateSchema)({ ...base, models: [], hidden: [foundModel] })
+    expect(state.hidden).toHaveLength(1)
+    expect(() => Schema.decodeUnknownSync(LocalModelsStateSchema)({ ...base, models: [foundModel], hidden: [foundModel] }))
+      .toThrow()
+  })
+})
+
+describe("CandidateInspectionSchema", () => {
+  const version = (label: string, recommended: boolean) => ({
+    label,
+    modelId: `hf:owner/repository/model-${label}.gguf`,
+    files: [`model-${label}.gguf`],
+    sizeBytes: 10,
+    recommended,
+  })
+  const inspection = {
+    source: { _tag: "HuggingFace", repository: "owner/repository", commit: "abc" },
+    displayName: "Model",
+    versions: [version("Q4_K_M", true), version("Q8_0", false)],
+  }
+
+  it("accepts a repository step with one recommendation and a listed selection", () => {
+    expect(() => Schema.decodeUnknownSync(CandidateInspectionSchema)({
+      ...inspection,
+      selectedVersion: "Q8_0",
+    })).not.toThrow()
+  })
+
+  it("rejects an unlisted selection and two recommendations", () => {
+    expect(() => Schema.decodeUnknownSync(CandidateInspectionSchema)({
+      ...inspection,
+      selectedVersion: "Q2_K",
+    })).toThrow()
+    expect(() => Schema.decodeUnknownSync(CandidateInspectionSchema)({
+      ...inspection,
+      versions: [version("Q4_K_M", true), version("Q8_0", true)],
     })).toThrow()
   })
 })

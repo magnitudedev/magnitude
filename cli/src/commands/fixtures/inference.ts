@@ -1,25 +1,42 @@
-import { Option, Schema } from "effect"
+import { Option } from "effect"
 import {
   AssessmentEnvironmentIdSchema,
   CatalogFormModelIdSchema,
-  HuggingFaceFormModelIdSchema,
+  CustomFormModelIdSchema,
+  HuggingFaceRepositoryIdSchema,
+  HuggingFaceArtifactSelectorSchema,
   HttpsUrlSchema,
   LocalInferenceAcceleratorIdSchema,
   LocalInferenceMemoryDomainIdSchema,
   ModelAssessmentIdSchema,
   ModelVariantLabelSchema,
+  type CandidateInspection,
+  type CandidateVersion,
+  type CatalogLocalModel,
+  type CustomLocalModel,
+  type DrafterCandidate,
+  type HuggingFaceSearchResponse,
   type LocalInferenceHardware,
   type LocalModel,
   type LocalModelAcquisitionState,
+  type LocalModelAssessment,
+  type ModelCatalogState,
+  type ModelLocation,
   type ModelReleaseDate,
+  type UnsupportedLocalModel,
 } from "@magnitudedev/sdk"
 
 const GIB = 1024 ** 3
-const TEST_MODEL_ID = HuggingFaceFormModelIdSchema.make("hf:test/model/model-q4.gguf")
+const GB = 1_000_000_000
 const TEST_CATALOG_MODEL_ID = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
 const TEST_MEMORY_DOMAIN_ID = LocalInferenceMemoryDomainIdSchema.make("memory")
-type DiscoveredLocalModel = Extract<LocalModel, { readonly _tag: "Discovered" }>
-type CatalogLocalModel = Extract<LocalModel, { readonly _tag: "Catalog" }>
+const ENVIRONMENT_ID = AssessmentEnvironmentIdSchema.make("environment_test")
+export const TEST_REPOSITORY = HuggingFaceRepositoryIdSchema.make("HauhauCS/Qwen-Test-Uncensored-GGUF")
+export const TEST_COMMIT = "4f1c2e9d0b7a6c5e4f3a2b1c0d9e8f7a6b5c4d3e"
+export const FOUND_MODEL_ID = CustomFormModelIdSchema.make("hf:bartowski/Qwen-Test-GGUF/Qwen-Test-Q4_K_M.gguf")
+export const ADDED_MODEL_ID = CustomFormModelIdSchema.make(`hf:${TEST_REPOSITORY}/Qwen-Test-Q4_K_P.gguf`)
+export const IMPORTED_MODEL_ID = CustomFormModelIdSchema.make(`local:${"a".repeat(64)}`)
+export const CATALOG_DRAFTER_ID = CatalogFormModelIdSchema.make("qwen-test:gguf:q4")
 
 export const makeHardware = (
   overrides: Partial<LocalInferenceHardware> = {},
@@ -59,6 +76,8 @@ const capabilities = {
   reasoning: { supported: false as const, efforts: [], defaultEffort: Option.none() },
 }
 
+const CONTEXT_LENGTH = 32_768
+
 const performance = (contextLength: number) => [...new Set([
   ...[25_000, 50_000, 75_000].filter((context) => context <= contextLength),
   contextLength,
@@ -67,124 +86,323 @@ const performance = (contextLength: number) => [...new Set([
   estimatedTokensPerSecond: contextTokens === contextLength ? 24 : 28,
 }))
 
-type ReadyDiscoveredLocalModel = Omit<DiscoveredLocalModel, "state"> & {
-  readonly state: Extract<DiscoveredLocalModel["state"], { readonly _tag: "Ready" }>
+const metadata = {
+  format: "gguf",
+  quantization: "Q4_K_M",
+  quantizationName: "4-bit",
+  architecture: "test",
+  storageBytes: 16 * GIB,
+  maximumContextLength: Option.some(CONTEXT_LENGTH),
 }
 
-const makeModel = (overrides: Partial<ReadyDiscoveredLocalModel> = {}): ReadyDiscoveredLocalModel => {
-  const contextLength = 32_768
-  return {
-    _tag: "Discovered",
-    modelId: overrides.modelId ?? TEST_MODEL_ID,
-    presentation: {
-      displayName: "Qwen Test",
-      variantLabel: ModelVariantLabelSchema.make("Q4"),
-      description: "Test model",
-      license: Option.none(),
-      sourceUrls: [HttpsUrlSchema.make("https://huggingface.co/test/model")],
-    },
-    state: {
-      _tag: "Ready",
-      installation: {
-        _tag: "Resolved",
-        installedBytes: 16 * GIB,
-        primaryPath: "/models/model-q4.gguf",
-        ownership: "ExternalHuggingFace",
-      },
-      residencyState: { _tag: "Unloaded" },
-      catalogAttribution: { _tag: "NotInCatalog" },
-      servingState: {
-        _tag: "Assessed",
-        metadata: {
-          format: "gguf",
-          quantization: "Q4_K_M",
-          quantizationName: "4-bit",
-          architecture: "test",
-          storageBytes: 16 * GIB,
-          maximumContextLength: Option.some(contextLength),
-        },
-        capabilities,
-        speculativeMethod: Option.none(),
-        assessment: {
-          _tag: "Fits",
-          profile: { contextLength },
-          assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
-          environmentId: AssessmentEnvironmentIdSchema.make("environment_test"),
-          memory: {
-            domains: [],
-            totalRequiredBytes: 0,
-            requiredSystemMemoryBytes: 0,
-          },
-          performance: performance(contextLength),
-        },
-      },
-    },
-    ...overrides,
-  }
+export const fitsAssessment = (): Extract<LocalModelAssessment, { readonly _tag: "Fits" }> => ({
+  _tag: "Fits",
+  profile: { contextLength: CONTEXT_LENGTH },
+  assessmentId: ModelAssessmentIdSchema.make("assessment_test"),
+  environmentId: ENVIRONMENT_ID,
+  memory: { domains: [], totalRequiredBytes: 0, requiredSystemMemoryBytes: 0 },
+  performance: performance(CONTEXT_LENGTH),
+})
+
+export const doesNotFitAssessment = (): LocalModelAssessment => ({
+  _tag: "DoesNotFit",
+  profile: { contextLength: CONTEXT_LENGTH },
+  assessmentId: ModelAssessmentIdSchema.make("assessment_large"),
+  environmentId: ENVIRONMENT_ID,
+  memoryDomains: [],
+  totalRequiredBytes: 0,
+  deficitBytes: 8 * GIB,
+  limitingResource: "memory",
+})
+
+export const unsupportedAssessment = (ggmlType: string): LocalModelAssessment => ({
+  _tag: "Unsupported",
+  profile: { contextLength: CONTEXT_LENGTH },
+  environmentId: ENVIRONMENT_ID,
+  reasons: [{ _tag: "WeightTypes", types: [{ ggmlType, tensorCount: 2 }] }],
+  detail: `source_element has no ${ggmlType} case`,
+})
+
+const catalogPresentation = {
+  displayName: "Qwen Test",
+  variantLabel: ModelVariantLabelSchema.make("Q4"),
+  description: "Test model",
+  license: Option.some("Apache-2.0"),
+  sourceUrls: [HttpsUrlSchema.make("https://huggingface.co/test/model")],
 }
 
 const makeCatalogOnlyModel = (
   overrides: Partial<CatalogLocalModel> = {},
   modelId = TEST_CATALOG_MODEL_ID,
-): CatalogLocalModel => {
-  const model = makeModel()
-  const { state: _state, ...shared } = model
-  const servingState = model.state.servingState
-  if (servingState._tag !== "Assessed" || servingState.assessment._tag !== "Fits") {
-    throw new Error("Base fixture must have a fitting assessment")
-  }
-  return {
-    ...shared,
-    _tag: "Catalog",
-    modelId,
-    storageBytes: servingState.metadata.storageBytes,
-    catalogData: {
-        releaseDate: "2026-01-01" as ModelReleaseDate,
-        parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
-        intelligence: 75,
-        support: { _tag: "Supported" },
-        fidelityRank: 75,
-        quantizationAware: false,
-    },
-    acquisitionState: { _tag: "NotInstalled" },
-    servingState: {
-      _tag: "Assessed",
-      metadata: servingState.metadata,
-      capabilities: servingState.capabilities,
-      speculativeMethod: servingState.speculativeMethod,
-      assessment: servingState.assessment,
-      rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, fidelity: 0.75 }),
-    },
-    presentation: { ...model.presentation, license: Option.some("Apache-2.0") },
-    ...overrides,
-  }
-}
+): CatalogLocalModel => ({
+  _tag: "Catalog",
+  modelId,
+  presentation: catalogPresentation,
+  storageBytes: metadata.storageBytes,
+  catalogData: {
+    releaseDate: "2026-01-01" as ModelReleaseDate,
+    parameterization: { architecture: "dense", totalParameters: 8_000_000_000 },
+    intelligence: 75,
+    support: { _tag: "Supported" },
+    fidelityRank: 75,
+    quantizationAware: false,
+  },
+  acquisitionState: { _tag: "NotInstalled" },
+  servingState: {
+    _tag: "Assessed",
+    metadata,
+    capabilities,
+    speculativeMethod: Option.some({ _tag: "DFlash" }),
+    assessment: fitsAssessment(),
+    rankingScores: Option.some({ intelligence: 0.75, speed: 0.65, fidelity: 0.75 }),
+  },
+  ...overrides,
+})
 
 export const makeCatalogModel = (overrides: Partial<CatalogLocalModel> = {}): CatalogLocalModel =>
   makeCatalogOnlyModel(overrides)
 
+const installation = (primaryPath: string, ownership: "Magnitude" | "External" = "Magnitude") => ({
+  _tag: "Resolved" as const,
+  installedBytes: metadata.storageBytes,
+  primaryPath,
+  ownership,
+})
+
 export const makeInstalledCatalogModel = (
   overrides: Partial<CatalogLocalModel> = {},
-): CatalogLocalModel => {
-  const model = makeCatalogOnlyModel()
-  if (model.servingState._tag !== "Assessed") throw new Error("Base fixture must be assessed")
-  return {
-    ...model,
-    acquisitionState: {
-      _tag: "Installed",
-      installation: {
-        _tag: "Resolved",
-        installedBytes: model.servingState.metadata.storageBytes,
-        primaryPath: "/models/catalog-model.gguf",
-        ownership: "Magnitude",
-      },
-      residencyState: { _tag: "Unloaded" },
-    },
-    ...overrides,
-  }
-}
+): CatalogLocalModel => makeCatalogOnlyModel({
+  acquisitionState: {
+    _tag: "Installed",
+    installation: installation("/models/catalog-model.gguf"),
+    residencyState: { _tag: "Unloaded" },
+  },
+  ...overrides,
+})
 
 export const makeAcquiringModel = (
   acquisitionState: LocalModelAcquisitionState,
   overrides: Partial<CatalogLocalModel> = {},
 ): CatalogLocalModel => makeCatalogOnlyModel({ acquisitionState, ...overrides })
+
+export const makeDrafterCandidate = (overrides: Partial<DrafterCandidate> = {}): DrafterCandidate => ({
+  category: "CatalogDrafter",
+  reference: { _tag: "Catalog", modelId: CATALOG_DRAFTER_ID },
+  label: "Magnitude DFlash for Qwen Test",
+  sizeBytes: 900_000_000,
+  lineage: "Lineage",
+  verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: GIB },
+  onThisComputer: false,
+  method: Option.some({ _tag: "DFlash" }),
+  measuredAcceptance: Option.none(),
+  ...overrides,
+})
+
+export const makeDrafterCandidates = (): readonly DrafterCandidate[] => [
+  makeDrafterCandidate(),
+  makeDrafterCandidate({
+    category: "BuiltIn",
+    reference: { _tag: "Embedded" },
+    label: "MTP heads",
+    sizeBytes: 0,
+    lineage: "Exact",
+    verdict: { _tag: "Bound", method: { _tag: "Mtp" }, memoryBytes: GIB / 2 },
+    method: Option.some({ _tag: "Mtp" }),
+  }),
+  makeDrafterCandidate({
+    category: "HuggingFace",
+    reference: {
+      _tag: "HuggingFace",
+      repository: HuggingFaceRepositoryIdSchema.make("z-lab/Qwen-Test-DFlash"),
+      commit: TEST_COMMIT,
+      path: HuggingFaceArtifactSelectorSchema.make("dflash.gguf"),
+    },
+    label: "z-lab DFlash",
+    sizeBytes: 1_200_000_000,
+    lineage: "None",
+    verdict: {
+      _tag: "Rejected",
+      reasons: [{ _tag: "TargetMismatch", detail: "hidden size 2048 does not match 4096" }],
+      detail: "drafter hidden size mismatch",
+    },
+    method: Option.none(),
+  }),
+]
+
+const customPresentation = (sourceLabel: string) => ({
+  displayName: "Qwen Test Uncensored",
+  variantLabel: ModelVariantLabelSchema.make("Q4_K_M"),
+  sourceLabel,
+  variantOf: Option.some(TEST_CATALOG_MODEL_ID),
+  license: Option.some("apache-2.0"),
+  sourceUrls: [],
+})
+
+const customServing = (assessment: LocalModelAssessment = fitsAssessment()): CustomLocalModel["servingState"] => ({
+  _tag: "Assessed",
+  metadata,
+  capabilities,
+  speculativeMethod: Option.none(),
+  assessment,
+})
+
+export const makeFoundModel = (overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => ({
+  _tag: "Custom",
+  modelId: FOUND_MODEL_ID,
+  origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
+  presentation: customPresentation("Hugging Face cache"),
+  drafter: Option.none(),
+  recommendedDrafter: Option.some(makeDrafterCandidate()),
+  measuredAcceptance: Option.none(),
+  acquisitionState: {
+    _tag: "External",
+    installation: installation("/cache/Qwen-Test-Q4_K_M.gguf", "External"),
+    residencyState: { _tag: "Unloaded" },
+  },
+  servingState: customServing(),
+  storageBytes: metadata.storageBytes,
+  ...overrides,
+})
+
+export const makeAddedModel = (overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => makeFoundModel({
+  modelId: ADDED_MODEL_ID,
+  origin: { _tag: "Added", repository: TEST_REPOSITORY, commit: TEST_COMMIT },
+  presentation: { ...customPresentation("Hugging Face"), variantLabel: ModelVariantLabelSchema.make("Q4_K_P") },
+  drafter: Option.some({
+    reference: { _tag: "Catalog", modelId: CATALOG_DRAFTER_ID },
+    label: "Magnitude DFlash for Qwen Test",
+    sizeBytes: 900_000_000,
+    verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: GIB },
+    availability: { _tag: "Present" },
+    updateAvailable: false,
+  }),
+  recommendedDrafter: Option.none(),
+  measuredAcceptance: Option.some({
+    acceptanceRate: 0.58,
+    tokensPerSecond: 61,
+    withoutDrafterTokensPerSecond: Option.some(40),
+    slower: false,
+  }),
+  acquisitionState: {
+    _tag: "Installed",
+    installation: installation("/magnitude/models/Qwen-Test-Q4_K_P.gguf"),
+    residencyState: { _tag: "Unloaded" },
+  },
+  ...overrides,
+})
+
+export const makeImportedModel = (overrides: Partial<CustomLocalModel> = {}): CustomLocalModel => makeFoundModel({
+  modelId: IMPORTED_MODEL_ID,
+  origin: { _tag: "Imported", path: "/Users/test/models/qwen-test.gguf" },
+  presentation: { ...customPresentation("GGUF file"), variantOf: Option.none() },
+  recommendedDrafter: Option.none(),
+  acquisitionState: {
+    _tag: "Unavailable",
+    installation: installation("/Users/test/models/qwen-test.gguf", "External"),
+    failure: { code: "missing", message: "The file was moved or deleted", retryable: false },
+  },
+  ...overrides,
+})
+
+export const makeUnsupportedLocalModel = (overrides: Partial<UnsupportedLocalModel> = {}): UnsupportedLocalModel => ({
+  displayName: "DeepSeek V4 Flash",
+  origin: { _tag: "Found", source: { _tag: "Ollama" } },
+  path: "/Users/test/.ollama/models/blobs/sha256-abc",
+  reasons: [{ _tag: "Architecture", architecture: "deepseek4" }],
+  detail: "unknown general.architecture deepseek4",
+  ...overrides,
+})
+
+type CatalogSnapshotState = Exclude<ModelCatalogState, { readonly _tag: "Initializing" }>
+
+export const catalogState = (
+  models: readonly LocalModel[] = [],
+  unsupported: readonly UnsupportedLocalModel[] = [],
+  hidden: readonly CustomLocalModel[] = [],
+): CatalogSnapshotState => ({
+  _tag: "Ready",
+  providers: [],
+  models: models.map((product) => ({ _tag: "Local", product, offering: Option.none() })),
+  failures: [],
+  localModelPreparation: {
+    discovery: { complete: true, modelsFound: models.length },
+    assessment: { complete: true, settledModels: models.length, totalModels: models.length },
+  },
+  unsupportedLocalModels: unsupported,
+  hiddenLocalModels: hidden,
+})
+
+export const makeSearchResponse = (overrides: Partial<HuggingFaceSearchResponse> = {}): HuggingFaceSearchResponse => ({
+  results: [
+    {
+      repository: TEST_REPOSITORY,
+      displayName: "Qwen Test Uncensored",
+      uploader: "HauhauCS",
+      variantOf: Option.some(TEST_CATALOG_MODEL_ID),
+      downloads: 48_213,
+      architecture: Option.some("qwen35moe"),
+      unsupported: Option.none(),
+    },
+    {
+      repository: HuggingFaceRepositoryIdSchema.make("huihui-ai/Qwen-Test-abliterated-GGUF"),
+      displayName: "Qwen Test abliterated",
+      uploader: "huihui-ai",
+      variantOf: Option.none(),
+      downloads: 912,
+      architecture: Option.some("qwen35moe"),
+      unsupported: Option.none(),
+    },
+  ],
+  hiddenCount: 3,
+  ...overrides,
+})
+
+export const makeUnsupportedSearchResult = (): HuggingFaceSearchResponse["results"][number] => ({
+  repository: HuggingFaceRepositoryIdSchema.make("unsloth/DeepSeek-V4-Flash-GGUF"),
+  displayName: "DeepSeek V4 Flash",
+  uploader: "unsloth",
+  variantOf: Option.none(),
+  downloads: 2_400_000,
+  architecture: Option.some("deepseek4"),
+  unsupported: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]),
+})
+
+const version = (
+  label: string,
+  sizeGb: number,
+  assessment: LocalModelAssessment,
+  overrides: Partial<CandidateVersion> = {},
+): CandidateVersion => ({
+  label,
+  modelId: CustomFormModelIdSchema.make(`hf:${TEST_REPOSITORY}/Qwen-Test-${label}.gguf`),
+  files: [`Qwen-Test-${label}.gguf`],
+  sizeBytes: Math.round(sizeGb * GB),
+  assessment: Option.some(assessment),
+  recommended: false,
+  onThisComputer: Option.none(),
+  ...overrides,
+})
+
+export const makeInspection = (overrides: Partial<CandidateInspection> = {}): CandidateInspection => ({
+  source: { _tag: "HuggingFace", repository: TEST_REPOSITORY, commit: TEST_COMMIT },
+  displayName: "Qwen Test Uncensored",
+  license: Option.some("apache-2.0"),
+  variantOf: Option.some(TEST_CATALOG_MODEL_ID),
+  versions: [
+    version("Q8_K_P", 43.6, doesNotFitAssessment()),
+    version("Q6_K_P", 30.6, fitsAssessment(), { onThisComputer: Option.some(FOUND_MODEL_ID) }),
+    version("Q4_K_P", 23.4, fitsAssessment(), { recommended: true }),
+    version("Q2_K_P", 15.0, unsupportedAssessment("Q2_K")),
+  ],
+  selectedVersion: Option.none(),
+  projector: Option.none(),
+  unsupportedArchitecture: Option.none(),
+  ...overrides,
+})
+
+export const makeLocations = (): readonly ModelLocation[] => [
+  { kind: "HuggingFaceCache", path: "/Users/test/.cache/huggingface/hub", enabled: true, automatic: true, found: true },
+  { kind: "LmStudio", path: "/Users/test/.lmstudio/models", enabled: true, automatic: true, found: false },
+  { kind: "Ollama", path: "/Users/test/.ollama/models", enabled: false, automatic: true, found: true },
+  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, found: true },
+]

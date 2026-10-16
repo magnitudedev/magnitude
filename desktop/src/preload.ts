@@ -1,4 +1,4 @@
-import { ModelTrayPresentation } from "@magnitudedev/client-common/application/contracts"
+import { HostAction, ModelTrayPresentation } from "@magnitudedev/client-common/application/contracts"
 import { contextBridge, ipcRenderer } from "electron"
 import { RpcClient } from "@effect/rpc"
 import { Cause, Context, Effect, Exit, Fiber, Layer, ManagedRuntime, Option, Schema, Stream } from "effect"
@@ -34,7 +34,7 @@ const query = <A>(select: (client: InferenceHostClient) => Effect.Effect<A, unkn
 const api: DesktopApi = {
   platform: process.platform,
   observe: (value, error) => observe(client => client.Observe({}), state => value(Schema.encodeSync(ApplicationSnapshot)(state)), error),
-  actions: value => observe(client => client.Actions({}), value, message => console.error(message)),
+  actions: (value, error) => observe(client => client.Actions({}), action => value(Schema.encodeSync(HostAction)(action)), error),
   presentModel: value => command(client => client.PresentModel(Schema.decodeUnknownSync(ModelTrayPresentation)(value))),
   getAppearance: () => runtime.runPromise(Effect.flatMap(HostClient, client => client.GetAppearance({}))),
   setAppearance: preference => command(client => client.SetAppearance({ preference })),

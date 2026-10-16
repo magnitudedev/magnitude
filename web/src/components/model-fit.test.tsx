@@ -22,4 +22,9 @@ describe("Load model action", () => {
       expect(loadRefusal(model)).toBeNull()
     }
   })
+  it("is disabled with the engine's reasons when Magnitude can't run the model", () => {
+    const unsupported = assessed({ _tag: "Unsupported", reasons: [{ _tag: "Architecture", architecture: "deepseek4" }], detail: "PRIVATE" })
+    expect(loadRefusal(unsupported)).toBe("Magnitude can’t run this model. No kernels for the deepseek4 architecture.")
+    expect(renderToStaticMarkup(<LoadModelButton model={unsupported} pending={false} onLoad={() => {}} />)).toMatch(/<button[^>]*disabled=""/)
+  })
 })

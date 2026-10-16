@@ -4,14 +4,26 @@ import { replaySafe, atMostOnce } from "../transport/recovery"
 import { Option, Schema } from "effect"
 import { ProviderIdSchema } from "@magnitudedev/ai/provider/model"
 import {
+  CustomModelMutationError,
   LocalInferenceError,
+  LocalModelMutationFailed,
+  ModelCandidateError,
+  ModelLocationError,
   ModelPreferenceMutationFailed,
   ModelSlotUpdateError,
 } from "../errors"
 import {
+  AutomaticModelLocationKindSchema,
+  CandidateInspectionSchema,
+  CustomFormModelIdSchema,
+  DrafterCandidateSchema,
+  DrafterChoiceSchema,
+  DrafterTargetSchema,
+  HuggingFaceRepositoryIdSchema,
+  HuggingFaceSearchResponseSchema,
   LocalInferenceHardwareSchema,
-  CatalogFormModelIdSchema,
   ModelIdSchema,
+  ModelLocationSchema,
   ModelCatalogStateSchema,
   ModelLoadPlanSchema,
   ModelSlotsStateSchema,
@@ -64,13 +76,13 @@ const SetFavorite = Rpc.make("SetModelFavorite", {
 }).pipe(replaySafe)
 
 const SyncLocalModel = Rpc.make("SyncLocalModel", {
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({ outcome: Schema.Literal("Started", "AlreadyCurrent") }),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
 
 const CancelLocalModelSync = Rpc.make("CancelLocalModelSync", {
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
@@ -78,14 +90,14 @@ const CancelLocalModelSync = Rpc.make("CancelLocalModelSync", {
 const AcknowledgeLocalModelSyncFailure = Rpc.make(
   "AcknowledgeLocalModelSyncFailure",
   {
-    payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+    payload: Schema.Struct({ modelId: ModelIdSchema }),
     success: Schema.Struct({}),
     error: LocalInferenceError,
   }
 ).pipe(atMostOnce)
 
 const RemoveLocalModel = Rpc.make("RemoveLocalModel", {
-  payload: Schema.Struct({ modelId: CatalogFormModelIdSchema }),
+  payload: Schema.Struct({ modelId: ModelIdSchema }),
   success: Schema.Struct({}),
   error: LocalInferenceError,
 }).pipe(atMostOnce)
@@ -120,6 +132,111 @@ const PreviewSlotLoad = Rpc.make("PreviewModelSlotLoad", {
   error: LocalInferenceError,
 }).pipe(replaySafe)
 
+const optional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
+  Schema.optionalWith(schema, { as: "Option", exact: true })
+
+const NonEmptyString = Schema.String.pipe(Schema.minLength(1))
+
+/** Supported GGUF repositories on Hugging Face; `all` also lists unsupported ones with their reasons. */
+const SearchHuggingFaceModels = Rpc.make("SearchHuggingFaceModels", {
+  payload: Schema.Struct({
+    query: Schema.String,
+    limit: optional(Schema.Int.pipe(Schema.between(1, 100))),
+    all: Schema.Boolean,
+  }),
+  success: HuggingFaceSearchResponseSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+/** A Hugging Face URL, `owner/repo`, `owner/repo:QUANT`, or local GGUF path, inspected without changes. */
+const InspectModelCandidate = Rpc.make("InspectModelCandidate", {
+  payload: Schema.Struct({ reference: NonEmptyString }),
+  success: CandidateInspectionSchema,
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+/** Drafters for a target in preselection order; `other` adds any reference with the engine's verdict. */
+const ListDrafterCandidates = Rpc.make("ListDrafterCandidates", {
+  payload: Schema.Struct({
+    target: DrafterTargetSchema,
+    other: optional(NonEmptyString),
+  }),
+  success: Schema.Struct({ candidates: Schema.Array(DrafterCandidateSchema) }),
+  error: ModelCandidateError,
+}).pipe(replaySafe)
+
+const ListModelLocations = Rpc.make("ListModelLocations", {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({ locations: Schema.Array(ModelLocationSchema) }),
+  error: LocalModelMutationFailed,
+}).pipe(replaySafe)
+
+const AddedCustomModelSchema = Schema.Struct({
+  modelId: CustomFormModelIdSchema,
+  version: NonEmptyString,
+  drafter: optional(DrafterCandidateSchema),
+  outcome: Schema.Literal("Started", "AlreadyOnThisComputer"),
+})
+
+/** Pins the repository's commit, picks the recommended version when none is named, and starts the download. */
+const AddHuggingFaceModel = Rpc.make("AddHuggingFaceModel", {
+  payload: Schema.Struct({
+    repository: HuggingFaceRepositoryIdSchema,
+    revision: optional(NonEmptyString),
+    version: optional(NonEmptyString),
+    drafter: DrafterChoiceSchema,
+  }),
+  success: AddedCustomModelSchema,
+  error: CustomModelMutationError,
+}).pipe(atMostOnce)
+
+/** Declares one GGUF by path, referenced in place; never copies or deletes it. */
+const ImportModelFile = Rpc.make("ImportModelFile", {
+  payload: Schema.Struct({ path: NonEmptyString, drafter: DrafterChoiceSchema }),
+  success: Schema.Struct({
+    modelId: CustomFormModelIdSchema,
+    drafter: optional(DrafterCandidateSchema),
+  }),
+  error: CustomModelMutationError,
+}).pipe(atMostOnce)
+
+/** Adds, changes, or turns off a custom model's drafter; downloads only the drafter when needed. */
+const SetModelDrafter = Rpc.make("SetModelDrafter", {
+  payload: Schema.Struct({ modelId: CustomFormModelIdSchema, drafter: DrafterChoiceSchema }),
+  success: Schema.Struct({ drafter: optional(DrafterCandidateSchema) }),
+  error: CustomModelMutationError,
+}).pipe(atMostOnce)
+
+const HideModel = Rpc.make("HideModel", {
+  payload: Schema.Struct({ modelId: CustomFormModelIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalModelMutationFailed,
+}).pipe(atMostOnce)
+
+const UnhideModel = Rpc.make("UnhideModel", {
+  payload: Schema.Struct({ modelId: CustomFormModelIdSchema }),
+  success: Schema.Struct({}),
+  error: LocalModelMutationFailed,
+}).pipe(atMostOnce)
+
+const AddModelFolder = Rpc.make("AddModelFolder", {
+  payload: Schema.Struct({ path: NonEmptyString }),
+  success: Schema.Struct({}),
+  error: ModelLocationError,
+}).pipe(atMostOnce)
+
+const RemoveModelFolder = Rpc.make("RemoveModelFolder", {
+  payload: Schema.Struct({ path: NonEmptyString }),
+  success: Schema.Struct({}),
+  error: ModelLocationError,
+}).pipe(atMostOnce)
+
+const SetModelLocationEnabled = Rpc.make("SetModelLocationEnabled", {
+  payload: Schema.Struct({ kind: AutomaticModelLocationKindSchema, enabled: Schema.Boolean }),
+  success: Schema.Struct({}),
+  error: LocalModelMutationFailed,
+}).pipe(atMostOnce)
+
 export const Models = {
   getServingUsage: GetServingUsage,
   getCatalog: GetCatalog,
@@ -138,4 +255,16 @@ export const Models = {
   loadSlot: LoadSlot,
   stopSlot: StopSlot,
   previewSlotLoad: PreviewSlotLoad,
+  searchHuggingFaceModels: SearchHuggingFaceModels,
+  inspectModelCandidate: InspectModelCandidate,
+  listDrafterCandidates: ListDrafterCandidates,
+  listModelLocations: ListModelLocations,
+  addHuggingFaceModel: AddHuggingFaceModel,
+  importModelFile: ImportModelFile,
+  setModelDrafter: SetModelDrafter,
+  hideModel: HideModel,
+  unhideModel: UnhideModel,
+  addModelFolder: AddModelFolder,
+  removeModelFolder: RemoveModelFolder,
+  setModelLocationEnabled: SetModelLocationEnabled,
 }

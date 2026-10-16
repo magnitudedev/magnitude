@@ -6,8 +6,9 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { nativeWindowsJobOwnerLayer, nativeWindowsPrivatePipesLayer } from "@magnitudedev/utils/windows-native";
 import { WindowsIcnChildSpawner } from "./windows-child";
-import { Duration, Effect, Layer, Option, Ref, Schema } from "effect";
-import { MagnitudeStorage, resolveUsableModelStoreLocation } from "@magnitudedev/storage";
+import { Duration, Effect, Layer, Option, Redacted, Ref, Schema } from "effect";
+import type { LocalModelsConfiguration } from "@magnitudedev/icn-protocol/schemas";
+import { EMPTY_CUSTOM_MODELS_CONFIG, MagnitudeStorage, resolveUsableModelStoreLocation } from "@magnitudedev/storage";
 import {
   type AcnInstallationPlan,
   type AcnStartupProgress,
@@ -20,7 +21,9 @@ import {
   IcnModelAssessments,
   makeIcnCatalog,
   makeIcnCatalogInstallations,
-  makeIcnDiscovery,
+  makeIcnLocalModels,
+  makeIcnDownloads,
+  IcnCandidatesLive,
   makeIcnModelAssessments,
   makeIcnClient,
   makeIcnProcess,
@@ -32,7 +35,8 @@ import {
   IcnPreparationReporter,
 } from "@magnitudedev/icn";
 import { ACN_VERSION } from "../version";
-import { resolveHuggingFaceCacheRoots } from "./hugging-face-cache";
+import { hostDiscoveryEnvironment, resolveAutomaticLocations } from "./discovery-roots";
+import { localModelsConfiguration } from "../custom-models";
 import { AcnServiceLifecycle } from "../service-lifecycle";
 
 const artifactProgress = (
@@ -125,7 +129,26 @@ const resolveModelStore = (dataDir: string) =>
     return location.root;
   });
 
-const makeProcess = (dataDir: string, modelStore: string) =>
+/**
+ * The local-models snapshot ICN scans first, from the saved choices as they stand at spawn. Drafters
+ * whose binding method is relearned after readiness are completed by the first configuration push.
+ */
+const resolveLocalModelsSnapshot = Effect.gen(function* () {
+  const storage = yield* MagnitudeStorage;
+  const config = yield* storage.config.load().pipe(
+    Effect.map((loaded) => Option.getOrElse(loaded.models, () => EMPTY_CUSTOM_MODELS_CONFIG)),
+    Effect.tapError((error) =>
+      Effect.logWarning("Could not read model choices from config.json; scanning only the automatic locations").pipe(
+        Effect.annotateLogs({ cause: error.message })
+      )
+    ),
+    Effect.orElseSucceed(() => EMPTY_CUSTOM_MODELS_CONFIG)
+  );
+  const locations = yield* resolveAutomaticLocations(hostDiscoveryEnvironment());
+  return localModelsConfiguration(config, locations, () => Option.none());
+});
+
+const makeProcess = (dataDir: string, modelStore: string, localModels: LocalModelsConfiguration) =>
   makeIcnProcess(
     new IcnLifecycleConfig({
       binary: new IcnBinaryResolutionConfig({
@@ -147,7 +170,8 @@ const makeProcess = (dataDir: string, modelStore: string) =>
       storage: new IcnStorageConfig({
         modelStore: Option.some(modelStore),
         cacheRoot: Option.some(join(dataDir, "cache")),
-        huggingFaceCaches: resolveHuggingFaceCacheRoots(),
+        localModelsConfigurationFile: join(dataDir, "cache", "local-models-configuration.json"),
+        localModels,
       }),
       host: "127.0.0.1",
       startupTimeout: Duration.seconds(150),
@@ -155,6 +179,10 @@ const makeProcess = (dataDir: string, modelStore: string) =>
       forceShutdownTimeout: Duration.millis(500),
       outputLimitBytes: 256 * 1024,
       logFile: Option.some(join(dataDir, "logs", "inference.log")),
+      huggingFaceToken: Option.map(
+        Option.fromNullable(process.env.HF_TOKEN?.trim()).pipe(Option.filter((token) => token.length > 0)),
+        Redacted.make,
+      ),
     })
   ).pipe(Layer.provide(process.platform === "win32"
     ? WindowsIcnChildSpawner.pipe(Layer.provide(Layer.merge(
@@ -263,8 +291,9 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
     })
   );
   const process = Layer.unwrapEffect(
-    resolveModelStore(dataDir).pipe(
-      Effect.map((modelStore) => makeProcess(dataDir, modelStore).pipe(Layer.provide(preparation)))
+    Effect.all([resolveModelStore(dataDir), resolveLocalModelsSnapshot]).pipe(
+      Effect.map(([modelStore, localModels]) =>
+        makeProcess(dataDir, modelStore, localModels).pipe(Layer.provide(preparation)))
     )
   );
   const supervisedProcess = Layer.provideMerge(makeSupervision(), process);
@@ -272,7 +301,9 @@ export const makeAcnIcn = (dataDir: string = defaultDataDir()) => {
   const withEvents = Layer.provideMerge(makeIcnEvents(), withClient);
   const withHardware = Layer.provideMerge(makeIcnHardware(), withEvents);
   const withCatalog = Layer.provideMerge(makeIcnCatalog(), withHardware);
-  const withModels = Layer.provideMerge(makeIcnDiscovery(), withCatalog);
+  const withLocalModels = Layer.provideMerge(makeIcnLocalModels(), withCatalog);
+  const withDownloads = Layer.provideMerge(makeIcnDownloads(), withLocalModels);
+  const withModels = Layer.provideMerge(IcnCandidatesLive, withDownloads);
   const withAssessments = Layer.provideMerge(makeIcnModelAssessments(), withModels);
   const withDiagnostics = globalThis.process.env.MAGNITUDE_ACCEPTANCE_ASSESSMENT_DIAGNOSTICS
     ? Layer.provideMerge(acceptanceAssessmentDiagnostics, withAssessments)

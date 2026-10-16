@@ -26,7 +26,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
     _tag: "Resolved",
     installedBytes: 1_000,
     primaryPath: "/models/model.gguf",
-    ownership: source === "Catalog" ? "Magnitude" : "ExternalHuggingFace",
+    ownership: source === "Catalog" ? "Magnitude" : "External",
   } as const
   const servingState = {
     _tag: "Assessed",
@@ -53,10 +53,31 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 25 }],
     },
   } as const
+  if (source === "Discovered") {
+    return Schema.validateSync(LocalModelSchema)({
+      _tag: "Custom",
+      modelId: providerModelId,
+      origin: { _tag: "Found", source: { _tag: "HuggingFaceCache" } },
+      presentation: {
+        displayName: "Model",
+        variantLabel: ModelVariantLabelSchema.make("Q4"),
+        sourceLabel: "Hugging Face cache",
+        variantOf: Option.none(),
+        license: Option.none(),
+        sourceUrls: [],
+      },
+      drafter: Option.none(),
+      recommendedDrafter: Option.none(),
+      measuredAcceptance: Option.none(),
+      acquisitionState: { _tag: "External", installation, residencyState: { _tag: "Unloaded" } },
+      servingState,
+      storageBytes: 1_000,
+    })
+  }
   return Schema.validateSync(LocalModelSchema)({
-    _tag: source,
+    _tag: "Catalog",
     modelId: providerModelId,
-    ...(source === "Catalog" ? { storageBytes: 1_000 } : {}),
+    storageBytes: 1_000,
     presentation: {
       displayName: "Model",
       variantLabel: ModelVariantLabelSchema.make("Q4"),
@@ -64,21 +85,16 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       license: Option.none(),
       sourceUrls: [],
     },
-    ...(source === "Catalog"
-      ? { catalogData: {
-          releaseDate: "2026-08-29",
-          parameterization: { architecture: "dense", totalParameters: 1 },
-          intelligence: 1,
-          support: { _tag: "Supported" },
-          fidelityRank: 1,
-          quantizationAware: false,
-        } }
-      : {}),
-    ...(source === "Catalog"
-      ? { acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } } }
-      : { state: { _tag: "Ready", installation, residencyState: { _tag: "Unloaded" },
-          catalogAttribution: { _tag: "NotInCatalog" }, servingState } }),
-    ...(source === "Catalog" ? { servingState: { ...servingState, rankingScores: Option.none() } } : {}),
+    catalogData: {
+      releaseDate: "2026-08-29",
+      parameterization: { architecture: "dense", totalParameters: 1 },
+      intelligence: 1,
+      support: { _tag: "Supported" },
+      fidelityRank: 1,
+      quantizationAware: false,
+    },
+    acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
+    servingState: { ...servingState, rankingScores: Option.none() },
   })
 }
 
@@ -89,7 +105,7 @@ const catalogAssessed = (modelId: string): Extract<LocalModel, { readonly _tag: 
 }
 
 describe("local provider offerings", () => {
-  it("preserves canonical catalog and discovered model IDs unchanged", () => {
+  it("preserves canonical catalog and custom model IDs unchanged", () => {
     const catalog = assessed("qwen3.5-4b:gguf:q4", "Catalog")
     const discovered = assessed("hf:owner/repository/model-q5.gguf", "Discovered")
     const projection = projectLocalProviderOfferings([catalog, discovered])
@@ -187,6 +203,8 @@ describe("local provider offerings", () => {
         assessment: { complete: true, settledModels: 1, totalModels: 1 },
       },
       models: [model],
+      unsupported: [],
+      hidden: [],
       ...overrides,
     })
     expect(localProviderOfferingsReady(state())).toBe(true)

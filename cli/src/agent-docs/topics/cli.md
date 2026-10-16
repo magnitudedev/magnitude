@@ -12,11 +12,19 @@ magnitude status
 magnitude hardware
 magnitude catalog status
 magnitude catalog list
-magnitude catalog show|pull|cancel|remove <model-id>
+magnitude catalog show|cancel|remove <model-id>
 magnitude catalog recommendations [--preference <value>] [--limit <count>]
-magnitude models status [model-id]
+magnitude catalog search <query> [--all] [--limit <count>]
+magnitude catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT | path.gguf>
+magnitude catalog pull <model-id | owner/repo[:QUANT] | huggingface-url> [--drafter auto|none|<drafter>]
+magnitude models status [model-id] [--all]
 magnitude models load <model-id>
 magnitude models stop
+magnitude models import <path.gguf> [--drafter auto|none|<drafter>]
+magnitude models drafter <model-id> <auto | none | drafter>
+magnitude models hide|unhide <model-id>
+magnitude models folders list
+magnitude models folders add|remove <path>
 magnitude connections list
 magnitude connections connect <harness> [--set-model <model-id>] [--install-skill]
 magnitude connections sync [harness]
@@ -44,14 +52,24 @@ Each command prints only the product information relevant to that operation. Col
 use borderless tables when the rows are directly comparable; detail commands use labeled fields.
 Exact model and harness IDs are always printed so their output can be used in later commands.
 
-`catalog` owns catalog assessment progress, reviewed model choices, recommendation
-evidence, and download operations. `models` owns models on this computer and their current
-installation or runtime state. Catalog assessment and model loading are background work:
-observation commands return the current state and never wait for either to settle.
+Every `hardware`, `catalog`, and `models` command accepts `--json` and then prints one JSON document
+of the same facts instead of text, with exact IDs, structured reasons a model can't run (with the
+engine's developer `detail`), and drafter verdicts. Optional fields are omitted when absent. Errors
+stay on stderr with a nonzero exit in both modes. No command prompts or reads standard input: where
+a choice is needed it takes the desktop's default and prints what it chose.
 
-Discovery scans existing local Hugging Face caches for usable GGUF models without downloading or
-contacting the Hub. Assessment evaluates catalog and discovered models for the current hardware,
-including compatibility, memory fit, serving configuration, acceleration, and expected speed.
+`catalog` finds and downloads models: catalog assessment progress, reviewed model choices,
+recommendation evidence, Hugging Face search and inspection, and downloads. `models` owns what is on
+this computer: catalog models, models added from Hugging Face or as a file, models found in other
+apps' folders, drafters, hidden models, model locations, and runtime state. Catalog assessment,
+downloads, and model loading are background work: observation commands return the current state and
+never wait for any of them to settle.
+
+Magnitude scans the Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and folders you add
+for GGUF models, reading headers only and never changing those files. Assessment evaluates every
+model for the current hardware, including compatibility, memory fit, serving configuration,
+acceleration, and expected speed. See `magnitude docs custom-models` for adding models from Hugging
+Face or disk, drafters, and model locations.
 
 `connections connect --install-skill` installs or refreshes the bundled Magnitude skill in the selected
 harness's supported user-wide location before applying the connection.

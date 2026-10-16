@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import { Deferred, Effect, Exit, Fiber, Option, Ref, Schema, Scope, TestClock, TestContext } from "effect"
 import { describe, expect, it } from "vitest"
-import { ApplicationSnapshot } from "@magnitudedev/sdk/desktop-host"
+import { ApplicationSnapshot, type ApplicationIntent } from "@magnitudedev/sdk/desktop-host"
 import { acquireApplicationMaintenance, acquireApplicationOwner } from "./application-owner"
 import { requestApplication, serveApplicationControl } from "./application-control"
 import { acquireUpdateInstallationLease } from "./update-installation-lease"
@@ -22,7 +22,7 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
     const root = yield* directory
     const first = yield* acquireApplicationOwner(root, { _tag: "Headless" })
     if (first._tag !== "Owner") return yield* Effect.die("Expected owner")
-    const intents = yield* Ref.make<string[]>([])
+    const intents = yield* Ref.make<ApplicationIntent[]>([])
     yield* serveApplicationControl(first.socketPath, {
       snapshot: Effect.succeed({ ...snapshot, owner: owner === "Desktop"
         ? { _tag: "Desktop", tray: { _tag: "Registered" } } : { _tag: "Headless" } }),
@@ -110,12 +110,27 @@ describe.skipIf(process.platform === "win32")("native application owner arbitrat
       const root = yield* directory
       const first = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" })
       if (first._tag !== "Owner") return yield* Effect.die("Expected initial owner")
-      const intents = yield* Ref.make<string[]>([])
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
       yield* serveApplicationControl(first.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } }),
         login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]) })
       const second = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" })
       expect(second._tag).toBe("Forwarded")
       expect(yield* Ref.get(intents)).toEqual(["Observe", "ShowWindow"])
+    })).pipe(Effect.provide(nativeHostLayer(addon))))
+  })
+
+  it("forwards an opened link from a later launch to the existing desktop", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const root = yield* directory
+      const first = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: "ShowWindow" })
+      if (first._tag !== "Owner") return yield* Effect.die("Expected initial owner")
+      const intents = yield* Ref.make<ApplicationIntent[]>([])
+      yield* serveApplicationControl(first.socketPath, { snapshot: Effect.succeed({ ...snapshot, owner: { _tag: "Desktop", tray: { _tag: "Registered" } } }),
+        login: noLogin, update: noUpdate, dispatch: intent => Ref.update(intents, values => [...values, intent]) })
+      const url = "magnitude://open_from_hf?model=owner/repo&file=model.gguf"
+      const second = yield* acquireApplicationOwner(root, { _tag: "Desktop", intent: { _tag: "OpenUrl", url } })
+      expect(second._tag).toBe("Forwarded")
+      expect(yield* Ref.get(intents)).toEqual(["Observe", { _tag: "OpenUrl", url }])
     })).pipe(Effect.provide(nativeHostLayer(addon))))
   })
 

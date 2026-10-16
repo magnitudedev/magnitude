@@ -1,5 +1,6 @@
 import { Schema } from 'effect'
 import { CustomEndpointDeclarationsSchema } from './custom-endpoints'
+import { CustomModelsConfigSchema } from './custom-models'
 
 const NullableOptional = <A, I, R>(schema: Schema.Schema<A, I, R>) =>
   Schema.optionalWith(Schema.NullishOr(schema), {
@@ -33,6 +34,7 @@ export const MagnitudeConfigSchema = Schema.Struct({
   appearance: SerializableOptional(Schema.Literal("system", "light", "dark")),
   modelsDirectory: SerializableOptional(Schema.NonEmptyTrimmedString.pipe(Schema.maxLength(4_096))),
   network: SerializableOptional(NetworkAccessConfigSchema),
+  models: SerializableOptional(CustomModelsConfigSchema),
 })
 
 export type MagnitudeConfig = Schema.Schema.Type<typeof MagnitudeConfigSchema>

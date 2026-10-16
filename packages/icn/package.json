@@ -9,7 +9,6 @@
     ".": "./src/index.ts",
     "./lifecycle": "./src/lifecycle/index.ts",
     "./hardware": "./src/hardware/index.ts",
-    "./catalog": "./src/catalog/index.ts",
     "./provider": "./src/provider/index.ts",
     "./instances": "./src/instances/index.ts"
   },

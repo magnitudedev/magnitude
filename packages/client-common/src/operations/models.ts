@@ -1,4 +1,4 @@
-import { Schedule } from "effect";
+import { Effect, Schedule } from "effect";
 import { Models as Rpcs } from "@magnitudedev/sdk";
 import { Group, Mutation, QueryClient } from "@magnitudedev/effect-query";
 import { type SlotId } from "@magnitudedev/sdk";
@@ -140,12 +140,109 @@ const PreviewSlotLoad = query(
   (client) => client.models.previewSlotLoad
 );
 
+const SearchHuggingFaceModels = query(
+  Rpcs.searchHuggingFaceModels,
+  (client) => client.models.searchHuggingFaceModels,
+  { staleTime: "1 minute" }
+);
+
+const InspectModelCandidate = query(
+  Rpcs.inspectModelCandidate,
+  (client) => client.models.inspectModelCandidate,
+  { staleTime: "5 minutes" }
+);
+
+const ListDrafterCandidates = query(
+  Rpcs.listDrafterCandidates,
+  (client) => client.models.listDrafterCandidates,
+  { staleTime: "1 minute" }
+);
+
+const ListModelLocations = query(
+  Rpcs.listModelLocations,
+  (client) => client.models.listModelLocations,
+  { staleTime: Infinity }
+);
+
+const synchronizeLocations = QueryClient.refetch(ListModelLocations.match());
+
+const AddHuggingFaceModel = mutation(
+  Rpcs.addHuggingFaceModel,
+  (client) => client.models.addHuggingFaceModel,
+  {
+    scope: ({ repository }) => Mutation.MutationScope(`local-model-source:hf:${repository}`),
+    synchronize: () => synchronizeCatalog,
+  }
+);
+
+const ImportModelFile = mutation(
+  Rpcs.importModelFile,
+  (client) => client.models.importModelFile,
+  {
+    scope: ({ path }) => Mutation.MutationScope(`local-model-source:file:${path}`),
+    synchronize: () => synchronizeCatalog,
+  }
+);
+
+const SetModelDrafter = mutation(
+  Rpcs.setModelDrafter,
+  (client) => client.models.setModelDrafter,
+  {
+    scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
+    synchronize: () => synchronizeCatalog,
+  }
+);
+
+const HideModel = mutation(
+  Rpcs.hideModel,
+  (client) => client.models.hideModel,
+  {
+    scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
+    synchronize: () => synchronizeCatalog,
+  }
+);
+
+const UnhideModel = mutation(
+  Rpcs.unhideModel,
+  (client) => client.models.unhideModel,
+  {
+    scope: ({ modelId }) => Mutation.MutationScope(`local-model:${modelId}`),
+    synchronize: () => synchronizeCatalog,
+  }
+);
+
+const modelLocationsScope = Mutation.MutationScope("model-locations");
+
+const synchronizeLocationsAndCatalog = Effect.all([synchronizeLocations, synchronizeCatalog], { discard: true });
+
+const AddModelFolder = mutation(
+  Rpcs.addModelFolder,
+  (client) => client.models.addModelFolder,
+  { scope: () => modelLocationsScope, synchronize: () => synchronizeLocationsAndCatalog }
+);
+
+const RemoveModelFolder = mutation(
+  Rpcs.removeModelFolder,
+  (client) => client.models.removeModelFolder,
+  { scope: () => modelLocationsScope, synchronize: () => synchronizeLocationsAndCatalog }
+);
+
+const SetModelLocationEnabled = mutation(
+  Rpcs.setModelLocationEnabled,
+  (client) => client.models.setModelLocationEnabled,
+  { scope: () => modelLocationsScope, synchronize: () => synchronizeLocationsAndCatalog }
+);
+
 export const Models = Group.make({
   GetServingUsage,
   GetCatalog,
   GetSlots,
   GetLocalEnvironment,
   PreviewSlotLoad,
+  SearchHuggingFaceModels,
+  InspectModelCandidate,
+  ListDrafterCandidates,
+  ListModelLocations,
   RefreshCatalog,
   AssignSlot,
   ClearSlot,
@@ -158,4 +255,12 @@ export const Models = Group.make({
   StopActiveLocalModel,
   LoadSlot,
   StopSlot,
+  AddHuggingFaceModel,
+  ImportModelFile,
+  SetModelDrafter,
+  HideModel,
+  UnhideModel,
+  AddModelFolder,
+  RemoveModelFolder,
+  SetModelLocationEnabled,
 });

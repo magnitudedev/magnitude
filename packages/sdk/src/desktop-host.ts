@@ -2,7 +2,7 @@ import { MagnitudeHealthResponseSchema } from "@magnitudedev/acn-protocol"
 export { MachineFormFactor, MachineIdentity, MachineIdentityObservation } from "@magnitudedev/acn-protocol"
 import { Schema } from "effect"
 import { ApplicationUpdateState, LoginStartupState } from "@magnitudedev/acn-protocol"
-export { ApplicationUpdateState, LoginStartupState } from "@magnitudedev/acn-protocol"
+export { ApplicationUpdateState, LoginStartupState, HuggingFaceArtifactSelectorSchema, HuggingFaceRepositoryIdSchema, type HuggingFaceArtifactSelector, type HuggingFaceRepositoryId } from "@magnitudedev/acn-protocol"
 
 export const AppearancePreference = Schema.Literal("system", "light", "dark")
 export type AppearancePreference = typeof AppearancePreference.Type
@@ -26,7 +26,10 @@ export class Stopped extends Schema.TaggedClass<Stopped>()("Stopped", {}) {}
 export const OwnedServiceState = Schema.Union(Starting, Ready, Failed, CleanupFailed, Stopping, Stopped)
 export type OwnedServiceState = typeof OwnedServiceState.Type
 
-export const ApplicationIntent = Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield")
+/** A `magnitude://` link handed to a later launch, forwarded to the owner, which validates it again. */
+export const ApplicationOpenUrl = Schema.TaggedStruct("OpenUrl", { url: Schema.String.pipe(Schema.minLength(1), Schema.maxLength(4096)) })
+export type ApplicationOpenUrl = typeof ApplicationOpenUrl.Type
+export const ApplicationIntent = Schema.Union(Schema.Literal("EnsureRunning", "ShowWindow", "Observe", "Retry", "Quit", "Yield"), ApplicationOpenUrl)
 export type ApplicationIntent = typeof ApplicationIntent.Type
 export const ApplicationRequest = Schema.Struct({ version: Schema.Literal(1), intent: ApplicationIntent })
 export const TrayRegistration = Schema.Union(

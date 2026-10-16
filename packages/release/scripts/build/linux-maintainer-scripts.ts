@@ -17,6 +17,12 @@ export const restoreServerGrant = `/usr/lib/${LINUX_DESKTOP_PACKAGE_NAME}/resour
 export const reloadSystemd = "if [ -d /run/systemd/system ]; then systemctl daemon-reload || :; fi\n"
 
 /**
+ * The `.desktop` entry handles `magnitude://` links. Distributions refresh the MIME cache through
+ * package-manager triggers when desktop-file-utils is installed; this also covers systems without them.
+ */
+export const refreshDesktopDatabase = "if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database -q /usr/share/applications || :; fi\n"
+
+/**
  * Purging also forgets the server, so a later installation asks again instead of bringing it back.
  * The `magnitude` account and the data directory stay, as `server remove` keeps the data, and setup
  * reuses both.
@@ -30,9 +36,9 @@ export const forgetServer = "rm -f /etc/magnitude/server /etc/systemd/system/mul
  */
 export const renderLinuxMaintainerScripts = (begin: string, end: string): Readonly<Record<string, string>> => ({
   preinst: `case "$1" in install|upgrade) ;; *) exit 0 ;; esac\n${begin}`,
-  postinst: `case "$1" in configure|abort-upgrade|abort-remove) ;; *) exit 0 ;; esac\nif [ "$1" = configure ]; then ${restoreServerGrant.trimEnd()}; fi\n${reloadSystemd}[ -f /var/lib/magnitude-desktop/installing ] || exit 0\n${end}`,
+  postinst: `case "$1" in configure|abort-upgrade|abort-remove) ;; *) exit 0 ;; esac\nif [ "$1" = configure ]; then ${restoreServerGrant.trimEnd()}; fi\n${reloadSystemd}${refreshDesktopDatabase}[ -f /var/lib/magnitude-desktop/installing ] || exit 0\n${end}`,
   prerm: `case "$1" in remove) ;; *) exit 0 ;; esac\n${begin}`,
-  postrm: `case "$1" in remove|purge) ;; *) exit 0 ;; esac\n${removeServerGrant}${reloadSystemd}if [ "$1" = purge ]; then\n${forgetServer}fi\n[ -f /var/lib/magnitude-desktop/installation.lock ] || exit 0\n${end}\nif [ "$1" = purge ]; then rm -rf /var/lib/magnitude-desktop; fi\n`,
+  postrm: `case "$1" in remove|purge) ;; *) exit 0 ;; esac\n${removeServerGrant}${reloadSystemd}${refreshDesktopDatabase}if [ "$1" = purge ]; then\n${forgetServer}fi\n[ -f /var/lib/magnitude-desktop/installation.lock ] || exit 0\n${end}\nif [ "$1" = purge ]; then rm -rf /var/lib/magnitude-desktop; fi\n`,
 })
 
 /**
@@ -44,8 +50,8 @@ export const renderPacmanInstallScript = (begin: string, end: string): string =>
   const completion = `[ -f /var/lib/magnitude-desktop/installing ] || exit 0\n${end}`
   const scriptlet = (name: string, body: string) => `${name}() (\nset -eu\n${body.trimEnd()}\n)\n`
   return [
-    scriptlet("post_install", `${begin}\n${end}\n${restoreServerGrant}${reloadSystemd}`),
-    scriptlet("post_upgrade", `${restoreServerGrant}${reloadSystemd}${completion}`),
-    scriptlet("post_remove", `${removeServerGrant}${reloadSystemd}${completion}`),
+    scriptlet("post_install", `${begin}\n${end}\n${restoreServerGrant}${reloadSystemd}${refreshDesktopDatabase}`),
+    scriptlet("post_upgrade", `${restoreServerGrant}${reloadSystemd}${refreshDesktopDatabase}${completion}`),
+    scriptlet("post_remove", `${removeServerGrant}${reloadSystemd}${refreshDesktopDatabase}${completion}`),
   ].join("\n")
 }
