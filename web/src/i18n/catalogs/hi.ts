@@ -649,4 +649,7 @@ export const hi = {
   korean: "कोरियाई",
   vietnamese: "वियतनामी",
   indonesian: "इंडोनेशियाई",
+  noModelsDownloaded: "अभी तक कोई मॉडल डाउनलोड नहीं किया गया है। डिस्कवर में एक खोजें।",
+  couldNotCheckAvailableModels: "उपलब्ध मॉडल जाँचे नहीं जा सके",
+  restartServerToApply: "{reason} बदलाव लागू करने के लिए Magnitude सर्वर को पुनः आरंभ करें।",
 } satisfies typeof en
