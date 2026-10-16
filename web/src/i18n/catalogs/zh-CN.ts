@@ -558,4 +558,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   networkAddress: "网络地址",
   pageCantConnectService: "此页面无法连接到 Magnitude 服务，并会持续重试。请确认 Magnitude 正在那台电脑上运行，且此设备可以访问它。",
   memoryUsageUnit: "内存",
+  thisBrowserControlsAt: "此浏览器正在通过 {host} 控制 Magnitude。",
 }
