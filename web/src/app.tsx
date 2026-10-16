@@ -43,7 +43,7 @@ import { useId, useMemo, useRef, useState, type ReactNode } from "react"
 import { Atom, Result, useAtomValue, useAtomSet, useAtomMount } from "@effect-atom/atom-react"
 import { Cause, Effect, Option } from "effect"
 import { localModelDeprecation, type ProviderModelId, type CatalogLocalModel, type LocalInferenceHardware, type ModelOptimizationProgress, type ModelResidency } from "@magnitudedev/sdk"
-import type { ApplicationSnapshot, AppearancePreference } from "@magnitudedev/sdk/desktop-host"
+import type { AppearancePreference } from "@magnitudedev/sdk/desktop-host"
 import { ServerSettingsFailed, type ApplicationUpdateState, type NetworkAccessChange, type NetworkBind, type OwnerCapability } from "@magnitudedev/sdk"
 import { FolderPicker } from "./components/folder-picker"
 import {
