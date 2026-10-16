@@ -436,4 +436,13 @@ export const es: { [K in keyof typeof en]: string } = {
   exampleRequest: "Ejemplo de solicitud",
   folderPath: "Ruta de la carpeta",
   folders: "Carpetas",
+  totals: "Totales",
+  requests: "Solicitudes",
+  generationSpeed: "Velocidad de generación",
+  timeToFirstToken: "Tiempo hasta el primer token",
+  cachePercentage: "{percent}% de los tokens de entrada se sirvieron desde la caché.",
+  cacheNotReportedRequests: "No se informó del uso de caché en {count} solicitudes.",
+  tokensPerSecond: "tokens/s",
+  milliseconds: "ms",
+  secondsShort: "s",
 }
