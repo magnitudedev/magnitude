@@ -641,6 +641,7 @@ export const ur = {
   on: "آن",
   off: "بند",
   request: "درخواست",
+  appearanceCouldNotBeSaved: "اس براؤزر میں ظاہری شکل محفوظ نہیں کی جا سکی۔",
   savedAppearanceReadError: "محفوظ کردہ ظاہری شکل نہیں پڑھی جا سکی۔ سسٹم کی ظاہری شکل استعمال ہو رہی ہے۔",
   chineseTraditional: "روایتی چینی",
   korean: "کوریائی",
