@@ -635,4 +635,8 @@ export const bn = {
   capabilityProfile: "{name}-এর সক্ষমতার প্রোফাইল",
   harnessModel: "{name} মডেল",
   cacheNotReportedForRequests: "{count}টি অনুরোধের তথ্য জানানো হয়নি",
+  magnitudeCouldNotOpen: "Magnitude খোলা যায়নি",
+  reloadWindowRestart: "এই উইন্ডোটি আবার লোড করুন। তবুও না খুললে Magnitude পুনরায় চালু করুন।",
+  quitAndReopen: "Magnitude বন্ধ করে আবার খুলুন।",
+  savedAppearanceReadError: "সংরক্ষিত চেহারার সেটিং পড়া যায়নি। সিস্টেমের চেহারা ব্যবহার করা হচ্ছে।",
 } satisfies typeof en
