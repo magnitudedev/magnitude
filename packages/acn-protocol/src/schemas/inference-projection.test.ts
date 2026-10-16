@@ -48,7 +48,7 @@ describe("summarizeInferenceHardware", () => {
   const snapshot = (fields: Partial<InferenceSchema.HardwareSnapshot>): InferenceSchema.HardwareSnapshot => ({
     architecture: "x86_64", captured_at: 1, cpu_model: Option.some("AMD EPYC 7V13 64-Core Processor"), enabled_backends: ["cpu", "cuda", "vulkan"],
     logical_cores: 12, memory_domains: [], native_build: "test", physical_cores: Option.some(6), platform: "windows",
-    system_memory: { abort_reserve_bytes: 0, allocation_capacity_bytes: 0, allocation_headroom_bytes: 0, assess_reserve_bytes: 0, abort_reserve_bytes: 0, physical_available_bytes: 0, physical_capacity_bytes: 118111600640 },
+    system_memory: { abort_reserve_bytes: 0, allocation_capacity_bytes: 0, allocation_headroom_bytes: 0, physical_available_bytes: 0, physical_capacity_bytes: 118111600640 },
     system_product_name: Option.none(), topology_fingerprint: "f", backend_diagnostics: Option.none(), ...fields,
   })
   const cudaCard = domain({ id: "gpu-1", kind: "physical_device", total_capacity_bytes: 8589934592, devices: [
