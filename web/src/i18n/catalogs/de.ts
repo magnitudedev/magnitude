@@ -632,4 +632,7 @@ export const de = {
   stopRequiringKeyDescription: "Beim Neustart von Magnitude kann jedes Gerät, das diesen Computer erreicht, ohne Schlüssel Inferenz nutzen. Aktivieren Sie dies nur in einem vertrauenswürdigen Netzwerk. Dieser Browser benötigt zum Anmelden weiterhin den Schlüssel.",
   changeAddressDescription: "Beim Neustart akzeptiert Magnitude Verbindungen nur unter der ausgewählten Adresse. Dieser Browser kann möglicherweise keine erneute Verbindung herstellen.",
   restartDisconnectDescription: "Dieser Browser wird während des Neustarts von Magnitude getrennt und verbindet sich anschließend automatisch wieder.",
+  capabilityProfile: "Fähigkeitsprofil von {name}",
+  harnessModel: "{name}-Modell",
+  cacheNotReportedForRequests: "Für {count} Anfragen nicht gemeldet",
 } satisfies typeof en
