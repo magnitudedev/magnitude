@@ -642,4 +642,10 @@ export const id: Partial<typeof en> = {
   reloadWindowRestart: "Muat ulang jendela ini. Jika masih tidak terbuka, mulai ulang Magnitude.",
   quitAndReopen: "Keluar dari Magnitude dan buka lagi.",
   savedAppearanceReadError: "Tampilan yang disimpan tidak dapat dibaca. Menggunakan tampilan Sistem.",
+  on: "Aktif",
+  off: "Nonaktif",
+  request: "permintaan",
+  appearanceCouldNotBeSaved: "Tampilan tidak dapat disimpan di browser ini.",
+  computer: "Komputer",
+  laptopTablet: "Laptop / tablet",
 }
