@@ -584,4 +584,5 @@ export const es: { [K in keyof typeof en]: string } = {
   speculation: "Especulación",
   fit: "Ajuste",
   fidelity: "Fidelidad",
+  modelsAssessedCount: "{settled} de {total} evaluados",
 }
