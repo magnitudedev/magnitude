@@ -486,4 +486,6 @@ export const es: { [K in keyof typeof en]: string } = {
   setupPromptCopied: "Se ha copiado la instrucción de configuración de {name}",
   includes: "Incluye",
   copyHarnessCommand: "Copiar comando de {name}",
+  terminal: "tu terminal",
+  setupPromptInstruction: "Copia las instrucciones de configuración de un agente y pégalas en ese agente, o en cualquier agente de programación, en el equipo que estás usando.",
 }
