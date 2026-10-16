@@ -634,4 +634,8 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   capabilityProfile: "{name} 的能力概况",
   harnessModel: "{name} 模型",
   cacheNotReportedForRequests: "未报告 {count} 次请求的数据",
+  magnitudeCouldNotOpen: "Magnitude 无法打开",
+  reloadWindowRestart: "重新加载此窗口。如果仍无法打开，请重启 Magnitude。",
+  quitAndReopen: "退出 Magnitude，然后重新打开。",
+  savedAppearanceReadError: "无法读取已保存的外观设置。将使用系统外观。",
 }
