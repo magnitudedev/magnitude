@@ -641,6 +641,7 @@ export const bn = {
   on: "চালু",
   off: "বন্ধ",
   request: "অনুরোধ",
+  appearanceCouldNotBeSaved: "এই ব্রাউজারে চেহারার সেটিং সংরক্ষণ করা যায়নি。",
   savedAppearanceReadError: "সংরক্ষিত চেহারার সেটিং পড়া যায়নি। সিস্টেমের চেহারা ব্যবহার করা হচ্ছে।",
   chineseTraditional: "প্রথাগত চীনা",
   korean: "কোরীয়",
