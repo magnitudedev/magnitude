@@ -1,4 +1,5 @@
 import type { ReactNode } from "react"
+import { useI18n } from "../i18n"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -20,6 +21,7 @@ export function ConfirmDialog({ open, onOpenChange, title, description, confirmL
   destructive?: boolean
   onConfirm: () => void
 }) {
+  const { t } = useI18n()
   return <AlertDialog open={open} onOpenChange={onOpenChange}>
     <AlertDialogContent>
       <AlertDialogHeader>
