@@ -50,7 +50,7 @@ import {
   activeLocalModel, useAgentClient, type ApplicationPage, type HostNotice,
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
-  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, MODEL_STOPPED_FOR_MEMORY_MESSAGE, modelStoppedForMemory,
+  formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, modelStoppedForMemory,
   catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
@@ -76,6 +76,21 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
   : `mv "${from}/"* "${to}/"`
 function T({ k }: { k: MessageKey }) { const { t } = useI18n(); return t(k) }
 const tr = (key: MessageKey) => translate(readLanguage(), key)
+function localizeModelText(text: string): string {
+  const known: Record<string, MessageKey> = {
+    "Waiting for memory…": "waitingForMemory",
+    "Preparing…": "preparingEllipsis",
+    "Loading weights…": "loadingWeights",
+    "Finalizing…": "finalizing",
+    "Optimizing…": "optimizingEllipsis",
+    "Preparing to optimize…": "preparingToOptimize",
+  }
+  if (known[text]) return tr(known[text]!)
+  if (text.startsWith("Optimizing for ") && text.endsWith("…")) {
+    return tr("optimizingForDevice").replace("{device}", text.slice("Optimizing for ".length, -1))
+  }
+  return text
+}
 function localizedPageName(page: ApplicationPage, t: (key: import("./i18n").MessageKey) => string) {
   const keys = { discover: "discover", catalog: "catalog", models: "myModels", connections: "connections", usage: "usage", status: "status", settings: "settings" } as const
   return t(keys[page])
@@ -147,7 +162,7 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false, l
   let heading: string, title: ReactNode, detail: string, percent: number | null, downloadWidth: number, pulse: boolean, stat: { label: string; value: string }, remaining: string, cancelLabel: string
   if (acquisition._tag === "Optimizing") {
     const { stage, completed, total } = acquisition.progress
-    heading = describeModelOptimization(acquisition.progress, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())
+    heading = localizeModelText(describeModelOptimization(acquisition.progress, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none()))
     title = <span className="min-w-0 flex-1 truncate">{heading}</span>
     detail = tr("oneTimeSetup")
     percent = stage === "tuning" && total > 0 ? Math.min(100, completed * 100 / total) : null
@@ -298,7 +313,7 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware }: {
   const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}><T k="details" /><CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
-  const statusLabel = acquisition._tag === "Removing" ? tr("removing") : acquisition._tag === "RemoveFailed" ? tr("removalFailed") : residency?._tag === "Ready" ? tr("loaded") : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? tr("downloaded") : residency?._tag === "Failed" ? tr("notLoaded") : residency?._tag === "Requested" ? tr("preparingEllipsis") : residency?._tag === "Loading" ? describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? tr("notDownloaded") : acquisition._tag === "UpdateFailed" ? tr("updateIncomplete") : acquisition._tag === "UpdateAvailable" ? tr("updateAvailable") : acquisition._tag)
+  const statusLabel = acquisition._tag === "Removing" ? tr("removing") : acquisition._tag === "RemoveFailed" ? tr("removalFailed") : residency?._tag === "Ready" ? tr("loaded") : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? tr("downloaded") : residency?._tag === "Failed" ? tr("notLoaded") : residency?._tag === "Requested" ? tr("preparingEllipsis") : residency?._tag === "Loading" ? localizeModelText(describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? tr("notDownloaded") : acquisition._tag === "UpdateFailed" ? tr("updateIncomplete") : acquisition._tag === "UpdateAvailable" ? tr("updateAvailable") : acquisition._tag)
   const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} {tr("memory")}</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
