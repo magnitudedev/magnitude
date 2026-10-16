@@ -209,6 +209,9 @@ describe("custom models in client projections", () => {
     expect(localModelSourceTag(makeSetupModel(true))).toEqual(Option.none())
     expect(catalogVariantOfName([makeSetupModel(false)], found.presentation.variantOf)).toEqual(Option.some("Setup Model"))
     expect(catalogVariantOfName([], Option.some(CatalogFormModelIdSchema.make("other:gguf:q4")))).toEqual(Option.none())
+    const listed = makeSetupModel(false)
+    const otherVariant = CatalogFormModelIdSchema.make(`${listed.modelId.slice(0, listed.modelId.indexOf(":"))}:gguf:q2`)
+    expect(catalogVariantOfName([listed], Option.some(otherVariant))).toEqual(Option.some("Setup Model"))
     const unavailable = makeFoundModel({
       acquisitionState: {
         _tag: "Unavailable",

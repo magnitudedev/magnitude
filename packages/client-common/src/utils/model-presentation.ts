@@ -73,9 +73,12 @@ export const localModelSourceTag = (model: LocalModel): Option.Option<string> =>
 export const unsupportedLocalModelSourceTag = (model: UnsupportedLocalModel): string =>
   customModelSourceLabel(model.origin)
 
-/** The catalog model's name for "Variant of <model>", when it is listed. */
+const catalogBase = (modelId: string): string => modelId.slice(0, modelId.indexOf(":"))
+
+/** The catalog model's name for "Variant of <model>", matched by base model so any listed variant names it. */
 export const catalogVariantOfName = (
   models: readonly LocalModel[],
   variantOf: Option.Option<CatalogFormModelId>,
 ): Option.Option<string> => Option.flatMap(variantOf, (modelId) =>
-  Option.fromNullable(models.find((model) => model.modelId === modelId)?.presentation.displayName))
+  Option.fromNullable(models.find((model) =>
+    model._tag === "Catalog" && catalogBase(model.modelId) === catalogBase(modelId))?.presentation.displayName))
