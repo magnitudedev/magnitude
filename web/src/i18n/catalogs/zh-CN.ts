@@ -601,4 +601,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   allInOne: "一体机",
   server: "服务器",
   graphicsCard: "显卡",
+  piExtension: "Pi 扩展",
 }
