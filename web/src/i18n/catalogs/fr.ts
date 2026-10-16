@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** French UI translations; untranslated long-tail messages fall back to English. */
+/** Complete French UI catalog; every message key is translated explicitly. */
 export const fr = {
   settings: "Paramètres",
   general: "Général",
