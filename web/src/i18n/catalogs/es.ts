@@ -335,7 +335,6 @@ export const es: { [K in keyof typeof en]: string } = {
   cancelDownload: "Cancelar descarga",
   optimizationProgress: "Progreso de optimización",
   downloadProgress: "Progreso de descarga",
-  modelDownload: "Descarga del modelo",
   removingState: "Eliminando",
   replacementModelAvailable: "Hay un modelo de reemplazo disponible",
   requested: "Solicitado",
