@@ -484,4 +484,6 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   copyExampleRequest: "复制示例请求",
   copyPrompt: "复制显示的 {name} 提示词",
   setupPromptCopied: "已复制 {name} 的设置提示词",
+  includes: "包含",
+  copyHarnessCommand: "复制 {name} 命令",
 }
