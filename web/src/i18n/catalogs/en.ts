@@ -639,5 +639,8 @@ export const en = {
   magnitudeCouldNotOpen: "Magnitude couldn’t open",
   reloadWindowRestart: "Reload this window. If it still won’t open, restart Magnitude.",
   quitAndReopen: "Quit Magnitude and open it again.",
+  on: "On",
+  off: "Off",
+  request: "request",
   savedAppearanceReadError: "The saved appearance could not be read. Using System appearance.",
 } as const
