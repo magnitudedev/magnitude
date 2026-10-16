@@ -1523,6 +1523,7 @@ mod tests {
             Encoding::Q4K,
             Encoding::Q5K,
             Encoding::Q6K,
+            Encoding::Iq2Xxs,
             Encoding::Iq2Xs,
             Encoding::Iq3Xxs,
             Encoding::Iq3S,

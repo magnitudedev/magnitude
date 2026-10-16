@@ -1489,6 +1489,9 @@ enum Experts {
     Fp4,
     /// Vector codes: gate and down iq2xs (IQ2_XS), up iq3xxs (IQ3_XXS).
     Grid,
+    /// Nemotron 3.5 Bolt's vector codes: every expert and shared weight
+    /// iq2xxs (IQ2_XXS).
+    Iq2Xxs,
 }
 
 /// The 35B-A3B storage mix at reduced width: expert weights per `Experts`,
@@ -1544,13 +1547,18 @@ impl PackedBlock {
             Experts::Grid => {
                 packed_weight(device, ["iq2xs", "iq3xxs", "iq2xs"][which], shape, seed)
             }
+            Experts::Iq2Xxs => packed_weight(device, "iq2xxs", shape, seed),
         };
         let (expert_gate, gate) = expert_weight(0, &[e, f, h], 41);
         let (expert_up, up) = expert_weight(1, &[e, f, h], 42);
         let (expert_down, down) = expert_weight(2, &[e, h, f], 43);
-        let (shared_gate, sgate) = packed_weight(device, "q8g32s", &[s, h], 44);
-        let (shared_up, sup) = packed_weight(device, "q8g32s", &[s, h], 45);
-        let (shared_down, sdown) = packed_weight(device, "q8g32s", &[h, s], 46);
+        let shared = match experts {
+            Experts::Iq2Xxs => "iq2xxs",
+            _ => "q8g32s",
+        };
+        let (shared_gate, sgate) = packed_weight(device, shared, &[s, h], 44);
+        let (shared_up, sup) = packed_weight(device, shared, &[s, h], 45);
+        let (shared_down, sdown) = packed_weight(device, shared, &[h, s], 46);
         Self {
             routed: Routed {
                 hidden: Self::HIDDEN,
@@ -1805,6 +1813,20 @@ fn native_decode_expand_and_output_match_reference_with_bf16_experts() {
         native_decode_expand_and_output_match_reference_rows(
             &device,
             Experts::Bf16,
+            false,
+            &[1, 3, 8],
+            decode_mappings(&device),
+        );
+    }
+}
+
+/// Routed and shared experts all IQ2_XXS (Nemotron 3.5 Bolt).
+#[test]
+fn native_decode_expand_and_output_match_reference_with_iq2_xxs_experts() {
+    for device in devices() {
+        native_decode_expand_and_output_match_reference_rows(
+            &device,
+            Experts::Iq2Xxs,
             false,
             &[1, 3, 8],
             decode_mappings(&device),

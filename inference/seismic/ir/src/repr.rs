@@ -378,6 +378,11 @@ representation!(IQ2XSRows32, "iq2xs", Rows32, F32, 3);
 representation!(IQ3XXSRows32, "iq3xxs", Rows32, F32, 3);
 representation!(IQ2XSMma16, "iq2xs", Mma16, F32, 3);
 representation!(IQ3XXSMma16, "iq3xxs", Mma16, F32, 3);
+representation!(IQ2XXS, "iq2xxs", F32, 3);
+representation!(IQ2XXSRows16, "iq2xxs", Rows16, F32, 3);
+representation!(IQ2XXSRows8, "iq2xxs", Rows8, F32, 3);
+representation!(IQ2XXSRows32, "iq2xxs", Rows32, F32, 3);
+representation!(IQ2XXSMma16, "iq2xxs", Mma16, F32, 3);
 
 /// Dispatches a runtime representation id into the typed world.
 pub trait RepresentationVisitor {
@@ -446,6 +451,10 @@ pub fn with_representation<V: RepresentationVisitor>(
         ("iq3xxs", registry::Layout::Rows32) => return visitor.visit::<IQ3XXSRows32>(),
         ("iq2xs", registry::Layout::Mma16) => return visitor.visit::<IQ2XSMma16>(),
         ("iq3xxs", registry::Layout::Mma16) => return visitor.visit::<IQ3XXSMma16>(),
+        ("iq2xxs", registry::Layout::Rows16) => return visitor.visit::<IQ2XXSRows16>(),
+        ("iq2xxs", registry::Layout::Rows8) => return visitor.visit::<IQ2XXSRows8>(),
+        ("iq2xxs", registry::Layout::Rows32) => return visitor.visit::<IQ2XXSRows32>(),
+        ("iq2xxs", registry::Layout::Mma16) => return visitor.visit::<IQ2XXSMma16>(),
         (_, registry::Layout::Packet) => {}
         (other, layout) => panic!(
             "registry storage `{other}` in layout `{}` has no type-level marker",
@@ -476,6 +485,7 @@ pub fn with_representation<V: RepresentationVisitor>(
         "nvfp4g16" => visitor.visit::<NVFP4G16>(),
         "iq2xs" => visitor.visit::<IQ2XS>(),
         "iq3xxs" => visitor.visit::<IQ3XXS>(),
+        "iq2xxs" => visitor.visit::<IQ2XXS>(),
         other => panic!("registry representation `{other}` has no type-level marker"),
     }
 }

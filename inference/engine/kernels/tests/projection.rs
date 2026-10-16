@@ -140,16 +140,18 @@ enum Repr {
     // Built from GGUF blocks through the registry's conversion
     // (`gguf_weight`).
     Q4g32s,
+    Iq4g32s,
     Q5g32s,
     Q5g32,
     Mxfp4,
     Nvfp4,
     Iq2xs,
     Iq3xxs,
+    Iq2xxs,
 }
 
 /// The vector-coded formats (256-value GGUF blocks).
-const GRID_REPRS: [Repr; 2] = [Repr::Iq2xs, Repr::Iq3xxs];
+const GRID_REPRS: [Repr; 3] = [Repr::Iq2xs, Repr::Iq3xxs, Repr::Iq2xxs];
 
 /// The formats with a representation of their own, imported from GGUF.
 const GGUF_REPRS: [Repr; 5] = [
@@ -175,12 +177,14 @@ impl Repr {
             Repr::Iq4 => "iq4g32",
             Repr::Bf16 => "bf16",
             Repr::Q4g32s => "q4g32s",
+            Repr::Iq4g32s => "iq4g32s",
             Repr::Q5g32s => "q5g32s",
             Repr::Q5g32 => "q5g32",
             Repr::Mxfp4 => "mxfp4g32",
             Repr::Nvfp4 => "nvfp4g16",
             Repr::Iq2xs => "iq2xs",
             Repr::Iq3xxs => "iq3xxs",
+            Repr::Iq2xxs => "iq2xxs",
         }
     }
     /// The GGUF source of a representation built from GGUF blocks, with its
@@ -188,12 +192,14 @@ impl Repr {
     fn gguf_source(self) -> Option<(&'static str, usize, usize)> {
         match self {
             Repr::Q4g32s => Some(("gguf_q4_0", 18, 32)),
+            Repr::Iq4g32s => Some(("gguf_iq4_nl_block", 18, 32)),
             Repr::Q5g32s => Some(("gguf_q5_0", 22, 32)),
             Repr::Q5g32 => Some(("gguf_q5_1", 24, 32)),
             Repr::Mxfp4 => Some(("gguf_mxfp4", 17, 32)),
             Repr::Nvfp4 => Some(("gguf_nvfp4", 36, 64)),
             Repr::Iq2xs => Some(("gguf_iq2_xs", 74, 256)),
             Repr::Iq3xxs => Some(("gguf_iq3_xxs", 98, 256)),
+            Repr::Iq2xxs => Some(("gguf_iq2_xxs", 66, 256)),
             _ => None,
         }
     }
@@ -282,12 +288,14 @@ fn planes(repr: Repr, k: usize) -> Planes {
         }
         Repr::Bf16 => at = 2 * k,
         Repr::Q4g32s
+        | Repr::Iq4g32s
         | Repr::Q5g32s
         | Repr::Q5g32
         | Repr::Mxfp4
         | Repr::Nvfp4
         | Repr::Iq2xs
-        | Repr::Iq3xxs => {
+        | Repr::Iq3xxs
+        | Repr::Iq2xxs => {
             unreachable!("{repr:?} takes the registry's geometry (`gguf_weight`)")
         }
     }
@@ -495,12 +503,14 @@ fn weight(repr: Repr, rows: usize, k: usize, seed: u64, scale: f32) -> Weight {
                 }
             }
             Repr::Q4g32s
+            | Repr::Iq4g32s
             | Repr::Q5g32s
             | Repr::Q5g32
             | Repr::Mxfp4
             | Repr::Nvfp4
             | Repr::Iq2xs
-            | Repr::Iq3xxs => {
+            | Repr::Iq3xxs
+            | Repr::Iq2xxs => {
                 unreachable!("built by `gguf_weight`")
             }
         }
@@ -529,6 +539,8 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
         let factor = scale * (0.5 + rng.uniform());
         match repr {
             Repr::Q4g32s => block[..2].copy_from_slice(&f16_bits(factor / 8.0).to_le_bytes()),
+            // d: the table's values reach 127 d.
+            Repr::Iq4g32s => block[..2].copy_from_slice(&f16_bits(factor / 128.0).to_le_bytes()),
             Repr::Q5g32s => block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes()),
             Repr::Q5g32 => {
                 block[..2].copy_from_slice(&f16_bits(factor / 16.0).to_le_bytes());
@@ -544,7 +556,9 @@ fn gguf_weight(repr: Repr, rows: usize, k: usize, rng: &mut Rng, scale: f32) -> 
                 }
             }
             // d: values reach d (2 s + 1) 43 / 8 and d (2 s + 1) 62 / 4.
-            Repr::Iq2xs => block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes()),
+            Repr::Iq2xs | Repr::Iq2xxs => {
+                block[..2].copy_from_slice(&f16_bits(factor / 40.0).to_le_bytes())
+            }
             Repr::Iq3xxs => block[..2].copy_from_slice(&f16_bits(factor / 120.0).to_le_bytes()),
             _ => unreachable!("{repr:?} is not imported from GGUF"),
         }
@@ -2537,6 +2551,7 @@ fn metal_tall_and_packed_project_rows_agree_with_the_staged_form() {
         Repr::Q4g32s,
         Repr::Q8,
         Repr::Iq4,
+        Repr::Iq4g32s,
     ] {
         let (outputs, k) = (192, 1024);
         let weight = weight(repr, outputs, k, 97, 1.0);
@@ -2651,6 +2666,7 @@ fn metal_packed_dense_output_agrees_with_the_staged_form() {
         Repr::Q4g32s,
         Repr::Q8,
         Repr::Iq4,
+        Repr::Iq4g32s,
     ] {
         let (outputs, k) = (192, 1024);
         let down = weight(repr, outputs, k, 91, 1.0);
@@ -2746,6 +2762,7 @@ fn metal_packed_dense_expand_agrees_with_the_staged_form() {
         (Repr::Q8, Repr::Q8, true),
         (Repr::Iq4, Repr::Iq4, true),
         (Repr::Iq4, Repr::Q8, true),
+        (Repr::Iq4g32s, Repr::Iq4g32s, true),
         (Repr::Q4k, Repr::Q6k, false),
         (Repr::Q8, Repr::Q4k, false),
     ] {
@@ -3690,6 +3707,7 @@ fn packing_bound_matches_its_portable_body() {
             Repr::Q8,
             Repr::Iq4,
             Repr::Q4g32s,
+            Repr::Iq4g32s,
             Repr::Q5g32s,
             Repr::Q5g32,
         ] {
@@ -3756,7 +3774,7 @@ fn dense_output_gguf_formats_match_their_portable_body_and_the_host_reference() 
     }
 }
 
-/// IQ2_XS and IQ3_XXS weights, imported into their vector-coded
+/// IQ2_XS, IQ3_XXS and IQ2_XXS weights, imported into their vector-coded
 /// representations.
 #[test]
 fn dense_output_grid_formats_match_their_portable_body_and_the_host_reference() {
@@ -3768,7 +3786,10 @@ fn dense_output_grid_formats_match_their_portable_body_and_the_host_reference() 
 #[test]
 fn dense_expand_grid_formats_match_their_portable_body() {
     for device in devices() {
-        dense_expand_matches_its_portable_body_on(&device, &[(Repr::Iq2xs, Repr::Iq3xxs)]);
+        dense_expand_matches_its_portable_body_on(
+            &device,
+            &[(Repr::Iq2xs, Repr::Iq3xxs), (Repr::Iq2xxs, Repr::Iq2xxs)],
+        );
     }
 }
 

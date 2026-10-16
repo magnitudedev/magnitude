@@ -8,7 +8,7 @@
 // high-bit plane (q5k: one u32, q6k: one u2), its local coefficients and its
 // super factors; an iq4g32 packet is the same low-nibble load plus its f32
 // scale, its codes decoded through the IQ4 table; a q8 packet is two 16-byte
-// loads of int8 codes; a vector-coded (iq2xs, iq3xxs) packet is its four
+// loads of int8 codes; a vector-coded (iq2xs, iq3xxs, iq2xxs) packet is its four
 // grid entries, one a sub-step, decoded through the grid. A packet is
 // consumed in four 8-element sub-steps. Each sub-step decodes its codes as
 // exact small integers in two float4s, `even` (elements 0,2,4,6) and `odd`
@@ -467,13 +467,13 @@ struct Q5G32 {
 };
 
 // ---------------------------------------------------------------------------
-// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs). An entry
-// of the grids plane codes eight values: grid indices name their magnitudes
-// (<seismic/grids.h>), and seven sign bits, completed by an eighth of even
-// parity, their signs. A packet is four entries, one a sub-step. Every 16
-// (iq2xs) or 32 (iq3xxs) values have an odd scale code 2s + 1 (a nibble of
-// the scales plane) and every 256 one f32 factor: value = factor * (2s + 1)
-// * code, every product exact.
+// Vector-coded weights (the registry's grid codes: iq2xs, iq3xxs, iq2xxs). An
+// entry of the grids plane codes eight values: grid indices name their
+// magnitudes (<seismic/grids.h>), and seven sign bits, completed by an eighth
+// of even parity, their signs. A packet is four entries, one a sub-step.
+// Every 16 (iq2xs) or 32 (iq3xxs, iq2xxs) values have an odd scale code
+// 2s + 1 (a nibble of the scales plane) and every 256 one f32 factor: value =
+// factor * (2s + 1) * code, every product exact.
 
 // The eight lane sign bits of an entry's seven: the eighth makes the count of
 // set bits even.
@@ -530,6 +530,20 @@ struct Iq3XxsGrid {
     static uint signs(uint entry) { return (entry >> 16) & 127u; }
 };
 
+// iq2xxs: sixteen-bit entries (an 8-bit index into the 256-point grid, then
+// the signs); a scale per 32 values, a nibble a packet.
+struct Iq2XxsGrid {
+    static constant constexpr uint groups = 1;
+    static constant constexpr ulong unit = 8;
+    static constant constexpr ulong scale_bytes = 4;
+    static constant constexpr uint field_bits = 4;
+    typedef uint2 entries;
+    static entries load(device const uchar *at) { return *reinterpret_cast<device const uint2 *>(at); }
+    static uint entry(entries e, uint step) { return (e[step >> 1] >> (16u * (step & 1u))) & 0xffffu; }
+    static uint2 point(uint entry) { return grids::iq2xxs[entry & 255u]; }
+    static uint signs(uint entry) { return (entry >> 8) & 127u; }
+};
+
 template <typename G>
 struct Grid {
     static constant constexpr uint groups = G::groups;
@@ -565,6 +579,7 @@ struct Grid {
 
 typedef Grid<Iq2XsGrid> IQ2XS;
 typedef Grid<Iq3XxsGrid> IQ3XXS;
+typedef Grid<Iq2XxsGrid> IQ2XXS;
 
 // Dense weights of element type E (element::Bf16, F16 or F32). The row's
 // final packet may be partial when K is not a multiple of 32; its missing
@@ -868,6 +883,9 @@ PACKETS_BIND(W0, packets::IQ2XS)
 #elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ3XXS)
 PACKETS_BIND(W0, packets::IQ3XXS)
 #define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W0)
+#elif ELEMENT_HAS(KERNEL_W0, _REPRESENTATION_IQ2XXS)
+PACKETS_BIND(W0, packets::IQ2XXS)
+#define KERNEL_W0_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W0)
 #else
 #error "KERNEL_W0: unsupported weight representation"
 #endif
@@ -923,6 +941,9 @@ PACKETS_BIND(W1, packets::IQ2XS)
 #define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W1)
 #elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ3XXS)
 PACKETS_BIND(W1, packets::IQ3XXS)
+#define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W1)
+#elif ELEMENT_HAS(KERNEL_W1, _REPRESENTATION_IQ2XXS)
+PACKETS_BIND(W1, packets::IQ2XXS)
 #define KERNEL_W1_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W1)
 #else
 #error "KERNEL_W1: unsupported weight representation"
@@ -980,6 +1001,9 @@ PACKETS_BIND(W2, packets::IQ2XS)
 #elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ3XXS)
 PACKETS_BIND(W2, packets::IQ3XXS)
 #define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W2)
+#elif ELEMENT_HAS(KERNEL_W2, _REPRESENTATION_IQ2XXS)
+PACKETS_BIND(W2, packets::IQ2XXS)
+#define KERNEL_W2_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W2)
 #else
 #error "KERNEL_W2: unsupported weight representation"
 #endif
@@ -1035,6 +1059,9 @@ PACKETS_BIND(W3, packets::IQ2XS)
 #define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W3)
 #elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ3XXS)
 PACKETS_BIND(W3, packets::IQ3XXS)
+#define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W3)
+#elif ELEMENT_HAS(KERNEL_W3, _REPRESENTATION_IQ2XXS)
+PACKETS_BIND(W3, packets::IQ2XXS)
 #define KERNEL_W3_LAYOUT(k) PACKETS_ROWS16_GRID(KERNEL_W3)
 #else
 #error "KERNEL_W3: unsupported weight representation"

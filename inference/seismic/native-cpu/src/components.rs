@@ -10,12 +10,12 @@
 use crate::isa::Tier;
 use crate::quant::Q8Block;
 use crate::weights::{
-    self, DenseRows, Format, Iq2Xs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32M, Q5G32S,
-    Q5K, Q6K, Q8, RowGeometry, Rows8,
+    self, DenseRows, Format, Iq2Xs, Iq2Xxs, Iq3Xxs, Iq4, Iq4S, Mxfp4, Nvfp4, Q4G32, Q4K, Q5G32M,
+    Q5G32S, Q5K, Q6K, Q8, RowGeometry, Rows8,
 };
 
 /// Weight representations with components.
-const REPRESENTATIONS: usize = 29;
+const REPRESENTATIONS: usize = 31;
 
 /// Row blocks of the dot component, in the order of [`WeightKernels::dot`].
 pub const ROW_BLOCKS: [usize; 4] = [1, 2, 4, 8];
@@ -277,6 +277,7 @@ macro_rules! tier_components {
                 kernels::<Nvfp4>(),
                 kernels::<Iq2Xs>(),
                 kernels::<Iq3Xxs>(),
+                kernels::<Iq2Xxs>(),
                 kernels::<Rows8<Q4K>>(),
                 kernels::<Rows8<Q5K>>(),
                 kernels::<Rows8<Q6K>>(),
@@ -290,6 +291,7 @@ macro_rules! tier_components {
                 kernels::<Rows8<Nvfp4>>(),
                 kernels::<Rows8<Iq2Xs>>(),
                 kernels::<Rows8<Iq3Xxs>>(),
+                kernels::<Rows8<Iq2Xxs>>(),
             ];
         }
     };
@@ -520,7 +522,7 @@ mod tests {
                     }
                 }
                 // Random entries and scale codes; a small f32 factor per block.
-                "iq2xs@rows16" | "iq3xxs@rows16" => {
+                "iq2xs@rows16" | "iq3xxs@rows16" | "iq2xxs@rows16" => {
                     for block in 0..k.div_ceil(256) {
                         let at = base + geometry.supers + 4 * block;
                         data[at..at + 4]
@@ -861,6 +863,8 @@ mod tests {
                     "iq3xxs@rows16" => by_block!(Iq3Xxs),
                     "iq2xs@rows8" => by_block!(Rows8<Iq2Xs>),
                     "iq3xxs@rows8" => by_block!(Rows8<Iq3Xxs>),
+                    "iq2xxs@rows16" => by_block!(Iq2Xxs),
+                    "iq2xxs@rows8" => by_block!(Rows8<Iq2Xxs>),
                     other => panic!("no format for {other}"),
                 }
             }};

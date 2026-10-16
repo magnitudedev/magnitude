@@ -408,12 +408,21 @@ impl Element {
     }
     /// The integer codes of packed storage, as the registry decodes them:
     /// the values a code takes and the columns that share one scale. `None`
-    /// for dense storage and for floating codes.
+    /// for dense storage, for floating codes and for grid codes (vector
+    /// entries indexing a value grid, whose indices are not magnitudes).
     pub fn integer_codes(&self) -> Option<IntegerCodes> {
         use seismic_lang::reference_math::ReferenceScalar;
-        use seismic_lang::registry::{DecodeComponent, QuantizedComponent};
+        use seismic_lang::registry::{DecodeComponent, DecodeStep, QuantizedComponent};
         let recipe = seismic_lang::registry::decode_recipe(self.0, DType::F32)?;
-        recipe.component(QuantizedComponent::Code)?;
+        let DecodeComponent::Temporary(code) = recipe.component(QuantizedComponent::Code)? else {
+            return None;
+        };
+        let grid = recipe.steps().iter().any(
+            |step| matches!(step, DecodeStep::InterpretGridCode { into, .. } if *into == code),
+        );
+        if grid {
+            return None;
+        }
         let constant = |role| match recipe.component(role) {
             Some(DecodeComponent::Constant(ReferenceScalar::I32(value))) => Some(value),
             _ => None,
