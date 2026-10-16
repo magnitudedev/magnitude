@@ -577,4 +577,11 @@ export const es: { [K in keyof typeof en]: string } = {
   optimizingEllipsis: "Optimizando…",
   preparingToOptimize: "Preparando la optimización…",
   optimizingForDevice: "Optimizando para {device}…",
+  speedEstimateNote: "Estimación aproximada. No tiene en cuenta la decodificación especulativa.",
+  speedEstimateTooltip: "Estimación basada en el ancho de banda de memoria de tu equipo. El rendimiento real puede variar. No incluye la decodificación especulativa.",
+  notAssessed: "Sin evaluar",
+  intelligence: "Inteligencia",
+  speculation: "Especulación",
+  fit: "Ajuste",
+  fidelity: "Fidelidad",
 }
