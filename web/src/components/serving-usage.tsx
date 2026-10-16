@@ -55,7 +55,7 @@ export function UsageFigures({ usage }: { usage: Extract<ServingUsageSnapshot, {
   const cachePercentage = !usage || usage.inputTokens === 0 ? tr("noInputTokens") : usage.cachedInputRequests === 0 ? tr("cacheNotReported") : tr("cachePercentage").replace("{percent}", decimal(usage.cachedInputTokens / usage.inputTokens * 100)) + (missingCache > 0 ? ` ${tr("cacheNotReportedRequests").replace("{count}", number(missingCache))}` : "")
   const metrics = [
     { id: "Input tokens", label: tr("inputTokens"), value: usage ? number(usage.inputTokens) : null, icon: ArrowDownIcon, note: null },
-    { id: "Cached input", label: tr("cachedInput"), value: !usage ? null : usage.cachedInputRequests === 0 && usage.requests > 0 ? "—" : number(usage.cachedInputTokens), icon: StackIcon, note: missingCache > 0 ? `Not reported for ${number(missingCache)} requests` : null },
+    { id: "Cached input", label: tr("cachedInput"), value: !usage ? null : usage.cachedInputRequests === 0 && usage.requests > 0 ? "—" : number(usage.cachedInputTokens), icon: StackIcon, note: missingCache > 0 ? tr("cacheNotReportedForRequests").replace("{count}", number(missingCache)) : null },
     { id: "Output tokens", label: tr("outputTokens"), value: usage ? number(usage.outputTokens) : null, icon: ArrowUpIcon, note: null },
   ]
   return <>
