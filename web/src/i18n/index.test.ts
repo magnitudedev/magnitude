@@ -120,4 +120,26 @@ describe("i18n catalogs", () => {
       expect(bn[key], `Bengali translation: ${key}`).not.toBe(en[key])
     }
   })
+
+  test("localizes runtime errors, usage, and network-security warnings in every non-English locale", () => {
+    const catalogs = [
+      ["es", es], ["zh-CN", zhCN], ["hi", hi], ["ur", ur], ["bn", bn],
+      ["fr", fr], ["de", de], ["ja", ja], ["pt", pt], ["it", it], ["uk", uk],
+    ] as const
+    const keys = [
+      "allInterfacesLabel", "lessThanMinute", "aboutMinutes", "copyPrompt", "setupPromptCopied",
+      "setupPromptInstruction", "currentStreak", "dailyTokenActivity", "updateVerifyFailure",
+      "versionReadyRestart", "pageCantConnectService", "thisBrowserControlsAt",
+      "blockedMemoryDescription", "memoryPressureDescription", "modelsAssessedCount",
+      "existingDownloadsPreviousFolder", "turnOffNetworkDescription", "regenerateKeyDescription",
+      "stopRequiringKeyDescription", "changeAddressDescription", "restartDisconnectDescription",
+      "cpuCoreOptionsSpec", "neuralEngineCoresSpec", "gpuArchitectureSpec",
+    ] as const
+    for (const [locale, catalog] of catalogs) {
+      for (const key of keys) {
+        expect(catalog[key], `${locale} translation: ${key}`).not.toBe(en[key])
+      }
+    }
+  })
+
 })
