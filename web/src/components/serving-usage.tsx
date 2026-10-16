@@ -11,12 +11,12 @@ import { GaugeIcon, TimerIcon, ArrowDownIcon, ArrowUpIcon, StackIcon, InfoIcon, 
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select"
 
 import { ActionTooltip } from "./ui/tooltip"
-
-const number = (value: number) => value.toLocaleString()
-const decimal = (value: number) => value.toLocaleString(undefined, { maximumFractionDigits: 1 })
 import { readLanguage, translate } from "../i18n"
 
 const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
+const number = (value: number) => value.toLocaleString()
+const decimal = (value: number) => value.toLocaleString(undefined, { maximumFractionDigits: 1 })
 export function ServingUsage() {
   const [period, setPeriod] = useState<"Today" | "AllTime">("Today")
   const [model, setModel] = useState("")
