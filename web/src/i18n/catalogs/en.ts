@@ -561,4 +561,9 @@ export const en = {
   loadConfirmationTitle: "Load {name}?",
   loadConfirmationDescription: "Loading {name} will stop {replacing}.",
   downloadWithSize: "Download ({size})",
+  notEnoughMemoryRightNow: "Not enough memory right now",
+  memoryPressureTitle: "Your computer is under heavy memory pressure",
+  blockedMemoryDescription: "This model needs {required} and {available} is available. Quit apps you aren’t using, or choose a smaller model.",
+  memoryPressureDescription: "Loading stopped to keep other apps responsive. Quit apps you aren’t using, or try again in a moment.",
+  modelStoppedForMemory: "Stopped because your computer ran low on memory",
 } as const
