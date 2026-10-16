@@ -1,8 +1,5 @@
-import { en } from "./en"
-
 /** Hindi (हिन्दी) translations for the complete Magnitude message catalog. */
 export const hi = {
-  ...en,
   settings: "सेटिंग्स", general: "सामान्य", about: "परिचय", thisBrowser: "यह ब्राउज़र",
   language: "भाषा", languageHint: "इस ब्राउज़र या डेस्कटॉप ऐप में Magnitude की भाषा चुनें।",
   english: "अंग्रेज़ी", spanish: "स्पैनिश", chineseSimplified: "सरलीकृत चीनी",
@@ -633,4 +630,4 @@ export const hi = {
   snug: "सघन",
   tight: "बहुत सघन",
   none: "कोई नहीं",
-} satisfies Partial<typeof en>
+} satisfies typeof en
