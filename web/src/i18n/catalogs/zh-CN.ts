@@ -585,4 +585,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   fit: "适配度",
   fidelity: "保真度",
   modelsAssessedCount: "已评估 {settled} / {total}",
+  memoryUsage: "内存用量",
 }
