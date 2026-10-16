@@ -53,7 +53,7 @@ export function UsageActivity({ days }: { days: Activity | null }) {
     <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
       <h2 className="text-sm font-medium">{tr("tokenActivity")}</h2>
       <div className="flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
-        {summary ? <span aria-label={tr("currentStreak").replace("{count}", String(summary.currentStreak)).replace("{days}", summary.currentStreak === 1 ? tr("day") : tr("days"))} className="flex items-center gap-1.5 text-slate-500"><FireIcon aria-hidden="true" weight="fill" className="size-4 text-orange-500" /><span className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.currentStreak}</span> {tr("currentStreak").replace("Current streak: ", "").replace("{count}", "").replace("{days}", summary.currentStreak === 1 ? tr("day") : tr("days")).trim()}</span> : <Skeleton className="h-5 w-28" />}
+        {summary ? <span aria-label={tr("currentStreak").replace("{count}", String(summary.currentStreak)).replace("{days}", summary.currentStreak === 1 ? tr("day") : tr("days"))} className="flex items-center gap-1.5 text-slate-500"><FireIcon aria-hidden="true" weight="fill" className="size-4 text-orange-500" /><span className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.currentStreak}</span> {tr("streakLabel").replace("{count}", String(summary.currentStreak)).replace("{days}", summary.currentStreak === 1 ? tr("day") : tr("days"))}</span> : <Skeleton className="h-5 w-28" />}
         {summary ? <p className="text-slate-500"><strong className="font-medium tabular-nums text-slate-900 dark:text-slate-100">{summary.totalTokens.toLocaleString()}</strong> {tr("tokensPastYear")}</p> : <Skeleton className="h-5 w-40" />}
       </div>
     </div>
@@ -62,7 +62,7 @@ export function UsageActivity({ days }: { days: Activity | null }) {
         <table ref={table} aria-label={tr("dailyTokenActivity")} className="w-full min-w-[640px] table-fixed border-separate border-spacing-[3px] [direction:ltr]">
           <thead><tr><td className="w-8" />{weeks.map((week, column) => {
             const month = week.find(day => day.date.endsWith("-01"))
-            return <th key={column} scope="col" className="h-6 overflow-visible whitespace-nowrap text-left text-xs font-normal text-slate-500">{month && new Date(`${month.date}T12:00:00Z`).toLocaleDateString(undefined, { timeZone: "UTC", month: "short" })}</th>
+            return <th key={column} scope="col" className="h-6 overflow-visible whitespace-nowrap text-left text-xs font-normal text-slate-500">{month && new Date(`${month.date}T12:00:00Z`).toLocaleDateString(locale(), { timeZone: "UTC", month: "short" })}</th>
           })}</tr></thead>
           <tbody>{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((weekday, row) => <tr key={weekday}>
             <th scope="row" className="text-left text-[10px] font-normal text-slate-500"><span className={row % 2 === 0 ? "sr-only" : ""}>{weekday}</span></th>
