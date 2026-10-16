@@ -890,7 +890,15 @@ async fn inspection_groups_versions_and_reports_each_engine_verdict() {
         .unwrap(),
     );
     let q8_size = llama(7, Encoding::Q8_0).bytes().1;
-    let fixture = fixture(vec![custom_model(on_disk.clone(), q8_size)]).await;
+    // Found with a projector beside it, as an Ollama `hf.co/…` pull is: the version is still the
+    // same bytes, so it is already on this computer.
+    let mut found = custom_model(on_disk.clone(), q8_size + 1_000);
+    found.files[0].size_bytes = q8_size;
+    found.projector = Some(magnitude_service_contracts::models::CustomModelFile {
+        path: PathBuf::from("/found/mmproj.gguf"),
+        size_bytes: 1_000,
+    });
+    let fixture = fixture(vec![found]).await;
     let inspection = fixture
         .candidates
         .inspect(CandidateInspectionRequest::HuggingFace {
@@ -1050,11 +1058,15 @@ fn custom_model(model_id: ModelId, size_bytes: u64) -> CustomModel {
         display_name: "Found".to_owned(),
         variant_label: None,
         variant_of: None,
-        files: Vec::new(),
+        files: vec![magnitude_service_contracts::models::CustomModelFile {
+            path: PathBuf::from("/found/model.gguf"),
+            size_bytes,
+        }],
         size_bytes,
         projector: None,
         drafter: None,
         recommended_drafter: None,
+        license: None,
         profile: ServingProfile {
             context_length: 8192,
         },
@@ -1528,6 +1540,7 @@ fn enrichment_answers_only_for_the_exact_target_it_was_computed_for() {
     let result = CustomModelEnrichmentResult {
         variant_of: Some("llama-test:gguf:q8".parse().unwrap()),
         recommended_drafter: None,
+        license: Some("apache-2.0".to_owned()),
     };
     assert!(enrichment.record((model_id.clone(), "package_a".to_owned()), result.clone()));
     assert!(!enrichment.record((model_id.clone(), "package_a".to_owned()), result.clone()));

@@ -116,19 +116,27 @@ Custom models follow [the local-model product projection](../model-management/lo
   drafter…"; and "Pinned to the current version of this repository" with Download and its total size
   (target, drafter, projector). A version already on this computer is marked so and Download becomes
   Add, fetching only the drafter. A repository the engine can't run shows a plain explanation before
-  anything downloads. Download closes the dialog and lands on My Models, whose new card shows
+  anything downloads. When every version is too large or unsupported, the footer says "No version of
+  this model runs on this computer" with why, derived from the verdicts (too large for this machine,
+  and the unsupported reasons said once). A repository that needs accepted terms and an access token
+  says so and names `HF_TOKEN`; a file Magnitude can't read says that, never that Hugging Face
+  couldn't be reached. Download closes the dialog and lands on My Models, whose new card shows
   download and optimization progress.
 - **Catalog card Details** has "Find other versions on Hugging Face" under Sources, which opens the
   same dialog with Search prefilled with the model's name. It is never a button on the card.
 - **My Models** gives every model the same card, with a tag for where its files came from (none for
   the catalog, "Hugging Face", "Ollama", "LM Studio", "Hugging Face cache", or the folder name), and
   actions that follow who owns the files: Remove deletes catalog and added files, forgets an
-  imported file, and is "Hide from Magnitude" for found models. Details show Source (an added
+  imported file, and is "Hide from Magnitude" for found models; added and imported models are never
+  offered Hide, and ACN refuses to hide them. Details show Source (an added
   model's repository pinned to its commit), Variant of, and the drafter's name with Change and Turn
   off for every custom model. A custom model with no drafter,
   when one is recommended, shows "Faster with a drafter · Add (size)" on its card and in Details;
   one click downloads only the drafter. Catalog models never offer a drafter change. Add GGUF file… adds one file in place
-  through the same repository step, with a file picker in place of the version list.
+  through the same repository step, with a file picker in place of the version list; it imports the
+  chosen file by its own path, and ACN refuses a folder.
+- **Repeated reasons** are said once: many unrecognized tensors read "Has parts Magnitude doesn't
+  recognize (60 tensors)", in My Models, the repository step and the CLI alike.
 - **Models that can't run** never get disabled cards. One collapsed line at the bottom of My Models
   ("N other models on this computer can't run in Magnitude") expands to dimmed rows with name,
   source tag and a plain reason per structured reason; there are no actions. An unknown reason

@@ -20,6 +20,7 @@ import {
   drafterCandidateWarning,
 } from "./drafter-presentation"
 import { unsupportedReasonMessage, unsupportedReasonMessages } from "./failure-messages"
+import { noRunnableVersionReason } from "./candidate-versions"
 import {
   installedLocalModels,
   localModelIsInstalled,
@@ -76,6 +77,22 @@ describe("unsupported reasons in the UI", () => {
       reason({ _tag: "KernelDomain", backend: "metal", entry: "a", statics: [] }),
       reason({ _tag: "Backend", backend: "metal" }),
     ])).toEqual(["Its layer sizes aren't supported on this GPU"])
+  })
+
+  it("says many unrecognized parts once, with how many there are", () => {
+    const tensors = Array.from({ length: 60 }, (_, index) => reason({ _tag: "UnrecognizedTensor", name: `blk.${15 + Math.floor(index / 3)}.attn_k` }))
+    expect(unsupportedReasonMessages([
+      ...tensors,
+      reason({ _tag: "UnrecognizedMetadata", key: "gemma4.a" }),
+      reason({ _tag: "UnrecognizedMetadata", key: "gemma4.b" }),
+      reason({ _tag: "Architecture", architecture: "deepseek4" }),
+    ])).toEqual([
+      "Has parts Magnitude doesn't recognize (60 tensors)",
+      "Has parts Magnitude doesn't recognize (2 metadata keys)",
+      "No kernels for the deepseek4 architecture",
+    ])
+    expect(unsupportedReasonMessages([reason({ _tag: "UnrecognizedTensor", name: "blk.15.attn_k" })]))
+      .toEqual(["Has parts Magnitude doesn't recognize (blk.15.attn_k)"])
   })
 })
 
@@ -245,5 +262,32 @@ describe("custom models in client projections", () => {
       failure: Option.some({ operation: "load" as const, rejection: Option.none() }),
     }
     expect(localModelCommandStatus(customModelId, [[failedLoad]], Option.some(loading)).failures).toEqual([])
+  })
+})
+
+describe("repositories where nothing runs", () => {
+  const assessment = (value: Record<string, unknown>) => Option.some(value as never)
+  const version = (label: string, verdict: Option.Option<never>) => ({
+    label, modelId: `hf:o/r/${label}.gguf`, files: [`${label}.gguf`], sizeBytes: 1, downloadBytes: 1,
+    assessment: verdict, recommended: false, onThisComputer: Option.none(),
+  }) as never
+  const tooLarge = assessment({ _tag: "DoesNotFit" })
+  const unsupportedTensors = (count: number) => assessment({
+    _tag: "Unsupported",
+    reasons: Array.from({ length: count }, (_, index) => reason({ _tag: "UnrecognizedTensor", name: `blk.${index}.attn_k` })),
+  })
+
+  it("says why no version runs from the engine's verdicts", () => {
+    expect(noRunnableVersionReason([version("Q8_0", tooLarge)])).toEqual(Option.some("Every version is too large for this machine."))
+    expect(noRunnableVersionReason([version("Q4_K_M", unsupportedTensors(60)), version("Q8_0", unsupportedTensors(60))]))
+      .toEqual(Option.some("Magnitude can't run any version: Has parts Magnitude doesn't recognize (120 tensors)."))
+    expect(noRunnableVersionReason([version("Q8_0", tooLarge), version("Q4_K_M", unsupportedTensors(1))]))
+      .toEqual(Option.some("Some versions are too large for this machine, and Magnitude can't run the others: Has parts Magnitude doesn't recognize (blk.0.attn_k)."))
+  })
+
+  it("says nothing when some version fits or hasn't been checked", () => {
+    expect(noRunnableVersionReason([version("Q8_0", tooLarge), version("Q4_K_M", assessment({ _tag: "Fits" }))])).toEqual(Option.none())
+    expect(noRunnableVersionReason([version("Q8_0", tooLarge), version("Q4_K_M", Option.none() as never)])).toEqual(Option.none())
+    expect(noRunnableVersionReason([])).toEqual(Option.none())
   })
 })

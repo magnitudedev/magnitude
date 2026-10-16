@@ -4,6 +4,7 @@ import {
   LOCAL_TOKEN,
   OPENAI_BASE_URL,
   defineConnector,
+  magnitudeSelection,
   readOr,
   qualifiedModelSelection,
   removeOwnedYaml,
@@ -36,6 +37,12 @@ export const makeHermesConnector = (paths: HarnessConnectionPaths, baseUrl = OPE
   executable: "hermes",
   skillInstallationTarget: "hermes-user",
   configurationFiles: [paths.hermes],
+  selectedModel: readOr(paths.hermes, "{}\n").pipe(Effect.map((source) => {
+    const document = parseDocument(source.trim() === "" ? "{}\n" : source).toJS()
+    return valueAt(document, ["model", "provider"]) === "custom:magnitude"
+      ? magnitudeSelection(valueAt(document, ["model", "default"]), "")
+      : Option.none()
+  })),
   connect: (spec) => Effect.gen(function* () {
     const original = yield* readOr(paths.hermes, "{}\n")
     const source = removeOwnedYaml(original, Object.entries(hermesReasoningOverrides(spec.previousModels ?? [])).map(

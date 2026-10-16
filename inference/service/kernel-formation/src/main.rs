@@ -9,7 +9,8 @@
 //! complete coverage run reports that run and searches nothing; catalog
 //! requests are always enumerated, and those the ledger holds are recalled.
 //! Any failure, unreached group, unformed form value, configuration this host
-//! cannot form, or catalog request that does not form fails the run.
+//! cannot form, catalog request that does not form, or supported catalog model
+//! assessment finds unsupported fails the run.
 
 mod forming;
 mod ledger;
@@ -152,7 +153,8 @@ fn form(backend: BackendName, ledger: &Path, catalog: &Path) -> anyhow::Result<b
         .ledger()
         .compact()
         .context("compacting the formation ledger")?;
-    Ok(covered && failures == 0)
+    // A supported catalog model the engine refuses on this backend is a release defect.
+    Ok(covered && failures == 0 && catalog.unsupported.is_empty())
 }
 
 /// How often a running phase reports its progress.

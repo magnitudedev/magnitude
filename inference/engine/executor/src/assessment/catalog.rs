@@ -39,10 +39,7 @@ const FAMILIES: [&dyn ModelFamily; 7] = [
 
 /// Catalog targets whose load must derive whatever their catalog support
 /// level: (model, role).
-const REQUIRED: [(&str, &str); 2] = [
-    ("qwen3.8-flash-next", "target-gguf_q2"),
-    ("qwen3.8-flash-next", "target-gguf_q4"),
-];
+const REQUIRED: [(&str, &str); 1] = [("qwen3.8-flash-next", "target-gguf_q4")];
 
 /// Each catalog model's support level (`catalog/models.json`).
 fn support_levels() -> BTreeMap<String, String> {

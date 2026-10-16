@@ -97,7 +97,8 @@ detail). A drafter that fails to bind is reported, never silently dropped. The e
 whether a drafter binds; lineage stays a product judgment
 (see [drafter selection](./drafter-selection.md)).
 
-An assessed entry also carries the target's `ModelFingerprint`: architecture, block count, embedding
+An assessed entry also carries the target's `ModelFingerprint`: architecture, decoder block count (without
+MTP prediction layers, so a conversion that dropped the heads keeps it), embedding
 length, head and KV-head counts, key length, vocabulary size, expert count, and a digest of the
 tokenizer's token table. The engine also publishes the architecture strings it recognizes, which
 Hugging Face search uses as its prefilter. The product side never parses headers, reads file names

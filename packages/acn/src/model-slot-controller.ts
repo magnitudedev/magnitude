@@ -30,7 +30,7 @@ import {
 } from "@magnitudedev/acn-protocol"
 import { MagnitudeStorage } from "@magnitudedev/storage"
 import { ReasoningEffortSchema, type ProviderId, type ProviderModelId } from "@magnitudedev/providers/client"
-import { projectInferenceResidency } from "@magnitudedev/acn-protocol"
+import { canonicalLocalModelId, projectInferenceResidency } from "@magnitudedev/acn-protocol"
 import { PROVIDER_ID as LOCAL_PROVIDER_ID } from "@magnitudedev/icn/provider"
 import { IcnInstances } from "@magnitudedev/icn"
 import { ModelSelection } from "./model-selection"
@@ -356,12 +356,23 @@ export const ModelSlotControllerLive: Layer.Layer<
     const catalogState = yield* catalog.state
     const contents = catalogContents(catalogState)
     const localReady = yield* localOfferings.ready
-    const localIds = new Set<string>((yield* localModels.state).models.map(({ modelId }) => modelId))
+    const local = yield* localModels.state
+    const localIds = new Set<string>(local.models.map(({ modelId }) => modelId))
     for (const slotId of [PRIMARY_SLOT_ID, SECONDARY_SLOT_ID] as const) {
       const selected = configured.slots[slotKey(slotId)]
       if (Option.isNone(selected)) continue
       const selection = selected.value
       if (selection.providerId === LOCAL_PROVIDER_ID && !localReady) continue
+      if (selection.providerId === LOCAL_PROVIDER_ID) {
+        const canonical = canonicalLocalModelId(local.models, selection.providerModelId)
+        if (canonical !== selection.providerModelId) {
+          yield* modelSelection.replaceModel(
+            { providerId: LOCAL_PROVIDER_ID, providerModelId: selection.providerModelId },
+            { providerId: LOCAL_PROVIDER_ID, providerModelId: canonical },
+          ).pipe(Effect.orDie)
+          continue
+        }
+      }
       if (!providerIdentityIsAuthoritative(selection.providerId, catalogState)) continue
       const exists = selection.providerId === LOCAL_PROVIDER_ID
         ? localIds.has(selection.providerModelId)

@@ -1,6 +1,6 @@
 import { Either, Option } from "effect"
 import { describe, expect, it } from "vitest"
-import { parseModelReference, repositoryDisplayName } from "./model-references"
+import { drafterInput, parseModelReference, repositoryDisplayName } from "./model-references"
 
 const mac = { platform: "darwin" as const, env: {}, home: "/Users/ada" }
 const parse = (input: string) => parseModelReference(input, mac)
@@ -34,6 +34,17 @@ describe("model references", () => {
     expect(Either.isLeft(parse("https://example.com/owner/repo"))).toBe(true)
     expect(Either.isLeft(parse("owner/repo:"))).toBe(true)
     expect(Either.isLeft(parse("   "))).toBe(true)
+  })
+
+  it("passes an entered drafter to the service as owner/repo[@revision]:path", () => {
+    const entered = (input: string) => drafterInput(input, mac)
+    expect(entered("magnitudedev/Qwen3.5-4B-DFlash-GGUF/dflash.gguf")).toBe("magnitudedev/Qwen3.5-4B-DFlash-GGUF:dflash.gguf")
+    expect(entered("hf:bartowski/Model-GGUF/MTP/mtp-Model-Q8_0.gguf")).toBe("bartowski/Model-GGUF:MTP/mtp-Model-Q8_0.gguf")
+    expect(entered("https://huggingface.co/owner/repo/blob/abc123/d.gguf")).toBe("owner/repo@abc123:d.gguf")
+    expect(entered("owner/repo:d.gguf")).toBe("owner/repo:d.gguf")
+    expect(entered("owner/repo@abc:sub/d.gguf")).toBe("owner/repo@abc:sub/d.gguf")
+    expect(entered("owner/repo")).toBe("owner/repo")
+    expect(entered("~/drafters/d.gguf")).toBe("/Users/ada/drafters/d.gguf")
   })
 
   it("derives a readable repository name", () => {

@@ -43,7 +43,7 @@ export const downloadNotice = (failure: ModelAcquisitionFailure): NoticeContent 
 
 export const modelRemovalNotice = (failure: ModelFailure): NoticeContent => {
   switch (failure.code) {
-    case "model_removal_retained_external": return { title: "This model is managed outside Magnitude", description: "Its files are in an external model cache and have not been removed." }
+    case "model_removal_retained_external": return { title: "This model is managed outside Magnitude", description: "Another app manages its files, so Magnitude doesn’t delete them. Hide it from Magnitude instead." }
     case "model_removal_retained_shared": return { title: "These model files are shared", description: "Another model uses these files, so they have not been removed." }
     default: return { title: "Couldn’t remove the model", description: "The files may still be on disk. Check that the model folder is accessible before trying again." }
   }

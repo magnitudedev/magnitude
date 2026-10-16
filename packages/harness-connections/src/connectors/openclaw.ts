@@ -6,6 +6,7 @@ import {
   LOCAL_TOKEN,
   OPENAI_BASE_URL,
   defineConnector,
+  magnitudeSelection,
   readOr,
   valueAt,
   writeIfChanged,
@@ -64,6 +65,8 @@ export const makeOpenClawConnector = (paths: HarnessConnectionPaths, baseUrl = O
   executable: "openclaw",
   skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.openclaw],
+  selectedModel: readOr(paths.openclaw, "{}\n").pipe(Effect.map((source) =>
+    magnitudeSelection(valueAt(json5Object(source), ["agents", "defaults", "model", "primary"]), "magnitude/"))),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.openclaw, "{}\n")
     const value = json5Object(source)

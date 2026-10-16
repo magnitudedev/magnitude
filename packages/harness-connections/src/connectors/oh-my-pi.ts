@@ -5,6 +5,7 @@ import {
   CHAT_COMPLETIONS_API,
   OPENAI_BASE_URL,
   defineConnector,
+  magnitudeSelection,
   readOr,
   removeYamlPaths,
   updateYaml,
@@ -59,6 +60,8 @@ export const makeOhMyPiConnector = (paths: HarnessConnectionPaths, baseUrl = OPE
   executable: "omp",
   skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.ompModels, paths.ompSettings],
+  selectedModel: readOr(paths.ompSettings, "{}\n").pipe(Effect.map((source) => magnitudeSelection(
+    valueAt(parseDocument(source.trim() === "" ? "{}\n" : source).toJS(), ["modelRoles", "default"]), "magnitude/"))),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.ompModels, "{}\n")
     yield* writeIfChanged(paths.ompModels, source, updateYaml(source, [[

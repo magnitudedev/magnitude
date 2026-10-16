@@ -61,6 +61,7 @@ export interface HarnessConnection {
   readonly sync: (
     harness?: HarnessId,
   ) => Effect.Effect<ReadonlyArray<HarnessDestination>, HarnessConnectionError>
+  readonly syncRenamedSelections: Effect.Effect<ReadonlyArray<HarnessId>, HarnessConnectionError>
   readonly disconnect: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installSkill: (harness: HarnessId) => Effect.Effect<void, HarnessConnectionError>
   readonly installStartup: Effect.Effect<void, HarnessConnectionError>

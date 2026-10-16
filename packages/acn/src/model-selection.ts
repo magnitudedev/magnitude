@@ -32,6 +32,10 @@ export interface ModelSelectionApi {
     model: ProviderModelIdentity,
     favorite: boolean,
   ) => Effect.Effect<void, StateDocumentError>
+  readonly replaceModel: (
+    from: ProviderModelIdentity,
+    to: ProviderModelIdentity,
+  ) => Effect.Effect<void, StateDocumentError>
 }
 
 export class ModelSelection extends Context.Tag('ModelSelection')<
@@ -58,6 +62,29 @@ const select = (state: ModelState): ModelSelectionState => ({
   recentModels: state.recentModels,
   favorites: state.favorites,
 })
+
+const replaced = (values: readonly ProviderModelIdentity[], from: ProviderModelIdentity, to: ProviderModelIdentity) =>
+  values.map((value) => matches(value, from) ? to : value)
+    .filter((value, index, all) => all.findIndex((candidate) => matches(candidate, value)) === index)
+
+/** Every persisted reference to `from` (slot selections, recents, favorites) renamed to `to`. */
+const replaceModelReferences = (
+  current: ModelState,
+  from: ProviderModelIdentity,
+  to: ProviderModelIdentity,
+): ModelState => {
+  const slot = (selection: ModelState['slots']['primary']) => Option.map(selection, (selected) =>
+    matches(selected, from) ? { ...selected, providerId: to.providerId, providerModelId: to.providerModelId } : selected)
+  return {
+    ...current,
+    slots: { primary: slot(current.slots.primary), secondary: slot(current.slots.secondary) },
+    recentModels: {
+      primary: replaced(current.recentModels.primary, from, to),
+      secondary: replaced(current.recentModels.secondary, from, to),
+    },
+    favorites: replaced(current.favorites, from, to),
+  }
+}
 
 export const makeModelSelection = (
   state: StateHandle<ModelState, StateDocumentError>,
@@ -91,6 +118,7 @@ export const makeModelSelection = (
       ? moveToFront(current.favorites, model)
       : current.favorites.filter((candidate) => !matches(candidate, model)),
   })).pipe(Effect.asVoid),
+  replaceModel: (from, to) => state.update((current) => replaceModelReferences(current, from, to)).pipe(Effect.asVoid),
 })
 
 export const ModelSelectionLive: Layer.Layer<ModelSelection, never, MagnitudeStorage> =

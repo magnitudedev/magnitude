@@ -9,6 +9,8 @@ import {
   codexLocalModelId,
   defineConnector,
   isCodexLocalModelId,
+  LOCAL_CODEX_MODEL_PREFIX,
+  magnitudeSelection,
   qualifiedModelSelection,
   readOr,
   removeTomlTable,
@@ -125,6 +127,8 @@ export const makeCodexConnector = (
   executable: "codex",
   skillInstallationTarget: "shared-agents",
   configurationFiles: [paths.codexUser, paths.codexModels],
+  selectedModel: readOr(paths.codexUser, "").pipe(Effect.map((source) =>
+    magnitudeSelection(tomlTopLevelValue(source, "model"), LOCAL_CODEX_MODEL_PREFIX))),
   connect: (spec) => Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const bundled = yield* bundledCatalog(spec.installation.executable)

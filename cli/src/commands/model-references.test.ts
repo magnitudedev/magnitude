@@ -59,6 +59,8 @@ describe("model references", () => {
     expect(parse("qwen-test:gguf:q4")).toEqual({ _tag: "Reference", reference: { _tag: "Catalog", modelId: "qwen-test:gguf:q4" } })
     expect(parse("z-lab/Qwen-DFlash")).toEqual({ _tag: "Lookup", reference: "z-lab/Qwen-DFlash" })
     expect(parse("drafters/mtp.gguf")).toEqual({ _tag: "Lookup", reference: "/work/drafters/mtp.gguf" })
+    expect(parse("owner/Model-GGUF/MTP/mtp.gguf")).toEqual({ _tag: "Lookup", reference: "owner/Model-GGUF/MTP/mtp.gguf" })
+    expect(parse("hf:owner/Model-GGUF/mtp.gguf")).toEqual({ _tag: "Lookup", reference: "hf:owner/Model-GGUF/mtp.gguf" })
     expect(drafterReferenceArgument({ _tag: "Embedded" })).toBe("built-in")
     expect(drafterReferenceArgument({ _tag: "Local", path: "/d.gguf" })).toBe("/d.gguf")
   })
@@ -75,6 +77,9 @@ describe("drafterReferenceMatches", () => {
   it("matches a listed Hub drafter by repository and file", () => {
     expect(drafterReferenceMatches("owner/model-gguf:MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
     expect(drafterReferenceMatches("owner/Model-GGUF@main:MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
+    expect(drafterReferenceMatches("owner/Model-GGUF/MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
+    expect(drafterReferenceMatches("hf:owner/Model-GGUF/MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
+    expect(drafterReferenceMatches(drafterReferenceArgument(hub as never), hub as never)).toBe(true)
     expect(drafterReferenceMatches("https://huggingface.co/owner/Model-GGUF/blob/main/MTP/mtp-Model-Q8_0.gguf", hub as never)).toBe(true)
   })
   it("rejects other files, repositories, and kinds", () => {

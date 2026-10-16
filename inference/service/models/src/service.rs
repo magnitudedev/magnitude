@@ -365,11 +365,15 @@ fn delete_managed(
         if !referenced.contains(&blob)
             && let Ok(metadata) = blob.metadata()
         {
-            fs::remove_file(blob).map_err(io_error)?;
+            fs::remove_file(&blob).map_err(io_error)?;
             freed = freed.saturating_add(metadata.len());
+            let mut checkpoint = blob.into_os_string();
+            checkpoint.push(".integrity");
+            let _ = fs::remove_file(checkpoint);
         }
     }
     remove_empty_parents(&snapshot, &repo_root.join("snapshots"));
+    crate::store_fs::prune_empty_repository(&repo_root);
     Ok(freed)
 }
 

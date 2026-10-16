@@ -24,7 +24,8 @@ export class LocalModelRemovals extends Context.Tag("LocalModelRemovals")<
   LocalModelRemovalsApi
 >() {}
 
-export const catalogRemovalOutcome = (
+/** ICN retains an installation it doesn't own outright: only another app's copy (hide it instead), or shared files. */
+export const catalogRemovalOutcome = (modelId: CatalogFormModelId) => (
   result: CatalogInstallationRemoval,
 ): Effect.Effect<{}, LocalModelMutationFailed> => result._tag === "Removed"
   ? Effect.succeed({})
@@ -33,7 +34,7 @@ export const catalogRemovalOutcome = (
         ? "model_removal_retained_external"
         : "model_removal_retained_shared",
       message: result.reason === "ExternalOwnership"
-        ? "This model is provided by an external Hugging Face cache and was not removed."
+        ? `${modelId} uses files another app manages, which Magnitude never deletes. Hide it with \`magnitude models hide ${modelId}\` instead.`
         : "This model uses files shared by another catalog model and was not removed.",
       retryable: false,
     }))
@@ -71,7 +72,7 @@ export const LocalModelRemovalsLive: Layer.Layer<
       const clear = SubscriptionRef.update(removals, (current) => updated(current, (next) => next.delete(modelId)))
       yield* restore(client.catalog.removeCatalogModelInstallation({ path: { model_id: modelId } }).pipe(
         Effect.mapError((cause) => icnCommandFailure("remove", cause)),
-        Effect.flatMap(catalogRemovalOutcome),
+        Effect.flatMap(catalogRemovalOutcome(modelId)),
         Effect.tap(() => catalog.refresh.pipe(Effect.ignore)),
         // The catalog model's drafter stays while another model uses it; otherwise it goes too.
         Effect.tap(() => localModels.pruneDrafters.pipe(Effect.ignore)),

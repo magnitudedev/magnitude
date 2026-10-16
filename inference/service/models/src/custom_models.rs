@@ -62,6 +62,7 @@ pub struct CustomModelFacts<'a> {
 pub struct CustomModelEnrichmentResult {
     pub variant_of: Option<ModelId>,
     pub recommended_drafter: Option<DrafterCandidate>,
+    pub license: Option<String>,
 }
 
 /// Lineage and drafter recommendation for custom models. It is called while the local-models
@@ -754,6 +755,7 @@ impl ModelContext<'_> {
             &hub.map_or_else(|| representative.primary.clone(), |hub| PathBuf::from(&hub.selector)),
             hub.map(|hub| hub.repository.as_str()),
             evidence.name.as_deref(),
+            evidence.quantization.as_deref(),
         );
         let display_name = match (representative.ollama_name, hub) {
             (Some(name), None) => name.to_owned(),
@@ -882,6 +884,7 @@ impl ModelContext<'_> {
                 projector,
                 drafter: drafter.map(|drafter| drafter.attached),
                 recommended_drafter: enriched.recommended_drafter,
+                license: enriched.license.or_else(|| evidence.license.clone()),
                 profile,
                 state,
             },
@@ -920,6 +923,7 @@ impl ModelContext<'_> {
             Path::new(primary),
             Some(repository.as_str()),
             None,
+            None,
         );
         Some(ProjectedModel {
             model: CustomModel {
@@ -943,6 +947,7 @@ impl ModelContext<'_> {
                 projector: None,
                 drafter,
                 recommended_drafter: None,
+                license: None,
                 profile: ServingProfile {
                     context_length: DEFAULT_EXTERNAL_CONTEXT,
                 },
@@ -1685,6 +1690,67 @@ mod tests {
         assert_eq!(qwen.variant_label.as_deref(), Some("Q4_K_M"));
     }
 
+    /// Current llama.cpp writes `-hf` downloads in the Hugging Face hub layout: in `LLAMA_CACHE`
+    /// itself or its `hub` folder they are llama.cpp's, keep their Hub identity and commit, and are
+    /// never also listed as flat llama.cpp files. The same layout in the shared Hugging Face cache
+    /// stays the Hugging Face cache's.
+    #[tokio::test]
+    async fn llama_cpp_hub_layout_downloads_are_llama_cpp_models_with_their_hub_identity() {
+        let fixture = Fixture::new().await;
+        let llama = fixture.root.join("llama.cpp");
+        publish_hf_cache(
+            &llama,
+            "owner/Model-GGUF",
+            &"a".repeat(40),
+            &[("Model-Q4_K_M.gguf", model_bytes("in-cache"))],
+        );
+        publish_hf_cache(
+            &llama.join("hub"),
+            "owner/Other-GGUF",
+            &"b".repeat(40),
+            &[("Other-Q8_0.gguf", model_bytes("in-hub"))],
+        );
+        write_model(
+            &llama.join("bartowski_Qwen3-8B-GGUF_Qwen3-8B-Q4_K_M.gguf"),
+            "flat",
+        );
+        let shared = fixture.root.join("hf");
+        publish_hf_cache(
+            &shared,
+            "owner/Shared-GGUF",
+            &"c".repeat(40),
+            &[("Shared-Q4_K_M.gguf", model_bytes("shared"))],
+        );
+
+        let listed = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::LlamaCpp, &llama),
+                root(ModelRootKind::HuggingFaceCache, &shared),
+            ]))
+            .await;
+
+        let source = |id: &str| {
+            listed
+                .models
+                .iter()
+                .find(|model| model.model_id.as_str() == id)
+                .map(|model| model.origin.clone())
+        };
+        let llama_cpp = Some(CustomModelOrigin::Found {
+            source: FoundSource::LlamaCpp,
+        });
+        assert_eq!(listed.models.len(), 4, "{:?}", ids(&listed.models));
+        assert_eq!(source("hf:owner/Model-GGUF/Model-Q4_K_M.gguf"), llama_cpp);
+        assert_eq!(source("hf:owner/Other-GGUF/Other-Q8_0.gguf"), llama_cpp);
+        assert_eq!(source("hf:bartowski/Qwen3-8B-GGUF/Qwen3-8B-Q4_K_M.gguf"), llama_cpp);
+        assert_eq!(
+            source("hf:owner/Shared-GGUF/Shared-Q4_K_M.gguf"),
+            Some(CustomModelOrigin::Found {
+                source: FoundSource::HuggingFaceCache
+            })
+        );
+    }
+
     fn write_ollama(
         root: &Path,
         registry: &str,
@@ -2272,6 +2338,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_folder_is_refused_as_an_imported_model() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("gguf-import");
+        write_model(&folder.join("model.gguf"), "imported");
+        let declaration = CustomModelDeclaration {
+            model_id: local_id(&folder.join("model.gguf")),
+            origin: CustomModelDeclarationOrigin::Imported { path: folder.clone() },
+            target: vec![folder.to_string_lossy().into_owned()],
+            projector: None,
+        };
+
+        let refused = fixture
+            .local
+            .configure(LocalModelsConfiguration {
+                declarations: vec![declaration],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+        assert!(
+            matches!(&refused, Err(InventoryError::InvalidRequest(message)) if message.contains("names the folder")),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn imported_files_are_referenced_in_place_and_forgotten_without_deletion() {
         let fixture = Fixture::new().await;
         let elsewhere = fixture.root.join("Downloads");
@@ -2718,6 +2809,40 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn turning_the_drafter_off_serves_a_model_with_heads_without_them() {
+        let fixture = Fixture::new().await;
+        let folder = fixture.root.join("models");
+        write_mtp_model(&folder.join("with-heads.gguf"), "heads");
+        let with_heads = local_id(&folder.join("with-heads.gguf"));
+
+        fixture
+            .apply(LocalModelsConfiguration {
+                roots: vec![root(ModelRootKind::Folder, &folder)],
+                drafters: vec![DrafterAttachment {
+                    model_id: with_heads.clone(),
+                    drafter: DrafterChoice::None,
+                }],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+
+        assert!(
+            matches!(
+                fixture.resolver.serving_configuration(&with_heads).unwrap().bundle,
+                ServableModelBundle::Standalone { .. }
+            ),
+            "no drafter is a standalone bundle, which the engine serves plain"
+        );
+        let listed = fixture.local.list_local().await.unwrap();
+        let model = listed
+            .models
+            .iter()
+            .find(|model| model.model_id == with_heads)
+            .unwrap();
+        assert!(model.drafter.is_none());
+    }
+
     struct Recommends {
         drafter: PathBuf,
         variant_of: ModelId,
@@ -2740,6 +2865,7 @@ mod tests {
                     on_this_computer: true,
                     method: Some(SpeculativeMethod::DFlash),
                 }),
+                license: None,
             }
         }
     }

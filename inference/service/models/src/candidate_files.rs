@@ -141,7 +141,8 @@ pub fn header_inspection(
     use sha2::Digest;
     let directory = header_directory(header)?;
     let digest = format!("{:x}", sha2::Sha256::digest(header));
-    let inspection = crate::gguf::interpret(&directory, digest)
+    let header_bytes = crate::gguf::header_extent(&directory, header.len() as u64);
+    let inspection = crate::gguf::interpret(&directory, digest, header_bytes)
         .map_err(|error| InventoryError::Integrity(error.to_string()))?;
     Ok((directory, inspection))
 }
@@ -182,7 +183,10 @@ pub fn local_header_digest(path: &Path) -> Result<String, InventoryError> {
     use sha2::Digest;
     use std::io::Read;
     let directory = local_directory(path)?;
-    let length = usize::try_from(directory.data_offset)
+    let file_length = std::fs::metadata(path)
+        .map_err(|error| InventoryError::Io(format!("{}: {error}", path.display())))?
+        .len();
+    let length = usize::try_from(crate::gguf::header_extent(&directory, file_length))
         .map_err(|_| InventoryError::Integrity("GGUF header is too large".to_owned()))?;
     let mut header = vec![0_u8; length];
     std::fs::File::open(path)
@@ -315,7 +319,9 @@ pub fn split_shard(path: &Path) -> Option<(String, u32, u32)> {
 /// writers spell it (`Q4_K_M`, `IQ2_M`, `UD-Q4_K_XL`, `BF16`), else its file stem. Labels never
 /// decide compatibility.
 #[must_use]
-pub fn version_label(path: &Path) -> String {
+/// A version's label: the quantization its file or folder name spells (keeping a qualifier such as
+/// `UD-`), else its header's quantization, else its file name.
+pub fn version_label(path: &Path, header_quantization: Option<&str>) -> String {
     let stem = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -340,7 +346,14 @@ pub fn version_label(path: &Path) -> String {
         .unwrap_or_default();
     quantization_label(&stem)
         .or_else(|| quantization_label(directory))
+        .or_else(|| header_label(header_quantization))
         .unwrap_or(stem)
+}
+
+fn header_label(header_quantization: Option<&str>) -> Option<String> {
+    header_quantization
+        .and_then(crate::gguf::quantization_label)
+        .map(str::to_owned)
 }
 
 fn quantization_label(text: &str) -> Option<String> {
@@ -372,8 +385,9 @@ fn is_quantization_token(token: &str) -> bool {
     let Some(rest) = rest else {
         return false;
     };
+    // One digit of bits: `Q4_0`, `IQ2_XXS`; `q40` is no quantization name.
     let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    digits > 0
+    digits == 1
         && rest[digits..]
             .split('_')
             .all(|part| part.bytes().all(|byte| byte.is_ascii_alphanumeric()))
@@ -392,8 +406,8 @@ pub fn display_name(name: &str) -> String {
     trimmed.replace(['-', '_'], " ")
 }
 
-/// How a model on this computer is named: its display name and, when its file names one, the
-/// quantization label of the variant (`Q4_K_M`, `UD-Q4_K_XL`). The name is the repository's when
+/// How a model on this computer is named: its display name and the quantization label of the
+/// variant, the one its file names (`Q4_K_M`, `UD-Q4_K_XL`) or else its header's. The name is the repository's when
 /// the file has a Hub identity (`Qwen3.5 4B` for `lmstudio-community/Qwen3.5-4B-GGUF`), else the
 /// GGUF's `general.name`, else the file name, each without its quantization and with separators as
 /// spaces. Names are presentation only.
@@ -402,6 +416,7 @@ pub fn model_presentation(
     primary: &Path,
     repository: Option<&str>,
     header_name: Option<&str>,
+    header_quantization: Option<&str>,
 ) -> (String, Option<String>) {
     let stem = primary
         .file_name()
@@ -412,7 +427,7 @@ pub fn model_presentation(
                 .unwrap_or(name)
         })
         .unwrap_or_default();
-    let label = quantization_label(stem);
+    let label = quantization_label(stem).or_else(|| header_label(header_quantization));
     let without_label = |text: &str| {
         let cleaned = match quantization_label(text) {
             Some(label) => {
@@ -493,8 +508,18 @@ mod tests {
             ("model-bf16.gguf", "BF16"),
             ("weights.gguf", "weights"),
         ] {
-            assert_eq!(version_label(Path::new(path)), label, "{path}");
+            assert_eq!(version_label(Path::new(path), None), label, "{path}");
         }
+        assert_eq!(
+            version_label(Path::new("new-q40.gguf"), Some("Q4_0")),
+            "Q4_0",
+            "a name that isn't a quantization label gives way to the header's"
+        );
+        assert_eq!(version_label(Path::new("weights.gguf"), Some("Q4_K - Medium")), "Q4_K_M");
+        assert_eq!(
+            version_label(Path::new("model-UD-Q4_K_XL.gguf"), Some("Q4_K - Medium")),
+            "UD-Q4_K_XL"
+        );
     }
 
     #[test]
@@ -603,20 +628,34 @@ mod tests {
             model_presentation(
                 Path::new("MiniCPM5-1B-Q3_K_M.gguf"),
                 Some("NANI-Nithin/MiniCPM5-1B-GGUF"),
-                Some("MiniCPM5-1B")
+                Some("MiniCPM5-1B"),
+                Some("Q3_K - Medium")
             ),
             ("MiniCPM5 1B".to_owned(), Some("Q3_K_M".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("blobs/sha256-abc"), None, Some("Qwen3.5-4B-Q4_K_M")),
+            model_presentation(Path::new("blobs/sha256-abc"), None, Some("Qwen3.5-4B-Q4_K_M"), None),
             ("Qwen3.5 4B".to_owned(), None)
         );
         assert_eq!(
-            model_presentation(Path::new("models/MiniCPM5-1B-q4_k_s.gguf"), None, None),
+            model_presentation(
+                Path::new("blobs/sha256-abc"),
+                None,
+                Some("Qwen3.5-4B-Q4_K_M"),
+                Some("Q4_K - Medium")
+            ),
+            ("Qwen3.5 4B".to_owned(), Some("Q4_K_M".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(Path::new("models/new-q40.gguf"), None, None, Some("Q4_0")),
+            ("new q40".to_owned(), Some("Q4_0".to_owned()))
+        );
+        assert_eq!(
+            model_presentation(Path::new("models/MiniCPM5-1B-q4_k_s.gguf"), None, None, None),
             ("MiniCPM5 1B".to_owned(), Some("Q4_K_S".to_owned()))
         );
         assert_eq!(
-            model_presentation(Path::new("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"), None, None),
+            model_presentation(Path::new("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"), None, None, None),
             ("Qwen3.6 35B A3B".to_owned(), Some("UD-Q4_K_XL".to_owned()))
         );
     }

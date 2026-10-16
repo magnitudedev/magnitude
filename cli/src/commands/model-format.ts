@@ -13,7 +13,7 @@ import {
   localModelServingProfile,
   localModelServingState,
 } from "@magnitudedev/client-common"
-import type { CatalogLocalModel, LocalModel, ModelCatalogState } from "@magnitudedev/sdk"
+import { findLocalModelById, type CatalogLocalModel, type LocalModel, type ModelCatalogState, type ModelId } from "@magnitudedev/sdk"
 import { Effect, Option, Schema } from "effect"
 import { catalogProducts } from "./inference-client"
 import { formatContext } from "./inference-format"
@@ -36,7 +36,7 @@ export const findModel = <M extends LocalModel>(
   kind = "model",
   accept: (model: LocalModel) => model is M = (model): model is M => true,
 ): Effect.Effect<M, ModelCommandError> => {
-  const model = models.find((candidate) => candidate.modelId === modelId)
+  const model = Option.getOrUndefined(findLocalModelById(models, modelId as ModelId))
   return model === undefined || !accept(model)
     ? Effect.fail(new ModelCommandError({ message: `Unknown ${kind}: ${modelId}` }))
     : Effect.succeed(model)

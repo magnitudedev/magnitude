@@ -633,6 +633,11 @@ export const CatalogSupportSchema = Schema.Union(
 )
 export type CatalogSupport = typeof CatalogSupportSchema.Type
 
+/**
+ * A catalog model's catalog facts. `aliases` are the IDs its files would have as found models (the
+ * catalog's exact target found in another app's location); a request naming one means this model. A
+ * hidden external copy keeps its own ID and is not an alias here.
+ */
 export const LocalModelCatalogDataSchema = Schema.Struct({
   releaseDate: ModelReleaseDateSchema,
   parameterization: ModelParameterizationSchema,
@@ -640,6 +645,7 @@ export const LocalModelCatalogDataSchema = Schema.Struct({
   support: CatalogSupportSchema,
   fidelityRank: NonNegativeSafeInteger,
   quantizationAware: Schema.Boolean,
+  aliases: Schema.Array(CustomFormModelIdSchema),
 })
 export type LocalModelCatalogData = typeof LocalModelCatalogDataSchema.Type
 

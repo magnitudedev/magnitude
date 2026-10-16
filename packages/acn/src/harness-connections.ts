@@ -3,6 +3,7 @@ import { Context, Effect, Layer, Option, PubSub, Schedule, Stream } from "effect
 import { homedir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import {
+  canonicalLocalModelId,
   HarnessConnectionFailed,
   type HarnessConnectOutcome,
   type HarnessConnectRequest,
@@ -10,7 +11,9 @@ import {
   type HarnessId,
   type HarnessSetup,
   type HarnessSetupRequest,
+  type LocalModelsState,
 } from "@magnitudedev/acn-protocol"
+import type { ProviderModelId } from "@magnitudedev/providers/client"
 import {
   harnessCommandExecutor,
   harnessExecutableSearchPath,
@@ -22,6 +25,7 @@ import {
 import { BunSqliteDriverLayer } from "@magnitudedev/storage/sqlite/bun"
 import { guardedCommandLayer } from "@magnitudedev/utils/guarded-command"
 import { AcnHost } from "./server-settings"
+import { LocalModels, type LocalModelsApi } from "./local-models"
 
 export interface AcnHarnessConnectionsApi {
   /** Inspects on subscribe, after any connect or disconnect from any client, and every two seconds while observed. */
@@ -43,8 +47,33 @@ const failed = (error: HarnessConnectionError) => new HarnessConnectionFailed({
 /** The installed layout keeps the protected command helper beside the native host. */
 const commandHelperPath = () => join(dirname(process.env.MAGNITUDE_NATIVE_HOST ?? join(dirname(process.execPath), "desktop-host.node")), "magnitude-command")
 
+const aliasKey = ({ models }: LocalModelsState): string => models
+  .flatMap((model) => model._tag === "Catalog" ? model.catalogData.aliases.map((alias) => `${alias}\0${model.modelId}`) : [])
+  .sort()
+  .join("\n")
+
+/**
+ * Once at start and whenever the catalog's aliases change, moves every connected harness whose selection
+ * names an alias to the catalog ID, through the same reconciliation `connections sync` uses.
+ */
+export const moveHarnessSelectionsOnAliasChanges = <E>(
+  localModels: Pick<LocalModelsApi, "state" | "changes">,
+  syncRenamedSelections: Effect.Effect<ReadonlyArray<HarnessId>, E>,
+): Effect.Effect<void, E> =>
+  Stream.concat(Stream.fromEffect(localModels.state), localModels.changes.pipe(Stream.mapEffect(() => localModels.state))).pipe(
+    Stream.map(aliasKey),
+    Stream.changes,
+    Stream.filter((key) => key.length > 0),
+    Stream.runForEach(() => syncRenamedSelections),
+  )
+
 export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Effect.gen(function* () {
   const host = yield* AcnHost
+  const localModels = yield* LocalModels
+  // A harness selection naming a catalog model's alias (from before an upgrade) moves to the catalog ID.
+  const canonicalModel = (modelId: ProviderModelId) => localModels.state.pipe(
+    Effect.map(({ models, hidden }) => canonicalLocalModelId([...models, ...hidden], modelId)),
+  )
   const context = yield* Effect.context<FileSystem.FileSystem | Path.Path | CommandExecutor.CommandExecutor | HttpClient.HttpClient>()
   const changes = yield* PubSub.unbounded<void>()
   // Harnesses are found through the user's login-shell environment, which a service started by
@@ -59,6 +88,7 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     const values = yield* environment
     const executor = yield* harnessCommandExecutor(values)
     return yield* makeHarnessConnectionService({
+      canonicalModel,
       paths: yield* resolveHarnessConnectionPaths(isolated ? join(host.dataDir, "harness-home") : undefined, values),
       serviceEndpoint: `http://127.0.0.1:${host.port}`,
       detect: connector => connector.detect(harnessExecutableSearchPath(values.PATH)),
@@ -72,6 +102,14 @@ export const AcnHarnessConnectionsLive = Layer.scoped(AcnHarnessConnections, Eff
     ? Effect.fail(new HarnessConnectionError({ operation, harness: Option.getOrUndefined(harness), message:
       "This Magnitude runs as a server. Connect a harness on this machine from your own terminal with `magnitude connections connect <harness>`, or copy its setup to another computer." }))
     : Effect.void
+
+  if (!serverService) {
+    yield* moveHarnessSelectionsOnAliasChanges(localModels, service.pipe(
+      Effect.flatMap((connections) => connections.syncRenamedSelections),
+      Effect.tap((renamed) => renamed.length > 0 ? changed : Effect.void),
+      Effect.catchAll((error) => Effect.logWarning(`Moving harness selections to renamed models failed: ${error.message}`).pipe(Effect.as([]))),
+    )).pipe(Effect.forkScoped)
+  }
 
   const inspect = service.pipe(
     Effect.flatMap(connections => connections.inspect),

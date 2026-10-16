@@ -36,6 +36,7 @@ const catalogModel = {
     support: { _tag: "Supported" },
     fidelityRank: 1,
     quantizationAware: false,
+    aliases: [],
   },
   acquisitionState: { _tag: "NotInstalled" },
   servingState: {

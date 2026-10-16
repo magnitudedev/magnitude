@@ -406,7 +406,7 @@ export const AcnBoundaryLive = AcnRpcGroup.toLayer(Effect.gen(function* () {
       SetModelDrafter: ({ modelId, drafter }) =>
         observeRpcDefects(
           "SetModelDrafter",
-          customModelCommands.setModelDrafter(modelId, drafter).pipe(Effect.map((chosen) => ({ drafter: chosen }))),
+          customModelCommands.setModelDrafter(modelId, drafter),
         ),
 
       HideModel: ({ modelId }) =>

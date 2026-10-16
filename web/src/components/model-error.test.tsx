@@ -45,7 +45,7 @@ describe("desktop failure presentation", () => {
     expect(JSON.stringify(modelCommandNotice({ operation: "remove", rejection: Option.some(rejection) }))).not.toContain("PRIVATE")
   })
   it("explains retained files and an interrupted load without inventing remediation", () => {
-    expect(modelRemovalNotice({ code: "model_removal_retained_external", message: "PRIVATE", retryable: false }).description).toContain("external model cache")
+    expect(modelRemovalNotice({ code: "model_removal_retained_external", message: "PRIVATE", retryable: false }).description).toContain("Hide it from Magnitude instead")
     expect(modelRemovalNotice({ code: "model_removal_retained_shared", message: "PRIVATE", retryable: false }).description).toContain("Another model")
     expect(modelCommandNotice({ operation: "load", rejection: Option.some(new LocalModelMutationFailed({ code: "model_instance_stopped", message: "PRIVATE", retryable: true })) })).toMatchObject({ severity: "info", title: "Loading was stopped" })
   })

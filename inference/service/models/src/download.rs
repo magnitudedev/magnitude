@@ -532,6 +532,48 @@ impl ManagedModelStore {
 
     /// Removes the admission entry only while it still names this operation; a request admitted
     /// after cancellation may already have replaced it.
+    /// For each component, a file on this computer outside Magnitude's store holding exactly its
+    /// content (an installation in a Hugging Face cache), which the download copies instead of
+    /// fetching.
+    fn local_sources(&self, components: &[ModelComponent]) -> Vec<Option<PathBuf>> {
+        let external = self
+            .models
+            .read()
+            .map(|models| {
+                models
+                    .values()
+                    .filter(|model| {
+                        !matches!(model.location, ModelLocation::MagnitudeCache { .. })
+                            && matches!(model.availability, ModelAvailability::Available { .. })
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut by_content = std::collections::BTreeMap::new();
+        for model in &external {
+            let Ok(resolved) = crate::service::resolve_components(&self.config.root, model) else {
+                continue;
+            };
+            for (declared, resolved) in model.location.components().iter().zip(resolved) {
+                if let ContentIdentity::Sha256 { value } = &declared.content {
+                    by_content
+                        .entry((value.clone(), declared.size_bytes))
+                        .or_insert(resolved.path);
+                }
+            }
+        }
+        components
+            .iter()
+            .map(|component| match &component.content {
+                ContentIdentity::Sha256 { value } => by_content
+                    .get(&(value.clone(), component.size_bytes))
+                    .cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn release_operation(&self, key: &str, operation: &Arc<DownloadOperation>) {
         let mut operations = self.operations.lock().await;
         if operations
@@ -566,6 +608,13 @@ impl ManagedModelStore {
             && operation.discard_partial.load(Ordering::Acquire)
         {
             discard_partial_components(&repo_root, &components).await;
+        }
+        if result.is_err() {
+            let pruned = repo_root.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::store_fs::prune_empty_repository(&pruned);
+            })
+            .await;
         }
         drop(repository_lock);
         result
@@ -735,6 +784,7 @@ impl ManagedModelStore {
             })?;
         ensure_owned_directory(&repo_root).await?;
         ensure_owned_directory(&repo_root.join("blobs")).await?;
+        let local_sources = self.local_sources(&components);
         let started = Instant::now();
         let mut resumed_by_component = Vec::with_capacity(components.len());
         for component in &components {
@@ -751,6 +801,7 @@ impl ManagedModelStore {
                 &self.config.root,
                 &commit,
                 component,
+                local_sources[index].as_deref(),
                 |file_completed, stage| {
                     let timestamp = Instant::now();
                     if file_completed != component.size_bytes
@@ -939,6 +990,7 @@ async fn download_component_with_retry(
     root: &Path,
     commit: &str,
     component: &ModelComponent,
+    local_source: Option<&Path>,
     mut progress: impl FnMut(u64, DownloadStage),
     control: &TransferControl,
 ) -> Result<(), DownloadError> {
@@ -950,6 +1002,18 @@ async fn download_component_with_retry(
     if recover_completed_blob(&paths, component).await? {
         progress(component.size_bytes, DownloadStage::Verifying);
         return Ok(());
+    }
+    if let Some(source) = local_source {
+        match copy_local_component(source, component, &paths, &mut progress, control).await {
+            Ok(()) => return Ok(()),
+            Err(error) if matches!(error.kind, DownloadErrorKind::Cancelled) => return Err(error),
+            Err(error) => tracing::warn!(
+                path = %component.path.display(),
+                source = %source.display(),
+                %error,
+                "copying the component from this computer failed; downloading it instead"
+            ),
+        }
     }
     for attempt in 0..MAX_ATTEMPTS {
         // Each attempt resumes from the durable checkpoint: streamed bytes
@@ -1086,6 +1150,62 @@ async fn download_component_once(
     }
     publish_verified_blob(paths).await?;
     Ok(())
+}
+
+/// A component copied from a file already on this computer with the same content (the exact
+/// file in a Hugging Face cache) instead of fetched: cloned where the file system can, then
+/// verified like a download before it becomes the blob.
+async fn copy_local_component(
+    source: &Path,
+    component: &ModelComponent,
+    paths: &DownloadComponentPaths,
+    progress: &mut impl FnMut(u64, DownloadStage),
+    control: &TransferControl,
+) -> Result<(), DownloadError> {
+    use tokio::io::AsyncReadExt as _;
+    if !matches!(component.content, ContentIdentity::Sha256 { .. }) {
+        return Err(DownloadError {
+            kind: DownloadErrorKind::Integrity,
+            message: "only content with a SHA-256 identity is copied from this computer".to_owned(),
+            retryable: false,
+            resumable: false,
+        });
+    }
+    discard_component_files(paths).await?;
+    progress(0, DownloadStage::Verifying);
+    let copied = tokio::fs::copy(source, &paths.partial).await;
+    let result = async {
+        if copied.map_err(download_io)? != component.size_bytes {
+            return Err(DownloadError {
+                kind: DownloadErrorKind::Integrity,
+                message: format!("unexpected size for {}", source.display()),
+                retryable: false,
+                resumable: false,
+            });
+        }
+        let mut file = tokio::fs::File::open(&paths.partial).await.map_err(download_io)?;
+        let mut integrity = DownloadIntegrity::empty(component);
+        let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+        loop {
+            if control.is_cancelled() {
+                return Err(cancelled_error());
+            }
+            let read = file.read(&mut buffer).await.map_err(download_io)?;
+            if read == 0 {
+                break;
+            }
+            integrity.update(&buffer[..read])?;
+            progress(integrity.bytes, DownloadStage::Verifying);
+        }
+        integrity.verify(component)?;
+        atomic_json(&paths.checkpoint, &integrity.record(component)).await?;
+        publish_verified_blob(paths).await
+    }
+    .await;
+    if result.is_err() {
+        discard_component_files(paths).await?;
+    }
+    result
 }
 
 async fn recover_partial(
@@ -2713,6 +2833,7 @@ mod tests {
             directory.path(),
             &"a".repeat(40),
             &component,
+            None,
             |_, _| {},
             &control,
         )
@@ -2723,6 +2844,108 @@ mod tests {
             *ranges.lock().expect("ranges"),
             vec!["bytes=0-65535".to_owned(), "bytes=16384-65535".to_owned()]
         );
+    }
+
+    #[tokio::test]
+    async fn a_component_already_on_this_computer_is_copied_and_verified_without_fetching() {
+        let contents = vec![9_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let found = directory.path().join("found.gguf");
+        tokio::fs::write(&found, &contents).await.expect("found file");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&found),
+            |_, _| {},
+            &control,
+        )
+        .await
+        .expect("copied component");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
+        assert!(ranges.lock().expect("ranges").is_empty(), "nothing was fetched");
+        assert!(recover_completed_blob(&paths, &component).await.expect("recovery"));
+        assert_eq!(tokio::fs::read(&found).await.expect("found file"), contents);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hugging_face_cache_blob_is_the_local_source_of_its_content() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let contents = crate::test_gguf::gguf_bytes(
+            &[("general.architecture", crate::test_gguf::Meta::Str("llama"))],
+            &["token_embd.weight"],
+        );
+        let digest = format!("{:x}", Sha256::digest(&contents));
+        let repository = temporary.path().join("hf-cache").join("models--owner--repository");
+        let blob = repository.join("blobs").join(&digest);
+        let snapshot = repository.join("snapshots").join("a".repeat(40));
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(&blob, &contents).unwrap();
+        std::os::unix::fs::symlink(format!("../../blobs/{digest}"), snapshot.join("model.gguf"))
+            .unwrap();
+        let mut config = InventoryConfig::with_roots(
+            temporary.path().join("store"),
+            temporary.path().join("cache"),
+        )
+        .unwrap();
+        config.add_hugging_face_caches([temporary.path().join("hf-cache")]);
+        let manager = ManagedModelStore::open(config).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+
+        let present = model_component(&contents);
+        let absent = model_component(b"other contents");
+        let sources = manager.local_sources(&[present, absent]);
+        let found = sources[0].as_ref().expect("the cached blob is a local source");
+        assert_eq!(std::fs::read(found).unwrap(), contents);
+        assert!(sources[1].is_none());
+    }
+
+    #[tokio::test]
+    async fn a_local_copy_that_does_not_verify_is_downloaded_instead() {
+        let contents = vec![9_u8; 64 * 1024];
+        let component = model_component(&contents);
+        let (endpoint, ranges) = serve_source(contents.clone(), usize::MAX, 0);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let repo = source_repository(&endpoint, directory.path());
+        let control = TransferControl::new(Duration::from_secs(60));
+        let changed = directory.path().join("changed.gguf");
+        tokio::fs::write(&changed, vec![8_u8; 64 * 1024]).await.expect("changed file");
+        let blobs = directory
+            .path()
+            .join("hub")
+            .join(hf_repo_dir(&repo.repo_path()))
+            .join("blobs");
+        tokio::fs::create_dir_all(&blobs).await.expect("blobs");
+
+        download_component_with_retry(
+            &repo,
+            directory.path(),
+            &"a".repeat(40),
+            &component,
+            Some(&changed),
+            |_, _| {},
+            &control,
+        )
+        .await
+        .expect("downloaded component");
+        let paths = DownloadComponentPaths::new(&blobs, &blob_key(&component.content));
+        assert_eq!(tokio::fs::read(&paths.blob).await.expect("blob"), contents);
+        assert_eq!(ranges.lock().expect("ranges").len(), 1);
     }
 
     #[tokio::test]
@@ -2745,6 +2968,7 @@ mod tests {
             directory.path(),
             &"a".repeat(40),
             &component,
+            None,
             |_, _| {},
             &control,
         )

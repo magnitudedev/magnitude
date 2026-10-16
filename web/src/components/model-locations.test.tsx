@@ -76,8 +76,15 @@ describe("model locations", () => {
   it("words folder and reference failures without service text", () => {
     expect(modelLocationErrorNotice(new DirectoryNotFound({ path: "/x" })).title).toBe("This folder doesn’t exist")
     expect(candidateErrorNotice(new InvalidModelReference({ reference: "x", message: "PRIVATE" }))).toMatchObject({ title: "Magnitude can’t open this model", retryable: false })
-    expect(candidateErrorNotice(new ModelSourceUnavailable({ message: "PRIVATE", retryable: true }))).toMatchObject({ title: "Couldn’t reach Hugging Face", retryable: true })
-    expect(JSON.stringify(candidateErrorNotice(new ModelSourceUnavailable({ message: "PRIVATE", retryable: false })))).not.toContain("PRIVATE")
+    expect(candidateErrorNotice(new ModelSourceUnavailable({ reason: "SourceUnreachable", message: "PRIVATE", retryable: true }))).toMatchObject({ title: "Couldn’t reach Hugging Face", retryable: true })
+    expect(candidateErrorNotice(new ModelSourceUnavailable({ reason: "ServiceUnreachable", message: "PRIVATE", retryable: true })).title).toBe("Couldn’t reach the Magnitude service")
+    expect(JSON.stringify(candidateErrorNotice(new ModelSourceUnavailable({ reason: "Unavailable", message: "PRIVATE", retryable: false })))).not.toContain("PRIVATE")
+    const access = "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again."
+    expect(candidateErrorNotice(new ModelSourceUnavailable({ reason: "AccessRequired", message: access, retryable: false })))
+      .toMatchObject({ title: "This repository needs access", description: access, retryable: false })
+    const unreadable = candidateErrorNotice(new ModelSourceUnavailable({ reason: "Unreadable", message: "Magnitude couldn't read this file.", retryable: false }))
+    expect(unreadable).toMatchObject({ title: "Magnitude couldn’t read this model", description: "Magnitude couldn't read this file." })
+    expect(unreadable.title).not.toMatch(/reach/i)
     expect(candidateErrorNotice(new Error("transport")).title).toBe("Couldn’t reach the Magnitude service")
   })
 })

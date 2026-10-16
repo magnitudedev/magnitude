@@ -1,7 +1,7 @@
 import { BunFileSystem } from "@effect/platform-bun"
 import { Effect, Layer, Option, Schema, Stream } from "effect"
 import { describe, expect, it } from "vitest"
-import { mkdtempSync, writeFileSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -143,9 +143,11 @@ const harness = (options: {
     }),
   }
   const layer = Effect.gen(function* () {
-    const custom = yield* makeTestCustomModels(options.config ?? customModelsConfig())
+    const config = options.config ?? customModelsConfig()
+    const custom = yield* makeTestCustomModels(config)
     const rows = sourceModels.flatMap((entry) => Option.toArray(customModel({
       entry, assessment: undefined, instances: [], related: [], catalog: options.catalog ?? [],
+      drafterChoice: config.drafters[entry.id] ?? { _tag: "Auto" },
     })))
     const localState: LocalModelsState = {
       preparation: { discovery: { complete: true, modelsFound: rows.length }, assessment: { complete: true, settledModels: 0, totalModels: 0 } },
@@ -240,9 +242,20 @@ describe("finding models", () => {
     const rejected = await integrity.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
     expect(rejected._tag === "Left" && rejected.left).toMatchObject({
       _tag: "ModelSourceUnavailable",
-      message: "unknown GGUF tensor type 31",
+      reason: "Unreadable",
+      message: "Magnitude couldn't read this file. It may be incomplete, damaged, or use a format Magnitude doesn't support yet.",
       retryable: false,
     })
+
+    const upstream = harness({
+      inspectFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 500,
+        body: { error: { code: "inventory_error", message: "upstream model service failed: timed out" } },
+      },
+    })
+    const failed = await upstream.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    expect(failed._tag === "Left" && failed.left).toMatchObject({ reason: "SourceUnreachable", retryable: true })
 
     const invalid = harness({
       inspectFailure: { _tag: "GeneratedClientInvalidResponseError", status: 418, message: "undeclared status" },
@@ -253,7 +266,26 @@ describe("finding models", () => {
 
     const transport = harness({ inspectFailure: { _tag: "GeneratedClientTransportError", cause: new Error("refused") } })
     const unreachable = await transport.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
-    expect(unreachable._tag === "Left" && unreachable.left).toMatchObject({ _tag: "ModelSourceUnavailable", retryable: true })
+    expect(unreachable._tag === "Left" && unreachable.left).toMatchObject({ _tag: "ModelSourceUnavailable", reason: "ServiceUnreachable", retryable: true })
+  })
+
+  it("asks for Hugging Face access and a token for a gated repository", async () => {
+    const gated = harness({
+      inspectFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 409,
+        body: { error: { code: "hugging_face_access_required", message: "GGUF header request returned HTTP 401 Unauthorized" } },
+      },
+    })
+    const result = await gated.run((commands) => commands.addHuggingFaceModel({
+      repository, revision: Option.none(), version: Option.none(), drafter: { _tag: "Auto" },
+    }).pipe(Effect.either))
+    expect(result._tag === "Left" && result.left).toMatchObject({
+      _tag: "ModelSourceUnavailable",
+      reason: "AccessRequired",
+      message: "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again.",
+      retryable: false,
+    })
   })
 
   it("refuses a version the repository does not have", async () => {
@@ -335,6 +367,27 @@ describe("adding models", () => {
   })
 })
 
+describe("importing a folder", () => {
+  it("refuses a folder as an imported model and declares nothing", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "gguf-import-"))
+    try {
+      const { run, recorded } = harness({ config: customModelsConfig({ declarations: {} }) })
+      const result = await run((commands, models) => Effect.gen(function* () {
+        const imported = yield* commands.importModelFile(folder, { _tag: "Auto" }).pipe(Effect.either)
+        return { imported, config: yield* models.get }
+      }))
+      expect(result.imported._tag === "Left" && result.imported.left).toMatchObject({
+        _tag: "InvalidModelReference",
+        message: `${folder} is a folder. Choose a GGUF file, or add the folder as a model location.`,
+      })
+      expect(result.config.declarations).toEqual({})
+      expect(recorded.started).toEqual([])
+    } finally {
+      rmSync(folder, { recursive: true, force: true })
+    }
+  })
+})
+
 describe("drafter changes", () => {
   it("refuses a drafter the engine rejects", async () => {
     const { run } = harness({
@@ -351,6 +404,16 @@ describe("drafter changes", () => {
     ))
     expect(result.drafters[foundId]).toEqual({ _tag: "None" })
     expect(recorded.bundles).toEqual([])
+  })
+
+  it("says a drafter download started only when one did", async () => {
+    const onDisk = harness({ drafters: [nativeCandidate({ category: "NextToModel", onThisComputer: true })] })
+    const chosen = await onDisk.run((commands) => commands.setModelDrafter(foundId, { _tag: "Auto" }))
+    expect(chosen.drafterDownloadStarted).toBe(false)
+    expect(onDisk.recorded.started).toEqual([])
+    const missing = harness()
+    expect((await missing.run((commands) => commands.setModelDrafter(foundId, { _tag: "Auto" }))).drafterDownloadStarted).toBe(true)
+    expect(missing.recorded.started).toHaveLength(1)
   })
 
   it("refuses a model that is not on this computer", async () => {
@@ -376,6 +439,23 @@ describe("removal by origin", () => {
     expect(recorded.prunes).toBe(2)
     expect(Object.keys(config.declarations)).toEqual([])
     expect(config.hidden).toEqual([foundId])
+  })
+
+  it("refuses to hide a model added from Hugging Face or imported, and hides a found one", async () => {
+    const { run } = harness()
+    const result = await run((commands, models) => Effect.gen(function* () {
+      const added = yield* commands.hide(addedId).pipe(Effect.flip)
+      const imported = yield* commands.hide(importedId).pipe(Effect.flip)
+      yield* commands.hide(foundId)
+      return { added, imported, hidden: (yield* models.get).hidden }
+    }))
+    expect(result.added).toMatchObject({
+      code: "managed_model_not_hideable",
+      message: `${addedId} was added to Magnitude, so it can't be hidden. Remove it with \`magnitude catalog remove ${addedId}\` instead.`,
+    })
+    expect(result.imported).toMatchObject({ code: "managed_model_not_hideable" })
+    expect(result.imported.message).toContain("was imported into Magnitude")
+    expect(result.hidden).toEqual([foundId])
   })
 
   it("unhides a hidden model", async () => {
@@ -485,9 +565,11 @@ describe("catalog models found elsewhere", () => {
   const owned = CatalogFormModelIdSchema.make("qwen3.6-27b:gguf:q4")
   const cachePath = "/nonexistent-home/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf"
 
-  it("hides a catalog model whose files are only in an external location, and refuses one Magnitude owns", async () => {
+  it("hides a catalog model whose files are only in an external location by its files' found-model IDs, and refuses one Magnitude owns", async () => {
+    const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf")
     const { run } = harness({
       catalogRows: [catalogRow(external, "External", cachePath), catalogRow(owned, "Magnitude", "/store/m.gguf")],
+      catalog: [{ id: external, source: { aliases: Option.some([alias]) } }] as unknown as readonly CatalogModelSource[],
     })
     const result = await run((commands, models) => Effect.gen(function* () {
       const files = yield* commands.externalCatalogFiles(external)
@@ -495,10 +577,14 @@ describe("catalog models found elsewhere", () => {
       const refused = yield* commands.hide(owned).pipe(Effect.flip)
       const hidden = (yield* models.get).hidden
       yield* commands.unhide(external)
-      return { files, refused, hidden, afterUnhide: (yield* models.get).hidden }
+      const afterUnhide = (yield* models.get).hidden
+      yield* commands.hide(external)
+      yield* commands.unhide(alias)
+      return { files, refused, hidden, afterUnhide, afterAliasUnhide: (yield* models.get).hidden }
     }))
     expect(result.files).toEqual(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") }))
-    expect(result.hidden).toEqual([external])
+    expect(result.hidden).toEqual([alias])
+    expect(result.afterAliasUnhide).toEqual([])
     expect(result.refused.message).toBe(`${owned} is a catalog model. Remove it with \`magnitude catalog remove ${owned}\` instead.`)
     expect(result.afterUnhide).toEqual([])
   })

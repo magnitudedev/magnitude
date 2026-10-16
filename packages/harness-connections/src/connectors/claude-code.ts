@@ -9,6 +9,8 @@ import {
   defineConnector,
   isAnthropicLocalModelId,
   jsonObject,
+  LOCAL_ANTHROPIC_MODEL_PREFIX,
+  magnitudeSelection,
   readOr,
   removeJsoncPaths,
   removeOwnedJsonc,
@@ -78,6 +80,8 @@ export const makeClaudeCodeConnector = (paths: HarnessConnectionPaths, baseUrl =
   executable: "claude",
   skillInstallationTarget: "claude-user",
   configurationFiles: [paths.claude],
+  selectedModel: readOr(paths.claude, "{}\n").pipe(Effect.map((source) =>
+    magnitudeSelection(valueAt(jsonObject(source), ["model"]), LOCAL_ANTHROPIC_MODEL_PREFIX))),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.claude, "{}\n")
     const value = jsonObject(source)

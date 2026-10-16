@@ -13,7 +13,8 @@ use magnitude_service_contracts::models::{
     ServingProfile,
 };
 use magnitude_service_contracts::{
-    ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, InventoryError,
+    ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner,
+    InventoryError,
     InventoryModel, InventoryProperties, ModelAvailability, ModelInventory, ModelLocation,
     ModelPreviewComponentSource, ModelPreviewSource, ModelSource, ResolvedModel,
 };
@@ -54,6 +55,10 @@ pub(crate) struct PrimaryEvidence {
     pub(crate) name: Option<String>,
     pub(crate) architecture: Option<String>,
     pub(crate) base_models: Vec<crate::gguf::GgufBaseModel>,
+    #[serde(default)]
+    pub(crate) license: Option<String>,
+    #[serde(default)]
+    pub(crate) quantization: Option<String>,
 }
 
 impl PrimaryEvidence {
@@ -64,6 +69,8 @@ impl PrimaryEvidence {
             name: inspection.name.clone(),
             architecture: inspection.architecture.clone(),
             base_models: inspection.base_models.clone(),
+            license: inspection.license.clone(),
+            quantization: inspection.quantization.clone(),
         }
     }
 }
@@ -481,7 +488,10 @@ fn installed_path(model: &InventoryModel, resolved: &ResolvedModel) -> PathBuf {
 fn installation_origin(location: &ModelLocation) -> ModelPackageInstallationOrigin {
     match location {
         ModelLocation::MagnitudeCache { .. } => ModelPackageInstallationOrigin::Magnitude,
-        ModelLocation::HuggingFaceCache { .. } => ModelPackageInstallationOrigin::HuggingFaceCache,
+        ModelLocation::HuggingFaceCache { owner, .. } => match owner {
+            HubCacheOwner::HuggingFace => ModelPackageInstallationOrigin::HuggingFaceCache,
+            HubCacheOwner::LlamaCpp => ModelPackageInstallationOrigin::LlamaCpp,
+        },
         ModelLocation::External { origin, .. } => match origin {
             ExternalOrigin::LmStudio { .. } => ModelPackageInstallationOrigin::LmStudio,
             ExternalOrigin::LlamaCpp { .. } => ModelPackageInstallationOrigin::LlamaCpp,
@@ -547,6 +557,60 @@ pub fn servable_model_bundle_key_for_bundle(
             method,
         ),
     }
+}
+
+/// The `hf:` ID a package from a Hugging Face repository has as a custom model: its repository and
+/// the path of its primary weights file.
+pub(crate) fn hub_model_id(package: &ModelPackage) -> Option<magnitude_service_contracts::models::ModelId> {
+    let ModelPackageSource::HuggingFace { repository, .. } = &package.source else {
+        return None;
+    };
+    let selector = package
+        .files
+        .iter()
+        .filter(|file| file.role == ModelFileRole::Weights)
+        .map(|file| &file.path)
+        .min()?
+        .components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()?
+        .join("/");
+    Some(magnitude_service_contracts::models::ModelId::hugging_face(
+        &magnitude_service_contracts::models::HuggingFaceRepositoryId::new(repository.clone()).ok()?,
+        &magnitude_service_contracts::models::HuggingFaceArtifactSelector::new(selector).ok()?,
+    ))
+}
+
+/// Whether `package` holds exactly `target`'s weights: the same Hugging Face repository and commit,
+/// and the same weight files by path and content. A projector the package lacks doesn't change
+/// what its weights are; the catalog fetches only what is missing.
+pub(crate) fn exact_target_weights(target: &ModelPackage, package: &ModelPackage) -> bool {
+    let (
+        ModelPackageSource::HuggingFace {
+            repository: target_repository,
+            revision: target_revision,
+        },
+        ModelPackageSource::HuggingFace {
+            repository,
+            revision,
+        },
+    ) = (&target.source, &package.source)
+    else {
+        return false;
+    };
+    let weights = |package: &ModelPackage| {
+        package
+            .files
+            .iter()
+            .filter(|file| file.role == ModelFileRole::Weights)
+            .map(|file| (file.path.clone(), file.id.clone()))
+            .collect::<BTreeSet<_>>()
+    };
+    let target_weights = weights(target);
+    target_repository.eq_ignore_ascii_case(repository)
+        && target_revision == revision
+        && !target_weights.is_empty()
+        && target_weights == weights(package)
 }
 
 impl ManagedModelStore {
@@ -630,10 +694,35 @@ impl ManagedModelStore {
         }
 
         // Intrinsic upgrade attribution is reserved for Magnitude-managed
-        // installations. External material requires an exact current or
-        // persisted package identity match.
+        // installations. External material is a catalog target only when its
+        // weights are exactly a current target's.
         if !matches!(model.location, ModelLocation::MagnitudeCache { .. }) {
-            return InstalledCatalogAttribution::NotCatalogTarget;
+            // A found copy of a catalog target that was hidden stays a hidden found model.
+            let hidden = hub_model_id(package).is_some_and(|model_id| {
+                self.local_models
+                    .read()
+                    .is_ok_and(|configuration| configuration.hidden.contains(&model_id))
+            });
+            if hidden {
+                return InstalledCatalogAttribution::NotCatalogTarget;
+            }
+            let exact = self
+                .config
+                .catalog_models
+                .iter()
+                .filter(|catalog_model| exact_target_weights(catalog_target(catalog_model), package))
+                .collect::<Vec<_>>();
+            return match exact.as_slice() {
+                [] => InstalledCatalogAttribution::NotCatalogTarget,
+                [catalog_model] => attributed(catalog_model),
+                _ => failure(
+                    "catalog_target_package_ambiguous",
+                    format!(
+                        "package {} holds the target weights of multiple catalog variants",
+                        package.id.0
+                    ),
+                ),
+            };
         }
 
         let ModelPackageSource::HuggingFace { .. } = &package.source else {
@@ -741,7 +830,7 @@ impl ManagedModelStore {
 
     fn gguf_inspection_cache_key(path: &Path, content: &ContentIdentity) -> Option<String> {
         let evidence =
-            serde_json::to_vec(&("gguf-inspection-v3", content, path.metadata().ok()?.len()))
+            serde_json::to_vec(&("gguf-inspection-v4", content, path.metadata().ok()?.len()))
                 .ok()?;
         Some(format!("gguf_inspection_{:x}", Sha256::digest(evidence)))
     }

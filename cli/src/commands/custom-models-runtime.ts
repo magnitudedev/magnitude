@@ -33,9 +33,6 @@ const requirePath = (input: string, what: string): Effect.Effect<string, ModelCo
     : Effect.succeed(absolutePath(trimmed))
 }
 
-const drafterDownloads = (drafter: Option.Option<DrafterCandidate>) =>
-  Option.exists(drafter, (candidate) => !candidate.onThisComputer && candidate.reference._tag !== "Embedded")
-
 const drafterLine = (drafter: Option.Option<DrafterCandidate>) =>
   `Drafter: ${Option.match(drafter, { onNone: () => "none", onSome: ({ name }) => name })}`
 
@@ -49,7 +46,7 @@ export const renderImport = (result: ImportResult): string => ensureTrailingNewl
   `Added ${result.path}. Magnitude uses the file where it is and never moves or deletes it.`,
   drafterLine(result.drafter),
   `Model ID: ${result.modelId}`,
-  drafterDownloads(result.drafter)
+  result.drafterDownloadStarted
     ? `Check progress: magnitude models status ${result.modelId}`
     : `Load it: magnitude models load ${result.modelId}`,
 ].join("\n"))
@@ -92,7 +89,7 @@ export const renderSetDrafter = (result: SetDrafterResult, requested: DrafterArg
     : `No drafter is known to work with ${result.modelId}, so it runs without one.\n`,
   onSome: (drafter) => ensureTrailingNewline([
     `Drafter for ${result.modelId}: ${drafter.name}.`,
-    ...(drafterDownloads(result.drafter)
+    ...(result.drafterDownloadStarted
       ? ["Downloading the drafter.", `Check progress: magnitude models status ${result.modelId}`]
       : []),
   ].join("\n")),
@@ -143,7 +140,7 @@ const LOCATION_NAMES: Record<ModelLocationKind, string> = {
 }
 
 const LOCATION_STATES: Record<ModelLocationState, string> = {
-  Found: "Scanning",
+  Found: "Found",
   NotFound: "Not found",
   Unreadable: "Can't read",
 }

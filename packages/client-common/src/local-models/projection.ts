@@ -1,5 +1,6 @@
 /** Local-model projections are part of the contract; re-exported for client consumers. */
 export {
+  canonicalLocalModelId,
   customModelSourceLabel,
   findLocalModelById,
   installedLocalModels,

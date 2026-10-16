@@ -91,10 +91,22 @@ export const localModelProviderModelId = (
     : Option.none()
 }
 
+/** The model an ID names: its own ID, or a catalog model's alias (its files' ID as a found model). */
 export const findLocalModelById = (
   models: readonly LocalModel[],
   modelId: ProviderModelId,
-): Option.Option<LocalModel> => Option.fromNullable(models.find((model) => model.modelId === modelId))
+): Option.Option<LocalModel> => Option.fromNullable(models.find((model) => model.modelId === modelId)
+  ?? models.find((model) => model._tag === "Catalog" && model.catalogData.aliases.some((alias) => alias === (modelId as string))))
+
+/** The canonical ID for an ID that may be a catalog model's alias; any other ID is its own. */
+export const canonicalLocalModelId = <Id extends ProviderModelId>(
+  models: readonly LocalModel[],
+  modelId: Id,
+): Id | LocalModel["modelId"] => Option.match(
+  Option.fromNullable(models.find((model) => model._tag === "Catalog"
+    && model.catalogData.aliases.some((alias) => alias === (modelId as string)))),
+  { onNone: () => modelId, onSome: (model) => model.modelId },
+)
 
 export const localModelInstalledBytes = (model: LocalModel): Option.Option<number> =>
   Option.map(localModelInstallation(model), ({ installedBytes }) => installedBytes)

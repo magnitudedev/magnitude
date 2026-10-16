@@ -38,9 +38,38 @@ export const unsupportedReasonMessage = (reason: UnsupportedReason): string => {
   }
 }
 
-/** Every distinct user-facing reason, in the engine's order. */
+/** Identical reasons collapsed to one, with how many the engine reported; unrecognized parts collapse by kind. */
+export interface UnsupportedReasonGroup {
+  readonly reason: UnsupportedReason
+  readonly count: number
+}
+
+const reasonGroupKey = (reason: UnsupportedReason): string =>
+  reason._tag === "UnrecognizedTensor" || reason._tag === "UnrecognizedMetadata"
+    ? reason._tag
+    : unsupportedReasonMessage(reason)
+
+/** The engine's reasons collapsed into groups, in the order each first appears. */
+export const unsupportedReasonGroups = (reasons: ReadonlyArray<UnsupportedReason>): ReadonlyArray<UnsupportedReasonGroup> => {
+  const groups = new Map<string, UnsupportedReasonGroup>()
+  for (const reason of reasons) {
+    const key = reasonGroupKey(reason)
+    const existing = groups.get(key)
+    groups.set(key, { reason: existing?.reason ?? reason, count: (existing?.count ?? 0) + 1 })
+  }
+  return [...groups.values()]
+}
+
+/** One group's reason: "Has parts Magnitude doesn't recognize (60 tensors)" for many unrecognized parts. */
+export const unsupportedReasonGroupMessage = ({ reason, count }: UnsupportedReasonGroup): string => {
+  if (count > 1 && reason._tag === "UnrecognizedTensor") return `Has parts Magnitude doesn't recognize (${count} tensors)`
+  if (count > 1 && reason._tag === "UnrecognizedMetadata") return `Has parts Magnitude doesn't recognize (${count} metadata keys)`
+  return unsupportedReasonMessage(reason)
+}
+
+/** Every distinct user-facing reason, in the engine's order, with identical reasons said once. */
 export const unsupportedReasonMessages = (reasons: ReadonlyArray<UnsupportedReason>): ReadonlyArray<string> =>
-  [...new Set(reasons.map(unsupportedReasonMessage))]
+  unsupportedReasonGroups(reasons).map(unsupportedReasonGroupMessage)
 
 const joinWithAnd = (values: ReadonlyArray<string>): string =>
   values.length <= 2 ? values.join(" and ") : `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`

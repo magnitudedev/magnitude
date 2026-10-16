@@ -146,6 +146,7 @@ const makeCatalogOnlyModel = (
     support: { _tag: "Supported" },
     fidelityRank: 75,
     quantizationAware: false,
+    aliases: [],
   },
   acquisitionState: { _tag: "NotInstalled" },
   servingState: {

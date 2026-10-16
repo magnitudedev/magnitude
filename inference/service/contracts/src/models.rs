@@ -1217,6 +1217,9 @@ pub enum CatalogModelState {
     },
 }
 
+/// A catalog variant and its state on this computer. `aliases` are the `hf:` IDs its target's
+/// files found in an external location (a Hugging Face cache) would have as custom models, which
+/// clients resolve to this model, so references made before the file was attributed keep working.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1235,6 +1238,8 @@ pub struct CatalogModel {
     pub fidelity_rank: u32,
     pub quantization_aware: bool,
     pub local_state: CatalogModelState,
+    #[serde(default)]
+    pub aliases: Vec<ModelId>,
 }
 
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1536,6 +1541,9 @@ pub struct CustomModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false))]
     pub recommended_drafter: Option<DrafterCandidate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false))]
+    pub license: Option<String>,
     pub profile: ServingProfile,
     pub state: CustomModelState,
 }

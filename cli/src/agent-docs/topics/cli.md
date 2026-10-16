@@ -55,7 +55,8 @@ Exact model and harness IDs are always printed so their output can be used in la
 Every `hardware`, `catalog`, and `models` command accepts `--json` and then prints one JSON document
 of the same facts instead of text, with exact IDs, structured reasons a model can't run (with the
 engine's developer `detail`), and drafter verdicts. Optional fields are omitted when absent. Errors
-stay on stderr with a nonzero exit in both modes. No command prompts or reads standard input: where
+stay on stderr with a nonzero exit in both modes; with `--json` an error is one JSON document,
+`{"error": {"message": "...", "code": "..."}}`, whose `code` is a stable snake_case identifier. No command prompts or reads standard input: where
 a choice is needed it takes the desktop's default and prints what it chose.
 
 `catalog` finds and downloads models: catalog assessment progress, reviewed model choices,

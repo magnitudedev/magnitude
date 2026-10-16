@@ -215,6 +215,7 @@ pub enum ModelLocation {
         integrity: Integrity,
     },
     HuggingFaceCache {
+        owner: HubCacheOwner,
         cache_root: PathBuf,
         repository: String,
         commit: String,
@@ -241,6 +242,15 @@ pub enum ModelLocation {
         total_bytes: u64,
         integrity: Integrity,
     },
+}
+
+/// The application whose cache holds a Hugging Face hub layout: the shared Hugging Face cache, or
+/// llama.cpp's own cache, which current llama.cpp writes in the same layout under `LLAMA_CACHE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HubCacheOwner {
+    HuggingFace,
+    LlamaCpp,
 }
 
 /// Which read-only location an external file was observed in, with the Hugging Face file it is

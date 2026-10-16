@@ -2,6 +2,15 @@ import { Effect, Fiber, Option, Schema, SubscriptionRef } from "effect"
 import { describe, expect, it } from "vitest"
 import { modelCommandFailure, type ModelCommandsApi } from "./model-commands"
 import { CustomModelCommands, type CustomModelCommandsApi } from "./custom-model-commands"
+import { LocalModels } from "./local-models"
+
+const UPGRADED_ALIAS = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+const localModels = {
+  state: Effect.succeed({
+    models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] } }],
+    hidden: [],
+  }),
+} as never
 
 const customCalls: string[] = []
 const customCommands = {
@@ -77,6 +86,7 @@ it("retries active and slot Stop against the exact stopping instance", async () 
   }).pipe(
     Effect.provide(ModelCommandsLive),
     Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
     Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { stopped.push(path.instance_id); return {} }) } } as never),
     Effect.provideService(ModelSlotController, { state: Effect.succeed({ slots: { primary: { _tag: "ConfiguredLocal", selection: { providerModelId: "model-a:gguf:test" } } } }) } as never),
@@ -106,6 +116,7 @@ it("stops a running model before removing it, and removes an idle model without 
   }).pipe(
     Effect.provide(ModelCommandsLive),
     Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed(snapshot) } as never),
     Effect.provideService(IcnClient, { models: { stopModelInstance: ({ path }: { path: { instance_id: string } }) => Effect.sync(() => { calls.push(`stop ${path.instance_id}`); return {} }) } } as never),
     Effect.provideService(LocalModelRemovals, { remove: (modelId: string) => Effect.sync(() => { calls.push(`remove ${modelId}`); return {} }) } as never),
@@ -136,6 +147,7 @@ it("reports whether a catalog sync installs, updates, or finds the model current
   }).pipe(
     Effect.provide(ModelCommandsLive),
     Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
     Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
     Effect.provideService(IcnClient, {
       catalog: { installCatalogModel: () => Effect.succeed({ _tag: admission, operationId: "op" }) },
@@ -169,7 +181,9 @@ describe("load acknowledgement", () => {
         Effect.either,
         Effect.provide(ModelCommandsLive),
         Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
     Effect.provideService(CustomModelCommands, customCommands),
+    Effect.provideService(LocalModels, localModels),
         Effect.provideService(IcnInstances, { get: SubscriptionRef.get(instances), changes: instances.changes } as never),
         Effect.provideService(IcnClient, { models: { ensureModelInstance: ({ payload }: { payload: { modelId: string } }) => ensure(payload.modelId) } } as never),
         Effect.provideService(ModelSlotController, {
@@ -219,6 +233,17 @@ describe("load acknowledgement", () => {
       Effect.zipLeft(Effect.yieldNow()),
     ))
 
+    expect(outcome).toMatchObject({ _tag: "Right", right: {} })
+    expect(demands).toEqual(["model-a:gguf:test"])
+  })
+
+  it("loads the catalog model when a request names the ID its files had as a found model before an upgrade", async () => {
+    const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+    const demands: string[] = []
+    const fixture = await loadFixture(loading(1), (modelId) => Effect.sync(() => { demands.push(modelId) }).pipe(Effect.zipRight(Effect.never)))
+    const outcome = await fixture.run((commands) => commands.loadModel(Schema.decodeUnknownSync(ModelIdSchema)(UPGRADED_ALIAS)).pipe(
+      Effect.zipLeft(Effect.yieldNow()),
+    ))
     expect(outcome).toMatchObject({ _tag: "Right", right: {} })
     expect(demands).toEqual(["model-a:gguf:test"])
   })

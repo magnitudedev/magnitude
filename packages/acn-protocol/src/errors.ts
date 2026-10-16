@@ -113,22 +113,38 @@ export class RevealFailed extends Schema.TaggedError<RevealFailed>()(
 export class InvalidDirectoryPath extends Schema.TaggedError<InvalidDirectoryPath>()(
   "InvalidDirectoryPath",
   { path: Schema.String },
-) {}
+) {
+  override get message(): string {
+    return `${this.path} isn't an absolute folder path.`
+  }
+}
 
 export class DirectoryNotFound extends Schema.TaggedError<DirectoryNotFound>()(
   "DirectoryNotFound",
   { path: Schema.String },
-) {}
+) {
+  override get message(): string {
+    return `${this.path} doesn't exist.`
+  }
+}
 
 export class DirectoryAccessDenied extends Schema.TaggedError<DirectoryAccessDenied>()(
   "DirectoryAccessDenied",
   { path: Schema.String },
-) {}
+) {
+  override get message(): string {
+    return `Magnitude doesn't have permission to read ${this.path}.`
+  }
+}
 
 export class PathNotDirectory extends Schema.TaggedError<PathNotDirectory>()(
   "PathNotDirectory",
   { path: Schema.String },
-) {}
+) {
+  override get message(): string {
+    return `${this.path} isn't a folder.`
+  }
+}
 
 export class FileSystemUnavailable extends Schema.TaggedError<FileSystemUnavailable>()(
   "FileSystemUnavailable",
@@ -256,10 +272,24 @@ export class InvalidModelReference extends Schema.TaggedError<InvalidModelRefere
   { reference: Schema.String, message: Schema.String },
 ) {}
 
+/**
+ * Why a model source couldn't be used: the inference service didn't answer, Hugging Face didn't
+ * answer, the repository needs accepted terms and an access token, the file couldn't be read, or
+ * the model isn't available.
+ */
+export const ModelSourceUnavailableReasonSchema = Schema.Literal(
+  "ServiceUnreachable",
+  "SourceUnreachable",
+  "AccessRequired",
+  "Unreadable",
+  "Unavailable",
+)
+export type ModelSourceUnavailableReason = typeof ModelSourceUnavailableReasonSchema.Type
+
 /** Hugging Face or a local file could not be read; `retryable` when the cause may clear. */
 export class ModelSourceUnavailable extends Schema.TaggedError<ModelSourceUnavailable>()(
   "ModelSourceUnavailable",
-  { message: Schema.String, retryable: Schema.Boolean },
+  { reason: ModelSourceUnavailableReasonSchema, message: Schema.String, retryable: Schema.Boolean },
 ) {}
 
 export const ModelCandidateError = Schema.Union(

@@ -3,6 +3,7 @@ import { Effect, Option } from "effect"
 import {
   CatalogFormModelIdSchema,
   CustomFormModelIdSchema,
+  DirectoryNotFound,
   type CustomLocalModel,
   type ModelCatalogState,
 } from "@magnitudedev/sdk"
@@ -33,6 +34,7 @@ import { registerInferenceCommands } from "./inference"
 import type { CliModelsClient } from "./inference-client"
 import { parseDrafterArgument, parsePullReference } from "./model-references"
 import { asJson, jsonDocument, runCommand } from "./output"
+import { findModel } from "./model-format"
 import {
   addModelFolder,
   cancelDownload,
@@ -405,6 +407,10 @@ describe("candidate inspection", () => {
       versions: makeInspection().versions.map((version) => ({ ...version, recommended: false })),
     })
     expect(renderInspection({ inspection: tooLarge, drafters: [], models: [] })).toContain("No version of this model runs on this computer.")
+    const nothingRuns = makeInspection({ versions: [makeInspection().versions[0]!, makeInspection().versions[3]!] })
+    expect(renderInspection({ inspection: nothingRuns, drafters: [], models: [] })).toContain(
+      "No version of this model runs on this computer. Some versions are too large for this machine, and Magnitude can't run the others: Uses Q2_K weights, which Magnitude doesn't support yet.",
+    )
     const local = makeInspection({
       source: { _tag: "Local", path: "/models" },
       versions: [{ ...makeInspection().versions[2]!, label: "Q4_K_M", files: ["qwen.gguf"] }],
@@ -419,6 +425,10 @@ describe("candidate inspection", () => {
     expect(versionVerdict(onDisk!, true)).toBe("Fits (selected) · already on this computer")
     expect(versionVerdict(recommended!, true)).toBe("Fits (recommended)")
     expect(versionVerdict({ ...recommended!, assessment: Option.none() }, false)).toBe("Not assessed (recommended)")
+    const tensors = Array.from({ length: 60 }, (_, index) => ({ _tag: "UnrecognizedTensor" as const, name: `blk.${index}.attn_k` }))
+    expect(versionVerdict({ ...large!, assessment: Option.some({
+      _tag: "Unsupported", environmentId: "environment", profile: { contextLength: 32_768 }, reasons: tensors, detail: "",
+    } as never) }, false)).toBe("Unsupported: Has parts Magnitude doesn't recognize (60 tensors)")
   })
 })
 
@@ -428,6 +438,7 @@ describe("pull and model mutations", () => {
     version: "Q4_K_P",
     drafter,
     outcome,
+    drafterDownloadStarted: outcome === "AlreadyOnThisComputer" && Option.isSome(drafter),
   })
 
   it("prints the chosen version, drafter, and model ID", () => {
@@ -466,15 +477,15 @@ describe("pull and model mutations", () => {
 
   it("renders import and drafter acknowledgements", () => {
     const modelId = CustomFormModelIdSchema.make(`local:${"b".repeat(64)}`)
-    expect(renderImport({ path: "/models/q.gguf", modelId, drafter: Option.none() })).toBe([
+    expect(renderImport({ path: "/models/q.gguf", modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe([
       "Added /models/q.gguf. Magnitude uses the file where it is and never moves or deletes it.",
       "Drafter: none",
       `Model ID: ${modelId}`,
       `Load it: magnitude models load ${modelId}`,
       "",
     ].join("\n"))
-    expect(renderSetDrafter({ modelId, drafter: Option.none() })).toBe(`Turned off the drafter for ${modelId}.\n`)
-    expect(renderSetDrafter({ modelId, drafter: Option.none() }, "Auto"))
+    expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false })).toBe(`Turned off the drafter for ${modelId}.\n`)
+    expect(renderSetDrafter({ modelId, drafter: Option.none(), drafterDownloadStarted: false }, "Auto"))
       .toBe(`No drafter is known to work with ${modelId}, so it runs without one.\n`)
     expect(renderRemoval(modelId, Option.some({ _tag: "Imported", path: "/models/q.gguf" })))
       .toBe(`Forgot ${modelId}. Magnitude never deletes your file; it stays where it is.\n`)
@@ -482,8 +493,11 @@ describe("pull and model mutations", () => {
       .toContain(`Hid ${FOUND_MODEL_ID} from Magnitude. Its files are untouched.`)
     expect(renderRemoval(ADDED_MODEL_ID, Option.some({ _tag: "Added", repository: TEST_REPOSITORY, commit: TEST_COMMIT })))
       .toContain("Magnitude deleted only its own copy")
-    expect(renderSetDrafter({ modelId, drafter: Option.some(makeDrafterCandidate()) }))
+    expect(renderSetDrafter({ modelId, drafter: Option.some(makeDrafterCandidate()), drafterDownloadStarted: true }))
       .toContain(`Downloading the drafter.\nCheck progress: magnitude models status ${modelId}`)
+    const onDisk = renderSetDrafter({ modelId, drafter: Option.some(makeDrafterCandidate({ onThisComputer: false })), drafterDownloadStarted: false })
+    expect(onDisk).toBe(`Drafter for ${modelId}: ${makeDrafterCandidate().name}.\n`)
+    expect(onDisk).not.toContain("Downloading")
   })
 
   const pullReference = (input: string) => Effect.runSync(parsePullReference(input))
@@ -730,8 +744,8 @@ describe("model locations", () => {
       "Automatic locations",
       "",
       "LOCATION            STATUS     PATH",
-      "Hugging Face cache  Scanning   /Volumes/hf/hub",
-      "Hugging Face cache  Scanning   /Users/test/.cache/huggingface/hub",
+      "Hugging Face cache  Found      /Volumes/hf/hub",
+      "Hugging Face cache  Found      /Users/test/.cache/huggingface/hub",
       "LM Studio           Not found  /Users/test/.lmstudio/models",
       "LM Studio           Not found  /Users/test/.cache/lm-studio/models",
       "Ollama              Off        /Users/test/.ollama/models",
@@ -739,7 +753,7 @@ describe("model locations", () => {
       "Your folders",
       "",
       "PATH                      STATUS",
-      "/Volumes/External/models  Scanning",
+      "/Volumes/External/models  Found",
       "",
     ].join("\n"))
     expect(renderModelLocations(makeLocations().slice(0, 1))).toContain("No folders added. Add one: magnitude models folders add <path>")
@@ -754,7 +768,7 @@ describe("model locations", () => {
       ], enabled: true, automatic: true, state: "Found" },
       { kind: "Folder", paths: [{ path: "/srv/models", state: "Unreadable" }], enabled: true, automatic: false, state: "Unreadable" },
     ])
-    expect(rendered).toContain("Ollama    Scanning    /home/ada/.ollama/models")
+    expect(rendered).toContain("Ollama    Found       /home/ada/.ollama/models")
     expect(rendered).toContain("Ollama    Can't read  /usr/share/ollama/.ollama/models")
     expect(rendered).not.toContain("/var/lib/ollama")
     expect(rendered).toContain("Can't read /usr/share/ollama/.ollama/models. Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here.")
@@ -805,13 +819,13 @@ describe("--json output", () => {
       _tag: "HuggingFace",
       repository: TEST_REPOSITORY,
       versionRequested: false,
-      added: { modelId: ADDED_MODEL_ID, version: "Q4_K_P", drafter: Option.none(), outcome: "Started" },
+      added: { modelId: ADDED_MODEL_ID, version: "Q4_K_P", drafter: Option.none(), outcome: "Started", drafterDownloadStarted: false },
     })
     expect(pull).toEqual({
       _tag: "HuggingFace",
       repository: TEST_REPOSITORY,
       versionRequested: false,
-      added: { modelId: ADDED_MODEL_ID, version: "Q4_K_P", outcome: "Started" },
+      added: { modelId: ADDED_MODEL_ID, version: "Q4_K_P", outcome: "Started", drafterDownloadStarted: false },
     })
 
     expect(encode(catalogStatusJson, { _tag: "Initializing" })).toEqual({})
@@ -849,14 +863,57 @@ describe("--json output", () => {
       path: "/m/q.gguf",
       modelId: CustomFormModelIdSchema.make(`local:${"d".repeat(64)}`),
       drafter: Option.none(),
-    })).toEqual({ path: "/m/q.gguf", modelId: `local:${"d".repeat(64)}` })
+      drafterDownloadStarted: false,
+    })).toEqual({ path: "/m/q.gguf", modelId: `local:${"d".repeat(64)}`, drafterDownloadStarted: false })
   })
 
-  it("keeps errors on stderr in JSON mode", async () => {
-    const result = await capture(() => showModelsStatus("bad", { json: true }))
+  it.each([
+    [() => showModelsStatus("bad", { json: true }), "Invalid model ID: bad"],
+    [() => removeModel("nonsense", { json: true }), "Invalid model ID: nonsense"],
+    [() => loadInstance("local:not-a-digest", { json: true }), "Invalid model ID: local:not-a-digest"],
+    [() => searchHuggingFace("  ", { json: true }), "Search query must not be empty"],
+    [() => hideModel("nope", { json: true }), "Invalid model ID: nope"],
+  ])("prints one JSON error document on stderr in JSON mode (%#)", async (command, message) => {
+    const result = await capture(command)
     expect(result.stdout).toBe("")
-    expect(result.stderr).toBe("Invalid model ID: bad\n")
+    expect(JSON.parse(result.stderr)).toEqual({ error: { message, code: "model_command_error" } })
     expect(result.exitCode).toBe(1)
+  })
+
+  it("says plainly that a folder to add doesn't exist, in text and in JSON", async () => {
+    const missing = new DirectoryNotFound({ path: "/home/qa/nonexistent" })
+    const text = await capture(() => runCommand({ effect: Effect.fail(missing), render: () => "", json: asJson({}, searchJson) }))
+    expect(text.stderr).toBe("/home/qa/nonexistent doesn't exist.\n")
+    const json = await capture(() => runCommand({ effect: Effect.fail(missing), render: () => "", json: asJson({ json: true }, searchJson) }))
+    expect(JSON.parse(json.stderr)).toEqual({ error: { message: "/home/qa/nonexistent doesn't exist.", code: "directory_not_found" } })
+  })
+
+  it("carries the service's own failure code in the JSON error document", async () => {
+    const failure = { _tag: "LocalModelMutationFailed", code: "managed_model_not_hideable", message: "Remove it instead.", retryable: false }
+    const result = await capture(() => runCommand({ effect: Effect.fail(failure), render: () => "", json: asJson({ json: true }, searchJson) }))
+    expect(JSON.parse(result.stderr)).toEqual({ error: { message: "Remove it instead.", code: "managed_model_not_hideable" } })
+    const text = await capture(() => runCommand({ effect: Effect.fail(failure), render: () => "", json: asJson({}, searchJson) }))
+    expect(text.stderr).toBe("Remove it instead.\n")
+  })
+})
+
+describe("upgraded model IDs", () => {
+  it("finds the catalog model a request names by the ID its files had as a found model", async () => {
+    const alias = CustomFormModelIdSchema.make("hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf")
+    const base = makeCatalogModel()
+    const catalog = makeCatalogModel({ catalogData: { ...base.catalogData, aliases: [alias] } })
+    const found = await run(findModel([catalog], alias))
+    expect(found._tag === "Right" && found.right.modelId).toBe(catalog.modelId)
+  })
+})
+
+describe("custom model license", () => {
+  it("shows a custom model's license in its details when it is known", () => {
+    const base = makeFoundModel()
+    const licensed = makeFoundModel({ presentation: { ...base.presentation, license: Option.some("apache-2.0") } })
+    expect(renderModelDetail({ model: licensed, models: [], drafters: { _tag: "NotApplicable" } })).toMatch(/License\s+apache-2\.0/)
+    expect(renderModelDetail({ model: makeFoundModel({ presentation: { ...base.presentation, license: Option.none() } }), models: [], drafters: { _tag: "NotApplicable" } }))
+      .not.toContain("License")
   })
 })
 

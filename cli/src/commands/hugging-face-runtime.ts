@@ -2,8 +2,11 @@ import {
   candidateDownloadBytes,
   catalogVariantOfName,
   formatStorageSize,
+  noRunnableVersionReason,
   preselectedDrafterCandidate,
-  unsupportedReasonMessage,
+  unsupportedReasonGroupMessage,
+  unsupportedReasonGroups,
+  type UnsupportedReasonGroup,
   unsupportedReasonMessages,
 } from "@magnitudedev/client-common"
 import {
@@ -151,11 +154,12 @@ export const chosenVersion = (inspection: CandidateInspection): Option.Option<Ca
     onNone: () => Option.fromNullable(inspection.versions.find(({ recommended }) => recommended)),
   })
 
-const shortUnsupportedReason = (reason: UnsupportedReason): string => {
+const shortUnsupportedReason = (group: UnsupportedReasonGroup): string => {
+  const { reason } = group
   switch (reason._tag) {
     case "WeightTypes": return `${reason.types.map(({ ggmlType }) => ggmlType).join(", ")} weights`
     case "Architecture": return `${reason.architecture} architecture`
-    default: return unsupportedReasonMessage(reason)
+    default: return unsupportedReasonGroupMessage(group)
   }
 }
 
@@ -166,7 +170,7 @@ export const versionVerdict = (version: CandidateVersion, selected: boolean): st
       switch (assessment._tag) {
         case "Fits": return "Fits"
         case "DoesNotFit": return "Too large"
-        case "Unsupported": return `Unsupported: ${[...new Set(assessment.reasons.map(shortUnsupportedReason))].join(", ")}`
+        case "Unsupported": return `Unsupported: ${[...new Set(unsupportedReasonGroups(assessment.reasons).map(shortUnsupportedReason))].join(", ")}`
       }
     },
   })
@@ -203,7 +207,7 @@ const isRunnable = (version: CandidateVersion) =>
 
 export const acquisitionHint = (inspection: CandidateInspection): string => Option.match(
   Option.filter(chosenVersion(inspection), isRunnable), {
-    onNone: () => "No version of this model runs on this computer.",
+    onNone: () => ["No version of this model runs on this computer.", ...Option.toArray(noRunnableVersionReason(inspection.versions))].join(" "),
     onSome: (version) => inspection.source._tag === "HuggingFace"
       ? `Download: magnitude catalog pull ${inspection.source.repository}:${version.label}`
       : `Add: magnitude models import ${join(inspection.source.path, version.files[0]!)}`,
@@ -324,13 +328,14 @@ export const drafterChoice = (argument: Exclude<DrafterArgument, { readonly _tag
 
 const HUB_URL = /^https?:\/\/(?:www\.)?huggingface\.co\/([^/]+\/[^/]+)\/(?:blob|resolve)\/[^/]+\/(.+)$/
 const HUB_REFERENCE = /^([^/@:\s]+\/[^/@:\s]+)(?:@[^:]+)?:(.+)$/
+const HUB_FILE = /^(?:hf:)?([^/@:\s]+\/[^/@:\s]+)\/([^:]+)$/i
 
 /** Whether a typed drafter reference names an already listed candidate: the same Hub file or the same local path. */
 export const drafterReferenceMatches = (input: string, reference: DrafterCandidate["reference"]): boolean => {
   const typed = input.trim()
   switch (reference._tag) {
     case "HuggingFace": {
-      const hub = HUB_URL.exec(typed) ?? HUB_REFERENCE.exec(typed)
+      const hub = HUB_URL.exec(typed) ?? HUB_REFERENCE.exec(typed) ?? HUB_FILE.exec(typed)
       return hub !== null
         && hub[1]!.toLowerCase() === reference.repository.toLowerCase()
         && decodeURIComponent(hub[2]!) === reference.path
@@ -392,9 +397,6 @@ export const PullResultSchema = Schema.Union(
 )
 export type PullResult = typeof PullResultSchema.Type
 
-const drafterDownloads = (drafter: Option.Option<DrafterCandidate>) =>
-  Option.exists(drafter, (candidate) => !candidate.onThisComputer && candidate.reference._tag !== "Embedded")
-
 const syncStarted = (modelId: string, outcome: Exclude<LocalModelSyncOutcome, "AlreadyCurrent">): string => {
   const started = {
     Installing: `Downloading ${modelId}.`,
@@ -423,10 +425,10 @@ export const renderPull = (result: PullResult): string => {
     progress,
   ].join("\n"))
   return ensureTrailingNewline([
-    `${name}${choice} is already on this computer. ${drafterDownloads(added.drafter) ? "Downloading only the drafter." : "Nothing to download."}`,
+    `${name}${choice} is already on this computer. ${added.drafterDownloadStarted ? "Downloading only the drafter." : "Nothing to download."}`,
     drafter,
     `Model ID: ${added.modelId}`,
-    drafterDownloads(added.drafter) ? progress : `Load it: magnitude models load ${added.modelId}`,
+    added.drafterDownloadStarted ? progress : `Load it: magnitude models load ${added.modelId}`,
   ].join("\n"))
 }
 

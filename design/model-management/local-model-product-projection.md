@@ -48,7 +48,10 @@ instances separately, then publishes one `LocalModel` union:
   state, and, for `Added` only, managed acquisition state. ICN names it: the repository's name when
   the file has a Hub identity (as the repository step does), else the GGUF's `general.name`, else
   the file name, each without the quantization and with separators as spaces, and the quantization
-  its file names (`Q4_K_M`) as the variant label; without one, ACN labels it by bit width.
+  its file names (`Q4_K_M`) as the variant label, else its header's `general.file_type` label; only
+  without either does ACN label it by bit width. ICN also gives its license when known: the Hub
+  card's when the repository is known, else the GGUF's `general.license` (its
+  `general.license.name` when the license is `other`).
 
 `LocalModelsState` separately lists unsupported local models: display name, origin, location, the
 complete list of structured reasons, and developer detail. It combines the groups ICN could not
@@ -73,7 +76,10 @@ Actions follow who owns the files:
 | Catalog, files only in an external location | Hide from Magnitude; Remove explains where the files are | New catalog revision | The catalog's |
 
 Adding a drafter to a model whose target is present downloads only the drafter. When a catalog
-drafter gets a new revision, every model using it shows Update.
+drafter gets a new revision, every model using it shows Update. Hide applies only to found models
+(including a catalog model whose files are only in an external location); ACN refuses to hide an
+added or imported model (`managed_model_not_hideable`) and points to Remove. Importing a file
+refuses a folder.
 
 The same projection publishes a small preparation summary derived directly from the current ICN
 source and assessment snapshots: local-model scan completion and the custom-model count (catalog
@@ -133,8 +139,14 @@ remain authoritative.
   imported models they appear only in the unsupported list, with every reason; targets whose
   assessment attempt fails are omitted.
 - Hidden models appear only in the hidden list, are never assessed, and are never offered. A catalog
-  model whose installation is entirely externally owned is a found copy: ACN keeps it in the same
-  hidden list when the user hides it, and shows it again once Magnitude owns any of its files.
+  model whose installation is entirely externally owned is a found copy: hiding it adds the catalog
+  model's `aliases` (the `hf:` IDs its external files have as found models) to the hidden IDs, so ICN
+  stops attributing that copy to the catalog model and lists it as a hidden found model; unhiding the
+  catalog ID or the alias removes them. A catalog model with a Magnitude-owned copy can't be hidden.
+- Catalog rows carry `aliases`, except a hidden external copy's ID, which names that hidden found
+  model and is never resolved to the catalog model. A request naming an alias (load, sync, remove, status) means that
+  catalog model, and ACN rewrites persisted references to an alias (slot selections, recents,
+  favorites, and connected harnesses' selections, automatically) to the catalog ID.
 - Catalog rows carry their catalog support level unchanged; support and assessment stay separate
   facts in the projection.
 - Found and imported models can be selected and loaded but cannot be installed, updated, or deleted;

@@ -6,6 +6,7 @@ import {
   OPENAI_BASE_URL,
   defineConnector,
   jsonObject,
+  magnitudeSelection,
   readOr,
   qualifiedModelSelection,
   removeJsoncPaths,
@@ -69,6 +70,8 @@ export const makeClineConnector = (paths: HarnessConnectionPaths, baseUrl = OPEN
   executable: "cline",
   skillInstallationTarget: "cline-user",
   configurationFiles: [paths.clineProviders, paths.clineModels],
+  selectedModel: readOr(paths.clineProviders, "{}\n").pipe(Effect.map((source) =>
+    magnitudeSelection(valueAt(jsonObject(source), ["providers", "openai-compatible", "settings", "model"]), ""))),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.clineProviders, "{}\n")
     const value = jsonObject(source)

@@ -59,7 +59,8 @@ impl ModelFingerprint {
         Self::from_directory(headers.target())
     }
 
-    /// The fingerprint of a target's header directory. A per-layer head
+    /// The fingerprint of a target's header directory. Its block count is the decoder's, without
+    /// MTP prediction layers (`nextn_predict_layers`). A per-layer head
     /// count is its largest layer's (recurrent layers state zero key-value
     /// heads); an absent key-value count is the head count and an absent key
     /// length is the embedding length per head, as llama.cpp reads them. A
@@ -97,7 +98,13 @@ impl ModelFingerprint {
         let narrow = |name: &str, value: u64| {
             u32::try_from(value).map_err(|_| FingerprintError::Invalid(name.to_owned()))
         };
-        let block_count = required("block_count")?;
+        // A file carrying MTP heads counts them as extra blocks; the decoder is the same with or
+        // without them, so a conversion that dropped the heads keeps the fingerprint.
+        let prediction_layers = count("nextn_predict_layers")?.unwrap_or(0);
+        let block_count = required("block_count")?
+            .checked_sub(prediction_layers)
+            .filter(|blocks| *blocks > 0)
+            .ok_or_else(|| FingerprintError::Invalid(key("nextn_predict_layers")))?;
         let embedding_length = required("embedding_length")?;
         let head_count = required("attention.head_count")?;
         let head_count_kv = count("attention.head_count_kv")?

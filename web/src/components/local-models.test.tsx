@@ -44,6 +44,8 @@ describe("removing by origin", () => {
     expect(render(customModel(added))).toContain('title="Remove download"')
     expect(render(customModel(imported))).toContain('aria-label="Remove Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
     expect(render(customModel(foundIn({ _tag: "Ollama" })))).toContain('aria-label="Hide Qwen3.6 35B A3B Uncensored (Q4_K_P) from Magnitude"')
+    expect(render(customModel(added))).not.toContain("Hide")
+    expect(render(customModel(imported))).not.toContain("Hide")
   })
   it("never offers deleting a catalog model whose files are only in another app's location", () => {
     const external = catalogModel()
@@ -79,6 +81,13 @@ describe("models that can't run", () => {
     expect(html).toContain("text-slate-500")
     expect(html).not.toMatch(/<button/)
     expect(html).not.toContain("PRIVATE<")
+  })
+  it("says many unrecognized tensors once", () => {
+    const gemma = unsupportedLocal("Gemma 4 E2B (Q4_K_M)", foundIn({ _tag: "LmStudio" }), { _tag: "UnrecognizedTensor", name: "blk.15.attn_k" })
+    const tensors = Array.from({ length: 60 }, (_, index) => ({ _tag: "UnrecognizedTensor" as const, name: `blk.${15 + index}.attn_k` }))
+    const html = renderToStaticMarkup(<UnsupportedModels models={[{ ...gemma, reasons: [tensors[0]!, ...tensors.slice(1)] }]} />)
+    expect(html).toContain("Has parts Magnitude doesn&#x27;t recognize (60 tensors)")
+    expect(html).not.toContain("blk.15.attn_k")
   })
   it("is absent when everything runs", () => {
     expect(renderToStaticMarkup(<UnsupportedModels models={[]} />)).toBe("")

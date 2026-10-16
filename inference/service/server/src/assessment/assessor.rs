@@ -287,14 +287,15 @@ impl ModelAssessor {
 
 /// The components the engine reads: the target GGUF (a split target by its first shard, beside
 /// which the engine finds the others), its projector and a separate draft, with the method the
-/// bundle declares. A standalone package resolves its method from the package (`Auto`); a
-/// speculative bundle declares its method, and the engine rejects a draft that does not implement
-/// it rather than serving the target plain.
+/// bundle declares. A standalone package is served plain, even when its file carries MTP heads:
+/// heads are used only through a bundle that declares them. A speculative bundle declares its
+/// method, and the engine rejects a draft that does not implement it rather than serving the
+/// target plain.
 pub(crate) fn engine_material(
     resolved: &ResolvedServableModelBundle,
 ) -> Result<ModelPackagePaths, InventoryError> {
     let (method, draft) = match &resolved.bundle {
-        ServableModelBundle::Standalone { .. } => (ModelMethod::Auto, None),
+        ServableModelBundle::Standalone { .. } => (ModelMethod::Plain, None),
         ServableModelBundle::SpeculativeDecoding {
             draft_source,
             method,
@@ -895,6 +896,19 @@ mod tests {
             assert_eq!(material.draft, Some(PathBuf::from("/models/draft.gguf")));
             assert_eq!(material.method, expected);
         }
+        let standalone = engine_material(&ResolvedServableModelBundle::new(
+            ServableModelBundle::Standalone {
+                package: package("target"),
+            },
+            resolved_model("target.gguf"),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(
+            (standalone.draft, standalone.method),
+            (None, ModelMethod::Plain),
+            "a standalone package never drafts with heads its file carries"
+        );
         let embedded = engine_material(&speculative(false, SpeculativeMethod::Mtp)).unwrap();
         assert_eq!((embedded.draft, embedded.method), (None, ModelMethod::Mtp));
         for (draft, method) in [

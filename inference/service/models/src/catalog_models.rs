@@ -6,7 +6,8 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use magnitude_service_contracts::InventoryError;
 use magnitude_service_contracts::models::{
-    CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModel, CatalogModelState,
+    CatalogBaseId, CatalogInstallationAdmission, CatalogInstallationRemoval, CatalogModel,
+    CatalogModelState, CatalogVariantId,
     CatalogModelUpdate, CatalogModels, CatalogModelsResponse, CatalogPackageRole, CatalogSupport,
     EffectiveModel,
     InstalledCatalogAttribution, InstalledModelPackage, ModelAssessmentSubject,
@@ -30,24 +31,32 @@ pub struct CatalogRemovalPlan {
     pub shared: bool,
 }
 
+/// Removal deletes Magnitude's own copies of the model's packages and never another app's files.
+/// A target with no copy of Magnitude's own is retained as externally owned; one that another
+/// catalog model shares is retained as shared. When an external copy of the target remains after
+/// Magnitude's is removed, it serves the catalog model from where it is.
 fn removal_plan(
     ids: &BTreeSet<ModelPackageId>,
     target_ids: &BTreeSet<ModelPackageId>,
-    external_ids: &BTreeSet<ModelPackageId>,
+    managed_ids: &BTreeSet<ModelPackageId>,
     shared_ids: &BTreeSet<ModelPackageId>,
 ) -> CatalogRemovalPlan {
+    let managed_targets = target_ids
+        .intersection(managed_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     CatalogRemovalPlan {
-        package_ids: if target_ids.is_empty() {
+        package_ids: if managed_targets.is_empty() {
             Vec::new()
         } else {
-            ids.difference(external_ids)
+            ids.intersection(managed_ids)
                 .filter(|package_id| !shared_ids.contains(*package_id))
                 .cloned()
                 .collect()
         },
         installed: !target_ids.is_empty(),
-        externally_owned: !target_ids.is_disjoint(external_ids),
-        shared: !target_ids.is_disjoint(shared_ids),
+        externally_owned: managed_targets.is_empty(),
+        shared: !managed_targets.is_disjoint(shared_ids),
     }
 }
 
@@ -85,6 +94,25 @@ impl ModelDomainResolver {
                 self.custom_serving_configuration(model_id)
             }
         }
+    }
+
+    /// The model a request names: an `hf:` ID a catalog model lists as an alias (the ID its exact
+    /// target had as a found model before it was attributed) is that catalog model; every other ID
+    /// is itself.
+    pub fn canonical_model_id(&self, model_id: ModelId) -> Result<ModelId, InventoryError> {
+        if !matches!(model_id.parsed(), ParsedModelId::HuggingFace { .. }) {
+            return Ok(model_id);
+        }
+        let records = self
+            .inventory
+            .installed_packages
+            .read()
+            .map_err(|_| InventoryError::Internal("installed package lock poisoned".to_owned()))?;
+        let aliased = catalog_aliases(records.records.values().map(|record| &record.installed), None)
+            .into_iter()
+            .find(|(_, aliases)| aliases.contains(&model_id))
+            .map(|((base, variant), _)| ModelId::catalog(&base, &variant));
+        Ok(aliased.unwrap_or(model_id))
     }
 
     pub fn assessment_configuration(
@@ -172,11 +200,16 @@ impl ModelDomainResolver {
             .entries()
             .cloned()
             .collect::<Vec<_>>();
-        let occurrence_origins = self
+        let records = self
             .inventory
             .installed_packages
             .read()
-            .map_err(|_| InventoryError::Internal("installed package lock poisoned".to_owned()))?
+            .map_err(|_| InventoryError::Internal("installed package lock poisoned".to_owned()))?;
+        let aliases = catalog_aliases(
+            records.records.values().map(|record| &record.installed),
+            Some(&self.catalog.models),
+        );
+        let occurrence_origins = records
             .records
             .values()
             .fold(
@@ -197,7 +230,13 @@ impl ModelDomainResolver {
                 .models
                 .iter()
                 .map(|definition| {
-                    catalog_model(definition, &present, &affiliations, &occurrence_origins)
+                    let mut model =
+                        catalog_model(definition, &present, &affiliations, &occurrence_origins);
+                    model.aliases = aliases
+                        .get(&(definition.model_id.clone(), definition.variant_id.clone()))
+                        .map(|aliases| aliases.iter().cloned().collect())
+                        .unwrap_or_default();
+                    model
                 })
                 .collect(),
         })
@@ -225,11 +264,19 @@ impl ModelDomainResolver {
             .entries()
             .cloned()
             .collect::<Vec<_>>();
+        let attributed = |entry: &InstalledModelPackage| {
+            matches!(
+                &entry.catalog_attribution,
+                InstalledCatalogAttribution::Attributed { model_id, variant_id }
+                    if model_id == &definition.model_id && variant_id == &definition.variant_id
+            )
+        };
         let ids = installed
             .packages
             .iter()
             .filter(|entry| {
-                catalog_packages(definition).any(|(package, _)| package.id == entry.package.id)
+                attributed(entry)
+                    || catalog_packages(definition).any(|(package, _)| package.id == entry.package.id)
                     || affiliations.iter().any(|affiliation| {
                         affiliation.model_id == definition.model_id
                             && affiliation.variant_id == definition.variant_id
@@ -238,16 +285,22 @@ impl ModelDomainResolver {
             })
             .map(|entry| entry.package.id.clone())
             .collect::<BTreeSet<_>>();
+        let attributed_targets = installed
+            .packages
+            .iter()
+            .filter(|entry| attributed(entry))
+            .map(|entry| entry.package.id.clone())
+            .collect::<BTreeSet<_>>();
         let occurrences =
             self.inventory.installed_packages.read().map_err(|_| {
                 InventoryError::Internal("installed package lock poisoned".to_owned())
             })?;
-        let external_ids = occurrences
+        let managed_ids = occurrences
             .records
             .values()
             .filter(|record| {
                 ids.contains(&record.installed.package.id)
-                    && record.installed.origin != ModelPackageInstallationOrigin::Magnitude
+                    && record.installed.origin == ModelPackageInstallationOrigin::Magnitude
             })
             .map(|record| record.installed.package.id.clone())
             .collect::<BTreeSet<_>>();
@@ -270,6 +323,7 @@ impl ModelDomainResolver {
             .iter()
             .filter(|package_id| {
                 **package_id == catalog_target(definition).id
+                    || attributed_targets.contains(*package_id)
                     || affiliations.iter().any(|affiliation| {
                         affiliation.model_id == definition.model_id
                             && affiliation.variant_id == definition.variant_id
@@ -279,7 +333,7 @@ impl ModelDomainResolver {
             })
             .cloned()
             .collect::<BTreeSet<_>>();
-        Ok(removal_plan(&ids, &target_ids, &external_ids, &shared_ids))
+        Ok(removal_plan(&ids, &target_ids, &managed_ids, &shared_ids))
     }
 
     pub(crate) fn catalog_cleanup_package_ids(
@@ -470,6 +524,7 @@ fn catalog_model(
         support: definition.support.clone(),
         fidelity_rank: definition.fidelity_rank,
         quantization_aware: definition.quantization_aware,
+        aliases: Vec::new(),
         local_state: match resolution.state {
             CatalogMaterialState::NotInstalled => CatalogModelState::NotInstalled,
             CatalogMaterialState::Installed {
@@ -547,10 +602,18 @@ fn catalog_resolution<'a>(
         .filter(|package_id| !present.contains_key(*package_id))
         .cloned()
         .collect::<Vec<_>>();
+    // A missing package's files already present elsewhere (its exact target weights found in a
+    // Hugging Face cache) are copied locally, not downloaded.
+    let present_files = present
+        .values()
+        .flat_map(|entry| &entry.package.files)
+        .map(|file| &file.id)
+        .collect::<BTreeSet<_>>();
     let required_download_bytes = desired_packages
         .iter()
         .filter(|(package, _)| !present.contains_key(&package.id))
         .flat_map(|(package, _)| &package.files)
+        .filter(|file| !present_files.contains(&file.id))
         .map(|file| file.size_bytes)
         .sum();
     let superseded_package_ids = affiliations
@@ -653,6 +716,41 @@ fn catalog_resolution<'a>(
         required_download_bytes,
         state,
     }
+}
+
+/// The `hf:` IDs of external installations of each catalog variant's exact target: what each is
+/// called as a found custom model. Attributed copies always count; with `catalog`, so do exact
+/// copies that are hidden (and so not attributed), which the catalog lists so they can be unhidden
+/// by the catalog ID.
+fn catalog_aliases<'a>(
+    installed: impl Iterator<Item = &'a InstalledModelPackage>,
+    catalog: Option<&[RecommendableModel]>,
+) -> BTreeMap<(CatalogBaseId, CatalogVariantId), BTreeSet<ModelId>> {
+    let mut aliases = BTreeMap::<_, BTreeSet<ModelId>>::new();
+    for entry in installed {
+        if entry.origin == ModelPackageInstallationOrigin::Magnitude {
+            continue;
+        }
+        let Some(alias) = crate::package_service::hub_model_id(&entry.package) else {
+            continue;
+        };
+        let mut variants = Vec::new();
+        if let InstalledCatalogAttribution::Attributed {
+            model_id,
+            variant_id,
+        } = &entry.catalog_attribution
+        {
+            variants.push((model_id.clone(), variant_id.clone()));
+        }
+        variants.extend(catalog.into_iter().flatten().filter_map(|definition| {
+            crate::package_service::exact_target_weights(catalog_target(definition), &entry.package)
+                .then(|| (definition.model_id.clone(), definition.variant_id.clone()))
+        }));
+        for variant in variants {
+            aliases.entry(variant).or_default().insert(alias.clone());
+        }
+    }
+    aliases
 }
 
 pub(crate) fn catalog_id(definition: &RecommendableModel) -> ModelId {
@@ -811,9 +909,10 @@ mod tests {
         let plan = removal_plan(
             &ids,
             &BTreeSet::from([target.clone()]),
-            &BTreeSet::from([external_dependency]),
+            &BTreeSet::from([target.clone(), shared_dependency.clone()]),
             &BTreeSet::from([shared_dependency]),
         );
+        let _ = external_dependency;
         assert!(plan.installed);
         assert!(!plan.externally_owned);
         assert!(!plan.shared);
@@ -824,15 +923,26 @@ mod tests {
     fn removal_is_retained_when_the_target_itself_is_external_or_shared() {
         let target = ModelPackageId("target".to_owned());
         let ids = BTreeSet::from([target.clone()]);
-        let external = removal_plan(
-            &ids,
-            &ids,
-            &BTreeSet::from([target.clone()]),
-            &BTreeSet::new(),
-        );
+        let external = removal_plan(&ids, &ids, &BTreeSet::new(), &BTreeSet::new());
         assert!(external.externally_owned);
-        let shared = removal_plan(&ids, &ids, &BTreeSet::new(), &BTreeSet::from([target]));
+        assert!(external.package_ids.is_empty());
+        let shared = removal_plan(&ids, &ids, &ids, &BTreeSet::from([target]));
         assert!(shared.shared);
+    }
+
+    /// After upgrading from 0.2.9, the catalog's target is both in Magnitude's store and in a
+    /// Hugging Face cache: removal deletes Magnitude's copy and keeps the cache's, which then
+    /// serves the catalog model.
+    #[test]
+    fn removal_deletes_magnitudes_copy_when_an_external_copy_of_the_target_also_exists() {
+        let managed = ModelPackageId("target".to_owned());
+        let external = ModelPackageId("found-weights".to_owned());
+        let ids = BTreeSet::from([managed.clone(), external.clone()]);
+        let plan = removal_plan(&ids, &ids, &BTreeSet::from([managed.clone()]), &BTreeSet::new());
+        assert!(plan.installed);
+        assert!(!plan.externally_owned);
+        assert!(!plan.shared);
+        assert_eq!(plan.package_ids, vec![managed]);
     }
 
     #[test]
@@ -922,6 +1032,81 @@ mod tests {
             resolution.state,
             CatalogMaterialState::NotInstalled
         ));
+    }
+
+    #[test]
+    fn exact_target_weights_found_externally_install_the_catalog_model_and_only_the_rest_is_downloaded() {
+        let found = package("found", 3_000);
+        let mut target = found.clone();
+        target.id = ModelPackageId("target".to_owned());
+        target.files.push(ModelFile {
+            id: ModelFileId("file-projector".to_owned()),
+            path: PathBuf::from("mmproj.gguf"),
+            role: ModelFileRole::Projector,
+            size_bytes: 600,
+            tensor_storage_bytes: Some(600),
+            sha256: "b".repeat(64),
+        });
+        let draft = package("draft", 900);
+        let definition = definition(ServableModelBundle::SpeculativeDecoding {
+            target,
+            draft_source: SpeculativeDraftSource::Separate { draft },
+            method: SpeculativeMethod::DFlash,
+        });
+        let mut external = installed(found, ModelPackageInstallationOrigin::HuggingFaceCache);
+        external.catalog_attribution = InstalledCatalogAttribution::Attributed {
+            model_id: definition.model_id.clone(),
+            variant_id: definition.variant_id.clone(),
+        };
+        let present = BTreeMap::from([(external.package.id.clone(), &external)]);
+        let model = catalog_model(&definition, &present, &[], &BTreeMap::new());
+        let CatalogModelState::Installed {
+            effective: EffectiveModel::Ready { .. },
+            installation: ModelInstallation::Resolved { ownership, .. },
+            update_state:
+                CatalogModelUpdate::Available {
+                    required_download_bytes,
+                },
+        } = model.local_state
+        else {
+            panic!("the found exact target is the installed catalog model: {:?}", model.local_state);
+        };
+        assert_eq!(ownership, ModelInstallationOwnership::External);
+        assert_eq!(
+            required_download_bytes,
+            600 + 900,
+            "the target weights are already here; only the projector and drafter are fetched"
+        );
+    }
+
+    #[test]
+    fn an_attributed_external_target_keeps_the_hub_id_it_had_as_a_found_model_as_an_alias() {
+        let definition = definition(ServableModelBundle::Standalone {
+            package: package("target", 10),
+        });
+        let mut found = package("found", 10);
+        found.source = ModelPackageSource::HuggingFace {
+            repository: "unsloth/Qwen3.5-4B-MTP-GGUF".to_owned(),
+            revision: "a".repeat(40),
+        };
+        found.files[0].path = PathBuf::from("Qwen3.5-4B-UD-Q4_K_XL.gguf");
+        let mut external = installed(found.clone(), ModelPackageInstallationOrigin::HuggingFaceCache);
+        external.catalog_attribution = InstalledCatalogAttribution::Attributed {
+            model_id: definition.model_id.clone(),
+            variant_id: definition.variant_id.clone(),
+        };
+        let mut managed = installed(found, ModelPackageInstallationOrigin::Magnitude);
+        managed.catalog_attribution = external.catalog_attribution.clone();
+        let unattributed = installed(package("other", 10), ModelPackageInstallationOrigin::HuggingFaceCache);
+
+        let aliases = catalog_aliases([&external, &managed, &unattributed].into_iter(), None);
+        assert_eq!(
+            aliases
+                .get(&(definition.model_id.clone(), definition.variant_id.clone()))
+                .map(|aliases| aliases.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            Some(vec!["hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf".to_owned()])
+        );
+        assert_eq!(aliases.len(), 1);
     }
 
     #[test]

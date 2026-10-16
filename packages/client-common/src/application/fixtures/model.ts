@@ -20,6 +20,7 @@ export const makeSetupModel = (installed: boolean): Extract<LocalModel, { readon
         support: { _tag: "Supported" },
         fidelityRank: 1,
         quantizationAware: false,
+        aliases: [],
     },
     acquisitionState: installed
       ? {

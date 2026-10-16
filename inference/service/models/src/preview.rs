@@ -1437,6 +1437,12 @@ impl<'a> RemoteRanges<'a> {
             request
         })
         .await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(hub_access_required(token.is_some()));
+        }
         if !response.status().is_success() {
             return Err(InventoryError::Upstream(format!(
                 "GGUF header request returned HTTP {}",
@@ -1533,6 +1539,9 @@ pub(crate) async fn read_header(
                 bytes.truncate(header_length);
                 return Ok(bytes);
             }
+            // A file with no tensor data (a split's metadata-only first shard) may end before the
+            // padding to its aligned data offset: the whole file is its header.
+            HeaderPrefix::Complete(_) if bytes.len() == logical_length => return Ok(bytes),
             HeaderPrefix::Complete(header_length)
                 if header_length <= MAX_HEADER_BYTES.min(logical_length) =>
             {
@@ -1547,10 +1556,15 @@ pub(crate) async fn read_header(
                     .min(MAX_HEADER_BYTES)
                     .min(logical_length);
             }
-            HeaderPrefix::Complete(_) | HeaderPrefix::Truncated => {
+            HeaderPrefix::Truncated if bytes.len() == logical_length => {
                 return Err(InventoryError::Integrity(
-                    "GGUF header extends beyond its size bound".to_owned(),
+                    "the file ends before its GGUF header does".to_owned(),
                 ));
+            }
+            HeaderPrefix::Complete(_) | HeaderPrefix::Truncated => {
+                return Err(InventoryError::Integrity(format!(
+                    "GGUF header extends beyond {MAX_HEADER_BYTES} bytes"
+                )));
             }
         }
     }
@@ -1613,6 +1627,21 @@ fn valid_content_range(
     start.parse::<u64>().ok() == Some(expected_start)
         && end.parse::<u64>().ok() == expected_end.checked_sub(1)
         && total.parse::<u64>().ok() == Some(logical_size)
+}
+
+/// A gated or private repository's files refused to this request: without `HF_TOKEN`, or with a
+/// token whose account hasn't been granted access.
+pub(crate) fn hub_access_required(with_token: bool) -> InventoryError {
+    InventoryError::ModelOperation {
+        code: "hugging_face_access_required".to_owned(),
+        message: if with_token {
+            "This repository requires accepting its terms on Hugging Face, and the account of your HF_TOKEN doesn't have access yet. Accept its terms on the repository's page with that account, then try again."
+        } else {
+            "This repository requires accepting its terms on Hugging Face and an access token. Set HF_TOKEN to a token from an account that has accepted them, then try again."
+        }
+        .to_owned(),
+        retryable: false,
+    }
 }
 
 fn hub_token() -> Option<String> {
@@ -1738,7 +1767,7 @@ fn classification_evidence(
     digest: &str,
     architectures: &crate::candidate_files::RecognizedArchitectures,
 ) -> String {
-    format!("candidate-classification-v1:{digest}:{}", architectures.key())
+    format!("candidate-classification-v2:{digest}:{}", architectures.key())
 }
 
 fn remote_header_evidence(
@@ -1757,11 +1786,20 @@ pub struct RemoteGgufHeader {
     pub bytes: Vec<u8>,
 }
 
+/// What reading one remote file's header found: its bytes (stored as a blob by digest), or why it
+/// isn't a readable GGUF header. Both are facts of the immutable file, so neither is fetched again.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CachedRemoteGgufHeader {
     content: ContentIdentity,
-    header_digest: String,
+    header: CachedRemoteHeader,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
+enum CachedRemoteHeader {
+    Read { digest: String },
+    Unreadable { detail: String },
 }
 
 impl ManagedModelStore {
@@ -1776,6 +1814,12 @@ impl ManagedModelStore {
         sibling: Option<&[u8]>,
     ) -> Result<RemoteGgufHeader, InventoryError> {
         let evidence = remote_header_evidence(self.client.endpoint(), repository, commit, file);
+        match self.cached_hugging_face_header(repository, commit, file) {
+            Some(CachedRemoteHeader::Unreadable { detail }) => {
+                return Err(InventoryError::Integrity(detail));
+            }
+            Some(CachedRemoteHeader::Read { .. }) | None => {}
+        }
         if let Some(digest) = self.cached_hugging_face_header_digest(repository, commit, file) {
             let cache = self.cache.clone();
             let cached = tokio::task::spawn_blocking(move || {
@@ -1797,18 +1841,37 @@ impl ManagedModelStore {
             &file.path,
             file.size_bytes,
         )?;
-        let shared = match sibling {
-            Some(sibling) => {
-                crate::header_delta::read_header_sharing_tokenizer(&mut remote, sibling).await?
+        let read = async {
+            let shared = match sibling {
+                Some(sibling) => {
+                    crate::header_delta::read_header_sharing_tokenizer(&mut remote, sibling).await?
+                }
+                None => None,
+            };
+            match shared {
+                Some(bytes) => Ok(bytes),
+                None => {
+                    let target = sibling.map_or(INITIAL_HEADER_BYTES, <[u8]>::len);
+                    read_header(&mut remote, Vec::new(), target).await
+                }
             }
-            None => None,
         };
-        let bytes = match shared {
-            Some(bytes) => bytes,
-            None => {
-                let target = sibling.map_or(INITIAL_HEADER_BYTES, <[u8]>::len);
-                read_header(&mut remote, Vec::new(), target).await?
+        let bytes = match read.await {
+            Ok(bytes) => bytes,
+            Err(InventoryError::Integrity(detail)) => {
+                self.cache.write_index(
+                    ModelIndexKind::HuggingFaceGgufHeader,
+                    &evidence,
+                    &CachedRemoteGgufHeader {
+                        content: file.content.clone(),
+                        header: CachedRemoteHeader::Unreadable {
+                            detail: detail.clone(),
+                        },
+                    },
+                );
+                return Err(InventoryError::Integrity(detail));
             }
+            Err(error) => return Err(error),
         };
         let cache = self.cache.clone();
         let content = file.content.clone();
@@ -1820,7 +1883,9 @@ impl ManagedModelStore {
                 &evidence,
                 &CachedRemoteGgufHeader {
                     content,
-                    header_digest: digest.clone(),
+                    header: CachedRemoteHeader::Read {
+                        digest: digest.clone(),
+                    },
                 },
             );
             RemoteGgufHeader { digest, bytes }
@@ -1886,13 +1951,25 @@ impl ManagedModelStore {
         commit: &str,
         file: &HuggingFaceRepositoryFile,
     ) -> Option<String> {
+        match self.cached_hugging_face_header(repository, commit, file)? {
+            CachedRemoteHeader::Read { digest } => Some(digest),
+            CachedRemoteHeader::Unreadable { .. } => None,
+        }
+    }
+
+    fn cached_hugging_face_header(
+        &self,
+        repository: &str,
+        commit: &str,
+        file: &HuggingFaceRepositoryFile,
+    ) -> Option<CachedRemoteHeader> {
         self.cache
             .read_index::<CachedRemoteGgufHeader>(
                 ModelIndexKind::HuggingFaceGgufHeader,
                 &remote_header_evidence(self.client.endpoint(), repository, commit, file),
             )
             .filter(|cached| cached.content == file.content)
-            .map(|cached| cached.header_digest)
+            .map(|cached| cached.header)
     }
 
     /// The exact package a repository-snapshot preview describes, identified as the same package
@@ -2575,6 +2652,199 @@ mod tests {
         .unwrap();
         assert_eq!(hinted, header);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3, "the hint covers the header");
+    }
+
+    /// A split's metadata-only first shard: no tensors, its header unpadded at the end of the file,
+    /// as unsloth's `Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf` (10,946,618 bytes) is.
+    fn metadata_only_shard(description_bytes: usize) -> Vec<u8> {
+        (description_bytes..)
+            .map(|length| {
+                let description = "x".repeat(length);
+                let mut file = crate::test_gguf::gguf_bytes(
+                    &[
+                        ("general.architecture", crate::test_gguf::Meta::Str("qwen35moe")),
+                        ("split.count", crate::test_gguf::Meta::U32(6)),
+                        ("general.description", crate::test_gguf::Meta::Str(&description)),
+                    ],
+                    &[],
+                );
+                while file.last() == Some(&0) {
+                    file.pop();
+                }
+                file
+            })
+            .find(|file| file.len() % 32 != 0)
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_metadata_only_shard_without_trailing_padding_is_its_whole_header() {
+        for description_bytes in [6 * 1024, 10 * 1024 * 1024] {
+            let file = metadata_only_shard(description_bytes);
+            assert_ne!(file.len() % 32, 0, "the file ends before its aligned data offset");
+            assert!(matches!(header_prefix(&file), Ok(HeaderPrefix::Complete(length)) if length > file.len()));
+            let size = u64::try_from(file.len()).unwrap();
+            let (endpoint, _, _) = serve_ranges(vec![("model-00001-of-00006.gguf", file.clone())]);
+            let header = fetch_header(
+                &reqwest::Client::new(),
+                &endpoint,
+                "owner/repo",
+                &"a".repeat(40),
+                Path::new("model-00001-of-00006.gguf"),
+                size,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(header, file);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_header_larger_than_the_probe_by_far_is_read_whole() {
+        let description = "x".repeat(40 * 1024 * 1024);
+        let mut file = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("general.description", crate::test_gguf::Meta::Str(&description)),
+            ],
+            &["token_embd.weight"],
+        );
+        let header_end = header_length(&file).unwrap();
+        file.resize(file.len() + 1024 * 1024, 0);
+        let size = u64::try_from(file.len()).unwrap();
+        let (endpoint, _, _) = serve_ranges(vec![("model.gguf", file.clone())]);
+        let header = fetch_header(
+            &reqwest::Client::new(),
+            &endpoint,
+            "owner/repo",
+            &"a".repeat(40),
+            Path::new("model.gguf"),
+            size,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(header, file[..header_end]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_that_ends_inside_its_header_is_reported_as_truncated() {
+        let description = "x".repeat(2 * 1024 * 1024);
+        let mut file = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("general.description", crate::test_gguf::Meta::Str(&description)),
+            ],
+            &["token_embd.weight"],
+        );
+        file.truncate(1024 * 1024 + 7);
+        let size = u64::try_from(file.len()).unwrap();
+        let (endpoint, _, _) = serve_ranges(vec![("model.gguf", file)]);
+        let error = fetch_header(
+            &reqwest::Client::new(),
+            &endpoint,
+            "owner/repo",
+            &"a".repeat(40),
+            Path::new("model.gguf"),
+            size,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, InventoryError::Integrity(detail) if detail == "the file ends before its GGUF header does"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_gated_repository_refusing_its_files_asks_for_access_and_a_token() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("gated listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("gated address"));
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().expect("stream"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        let error = fetch_header(
+            &reqwest::Client::new(),
+            &endpoint,
+            "google/gated-model-GGUF",
+            &"a".repeat(40),
+            Path::new("model.gguf"),
+            1024 * 1024 * 1024,
+            None,
+        )
+        .await
+        .unwrap_err();
+        let InventoryError::ModelOperation { code, message, retryable } = error else {
+            panic!("a refused gated file is a model operation failure: {error:?}");
+        };
+        assert_eq!(code, "hugging_face_access_required");
+        assert!(message.contains("HF_TOKEN"), "{message}");
+        assert!(!retryable);
+    }
+
+    /// The Linux QA lanes saw one inspect pull 446 MB to 1.1 GB for files with unknown tensor
+    /// types, and every retry pull it again. A header proven invalid stops at the probe that
+    /// proves it, and the verdict is cached for the immutable file, so a retry fetches nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreadable_header_costs_one_probe_once_and_nothing_on_retry() {
+        let mut file = crate::test_gguf::gguf_bytes(
+            &[("general.architecture", crate::test_gguf::Meta::Str("llama"))],
+            &["token_embd.weight"],
+        );
+        let mut name = ("token_embd.weight".len() as u64).to_le_bytes().to_vec();
+        name.extend(b"token_embd.weight");
+        let type_at = file
+            .windows(name.len())
+            .position(|window| window == name)
+            .unwrap()
+            + name.len()
+            + 4
+            + 8;
+        file[type_at..type_at + 4].copy_from_slice(&31_u32.to_le_bytes());
+        file.resize(file.len() + 256 * 1024 * 1024, 0);
+        let (endpoint, _, sent) = serve_ranges(vec![("model-Q4_0_4_4.gguf", file.clone())]);
+        let (_temporary, store) = stub_store(endpoint).await;
+        let repository_file = HuggingFaceRepositoryFile {
+            path: PathBuf::from("model-Q4_0_4_4.gguf"),
+            size_bytes: file.len() as u64,
+            content: ContentIdentity::Sha256 {
+                value: "c".repeat(64),
+            },
+        };
+        let commit = "a".repeat(40);
+        for attempt in 0..2 {
+            let error = store
+                .hugging_face_gguf_header("owner/repo", &commit, &repository_file, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, InventoryError::Integrity(detail) if detail == "unknown GGUF tensor type 31"),
+                "attempt {attempt}: {error:?}"
+            );
+        }
+        assert_eq!(
+            sent.load(std::sync::atomic::Ordering::SeqCst),
+            INITIAL_HEADER_BYTES,
+            "one probe, and nothing on the retry"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

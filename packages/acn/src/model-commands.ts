@@ -13,7 +13,8 @@ import {
   type SlotId,
 } from "@magnitudedev/acn-protocol"
 import { IcnCatalog, IcnCatalogInstallations, IcnClient, IcnInstances } from "@magnitudedev/icn"
-import { projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
+import { canonicalLocalModelId, projectInferenceLoadPlan } from "@magnitudedev/acn-protocol"
+import { LocalModels } from "./local-models"
 import { ModelSlotController } from "./model-slot-controller"
 import { LocalModelRemovals } from "./local-model-removals"
 import { icnCommandFailure, type IcnCommandError } from "./icn-command-failure"
@@ -39,9 +40,15 @@ export const modelCommandFailure = (operation: string, cause: IcnCommandError) =
 export const ModelCommandsLive: Layer.Layer<
   ModelCommands,
   never,
-  IcnClient | IcnCatalog | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals | CustomModelCommands
+  | IcnClient | IcnCatalog | IcnCatalogInstallations | IcnInstances | ModelSlotController | LocalModelRemovals
+  | CustomModelCommands | LocalModels
 > = Layer.scoped(ModelCommands, Effect.gen(function* () {
   const custom = yield* CustomModelCommands
+  const localModels = yield* LocalModels
+  /** A catalog model's alias (its files' ID as a found model, before an upgrade) names that catalog model. */
+  const canonical = (modelId: ModelId) => localModels.state.pipe(
+    Effect.map(({ models, hidden }) => canonicalLocalModelId([...models, ...hidden], modelId)),
+  )
   const scope = yield* Effect.scope
   const client = yield* IcnClient
   const catalog = yield* IcnCatalog
@@ -87,12 +94,12 @@ export const ModelCommandsLive: Layer.Layer<
     return {}
   }).pipe(Effect.mapError((cause) => modelCommandFailure("stop", cause)))
   const byForm = <A>(
-    modelId: ModelId,
+    requested: ModelId,
     catalogCommand: (id: CatalogFormModelId) => Effect.Effect<A, LocalInferenceError>,
     customCommand: (id: typeof CustomFormModelIdSchema.Type) => Effect.Effect<A, LocalInferenceError>,
-  ) => Schema.is(CatalogFormModelIdSchema)(modelId)
+  ) => canonical(requested).pipe(Effect.flatMap((modelId) => Schema.is(CatalogFormModelIdSchema)(modelId)
     ? catalogCommand(modelId)
-    : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))
+    : customCommand(Schema.decodeSync(CustomFormModelIdSchema)(modelId))))
   const catalogSync = (modelId: CatalogFormModelId) => Effect.gen(function* () {
     const installed = (yield* catalog.get).state.models
       .some((model) => model.id === modelId && model.localState._tag === "Installed")
@@ -134,7 +141,7 @@ export const ModelCommandsLive: Layer.Layer<
     sync: (modelId) => byForm(modelId, catalogSync, custom.sync),
     cancelSync: (modelId) => byForm(modelId, catalogCancel, custom.cancelSync),
     acknowledgeSyncFailure: (modelId) => byForm(modelId, catalogAcknowledge, custom.acknowledgeSyncFailure),
-    remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(modelId).pipe(Effect.zipRight(custom.remove(id)))),
+    remove: (modelId) => byForm(modelId, catalogRemove, (id) => stopModel(id).pipe(Effect.zipRight(custom.remove(id)))),
     loadSlot: (slotId) => selectedLocalModel(slotId).pipe(
       Effect.flatMap(requestLoad),
       Effect.tap(() => slots.refresh),
@@ -144,7 +151,10 @@ export const ModelCommandsLive: Layer.Layer<
       Effect.map(projectInferenceLoadPlan),
       Effect.mapError((cause) => cause instanceof ModelSlotMutationRejected ? cause : modelCommandFailure("preview", cause))),
     stopSlot: (slotId) => selectedLocalModel(slotId).pipe(Effect.flatMap(stopModel)),
-    loadModel: (modelId) => requestLoad(modelId).pipe(Effect.mapError((cause) => modelCommandFailure("load", cause))),
+    loadModel: (modelId) => canonical(modelId).pipe(
+      Effect.flatMap(requestLoad),
+      Effect.mapError((cause) => modelCommandFailure("load", cause)),
+    ),
     stopActiveModel: instances.get.pipe(Effect.flatMap(({ instances: current }) => {
       const active = current.findLast((instance) =>
         instance.lifecycle._tag === "Loading" || instance.lifecycle._tag === "Ready" || instance.lifecycle._tag === "Stopping")

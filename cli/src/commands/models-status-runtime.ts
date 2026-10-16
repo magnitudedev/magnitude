@@ -330,6 +330,7 @@ export const renderModelDetail = (view: ModelDetailView): string => {
     renderFields([
       ["Model ID", model.modelId],
       ...(model._tag === "Custom" ? customFields(model, models) : [["Source", "Catalog"] as const]),
+      ...Option.match(model.presentation.license, { onNone: () => [], onSome: (license) => [["License", license] as const] }),
       ...supportFields(model, models),
       ...installationFields(model),
       ...(localModelIsInstalled(model) ? [["Runtime", residencyLabel(model)]] as const : []),

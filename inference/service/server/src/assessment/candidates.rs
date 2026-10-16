@@ -216,10 +216,15 @@ impl ManagedModelCandidates {
             .catalog_match(exact, &target.lineage, plain.fingerprint.as_ref())
             .await
             .map(|(matched, _)| matched.model_id);
+        let license = target
+            .snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.license.clone());
         let recommended_drafter = recommended(self.enumerate_drafters(target, None, true).await?);
         Ok(CustomModelEnrichmentResult {
             variant_of,
             recommended_drafter,
+            license,
         })
     }
 
@@ -373,7 +378,7 @@ impl ManagedModelCandidates {
         method: &ModelMethod,
     ) -> Result<String, InventoryError> {
         serde_json::to_string(&(
-            "candidate-assessment-v2",
+            "candidate-assessment-v3",
             &self.assessor.environment().id.0,
             target,
             drafter,
@@ -1465,7 +1470,8 @@ impl ManagedModelCandidates {
     }
 
     /// An explicit drafter: a Hugging Face reference (`owner/repo`, `owner/repo:path`,
-    /// `owner/repo@revision:path` or a model URL) or a local file.
+    /// `owner/repo/path`, `owner/repo@revision:path`, any of them after `hf:`, or a model URL) or
+    /// a local file.
     async fn other_drafter(
         &self,
         target: &DrafterTarget,
@@ -2178,7 +2184,8 @@ fn local_model_id(header_digest: &str) -> Option<ModelId> {
 }
 
 /// The custom model already on this computer with the same bytes: the same header digest, the
-/// same Hugging Face identity and size, or the same files.
+/// same Hugging Face identity and weights size (a projector it was found with, such as an Ollama
+/// pull's, is not part of the version), or the same files.
 fn on_this_computer(
     custom: &[CustomModel],
     hugging_face: Option<&ModelId>,
@@ -2201,7 +2208,9 @@ fn on_this_computer(
         .filter(|model| !matches!(model.state, CustomModelState::NotInstalled))
         .find(|model| {
             Some(&model.model_id) == local.as_ref()
-                || (Some(&model.model_id) == hugging_face && model.size_bytes == group.size_bytes())
+                || (Some(&model.model_id) == hugging_face
+                    && model.files.iter().map(|file| file.size_bytes).sum::<u64>()
+                        == group.size_bytes())
                 || (!paths.is_empty() && model.files.iter().any(|file| paths.contains(&file.path)))
         })
         .map(|model| model.model_id.clone())
@@ -2246,14 +2255,19 @@ fn candidate_versions(
         .map(|(index, _)| index);
     let mut labels = BTreeMap::<String, usize>::new();
     for version in &versions {
-        *labels.entry(version_label(&version.group.group.primary().path)).or_default() += 1;
+        *labels
+            .entry(version_label(
+                &version.group.group.primary().path,
+                version.group.quantization.as_deref(),
+            ))
+            .or_default() += 1;
     }
     versions
         .into_iter()
         .enumerate()
         .map(|(index, version)| {
             let group = version.group;
-            let label = version_label(&group.group.primary().path);
+            let label = version_label(&group.group.primary().path, group.quantization.as_deref());
             let label = if labels.get(&label).copied().unwrap_or(0) > 1 {
                 path_string(&group.group.primary().path)
             } else {
@@ -2276,14 +2290,17 @@ fn candidate_versions(
         .collect()
 }
 
-/// `(repository, revision, path)` from `owner/repo`, `owner/repo:path`, `owner/repo@rev:path` or a
-/// Hugging Face URL (`…/blob/<rev>/<path>` or `…/resolve/<rev>/<path>` included).
+/// `(repository, revision, path)` from `owner/repo`, `owner/repo:path`, `owner/repo/path`,
+/// `owner/repo@rev:path`, any of those after `hf:`, or a Hugging Face URL (`…/blob/<rev>/<path>`
+/// or `…/resolve/<rev>/<path>` included).
 fn parse_hugging_face_reference(
     reference: &str,
 ) -> Result<(String, String, Option<String>), InventoryError> {
+    let original_reference = reference;
+    let reference = reference.strip_prefix("hf:").unwrap_or(reference);
     let invalid = || {
         InventoryError::InvalidRequest(format!(
-            "{reference} is not a Hugging Face reference or an absolute file path"
+            "{original_reference} is not a Hugging Face reference or an absolute file path"
         ))
     };
     if let Some(repository) = hugging_face_repository_from_url(reference) {
@@ -2306,7 +2323,12 @@ fn parse_hugging_face_reference(
     }
     let (repository, path) = match reference.split_once(':') {
         Some((repository, path)) => (repository, Some(path.to_owned())),
-        None => (reference, None),
+        None => match reference.match_indices('/').nth(1) {
+            Some((split, _)) if split + 1 < reference.len() => {
+                (&reference[..split], Some(reference[split + 1..].to_owned()))
+            }
+            _ => (reference, None),
+        },
     };
     let (repository, revision) = match repository.split_once('@') {
         Some((repository, revision)) => (repository, revision.to_owned()),
@@ -2405,6 +2427,33 @@ mod tests {
                 "main".to_owned(),
                 Some("draft.gguf".to_owned())
             )
+        );
+        let path_form = (
+            "magnitudedev/Qwen3.5-4B-DFlash-GGUF".to_owned(),
+            "main".to_owned(),
+            Some("Qwen3.5-4B-DFlash-Q8_0.gguf".to_owned()),
+        );
+        assert_eq!(
+            parse_hugging_face_reference(
+                "magnitudedev/Qwen3.5-4B-DFlash-GGUF/Qwen3.5-4B-DFlash-Q8_0.gguf"
+            )
+            .unwrap(),
+            path_form
+        );
+        assert_eq!(
+            parse_hugging_face_reference(
+                "hf:magnitudedev/Qwen3.5-4B-DFlash-GGUF/Qwen3.5-4B-DFlash-Q8_0.gguf"
+            )
+            .unwrap(),
+            path_form
+        );
+        assert_eq!(
+            parse_hugging_face_reference("hf:owner/repo/MTP/mtp.gguf").unwrap(),
+            ("owner/repo".to_owned(), "main".to_owned(), Some("MTP/mtp.gguf".to_owned()))
+        );
+        assert_eq!(
+            parse_hugging_face_reference("hf:owner/repo").unwrap(),
+            ("owner/repo".to_owned(), "main".to_owned(), None)
         );
         assert!(parse_hugging_face_reference("not a reference").is_err());
     }

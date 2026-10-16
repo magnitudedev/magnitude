@@ -35,6 +35,8 @@ pub struct GgufInspection {
     pub header_digest: String,
     pub fingerprint_material: Vec<u8>,
     pub role: GgufRole,
+    #[serde(default)]
+    pub license: Option<String>,
 }
 
 /// What a GGUF file is, read from its architecture and tensors rather than its name. A `Drafter`
@@ -83,8 +85,7 @@ pub fn inspect_complete(path: &Path) -> Result<GgufInspection, GgufError> {
         .iter()
         .map(|tensor| tensor.offset.saturating_add(tensor.nbytes))
         .max()
-        .unwrap_or(0)
-        .saturating_add(directory.data_offset);
+        .map_or(0, |end| end.saturating_add(directory.data_offset));
     let actual = std::fs::metadata(path)?.len();
     if actual < declared {
         return Err(GgufError::Io(io::Error::new(
@@ -94,14 +95,23 @@ pub fn inspect_complete(path: &Path) -> Result<GgufInspection, GgufError> {
             ),
         )));
     }
-    let header_digest = header_digest(path, directory.data_offset)?;
-    interpret(&directory, header_digest)
+    let header_digest = header_digest(path, header_extent(&directory, actual))?;
+    interpret(&directory, header_digest, header_extent(&directory, actual))
 }
 
 pub fn inspect(path: &Path) -> Result<GgufInspection, GgufError> {
     let directory = read_directory(path)?;
-    let header_digest = header_digest(path, directory.data_offset)?;
-    interpret(&directory, header_digest)
+    let file_length = std::fs::metadata(path)?.len();
+    let header_digest = header_digest(path, header_extent(&directory, file_length))?;
+    interpret(&directory, header_digest, header_extent(&directory, file_length))
+}
+
+/// The bytes of a GGUF that are its header: through the aligned tensor-data offset, or the whole
+/// file when it holds no tensor data and ends before that offset's padding (a split's
+/// metadata-only first shard).
+#[must_use]
+pub fn header_extent(directory: &Directory, file_length: u64) -> u64 {
+    directory.data_offset.min(file_length)
 }
 
 fn read_directory(path: &Path) -> Result<Directory, GgufError> {
@@ -137,6 +147,21 @@ fn role(directory: &Directory, architecture: Option<&str>) -> GgufRole {
         .iter()
         .filter(|tensor| is_nextn_tensor(&tensor.name))
         .count();
+    // An MTP file extracted from its model keeps only the prediction blocks (each a full layer
+    // beside its `nextn.*` tensors, as Nemotron-H's are) and the shared embedding and head: every
+    // block tensor belongs to a block that has `nextn.*` tensors.
+    let nextn_blocks = directory
+        .tensors
+        .iter()
+        .filter(|tensor| is_nextn_tensor(&tensor.name))
+        .filter_map(|tensor| block_index(&tensor.name))
+        .collect::<std::collections::BTreeSet<_>>();
+    let only_prediction_blocks = !nextn_blocks.is_empty()
+        && directory
+            .tensors
+            .iter()
+            .filter_map(|tensor| block_index(&tensor.name))
+            .all(|block| nextn_blocks.contains(block));
     let shares_target_tables = architecture.is_some_and(|architecture| {
         matches!(
             directory.value(&format!("{architecture}.nextn_shared_target_tensors")),
@@ -159,6 +184,7 @@ fn role(directory: &Directory, architecture: Option<&str>) -> GgufRole {
             method: Some(SpeculativeMethod::Mtp),
         },
         _ if shares_target_tables
+            || only_prediction_blocks
             || (nextn_tensors > 0 && nextn_tensors == directory.tensors.len()) =>
         {
             GgufRole::Drafter {
@@ -171,6 +197,12 @@ fn role(directory: &Directory, architecture: Option<&str>) -> GgufRole {
     }
 }
 
+/// The block a `blk.<index>.*` tensor belongs to.
+fn block_index(name: &str) -> Option<&str> {
+    let (index, _) = name.strip_prefix("blk.")?.split_once('.')?;
+    index.bytes().all(|byte| byte.is_ascii_digit()).then_some(index)
+}
+
 fn is_nextn_tensor(name: &str) -> bool {
     name.strip_prefix("blk.")
         .and_then(|rest| rest.split_once('.'))
@@ -179,7 +211,11 @@ fn is_nextn_tensor(name: &str) -> bool {
         })
 }
 
-pub(crate) fn interpret(directory: &Directory, header_digest: String) -> Result<GgufInspection, GgufError> {
+pub(crate) fn interpret(
+    directory: &Directory,
+    header_digest: String,
+    header_bytes: u64,
+) -> Result<GgufInspection, GgufError> {
     let architecture = string_value(directory, "general.architecture");
     let role = role(directory, architecture.as_deref());
     let training_context_length = architecture
@@ -262,7 +298,16 @@ pub(crate) fn interpret(directory: &Directory, header_digest: String) -> Result<
         fingerprint_material.extend_from_slice(&value.to_le_bytes());
     }
 
+    // `other` names its license in `general.license.name`.
+    let license = match string_value(directory, "general.license") {
+        Some(license) if license.eq_ignore_ascii_case("other") => {
+            string_value(directory, "general.license.name").or(Some(license))
+        }
+        license => license,
+    }
+    .filter(|license| !license.trim().is_empty());
     Ok(GgufInspection {
+        license,
         architecture,
         name: string_value(directory, "general.name"),
         quantization: file_type.map(|file_type| file_type.name()),
@@ -275,7 +320,7 @@ pub(crate) fn interpret(directory: &Directory, header_digest: String) -> Result<
         base_models,
         modalities,
         tensor_storage_bytes,
-        header_bytes: directory.data_offset,
+        header_bytes,
         header_digest,
         fingerprint_material,
         role,
@@ -489,6 +534,52 @@ impl FileTypeKind {
     }
 }
 
+/// The conventional short label of a header's quantization (`general.file_type` as
+/// [`GgufInspection::quantization`] names it): `Q4_K - Medium` is `Q4_K_M`, `IQ3_S mix - 3.66 bpw`
+/// is `IQ3_M`.
+#[must_use]
+pub fn quantization_label(quantization: &str) -> Option<&'static str> {
+    Some(match quantization {
+        "all F32" => "F32",
+        "F16" => "F16",
+        "BF16" => "BF16",
+        "Q1_0" => "Q1_0",
+        "Q2_0" => "Q2_0",
+        "Q4_0" => "Q4_0",
+        "Q4_1" => "Q4_1",
+        "Q5_0" => "Q5_0",
+        "Q5_1" => "Q5_1",
+        "Q8_0" => "Q8_0",
+        "MXFP4 MoE" => "MXFP4_MOE",
+        "NVFP4" => "NVFP4",
+        "Q2_K - Medium" => "Q2_K",
+        "Q2_K - Small" => "Q2_K_S",
+        "Q3_K - Small" => "Q3_K_S",
+        "Q3_K - Medium" => "Q3_K_M",
+        "Q3_K - Large" => "Q3_K_L",
+        "Q4_K - Small" => "Q4_K_S",
+        "Q4_K - Medium" => "Q4_K_M",
+        "Q5_K - Small" => "Q5_K_S",
+        "Q5_K - Medium" => "Q5_K_M",
+        "Q6_K" => "Q6_K",
+        "TQ1_0 - 1.69 bpw ternary" => "TQ1_0",
+        "TQ2_0 - 2.06 bpw ternary" => "TQ2_0",
+        "IQ2_XXS - 2.0625 bpw" => "IQ2_XXS",
+        "IQ2_XS - 2.3125 bpw" => "IQ2_XS",
+        "IQ2_S - 2.5 bpw" => "IQ2_S",
+        "IQ2_M - 2.7 bpw" => "IQ2_M",
+        "IQ3_XS - 3.3 bpw" => "IQ3_XS",
+        "IQ3_XXS - 3.0625 bpw" => "IQ3_XXS",
+        "IQ1_S - 1.5625 bpw" => "IQ1_S",
+        "IQ1_M - 1.75 bpw" => "IQ1_M",
+        "IQ4_NL - 4.5 bpw" => "IQ4_NL",
+        "IQ4_XS - 4.25 bpw" => "IQ4_XS",
+        "IQ3_S - 3.4375 bpw" => "IQ3_S",
+        "IQ3_S mix - 3.66 bpw" => "IQ3_M",
+        _ => return None,
+    })
+}
+
 fn string_value(directory: &Directory, key: &str) -> Option<String> {
     directory
         .value(key)
@@ -602,6 +693,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_license_is_the_header_license_or_the_name_an_other_license_gives() {
+        use crate::test_gguf::Meta;
+        let license = |metadata: &[(&str, Meta<'_>)]| {
+            inspect_bytes(&crate::test_gguf::gguf_bytes(metadata, &["token_embd.weight"]))
+                .unwrap()
+                .license
+        };
+        let arch = ("general.architecture", Meta::Str("llama"));
+        assert_eq!(
+            license(&[arch, ("general.license", Meta::Str("apache-2.0"))]),
+            Some("apache-2.0".to_owned())
+        );
+        let arch = ("general.architecture", Meta::Str("llama"));
+        assert_eq!(
+            license(&[
+                arch,
+                ("general.license", Meta::Str("other")),
+                ("general.license.name", Meta::Str("openmdw-1.1")),
+            ]),
+            Some("openmdw-1.1".to_owned())
+        );
+        let arch = ("general.architecture", Meta::Str("llama"));
+        assert_eq!(license(&[arch]), None);
+    }
+
+    #[test]
+    fn a_metadata_only_shard_without_trailing_padding_is_complete_and_its_whole_file_is_its_header() {
+        let mut bytes = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("qwen35moe")),
+                ("split.count", crate::test_gguf::Meta::U32(6)),
+                ("general.name", crate::test_gguf::Meta::Str("Shard")),
+            ],
+            &[],
+        );
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        assert_ne!(bytes.len() % 32, 0);
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("model-00001-of-00006.gguf");
+        std::fs::write(&path, &bytes).unwrap();
+        for inspection in [inspect(&path).unwrap(), inspect_complete(&path).unwrap()] {
+            assert_eq!(inspection.header_bytes, u64::try_from(bytes.len()).unwrap());
+            assert_eq!(inspection.header_digest, format!("{:x}", Sha256::digest(&bytes)));
+        }
+        assert_eq!(
+            crate::candidate_files::local_header_digest(&path).unwrap(),
+            format!("{:x}", Sha256::digest(&bytes))
+        );
+    }
+
     fn role_of(metadata: &[(&str, crate::test_gguf::Meta<'_>)], tensors: &[&str]) -> GgufRole {
         inspect_bytes(&crate::test_gguf::gguf_bytes(metadata, tensors))
             .unwrap()
@@ -680,6 +824,23 @@ mod tests {
                 ],
             ),
             GgufRole::Model { embedded_mtp: true }
+        );
+        assert_eq!(
+            role_of(
+                &[arch("nemotron_h_moe")],
+                &[
+                    "output.weight",
+                    "token_embd.weight",
+                    "blk.52.attn_q.weight",
+                    "blk.52.ffn_up_exps.weight",
+                    "blk.52.nextn.eh_proj.weight",
+                    "blk.52.nextn.enorm.weight",
+                ],
+            ),
+            GgufRole::Drafter {
+                method: Some(SpeculativeMethod::Mtp)
+            },
+            "an MTP file keeping only its prediction blocks (bartowski's Nemotron-H mtp-*.gguf) is a drafter"
         );
         assert_eq!(
             role_of(

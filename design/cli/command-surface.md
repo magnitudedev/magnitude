@@ -88,7 +88,11 @@ retryability flags, and stack traces.
 `--json` prints one machine-readable document of the same product facts the text form shows,
 including canonical IDs, structured unsupported reasons with their developer detail, and drafter
 verdicts. It never includes internal ACN/ICN identities, package structure, or prose meant only for
-terminals, and errors stay on stderr with a nonzero exit.
+terminals, and errors stay on stderr with a nonzero exit. Under `--json` every inference command
+writes its error to stderr as one document, `{"error": {"message": <product message>, "code":
+<stable snake_case code>}}`, so stdout holds only a successful result. The code is the service's
+failure code when it has one, else the failure's kind. One shared command runner produces this
+document for every command.
 
 Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
@@ -154,7 +158,7 @@ changes, or turns off the drafter of a custom model and is refused for catalog m
 and `unhide` apply to found models, including a catalog model whose files are only in an external
 location; `catalog remove` on such a model explains where the files are and points at `models hide`. `models folders list` shows the automatic locations and the
 user's folders, one row per directory: an automatic location lists each directory found or unreadable
-(every directory checked when none exists), each Scanning, Off, Not found, or Can't read, with what to
+(every directory checked when none exists), each Found, Off, Not found, or Can't read, with what to
 do for each directory Magnitude can't read; `add` and `remove` manage the folders, and turning a
 location on or off applies to all its directories.
 

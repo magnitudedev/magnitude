@@ -3,7 +3,7 @@ import type { ReactNode } from "react"
 import { describe, expect, it } from "vitest"
 import { Option } from "effect"
 import { Dialog } from "./ui/dialog"
-import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, confirmAction, formatDownloads, initialVersion, parseModelReference, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
+import { FindStepView, LocalFileSummary, LocalFileView, RepositoryFooter, RepositoryView, SearchResultsView, addVersionRequest, confirmAction, formatDownloads, initialVersion, parseModelReference, unsupportedVersionLabel, versionVerdict, type FindTab } from "./add-model-dialog"
 import { catalogId, catalogModel, drafterCandidate, inspection, repository, version, doesNotFit, unsupported } from "../../test/models/fixtures"
 
 const inDialog = (node: ReactNode) => renderToStaticMarkup(<Dialog open>{node}</Dialog>)
@@ -108,6 +108,19 @@ describe("repository step", () => {
     expect(html.match(/type="radio"[^>]*disabled=""/g)).toHaveLength(2)
     expect(html).toMatch(/type="radio"[^>]*checked=""/)
   })
+  it("explains why when no version runs on this computer", () => {
+    const nothingRuns = inspection({ versions: [
+      version("Q8_K_P", { assessment: Option.some(doesNotFit) }),
+      version("Q2_K", { assessment: Option.some(unsupported({ _tag: "WeightTypes", types: [{ ggmlType: "Q2_K", tensorCount: 2 }] })) }),
+    ] })
+    const html = inDialog(<RepositoryView inspection={nothingRuns} models={models} selectedVersion={Option.none()} onSelectVersion={() => {}} />)
+    expect(html).toContain("No version of this model runs on this computer")
+    expect(html).toContain("Some versions are too large for this machine, and Magnitude can&#x27;t run the others: Uses Q2_K weights, which Magnitude doesn&#x27;t support yet.")
+    const tooLarge = inDialog(<RepositoryView inspection={inspection({ versions: [version("Q8_K_P", { assessment: Option.some(doesNotFit) })] })} models={models} selectedVersion={Option.none()} onSelectVersion={() => {}} />)
+    expect(tooLarge).toContain("Every version is too large for this machine.")
+    expect(inDialog(<RepositoryView inspection={inspection()} models={models} selectedVersion={Option.some("Q4_K_P")} onSelectVersion={() => {}} />))
+      .not.toContain("No version of this model runs on this computer")
+  })
   it("explains an architecture the engine can't run in place of the versions", () => {
     const html = inDialog(<RepositoryView inspection={inspection({ displayName: "DeepSeek V4 Flash 0731", versions: [], unsupportedArchitecture: Option.some([{ _tag: "Architecture", architecture: "deepseek4" }]) })} models={models} selectedVersion={Option.none()} onSelectVersion={() => {}} />)
     expect(html).toContain("Magnitude can’t run this model")
@@ -128,6 +141,12 @@ describe("repository step", () => {
 describe("add GGUF file", () => {
   const localFile = (overrides: Parameters<typeof inspection>[0] = {}) => inspection({
     source: { _tag: "Local", path: "/Users/me/models/qwen.gguf" }, license: Option.none(), versions: [version("Q4_K_P")], ...overrides,
+  })
+  it("imports the chosen file by its own path, never the folder the inspection read it from", () => {
+    expect(addVersionRequest({ _tag: "File", path: "/Users/me/gguf-import/MiniCPM5-2B-Q4_K_M.gguf" }, version("Q4_K_M"), { _tag: "Auto" }))
+      .toEqual({ _tag: "Import", request: { path: "/Users/me/gguf-import/MiniCPM5-2B-Q4_K_M.gguf", drafter: { _tag: "Auto" } } })
+    expect(addVersionRequest({ _tag: "Repository", repository, commit: "c0ffee" }, version("Q4_K_P"), { _tag: "None" }))
+      .toEqual({ _tag: "Add", request: { repository, revision: Option.some("c0ffee"), version: Option.some("Q4_K_P"), drafter: { _tag: "None" } } })
   })
   it("opens on the file picker, in place of the version list, until a file is chosen", () => {
     const html = inDialog(<LocalFileView browser={<p>file browser</p>} file={Option.none()} />)

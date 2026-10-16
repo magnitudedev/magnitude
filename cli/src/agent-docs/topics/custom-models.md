@@ -10,7 +10,8 @@ three places:
   deletes it; `catalog remove` only forgets it.
 - **Found on this computer.** The Hugging Face cache, LM Studio, the llama.cpp cache, Ollama, and
   folders you add are scanned for GGUFs. These files belong to their apps; `models hide` hides a
-  model without touching its files.
+  found model without touching its files. Models added from Hugging Face or imported can't be
+  hidden; `catalog remove` removes them.
 
 Model IDs are `hf:<owner>/<repo>/<file>` when a model has a Hugging Face identity and
 `local:<header digest>` otherwise. The same bytes found in two places are one model.
@@ -43,10 +44,18 @@ its catalog drafter.
 
 ## Drafters
 
-Every model that runs gets the best drafter known to work with it, from any source. The choices, in
-order: the catalog drafter trained for the matching catalog model, MTP heads built into the model,
-drafter files next to the model, drafters already on this computer, drafters on Hugging Face for the
-same base model, and any drafter you name. The first one the engine binds is preselected.
+Every model that runs gets the best drafter known to work with it. Only drafters Magnitude can
+stand behind are chosen automatically, and the first one the engine binds, in this order, is
+preselected:
+
+1. a separate drafter in the model's own repository, or its folder for a local file;
+2. the catalog drafter trained for the matching catalog model;
+3. MTP heads built into the model;
+4. no drafter.
+
+Within one source, methods go DFlash2, DSpark, DFlash, a separate MTP file, then built-in MTP heads,
+and ties go to the smaller download. Magnitude never searches Hugging Face for drafters. A drafter
+you name is checked like the others but is never chosen automatically.
 
 `--drafter` on `catalog pull` and `models import`, and `models drafter <model-id> <drafter>`, take:
 
@@ -54,15 +63,16 @@ same base model, and any drafter you name. The first one the engine binds is pre
 - `none`: no drafter;
 - `built-in`: MTP heads inside the model;
 - a catalog model ID, which uses that model's drafter;
-- a Hugging Face reference (`owner/repo` or `owner/repo/path.gguf`) or a local GGUF path.
+- a Hugging Face file (a huggingface.co link, `owner/repo/path.gguf`, `hf:owner/repo/path.gguf`, or
+  `owner/repo:path.gguf`) or a local GGUF path.
 
 A drafter the engine rejects for the model is refused with the reason. One whose lineage doesn't
 match is allowed and marked untested. Catalog models keep the drafter Magnitude ships with them, so
-`models drafter` refuses them. `models status <model-id>` shows the drafter in use, the measured
-share of drafted tokens accepted once the model has served requests, and every choice with its
-verdict, its measured acceptance, and the argument that selects it. A choice that made responses
-slower than no drafter is marked. When a catalog drafter gets a new revision, `models status` shows
-Update for every model using it; `catalog pull <model-id>` downloads it.
+`models drafter` refuses them. `models status <model-id>` shows the drafter in use and every choice
+with its label, its verdict, and the argument that selects it. A found or imported model whose
+recommended drafter isn't on this computer shows "Faster with a drafter · Add"; `models drafter
+<model-id> auto` downloads only the drafter. When a catalog drafter gets a new revision,
+`models status` shows Update for every model using it; `catalog pull <model-id>` downloads it.
 
 ## What's on this computer
 
@@ -72,6 +82,6 @@ can't run with a plain reason, such as "No kernels for the deepseek4 architectur
 weights, which Magnitude doesn't support yet", and hidden models marked `Hidden`. `models unhide`
 shows a hidden model again.
 
-`models folders list` shows the automatic locations Magnitude found, whether each is scanning, off,
-or not found, and your own folders. `models folders add <path>` watches a folder: GGUFs added later
+`models folders list` shows the automatic locations and your own folders, each directory with its
+status: Found, Not found, Can't read, or Off. `models folders add <path>` watches a folder: GGUFs added later
 appear and deleted ones disappear. `models folders remove <path>` stops watching it.

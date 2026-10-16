@@ -75,3 +75,30 @@ pub fn catalog_kernel_requests(
         unsupported,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A supported catalog variant the engine refuses on any backend (weight types it can't
+    /// import, such as the `UD-Q2_K_XL` variants' Q2_K tensors) is a release defect: it must leave
+    /// the catalog until the engine runs it.
+    #[test]
+    #[ignore = "requires MAGNITUDE_CATALOG_BUNDLE, the release planner bundle (bun run icn:catalog:build-bundle)"]
+    fn every_supported_catalog_variant_runs_on_every_backend() {
+        let bundle = std::path::PathBuf::from(
+            std::env::var_os("MAGNITUDE_CATALOG_BUNDLE").expect("set MAGNITUDE_CATALOG_BUNDLE"),
+        );
+        let unsupported = BackendName::ALL
+            .into_iter()
+            .flat_map(|backend| {
+                catalog_kernel_requests(&bundle, backend)
+                    .unwrap_or_else(|error| panic!("{}: {error:#}", backend.as_str()))
+                    .unsupported
+                    .into_iter()
+                    .map(move |(model, reason)| format!("{} {model}: {reason}", backend.as_str()))
+            })
+            .collect::<Vec<_>>();
+        assert!(unsupported.is_empty(), "{unsupported:#?}");
+    }
+}

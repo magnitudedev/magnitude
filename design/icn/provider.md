@@ -22,7 +22,10 @@ or runtime residency.
 The local provider adapter consumes ACN's local-model product projection. Both an installed catalog
 model and a ready custom model of any origin can become callable. Within the `local` provider
 namespace, `ProviderModelId` is exactly the canonical `ModelId`; ACN creates no provider alias or
-configuration identity.
+configuration identity. The one exception is upgrade continuity: a found file later attributed to a
+catalog model (its exact target in a Hugging Face cache) keeps the `hf:` ID it had as a found model
+as one of the catalog model's `aliases`, which ICN publishes; ACN resolves a request naming an alias
+to the catalog model and rewrites persisted references to the catalog ID.
 
 A callable offering exists only when the exact current model has completed assessment with `Fits`
 and is `Selectable`. It contains that assessment cycle's profile and inspected capabilities.

@@ -54,15 +54,21 @@ as its own prefix, three verification windows inside the tokenizer compared byte
 first header's, and its own remainder; any mismatch, or a result that does not parse, reads that
 header whole. A header read stops growing as soon as the bytes in hand prove the header invalid
 (such as a tensor type the engine doesn't know); only a prefix that ends before its header reads
-on. A file whose header is invalid is a version assessed `Unsupported` with the `Unreadable`
+on. That a file's header is unreadable is cached like a header, by repository, commit, path and
+content identity, so a repeated inspection fetches nothing for it. A header is every byte through the aligned tensor-data offset, or the whole file when it holds no
+tensor data and ends before that offset's padding, as a split's metadata-only first shard may. A file whose header is invalid is a version assessed `Unsupported` with the `Unreadable`
 reason and the parser's detail; it never fails the repository's inspection, and an inspection
 failure is never reported as a network failure unless the inference service was unreachable. Each version also reports the bytes adding it downloads before any drafter: its
 files and the repository's projector, or nothing when it is already on this computer or is a local
 file used in place. Each version carries its canonical model ID,
-so clients never form identities: a repository file's `hf:` ID, and for a path the ID of the custom
+so clients never form identities, and a label: the quantization its file or folder name spells as a
+quantization label (`Q4_K_M`, `UD-Q4_K_XL`; a name such as `q40` is not one), else the header's
+`general.file_type` label. The ID is a repository file's `hf:` ID, and for a path the ID of the custom
 model already listed with those bytes (a Hugging Face identity when its location gives one), else
 `local:` with the file's header digest. A version whose bytes are already listed also names that
-model as on this computer. For a chosen version and drafter the service
+model as on this computer, whichever location lists it: the same header digest, the same `hf:` ID
+and weights size (a projector found beside it, as with an Ollama pull, is not part of the version),
+or the same files. For a chosen version and drafter the service
 also returns the exact servable bundle to download, with the same package identities a post-download
 scan computes; clients never construct bundles. These queries do not change the release catalog,
 managed inventory, or configuration, and catalog use does not depend on them.
@@ -176,7 +182,10 @@ file under `HF_HOME`) are never discovered. When the Hub rejects the presented c
 (HTTP 401, as for an expired or revoked token, which Hugging Face rejects even on public
 repositories), the package is resolved and downloaded anonymously instead. A rejected credential
 therefore never makes public packages unavailable; content that still requires authorization fails
-with its anonymous classification.
+with its anonymous classification. Header reads for inspection that the Hub refuses (401 or 403, a
+gated or private repository) fail with the model operation code `hugging_face_access_required`,
+whose message asks for accepting the repository's terms and setting `HF_TOKEN` (or, with a token,
+for granting that account access); clients present it as such, never as a connection failure.
 
 ## Artifact stores and inventory
 
@@ -235,7 +244,7 @@ ICN scans a list of model roots that ACN resolves and supplies (see
 |---|---|
 | Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID. A snapshot entry links to `<repository>/blobs/<hash>`, whose name is the file's Hub content hash; classic caches keep the bytes there, while current `huggingface_hub` makes that entry a link into a store every repository of the hub shares (`<hub>/blobs/<xx>/<hash>`, named by another hash). Both layouts are read, following link chains only within the hub; the repository blob's name is the content identity, and the cache stays read-only |
 | LM Studio | Publisher/repository layout gives the `hf:` ID |
-| llama.cpp cache | `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
+| llama.cpp cache | Current llama.cpp writes the Hugging Face hub layout (in the location itself or its `hub` folder): repository and commit, like the Hugging Face cache, but owned by llama.cpp (without `LLAMA_CACHE`, llama.cpp downloads into the shared Hugging Face cache, and those files stay the Hugging Face cache's). The older flat layout: `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
 | Ollama | Manifests name each model and its GGUF blob; both `manifests/` and newer releases' `manifests-v2/` (whose entries may be symlinks to the manifest stored as a blob, followed only within the root, and which name Ollama's registry `ollama.com` rather than `registry.ollama.ai`) are read, and a model in both is one model, named as Ollama names it (`qwen3.5:0.8b`). A GGUF blob's `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
 | User folders | Any GGUFs beneath the folder; `local:` |
 
@@ -454,12 +463,17 @@ ownership rejects or waits for removal of files used by a live model instance.
 
 Catalog removal is serialized with installation admission. An installation that is still
 downloading is rejected; one that is optimizing is stopped and removal proceeds.
-Externally owned or shared dependencies are retained while a removable target and other exclusively
-owned material are removed; a dependency is shared only with another catalog model that is installed
-or affiliated with it, never merely declared by an uninstalled one; removal is retained as a whole only when a target itself is external or
-shared, because deleting it would either violate ownership or break another catalog model. Removing
-an eligible package removes every Magnitude-owned inventory occurrence of that package and preserves
-every external occurrence.
+Removal deletes Magnitude's own copies and never another app's files. Externally owned or shared
+dependencies are retained while a removable target and other exclusively owned material are
+removed; a dependency is shared only with another catalog model that is installed or affiliated with
+it, never merely declared by an uninstalled one. Removal is retained as a whole only when no target
+has a Magnitude-owned copy (the model is a found copy, which is hidden instead) or a Magnitude-owned
+target is shared, because deleting it would break another catalog model. Removing an eligible
+package removes every Magnitude-owned inventory occurrence of that package and preserves every
+external occurrence; when an external copy of the target remains, as after upgrading with the same
+file in a Hugging Face cache, it keeps serving the catalog model from where it is. A hidden found
+copy is identified by the `hf:` ID it has as a found model, so hiding it ends its attribution to
+the catalog model and it is listed as a hidden found model.
 
 Removing an added custom model deletes its Magnitude-owned files under the same rules; any of its
 files that are also present in an external location stay there, and the model remains as found.

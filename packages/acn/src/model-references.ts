@@ -73,6 +73,24 @@ export const parseModelReference = (
   }))
 }
 
+/**
+ * A drafter the user entered, in the form the inference service reads: `owner/repo[@revision]:path`
+ * for a repository file (from a link, `owner/repo/path.gguf`, or `hf:owner/repo/path.gguf`), an
+ * absolute path for a local file, and anything else as typed for the service to judge.
+ */
+export const drafterInput = (input: string, environment: DiscoveryEnvironment): string => {
+  const value = input.trim().replace(/^hf:/i, "")
+  return Either.match(parseModelReference(value, environment), {
+    onLeft: () => value,
+    onRight: (reference) => {
+      if (reference._tag === "Local") return reference.path
+      if (Option.isSome(reference.quant) || Option.isNone(reference.file)) return value
+      const revision = reference.revision === "main" ? "" : `@${reference.revision}`
+      return `${reference.repository}${revision}:${reference.file.value}`
+    },
+  })
+}
+
 /** A repository's display name: its name without a trailing GGUF marker, words split at separators. */
 export const repositoryDisplayName = (id: string): string => {
   const name = id.split("/").at(-1) ?? id

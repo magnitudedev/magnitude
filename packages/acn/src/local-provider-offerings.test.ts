@@ -91,6 +91,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
       support: { _tag: "Supported" },
       fidelityRank: 1,
       quantizationAware: false,
+      aliases: [],
     },
     acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
     servingState: { ...servingState, rankingScores: Option.none() },

@@ -1,13 +1,13 @@
 import { parse as parseToml } from "smol-toml"
 import * as FileSystem from "@effect/platform/FileSystem"
 import * as Path from "@effect/platform/Path"
-import { HarnessIdSchema, type HarnessId } from "@magnitudedev/sdk"
+import { HarnessIdSchema, ProviderModelIdSchema, type HarnessId, type ProviderModelId } from "@magnitudedev/sdk"
 import {
   MAGNITUDE_CLAUDE_CODE_PROXY_BASE_URL,
   MAGNITUDE_CODEX_PROXY_BASE_URL,
   MAGNITUDE_INFERENCE_BASE_URL,
 } from "@magnitudedev/sdk"
-import { Effect, Option } from "effect"
+import { Effect, Option, Schema } from "effect"
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser"
 import { isDeepStrictEqual } from "node:util"
 import { parseDocument } from "yaml"
@@ -25,8 +25,8 @@ export const harnessEndpoints = (origin?: string) => {
 export const LOCAL_TOKEN = "magnitude-local"
 export const CHAT_COMPLETIONS_API = "openai-completions" as const
 export const OPENAI_COMPATIBLE_PACKAGE = "@ai-sdk/openai-compatible" as const
-const LOCAL_ANTHROPIC_MODEL_PREFIX = "anthropic-local/"
-const LOCAL_CODEX_MODEL_PREFIX = "magnitude-local/"
+export const LOCAL_ANTHROPIC_MODEL_PREFIX = "anthropic-local/"
+export const LOCAL_CODEX_MODEL_PREFIX = "magnitude-local/"
 
 export const anthropicLocalModelId = (modelId: string): string =>
   `${LOCAL_ANTHROPIC_MODEL_PREFIX}${modelId}`
@@ -41,6 +41,12 @@ export const isCodexLocalModelId = (modelId: unknown): modelId is string =>
   typeof modelId === "string" && modelId.startsWith(LOCAL_CODEX_MODEL_PREFIX)
 
 /** Normalize a harness selection whose provider and model are stored separately. */
+/** The Magnitude model a harness selection names: the selection without Magnitude's prefix, else none. */
+export const magnitudeSelection = (selection: unknown, prefix: string): Option.Option<ProviderModelId> =>
+  typeof selection === "string" && selection.startsWith(prefix) && selection.length > prefix.length
+    ? Option.getRight(Schema.decodeUnknownEither(ProviderModelIdSchema)(selection.slice(prefix.length)))
+    : Option.none()
+
 export const qualifiedModelSelection = (provider: unknown, model: unknown): Option.Option<string> =>
   typeof provider === "string" && provider.length > 0 && typeof model === "string" && model.length > 0
     ? Option.some(`${provider}/${model}`)
@@ -226,6 +232,7 @@ export const defineConnector = (definition: ConnectorDefinition): HarnessConnect
     ...(definition.skillRequired === true ? { skillRequired: true } : {}),
     skillInstallationTarget: definition.skillInstallationTarget,
     configurationFiles: definition.configurationFiles,
+    selectedModel: definition.selectedModel,
     connect: definition.connect,
     disconnect: definition.disconnect,
     detect: (searchPath) => Effect.sync(() => Option.fromNullable(findExecutable(definition.executable, searchPath)).pipe(

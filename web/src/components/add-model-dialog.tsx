@@ -3,10 +3,10 @@ import { Cause, Exit, Option } from "effect"
 import { Result, useAtomRefresh, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { ArrowLeftIcon, ArrowUpRightIcon, DownloadSimpleIcon, LinkIcon, MagnifyingGlassIcon, PlusIcon } from "@phosphor-icons/react"
 import {
-  candidateDownloadBytes, catalogVariantOfName, formatStorageSize, unsupportedReasonMessages, useAgentClient,
+  candidateDownloadBytes, catalogVariantOfName, formatStorageSize, noRunnableVersionReason, unsupportedReasonMessages, useAgentClient,
   type AddModelRequest,
 } from "@magnitudedev/client-common"
-import type { CandidateInspection, CandidateVersion, DrafterCandidate, HuggingFaceSearchResponse, HuggingFaceSearchResult, LocalModel, UnsupportedReason } from "@magnitudedev/sdk"
+import type { CandidateInspection, CandidateVersion, DrafterCandidate, DrafterChoice, HuggingFaceRepositoryId, HuggingFaceSearchResponse, HuggingFaceSearchResult, LocalModel, UnsupportedReason } from "@magnitudedev/sdk"
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog"
 import { Button } from "./ui/button"
 import { Input } from "./ui/input"
@@ -250,21 +250,35 @@ function InspectedRepository({ inspection, file, models, onBack, onAdded }: { in
   const [picked, setPicked] = useState(() => initialVersion(inspection, file))
   const version = Option.flatMap(picked, label => Option.fromNullable(inspection.versions.find(entry => entry.label === label)))
   const header = { inspection, models, selectedVersion: picked, onSelectVersion: (label: string) => setPicked(Option.some(label)), ...(onBack ? { onBack } : {}) }
-  if (Option.isNone(version) || Option.isSome(inspection.unsupportedArchitecture)) return <RepositoryView {...header} />
-  return <VersionWithDrafters key={version.value.label} version={version.value} header={header} onAdded={onAdded} />
+  const source = inspection.source
+  if (Option.isNone(version) || Option.isSome(inspection.unsupportedArchitecture) || source._tag !== "HuggingFace") return <RepositoryView {...header} />
+  return <VersionWithDrafters key={version.value.label} version={version.value} header={header} onAdded={onAdded}
+    target={{ _tag: "Repository", repository: source.repository, commit: source.commit }} />
 }
 
-function VersionWithDrafters({ version, header, onAdded }: {
+function VersionWithDrafters({ version, header, target, onAdded }: {
   version: CandidateVersion
   header: Omit<Parameters<typeof RepositoryView>[0], "drafters" | "footer">
+  target: AddTarget
   onAdded: () => void
 }) {
-  const { drafters, footer } = useVersionConfirmation(header.inspection, version, onAdded)
+  const { drafters, footer } = useVersionConfirmation(header.inspection, version, target, onAdded)
   return <RepositoryView {...header} drafters={drafters} footer={footer} />
 }
 
+/** What adding a version names: a Hugging Face repository pinned to the inspected commit, or the GGUF file the user chose. */
+export type AddTarget =
+  | { readonly _tag: "Repository"; readonly repository: HuggingFaceRepositoryId; readonly commit: string }
+  | { readonly _tag: "File"; readonly path: string }
+
+/** The command that adds a version: a Hugging Face repository is added at its version; a chosen file is imported by its own path. */
+export const addVersionRequest = (target: AddTarget, version: CandidateVersion, drafter: DrafterChoice) =>
+  target._tag === "File"
+    ? { _tag: "Import" as const, request: { path: target.path, drafter } }
+    : { _tag: "Add" as const, request: { repository: target.repository, revision: Option.some(target.commit), version: Option.some(version.label), drafter } }
+
 /** The drafter choices for one version and the footer that adds it with the chosen drafter. */
-function useVersionConfirmation(inspection: CandidateInspection, version: CandidateVersion, onAdded: () => void) {
+function useVersionConfirmation(inspection: CandidateInspection, version: CandidateVersion, target: AddTarget, onAdded: () => void) {
   const client = useAgentClient()
   const { candidates, otherPending, otherFailure, checkOther } = useDrafterCandidates({ _tag: "Candidate", source: inspection.source, files: version.files })
   const [selection, setSelection] = useState<DrafterSelection>({ _tag: "Auto" })
@@ -274,22 +288,21 @@ function useVersionConfirmation(inspection: CandidateInspection, version: Candid
   const adding = useAtomValue(client.Models.AddHuggingFaceModel)
   const importFile = useAtomSet(client.Models.ImportModelFile, { mode: "promiseExit" })
   const importing = useAtomValue(client.Models.ImportModelFile)
-  const source = inspection.source
-  const state = source._tag === "Local" ? importing : adding
+  const state = target._tag === "File" ? importing : adding
   const failure = Result.isFailure(state) && !state.waiting
     ? Option.match(Cause.failureOption(state.cause), { onNone: () => ({ title: "Couldn’t add this model", description: "Try again." }), onSome: candidateErrorNotice })
     : undefined
   const confirm = () => {
-    const drafter = drafterChoice(selection, list)
     const done = (exit: Exit.Exit<unknown, unknown>) => { if (Exit.isSuccess(exit)) onAdded() }
-    if (source._tag === "Local") void importFile({ path: source.path, drafter }).then(done)
-    else void add({ repository: source.repository, revision: Option.some(source.commit), version: Option.some(version.label), drafter }).then(done)
+    const command = addVersionRequest(target, version, drafterChoice(selection, list))
+    if (command._tag === "Import") void importFile(command.request).then(done)
+    else void add(command.request).then(done)
   }
   return {
     drafters: Result.isFailure(candidates) ? <ErrorNotice severity="warning" title="Couldn’t list drafters" description="The recommended drafter is still used when you add this model." />
       : findingDrafters ? <div aria-busy="true" aria-label="Finding drafters" className="space-y-2"><p className="text-xs text-slate-500">Finding drafters for this version…</p><SkeletonLine className="h-10" width="100%" /><SkeletonLine className="h-10" width="100%" /></div>
       : <DrafterList candidates={list} selection={selection} onSelect={setSelection} otherPending={otherPending} otherFailure={otherFailure} onCheckOther={checkOther} />,
-    footer: <RepositoryFooter local={source._tag === "Local"} action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={state.waiting || findingDrafters} failure={failure} onConfirm={confirm} />,
+    footer: <RepositoryFooter local={target._tag === "File"} action={confirmAction(inspection, version, selectedDrafterCandidate(selection, list))} pending={state.waiting || findingDrafters} failure={failure} onConfirm={confirm} />,
   }
 }
 
@@ -329,11 +342,11 @@ function LocalFileInspection({ path, models, onAdded }: { path: string; models: 
   if (version === undefined || Option.isSome(inspection.value.unsupportedArchitecture) || !versionVerdict(version).selectable) {
     return <LocalFileSummary inspection={inspection.value} models={models} />
   }
-  return <LocalFileVersion inspection={inspection.value} version={version} models={models} onAdded={onAdded} />
+  return <LocalFileVersion path={path} inspection={inspection.value} version={version} models={models} onAdded={onAdded} />
 }
 
-function LocalFileVersion({ inspection, version, models, onAdded }: { inspection: CandidateInspection; version: CandidateVersion; models: readonly LocalModel[]; onAdded: () => void }) {
-  const { drafters, footer } = useVersionConfirmation(inspection, version, onAdded)
+function LocalFileVersion({ path, inspection, version, models, onAdded }: { path: string; inspection: CandidateInspection; version: CandidateVersion; models: readonly LocalModel[]; onAdded: () => void }) {
+  const { drafters, footer } = useVersionConfirmation(inspection, version, { _tag: "File", path }, onAdded)
   return <LocalFileSummary inspection={inspection} models={models} drafters={drafters} footer={footer} />
 }
 
@@ -438,6 +451,17 @@ export function RepositoryView({ inspection, models, selectedVersion, onSelectVe
           </section>
           {drafters && <DrafterSection>{drafters}</DrafterSection>}
         </>}
+    {Option.isNone(inspection.unsupportedArchitecture) && Option.match(noRunnableVersionReason(inspection.versions), {
+      onNone: () => null,
+      onSome: reason => <NoRunnableVersionFooter reason={reason} />,
+    })}
     {footer}
   </>
+}
+
+/** In place of Download when nothing can run: what is wrong, from the versions' verdicts. */
+export function NoRunnableVersionFooter({ reason }: { reason: string }) {
+  return <div className="border-t border-slate-200 pt-4 dark:border-slate-750">
+    <ErrorNotice severity="info" title="No version of this model runs on this computer" description={reason} />
+  </div>
 }

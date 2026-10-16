@@ -3136,6 +3136,7 @@
       },
       "CatalogModel": {
         "type": "object",
+        "description": "A catalog variant and its state on this computer. `aliases` are the `hf:` IDs its target's\nfiles found in an external location (a Hugging Face cache) would have as custom models, which\nclients resolve to this model, so references made before the file was attributed keep working.",
         "required": [
           "id",
           "desired",
@@ -3201,6 +3202,12 @@
           },
           "localState": {
             "$ref": "#/components/schemas/CatalogModelState"
+          },
+          "aliases": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ModelId"
+            }
           }
         },
         "additionalProperties": false
@@ -4436,6 +4443,9 @@
           },
           "recommendedDrafter": {
             "$ref": "#/components/schemas/DrafterCandidate"
+          },
+          "license": {
+            "type": "string"
           },
           "profile": {
             "$ref": "#/components/schemas/ServingProfile"

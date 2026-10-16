@@ -11,7 +11,8 @@ use magnitude_service_contracts::models::{
     HuggingFaceRepositoryId, LocalModelsConfiguration, ModelRoot, ModelRootKind,
 };
 use magnitude_service_contracts::{
-    ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubFile, Integrity,
+    ComponentRelationship, ComponentRole, ContentIdentity, ExternalOrigin, HubCacheOwner, HubFile,
+    Integrity,
     InventoryError, LocalDeclaration, ModelComponent, ModelLocation, ModelSource,
 };
 
@@ -61,9 +62,11 @@ pub(crate) fn scan_root(
         return Ok(());
     }
     match root.kind {
-        ModelRootKind::HuggingFaceCache => scan_hf_cache(&root.path, declared, cache, output),
+        ModelRootKind::HuggingFaceCache => {
+            scan_hf_cache(HubCacheOwner::HuggingFace, &root.path, declared, cache, output)
+        }
         ModelRootKind::LmStudio => scan_lm_studio(&root.path, cache, output),
-        ModelRootKind::LlamaCpp => scan_llama_cpp(&root.path, cache, output),
+        ModelRootKind::LlamaCpp => scan_llama_cpp(&root.path, declared, cache, output),
         ModelRootKind::Ollama => scan_ollama(&root.path, cache, output),
         ModelRootKind::Folder => scan_folder(&root.path, cache, output),
     }
@@ -177,13 +180,20 @@ struct LlamaCppManifest {
     projector: Option<String>,
 }
 
-/// llama.cpp's `-hf` cache stores files flat as `<owner>_<repository>_<file>` beside
-/// `manifest=<owner>=<repository>=<tag>.json`, which names the exact Hub file and its projector.
+/// llama.cpp's `-hf` cache. Current releases write the Hugging Face hub layout
+/// (`models--<owner>--<repository>/snapshots/<commit>/…`), in `LLAMA_CACHE` itself or its `hub`
+/// folder; those repositories are scanned as a hub cache that llama.cpp owns. Older releases store
+/// files flat as `<owner>_<repository>_<file>` beside `manifest=<owner>=<repository>=<tag>.json`,
+/// which names the exact Hub file and its projector.
 fn scan_llama_cpp(
     root: &Path,
+    declared: &DeclaredProjectors,
     cache: &ModelCache,
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
+    for hub in [root.to_path_buf(), root.join("hub")] {
+        scan_hf_cache(HubCacheOwner::LlamaCpp, &hub, declared, cache, output)?;
+    }
     let manifests = llama_cpp_manifests(root)?;
     let declared = manifests
         .iter()
@@ -192,7 +202,19 @@ fn scan_llama_cpp(
             Some((root.join(name), root.join(projector)))
         })
         .collect::<BTreeMap<_, _>>();
+    let hub_layout = |path: &Path| {
+        relative_parts(root, path).is_some_and(|parts| {
+            let mut parts = parts.iter();
+            let first = parts.next();
+            first.is_some_and(|part| part.starts_with("models--"))
+                || (first.is_some_and(|part| part == "hub")
+                    && parts.next().is_some_and(|part| part.starts_with("models--")))
+        })
+    };
     for group in discover_groups(root, &canonical_or_self(root), cache, &declared)? {
+        if hub_layout(&group.paths[0]) {
+            continue;
+        }
         let name = group.paths[0]
             .file_name()
             .and_then(|name| name.to_str())

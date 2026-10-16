@@ -32,7 +32,7 @@ export const catalogModel = (): CatalogLocalModel => ({
   modelId: catalogId,
   storageBytes: 24 * GB,
   presentation: { displayName: "Qwen3.6 35B-A3B", variantLabel: ModelVariantLabelSchema.make("Q4"), description: "", license: Option.some("apache-2.0"), sourceUrls: [] },
-  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false },
+  catalogData: { releaseDate: ModelReleaseDateSchema.make("2026-01-01"), parameterization: { architecture: "dense", totalParameters: 1 }, intelligence: 1, support: { _tag: "Supported" }, fidelityRank: 1, quantizationAware: false, aliases: [] },
   acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 24 * GB, primaryPath: "/models/qwen.gguf", ownership: "Magnitude" }, residencyState: { _tag: "Unloaded" } },
   servingState: { _tag: "Assessed", capabilities, speculativeMethod: Option.none(), metadata, assessment: { _tag: "Fits", assessmentId, environmentId, profile: { contextLength: 32_768 }, memory: { domains: [], totalRequiredBytes: 24 * GB, requiredSystemMemoryBytes: 0 }, performance: [{ contextTokens: 32_768, estimatedTokensPerSecond: 80 }] }, rankingScores: Option.none() },
 })

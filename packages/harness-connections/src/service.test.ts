@@ -2304,3 +2304,75 @@ it.each(HARNESS_PRIORITY)("disconnects %s after its provider configuration has b
     expect(row.inspection._tag).toBe("Disconnected")
   }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
 })
+
+describe("selections after an upgrade", () => {
+  it.each(["opencode", "claude-code", "codex", "hermes", "openclaw", "oh-my-pi", "cline"] as const)(
+    "moves a %s selection naming a renamed model to the model it now names on sync",
+    async (harness) => {
+      await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-renamed-selection-" })
+        const paths = fixturePaths(root)
+        yield* writeFixtures(initialFiles(paths))
+        const registry = makeHarnessConnectorRegistry(paths, {
+          readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+          piCompanion: testPiCompanion,
+        })
+        const service = (canonicalModel: (id: typeof model) => Effect.Effect<typeof model>) => makeHarnessConnectionService({
+          paths,
+          registry,
+          canonicalModel,
+          detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+          resolveModels: Effect.succeed(models),
+          now: () => new Date("2026-08-26T00:00:00.000Z"),
+          installStartup: Effect.void,
+        })
+        const id = HarnessIdSchema.make(harness)
+        yield* (yield* service(Effect.succeed)).connect(id, { model: Option.some(secondModel) })
+        expect(yield* registry.get(id).selectedModel).toEqual(Option.some(secondModel))
+        yield* (yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))).sync(id)
+        expect(yield* registry.get(id).selectedModel).toEqual(Option.some(model))
+      }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+    },
+  )
+})
+
+describe("automatic alias reconciliation", () => {
+  it("moves only connected harnesses whose selection names a renamed model, once, and leaves other configuration alone", async () => {
+    await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "magnitude-alias-reconciliation-" })
+      const paths = fixturePaths(root)
+      yield* writeFixtures({
+        ...initialFiles(paths),
+        [paths.claude]: stringifyJson({ model: `anthropic-local/${secondModel}` }),
+      })
+      const registry = makeHarnessConnectorRegistry(paths, {
+        readCodexBundledCatalog: () => Effect.succeed(bundledCodexCatalog),
+        piCompanion: testPiCompanion,
+      })
+      const service = (canonicalModel: (id: typeof model) => Effect.Effect<typeof model>) => makeHarnessConnectionService({
+        paths,
+        registry,
+        canonicalModel,
+        detect: (connector) => Effect.succeed(Option.some({ executable: `/installed/${connector.id}` })),
+        resolveModels: Effect.succeed(models),
+        now: () => new Date("2026-08-26T00:00:00.000Z"),
+        installStartup: Effect.void,
+      })
+      const opencode = HarnessIdSchema.make("opencode")
+      const hermes = HarnessIdSchema.make("hermes")
+      const before = yield* service(Effect.succeed)
+      yield* before.connect(opencode, { model: Option.some(secondModel) })
+      yield* before.connect(hermes, { model: Option.some(model) })
+      const hermesBefore = yield* fs.readFileString(paths.hermes)
+      const claudeBefore = yield* fs.readFileString(paths.claude)
+      const upgraded = yield* service((selected) => Effect.succeed(selected === secondModel ? model : selected))
+      expect(yield* upgraded.syncRenamedSelections).toEqual([opencode])
+      expect(yield* registry.get(opencode).selectedModel).toEqual(Option.some(model))
+      expect(yield* fs.readFileString(paths.hermes)).toBe(hermesBefore)
+      expect(yield* fs.readFileString(paths.claude)).toBe(claudeBefore)
+      expect(yield* upgraded.syncRenamedSelections).toEqual([])
+    }).pipe(Effect.provide([BunContext.layer, FetchHttpClient.layer, BunSqliteDriverLayer]))))
+  })
+})

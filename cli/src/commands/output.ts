@@ -11,6 +11,23 @@ const messageOf = (error: unknown): string => {
   return String(error)
 }
 
+/** A stable machine code for a failure: the product code it carries, else its tag in snake case. */
+export const errorCode = (error: unknown): string => {
+  if (typeof error === "object" && error !== null) {
+    const candidate = error as { readonly code?: unknown; readonly _tag?: unknown }
+    if (typeof candidate.code === "string" && candidate.code.length > 0) return candidate.code
+    if (typeof candidate._tag === "string" && candidate._tag.length > 0) {
+      return candidate._tag.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase()
+    }
+  }
+  return "command_failed"
+}
+
+/** What a failed command writes to stderr: its product message, or under `--json` one error document. */
+export const renderCommandError = (error: unknown, json: boolean): string => json
+  ? `${JSON.stringify({ error: { message: messageOf(error), code: errorCode(error) } }, null, 2)}\n`
+  : `${messageOf(error)}\n`
+
 class CommandOutputFailed extends Data.TaggedError("CommandOutputFailed")<{
   readonly message: string
 }> {}
@@ -46,7 +63,7 @@ export const runCommand = <A>(options: {
     catch: (error) => new CommandOutputFailed({ message: messageOf(error) }),
   })),
   Effect.catchAll((error) => Effect.sync(() => {
-    process.stderr.write(`${messageOf(error)}\n`)
+    process.stderr.write(renderCommandError(error, options.json !== undefined))
     process.exitCode = 1
   })),
   Effect.asVoid,

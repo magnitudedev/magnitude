@@ -1,6 +1,6 @@
 import { Effect, Option } from "effect"
 import type { HarnessConnectionPaths } from "../paths"
-import { CHAT_COMPLETIONS_API, LOCAL_TOKEN, OPENAI_BASE_URL, defineConnector, readOr, qualifiedModelSelection, removeJsoncPaths, splitQualifiedModelSelection, updateJsonc, writeIfChanged } from "../shared"
+import { CHAT_COMPLETIONS_API, LOCAL_TOKEN, OPENAI_BASE_URL, defineConnector, magnitudeSelection, readOr, qualifiedModelSelection, removeJsoncPaths, splitQualifiedModelSelection, updateJsonc, writeIfChanged } from "../shared"
 import type { HarnessCompanionPackage, HarnessConnectionSpec } from "../contract"
 import { modelInput, modelMaxTokens, zeroCost } from "../model-fields"
 import { hasReasoning, projectReasoningControls } from "../reasoning"
@@ -54,6 +54,10 @@ export const makePiConnector = (
   skillRequired: true,
   ...(options.companion ? { companion: options.companion } : options.packageSource ? { companion: makePiCompanion(paths, options.packageSource) } : {}),
   configurationFiles: [paths.piModels, paths.piSettings],
+  selectedModel: readPiSettings(paths.piSettings).pipe(Effect.map(({ settings }) =>
+    Option.contains(settings.defaultProvider, "magnitude")
+      ? magnitudeSelection(Option.getOrUndefined(settings.defaultModel), "")
+      : Option.none())),
   connect: (spec) => Effect.gen(function* () {
     const source = yield* readOr(paths.piModels, "{}\n")
     yield* writeIfChanged(paths.piModels, source, updateJsonc(source, [[

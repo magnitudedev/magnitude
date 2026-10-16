@@ -65,7 +65,9 @@ Only these sources are offered automatically:
 Magnitude never searches Hugging Face for drafters and never offers loose drafter files from other locations. A
 user may enter **a different drafter** (a Hugging Face file or a local path); it is checked like every candidate,
 cannot be chosen when rejected, is labelled "Untested" when its lineage does not match, and is never chosen
-automatically. **No drafter** is always available. The preselected candidate's label reads "Recommended · ",
+automatically. ACN passes a drafter the user entered to ICN as `owner/repo[@revision]:path`, whether it was typed as
+a link, `owner/repo/path.gguf`, or `hf:owner/repo/path.gguf`, and a local path as an absolute path.
+**No drafter** is always available. The preselected candidate's label reads "Recommended · ",
 followed by its source label.
 
 ## Automatic choice
@@ -90,6 +92,14 @@ Catalog models always use their catalog drafter.
   drafter change.
 - Every custom model can add, change, or turn off its drafter. The choice is a persisted
   declaration keyed by `ModelId` and is delivered to ICN with the local-models configuration.
+  Turned off, the model is a standalone bundle, which the engine serves plain: built-in MTP heads
+  draft only through a bundle that declares them, never implicitly.
+- A found or imported model whose choice is automatic has no attached drafter until the
+  recommended one is on this computer: ACN projects it without a drafter, and clients offer the
+  recommended drafter ("Faster with a drafter · Add (size)"). A drafter the user chose that is
+  missing with no download running is an interrupted download that Sync resumes. An attached
+  drafter's verdict is its own: the assessment's when it names the attached method, else ICN's
+  verdict for the matching recommended candidate, never another drafter's.
 - Adding a drafter to a model whose target is present downloads only the drafter; one already on
   this computer downloads nothing. The download names the model it is for, so the attached drafter
   shows its progress and failure whichever repository, the catalog's included, it comes from. A

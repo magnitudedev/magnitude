@@ -136,11 +136,19 @@ it, preserving concurrent edits. Manifest commit is the uninterruptible durabili
 
 Applying a connection is an idempotent replacement of Magnitude-owned state. Unrelated user state
 is preserved. Without an explicit model, connection and sync do not change the harness's current
-model or generic reasoning preferences. With an explicit model, the connector records the previous
+model or generic reasoning preferences, with one exception: when the harness's current Magnitude
+model is an ID that now names another model (a catalog model's alias, the ID its files had as a found
+model before an upgrade), sync moves the selection to the catalog ID. Each connector reads its own
+current Magnitude selection for this; connect and setup descriptions accept an alias the same way.
+ACN applies this without a manual sync: once at start and whenever the catalog's aliases change, it
+subscribes to the local-model projection and reconciles only the connections in the manifest whose
+selection names an alias, through the same per-connection reconciliation sync uses. Harnesses
+Magnitude hasn't connected, and connections whose selection is not an alias, are never touched, so
+the reconciliation is idempotent. A server service account, which refuses sync, skips it. With an explicit model, the connector records the previous
 selection once and persists the Magnitude model used by an ordinary new harness session.
 
 `add` publishes the complete installed model set and may persist a selected model. `sync` refreshes
-the model set without launching or changing selection. `remove` deletes Magnitude-owned state and
+the model set without launching or changing selection, apart from renaming an alias selection. `remove` deletes Magnitude-owned state and
 conditionally restores the prior model only while the current selection remains Magnitude-owned.
 Cleanup continues when restoration is unnecessary or unsafe.
 

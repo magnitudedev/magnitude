@@ -13,7 +13,8 @@ use magnitude_service_contracts::models::{
     ModelRootKind, RecommendableModel, ServableModelBundle, SpeculativeDraftSource,
 };
 use magnitude_service_contracts::{
-    ComponentRole, ContentIdentity, Integrity, InventoryEntryId, InventoryError, InventoryModel,
+    ComponentRole, ContentIdentity, HubCacheOwner, Integrity, InventoryEntryId, InventoryError,
+    InventoryModel,
     InventoryProperties, LocalDeclaration, ModelAvailability, ModelComponent, ModelLocation,
     ModelOperation, ModelSource,
 };
@@ -980,6 +981,18 @@ fn validate_local_models(configuration: &LocalModelsConfiguration) -> Result<(),
                 declaration.model_id
             )));
         }
+        // A missing imported file only contributes nothing; a folder is never a model file.
+        if let CustomModelDeclarationOrigin::Imported { path } = &declaration.origin
+            && let Some(folder) = std::iter::once(path.as_path())
+                .chain(declaration.target.iter().map(Path::new))
+                .find(|file| file.is_dir())
+        {
+            return Err(InventoryError::InvalidRequest(format!(
+                "imported model {} names the folder {}; an imported model is one GGUF file",
+                declaration.model_id,
+                folder.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -1464,6 +1477,7 @@ fn append_discovered_groups(
 /// Snapshot entries may link anywhere inside the hub: current `huggingface_hub` keeps the bytes in
 /// a blob store every repository shares.
 pub(crate) fn scan_hf_cache(
+    owner: HubCacheOwner,
     cache: &Path,
     declared: &DeclaredProjectors,
     inspections: &ModelCache,
@@ -1507,7 +1521,11 @@ pub(crate) fn scan_hf_cache(
                     None => continue,
                 };
                 let content = content_id(&components);
-                let id = inventory_entry_id("hugging-face-cache", &snapshot, &content);
+                let kind = match owner {
+                    HubCacheOwner::HuggingFace => "hugging-face-cache",
+                    HubCacheOwner::LlamaCpp => "llama-cpp",
+                };
+                let id = inventory_entry_id(kind, &snapshot, &content);
                 let created = modified_seconds(&snapshot).unwrap_or_else(now);
                 output.push(DiscoveryCandidate::Artifact(Box::new(ArtifactCandidate {
                     id,
@@ -1525,6 +1543,7 @@ pub(crate) fn scan_hf_cache(
                         metadata: None,
                     },
                     location: ModelLocation::HuggingFaceCache {
+                        owner,
                         cache_root: snapshot.clone(),
                         repository: repository.clone(),
                         commit: commit.clone(),
@@ -1868,7 +1887,7 @@ impl DeclaredProjectors {
 /// time so an unchanged location is rescanned without rereading headers.
 pub(crate) fn inspect_cached(cache: &ModelCache, path: &Path) -> Option<gguf::GgufInspection> {
     let metadata = path.metadata().ok()?;
-    let evidence = format!("gguf-file-v2\0{}", file_identity(path, &metadata));
+    let evidence = format!("gguf-file-v3\0{}", file_identity(path, &metadata));
     if let Some(inspection) = cache.read_index(ModelIndexKind::GgufInspection, &evidence) {
         return Some(inspection);
     }
@@ -2638,6 +2657,10 @@ mod tests {
         assert_eq!(removed.freed_bytes, u64::try_from(bytes.len()).unwrap());
         assert!(!blob.exists());
         assert!(!snapshot.join("model.gguf").exists());
+        assert!(
+            !repository_root.exists(),
+            "a repository folder left without a model is removed from Magnitude's store"
+        );
         assert!(manager.list().await.unwrap().is_empty());
     }
 
@@ -2709,6 +2732,133 @@ mod tests {
             installed.packages[0].catalog_attribution,
             InstalledCatalogAttribution::Attributed { .. }
         ));
+    }
+
+    /// The catalog's exact target found in a Hugging Face cache, the same repository, commit and
+    /// weight file, is the catalog model even when the catalog's package also holds a projector
+    /// the cache lacks. Another commit of the same file is not.
+    #[tokio::test]
+    async fn external_exact_catalog_target_weights_are_attributed_without_its_projector() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = temporary.path().join("store");
+        let cache = temporary.path().join("cache");
+        let (hf_cache, source) = create_hf_snapshot(temporary.path());
+        write_minimal_gguf(&source.join("model.gguf"));
+
+        let mut initial = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        initial.add_hugging_face_caches([hf_cache.clone()]);
+        let manager = ManagedModelStore::open(initial).await.unwrap();
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let found = manager.list_installed().await.unwrap().packages[0]
+            .package
+            .clone();
+        drop(manager);
+
+        let weights = found.files[0].clone();
+        let projector = ModelFile {
+            id: ModelFileId(format!("file_{}", "b".repeat(64))),
+            path: PathBuf::from("mmproj-BF16.gguf"),
+            role: ModelFileRole::Projector,
+            size_bytes: 1_000,
+            tensor_storage_bytes: None,
+            sha256: "b".repeat(64),
+        };
+        let mut target = found.clone();
+        target.id = ModelPackageId("package_catalog_target".to_owned());
+        target.files = vec![weights.clone(), projector.clone()];
+        target.relationships = vec![
+            magnitude_service_contracts::models::ModelFileRelationship::ProjectorFor {
+                projector_file_id: projector.id.clone(),
+                weights_file_id: weights.id.clone(),
+            },
+        ];
+        let attribution = |target: ModelPackage, hidden: Vec<magnitude_service_contracts::models::ModelId>| {
+            let (store, cache, hf_cache) = (store.clone(), cache.clone(), hf_cache.clone());
+            async move {
+                let mut configured = InventoryConfig::with_roots(store, cache).unwrap();
+                configured.add_hugging_face_caches([hf_cache]);
+                configured.local_models.hidden = hidden;
+                configured.catalog_models = vec![catalog_model(target)];
+                let manager = ManagedModelStore::open(configured).await.unwrap();
+                manager.ensure_installed_model_inventory().await.unwrap();
+                manager.list_installed().await.unwrap().packages[0]
+                    .catalog_attribution
+                    .clone()
+            }
+        };
+
+        assert!(matches!(
+            attribution(target.clone(), Vec::new()).await,
+            InstalledCatalogAttribution::Attributed { .. }
+        ));
+        let found_id = crate::package_service::hub_model_id(&found).unwrap();
+        assert_eq!(found_id.to_string(), "hf:test/model/model.gguf");
+
+        // Requests and references made before the upgrade, naming the found model's `hf:` ID, are
+        // the catalog model's.
+        let mut configured = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        configured.add_hugging_face_caches([hf_cache.clone()]);
+        let definition = catalog_model(target.clone());
+        configured.catalog_models = vec![definition.clone()];
+        let manager = Arc::new(ManagedModelStore::open(configured).await.unwrap());
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let resolver = crate::model_domains::ModelDomainResolver::new(
+            manager,
+            magnitude_service_contracts::models::RecommendableModelCatalog {
+                models: vec![definition.clone()],
+                diagnostics: Vec::new(),
+            },
+        );
+        let catalog_id = magnitude_service_contracts::models::ModelId::catalog(
+            &definition.model_id,
+            &definition.variant_id,
+        );
+        assert_eq!(resolver.canonical_model_id(found_id.clone()).unwrap(), catalog_id);
+        assert_eq!(
+            resolver.canonical_model_id(catalog_id.clone()).unwrap(),
+            catalog_id
+        );
+        assert_eq!(
+            resolver.catalog_snapshot().unwrap().models[0].aliases,
+            vec![found_id.clone()]
+        );
+        drop(resolver);
+
+        // Hidden, the copy is a hidden found model, served under its own ID, and the catalog still
+        // lists the alias so the catalog ID can unhide it.
+        let mut hidden = InventoryConfig::with_roots(store.clone(), cache.clone()).unwrap();
+        hidden.add_hugging_face_caches([hf_cache.clone()]);
+        hidden.local_models.hidden = vec![found_id.clone()];
+        hidden.catalog_models = vec![definition.clone()];
+        let manager = Arc::new(ManagedModelStore::open(hidden).await.unwrap());
+        manager.ensure_installed_model_inventory().await.unwrap();
+        let resolver = crate::model_domains::ModelDomainResolver::new(
+            manager,
+            magnitude_service_contracts::models::RecommendableModelCatalog {
+                models: vec![definition.clone()],
+                diagnostics: Vec::new(),
+            },
+        );
+        assert_eq!(resolver.canonical_model_id(found_id.clone()).unwrap(), found_id);
+        assert_eq!(
+            resolver.catalog_snapshot().unwrap().models[0].aliases,
+            vec![found_id.clone()]
+        );
+        drop(resolver);
+        assert_eq!(
+            attribution(target.clone(), vec![found_id]).await,
+            InstalledCatalogAttribution::NotCatalogTarget,
+            "a hidden found copy of the catalog target stays a hidden found model"
+        );
+        let mut other_commit = target;
+        other_commit.source = ModelPackageSource::HuggingFace {
+            repository: "test/model".to_owned(),
+            revision: "f".repeat(40),
+        };
+        assert_eq!(
+            attribution(other_commit, Vec::new()).await,
+            InstalledCatalogAttribution::NotCatalogTarget
+        );
     }
 
     #[tokio::test]

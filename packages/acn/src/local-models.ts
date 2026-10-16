@@ -6,6 +6,7 @@ import {
   CatalogLocalModelSchema,
   CatalogFormModelIdSchema,
   CustomLocalModelSchema,
+  CustomFormModelIdSchema,
   CustomModelOriginSchema,
   DrafterVerdictSchema,
   ModelReleaseDateSchema,
@@ -20,6 +21,7 @@ import {
   type CustomLocalModelServingState,
   type CustomModelAcquisitionState,
   type CustomModelOrigin,
+  type DrafterChoice,
   type DrafterReference,
   type DrafterVerdict,
   type LocalModelAcquisitionState,
@@ -310,6 +312,7 @@ const catalogModel = (
   removal: LocalModelRemovalState | undefined,
   assessment: VisibleCoordinatedLocalModelAssessment | undefined,
   instances: readonly ModelInstance[],
+  hidden: readonly string[],
 ): Extract<LocalModel, { readonly _tag: "Catalog" }> => {
   const source = entry.source
   const residency = residencyFor(entry.id, instances)
@@ -350,6 +353,8 @@ const catalogModel = (
       support: catalogSupport(source.support),
       fidelityRank: source.fidelityRank,
       quantizationAware: source.quantizationAware,
+      aliases: Option.getOrElse(source.aliases, () => []).filter((alias) => !hidden.includes(alias)).flatMap((alias) =>
+        Option.toArray(Schema.decodeUnknownOption(CustomFormModelIdSchema)(alias))),
     },
     acquisitionState,
     servingState: catalogModelServingState(ready, assessment, rankingScores, unavailableFailure),
@@ -397,26 +402,41 @@ export interface CustomModelInputs {
   readonly instances: readonly ModelInstance[]
   readonly related: readonly RelatedDownload[]
   readonly catalog: readonly CatalogModelSource[]
+  readonly drafterChoice: DrafterChoice
 }
 
+/**
+ * The drafter attached to a custom model. A found or imported model whose automatic drafter is not
+ * on this computer has no drafter yet: its recommended drafter is offered instead. A verdict always
+ * belongs to the attached reference: the assessment's only when it names the attached method, else
+ * ICN's verdict for the matching recommended candidate.
+ */
 export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<AttachedDrafter> => {
-  const { entry, assessment, related, catalog } = inputs
-  return Option.flatMap(entry.source.drafter, (native) => Option.map(productDrafterReference(native.reference), (reference) => {
-    const recommended = Option.flatMap(entry.source.recommendedDrafter, (candidate) => productDrafterCandidate(candidate, catalog))
-      .pipe(Option.filter((candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
-    const assessedVerdict = assessment?._tag === "Assessed" ? assessment.drafter : undefined
-    const verdict: DrafterVerdict = native.state._tag === "Rejected"
-      ? productDrafterVerdict(native.state as NativeDrafterVerdict) ?? { _tag: "None" }
-      : assessedVerdict ?? { _tag: "Bound", method: native.method, memoryBytes: 0 }
+  const { entry, assessment, related, catalog, drafterChoice } = inputs
+  const added = entry.source.origin._tag === "Added"
+  return Option.flatMap(entry.source.drafter, (native) => Option.flatMap(productDrafterReference(native.reference), (reference) => {
     const drafterDownload = currentDownload(related, "Drafter")
     const targetDownload = currentDownload(related, "Target")
+    const notDownloaded = native.state._tag === "NotInstalled" && Option.isNone(drafterDownload)
+    if (notDownloaded && !added && drafterChoice._tag === "Auto") return Option.none()
+    const recommended = Option.flatMap(entry.source.recommendedDrafter, (candidate) => productDrafterCandidate(candidate, catalog))
+      .pipe(Option.filter((candidate) => drafterReferenceKey(candidate.reference) === drafterReferenceKey(reference)))
+    const assessedVerdict = Option.fromNullable(assessment?._tag === "Assessed" && native.state._tag === "Ready"
+      ? assessment.drafter
+      : undefined).pipe(Option.filter((verdict) => verdict._tag === "Bound" && verdict.method._tag === native.method._tag))
+    const verdict: DrafterVerdict = native.state._tag === "Rejected"
+      ? productDrafterVerdict(native.state as NativeDrafterVerdict) ?? { _tag: "None" }
+      : Option.getOrElse(
+          Option.orElse(assessedVerdict, () => Option.map(recommended, (candidate) => candidate.verdict)),
+          (): DrafterVerdict => ({ _tag: "Bound", method: native.method, memoryBytes: 0 }),
+        )
     const availability: AttachedDrafter["availability"] = Option.match(drafterDownload, {
       onSome: (download) => downloadIsActive(download)
         ? { _tag: "Downloading", progress: Option.getOrThrow(transferProgress(download)) }
         : { _tag: "DownloadFailed", failure: Option.getOrThrow(acquisitionFailure(download)) },
       onNone: () => {
         if (native.state._tag !== "NotInstalled") return { _tag: "Present" }
-        // An added model fetches its drafter with its target; any other missing drafter needs Sync.
+        // An added model fetches its drafter with its target; a chosen drafter that is missing needs Sync.
         return Option.match(Option.flatMap(targetDownload, transferProgress), {
           onSome: (progress) => ({ _tag: "Downloading", progress }),
           onNone: () => ({ _tag: "DownloadFailed", failure: Option.getOrElse(
@@ -430,7 +450,7 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       onNone: () => drafterReferenceNaming(reference, catalog),
       onSome: (candidate) => candidate,
     })
-    return {
+    return Option.some({
       reference,
       name,
       label,
@@ -438,7 +458,7 @@ export const attachedDrafter = (inputs: CustomModelInputs): Option.Option<Attach
       verdict,
       availability,
       updateAvailable: catalogUpdateAvailable(catalog, reference),
-    }
+    })
   }))
 }
 
@@ -513,7 +533,7 @@ export const customModel = (inputs: CustomModelInputs): Option.Option<CustomLoca
       )),
       sourceLabel: customModelSourceLabel(origin),
       variantOf: Option.flatMap(entry.source.variantOf, Schema.decodeUnknownOption(CatalogFormModelIdSchema)),
-      license: Option.none(),
+      license: Option.filter(Option.map(entry.source.license, (license) => license.trim()), (license) => license.length > 0),
       sourceUrls: sourceUrls(entry.id),
     },
     drafter,
@@ -611,14 +631,10 @@ export interface LocalModelsInputs {
   readonly downloads: readonly ModelDownload[]
 }
 
-/** A catalog model whose files are all in an external location: a found copy, hidden rather than removed. */
-export const catalogFilesExternal = (model: CatalogLocalModel): boolean =>
-  "installation" in model.acquisitionState && model.acquisitionState.installation.ownership === "External"
-
 /**
- * Catalog models stay ranked; custom models are never ranked. A catalog model found only in an external
- * location that the user hid is listed apart with hidden custom models. ICN lists hidden models apart and never
- * assesses them. A found or imported model the engine cannot run joins the unsupported list.
+ * Catalog models stay ranked; custom models are never ranked. ICN lists hidden models apart and never
+ * assesses them; a hidden external copy of a catalog model is one of them, under the ID its files have as
+ * a found model. A found or imported model the engine cannot run joins the unsupported list.
  */
 export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState => {
   const { source, assessment, operations, runtime, removals, config, downloads } = inputs
@@ -629,6 +645,7 @@ export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState 
     instances: runtime,
     related: customModelDownloads(entry.id, config, downloads),
     catalog: source.catalogModels,
+    drafterChoice: config.drafters[entry.id] ?? { _tag: "Auto" },
   })
   const custom = source.customModels.map((entry) => customInputs(
     entry,
@@ -637,14 +654,13 @@ export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState 
   const catalog = source.catalogModels.flatMap((entry) => {
     const coordinated = coordinatedAssessment(assessment, source.catalogRevision, "catalog", entry.id)
     return assessmentTargetVisible(coordinated)
-      ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime)]
+      ? [catalogModel(entry, latestOperation.get(entry.id), removals.get(entry.id), coordinated, runtime, config.hidden)]
       : []
   })
-  const catalogHidden = (model: CatalogLocalModel) => config.hidden.includes(model.modelId) && catalogFilesExternal(model)
   return {
     preparation: projectLocalModelPreparation(source, assessment),
     models: [
-      ...catalog.filter((model) => !catalogHidden(model)),
+      ...catalog,
       ...custom.flatMap((inputs) => Option.toArray(customModel(inputs))),
     ],
     unsupported: [
@@ -652,7 +668,6 @@ export const projectLocalModels = (inputs: LocalModelsInputs): LocalModelsState 
       ...custom.flatMap((inputs) => Option.toArray(unsupportedCustomModel(inputs))),
     ],
     hidden: [
-      ...catalog.filter(catalogHidden),
       ...source.hiddenModels.flatMap((entry) => Option.toArray(customModel(customInputs(entry, undefined)))),
     ],
   }

@@ -19,7 +19,18 @@ model/quality evidence to the complete catalog `ModelId`. Attribution resolves i
 
 1. exact current target package;
 2. exact persisted package affiliation; or
-3. one exact intrinsic model/quality candidate.
+3. for Magnitude-managed material, one exact intrinsic model/quality candidate; for external material
+   (a Hugging Face cache, or llama.cpp's Hugging Face layout), one current target whose weights are
+   exactly the material's: the same repository and commit, and the same weight files by path and
+   content. A projector or drafter the external material lacks does not change what its weights
+   are.
+
+An external exact target is the catalog model: it is never also a custom model, and the catalog
+reports the model installed with external ownership, serving the target alone until the rest of the
+bundle is present. Installing the catalog model then fetches only what is missing; a file whose
+exact content is already on this computer is copied (cloned where the file system can) and
+verified, never downloaded again. External attributions are derived on every reconciliation and are
+not persisted as affiliations.
 
 Zero or multiple candidates produce a truthful failure. There is no scoring, normalization,
 filename parsing, fuzzy comparison, closest match, or package-derived public identity. Drafters and

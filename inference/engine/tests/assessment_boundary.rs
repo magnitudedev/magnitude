@@ -579,6 +579,15 @@ fn the_fingerprint_reads_the_header_shape_and_the_token_table() {
         fingerprint.tokenizer_digest
     );
 
+    // MTP heads counted as extra blocks don't change the fingerprint: Ollama's qwen3.5:4b
+    // (32 blocks, heads dropped) matches the catalog's unsloth MTP target (33 blocks, one
+    // prediction layer).
+    let mut with_heads = llama();
+    with_heads.set("llama.block_count", Meta::U32(BLOCKS as u32 + 1));
+    with_heads.set("llama.nextn_predict_layers", Meta::U32(1));
+    let with_heads = with_heads.write(&scratch.file("with-heads.gguf"));
+    assert_eq!(ModelFingerprint::from_path(&with_heads).unwrap(), fingerprint);
+
     // The digest is pinned: sha256 over the length-prefixed version tag and
     // tokens.
     let mut small = llama();

@@ -245,6 +245,7 @@ impl ModelInstances {
         let model_id = model_id
             .parse::<ModelId>()
             .map_err(|error| InventoryError::InvalidId(error.to_string()))?;
+        let model_id = self.environment.model_variants.canonical_model_id(model_id)?;
         let configuration = self.environment.model_variants.serving_configuration(&model_id)?;
         Ok(residency_target(model_id, configuration))
     }

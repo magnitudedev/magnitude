@@ -374,6 +374,10 @@ export type CatalogInstallationsResponse = S.Schema.Type<typeof CatalogInstallat
 export type CatalogInstallationsResponseEncoded = S.Schema.Encoded<typeof CatalogInstallationsResponse>
 
 export const CatalogModel = S.Struct({
+  aliases: S.optionalWith(S.Array(S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId)), {
+    exact: true,
+    as: "Option",
+  }),
   description: S.String,
   desired: S.suspend((): S.Schema<ReadyModel, ReadyModelEncoded> => ReadyModel),
   displayName: S.String,
@@ -922,6 +926,7 @@ export const CustomModel = S.Struct({
     { exact: true, as: "Option" },
   ),
   files: S.Array(S.suspend((): S.Schema<CustomModelFile, CustomModelFileEncoded> => CustomModelFile)),
+  license: S.optionalWith(S.String, { exact: true, as: "Option" }),
   modelId: S.suspend((): S.Schema<ModelId, ModelIdEncoded> => ModelId),
   origin: S.suspend((): S.Schema<CustomModelOrigin, CustomModelOriginEncoded> => CustomModelOrigin),
   profile: S.suspend((): S.Schema<ServingProfile, ServingProfileEncoded> => ServingProfile),

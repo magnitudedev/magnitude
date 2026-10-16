@@ -177,6 +177,7 @@ const AddedCustomModelSchema = Schema.Struct({
   version: NonEmptyString,
   drafter: optional(DrafterCandidateSchema),
   outcome: Schema.Literal("Started", "AlreadyOnThisComputer"),
+  drafterDownloadStarted: Schema.Boolean,
 })
 
 /** Pins the repository's commit, picks the recommended version when none is named, and starts the download. */
@@ -197,6 +198,7 @@ const ImportModelFile = Rpc.make("ImportModelFile", {
   success: Schema.Struct({
     modelId: CustomFormModelIdSchema,
     drafter: optional(DrafterCandidateSchema),
+    drafterDownloadStarted: Schema.Boolean,
   }),
   error: CustomModelMutationError,
 }).pipe(atMostOnce)
@@ -204,7 +206,7 @@ const ImportModelFile = Rpc.make("ImportModelFile", {
 /** Adds, changes, or turns off a custom model's drafter; downloads only the drafter when needed. */
 const SetModelDrafter = Rpc.make("SetModelDrafter", {
   payload: Schema.Struct({ modelId: CustomFormModelIdSchema, drafter: DrafterChoiceSchema }),
-  success: Schema.Struct({ drafter: optional(DrafterCandidateSchema) }),
+  success: Schema.Struct({ drafter: optional(DrafterCandidateSchema), drafterDownloadStarted: Schema.Boolean }),
   error: CustomModelMutationError,
 }).pipe(atMostOnce)
 

@@ -2638,6 +2638,7 @@ mod tests {
             projector: None,
             drafter: None,
             recommended_drafter: None,
+            license: None,
             profile: ServingProfile {
                 context_length: 8192,
             },

@@ -54,6 +54,7 @@ const inputs = (entry = customSource(nativeCustomModel()), overrides: Partial<Pa
   instances: [],
   related: [],
   catalog: [],
+  drafterChoice: { _tag: "Auto" } as const,
   ...overrides,
 })
 
@@ -73,6 +74,14 @@ describe("custom model rows", () => {
     expect(row.acquisitionState._tag).toBe("External")
     expect(row.servingState._tag).toBe("Assessed")
     expect(row.servingState).not.toHaveProperty("rankingScores")
+  })
+
+  it("shows the license ICN read for a custom model, and none when it read nothing", () => {
+    const licensed = Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ license: "apache-2.0" })))))
+    expect(licensed.presentation.license).toEqual(Option.some("apache-2.0"))
+    expect(Option.getOrThrow(customModel(inputs())).presentation.license).toEqual(Option.none())
+    expect(Option.getOrThrow(customModel(inputs(customSource(nativeCustomModel({ license: "  " }))))).presentation.license)
+      .toEqual(Option.none())
   })
 
   it("names a model by ICN's display name and the quantization its file names", () => {
@@ -168,6 +177,56 @@ describe("custom model rows", () => {
         name: "Magnitude DFlash for Qwen3.6 35B-A3B",
         label: "Trained for Qwen3.6 35B-A3B",
       }))
+  })
+})
+
+describe("attached drafters", () => {
+  const recommendedDrafter = {
+    category: "CatalogDrafter",
+    reference: drafterReference,
+    name: "Magnitude DFlash for Qwen3.5 4B",
+    label: "Trained for Qwen3.5 4B",
+    sizeBytes: 1_530_000_000,
+    lineage: "Fingerprint",
+    verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1_530_000_000 },
+    onThisComputer: false,
+    method: { _tag: "DFlash" },
+  }
+  const builtInHeadsVerdict = { _tag: "Bound" as const, method: { _tag: "Mtp" as const }, memoryBytes: 619_000_000 }
+  const withHeads = { ...fits, drafter: builtInHeadsVerdict }
+  const recommendedButMissing = customSource(nativeCustomModel({
+    drafter: { ...attachedDrafter, state: { _tag: "NotInstalled" } },
+    recommendedDrafter,
+  }))
+
+  it("offers a found model's automatic drafter that was never downloaded instead of reporting a failure", () => {
+    const row = Option.getOrThrow(customModel(inputs(recommendedButMissing, { assessment: withHeads })))
+    expect(row.drafter).toEqual(Option.none())
+    expect(Option.map(row.recommendedDrafter, ({ verdict, sizeBytes }) => ({ verdict, sizeBytes }))).toEqual(Option.some({
+      verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1_530_000_000 },
+      sizeBytes: 1_530_000_000,
+    }))
+  })
+
+  it("keeps a chosen drafter that is missing as an interrupted download with its own verdict", () => {
+    const row = Option.getOrThrow(customModel(inputs(recommendedButMissing, {
+      assessment: withHeads,
+      drafterChoice: { _tag: "Reference", reference: drafterReference },
+    })))
+    expect(row.drafter).toMatchObject(Option.some({
+      availability: { _tag: "DownloadFailed", failure: { _tag: "Interrupted" } },
+      verdict: { _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1_530_000_000 },
+      sizeBytes: 1_530_000_000,
+    }))
+  })
+
+  it("never gives a present drafter the verdict of a different method", () => {
+    const present = customSource(nativeCustomModel({ drafter: attachedDrafter, recommendedDrafter }))
+    expect(Option.map(Option.getOrThrow(customModel(inputs(present, { assessment: withHeads }))).drafter, ({ verdict }) => verdict))
+      .toEqual(Option.some({ _tag: "Bound", method: { _tag: "DFlash" }, memoryBytes: 1_530_000_000 }))
+    const assessedDFlash = { _tag: "Bound" as const, method: { _tag: "DFlash" as const }, memoryBytes: 1_600_000_000 }
+    expect(Option.map(Option.getOrThrow(customModel(inputs(present, { assessment: { ...fits, drafter: assessedDFlash } }))).drafter,
+      ({ verdict }) => verdict)).toEqual(Option.some(assessedDFlash))
   })
 })
 
@@ -284,7 +343,7 @@ describe("local models state", () => {
       assessment: { complete: true, settledModels: 1, totalModels: 1 },
     })
   })
-  it("hides a catalog model found only in an external location, but never one Magnitude owns", () => {
+  it("lists catalog models with their aliases and leaves hiding an external copy to ICN", () => {
     const desired = {
       metadata: { storageBytes: 1 },
       profile: { contextLength: 32_768 },
@@ -293,6 +352,7 @@ describe("local models state", () => {
     const catalogEntry = (id: string, ownership: string) => ({
       id,
       source: {
+        aliases: Option.some([`hf:owner/${id}/model.gguf`]),
         description: "",
         desired,
         displayName: "Catalog Model",
@@ -324,8 +384,20 @@ describe("local models state", () => {
       config: customModelsConfig({ hidden: [external, owned] as never }),
       downloads: [],
     })
-    expect(state.models.map(({ modelId }) => modelId)).toEqual([owned])
-    expect(state.hidden.map(({ modelId }) => modelId)).toEqual([external])
+    expect(state.models.map(({ modelId }) => modelId)).toEqual([external, owned])
+    expect(state.hidden).toEqual([])
+    expect(state.models[1]?._tag === "Catalog" && state.models[1].catalogData.aliases).toEqual([`hf:owner/${owned}/model.gguf`])
+    expect(state.models[0]?._tag === "Catalog" && state.models[0].catalogData.aliases).toEqual([`hf:owner/${external}/model.gguf`])
+    const hiddenCopy = projectLocalModels({
+      source: { ...sources([]), catalogModels: [catalogEntry(external, "External")] },
+      assessment: assessments([]),
+      operations: [],
+      runtime: [],
+      removals: new Map(),
+      config: customModelsConfig({ hidden: [`hf:owner/${external}/model.gguf`] as never }),
+      downloads: [],
+    })
+    expect(hiddenCopy.models[0]?._tag === "Catalog" && hiddenCopy.models[0].catalogData.aliases).toEqual([])
   })
 
   it("moves a found model the engine cannot run into the unsupported list with its reasons", () => {
