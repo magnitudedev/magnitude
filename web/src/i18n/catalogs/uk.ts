@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** Ukrainian translations; remaining long-tail messages fall back to English. */
+/** Повний український каталог інтерфейсу; усі повідомлення перекладено явно. */
 export const uk = {
   settings: "Налаштування",
   general: "Загальні",
