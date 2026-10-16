@@ -639,4 +639,8 @@ export const bn = {
   reloadWindowRestart: "এই উইন্ডোটি আবার লোড করুন। তবুও না খুললে Magnitude পুনরায় চালু করুন।",
   quitAndReopen: "Magnitude বন্ধ করে আবার খুলুন।",
   savedAppearanceReadError: "সংরক্ষিত চেহারার সেটিং পড়া যায়নি। সিস্টেমের চেহারা ব্যবহার করা হচ্ছে।",
+  chineseTraditional: "প্রথাগত চীনা",
+  korean: "কোরীয়",
+  vietnamese: "ভিয়েতনামি",
+  indonesian: "ইন্দোনেশীয়",
 } satisfies typeof en
