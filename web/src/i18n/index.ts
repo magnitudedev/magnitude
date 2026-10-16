@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from "react"
 import { en } from "./catalogs/en"
 import { es } from "./catalogs/es"
 import { zhCN } from "./catalogs/zh-CN"
-import { zhTW } from "./catalogs/zh-TW"
 import { hi } from "./catalogs/hi"
 import { ur } from "./catalogs/ur"
 import { bn } from "./catalogs/bn"
@@ -12,15 +11,12 @@ import { ja } from "./catalogs/ja"
 import { pt } from "./catalogs/pt"
 import { it } from "./catalogs/it"
 import { uk } from "./catalogs/uk"
-import { id } from "./catalogs/id"
-import { ko } from "./catalogs/ko"
-import { vi } from "./catalogs/vi"
 
-export const LANGUAGES = ["en", "es", "zh-CN", "zh-TW", "hi", "ur", "bn", "fr", "de", "ja", "pt", "it", "uk", "id", "ko", "vi"] as const
+export const LANGUAGES = ["en", "es", "zh-CN", "hi", "ur", "bn", "fr", "de", "ja", "pt", "it", "uk"] as const
 export type Language = typeof LANGUAGES[number]
 export type MessageKey = keyof typeof en
 export const STORAGE_KEY = "magnitude.language"
-const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN, "zh-TW": zhTW, hi, ur, bn, fr, de, ja, pt, it, uk, id, ko, vi }
+const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN, hi, ur, bn, fr, de, ja, pt, it, uk }
 
 export function isLanguage(value: unknown): value is Language {
   return typeof value === "string" && (LANGUAGES as readonly string[]).includes(value)
