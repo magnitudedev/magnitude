@@ -1,8 +1,5 @@
-import { en } from "./en"
-
 /** Portuguese translations; remaining long-tail messages fall back to English. */
 export const pt = {
-  ...en,
   settings: "Configurações",
   general: "Geral",
   about: "Sobre",
@@ -634,4 +631,4 @@ export const pt = {
   stopRequiringKeyDescription: "Quando o Magnitude reiniciar, qualquer dispositivo que consiga aceder a este computador poderá usar a inferência sem chave. Faça-o apenas numa rede de confiança. Este navegador continuará a precisar da chave para iniciar sessão.",
   changeAddressDescription: "Quando o Magnitude reiniciar, aceitará ligações apenas no endereço escolhido. Este navegador poderá não conseguir voltar a ligar-se.",
   restartDisconnectDescription: "Este navegador será desligado enquanto o Magnitude reinicia e voltará a ligar-se automaticamente.",
-} satisfies Partial<typeof en>
+} satisfies typeof en
