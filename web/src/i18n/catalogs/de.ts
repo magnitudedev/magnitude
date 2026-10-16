@@ -642,6 +642,8 @@ export const de = {
   off: "Aus",
   request: "Anfrage",
   appearanceCouldNotBeSaved: "Das Erscheinungsbild konnte in diesem Browser nicht gespeichert werden.",
+  computer: "Computer",
+  laptopTablet: "Laptop / Tablet",
   savedAppearanceReadError: "Das gespeicherte Erscheinungsbild konnte nicht gelesen werden. Das System-Erscheinungsbild wird verwendet.",
   chineseTraditional: "Traditionelles Chinesisch",
   korean: "Koreanisch",
