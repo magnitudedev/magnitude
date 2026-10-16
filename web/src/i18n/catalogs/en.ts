@@ -557,4 +557,8 @@ export const en = {
   pageCantConnectService: "This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it.",
   memoryUsageUnit: "memory",
   thisBrowserControlsAt: "This browser controls Magnitude at {host}.",
+  switchToReplacementDescription: "Switch to {name} to continue receiving support.",
+  loadConfirmationTitle: "Load {name}?",
+  loadConfirmationDescription: "Loading {name} will stop {replacing}.",
+  downloadWithSize: "Download ({size})",
 } as const
