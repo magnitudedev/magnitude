@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 /** Complete Bengali translations for the Magnitude message catalog. */
 export const bn = {
   settings: "সেটিংস", general: "সাধারণ", about: "পরিচিতি", thisBrowser: "এই ব্রাউজার",
