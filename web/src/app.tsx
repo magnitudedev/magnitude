@@ -438,7 +438,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   return <>
     {!discover && <>
       <div className={pageLayout.modelHeader}>
-        <h1 className={pageLayout.pageTitle}>{localizedPageName(page, tr)}</h1>
+        <h1 className={pageLayout.pageTitle}>{localizedPageName(page, t)}</h1>
         <span className="text-sm tabular-nums text-slate-500" role="status">{visible.length} {visible.length === 1 ? "model" : "models"}</span>
       </div>
       <div className={pageLayout.catalogToolbar}>
@@ -911,6 +911,7 @@ function SettingsPage() {
   </>
 }
 export function App() {
+  const { t } = useI18n()
   const session = useSession()
   const observation = useServiceObservation()
   const page = useAtomValue(session.page)
