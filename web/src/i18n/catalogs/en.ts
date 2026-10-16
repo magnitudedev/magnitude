@@ -643,5 +643,7 @@ export const en = {
   off: "Off",
   request: "request",
   appearanceCouldNotBeSaved: "The appearance could not be saved in this browser.",
+  computer: "Computer",
+  laptopTablet: "Laptop / tablet",
   savedAppearanceReadError: "The saved appearance could not be read. Using System appearance.",
 } as const
