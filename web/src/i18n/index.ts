@@ -5,12 +5,15 @@ import { zhCN } from "./catalogs/zh-CN"
 import { hi } from "./catalogs/hi"
 import { ur } from "./catalogs/ur"
 import { bn } from "./catalogs/bn"
+import { fr } from "./catalogs/fr"
+import { de } from "./catalogs/de"
+import { ja } from "./catalogs/ja"
 
-export const LANGUAGES = ["en", "es", "zh-CN", "hi", "ur", "bn"] as const
+export const LANGUAGES = ["en", "es", "zh-CN", "hi", "ur", "bn", "fr", "de", "ja"] as const
 export type Language = typeof LANGUAGES[number]
 export type MessageKey = keyof typeof en
 export const STORAGE_KEY = "magnitude.language"
-const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN, hi, ur, bn }
+const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN, hi, ur, bn, fr, de, ja }
 
 export function isLanguage(value: unknown): value is Language {
   return typeof value === "string" && (LANGUAGES as readonly string[]).includes(value)
