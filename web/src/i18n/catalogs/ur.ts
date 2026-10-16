@@ -1,8 +1,5 @@
-import { en } from "./en"
-
 /** Urdu (اردو) translations for the complete Magnitude message catalog; RTL direction is set by the i18n hook. */
 export const ur = {
-  ...en,
   settings: "ترتیبات", general: "عمومی", about: "تعارف", thisBrowser: "یہ براؤزر",
   language: "زبان", languageHint: "اس براؤزر یا ڈیسک ٹاپ ایپ میں Magnitude کی زبان منتخب کریں۔",
   english: "انگریزی", spanish: "ہسپانوی", chineseSimplified: "آسان چینی",
@@ -633,4 +630,4 @@ export const ur = {
   snug: "کم کشادہ",
   tight: "بہت تنگ",
   none: "کوئی نہیں",
-} satisfies Partial<typeof en>
+} satisfies typeof en
