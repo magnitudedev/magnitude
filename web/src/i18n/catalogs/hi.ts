@@ -639,4 +639,8 @@ export const hi = {
   reloadWindowRestart: "इस विंडो को फिर से लोड करें। अगर यह फिर भी न खुले, तो Magnitude को दोबारा शुरू करें।",
   quitAndReopen: "Magnitude को बंद करके फिर से खोलें।",
   savedAppearanceReadError: "सहेजी गई दिखावट पढ़ी नहीं जा सकी। सिस्टम की दिखावट इस्तेमाल की जा रही है।",
+  chineseTraditional: "पारंपरिक चीनी",
+  korean: "कोरियाई",
+  vietnamese: "वियतनामी",
+  indonesian: "इंडोनेशियाई",
 } satisfies typeof en
