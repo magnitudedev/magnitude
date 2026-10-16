@@ -436,4 +436,13 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   exampleRequest: "请求示例",
   folderPath: "文件夹路径",
   folders: "文件夹",
+  totals: "总计",
+  requests: "请求数",
+  generationSpeed: "生成速度",
+  timeToFirstToken: "首个令牌耗时",
+  cachePercentage: "{percent}% 的输入令牌由缓存提供。",
+  cacheNotReportedRequests: "有 {count} 个请求未报告缓存用量。",
+  tokensPerSecond: "令牌/秒",
+  milliseconds: "毫秒",
+  secondsShort: "秒",
 }
