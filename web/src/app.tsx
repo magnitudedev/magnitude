@@ -795,7 +795,7 @@ function AutomaticUpdatesRow() {
   const closed = snapshot?.transfer._tag === "Closed"
   return <SettingsRow label={useI18n().t("automaticUpdates")}
     hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
-    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title=tr("updatesPreferencesNotSaved") description=tr("previousPreferenceInUse") /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
+    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title=tr("updatesPreferencesNotSaved") description=tr("previousPreferenceInUse") /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title=tr("couldNotReadUpdatePreferences") description=tr("autoDownloadsUnavailable") /> : undefined}
     control={snapshot && <Switch aria-label={useI18n().t("automaticUpdates")} checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
 const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
@@ -823,15 +823,15 @@ function AboutRow() {
   const snapshot = Result.isSuccess(observation) ? observation.value : null
   const current: UpdateTransfer | undefined = snapshot?.transfer
   const pending = downloading.waiting || restarting.waiting || discarding.waiting
-  const message = !current ? Result.isFailure(observation) ? "Update status unavailable." : "Reading update status…"
-    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? "You’re up to date." : "Checks for updates automatically."
+  const message = !current ? Result.isFailure(observation) ? tr("updateStatusUnavailable") : tr("readingUpdateStatus")
+    : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? tr("upToDate") : tr("checksAutomatically")
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}${Option.match(current.failed, {
       onNone: () => "", onSome: failed => ` · It ${failedUpdatePhrase[failed]} on this computer, so it isn’t downloaded automatically.` })}`
     : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
-    : current._tag === "Cancelling" ? "Stopping automatic download…"
+    : current._tag === "Cancelling" ? tr("stoppingAutomaticDownload")
     : current._tag === "Staging" ? `Preparing version ${current.version}…`
     : current._tag === "Ready" ? `Version ${current.version} is ready. Restarting stops the running model and service.`
-    : current._tag === "Closed" ? "Magnitude is quitting…" : current._tag === "Unavailable" ? "Updates aren’t available right now." : undefined
+    : current._tag === "Closed" ? "Magnitude is quitting…" : current._tag === "Unavailable" ? tr("updatesUnavailableNow") : undefined
   const actionFailure = firstFailure([checking, downloading, restarting, discarding])
   const checkFailed = snapshot?.check._tag === "Failed"
   const installable = current?._tag === "Ready" || current?._tag === "InstallationFailed"
@@ -844,10 +844,10 @@ function AboutRow() {
   </>
   return <>{disconnect.dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
     alert={hasFailure && !busy ? <ErrorNotice
-      title={Result.isFailure(discarding) && !discarding.waiting ? "Couldn’t discard the update" : current?._tag === "InstallationFailed" ? "The update wasn’t completed" : checkFailed ? "Couldn’t check for updates" : "The update couldn’t finish"}
-      description={installable ? "The prepared update is still available. Retry it, or discard its download."
+      title={Result.isFailure(discarding) && !discarding.waiting ? tr("couldNotDiscardUpdate") : current?._tag === "InstallationFailed" ? tr("updateNotCompleted") : checkFailed ? tr("couldNotCheckUpdates") : tr("updateCouldNotFinish")}
+      description={installable ? tr("preparedUpdateAvailable")
         : snapshot?.check._tag === "Failed" ? snapshot.check.message
-        : current?._tag === "Failed" ? current.message : "Check your connection before trying again."}
+        : current?._tag === "Failed" ? current.message : tr("checkConnectionRetry")}
       actions={actions} /> : undefined}
     control={hasFailure ? busy ? <span className="text-xs text-slate-500"><T k="working" /></span> : null : <>
       {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}><T k="discardDownload" /></Button>}
@@ -863,7 +863,7 @@ function SignOutRow() {
   const run = useAtomSet(action)
   const signingOut = useAtomValue(action)
   return <SettingsRow label="Signed in from another device" hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
-    alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
+    alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title=tr("couldNotSignOut") description=tr("checkDeviceReach") /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>{useI18n().t("signOut")}</Button>} />
 }
 function LanguageRow() {
@@ -902,11 +902,11 @@ export function App() {
   return <><RestartRequiredToast /><HostNotices /><QuitFailureDialog /><AppShell page={page} navigate={navigate} platform={platform}>
       {service?._tag === "Unreachable" ? <CannotReachMagnitude />
       : service?._tag === "Reconnecting" ? <ReconnectingToMagnitude />
-      : page === "status" ? Result.isFailure(observation.service) ? <ErrorNotice title="Couldn’t read service status" description="Magnitude can’t confirm the service’s current state." className="mt-7" /> : <Status observation={observation} />
+      : page === "status" ? Result.isFailure(observation.service) ? <ErrorNotice title=tr("couldNotReadServiceStatus") description=tr("cannotConfirmServiceState") className="mt-7" /> : <Status observation={observation} />
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}><T k="openStatus" /></NoticeAction>} /></> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title=tr("magnitudeNeedsAttention") description=tr("inferenceUnavailable") className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}><T k="openStatus" /></NoticeAction>} /></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </AppShell></>
