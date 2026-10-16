@@ -640,6 +640,7 @@ export const es: { [K in keyof typeof en]: string } = {
   on: "Activado",
   off: "Desactivado",
   request: "solicitud",
+  appearanceCouldNotBeSaved: "No se pudo guardar la apariencia en este navegador.",
   savedAppearanceReadError: "No se pudo leer la apariencia guardada. Se usará la apariencia del sistema.",
   chineseTraditional: "Chino tradicional",
   korean: "Coreano",
