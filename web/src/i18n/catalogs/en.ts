@@ -629,4 +629,7 @@ export const en = {
   snug: "Snug",
   tight: "Tight",
   none: "None",
+  capabilityProfile: "{name} capability profile",
+  harnessModel: "{name} model",
+  cacheNotReportedForRequests: "Not reported for {count} requests",
 } as const
