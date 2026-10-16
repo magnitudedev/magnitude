@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 /** Italian translations; remaining long-tail messages fall back to English. */
 export const it = {
   settings: "Impostazioni",
