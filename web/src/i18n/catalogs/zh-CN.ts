@@ -618,4 +618,7 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   vramLabel: "显存",
   acceleration: "加速",
   unknownProcessor: "未知处理器",
+  chip: "芯片",
+  cpuLabel: "CPU",
+  gpuLabel: "GPU",
 }
