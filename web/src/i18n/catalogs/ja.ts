@@ -642,6 +642,8 @@ export const ja = {
   off: "オフ",
   request: "リクエスト",
   appearanceCouldNotBeSaved: "このブラウザーでは外観設定を保存できませんでした。",
+  computer: "コンピューター",
+  laptopTablet: "ノートPC／タブレット",
   savedAppearanceReadError: "保存した外観設定を読み取れませんでした。システムの外観を使用します。",
   chineseTraditional: "繁体字中国語",
   korean: "韓国語",
