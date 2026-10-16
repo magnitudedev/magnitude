@@ -482,4 +482,6 @@ export const en = {
   copyExampleRequest: "Copy example request",
   copyPrompt: "Copy {name} prompt shown",
   setupPromptCopied: "Setup prompt for {name} copied",
+  includes: "Includes",
+  copyHarnessCommand: "Copy {name} command",
 } as const
