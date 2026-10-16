@@ -481,5 +481,5 @@ export const en = {
   anthropicApiHint: "Anthropic-compatible apps use /inference/anthropic instead.",
   copyExampleRequest: "Copy example request",
   copyPrompt: "Copy {name} prompt shown",
-  setupPromptCopied: "Se ha copiado la instrucción de configuración de {name}",
+  setupPromptCopied: "Setup prompt for {name} copied",
 } as const
