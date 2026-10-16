@@ -582,4 +582,5 @@ export const en = {
   speculation: "Speculation",
   fit: "Fit",
   fidelity: "Fidelity",
+  modelsAssessedCount: "{settled} of {total} assessed",
 } as const
