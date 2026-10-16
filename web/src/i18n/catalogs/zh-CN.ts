@@ -641,6 +641,8 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   off: "关",
   request: "请求",
   appearanceCouldNotBeSaved: "无法在此浏览器中保存外观设置。",
+  computer: "电脑",
+  laptopTablet: "笔记本电脑 / 平板电脑",
   savedAppearanceReadError: "无法读取已保存的外观设置。将使用系统外观。",
   chineseTraditional: "繁体中文",
   korean: "韩语",
