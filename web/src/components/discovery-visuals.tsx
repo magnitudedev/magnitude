@@ -23,6 +23,16 @@ const hardwareLabelKeys: Record<string, MessageKey> = {
   "Memory bandwidth (spec)": "memoryBandwidthSpec", "CPU core options (spec)": "cpuCoreOptionsSpec", "Neural Engine cores (spec)": "neuralEngineCoresSpec", "GPU cores (spec)": "gpuCoresSpec", "CUDA cores (spec)": "cudaCoresSpec", "GPU compute units (spec)": "gpuComputeUnitsSpec", "CPU cores / processor (spec)": "cpuCoresProcessorSpec", "Xe cores (spec)": "xeCoresSpec", "Stream processors (spec)": "streamProcessorsSpec", "GPU architecture (spec)": "gpuArchitectureSpec",
 }
 const localizeHardwareLabel = (label: string) => hardwareLabelKeys[label] ? tr(hardwareLabelKeys[label]!) : label
+const radarDetailKeys: Record<string, MessageKey> = {
+  "Not assessed": "notAssessed", "Very high": "veryHigh", "High": "high",
+  "Medium": "medium", "Reduced": "reduced", "Spacious": "spacious",
+  "Roomy": "roomy", "Comfortable": "comfortable", "Snug": "snug",
+  "Tight": "tight", "None": "none",
+}
+function localizeRadarDetail(detail: string): string {
+  const label = Object.keys(radarDetailKeys).find(candidate => detail === candidate || detail.startsWith(`${candidate} (`))
+  return label ? tr(radarDetailKeys[label]!) + detail.slice(label.length) : detail
+}
 function localizeHardwareDetail(detail: string): string {
   const normalized = detail.replace(/ \(spec\)/g, "")
   const exact: Record<string, MessageKey> = {
@@ -74,7 +84,7 @@ export function ModelRadar({ model }: { model: CatalogLocalModel }) {
                 <div className="flex h-full items-center justify-center gap-1 text-[11px] leading-none text-slate-500 dark:text-slate-400">{label} (est.)<SpeedInfo /></div>
               </foreignObject>
             : <text x={x} y={y} textAnchor="middle" className="fill-slate-500 dark:fill-slate-400" fontSize="11">{label}</text>}
-          <text x={x} y={y + 18} textAnchor="middle" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{axis.detail}</text>
+          <text x={x} y={y + 18} textAnchor="middle" className="fill-slate-800 dark:fill-slate-200" fontSize="13" fontWeight="500">{localizeRadarDetail(axis.detail)}</text>
         </g>
       })}
     </svg>
