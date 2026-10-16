@@ -628,4 +628,9 @@ export const de = {
   runInProjectFolder: "Führen Sie dies in {shell} im Projektordner aus.",
   downloadCompatibleModel: "Laden Sie ein kompatibles Modell herunter, um einen Befehl für diesen Agent zu erhalten.",
   openClawTuiInstruction: "Öffnen Sie bei laufendem Gateway die TUI und geben Sie dort Folgendes ein, um das Modell für die aktuelle Sitzung auszuwählen:",
+  turnOffNetworkDescription: "Dieser Browser ist über das Netzwerk verbunden. Beim nächsten Neustart von Magnitude, auch bei einem automatischen Update, endet der Fernzugriff: Dieser Browser und alle anderen Geräte, Apps und Agents verlieren den Zugriff. Nur jemand am Computer mit Magnitude kann ihn wieder aktivieren.",
+  regenerateKeyDescription: "Beim Neustart von Magnitude funktioniert der aktuelle Schlüssel nicht mehr. Sie werden in diesem Browser abgemeldet und benötigen zum erneuten Anmelden den neuen Schlüssel.",
+  stopRequiringKeyDescription: "Beim Neustart von Magnitude kann jedes Gerät, das diesen Computer erreicht, ohne Schlüssel Inferenz nutzen. Aktivieren Sie dies nur in einem vertrauenswürdigen Netzwerk. Dieser Browser benötigt zum Anmelden weiterhin den Schlüssel.",
+  changeAddressDescription: "Beim Neustart akzeptiert Magnitude Verbindungen nur unter der ausgewählten Adresse. Dieser Browser kann möglicherweise keine erneute Verbindung herstellen.",
+  restartDisconnectDescription: "Dieser Browser wird während des Neustarts von Magnitude getrennt und verbindet sich anschließend automatisch wieder.",
 } satisfies Partial<typeof en>
