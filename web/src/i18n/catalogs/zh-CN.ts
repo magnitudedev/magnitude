@@ -638,4 +638,8 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   reloadWindowRestart: "重新加载此窗口。如果仍无法打开，请重启 Magnitude。",
   quitAndReopen: "退出 Magnitude，然后重新打开。",
   savedAppearanceReadError: "无法读取已保存的外观设置。将使用系统外观。",
+  chineseTraditional: "繁体中文",
+  korean: "韩语",
+  vietnamese: "越南语",
+  indonesian: "印度尼西亚语",
 }
