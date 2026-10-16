@@ -333,7 +333,6 @@ export const en = {
   cancelDownload: "Cancel download",
   optimizationProgress: "Optimization progress",
   downloadProgress: "Download progress",
-  modelDownload: "Model download",
   removingState: "Removing",
   replacementModelAvailable: "A replacement model is available",
   requested: "Requested",
