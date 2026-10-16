@@ -51,7 +51,7 @@ import {
   useCatalogModels, useLocalModelCommandStatus, useLocalModelMutations, useLocalModelStopStatus, useLocalModels, modelTrayPresentation, useLocalInferenceHardware, formatLocalModelDisplayName,
   describeModelLoadStage, describeModelOptimization, formatModelLoadPercentage, formatModelMemory,
   formatStorageSize, formatTransferRate, formatMemorySize, localModelIsInstalled, localModelProviderModelId, rankedLocalModelOptions, featuredCatalogModels, targetPhysicalMemoryBytes, modelStoppedForMemory,
-  catalogModelReplacement, performanceRangeSpeedLabel, localModelSpeedNote,
+  catalogModelReplacement, performanceRangeSpeedLabel,
   LOCAL_MODEL_RANKING_SCALE_VALUES,
 } from "@magnitudedev/client-common"
 import { appearanceReadError } from "./appearance"
