@@ -635,4 +635,8 @@ export const uk = {
   capabilityProfile: "Профіль можливостей {name}",
   harnessModel: "Модель {name}",
   cacheNotReportedForRequests: "Не повідомлено для {count} запитів",
+  magnitudeCouldNotOpen: "Не вдалося відкрити Magnitude",
+  reloadWindowRestart: "Перезавантажте це вікно. Якщо воно не відкриється, перезапустіть Magnitude.",
+  quitAndReopen: "Закрийте Magnitude і відкрийте його знову.",
+  savedAppearanceReadError: "Не вдалося прочитати збережене оформлення. Використовується оформлення системи.",
 } satisfies typeof en
