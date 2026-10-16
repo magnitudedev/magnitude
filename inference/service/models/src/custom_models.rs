@@ -1780,6 +1780,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn several_ollama_roots_are_each_scanned_and_a_pull_in_both_is_one_model() {
+        let fixture = Fixture::new().await;
+        let user = fixture.root.join("home/.ollama/models");
+        let system = fixture.root.join("var/lib/ollama");
+        let shared = model_bytes("pulled by both installs");
+        for root in [&user, &system] {
+            write_ollama(
+                root,
+                "registry.ollama.ai",
+                "library",
+                "qwen3.5",
+                "0.8b",
+                &[("application/vnd.ollama.image.model", &shared)],
+            );
+        }
+        write_ollama(
+            &user,
+            "registry.ollama.ai",
+            "library",
+            "llama3",
+            "8b",
+            &[("application/vnd.ollama.image.model", &model_bytes("user only"))],
+        );
+        write_ollama(
+            &system,
+            "registry.ollama.ai",
+            "library",
+            "gemma3",
+            "4b",
+            &[("application/vnd.ollama.image.model", &model_bytes("system only"))],
+        );
+
+        let listed = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::Ollama, &user),
+                root(
+                    ModelRootKind::Ollama,
+                    &fixture.root.join("usr/share/ollama/.ollama/models"),
+                ),
+                root(ModelRootKind::Ollama, &system),
+            ]))
+            .await;
+
+        let mut names = listed
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["gemma3:4b", "llama3:8b", "qwen3.5:0.8b"]);
+    }
+
+    #[tokio::test]
+    async fn several_hugging_face_caches_are_each_scanned() {
+        let fixture = Fixture::new().await;
+        let configured = fixture.root.join("custom/hub");
+        let default = fixture.root.join("home/.cache/huggingface/hub");
+        let shared = model_bytes("in both caches");
+        publish_hf_cache(
+            &configured,
+            "owner/First-GGUF",
+            &"a".repeat(40),
+            &[
+                ("first.gguf", model_bytes("first")),
+                ("shared.gguf", shared.clone()),
+            ],
+        );
+        publish_hf_cache(
+            &default,
+            "owner/Second-GGUF",
+            &"b".repeat(40),
+            &[("second.gguf", model_bytes("second"))],
+        );
+        publish_hf_cache(
+            &default,
+            "owner/First-GGUF",
+            &"a".repeat(40),
+            &[("shared.gguf", shared)],
+        );
+
+        let listed = fixture
+            .apply(roots(vec![
+                root(ModelRootKind::HuggingFaceCache, &configured),
+                root(ModelRootKind::HuggingFaceCache, &default),
+            ]))
+            .await;
+
+        let mut listed_ids = ids(&listed.models);
+        listed_ids.sort();
+        assert_eq!(
+            listed_ids,
+            [
+                "hf:owner/First-GGUF/first.gguf",
+                "hf:owner/First-GGUF/shared.gguf",
+                "hf:owner/Second-GGUF/second.gguf",
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_manifests_name_their_blobs() {
         let fixture = Fixture::new().await;
         let ollama = fixture.root.join("ollama");

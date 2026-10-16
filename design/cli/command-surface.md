@@ -153,8 +153,10 @@ directly to their authoritative mutations.
 changes, or turns off the drafter of a custom model and is refused for catalog models. `models hide`
 and `unhide` apply to found models, including a catalog model whose files are only in an external
 location; `catalog remove` on such a model explains where the files are and points at `models hide`. `models folders list` shows the automatic locations and the
-user's folders, each Scanning, Off, Not found, or Can't read, with what to do for one Magnitude can't
-read; `add` and `remove` manage the folders.
+user's folders, one row per directory: an automatic location lists each directory found or unreadable
+(every directory checked when none exists), each Scanning, Off, Not found, or Can't read, with what to
+do for each directory Magnitude can't read; `add` and `remove` manage the folders, and turning a
+location on or off applies to all its directories.
 
 `models status` lists catalog models on the computer or with relevant acquisition/removal work and
 every visible custom model, with its source, followed by a footer counting models that can't run and

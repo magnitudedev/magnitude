@@ -49,14 +49,20 @@ describe("local-models configuration snapshot", () => {
     const configuration = localModelsConfiguration(
       sampleConfig(),
       [
-        { kind: "HuggingFaceCache", path: "/hf/hub", state: "Found" },
-        { kind: "Ollama", path: "/ollama", state: "NotFound" },
+        { kind: "HuggingFaceCache", paths: [{ path: "/hf/hub", state: "Found" }], state: "Found" },
+        { kind: "Ollama", paths: [
+          { path: "/home/ada/.ollama/models", state: "Found" },
+          { path: "/var/lib/ollama", state: "Unreadable" },
+          { path: "/usr/share/ollama/.ollama/models", state: "NotFound" },
+        ], state: "Found" },
       ],
       (reference) => reference._tag === "HuggingFace" ? Option.some({ _tag: "DFlash" }) : Option.none(),
     )
     expect(configuration.roots).toEqual([
       { kind: "HuggingFaceCache", path: "/hf/hub", enabled: true },
-      { kind: "Ollama", path: "/ollama", enabled: false },
+      { kind: "Ollama", path: "/home/ada/.ollama/models", enabled: false },
+      { kind: "Ollama", path: "/var/lib/ollama", enabled: false },
+      { kind: "Ollama", path: "/usr/share/ollama/.ollama/models", enabled: false },
       { kind: "Folder", path: "/Volumes/models", enabled: true },
     ])
     expect(configuration.declarations).toEqual([

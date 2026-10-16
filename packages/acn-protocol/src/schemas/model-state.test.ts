@@ -15,6 +15,8 @@ import {
   LocalModelSchema,
   LocalModelServingStateSchema,
   ModelIdSchema,
+  ModelLocationSchema,
+  modelLocationState,
   ModelParameterizationSchema,
   ModelReleaseDateSchema,
   parseModelId,
@@ -463,5 +465,42 @@ describe("IntelligenceScoreSchema", () => {
     for (const invalid of [-1, 101, 58.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => Schema.decodeUnknownSync(IntelligenceScoreSchema)(invalid)).toThrow()
     }
+  })
+})
+
+describe("ModelLocationSchema", () => {
+  const decode = Schema.decodeUnknownEither(ModelLocationSchema)
+  const ollama = {
+    kind: "Ollama",
+    paths: [
+      { path: "/home/ada/.ollama/models", state: "NotFound" },
+      { path: "/var/lib/ollama", state: "Found" },
+      { path: "/usr/share/ollama/.ollama/models", state: "Unreadable" },
+    ],
+    enabled: true,
+    automatic: true,
+    state: "Found",
+  }
+
+  it("summarizes a location's directories: found if any is found, else unreadable if any is", () => {
+    expect(modelLocationState([{ path: "/a", state: "NotFound" }, { path: "/b", state: "Found" }])).toBe("Found")
+    expect(modelLocationState([{ path: "/a", state: "NotFound" }, { path: "/b", state: "Unreadable" }])).toBe("Unreadable")
+    expect(modelLocationState([{ path: "/a", state: "NotFound" }])).toBe("NotFound")
+  })
+
+  it("accepts an automatic location with several directories and their own states", () => {
+    expect(decode(ollama)._tag).toBe("Right")
+  })
+
+  it("rejects a summary that disagrees with the directories, no directories, and a folder with several", () => {
+    expect(decode({ ...ollama, state: "Unreadable" })._tag).toBe("Left")
+    expect(decode({ ...ollama, paths: [] })._tag).toBe("Left")
+    expect(decode({
+      kind: "Folder",
+      paths: [{ path: "/a", state: "Found" }, { path: "/b", state: "Found" }],
+      enabled: true,
+      automatic: false,
+      state: "Found",
+    })._tag).toBe("Left")
   })
 })

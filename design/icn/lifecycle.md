@@ -232,11 +232,13 @@ the previous store remains intact on disk. ICN's managed Hugging Face hub lives 
 External locations participate only through the local-models configuration ACN supplies; ICN never
 discovers a host location implicitly. The configuration is one whole snapshot: model roots (kind,
 resolved path, enabled), custom-model declarations, hidden model IDs, and drafter attachments. ACN
-resolves each automatic root from its overrides and the owning tool's own configuration: the
-Hugging Face cache from `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, or `XDG_CACHE_HOME`;
-LM Studio from its own settings; the llama.cpp cache from `LLAMA_CACHE`; Ollama from
-`OLLAMA_MODELS`; each falling back to its platform defaults (Ollama on Linux: the user's
-`~/.ollama/models`, then a system service's `/usr/share/ollama/.ollama/models` or `/var/lib/ollama`). User folders come from configuration.
+resolves each automatic location to all of its distinct candidate directories, one root each, from
+its overrides and the owning tool's own configuration: the Hugging Face cache from `HF_HUB_CACHE`,
+`HUGGINGFACE_HUB_CACHE`, `HF_HOME`, and `XDG_CACHE_HOME`; LM Studio from its own settings; the
+llama.cpp cache from `LLAMA_CACHE`; Ollama from `OLLAMA_MODELS`; each followed by its platform
+defaults (Ollama on Linux: the user's `~/.ollama/models` and a system service's
+`/usr/share/ollama/.ollama/models` and `/var/lib/ollama`). Several roots may share a kind; ICN scans
+each, and the same bytes in several roots remain one model. User folders come from configuration.
 ACN writes the snapshot to a file and names it at spawn, so the first scan is already correct. After
 every change ACN replaces the whole snapshot through an idempotent `PUT`; ICN reconciles only what
 changed. ICN reads no other configuration source for local models.

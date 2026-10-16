@@ -115,11 +115,11 @@ export const localModelsConfiguration = (
   methodOf: (reference: DrafterReference) => Option.Option<SpeculativeMethod>,
 ): LocalModelsConfiguration => ({
   roots: [
-    ...locations.map((location): ModelRoot => ({
+    ...locations.flatMap((location) => location.paths.map(({ path }): ModelRoot => ({
       kind: location.kind,
-      path: location.path,
+      path,
       enabled: !config.disabledLocations.includes(location.kind),
-    })),
+    }))),
     ...config.folders.map((path): ModelRoot => ({ kind: "Folder", path, enabled: true })),
   ],
   declarations: Object.entries(config.declarations).map(([modelId, declaration]) => ({

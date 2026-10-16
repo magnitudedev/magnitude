@@ -239,13 +239,18 @@ ICN scans a list of model roots that ACN resolves and supplies (see
 | Ollama | Manifests name each model and its GGUF blob; both `manifests/` and newer releases' `manifests-v2/` (whose entries may be symlinks to the manifest stored as a blob, followed only within the root, and which name Ollama's registry `ollama.com` rather than `registry.ollama.ai`) are read, and a model in both is one model, named as Ollama names it (`qwen3.5:0.8b`). A GGUF blob's `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
 | User folders | Any GGUFs beneath the folder; `local:` |
 
-Each automatic location is resolved from its environment override and the owning tool's own
-configuration before its platform default, and remains configured while absent, so a location
-created later is observed. A location with several platform defaults resolves to the first one
-Magnitude can read, else the first one that exists but denies Magnitude permission, else the first.
-Each location reports one state: found, not found, or can't read (it exists, but the directory or a
-folder above it denies Magnitude permission, such as a system Ollama service's folder owned by the
-`ollama` user). The user may turn off an automatic location and add or remove folders;
+Each automatic location resolves to every directory its tool may use on this host, most
+authoritative first: its environment overrides and the owning tool's own configuration, then each
+platform default, because one machine often has several (a user's `ollama serve` beside a Linux
+system service under `/usr/share/ollama` or `/var/lib/ollama`, `HF_HUB_CACHE` beside the default
+Hugging Face cache, LM Studio's current home beside its legacy `~/.cache/lm-studio`). Candidates
+that are the same directory, by spelling or through a symlink, are one directory under the first
+spelling. Every directory is a root ICN scans, and each remains configured while absent, so one
+created later is observed. Each directory reports its own state: found, not found, or can't read
+(it exists, but the directory or a folder above it denies Magnitude permission, such as a system
+Ollama service's folder owned by the `ollama` user). The location is found when any directory is
+found, else can't read when any is unreadable, else not found. The user may turn off an automatic
+location, which turns off all of its directories, and add or remove folders, each one directory;
 the change reaches ICN as a new configuration and reconciles only the affected roots. Imported files
 are scanned at their declared paths. ICN watches every enabled root, so models appear and disappear
 without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.

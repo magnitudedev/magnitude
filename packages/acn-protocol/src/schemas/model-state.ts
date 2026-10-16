@@ -877,15 +877,37 @@ export type AutomaticModelLocationKind = typeof AutomaticModelLocationKindSchema
 export const ModelLocationStateSchema = Schema.Literal("Found", "NotFound", "Unreadable")
 export type ModelLocationState = typeof ModelLocationStateSchema.Type
 
-/** A directory scanned for GGUFs: an automatic location Magnitude resolved, or a user folder. */
+/** One directory of a model location, and whether it exists and Magnitude can read it. */
+export const ModelLocationPathSchema = Schema.Struct({
+  path: NonEmptyString,
+  state: ModelLocationStateSchema,
+})
+export type ModelLocationPath = typeof ModelLocationPathSchema.Type
+
+/** A location's state across its directories: found if any is found, else unreadable if any is unreadable. */
+export const modelLocationState = (paths: readonly ModelLocationPath[]): ModelLocationState =>
+  paths.some(({ state }) => state === "Found") ? "Found"
+    : paths.some(({ state }) => state === "Unreadable") ? "Unreadable"
+    : "NotFound"
+
+/**
+ * Where Magnitude scans for GGUFs: an automatic location with every directory Magnitude resolved
+ * for it on this host, most authoritative first, or a user folder, which is one directory.
+ */
 export const ModelLocationSchema = Schema.Struct({
   kind: ModelLocationKindSchema,
-  path: NonEmptyString,
+  paths: Schema.NonEmptyArray(ModelLocationPathSchema),
   enabled: Schema.Boolean,
   automatic: Schema.Boolean,
   state: ModelLocationStateSchema,
-}).pipe(Schema.filter((location) => location.automatic === (location.kind !== "Folder"),
-  { message: () => "only user folders are not automatic locations" }))
+}).pipe(
+  Schema.filter((location) => location.automatic === (location.kind !== "Folder"),
+    { message: () => "only user folders are not automatic locations" }),
+  Schema.filter((location) => location.automatic || location.paths.length === 1,
+    { message: () => "a user folder is one directory" }),
+  Schema.filter((location) => location.state === modelLocationState(location.paths),
+    { message: () => "a location's state summarizes its directories' states" }),
+)
 export type ModelLocation = typeof ModelLocationSchema.Type
 
 /** The engine's answer for a drafter paired with a target. */

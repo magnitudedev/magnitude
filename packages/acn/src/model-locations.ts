@@ -30,14 +30,14 @@ export const makeModelLocations = (
     list: (config) => Effect.gen(function* () {
       const automatic = (yield* resolve).map((location): ModelLocation => ({
         kind: location.kind,
-        path: location.path,
+        paths: location.paths,
         enabled: !config.disabledLocations.includes(location.kind),
         automatic: true,
         state: location.state,
       }))
       const folders = yield* Effect.forEach(config.folders, (path) => directoryState(path).pipe(
         provide,
-        Effect.map((state): ModelLocation => ({ kind: "Folder", path, enabled: true, automatic: false, state })),
+        Effect.map((state): ModelLocation => ({ kind: "Folder", paths: [{ path, state }], enabled: true, automatic: false, state })),
       ))
       return [...automatic, ...folders]
     }),

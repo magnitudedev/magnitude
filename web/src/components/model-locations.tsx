@@ -2,7 +2,7 @@ import { useState } from "react"
 import { Cause, Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { FolderPlusIcon } from "@phosphor-icons/react"
-import { unreadableModelLocationMessage, useAgentClient } from "@magnitudedev/client-common"
+import { shownModelLocationPaths, unreadableModelLocationMessage, useAgentClient } from "@magnitudedev/client-common"
 import type { AutomaticModelLocationKind, ModelLocation, ModelLocationKind } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 import { Switch } from "./ui/switch"
@@ -32,15 +32,20 @@ const sectionHeading = "font-heading text-sm font-semibold"
 const listClass = "divide-y divide-slate-200 rounded-lg border border-slate-200 dark:divide-slate-750 dark:border-slate-750"
 const rowClass = "flex items-center gap-3 px-3 py-2"
 
-const locationPath = (location: ModelLocation) =>
-  <span className={pathText} title={location.path}>{location.state === "Found" ? location.path : `${location.state === "Unreadable" ? "Can’t read" : "Not found"} · ${location.path}`}</span>
+/** The directories a location row lists, each marked when Magnitude can't read it or it isn't there. */
+const locationPaths = (location: ModelLocation) => shownModelLocationPaths(location).map(({ path, state }) =>
+  <span key={path} className={pathText} title={path}>{state === "Found" ? path : `${state === "Unreadable" ? "Can’t read" : "Not found"} · ${path}`}</span>)
 
 const unreadableHint = (location: ModelLocation) =>
-  location.state === "Unreadable" && <span className="mt-0.5 block text-xs text-orange-700 dark:text-orange-300">{unreadableModelLocationMessage(location.kind)}</span>
+  location.paths.some(({ state }) => state === "Unreadable")
+  && <span className="mt-0.5 block text-xs text-orange-700 dark:text-orange-300">{unreadableModelLocationMessage(location.kind)}</span>
+
+const folderPath = (folder: ModelLocation) => folder.paths[0].path
 
 /**
- * Manage…: the automatic locations here with an on/off switch, including ones Magnitude can't read
- * with what to do about it, the ones not found tucked away, then your folders.
+ * Manage…: the automatic locations here with an on/off switch for each, listing every directory
+ * found and any Magnitude can't read with what to do about it, the ones not found tucked away, then
+ * your folders.
  */
 export function ModelLocationsManager({ locations, busy, notice, onToggle, onRemove, onAdd }: {
   locations: readonly ModelLocation[]
@@ -64,7 +69,7 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
           {found.map(location => {
             const name = locationNames[location.kind]
             return <li key={location.kind} className={rowClass}>
-              <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{name}</span>{locationPath(location)}{unreadableHint(location)}</span>
+              <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{name}</span>{locationPaths(location)}{unreadableHint(location)}</span>
               <Switch aria-label={`Look for models in ${name}`} checked={location.enabled} disabled={busy} onCheckedChange={checked => onToggle(location.kind, checked)} />
             </li>
           })}
@@ -72,7 +77,8 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
       {missing.length > 0 && <details className="text-xs text-slate-500">
         <summary className="cursor-pointer select-none">Not found on this computer ({missing.length})</summary>
         <ul className="mt-1.5 space-y-1 pl-4">
-          {missing.map(location => <li key={location.kind} className="min-w-0"><span>{locationNames[location.kind]}</span><span className="block truncate" title={location.path}>{location.path}</span></li>)}
+          {missing.map(location => <li key={location.kind} className="min-w-0"><span>{locationNames[location.kind]}</span>
+            {location.paths.map(({ path }) => <span key={path} className="block truncate" title={path}>{path}</span>)}</li>)}
         </ul>
       </details>}
     </section>
@@ -85,9 +91,9 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
         ? "Add a folder of GGUF files no other app manages, such as an external drive. Files added to it later appear automatically."
         : "Magnitude watches these folders, so files added or deleted later appear or disappear."}</p>
       {folders.length > 0 && <ul className={listClass}>
-        {folders.map(folder => <li key={folder.path} className={rowClass}>
-          <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{folderName(folder.path)}</span>{locationPath(folder)}{unreadableHint(folder)}</span>
-          <Button size="sm" variant="ghost" disabled={busy} aria-label={`Remove ${folder.path}`} onClick={() => onRemove(folder.path)}>Remove</Button>
+        {folders.map(folder => <li key={folderPath(folder)} className={rowClass}>
+          <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{folderName(folderPath(folder))}</span>{locationPaths(folder)}{unreadableHint(folder)}</span>
+          <Button size="sm" variant="ghost" disabled={busy} aria-label={`Remove ${folderPath(folder)}`} onClick={() => onRemove(folderPath(folder))}>Remove</Button>
         </li>)}
       </ul>}
     </section>

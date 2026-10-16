@@ -48,5 +48,5 @@ const joinWithAnd = (values: ReadonlyArray<string>): string =>
 /** Why a model location reads "Can’t read", and what the user can do about it. */
 export const unreadableModelLocationMessage = (kind: ModelLocationKind): string =>
   kind === "Ollama"
-    ? "Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read."
+    ? "Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here."
     : "Magnitude doesn’t have permission to read this folder. Give your account read access to it."

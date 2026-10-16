@@ -123,11 +123,12 @@ const catalogHideRefusal = (modelId: ModelId) => new LocalModelMutationFailed({
   retryable: false,
 })
 
-/** The location holding a path: the deepest scanned directory that contains it. */
+/** The location holding a path: the one with the deepest scanned directory that contains it. */
 const containingLocation = (path: string, locations: readonly ModelLocation[]): Option.Option<ModelLocationKind> =>
   Option.fromNullable(locations
-    .filter((location) => path === location.path || path.startsWith(`${location.path.replace(/[\\/]+$/, "")}${sep}`))
-    .sort((left, right) => right.path.length - left.path.length)[0]?.kind)
+    .flatMap((location) => location.paths.map((directory) => ({ kind: location.kind, directory: directory.path })))
+    .filter(({ directory }) => path === directory || path.startsWith(`${directory.replace(/[\\/]+$/, "")}${sep}`))
+    .sort((left, right) => right.directory.length - left.directory.length)[0]?.kind)
 
 /** Custom-model commands: finding and adding models, drafters, hiding, and model locations. */
 export interface CustomModelCommandsApi {

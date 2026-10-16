@@ -63,8 +63,8 @@ The ordinary shell contains a dedicated Settings surface for local inference:
   `desktop-inference.md`; custom models are never ranked here. Catalog owns
   install, update, and transfer cancellation; active-model selection remains in the composer and
   installed-artifact removal remains in Models.
-- Model locations lists the automatic locations, each of which can be turned off, and the user's
-  folders with Add and Remove.
+- Model locations lists the automatic locations with the directories found for each, each location
+  turned off as a whole, and the user's folders with Add and Remove.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside
   resident allocations. Internal admission thresholds are not exposed as end-user concepts.
 

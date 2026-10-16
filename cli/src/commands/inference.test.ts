@@ -725,13 +725,15 @@ describe("model locations", () => {
     expect(parseAutomaticLocation("folder")).toEqual(Option.none())
   })
 
-  it("lists automatic locations with found and enabled state, then your folders", () => {
+  it("lists each automatic location's directories with their state, then your folders", () => {
     expect(renderModelLocations(makeLocations())).toBe([
       "Automatic locations",
       "",
       "LOCATION            STATUS     PATH",
+      "Hugging Face cache  Scanning   /Volumes/hf/hub",
       "Hugging Face cache  Scanning   /Users/test/.cache/huggingface/hub",
       "LM Studio           Not found  /Users/test/.lmstudio/models",
+      "LM Studio           Not found  /Users/test/.cache/lm-studio/models",
       "Ollama              Off        /Users/test/.ollama/models",
       "",
       "Your folders",
@@ -745,14 +747,21 @@ describe("model locations", () => {
 
   it("says which locations it can't read and how to grant access", () => {
     const rendered = renderModelLocations([
-      { kind: "Ollama", path: "/usr/share/ollama/.ollama/models", enabled: true, automatic: true, state: "Unreadable" },
-      { kind: "Folder", path: "/srv/models", enabled: true, automatic: false, state: "Unreadable" },
+      { kind: "Ollama", paths: [
+        { path: "/home/ada/.ollama/models", state: "Found" },
+        { path: "/usr/share/ollama/.ollama/models", state: "Unreadable" },
+        { path: "/var/lib/ollama", state: "NotFound" },
+      ], enabled: true, automatic: true, state: "Found" },
+      { kind: "Folder", paths: [{ path: "/srv/models", state: "Unreadable" }], enabled: true, automatic: false, state: "Unreadable" },
     ])
+    expect(rendered).toContain("Ollama    Scanning    /home/ada/.ollama/models")
     expect(rendered).toContain("Ollama    Can't read  /usr/share/ollama/.ollama/models")
-    expect(rendered).toContain("Can't read /usr/share/ollama/.ollama/models. Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read.")
+    expect(rendered).not.toContain("/var/lib/ollama")
+    expect(rendered).toContain("Can't read /usr/share/ollama/.ollama/models. Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here.")
     expect(rendered).toContain("/srv/models  Can't read")
     expect(rendered).toContain("Can't read /srv/models. Magnitude doesn’t have permission to read this folder. Give your account read access to it.")
-    expect(renderModelLocations([{ kind: "Ollama", path: "/o", enabled: false, automatic: true, state: "Unreadable" }])).not.toContain("permission")
+    expect(renderModelLocations([{ kind: "Ollama", paths: [{ path: "/o", state: "Unreadable" }], enabled: false, automatic: true, state: "Unreadable" }]))
+      .not.toContain("permission")
   })
 })
 

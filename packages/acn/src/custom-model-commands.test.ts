@@ -503,6 +503,13 @@ describe("catalog models found elsewhere", () => {
     expect(result.afterUnhide).toEqual([])
   })
 
+  it("attributes files in any of a location's directories to that location", async () => {
+    const systemOllama = "/var/lib/ollama/blobs/sha256-0000"
+    const { run } = harness({ catalogRows: [catalogRow(external, "External", systemOllama)] })
+    const files = await run((commands) => commands.externalCatalogFiles(external))
+    expect(files).toEqual(Option.some({ path: systemOllama, location: Option.some("Ollama") }))
+  })
+
   it("explains that Remove never deletes files in another tool's location", () => {
     expect(externalCatalogRemovalRefusal(external, { path: "/o/models/blob", location: Option.some("Ollama") }).message)
       .toBe(`${external} uses files in Ollama's models folder (/o/models/blob), which Magnitude never deletes. `
@@ -534,7 +541,11 @@ describe("model locations", () => {
     expect(result.afterAdd.folders).toEqual([folder])
     expect(result.afterAdd.disabledLocations).toEqual(["Ollama"])
     expect(result.locations.find(({ kind }) => kind === "Ollama")).toMatchObject({ enabled: false, automatic: true, state: "NotFound" })
-    expect(result.locations.find(({ kind }) => kind === "Folder")).toEqual({ kind: "Folder", path: folder, enabled: true, automatic: false, state: "Found" })
+    expect(result.locations.find(({ kind }) => kind === "Folder"))
+      .toEqual({ kind: "Folder", paths: [{ path: folder, state: "Found" }], enabled: true, automatic: false, state: "Found" })
+    expect(result.locations.find(({ kind }) => kind === "Ollama")?.paths.map(({ path }) => path)).toEqual([
+      "/nonexistent/ollama", "/nonexistent-home/.ollama/models", "/usr/share/ollama/.ollama/models", "/var/lib/ollama",
+    ])
     expect(result.afterRemove.folders).toEqual([])
   })
 })

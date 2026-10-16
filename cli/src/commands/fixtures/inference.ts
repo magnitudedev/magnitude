@@ -398,8 +398,14 @@ export const makeInspection = (overrides: Partial<CandidateInspection> = {}): Ca
 })
 
 export const makeLocations = (): readonly ModelLocation[] => [
-  { kind: "HuggingFaceCache", path: "/Users/test/.cache/huggingface/hub", enabled: true, automatic: true, state: "Found" },
-  { kind: "LmStudio", path: "/Users/test/.lmstudio/models", enabled: true, automatic: true, state: "NotFound" },
-  { kind: "Ollama", path: "/Users/test/.ollama/models", enabled: false, automatic: true, state: "Found" },
-  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, state: "Found" },
+  { kind: "HuggingFaceCache", paths: [
+    { path: "/Volumes/hf/hub", state: "Found" },
+    { path: "/Users/test/.cache/huggingface/hub", state: "Found" },
+  ], enabled: true, automatic: true, state: "Found" },
+  { kind: "LmStudio", paths: [
+    { path: "/Users/test/.lmstudio/models", state: "NotFound" },
+    { path: "/Users/test/.cache/lm-studio/models", state: "NotFound" },
+  ], enabled: true, automatic: true, state: "NotFound" },
+  { kind: "Ollama", paths: [{ path: "/Users/test/.ollama/models", state: "Found" }], enabled: false, automatic: true, state: "Found" },
+  { kind: "Folder", paths: [{ path: "/Volumes/External/models", state: "Found" }], enabled: true, automatic: false, state: "Found" },
 ]

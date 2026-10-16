@@ -12,7 +12,7 @@ import {
   type ModelLocationKind,
   type ModelLocationState,
 } from "@magnitudedev/sdk"
-import { unreadableModelLocationMessage } from "@magnitudedev/client-common"
+import { shownModelLocationPaths, unreadableModelLocationMessage } from "@magnitudedev/client-common"
 import { Effect, Option, Schema } from "effect"
 import { resolveDrafterChoice } from "./hugging-face-runtime"
 import { withClient, type CliModelsClient } from "./inference-client"
@@ -148,32 +148,44 @@ const LOCATION_STATES: Record<ModelLocationState, string> = {
   Unreadable: "Can't read",
 }
 
-const locationStatus = (location: ModelLocation): string =>
-  location.enabled ? LOCATION_STATES[location.state] : "Off"
+/** One table row per directory a location shows, so each directory carries its own status. */
+interface LocationRow {
+  readonly location: ModelLocation
+  readonly path: string
+  readonly state: ModelLocationState
+}
+
+const locationRows = (locations: readonly ModelLocation[]): readonly LocationRow[] =>
+  locations.flatMap((location) => shownModelLocationPaths(location).map(({ path, state }): LocationRow => ({ location, path, state })))
+
+const rowStatus = ({ location, state }: LocationRow): string => location.enabled ? LOCATION_STATES[state] : "Off"
 
 const unreadableNotes = (locations: readonly ModelLocation[]): readonly string[] =>
-  locations.filter(({ enabled, state }) => enabled && state === "Unreadable")
-    .flatMap(({ kind, path }) => ["", `Can't read ${path}. ${unreadableModelLocationMessage(kind)}`])
+  locations.filter(({ enabled }) => enabled).flatMap(({ kind, paths }) => paths
+    .filter(({ state }) => state === "Unreadable")
+    .flatMap(({ path }) => ["", `Can't read ${path}. ${unreadableModelLocationMessage(kind)}`]))
+
+const folderPath = (folder: ModelLocation): string => folder.paths[0].path
 
 export const renderModelLocations = (locations: readonly ModelLocation[]): string => {
   const automatic = locations.filter(({ automatic }) => automatic)
   const folders = locations.filter(({ automatic }) => !automatic)
-    .sort((left, right) => left.path.localeCompare(right.path))
+    .sort((left, right) => folderPath(left).localeCompare(folderPath(right)))
   return ensureTrailingNewline([
     "Automatic locations",
     "",
-    automatic.length === 0 ? "No automatic locations were found on this computer." : renderTable(automatic, [
-      { heading: "LOCATION", value: ({ kind }) => LOCATION_NAMES[kind] },
-      { heading: "STATUS", value: locationStatus },
+    automatic.length === 0 ? "No automatic locations were found on this computer." : renderTable(locationRows(automatic), [
+      { heading: "LOCATION", value: ({ location }) => LOCATION_NAMES[location.kind] },
+      { heading: "STATUS", value: rowStatus },
       { heading: "PATH", value: ({ path }) => path },
     ]).trimEnd(),
     ...unreadableNotes(automatic),
     "",
     "Your folders",
     "",
-    folders.length === 0 ? "No folders added. Add one: magnitude models folders add <path>" : renderTable(folders, [
+    folders.length === 0 ? "No folders added. Add one: magnitude models folders add <path>" : renderTable(locationRows(folders), [
       { heading: "PATH", value: ({ path }) => path },
-      { heading: "STATUS", value: locationStatus },
+      { heading: "STATUS", value: rowStatus },
     ]).trimEnd(),
     ...unreadableNotes(folders),
   ].join("\n"))

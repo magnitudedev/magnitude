@@ -1,9 +1,14 @@
 import { FileSystem } from "@effect/platform"
 import type { PlatformError } from "@effect/platform/Error"
-import { Effect, Either, Option, Schema } from "effect"
+import { Array, Effect, Either, Option, Schema } from "effect"
 import { homedir } from "node:os"
 import { posix, win32 } from "node:path"
-import type { AutomaticModelLocationKind, ModelLocationState } from "@magnitudedev/acn-protocol"
+import {
+  modelLocationState,
+  type AutomaticModelLocationKind,
+  type ModelLocationPath,
+  type ModelLocationState,
+} from "@magnitudedev/acn-protocol"
 
 /** The host facts automatic model locations depend on; injected so every platform's rules are testable. */
 export interface DiscoveryEnvironment {
@@ -18,16 +23,21 @@ export const hostDiscoveryEnvironment = (): DiscoveryEnvironment => ({
   home: homedir(),
 })
 
+type Candidates = readonly [string, ...string[]]
+
 /** One automatic location's candidate directories, most authoritative first. */
 export interface AutomaticLocationCandidates {
   readonly kind: AutomaticModelLocationKind
-  readonly candidates: readonly [string, ...string[]]
+  readonly candidates: Candidates
 }
 
-/** The directory Magnitude scans for one automatic location, and whether it exists and can be read. */
+/**
+ * Every distinct directory of one automatic location, each with whether it exists and can be read,
+ * and the location's state across them. Magnitude scans all of them.
+ */
 export interface ResolvedAutomaticLocation {
   readonly kind: AutomaticModelLocationKind
-  readonly path: string
+  readonly paths: readonly [ModelLocationPath, ...ModelLocationPath[]]
   readonly state: ModelLocationState
 }
 
@@ -47,71 +57,84 @@ export const expandPath = (environment: DiscoveryEnvironment, value: string): st
   return path.isAbsolute(expanded) ? path.normalize(expanded) : path.resolve(environment.home, expanded)
 }
 
-/** `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub`, `XDG_CACHE_HOME/huggingface/hub`, then `~/.cache/huggingface/hub`. */
-export const huggingFaceCacheCandidates = (environment: DiscoveryEnvironment): readonly [string, ...string[]] => {
+/** The configured directories, then the defaults, expanded, each once, in order. */
+const distinctCandidates = (
+  environment: DiscoveryEnvironment,
+  configuredPaths: readonly Option.Option<string>[],
+  defaults: Candidates,
+): Candidates => {
+  const expanded = [...Array.getSomes(configuredPaths), ...defaults].map((value) => expandPath(environment, value))
+  const distinct = expanded.filter((value, index) => expanded.indexOf(value) === index)
+  return [distinct[0]!, ...distinct.slice(1)]
+}
+
+/**
+ * `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub` and `XDG_CACHE_HOME/huggingface/hub`, then
+ * the default `~/.cache/huggingface/hub`, which tools run without those variables still fill.
+ */
+export const huggingFaceCacheCandidates = (environment: DiscoveryEnvironment): Candidates => {
   const path = pathFor(environment.platform)
   const { env } = environment
-  const root = Option.firstSomeOf([
+  return distinctCandidates(environment, [
     configured(env.HF_HUB_CACHE),
     configured(env.HUGGINGFACE_HUB_CACHE),
     Option.map(configured(env.HF_HOME), (home) => path.join(home, "hub")),
     Option.map(configured(env.XDG_CACHE_HOME), (cache) => path.join(cache, "huggingface", "hub")),
-  ]).pipe(Option.getOrElse(() => path.join(environment.home, ".cache", "huggingface", "hub")))
-  return [expandPath(environment, root)]
+  ], [path.join(environment.home, ".cache", "huggingface", "hub")])
 }
 
 /**
  * LM Studio keeps its models folder in its own settings (`downloadsFolder`), under its home
  * (`~/.lmstudio`, relocatable through `~/.lmstudio-home-pointer`); older installs used
- * `~/.cache/lm-studio`.
+ * `~/.cache/lm-studio`, whose models stay there after an upgrade.
  */
 export const lmStudioCandidates = (
   environment: DiscoveryEnvironment,
   settings: { readonly homePointer: Option.Option<string>; readonly downloadsFolder: Option.Option<string> },
-): readonly [string, ...string[]] => {
+): Candidates => {
   const path = pathFor(environment.platform)
   const home = Option.getOrElse(
     Option.map(settings.homePointer, (pointer) => expandPath(environment, pointer)),
     () => path.join(environment.home, ".lmstudio"),
   )
-  const defaults = [path.join(home, "models"), path.join(environment.home, ".cache", "lm-studio", "models")]
-  return Option.match(settings.downloadsFolder, {
-    onNone: () => [defaults[0]!, defaults[1]!],
-    onSome: (folder) => [expandPath(environment, folder), ...defaults],
-  })
-}
-
-/** `LLAMA_CACHE`, then the platform cache: macOS `~/Library/Caches`, Linux XDG or `~/.cache`, Windows `%LOCALAPPDATA%`. */
-export const llamaCppCandidates = (environment: DiscoveryEnvironment): readonly [string, ...string[]] => {
-  const path = pathFor(environment.platform)
-  const { env } = environment
-  const root = Option.getOrElse(configured(env.LLAMA_CACHE), () => {
-    switch (environment.platform) {
-      case "darwin": return path.join(environment.home, "Library", "Caches", "llama.cpp")
-      case "win32": return path.join(
-        Option.getOrElse(configured(env.LOCALAPPDATA), () => path.join(environment.home, "AppData", "Local")),
-        "llama.cpp",
-      )
-      default: return path.join(
-        Option.getOrElse(configured(env.XDG_CACHE_HOME), () => path.join(environment.home, ".cache")),
-        "llama.cpp",
-      )
-    }
-  })
-  return [expandPath(environment, root)]
+  return distinctCandidates(environment, [settings.downloadsFolder],
+    [path.join(home, "models"), path.join(environment.home, ".cache", "lm-studio", "models")])
 }
 
 /**
- * `OLLAMA_MODELS`, then `~/.ollama/models`. On Linux a system service keeps its models under the
- * `ollama` user's home, `/usr/share/ollama/.ollama/models` (the official install script), or directly
- * in `/var/lib/ollama` (distribution packages such as Arch's, which set `OLLAMA_MODELS` there).
+ * `LLAMA_CACHE`, then the platform cache: macOS `~/Library/Caches`, Windows `%LOCALAPPDATA%`, and on
+ * Linux `XDG_CACHE_HOME` and `~/.cache`.
  */
-export const ollamaCandidates = (environment: DiscoveryEnvironment): readonly [string, ...string[]] => {
+export const llamaCppCandidates = (environment: DiscoveryEnvironment): Candidates => {
   const path = pathFor(environment.platform)
-  const override = configured(environment.env.OLLAMA_MODELS)
-  if (Option.isSome(override)) return [expandPath(environment, override.value)]
+  const { env } = environment
+  const inCache = (cache: string) => path.join(cache, "llama.cpp")
+  switch (environment.platform) {
+    case "darwin":
+      return distinctCandidates(environment, [configured(env.LLAMA_CACHE)],
+        [inCache(path.join(environment.home, "Library", "Caches"))])
+    case "win32":
+      return distinctCandidates(environment, [configured(env.LLAMA_CACHE)], [inCache(
+        Option.getOrElse(configured(env.LOCALAPPDATA), () => path.join(environment.home, "AppData", "Local")),
+      )])
+    default:
+      return distinctCandidates(environment,
+        [configured(env.LLAMA_CACHE), Option.map(configured(env.XDG_CACHE_HOME), inCache)],
+        [inCache(path.join(environment.home, ".cache"))])
+  }
+}
+
+/**
+ * `OLLAMA_MODELS`, then `~/.ollama/models`, which a user's own `ollama serve` fills. On Linux a system
+ * service keeps its models apart, under the `ollama` user's home, `/usr/share/ollama/.ollama/models`
+ * (the official install script), or directly in `/var/lib/ollama` (distribution packages such as
+ * Arch's, which set `OLLAMA_MODELS` there); a machine often has both a user and a system install.
+ */
+export const ollamaCandidates = (environment: DiscoveryEnvironment): Candidates => {
+  const path = pathFor(environment.platform)
   const user = path.join(environment.home, ".ollama", "models")
-  return environment.platform === "linux" ? [user, "/usr/share/ollama/.ollama/models", "/var/lib/ollama"] : [user]
+  return distinctCandidates(environment, [configured(environment.env.OLLAMA_MODELS)],
+    environment.platform === "linux" ? [user, "/usr/share/ollama/.ollama/models", "/var/lib/ollama"] : [user])
 }
 
 export const automaticLocationCandidates = (
@@ -168,16 +191,26 @@ export const directoryState = (path: string): Effect.Effect<ModelLocationState, 
   return Either.isRight(listing) || !isPermissionDenied(listing.left) ? "Found" : "Unreadable"
 })
 
-/** Each automatic location's first found candidate, else its first unreadable one, else its first candidate. */
+/**
+ * The candidates that are distinct directories: one reached through a symlink, such as
+ * `/usr/share/ollama` linked to `/var/lib/ollama`, is the same directory as its target, and the
+ * first spelling is kept.
+ */
+const canonicalCandidates = (candidates: Candidates) => Effect.gen(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const canonical = yield* Effect.forEach(candidates, (path) => fs.realPath(path).pipe(Effect.orElseSucceed(() => path)))
+  const distinct = candidates.filter((_, index) => canonical.indexOf(canonical[index]!) === index)
+  return [distinct[0]!, ...distinct.slice(1)] as const
+})
+
+/** Every distinct candidate directory of each automatic location, with its state. */
 export const resolveAutomaticLocations = (environment: DiscoveryEnvironment) => Effect.gen(function* () {
   const lmStudio = yield* readLmStudioSettings(environment)
   return yield* Effect.forEach(automaticLocationCandidates(environment, lmStudio), ({ kind, candidates }) =>
     Effect.gen(function* () {
-      const states = yield* Effect.forEach(candidates, (path) =>
-        Effect.map(directoryState(path), (state): ResolvedAutomaticLocation => ({ kind, path, state })))
-      const fallback: ResolvedAutomaticLocation = { kind, path: candidates[0], state: "NotFound" }
-      return states.find(({ state }) => state === "Found")
-        ?? states.find(({ state }) => state === "Unreadable")
-        ?? fallback
+      const [first, ...rest] = yield* canonicalCandidates(candidates)
+      const resolvePath = (path: string) => Effect.map(directoryState(path), (state): ModelLocationPath => ({ path, state }))
+      const paths = [yield* resolvePath(first), ...yield* Effect.forEach(rest, resolvePath)] as const
+      return { kind, paths, state: modelLocationState(paths) } satisfies ResolvedAutomaticLocation
     }))
 })

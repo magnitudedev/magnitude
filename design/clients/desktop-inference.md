@@ -267,10 +267,11 @@ on the right and a one-line hint only when the state needs explaining: Theme (se
 Launch at login (switch), Model storage, Model locations, and Automatic updates (switch); then one
 About row with the application version, update status, and the single update action for the current
 state. Model locations is one row summarizing what is scanned (the found, enabled locations and the
-folder count) with a Manage action; Manage opens a modal listing found automatic locations with a
-switch and their path, locations Magnitude can't read with the same switch, "Can't read" before their
-path, and what to do about it, not-found locations folded away, and the user's folders with Add folder… and
-Remove. The version is the running service's, from its health.
+folder count) with a Manage action; Manage opens a modal listing each automatic location found or
+unreadable with one switch for the whole location and its directories beneath: every directory found,
+and every directory Magnitude can't read with "Can't read" before its path and what to do about it;
+directories not found are left out. Locations with no directory found or unreadable are folded away
+with the directories checked, and the user's folders follow with Add folder… and Remove. The version is the running service's, from its health.
 Folders are chosen with the app's own folder picker; a folder is watched, so files added or deleted
 later appear or disappear.
 

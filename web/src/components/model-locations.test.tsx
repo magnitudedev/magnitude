@@ -8,10 +8,16 @@ import { candidateErrorNotice, modelLocationErrorNotice } from "./candidate-erro
 import { DirectoryNotFound, InvalidModelReference, ModelSourceUnavailable } from "@magnitudedev/sdk"
 
 const locations: ModelLocation[] = [
-  { kind: "HuggingFaceCache", path: "/Users/me/.cache/huggingface/hub", enabled: true, automatic: true, state: "Found" },
-  { kind: "LmStudio", path: "/Users/me/.lmstudio/models", enabled: false, automatic: true, state: "Found" },
-  { kind: "Ollama", path: "/Users/me/.ollama/models", enabled: true, automatic: true, state: "NotFound" },
-  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, state: "Found" },
+  { kind: "HuggingFaceCache", paths: [
+    { path: "/Volumes/hf/hub", state: "Found" },
+    { path: "/Users/me/.cache/huggingface/hub", state: "Found" },
+  ], enabled: true, automatic: true, state: "Found" },
+  { kind: "LmStudio", paths: [
+    { path: "/Users/me/.lmstudio/models", state: "Found" },
+    { path: "/Users/me/.cache/lm-studio/models", state: "NotFound" },
+  ], enabled: false, automatic: true, state: "Found" },
+  { kind: "Ollama", paths: [{ path: "/Users/me/.ollama/models", state: "NotFound" }], enabled: true, automatic: true, state: "NotFound" },
+  { kind: "Folder", paths: [{ path: "/Volumes/External/models", state: "Found" }], enabled: true, automatic: false, state: "Found" },
 ]
 
 describe("model locations", () => {
@@ -19,13 +25,15 @@ describe("model locations", () => {
   const html = manager(locations)
   it("summarizes the locations found and on, then the folder count, in one row", () => {
     expect(modelLocationsSummary(locations)).toBe("Hugging Face cache · 1 folder")
-    expect(modelLocationsSummary([...locations, { ...locations[3]!, path: "/models" }])).toBe("Hugging Face cache · 2 folders")
+    expect(modelLocationsSummary([...locations, { ...locations[3]!, paths: [{ path: "/models", state: "Found" }] }])).toBe("Hugging Face cache · 2 folders")
     expect(modelLocationsSummary([{ ...locations[1]!, enabled: true }])).toBe("LM Studio")
     expect(modelLocationsSummary([locations[2]!])).toBe("Magnitude isn’t looking anywhere else for models")
   })
-  it("lists found automatic locations with their path and an on/off switch, and tucks away the ones not found", () => {
+  it("lists found automatic locations with every directory found and one on/off switch, and tucks away the ones not found", () => {
     expect(html).toContain("Hugging Face cache")
-    expect(html).toContain("/Users/me/.cache/huggingface/hub")
+    expect(html).toMatch(/Hugging Face cache.*\/Volumes\/hf\/hub.*\/Users\/me\/.cache\/huggingface\/hub.*Look for models in Hugging Face cache/)
+    expect(html).toContain("/Users/me/.lmstudio/models")
+    expect(html).not.toContain("/Users/me/.cache/lm-studio/models")
     expect(html).toContain('aria-label="Look for models in LM Studio"')
     expect(html).not.toContain('aria-label="Look for models in Ollama"')
     expect(html.match(/role="switch"/g)).toHaveLength(2)
@@ -38,17 +46,25 @@ describe("model locations", () => {
     expect(html.indexOf("Add folder…")).toBeLessThan(html.indexOf("Remove /Volumes"))
     expect(html.indexOf("Not found on this computer")).toBeLessThan(html.indexOf("Your folders"))
   })
-  it("keeps locations it can't read in view with what to do, and leaves them out of the summary", () => {
+  it("keeps directories it can't read in view with what to do, and summarizes only locations with one found", () => {
     const unreadable: ModelLocation[] = [
       locations[0]!,
-      { kind: "Ollama", path: "/usr/share/ollama/.ollama/models", enabled: true, automatic: true, state: "Unreadable" },
-      { kind: "Folder", path: "/srv/models", enabled: true, automatic: false, state: "Unreadable" },
+      { kind: "Ollama", paths: [
+        { path: "/home/me/.ollama/models", state: "Found" },
+        { path: "/usr/share/ollama/.ollama/models", state: "Unreadable" },
+        { path: "/var/lib/ollama", state: "NotFound" },
+      ], enabled: true, automatic: true, state: "Found" },
+      { kind: "Folder", paths: [{ path: "/srv/models", state: "Unreadable" }], enabled: true, automatic: false, state: "Unreadable" },
     ]
     const html = manager(unreadable)
-    expect(modelLocationsSummary(unreadable)).toBe("Hugging Face cache · 1 folder")
+    expect(modelLocationsSummary(unreadable)).toBe("Hugging Face cache, Ollama · 1 folder")
+    expect(modelLocationsSummary([{ ...unreadable[1]!, paths: [{ path: "/var/lib/ollama", state: "Unreadable" }], state: "Unreadable" }]))
+      .toBe("Magnitude isn’t looking anywhere else for models")
     expect(html).toContain('aria-label="Look for models in Ollama"')
+    expect(html).toContain("/home/me/.ollama/models")
     expect(html).toContain("Can’t read · /usr/share/ollama/.ollama/models")
-    expect(html).toContain("A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read.")
+    expect(html).not.toContain("/var/lib/ollama")
+    expect(html).toContain("A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it to use those models here.")
     expect(html).toContain("Can’t read · /srv/models")
     expect(html).toContain("Give your account read access to it.")
     expect(html).not.toContain("Not found on this computer")
