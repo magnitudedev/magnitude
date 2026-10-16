@@ -632,4 +632,7 @@ export const ur = {
   snug: "کم کشادہ",
   tight: "بہت تنگ",
   none: "کوئی نہیں",
+  capabilityProfile: "{name} کی صلاحیتوں کا خاکہ",
+  harnessModel: "{name} ماڈل",
+  cacheNotReportedForRequests: "{count} درخواستوں کی رپورٹ نہیں",
 } satisfies typeof en
