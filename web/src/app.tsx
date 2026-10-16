@@ -6,7 +6,7 @@ import { pageLayout } from "./components/page-layout"
 import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
-import { useI18n, isLanguage, type MessageKey } from "./i18n"
+import { useI18n, isLanguage, type MessageKey, readLanguage, translate } from "./i18n"
 import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
 import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
@@ -76,6 +76,7 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
   : `mv "${from}/"* "${to}/"`
 const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 function T({ k }: { k: MessageKey }) { const { t } = useI18n(); return t(k) }
+const tr = (key: MessageKey) => translate(readLanguage(), key)
 function localizedPageName(page: ApplicationPage, t: (key: import("./i18n").MessageKey) => string) {
   const keys = { discover: "discover", catalog: "catalog", models: "myModels", connections: "connections", usage: "usage", status: "status", settings: "settings" } as const
   return t(keys[page])
@@ -395,7 +396,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
   const session = useSession()
   const preference = useAtomValue(session.rankingPreference)
   const setPreference = useAtomSet(useMemo(() => Atom.fn((index: number) => session.setRankingPreference(index)), [session]))
-  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{localizedPageName(page, useI18n().t)}</h1>}<ErrorNotice title="Couldn’t load the model catalog" description="Model information is unavailable. Check the service on Status." className="mt-5" /></>
+  if (Result.isFailure(catalog)) return <>{!discover && <h1 className={pageLayout.pageTitle}>{localizedPageName(page, useI18n().t)}</h1>}<ErrorNotice title=tr("couldNotLoadCatalog") description=tr("modelInfoUnavailable") className="mt-5" /></>
   if (!Result.isSuccess(catalog) && !discover) return <ModelsSkeleton page={page} />
   const models = (Result.isSuccess(catalog) ? catalog.value.models : []).filter((model): model is CatalogLocalModel => model._tag === "Catalog")
   const ranked = !installedOnly && Result.isSuccess(hardware) ? rankedLocalModelOptions(models.map(model => ({ id: model.modelId, kind: localModelIsInstalled(model) ? "stored" as const : "downloadable" as const, model })), { fastToSmart: LOCAL_MODEL_RANKING_SCALE_VALUES[preference]!, memoryBudgetBytes: targetPhysicalMemoryBytes(hardware.value) }, models.length).flatMap(option => option.model._tag === "Catalog" ? [option.model] : []) : []
@@ -432,7 +433,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
             <SelectContent>{filterOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
           <Select value={lab} onValueChange={setLab}>
-            <SelectTrigger aria-label="Filter by lab"><SelectValue>{(value: ModelLab | null) => <LabOption lab={value} />}</SelectValue></SelectTrigger>
+            <SelectTrigger aria-label=tr("filterByLab")><SelectValue>{(value: ModelLab | null) => <LabOption lab={value} />}</SelectValue></SelectTrigger>
             <SelectContent>{[<SelectItem key="any" value={null}><LabOption lab={null} /></SelectItem>, ...labOptions.map(option => <SelectItem key={option.name} value={option}><LabOption lab={option} /></SelectItem>)]}</SelectContent>
           </Select>
           <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
@@ -444,7 +445,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
       </div>
     </>}
     {discover && <HardwareOverview /> }
-    {Option.isSome(stopResult.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopResult.failure.value} className="mt-5" />}
+    {Option.isSome(stopResult.failure) && <ErrorNotice title=tr("couldNotStopModel") description={stopResult.failure.value} className="mt-5" />}
     {discover && <RecommendationPreference value={preference} onChange={setPreference} />}
     {!discover && assessment && !assessment.complete && <p className="mb-4 text-sm text-slate-500">Assessing models · {assessment.settledModels} of {assessment.totalModels}</p>}
     {discover && (recommendationsPending
@@ -481,8 +482,8 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const commandModels = ranked.map(model => ({ id: model.modelId, label: formatLocalModelDisplayName(model) }))
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
   return <>
-    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Start the service from Status before connecting a harness." : "Start the service from Status before setting up an agent."}</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}><T k="discoverModels" /></NoticeAction>} />}
+    {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? tr("configurationChecksAvailable") : tr("startServiceBeforeAgent")}</p>}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : tr("downloadModelToConnect")} description={Result.isFailure(models) ? tr("checkServiceStatus") : tr("chooseCompatibleModel")} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}><T k="discoverModels" /></NoticeAction>} />}
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
@@ -500,10 +501,10 @@ function DesktopHarnessConnections({ canConnect, models, defaultModel, platform,
   const busy = connecting.waiting || disconnecting.waiting
   const error = !busy && firstFailure([connecting, disconnecting])
   return <>
-    {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? "Couldn’t disconnect this agent" : "Couldn’t connect this agent"} description="Check the agent’s configuration before trying again. Some changes may not have completed." className="mt-5" />}
-    {Result.isFailure(rows) ? <ErrorNotice title="Couldn’t check your connections" description="Connection status is unavailable. Magnitude will check again automatically." className="mt-5" />
+    {error && Result.isFailure(error) && <ErrorNotice title={Result.isFailure(disconnecting) ? tr("couldNotDisconnectAgent") : tr("couldNotConnectAgent")} description=tr("checkAgentConfig") className="mt-5" />}
+    {Result.isFailure(rows) ? <ErrorNotice title=tr("couldNotCheckConnections") description=tr("connectionStatusUnavailable") className="mt-5" />
       : !Result.isSuccess(rows) ? <ConnectionsSkeleton />
-      : rows.value._tag === "Unavailable" ? <ErrorNotice title="Couldn’t check your connections" description="Magnitude can’t read the saved connection information. Check that its configuration is accessible." className="mt-5" />
+      : rows.value._tag === "Unavailable" ? <ErrorNotice title=tr("couldNotCheckConnections") description=tr("cannotReadConnections") className="mt-5" />
       : <HarnessConnections connections={rows.value.connections} busy={busy} canConnect={canConnect} models={models} defaultModel={defaultModel} platform={platform}
           onConnect={harness => connect({ harness, model: selectedModel, installSkill: true })} onDisconnect={harness => disconnect({ harness })} />}
   </>
@@ -542,7 +543,7 @@ function ModelStatus() {
       <div className="flex min-w-0 items-center gap-3">
         {active ? <ModelLogo model={active.model} className="size-6 shrink-0" /> : <CubeIcon aria-hidden="true" className="size-5 shrink-0 text-slate-400 dark:text-slate-500" />}
         <div className="flex min-w-0 items-baseline gap-2">
-          <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? "Model status unavailable" : "Reading model status…")}</p>
+          <p title={active ? formatLocalModelDisplayName(active.model) : undefined} className={`m-0 min-w-0 truncate ${active ? "text-base font-medium text-slate-800 dark:text-slate-200" : "text-sm text-slate-500 dark:text-slate-400"}`}>{active ? formatLocalModelDisplayName(active.model) : presentation?.label ?? (Result.isFailure(models) ? tr("modelStatusUnavailable") : tr("readingModelStatus"))}</p>
           {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
         </div>
       </div>
@@ -551,12 +552,12 @@ function ModelStatus() {
     {active && Option.match(loadFraction(active.residency), {
       onNone: () => null,
       onSome: fraction => <div className="mt-4 flex items-center gap-3">
-        <Progress aria-label="Model loading progress" className="flex-1" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={fraction * 100} />
+        <Progress aria-label=tr("modelLoadingProgress") className="flex-1" indicatorClassName="bg-blue-700 dark:bg-blue-500" value={fraction * 100} />
         <span className="w-9 shrink-0 text-right text-xs tabular-nums text-slate-500 dark:text-slate-400">{formatModelLoadPercentage(fraction)}</span>
       </div>,
     })}
-    {Result.isFailure(models) && <ErrorNotice title="Couldn’t read model status" description="Magnitude can’t confirm whether a model is running." className="mt-2" />}
-    {Option.isSome(stopping.failure) && <ErrorNotice title="Couldn’t stop the model" description={stopping.failure.value} className="mt-2" />}
+    {Result.isFailure(models) && <ErrorNotice title=tr("couldNotReadModelStatus") description=tr("cannotConfirmModelRunning") className="mt-2" />}
+    {Option.isSome(stopping.failure) && <ErrorNotice title=tr("couldNotStopModel") description={stopping.failure.value} className="mt-2" />}
   </div>
 }
 function DownloadActivity() {
