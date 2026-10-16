@@ -6,7 +6,7 @@ import { pageLayout } from "./components/page-layout"
 import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
-import { useI18n, isLanguage, type MessageKey, readLanguage, translate } from "./i18n"
+import { useI18n, isLanguage, type MessageKey, readLanguage, translate, translateKnownMessage } from "./i18n"
 import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
 import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
@@ -116,7 +116,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
           return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
         })}</div></div>}
       </div>
-      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500"><T k="assessment" /></p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
+      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500"><T k="assessment" /></p><p className="break-words text-slate-600 dark:text-slate-300">{translateKnownMessage(serving.failure.message)}</p></div>}
       {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
         <p className="mb-1 flex items-center gap-1.5 font-medium"><T k="estimatedSpeed" /><SpeedInfo /></p>
         <p className="text-sm tabular-nums">{localizeModelText(performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength))}</p>
@@ -605,7 +605,7 @@ function Status({ observation }: { observation: ServiceObservation }) {
       {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500"><T k="startingService" /></p>}
       {ready && <DownloadActivity />}
       {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? tr("couldNotConfirmServiceStopped") : tr("serviceCouldNotStart")}
-        description={service._tag === "CleanupFailed" ? tr("backgroundWorkMayRun") : service.message}
+        description={service._tag === "CleanupFailed" ? tr("backgroundWorkMayRun") : translateKnownMessage(service.message)}
         actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}><T k="retryService" /></NoticeAction> : undefined} />}
       {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title={tr("couldNotRetryService")} className="mt-3" />}
     </section>
@@ -699,7 +699,7 @@ function LaunchAtLoginRow() {
   if (Result.isSuccess(owner) && !supports("LaunchAtLogin")) return null
   const current = Result.isSuccess(state) ? state.value : null
   const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
-  const hint = current?._tag === "Unavailable" ? current.message
+  const hint = current?._tag === "Unavailable" ? translateKnownMessage(current.message)
     : current?._tag === "RequiresApproval" ? tr("startupSettingsEnable")
     : tr("startsInBackground")
   const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title={tr("couldNotUpdateLaunch")} description={tr("startupSettingsCheck")} /> : Result.isFailure(state) ? <ErrorNotice title={tr("couldNotCheckLaunch")} description={tr("cannotConfirmSignIn")} /> : undefined
@@ -715,7 +715,7 @@ function ModelStorageRow() {
   const busy = saving.waiting
   const current = Result.isSuccess(settings) ? settings.value : null
   const failure = firstFailure([saving])
-  const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(error.message) : Option.none()) : Option.none<string>()
+  const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(translateKnownMessage(error.message)) : Option.none()) : Option.none<string>()
   return <>
     <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={current ? Option.some(current.path) : Option.none()}
       title={tr("chooseModelsFolder")} description={tr("modelFolderDescription")} confirmLabel={tr("useThisFolder")}
@@ -862,7 +862,7 @@ function AboutRow() {
     alert={hasFailure && !busy ? <ErrorNotice
       title={Result.isFailure(discarding) && !discarding.waiting ? tr("couldNotDiscardUpdate") : current?._tag === "InstallationFailed" ? tr("updateNotCompleted") : checkFailed ? tr("couldNotCheckUpdates") : tr("updateCouldNotFinish")}
       description={installable ? tr("preparedUpdateAvailable")
-        : snapshot?.check._tag === "Failed" ? snapshot.check.message
+        : snapshot?.check._tag === "Failed" ? translateKnownMessage(snapshot.check.message)
         : current?._tag === "Failed" ? current.message : tr("checkConnectionRetry")}
       actions={actions} /> : undefined}
     control={hasFailure ? busy ? <span className="text-xs text-slate-500"><T k="working" /></span> : null : <>
