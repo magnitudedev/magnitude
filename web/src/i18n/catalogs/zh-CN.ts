@@ -486,4 +486,6 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   setupPromptCopied: "已复制 {name} 的设置提示词",
   includes: "包含",
   copyHarnessCommand: "复制 {name} 命令",
+  terminal: "你的终端",
+  setupPromptInstruction: "复制代理的设置提示词，并将其粘贴到你当前使用的电脑上的该代理或任何编程代理中。",
 }
