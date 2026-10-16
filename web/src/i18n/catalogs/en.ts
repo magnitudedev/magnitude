@@ -510,4 +510,5 @@ export const en = {
   more: "More",
   recommendedForMachine: "Recommended for your machine",
   fasterRepliesSmarterAnswers: "Faster replies or smarter answers. Choose what matters more to you.",
+  tokensLabel: "tokens",
 } as const
