@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 /** Hindi (हिन्दी) translations for the complete Magnitude message catalog. */
 export const hi = {
   settings: "सेटिंग्स", general: "सामान्य", about: "परिचय", thisBrowser: "यह ब्राउज़र",
