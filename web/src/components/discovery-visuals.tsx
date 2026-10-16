@@ -15,6 +15,14 @@ import type { CatalogLocalModel, LocalInferenceHardware } from "@magnitudedev/sd
 import { readLanguage, translate, type MessageKey } from "../i18n"
 
 const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+const hardwareLabelKeys: Record<string, MessageKey> = {
+  "System RAM": "systemRam", "Unified memory": "unifiedMemory", "CPU cores": "cpuCores",
+  "Laptop": "laptop", "Gaming laptop": "gamingLaptop", "Gaming tablet": "gamingTablet",
+  "Mobile workstation": "mobileWorkstation", "Mini PC": "miniPc", "AI mini PC": "aiMiniPc",
+  "Desktop": "desktop", "Workstation": "workstation", "All-in-one": "allInOne",
+  "Server": "server", "Graphics card": "graphicsCard", "Unknown": "unknown",
+}
+const localizeHardwareLabel = (label: string) => hardwareLabelKeys[label] ? tr(hardwareLabelKeys[label]!) : label
 
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
@@ -82,7 +90,7 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
     <div className={`grid items-center gap-6 ${Option.isSome(presentation.photo) ? pageLayout.hardwareGrid : ""}`}>
       {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
       <div className="min-w-0">
-        <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{presentation.category}{presentation.cpuInference ? ` · ${tr("cpuInference")}` : ""}</p>
+        <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{localizeHardwareLabel(presentation.category)}{presentation.cpuInference ? ` · ${tr("cpuInference")}` : ""}</p>
         <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => tr("yourComputer")) : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
         <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
           {presentation.groups.map(group => {
@@ -90,7 +98,7 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
             return <div key={group.label} className="min-w-0">
               <div className="flex items-center gap-2">
                 <Icon aria-hidden="true" className="size-4 shrink-0 text-blue-600 dark:text-blue-400" />
-                <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label === "Memory" ? tr("memory") : group.label}</p>
+                <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label === "Memory" ? tr("memory") : localizeHardwareLabel(group.label)}</p>
               </div>
               <div className="min-w-0">
                 <p title={group.truncateName ? group.name : undefined} className={`mb-0 mt-1 text-sm font-semibold leading-snug ${group.truncateName ? "truncate" : "break-words"}`}>{group.name}</p>
