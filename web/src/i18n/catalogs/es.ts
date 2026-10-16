@@ -558,4 +558,5 @@ export const es: { [K in keyof typeof en]: string } = {
   networkAddress: "Dirección de red",
   pageCantConnectService: "Esta página no puede conectarse al servicio de Magnitude y sigue intentándolo. Comprueba que Magnitude se esté ejecutando en ese equipo y que este dispositivo pueda conectarse.",
   memoryUsageUnit: "memoria",
+  thisBrowserControlsAt: "Este navegador controla Magnitude en {host}.",
 }
