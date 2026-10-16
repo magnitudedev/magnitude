@@ -535,4 +535,7 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   checkingEllipsis: "正在检查…",
   openAiBaseUrlHint: "其他设备可将此地址用作兼容 OpenAI 的基础 URL{keyHint}。兼容 Anthropic 的应用请在同一地址使用 /inference/anthropic。",
   withApiKeyAbove: "，并附上上方的 API 密钥",
+  starting: "正在启动",
+  unavailable: "不可用",
+  optimizing: "正在优化",
 }
