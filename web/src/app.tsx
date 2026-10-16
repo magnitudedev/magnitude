@@ -143,18 +143,18 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false, l
   const optimization = acquisition._tag === "Optimizing" ? acquisition.progress : null
   const tuningEstimate = useTuningEstimate(optimization)
   if (acquisition._tag !== "Installing" && acquisition._tag !== "Updating" && acquisition._tag !== "Optimizing") return null
-  const stages = { queued: "Queued", resolving: "Preparing download", checking_space: "Checking space", downloading: "Downloading", verifying: "Verifying download", publishing: "Finishing download" }
+  const stages = { queued: tr("queued"), resolving: tr("preparingDownload"), checking_space: tr("checkingSpace"), downloading: tr("downloading"), verifying: tr("verifyingDownload"), publishing: tr("finishingDownload") }
   const bar = "absolute inset-y-0 left-0 rounded-md bg-blue-700 transition-[width,opacity] duration-500 ease-out dark:bg-blue-500"
   let heading: string, title: ReactNode, detail: string, percent: number | null, downloadWidth: number, pulse: boolean, stat: { label: string; value: string }, remaining: string, cancelLabel: string
   if (acquisition._tag === "Optimizing") {
     const { stage, completed, total } = acquisition.progress
     heading = describeModelOptimization(acquisition.progress, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())
     title = <span className="min-w-0 flex-1 truncate">{heading}</span>
-    detail = "One-time setup for this device"
+    detail = tr("oneTimeSetup")
     percent = stage === "tuning" && total > 0 ? Math.min(100, completed * 100 / total) : null
     downloadWidth = 100
     pulse = percent === null
-    stat = { label: "Model", value: modelName }
+    stat = { label: tr("model"), value: modelName }
     remaining = tuningEstimate
     cancelLabel = tr("skipOptimization")
   } else {
@@ -215,7 +215,7 @@ function SwitchToReplacement({ target }: { target: CatalogLocalModel }) {
   const fits = target.servingState._tag === "Assessed" && target.servingState.assessment._tag === "Fits"
   const transferring = target.acquisitionState._tag === "Installing" || target.acquisitionState._tag === "Updating"
   return <>
-    <Button disabled={command.pending || transferring || !fits} onClick={() => localModelIsInstalled(target) ? load(target.modelId) : install(target.modelId)}>Switch to {formatLocalModelDisplayName(target)}</Button>
+    <Button disabled={command.pending || transferring || !fits} onClick={() => localModelIsInstalled(target) ? load(target.modelId) : install(target.modelId)}>{tr("switchToModel").replace("{name}", formatLocalModelDisplayName(target))}</Button>
   </>
 }
 /** An installed deprecated model is removable and offers one step to its replacement; it never loads. */
@@ -286,10 +286,10 @@ function RemoveDownloadButton({ model, running, disabled, onRemove }: { model: C
   const [confirming, setConfirming] = useState(false)
   const name = formatLocalModelDisplayName(model)
   return <>
-    <Button variant="ghost" size="icon" aria-label={`Remove ${name}`} title="Remove download" disabled={disabled} onClick={() => setConfirming(true)}><TrashIcon /></Button>
+    <Button variant="ghost" size="icon" aria-label={`Remove ${name}`} title={tr("deleteDownload")} disabled={disabled} onClick={() => setConfirming(true)}><TrashIcon /></Button>
     <ConfirmDialog open={confirming} onOpenChange={setConfirming} destructive
-      title={running ? `Stop ${name} and remove its downloaded files?` : `Remove the downloaded files for ${name}?`}
-      description={tr("downloadAgainLater")} confirmLabel={running ? tr("stopAndRemove") : "Remove"} onConfirm={onRemove} />
+      title={running ? tr("stopAndRemoveFilesQuestion").replace("{name}", name) : tr("removeFilesQuestion").replace("{name}", name)}
+      description={tr("downloadAgainLater")} confirmLabel={running ? tr("stopAndRemove") : tr("remove")} onConfirm={onRemove} />
   </>
 }
 function ModelCard({ model, models, showMemory = false, replacing, hardware }: { model: CatalogLocalModel; models: readonly CatalogLocalModel[]; showMemory?: boolean; replacing?: string; hardware: Option.Option<LocalInferenceHardware> }) {
@@ -512,9 +512,9 @@ function DesktopHarnessConnections({ canConnect, models, defaultModel, platform,
 /** The model row's status: the load stage in full while loading, the memory in use once loaded. */
 const modelStatusText = (residency: ModelResidency, hardware: Option.Option<LocalInferenceHardware>): string => {
   switch (residency._tag) {
-    case "Requested": return describeModelLoadStage("preparing", Option.none(), hardware)
+    case "Requested": return tr("preparingEllipsis")
     case "Loading": return describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware)
-    case "Ready": return `Loaded · ${formatModelMemory(residency.allocation)}`
+    case "Ready": return `${tr("loaded")} · ${formatModelMemory(residency.allocation)}`
     case "Stopping": return tr("stoppingEllipsis")
     case "Unloaded":
     case "Stopped":
@@ -766,17 +766,17 @@ function NetworkAccessRows() {
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title={tr("savedAddressInvalid")} description={tr("chooseAddressBelow")} /> : undefined}
       control={current && <Switch aria-label={tr("networkAccess")} checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
-      <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? tr("noNetworkInterfaces") : "Which of this computer's addresses accepts connections."}
+      <SettingsRow nested label={tr("address")} hint={current.interfaces.length === 0 ? tr("noNetworkInterfaces") : tr("networkAddressHint")}
         control={<Select items={[{ value: ALL_INTERFACES, label: tr("allInterfaces") }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
           value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => value === ALL_INTERFACES || value === null ? update({ bind: Option.some<NetworkBind>({ _tag: "AllInterfaces" }) }) : disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>({ _tag: "Address", address: String(value) }) }))}>
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
           <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}><T k="allInterfacesLabel" /></SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
-      <SettingsRow nested label="API key" hint={current.requireApiKey ? tr("otherDevicesBearer") : tr("otherDevicesNoKey")}
+      <SettingsRow nested label={tr("apiKey")} hint={current.requireApiKey ? tr("otherDevicesBearer") : tr("otherDevicesNoKey")}
         control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}><T k="regenerate" /></Button><span className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400"><span aria-hidden="true"><T k="require" /></span><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => checked ? update({ requireApiKey: Option.some(true) }) : disconnect.warn("StopRequiringKey", () => update({ requireApiKey: Option.some(false) }))} /></span></>}>
         {Option.isSome(current.apiKey) && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey.value} label={tr("copyApiKey")} /></div>}
       </SettingsRow>
-      {reachable && <SettingsRow nested label={tr("reachableAt")} hint={`Use this as the OpenAI-compatible base URL on other devices${current.requireApiKey ? ", with the API key above" : ""}. Anthropic-compatible apps use /inference/anthropic on the same address.`}>
+      {reachable && <SettingsRow nested label={tr("reachableAt")} hint={tr("openAiBaseUrlHint").replace("{keyHint}", current.requireApiKey ? tr("withApiKeyAbove") : "")}>
         <div className="mt-2"><CopyCommand command={inferenceUrl(reachable, current.port)} label={tr("copyBaseUrl")} /></div>
       </SettingsRow>}
     </>}
@@ -794,11 +794,11 @@ function AutomaticUpdatesRow() {
   const preference = snapshot?.preference
   const closed = snapshot?.transfer._tag === "Closed"
   return <SettingsRow label={useI18n().t("automaticUpdates")}
-    hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
+    hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? tr("automaticUpdatesHint") : undefined}
     alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title={tr("updatesPreferencesNotSaved")} description={tr("previousPreferenceInUse")} /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title={tr("couldNotReadUpdatePreferences")} description={tr("autoDownloadsUnavailable")} /> : undefined}
     control={snapshot && <Switch aria-label={useI18n().t("automaticUpdates")} checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
-const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
+const failedUpdatePhrase = { verify: tr("updateVerifyFailure"), install: tr("updateInstallFailure"), authorization: tr("updateAuthorizationFailure"), startup: tr("updateStartupFailure") } as const
 
 function AboutRow() {
   const service = useSession()
@@ -827,10 +827,10 @@ function AboutRow() {
     : current._tag === "Idle" ? snapshot?.check._tag === "Succeeded" ? tr("upToDate") : tr("checksAutomatically")
     : current._tag === "Available" ? `Version ${current.version} is available · ${formatStorageSize(current.bytes)}${Option.match(current.failed, {
       onNone: () => "", onSome: failed => ` · It ${failedUpdatePhrase[failed]} on this computer, so it isn’t downloaded automatically.` })}`
-    : current._tag === "Downloading" ? `Downloading version ${current.version} · ${formatStorageSize(current.completed)} of ${formatStorageSize(current.total)}`
+    : current._tag === "Downloading" ? tr("downloadingVersion").replace("{version}", current.version).replace("{completed}", formatStorageSize(current.completed)).replace("{total}", formatStorageSize(current.total))
     : current._tag === "Cancelling" ? tr("stoppingAutomaticDownload")
-    : current._tag === "Staging" ? `Preparing version ${current.version}…`
-    : current._tag === "Ready" ? `Version ${current.version} is ready. Restarting stops the running model and service.`
+    : current._tag === "Staging" ? tr("preparingVersion").replace("{version}", current.version)
+    : current._tag === "Ready" ? tr("versionReadyRestart").replace("{version}", current.version)
     : current._tag === "Closed" ? tr("magnitudeQuitting") : current._tag === "Unavailable" ? tr("updatesUnavailableNow") : undefined
   const actionFailure = firstFailure([checking, downloading, restarting, discarding])
   const checkFailed = snapshot?.check._tag === "Failed"
@@ -853,7 +853,7 @@ function AboutRow() {
       {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}><T k="discardDownload" /></Button>}
       {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}><T k="restartToUpdate" /></Button>
         : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}><T k="downloadUpdate" /></Button>
-        : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={busy} onClick={() => check()}>{busy ? "Checking…" : tr("checkUpdates")}</Button>
+        : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={busy} onClick={() => check()}>{busy ? tr("checkingEllipsis") : tr("checkUpdates")}</Button>
         : null}
     </>} /></>
 }
