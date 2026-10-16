@@ -1,1 +1,31 @@
-PLACEHOLDER_KO
+import type { en } from "./en"
+
+export const ko: { [K in keyof typeof en]: string } = {
+  settings: "설정",
+  general: "일반",
+  about: "정보",
+  thisBrowser: "이 브라우저",
+  language: "언어",
+  languageHint: "이 브라우저 또는 데스크톱 앱에서 Magnitude가 사용할 언어를 선택하세요.",
+  english: "영어",
+  spanish: "스페인어",
+  chineseSimplified: "중국어(간체)",
+  chineseTraditional: "중국어(번체)",
+  hindi: "힌디어",
+  korean: "한국어",
+  vietnamese: "베트남어",
+  indonesian: "인도네시아어",
+  urdu: "우르두어",
+  bengali: "벵골어",
+  discover: "탐색",
+  catalog: "카탈로그",
+  myModels: "내 모델",
+  connections: "연결",
+  usage: "사용량",
+  status: "상태",
+  theme: "테마",
+  thisBrowserControlsAt: "이 브라우저는 {host}에서 Magnitude를 제어합니다.",
+  blockedMemoryDescription: "이 모델에는 {required}이(가) 필요하며 {available}을(를) 사용할 수 있습니다. 사용하지 않는 앱을 종료하거나 더 작은 모델을 선택하세요.",
+  removeFilesQuestion: "{name}의 다운로드한 파일을 제거할까요?",
+  savedAppearanceReadError: "저장된 모양을 읽을 수 없습니다. 시스템 모양을 사용합니다.",
+}
