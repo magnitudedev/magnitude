@@ -639,4 +639,8 @@ export const ur = {
   reloadWindowRestart: "اس ونڈو کو دوبارہ لوڈ کریں۔ اگر پھر بھی نہ کھلے تو Magnitude دوبارہ شروع کریں۔",
   quitAndReopen: "Magnitude بند کر کے دوبارہ کھولیں۔",
   savedAppearanceReadError: "محفوظ کردہ ظاہری شکل نہیں پڑھی جا سکی۔ سسٹم کی ظاہری شکل استعمال ہو رہی ہے۔",
+  chineseTraditional: "روایتی چینی",
+  korean: "کوریائی",
+  vietnamese: "ویتنامی",
+  indonesian: "انڈونیشیائی",
 } satisfies typeof en
