@@ -7,7 +7,7 @@ import { Skeleton } from "./ui/skeleton"
 import { readLanguage, translate } from "../i18n"
 
 const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
-const locale = () => ({ en: "en-US", es: "es-ES", "zh-CN": "zh-CN" })[readLanguage()]
+const locale = () => ({ en: "en-US", es: "es-ES", "zh-CN": "zh-CN", hi: "hi-IN", ur: "ur-PK", bn: "bn-BD", fr: "fr-FR", de: "de-DE", ja: "ja-JP", pt: "pt-PT", it: "it-IT", uk: "uk-UA" })[readLanguage()]
 
 type Activity = Extract<ServingUsageSnapshot, { _tag: "Available" }>["dailyActivity"]
 const colors = [
