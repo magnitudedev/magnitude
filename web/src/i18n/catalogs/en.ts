@@ -642,5 +642,6 @@ export const en = {
   on: "On",
   off: "Off",
   request: "request",
+  appearanceCouldNotBeSaved: "The appearance could not be saved in this browser.",
   savedAppearanceReadError: "The saved appearance could not be read. Using System appearance.",
 } as const
