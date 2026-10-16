@@ -618,4 +618,7 @@ export const es: { [K in keyof typeof en]: string } = {
   vramLabel: "VRAM",
   acceleration: "aceleración",
   unknownProcessor: "Procesador desconocido",
+  chip: "Chip",
+  cpuLabel: "CPU",
+  gpuLabel: "GPU",
 }
