@@ -513,4 +513,5 @@ export const es: { [K in keyof typeof en]: string } = {
   recommendedForMachine: "Recomendado para tu equipo",
   fasterRepliesSmarterAnswers: "Respuestas más rápidas o respuestas más inteligentes. Elige qué es más importante para ti.",
   tokensLabel: "tokens",
+  streakLabel: "racha de {count} {days}",
 }
