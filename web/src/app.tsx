@@ -686,7 +686,7 @@ function LaunchAtLoginRow() {
   const hint = current?._tag === "Unavailable" ? current.message
     : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
     : tr("startsInBackground")
-  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title=tr("couldNotUpdateLaunch") description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title="Couldn’t check launch at login" description="Magnitude can’t confirm whether it will open when you sign in." /> : undefined
+  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title=tr("couldNotUpdateLaunch") description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title=tr("couldNotCheckLaunch") description=tr("cannotConfirmSignIn") /> : undefined
   return <SettingsRow label={useI18n().t("launchAtLogin")} hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
     control={current && <Switch aria-label={useI18n().t("launchAtLogin")} checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
 }
@@ -702,9 +702,9 @@ function ModelStorageRow() {
   const refusal = failure ? Option.flatMap(Cause.failureOption(failure.cause), error => error instanceof ServerSettingsFailed ? Option.some(error.message) : Option.none()) : Option.none<string>()
   return <>
     <FolderPicker open={choosing} onOpenChange={setChoosing} initialPath={current ? Option.some(current.path) : Option.none()}
-      title="Choose a folder for downloaded models" description="Folders on the computer running Magnitude." confirmLabel="Use this folder"
+      title="Choose a folder for downloaded models" description=tr("modelFolderDescription") confirmLabel=tr("useThisFolder")
       onChoose={path => save({ path: Option.some(path) })} />
-    <SettingsRow label={useI18n().t("modelStorage")} alert={!busy && failure ? <ErrorNotice title="The model folder wasn’t saved" description={Option.getOrElse(refusal, () => "Check that the folder is available and writable, then try again.")} /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved model folder can’t be used" description="Magnitude is using the default folder instead. Choose a folder the Magnitude service can write to." /> : undefined}
+    <SettingsRow label={useI18n().t("modelStorage")} alert={!busy && failure ? <ErrorNotice title=tr("modelFolderNotSaved") description={Option.getOrElse(refusal, () => tr("checkFolderWritable"))} /> : Result.isFailure(settings) ? <ErrorNotice title=tr("couldNotReadFolderSetting") description=tr("runningServiceFolderUnchanged") /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title=tr("savedFolderUnavailable") description=tr("defaultFolderInstead") /> : undefined}
       hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
       control={<>
         {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}><T k="useDefault" /></Button>}
@@ -731,17 +731,17 @@ function RestartRequiredToast() {
   const relaunching = useAtomValue(client.Application.RestartApplication)
   if (!storagePending && !networkPending) return null
   const reason = storagePending && networkPending ? "Magnitude is still using the previous model folder and network settings."
-    : storagePending ? "Magnitude is still using the previous model folder." : "Magnitude is still using the previous network settings."
+    : storagePending ? tr("magnitudeStillPreviousFolder") : "Magnitude is still using the previous network settings."
   return <div className="fixed bottom-4 right-4 z-50 w-96 max-w-[calc(100vw-2rem)] rounded-lg bg-white shadow-md dark:bg-slate-850">
     {disconnect.dialog}
     <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
-      title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
+      title={Result.isFailure(relaunching) && !relaunching.waiting ? tr("magnitudeCouldNotRestart") : tr("restartApplyChanges")}
       description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
       actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}><T k="restartMagnitude" /></NoticeAction> : undefined}>
       {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
         <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500"><T k="movingModels" /></summary>
         <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
-        <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label="Copy move command" />
+        <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label=tr("copyMoveCommand") />
       </details>}
     </ErrorNotice>
   </div>
@@ -763,7 +763,7 @@ function NetworkAccessRows() {
   return <>
     {disconnect.dialog}
     <SettingsRow label={useI18n().t("networkAccess")} hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300"><T k="remoteServerGuide" /><ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
-      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved network address is invalid" description="All interfaces are selected. Choose an address below to save a valid setting." /> : undefined}
+      alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title=tr("savedAddressInvalid") description=tr("chooseAddressBelow") /> : undefined}
       control={current && <Switch aria-label="Network access" checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
       <SettingsRow nested label="Address" hint={current.interfaces.length === 0 ? "No network interfaces were found." : "Which of this computer's addresses accepts connections."}
@@ -772,7 +772,7 @@ function NetworkAccessRows() {
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
           <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}><T k="allInterfacesLabel" /></SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
-      <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
+      <SettingsRow nested label="API key" hint={current.requireApiKey ? tr("otherDevicesBearer") : tr("otherDevicesNoKey")}
         control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}><T k="regenerate" /></Button><span className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400"><span aria-hidden="true"><T k="require" /></span><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => checked ? update({ requireApiKey: Option.some(true) }) : disconnect.warn("StopRequiringKey", () => update({ requireApiKey: Option.some(false) }))} /></span></>}>
         {Option.isSome(current.apiKey) && current.requireApiKey && <div className="mt-2"><CopyCommand command={current.apiKey.value} label="Copy API key" /></div>}
       </SettingsRow>
@@ -795,7 +795,7 @@ function AutomaticUpdatesRow() {
   const closed = snapshot?.transfer._tag === "Closed"
   return <SettingsRow label={useI18n().t("automaticUpdates")}
     hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="200px" /> : preference?._tag === "Known" ? "Download updates in the background when they are available." : undefined}
-    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title="Update preferences weren’t saved" description="Your previous preference is still in use." /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
+    alert={Result.isFailure(saving) && !saving.waiting ? <ErrorNotice title=tr("updatesPreferencesNotSaved") description=tr("previousPreferenceInUse") /> : Result.isFailure(observation) || preference?._tag === "Unavailable" ? <ErrorNotice title="Couldn’t read update preferences" description="Automatic downloads are unavailable until your preference can be read." /> : undefined}
     control={snapshot && <Switch aria-label={useI18n().t("automaticUpdates")} checked={preference?._tag === "Known" && preference.autoDownload} disabled={preference?._tag !== "Known" || saving.waiting || closed} onCheckedChange={checked => setAutoDownload(checked)} />} />
 }
 const failedUpdatePhrase = { verify: "couldn’t be verified", install: "failed to install", authorization: "wasn’t authorized to install", startup: "failed to start" } as const
