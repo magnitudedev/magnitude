@@ -78,6 +78,7 @@ function T({ k }: { k: MessageKey }) { const { t } = useI18n(); return t(k) }
 const tr = (key: MessageKey) => translate(readLanguage(), key)
 function localizeModelText(text: string): string {
   const known: Record<string, MessageKey> = {
+    "Not assessed": "notAssessed",
     "Waiting for memory…": "waitingForMemory",
     "Preparing…": "preparingEllipsis",
     "Loading weights…": "loadingWeights",
@@ -118,7 +119,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
       {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
         <p className="mb-1 flex items-center gap-1.5 font-medium"><T k="estimatedSpeed" /><SpeedInfo /></p>
         <p className="text-sm tabular-nums">{performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength)}</p>
-        <p className="mt-1 text-xs text-slate-500">{localModelSpeedNote}</p>
+        <p className="mt-1 text-xs text-slate-500">{tr("speedEstimateNote")}</p>
       </div>}
       </div>
       {radar && <ModelRadar model={model} />}
