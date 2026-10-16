@@ -1,0 +1,58 @@
+import { useCallback, useEffect, useState } from "react"
+import { en } from "./catalogs/en"
+import { es } from "./catalogs/es"
+import { zhCN } from "./catalogs/zh-CN"
+
+export const LANGUAGES = ["en", "es", "zh-CN"] as const
+export type Language = typeof LANGUAGES[number]
+export type MessageKey = keyof typeof en
+export const STORAGE_KEY = "magnitude.language"
+const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN }
+
+export function isLanguage(value: unknown): value is Language {
+  return typeof value === "string" && (LANGUAGES as readonly string[]).includes(value)
+}
+
+/** localStorage is shared by the desktop renderer and browser client, scoped to each app/browser profile. */
+export function readLanguage(storage: Pick<Storage, "getItem"> | undefined = safeStorage()): Language {
+  try {
+    const stored = storage?.getItem(STORAGE_KEY)
+    return isLanguage(stored) ? stored : "en"
+  } catch {
+    return "en"
+  }
+}
+
+function safeStorage(): Storage | undefined {
+  try {
+    return typeof localStorage === "undefined" ? undefined : localStorage
+  } catch {
+    return undefined
+  }
+}
+
+export function translate(language: Language, key: MessageKey): string {
+  return catalogs[language][key] ?? en[key]
+}
+
+const changeEvent = "magnitude-language-change"
+
+export function useI18n() {
+  const [language, setLanguageState] = useState<Language>(() => readLanguage())
+  useEffect(() => {
+    const sync = () => setLanguageState(readLanguage())
+    window.addEventListener("storage", sync)
+    window.addEventListener(changeEvent, sync)
+    return () => {
+      window.removeEventListener("storage", sync)
+      window.removeEventListener(changeEvent, sync)
+    }
+  }, [])
+  const setLanguage = useCallback((next: Language) => {
+    setLanguageState(next)
+    try { safeStorage()?.setItem(STORAGE_KEY, next) } catch { /* storage may be disabled; keep the in-memory choice */ }
+    if (typeof window !== "undefined") window.dispatchEvent(new Event(changeEvent))
+  }, [])
+  const t = useCallback((key: MessageKey) => translate(language, key), [language])
+  return { language, setLanguage, t }
+}
