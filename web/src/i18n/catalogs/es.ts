@@ -631,4 +631,7 @@ export const es: { [K in keyof typeof en]: string } = {
   snug: "Justo",
   tight: "Muy ajustado",
   none: "Ninguno",
+  capabilityProfile: "Perfil de capacidades de {name}",
+  harnessModel: "Modelo de {name}",
+  cacheNotReportedForRequests: "No informado en {count} solicitudes",
 }
