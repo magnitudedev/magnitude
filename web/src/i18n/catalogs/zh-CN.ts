@@ -577,4 +577,11 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   optimizingEllipsis: "正在优化…",
   preparingToOptimize: "正在准备优化…",
   optimizingForDevice: "正在为 {device} 优化…",
+  speedEstimateNote: "粗略估算，未考虑推测解码。",
+  speedEstimateTooltip: "根据设备内存带宽估算。实际性能会有所不同，且未包含推测解码。",
+  notAssessed: "未评估",
+  intelligence: "智能度",
+  speculation: "推测",
+  fit: "适配度",
+  fidelity: "保真度",
 }
