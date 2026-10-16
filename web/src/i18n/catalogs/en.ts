@@ -492,4 +492,5 @@ export const en = {
   otherDeviceKeyIntro: "Other devices use the address and API key under Network access in ",
   turnOnNetworkIntro: "To use it from another device, turn on network access in ",
   secondsWord: "seconds",
+  noKeySetDescription: "On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one.",
 } as const
