@@ -641,6 +641,7 @@ export const uk = {
   on: "Увімкнено",
   off: "Вимкнено",
   request: "запит",
+  appearanceCouldNotBeSaved: "Не вдалося зберегти оформлення в цьому браузері.",
   savedAppearanceReadError: "Не вдалося прочитати збережене оформлення. Використовується оформлення системи.",
   chineseTraditional: "Традиційна китайська",
   korean: "Корейська",
