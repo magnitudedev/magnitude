@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 /** Portuguese translations; remaining long-tail messages fall back to English. */
 export const pt = {
   settings: "Configurações",
