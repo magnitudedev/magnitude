@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** Urdu (اردو). Untranslated long-tail messages retain the English fallback. */
+/** Urdu (اردو) translations for the complete Magnitude message catalog; RTL direction is set by the i18n hook. */
 export const ur = {
   ...en,
   settings: "ترتیبات", general: "عمومی", about: "تعارف", thisBrowser: "یہ براؤزر",
