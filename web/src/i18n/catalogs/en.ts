@@ -512,4 +512,10 @@ export const en = {
   fasterRepliesSmarterAnswers: "Faster replies or smarter answers. Choose what matters more to you.",
   tokensLabel: "tokens",
   streakLabel: "{count} {days} streak",
+  modelPreference: "Model preference",
+  fastest: "Fastest",
+  faster: "Faster",
+  balanced: "Balanced",
+  smarter: "Smarter",
+  smartest: "Smartest",
 } as const
