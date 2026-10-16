@@ -755,7 +755,7 @@ function RestartRequiredToast() {
       actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}><T k="restartMagnitude" /></NoticeAction> : undefined}>
       {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
         <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500"><T k="movingModels" /></summary>
-        <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
+        <p className="my-2">{tr("existingDownloadsPreviousFolder")}</p>
         <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label={tr("copyMoveCommand")} />
       </details>}
     </ErrorNotice>
