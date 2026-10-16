@@ -1,3 +1,5 @@
+import { en } from "./en"
+
 /** German UI translations; untranslated long-tail messages fall back to English. */
 export const de = {
   settings: "Einstellungen",
