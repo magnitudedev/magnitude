@@ -17,6 +17,7 @@ import { App, AppShell } from "./app"
 import { ModelsSkeleton } from "./components/page-skeletons"
 import { ErrorNotice } from "./components/error-notice"
 import { RemoteAccessProvider, SignIn } from "./remote-access"
+import { useI18n } from "./i18n"
 
 export interface ApplicationEntry<E> {
   readonly host: ApplicationHost
@@ -29,11 +30,16 @@ export interface ApplicationEntry<E> {
   readonly reconnect: "Automatic" | "OnConnect"
 }
 
+function StartupFailure({ descriptionKey }: { descriptionKey: "reloadWindowRestart" | "quitAndReopen" }) {
+  const { t } = useI18n()
+  return <div className="p-6"><ErrorNotice title={t("magnitudeCouldNotOpen")} description={t(descriptionKey)} /></div>
+}
+
 function SessionGate() {
   const client = useAgentClient()
   const session = useAtomValue(useMemo(() => client.runtime.atom(ApplicationSession), [client]))
   if (Result.isSuccess(session)) return <SessionProvider session={session.value}><App /></SessionProvider>
-  if (Result.isFailure(session)) return <div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Reload this window. If it still won’t open, restart Magnitude." /></div>
+  if (Result.isFailure(session)) return <StartupFailure descriptionKey="reloadWindowRestart" />
   return null
 }
 
@@ -67,6 +73,6 @@ export const renderApplication = <E,>(entry: ApplicationEntry<E>) => {
   })
   Effect.runPromise(boot).catch(error => {
     console.error(error)
-    root.render(<div className="p-6"><ErrorNotice title="Magnitude couldn’t open" description="Quit Magnitude and open it again." /></div>)
+    root.render(<StartupFailure descriptionKey="quitAndReopen" />)
   })
 }
