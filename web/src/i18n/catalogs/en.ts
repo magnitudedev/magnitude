@@ -434,4 +434,13 @@ export const en = {
   exampleRequest: "Example request",
   folderPath: "Folder path",
   folders: "Folders",
+  totals: "Totals",
+  requests: "Requests",
+  generationSpeed: "Generation speed",
+  timeToFirstToken: "Time to first token",
+  cachePercentage: "{percent}% of input tokens served from cache.",
+  cacheNotReportedRequests: "Cache usage not reported for {count} requests.",
+  tokensPerSecond: "tokens/s",
+  milliseconds: "ms",
+  secondsShort: "s",
 } as const
