@@ -493,4 +493,6 @@ export const en = {
   turnOnNetworkIntro: "To use it from another device, turn on network access in ",
   secondsWord: "seconds",
   noKeySetDescription: "On the computer running Magnitude, open Settings → Network access and choose Regenerate to create one.",
+  reloadPage: "Then reload this page.",
+  changeAddress: "Change address",
 } as const
