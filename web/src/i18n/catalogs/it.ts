@@ -180,7 +180,6 @@ export const it = {
   acceleration: "Accelerazione",
   high: "Alto",
   medium: "Medio",
-  low: "Basso",
   quittingTitle: "Magnitude non è riuscito a chiudersi completamente",
   quittingDescription: "Non è stato possibile confermare l’arresto dei processi in background. Riprova a uscire tenta di fermarli di nuovo. Forza chiusura chiude Magnitude anche se alcuni processi potrebbero essere ancora attivi.",
   retryDownloadSaved: "Riprova a scaricare. I progressi salvati verranno riutilizzati quando possibile.",
