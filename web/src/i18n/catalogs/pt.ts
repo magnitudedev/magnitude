@@ -180,7 +180,6 @@ export const pt = {
   acceleration: "Aceleração",
   high: "Alto",
   medium: "Médio",
-  low: "Baixo",
   quittingTitle: "O Magnitude não conseguiu encerrar completamente",
   quittingDescription: "Não foi possível confirmar que os processos em segundo plano pararam. Tentar encerrar novamente tenta pará-los outra vez. Forçar encerramento fecha o Magnitude mesmo que alguns processos continuem ativos.",
   retryDownloadSaved: "Tente baixar novamente. O progresso salvo será reutilizado quando possível.",
