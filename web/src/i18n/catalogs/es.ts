@@ -586,4 +586,5 @@ export const es: { [K in keyof typeof en]: string } = {
   fidelity: "Fidelidad",
   modelsAssessedCount: "{settled} de {total} evaluados",
   memoryUsage: "Uso de memoria",
+  existingDownloadsPreviousFolder: "Las descargas existentes permanecen en la carpeta anterior. Para moverlas, cierra Magnitude, ejecuta este comando y vuelve a abrir Magnitude.",
 }
