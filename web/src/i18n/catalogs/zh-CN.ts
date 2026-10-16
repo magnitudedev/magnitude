@@ -366,4 +366,8 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   local: "本地",
   remote: "远程",
   automaticDownloadHint: "有更新时在后台下载。",
+  startMagnitudeBackground: "在后台启动 Magnitude 并显示托盘图标。窗口将保持关闭。",
+  loadingUpdateSettings: "正在加载更新设置",
+  applicationUpdates: "应用更新",
+  detectingHardwareShort: "正在检测硬件",
 }
