@@ -486,4 +486,9 @@ export const en = {
   copyHarnessCommand: "Copy {name} command",
   terminal: "your terminal",
   setupPromptInstruction: "Copy an agent’s setup prompt and paste it into that agent, or any coding agent, on the computer you’re using now.",
+  baseUrlLabel: "Base URL",
+  anthropicAppsHint: "Anthropic-compatible apps use /inference/anthropic instead.",
+  remoteCopyKeyIntro: "Copy the key from Network access in ",
+  otherDeviceKeyIntro: "Other devices use the address and API key under Network access in ",
+  turnOnNetworkIntro: "To use it from another device, turn on network access in ",
 } as const
