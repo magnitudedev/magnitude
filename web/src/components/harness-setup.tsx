@@ -87,7 +87,7 @@ function SetupCard({ harness, name, model, origin, remote, platform }: {
     <SetupHeader harness={harness} name={name}>
       {!Result.isFailure(setup) && <>
         <button type="button" aria-expanded={open} aria-controls={promptId} disabled={!ready} onClick={() => setOpen(value => !value)} className="inline-flex cursor-pointer items-center gap-1 rounded text-sm font-medium text-slate-600 transition-colors hover:text-slate-900 focus-visible:text-slate-900 focus-visible:outline-2 focus-visible:outline-blue-500 disabled:cursor-default disabled:opacity-50 dark:text-slate-400 dark:hover:text-slate-100 dark:focus-visible:text-slate-100">{tr("showPrompt")}<CaretDownIcon aria-hidden="true" className={`size-3.5 transition-transform ${open ? "rotate-180" : ""}`} /></button>
-        <Button aria-label={`Copy ${name} setup prompt`} disabled={!ready} onClick={() => ready && copy(setup.value.prompt)}>
+        <Button aria-label={tr("copyPrompt").replace("{name}", name)} disabled={!ready} onClick={() => ready && copy(setup.value.prompt)}>
           {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}{copied ? tr("copied") : tr("copySetupPrompt")}
         </Button>
       </>}
