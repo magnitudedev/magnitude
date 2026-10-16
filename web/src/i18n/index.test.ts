@@ -37,6 +37,17 @@ describe("i18n catalogs", () => {
     expect(readLanguage({ getItem: () => { throw new Error("storage blocked") } })).toBe("en")
   })
 
+  test("preserves interpolation placeholders in every locale", () => {
+    const placeholders = (message: string) => [...message.matchAll(/\\{[A-Za-z0-9_]+\\}/g)].map(match => match[0]).sort()
+    for (const key of Object.keys(en) as Array<keyof typeof en>) {
+      expect(placeholders(es[key]), `Spanish placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(zhCN[key]), `Chinese placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(hi[key]), `Hindi placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(ur[key]), `Urdu placeholders: ${key}`).toEqual(placeholders(en[key]))
+      expect(placeholders(bn[key]), `Bengali placeholders: ${key}`).toEqual(placeholders(en[key]))
+    }
+  })
+
   test("catalogs share the same message keys and every locale has a translation", () => {
     expect(Object.keys(es).sort()).toEqual(Object.keys(en).sort())
     expect(Object.keys(zhCN).sort()).toEqual(Object.keys(en).sort())
