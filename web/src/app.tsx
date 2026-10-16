@@ -863,7 +863,7 @@ function AboutRow() {
       title={Result.isFailure(discarding) && !discarding.waiting ? tr("couldNotDiscardUpdate") : current?._tag === "InstallationFailed" ? tr("updateNotCompleted") : checkFailed ? tr("couldNotCheckUpdates") : tr("updateCouldNotFinish")}
       description={installable ? tr("preparedUpdateAvailable")
         : snapshot?.check._tag === "Failed" ? translateKnownMessage(snapshot.check.message)
-        : current?._tag === "Failed" ? current.message : tr("checkConnectionRetry")}
+        : current?._tag === "Failed" ? translateKnownMessage(current.message) : tr("checkConnectionRetry")}
       actions={actions} /> : undefined}
     control={hasFailure ? busy ? <span className="text-xs text-slate-500"><T k="working" /></span> : null : <>
       {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}><T k="discardDownload" /></Button>}
@@ -954,7 +954,7 @@ function HostNotices() {
   if (notices.length === 0) return null
   return <div className="fixed bottom-4 left-4 z-50 flex w-96 max-w-[calc(100vw-2rem)] flex-col gap-2">
     {notices.map((notice, index) => <div key={index} className="rounded-lg bg-white shadow-md dark:bg-slate-850">
-      <ErrorNotice title={notice.title} description={notice.description} actions={<NoticeAction onClick={() => dismiss(notice)}><T k="dismiss" /></NoticeAction>} />
+      <ErrorNotice title={translateKnownMessage(notice.title)} description={translateKnownMessage(notice.description)} actions={<NoticeAction onClick={() => dismiss(notice)}><T k="dismiss" /></NoticeAction>} />
     </div>)}
   </div>
 }
