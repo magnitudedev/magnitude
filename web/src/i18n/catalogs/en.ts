@@ -583,4 +583,5 @@ export const en = {
   fit: "Fit",
   fidelity: "Fidelity",
   modelsAssessedCount: "{settled} of {total} assessed",
+  memoryUsage: "Memory usage",
 } as const
