@@ -575,4 +575,11 @@ export const en = {
   optimizingEllipsis: "Optimizing…",
   preparingToOptimize: "Preparing to optimize…",
   optimizingForDevice: "Optimizing for {device}…",
+  speedEstimateNote: "Rough estimate. Does not account for speculative decoding.",
+  speedEstimateTooltip: "Estimated from your machine's memory bandwidth. Actual performance will differ. Does not include speculative decoding.",
+  notAssessed: "Not assessed",
+  intelligence: "Intelligence",
+  speculation: "Speculation",
+  fit: "Fit",
+  fidelity: "Fidelity",
 } as const
