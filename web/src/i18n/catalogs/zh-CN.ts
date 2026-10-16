@@ -559,4 +559,8 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   pageCantConnectService: "此页面无法连接到 Magnitude 服务，并会持续重试。请确认 Magnitude 正在那台电脑上运行，且此设备可以访问它。",
   memoryUsageUnit: "内存",
   thisBrowserControlsAt: "此浏览器正在通过 {host} 控制 Magnitude。",
+  switchToReplacementDescription: "切换到 {name} 以继续获得支持。",
+  loadConfirmationTitle: "加载 {name}？",
+  loadConfirmationDescription: "加载 {name} 将停止 {replacing}。",
+  downloadWithSize: "下载（{size}）",
 }
