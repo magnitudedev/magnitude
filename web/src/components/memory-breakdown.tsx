@@ -49,7 +49,7 @@ function ModelMemory() {
 }
 
 export function MemoryBreakdown() {
-  return <section aria-label={tr("memoryUsageUnavailable")} className={pageLayout.card}>
+  return <section aria-label={tr("memoryUsage")} className={pageLayout.card}>
     <div className="flex items-center gap-3"><MemoryIcon className="size-5 text-blue-600 dark:text-blue-400" /><h2 className="font-heading text-lg">{tr("memory")}</h2></div>
     <ModelMemory />
   </section>
