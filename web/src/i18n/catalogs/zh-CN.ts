@@ -648,4 +648,7 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   korean: "韩语",
   vietnamese: "越南语",
   indonesian: "印度尼西亚语",
+  noModelsDownloaded: "尚未下载任何模型。请在“发现”中查找模型。",
+  couldNotCheckAvailableModels: "无法检查可用模型",
+  restartServerToApply: "{reason} 请重启 Magnitude 服务器以应用更改。",
 }
