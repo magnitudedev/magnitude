@@ -44,10 +44,12 @@ specified by their dedicated contracts. Neither surface fabricates startup progr
 
 The ordinary shell contains a dedicated Settings surface for local inference:
 
-- Models is the searchable installed-model library. It lists downloaded model artifacts and exposes
-  only artifact-level actions: reveal the daemon-published installed target path or remove the
-  download. Externally managed Hugging Face cache artifacts may be revealed but do not expose a
-  removal action. Slot selection, residency, favorites, transfer activity, and load controls do not belong
+- Models is the searchable installed-model library. It lists downloaded catalog models and every
+  custom model with its source tag, and exposes only artifact-level actions: reveal the
+  daemon-published installed target path, and the ownership-following Remove (delete for catalog
+  and added models, forget for imported files, Hide from Magnitude for found models). Its header
+  offers Add GGUF file…, and models that can't run collapse into one expandable line with their
+  reasons and no actions. Slot selection, residency, favorites, transfer activity, and load controls do not belong
   on this surface. A deprecated installed model is labeled, names its replacement, and offers one
   switch action that downloads the replacement until it is installed; best-effort models are
   labeled wherever they appear.
@@ -56,21 +58,25 @@ The ordinary shell contains a dedicated Settings surface for local inference:
   size, or name. Onboarding preference is not applied to this general catalog. Ordinary
   downloadable rows do not repeat an `Available` label; non-default lifecycle and assessment
   states remain visible while completed `DoesNotFit` assessments and deprecated models are
-  excluded from the browsable catalog. Catalog owns
+  excluded from the browsable catalog. Its header offers Add from Hugging Face, and Details offer
+  Find other versions on Hugging Face, both opening the Add dialog specified in
+  `desktop-inference.md`; custom models are never ranked here. Catalog owns
   install, update, and transfer cancellation; active-model selection remains in the composer and
   installed-artifact removal remains in Models.
+- Model locations lists the automatic locations, each of which can be turned off, and the user's
+  folders with Add and Remove.
 - Hardware presents server-reported topology and a labeled physical-memory breakdown alongside
   resident allocations. Internal admission thresholds are not exposed as end-user concepts.
 
 Models and Catalog distinguish an unobserved query, server-side inventory initialization,
-catalog discovery, a successfully loaded empty collection, and failure. Before the first snapshot,
+local-model scanning, a successfully loaded empty collection, and failure. Before the first snapshot,
 and while the corresponding server lifecycle is still loading, each surface renders an explicit
 loading state rather than empty model chrome. An empty-state message is shown only after the daemon
 has made that collection authoritative. Partial usable choices may remain available while a refresh
-or discovery operation continues, accompanied by its nonterminal state.
+or scan continues, accompanied by its nonterminal state.
 
 Opening Settings changes the application sidebar from session navigation to Settings navigation.
-Models, Catalog, and Hardware are vertical sidebar destinations; the main pane renders only the
+Models, Catalog, Model locations, and Hardware are vertical sidebar destinations; the main pane renders only the
 selected destination. Returning from Settings restores the session sidebar. On narrow layouts the
 same navigation is presented in the existing sidebar overlay rather than as horizontal content tabs.
 Settings destinations take over the main pane directly and do not reuse the session chat title bar;
@@ -121,7 +127,7 @@ routes to Hardware.
 
 A selected model retains the ordinary foreground color regardless of residency. Loading is
 communicated by the work-status activity instead of muting model identity. The combined menu also
-reflects authoritative inventory and discovery availability: without a selection its trigger
+reflects authoritative inventory and local-model availability: without a selection its trigger
 identifies loading, and with a selection it preserves the selected identity while its menu reports
 that additional choices are still loading. Query failure is distinct from both loading and a
 successfully loaded empty list. Model and reasoning text use the slate hierarchy rather than a
@@ -168,7 +174,8 @@ interactive theme, or parallel onboarding presentation.
 - No web model-management component reconstructs the deprecated candidate/offering/download model.
 - Non-local catalog entries are never rendered, selected, assigned, or counted as ready.
 - Every long-running lifecycle is rendered from server state; mutations cover command admission.
-- Settings is a first-class application surface with Models, Catalog, and Hardware destinations.
+- Settings is a first-class application surface with Models, Catalog, Model locations, and Hardware
+  destinations.
 - Wide and narrow layouts preserve access to every model-management view and action.
 - Footer model and reasoning choices remain available without navigating away from the chat.
 - Catalog keeps the selected model's primary action visible while its evidence scrolls, labels

@@ -157,7 +157,7 @@ connection reports any reload or restart the user must perform in an already-run
 
 Connectors preserve canonical model IDs as opaque keys. Claude-facing identities add only the
 reserved `anthropic-local/` routing prefix. Provider-local registrations expose every installed
-Magnitude model, including callable external Hugging Face models.
+Magnitude model, including callable custom models.
 
 The protocol assignments are:
 

@@ -8,35 +8,49 @@ applies_to:
   - inference/service/contracts/src/models.rs
   - packages/icn/src/models/**
   - packages/icn/src/events/**
-  - packages/acn/src/local-model-**
-  - packages/acn-protocol/src/schemas/model-state.ts
-  - packages/acn-protocol/src/schemas/local-model-projection.ts
+  - packages/acn/src/local-model*
+  - packages/acn-protocol/src/schemas/**
   - packages/ai/src/provider/model.ts
   - packages/client-common/src/local-models/**
   - packages/client-common/src/utils/model-presentation.ts
-  - cli/src/commands/inference-runtime.ts
+  - packages/storage/src/types/custom-models*
+  - cli/src/commands/inference*.ts
   - web/src/app.tsx
 ---
 
 # Model catalog and acquisition
 
-This document defines catalog publication, package resolution, artifact presence, inventory,
-download, and deletion behavior. Terms follow [Model-management terminology](./terminology.md).
+This document defines catalog publication, package resolution, model locations, artifact presence,
+inventory, download, and deletion behavior. Terms follow
+[Model-management terminology](./terminology.md).
 
 ## Ownership
 
-ICN owns the recommendable catalog, exact packages and sources, the managed model store, filesystem
-inventory, and process-local download coordination. ACN observes those authorities and produces
-product projections. Clients initiate native mutations through ACN's transparent inference proxy
-and do not infer command authorization or completion from cached projections.
+ICN owns the recommendable catalog, exact packages and sources, the managed model store, scanning
+of model locations, filesystem inventory, Hugging Face access, and process-local download
+coordination. ACN persists the user's custom-model choices, resolves location paths, observes ICN's
+authorities and produces product projections. Clients initiate native mutations through ACN and do
+not infer command authorization or completion from cached projections.
 
 Catalog membership, artifact presence, download activity, package validation, assessment, provider
 offering, slot selection, and runtime residency remain separate facts.
 
-Live Hugging Face search and repository resolution are service-owned discovery queries. Search
-returns GGUF repositories with immutable commit identities; resolution returns the requested
-repository's immutable snapshot and GGUF file evidence. These queries do not change the release
-catalog or managed inventory, and catalog use does not depend on them.
+Hugging Face search, repository resolution, and candidate inspection are service-owned
+observational queries. Search returns GGUF repositories with immutable commit identities, lineage
+(`baseModels`, and the catalog model a result is a variant of), and a count of results hidden because
+the engine recognizes none of their architectures; the Hub's repository-level architecture is only
+a prefilter against the engine's recognized-architecture list. Repositories the catalog uses are
+never returned as new models. Resolution returns the requested repository's immutable snapshot and
+GGUF file evidence. Candidate inspection groups a repository's or path's GGUFs into versions (shards
+together) and assesses each through the engine from headers fetched by range request; it never
+reads file names for compatibility or quantization. Each version carries its canonical model ID,
+so clients never form identities: a repository file's `hf:` ID, and for a path the ID of the custom
+model already listed with those bytes (a Hugging Face identity when its location gives one), else
+`local:` with the file's header digest. A version whose bytes are already listed also names that
+model as on this computer. For a chosen version and drafter the service
+also returns the exact servable bundle to download, with the same package identities a post-download
+scan computes; clients never construct bundles. These queries do not change the release catalog,
+managed inventory, or configuration, and catalog use does not depend on them.
 
 Catalog attribution across exact artifact or drafter changes follows
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md).
@@ -156,11 +170,9 @@ files required by that package are currently present and valid. A bundle is inst
 its required packages are installed. No registry, configuration, download record, cache entry, or
 historical success can make files present or absent.
 
-Magnitude-owned artifacts live in the configured `ManagedModelStore`. Explicit Hugging Face roots are
-read-only external sources with origin `HuggingFaceCache`; they are never moved, deleted, or adopted.
-The standard environment-derived Hugging Face hub root remains configured even when absent at ICN
-startup, so an explicit later discovery refresh can observe a cache created during the same daemon
-lifetime. Origin affects ownership-sensitive operations, not package identity or runtime eligibility.
+Magnitude-owned artifacts live in the configured `ManagedModelStore`: catalog models and added
+custom models. Every other location is external and read-only (see Model locations). Origin
+affects ownership-sensitive operations, not package identity or runtime eligibility.
 
 Each repository in the Magnitude-owned store may contain any number of complete revision snapshots.
 Each snapshot directory names its immutable revision and contains links to installed
@@ -175,57 +187,90 @@ identities, roles, shards, and relationships come from existing validated files,
 matches, and package validation. Unsafe links, special files, escaping paths, and invalid entries
 make only the affected package unavailable. Store mutations reconcile owned path topology by
 quarantining conflicting nodes before writing; they never follow a conflicting link or overwrite an
-unclassified node. Explicit external Hugging Face roots retain their ordinary
-multi-revision layout and remain read-only.
-
-Each complete independently callable GGUF group in an external Hugging Face root is a discovered
-model candidate. A standalone file uses its repository-relative path as its artifact selector; a
-complete shard set uses its lexical first shard. Projectors and execution companions belong to the
-selected package and do not receive independent model identities. Metadata-only repositories,
-Safetensors-only repositories, and incomplete shard sets produce no discovered model.
-
-The canonical discovered identity is
-`hf:<owner>/<repository>/<artifact-selector>`. Its three semantic parts are parsed and validated;
-the identity never contains an inventory hash, absolute cache path, package ID, revision, or
-projector. Multiple quantizations therefore remain distinct when they occupy distinct repository
-paths. Quantization presentation comes from bounded GGUF parsing rather than filename parsing.
-
-When several cached revisions or configured roots provide the same repository and selector, exact
-identical packages collapse. Candidates referenced by a cached `main` ref outrank other candidates.
-Within the same ref priority, the most recently modified cached revision wins; its immutable commit
-provides the deterministic final tie-break. This is local cache recency, not a claim about upstream
-commit chronology. Selection precedes validation, so an invalid selected revision never falls back
-to a stale revision. An exact catalog target that is successfully attributed publishes only under
-its catalog identity; failed attribution remains visible through discovery so the installed
-artifact does not disappear from inventory.
-
-Inventory retains source occurrences by `InventoryEntryId` until this selection is complete.
-Package-content deduplication therefore never erases the repository, selector, root, revision, or
-current-ref evidence needed to form and select distinct `hf:` identities. Catalog package presence
-may collapse identical package content afterward, while ownership still reflects every retained
-physical occurrence.
+unclassified node.
 
 Temporary and `.incomplete` files never contribute presence. A partial multi-file package is not
 installed. A complete independently servable weights package may remain installed while an
 optional companion or a larger bundle is incomplete.
 
-Inventory reconciliation owns filesystem discovery, hashing, bounded GGUF parsing, tensor-storage
-derivation, package construction, package validation, and local Assessment Material derivation.
+Inventory reconciliation owns location scanning, managed-store hashing, bounded GGUF parsing,
+tensor-storage derivation, package construction, package validation, and local Assessment Material derivation.
 Package construction produces the exact package and its one authoritative structural validation
 atomically; catalog generation and installed inventory use that same operation. One cached GGUF
 parse supplies every structural property for an immutable component. Template-derived capabilities
 are produced only by assessment. Reconciliation publishes complete inventory snapshots and retains the
 previous complete inventory snapshot while a refresh is in flight. Queries return the current materialized snapshot
-and perform no filesystem work. Discovery is hardware-independent and performs no network access,
+and perform no filesystem work. Scanning is hardware-independent and performs no network access,
 assessment, calibration, profile choice, or ranking. ICN reconciles once at startup. Product-owned
 artifact mutations publish their exact inventory change before completing and do not trigger a
-global scan. A later global reconciliation is performed only when an operation explicitly requires
-fresh discovery or validation; it is never driven by an unconditional timer.
+global scan. Later reconciliation follows location watches, configuration changes, or an explicit
+refresh; it is never driven by an unconditional timer.
 
 All inventory indexes, content hashes, GGUF parses, validations, and derived package evidence are optimistic
 caches. Missing, stale, malformed, unreadable, or unwritable cache state causes scoped recomputation
 and cannot remove a valid artifact from inventory. Catalog failure cannot hide independently
 servable artifacts.
+
+### Model locations
+
+ICN scans a list of model roots that ACN resolves and supplies (see
+[ICN lifecycle](../icn/lifecycle.md)):
+
+| Location | Layout and identity |
+|---|---|
+| Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID |
+| LM Studio | Publisher/repository layout gives the `hf:` ID |
+| llama.cpp cache | `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
+| Ollama | Manifests name each model and its GGUF blob, whose `sha256-<hex>` name is its content identity; `hf.co/…` pulls give the `hf:` ID with selector `<tag>.gguf` (Ollama records no file name), library models are `local:` |
+| User folders | Any GGUFs beneath the folder; `local:` |
+
+Each automatic location is resolved from its environment override and the owning tool's own
+configuration before its platform default, and remains configured while absent, so a location
+created later is observed. The user may turn off an automatic location and add or remove folders;
+the change reaches ICN as a new configuration and reconciles only the affected roots. Imported files
+are scanned at their declared paths. ICN watches every enabled root, so models appear and disappear
+without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.
+
+Magnitude never writes to, moves, adopts, or deletes from an external location. Scans read GGUF
+headers only, follow no link out of a root, and skip partial downloads and temporary files. External
+files are identified by their header digest and never hashed in full; a package file whose SHA-256
+is not known from a blob name takes its identity from that digest and its size. A location that
+cannot be read is skipped for that reconciliation and never hides another location's models.
+
+Each complete independently callable GGUF group is a custom-model candidate. A standalone file is its
+own selector; a complete shard set uses its lexical first shard. Projectors and drafters are
+classified from their tensors, never from file names, and belong to the selected package rather
+than receiving independent model identities. Metadata-only directories, Safetensors-only
+repositories, and incomplete shard sets produce no model. The `hf:` and `local:` forms follow
+[terminology](./terminology.md); quantization presentation comes from bounded GGUF parsing rather
+than filename parsing.
+
+The same model found in several places is one model. When several cached revisions or roots provide
+the same identity, exact identical packages collapse. Candidates referenced by a cached `main` ref
+outrank other candidates. Within the same ref priority, the most recently modified cached revision
+wins; its immutable commit provides the deterministic final tie-break. This is local cache recency,
+not a claim about upstream commit chronology. Selection precedes validation, so an invalid selected
+revision never falls back to a stale revision. A found file that is exactly a catalog target (the
+same repository, commit, and file) is that catalog model and publishes only under its catalog
+identity; failed attribution remains visible as a custom model so the installed artifact does not
+disappear from inventory. A found file that matches an added model's declaration is that added
+model; its files remain externally owned.
+
+A complete GGUF group whose header cannot be read is published as an unsupported local model with
+the `Unreadable` reason and its location; it receives no callable identity and is never offered.
+Every readable group is published as a custom model and assessed, so the engine decides support:
+ACN lists a found or imported custom model whose assessment is `Unsupported` among the unsupported
+local models with the assessment's reasons, never as an offering; an added one keeps its row so it
+stays removable (see
+[local-model product projection](./local-model-product-projection.md)). Hidden models, named by ID in the
+local-models configuration, remain in inventory and are published separately as hidden, so a client
+can unhide them; they are neither assessed nor offered.
+
+Inventory retains source occurrences by `InventoryEntryId` until this selection is complete.
+Package-content deduplication therefore never erases the repository, selector, root, revision, or
+current-ref evidence needed to form and select distinct identities. Catalog package presence
+may collapse identical package content afterward, while ownership still reflects every retained
+physical occurrence.
 
 ## Downloads
 
@@ -235,10 +280,24 @@ model is already current. The admitted occurrence retains the exact resolved pri
 uses process-local download/package work internally; none of those internal identities crosses the
 ICN–ACN boundary.
 
+An added custom model is a Magnitude-managed download of a non-catalog `ServableModelBundle` built
+from its declaration: the target selector (shards included), the projector, and the drafter, each
+pinned to the repository commit resolved when it was added. ICN admits one model-addressed download
+for it, and a separate drafter-only download when a drafter is added to any custom model whose
+target is already present; a target already on this computer is never downloaded again. Each
+such download names the model it serves (`forModel`), and ICN echoes it in the download's state, so
+ACN attributes progress and failure to that model without matching package files: a download that
+carries an added model's declared target acquires that target, any other fetches its drafter alone,
+whatever repository (the catalog's included) the drafter comes from. A catalog installation names its
+catalog model the same way. These
+downloads share the catalog path's locking, resume, LFS SHA-256 verification, disk-space checks,
+failure classification, publication, acknowledgement and post-download optimization. Update for an
+added model means its repository has a newer commit; it never follows a mutable revision implicitly.
+
 Admission validates each package in the requested bundle against the current materialized package
 record and that package's current exact file evidence. It does not await inventory-wide filesystem
-reconciliation. Global reconciliation remains the discovery path for external filesystem changes;
-it is never a prerequisite for acknowledging a known catalog download.
+reconciliation. Location reconciliation remains the observation path for external filesystem
+changes; it is never a prerequisite for acknowledging a known download.
 
 Development tooling acquires one catalog model outside ICN through the catalog tool, into an explicit model store. It uses the same per-variant resolution at locked commits and the same download and verification path as the service:
 - it fetches only missing or invalid files;
@@ -328,8 +387,8 @@ Catalog and acquisition contribute catalog configurations, current package obser
 process-local download state to the [local-model product projection](./local-model-product-projection.md).
 They do not persist provider offerings or serving configurations.
 
-Every independently servable, unambiguous external Hugging Face artifact contributes a discovery
-row under its canonical `hf:` `ModelId`. Installed catalog targets are attributed to their complete
+Every independently servable, unambiguous custom model contributes one row under its canonical
+`hf:` or `local:` `ModelId` with its origin. Installed catalog targets are attributed to their complete
 catalog `ModelId` by the exact mapping defined in
 [Intrinsic catalog target mapping](./intrinsic-target-mapping.md). One catalog product row retains
 curated presentation across target, repository, and drafter changes.
@@ -370,7 +429,12 @@ owned material are removed; a dependency is shared only with another catalog mod
 or affiliated with it, never merely declared by an uninstalled one; removal is retained as a whole only when a target itself is external or
 shared, because deleting it would either violate ownership or break another catalog model. Removing
 an eligible package removes every Magnitude-owned inventory occurrence of that package and preserves
-every external Hugging Face cache occurrence.
+every external occurrence.
+
+Removing an added custom model deletes its Magnitude-owned files under the same rules; any of its
+files that are also present in an external location stay there, and the model remains as found.
+Removing an imported model forgets its declaration and never touches the file. A found model is
+hidden, never deleted.
 
 Deleting artifacts does not delete slot selection, favorites, or recency. Those are user intent and
 may remain unresolved until the exact catalog configuration and required files are available again.
@@ -382,9 +446,9 @@ may share in-flight hashing and inspection. Package download sharing and cancell
 within the owning ICN process.
 
 Startup derives inventory from current files and callable models from the catalog plus unambiguous,
-successfully inspected external Hugging Face artifacts.
-There is no model-state recovery epoch. Later explicit filesystem observations and product-owned
-artifact mutations update the same materialized derivation.
+successfully inspected custom models in the configured locations and declarations.
+There is no model-state recovery epoch. Later filesystem observations, configuration changes, and
+product-owned artifact mutations update the same materialized derivation.
 
 ## Conformance
 
@@ -403,8 +467,11 @@ artifact mutations update the same materialized derivation.
   configuration of a supported catalog model.
 - A deprecated model is never recommended, offered, installed, or loaded, keeps its locked
   revisions, and its installed files remain removable.
-- Independently callable external Hugging Face packages without catalog attribution publish under
-  their canonical `hf:` identity; other unattributed packages remain inventory only.
+- Independently callable packages without catalog attribution publish once as custom models under
+  their canonical `hf:` or `local:` identity; other unattributed packages remain inventory only.
+- The same bytes in two locations are one model; external files are never hashed in full.
+- Every complete GGUF group the engine cannot run is never callable; an unreadable, found, or
+  imported one appears as an unsupported local model with all its reasons.
 - Installed inventory is derived without network access or hardware assessment.
 - Partial, unsafe, invalid, or digest-mismatched content is not installed.
 - Complete packages from multiple repository revisions may coexist until exact catalog affiliation
@@ -418,5 +485,7 @@ artifact mutations update the same materialized derivation.
 - Historical download completion never proves current presence.
 - Shared blobs are deleted only after current filesystem references prove them unreferenced.
 - Catalog failure cannot hide independently servable installed packages.
-- External Hugging Face artifacts cannot be installed, updated, or removed through Magnitude-owned
-  acquisition operations.
+- Magnitude never writes to or deletes from an external location; found and imported files cannot be
+  installed, updated, or deleted through Magnitude-owned acquisition operations.
+- Added models are pinned to a repository commit and are downloaded and verified like catalog
+  models.

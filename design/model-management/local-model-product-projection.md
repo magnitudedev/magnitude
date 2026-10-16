@@ -5,7 +5,7 @@ applies_to:
   - packages/icn/src/models/**
   - packages/icn/src/events/**
   - packages/icn/src/instances/**
-  - packages/acn/src/local-model-**
+  - packages/acn/src/local-model*
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/**
 ---
@@ -18,48 +18,78 @@ ICN exposes two explicit model resources:
 
 - `/api/v1/catalog/**` publishes reviewed catalog variants and model-addressed managed installation
   operations.
-- `/api/v1/discovery/**` publishes non-catalog models observed in external sources and supports
+- `/api/v1/local-models/**` publishes custom models and unsupported local models found in the
+  configured locations and declarations, accepts the whole local-models configuration, and supports
   explicit refresh.
 
-There is no combined native management model list and no package, bundle, or raw-download resource
-at the ICN–ACN boundary. The OpenAI-compatible `/v1/models` endpoint is inference advertisement,
-not management state.
+Hugging Face search, candidate inspection, drafter candidates, and non-catalog downloads are
+separate ICN resources. There is no combined native management model list and no package, bundle,
+or raw-download identity at the ICN–ACN boundary. The OpenAI-compatible `/v1/models` endpoint is
+inference advertisement, not management state.
 
 Each row already carries a valid canonical `ModelId`. Catalog rows exist without local material and
-have `NotInstalled` or `Installed` local state. Discovered rows exist because material was observed
-and have exactly one truthful state: `Ready` or `Unavailable`; both contain the selected resolved
-installation.
+have `NotInstalled` or `Installed` local state. Custom-model rows exist because material was
+observed or declared and have exactly one truthful state: `Ready` or `Unavailable`; both contain the
+selected resolved installation. An added model whose download has not completed is projected from
+its download.
 
 ## ACN projection
 
-ACN observes catalog, discovery, catalog-installation operations, assessments, and instances
-separately, then publishes one `LocalModel` union:
+ACN observes catalog, custom models, catalog-installation operations, downloads, assessments, and
+instances separately, then publishes one `LocalModel` union:
 
 - `Catalog` contains catalog membership and managed acquisition state.
-- `Discovered` contains discovery state and never exposes managed acquisition actions.
+- `Custom` carries its `origin` (`Added`, `Imported`, or `Found` with its source), the catalog model
+  it is a variant of, its attached and recommended drafters, measured drafter acceptance, serving
+  state, and, for `Added` only, managed acquisition state.
+
+`LocalModelsState` separately lists unsupported local models: display name, origin, location, the
+complete list of structured reasons, and developer detail. It combines the groups ICN could not
+read with the found and imported custom models whose assessment is `Unsupported`. They are never
+`LocalModel` rows, never selectable, and have no actions. A reason case a client does not know still
+renders with its detail. An added model whose assessment is `Unsupported` stays a row with that
+assessment, so its Magnitude-owned files remain removable.
+
+`LocalModelsState` also lists hidden models apart. ACN sends the hidden model IDs to ICN in the
+local-models configuration; ICN publishes those models separately and never assesses them, and ACN
+projects them as `Custom` rows in `hidden`, never in `models`, so they are never offered and a client
+can unhide them.
+
+Actions follow who owns the files:
+
+| Origin | Remove | Update | Drafter |
+|---|---|---|---|
+| Catalog | Deletes the files | New catalog revision | The catalog's; changes only through Update |
+| Added | Deletes Magnitude-owned files | New repository commit | Add, Change, Turn off |
+| Imported | Forgets the declaration; never touches the file | None | Add, Change, Turn off |
+| Found | Hide from Magnitude; never touches the files | None | Add, Change, Turn off |
+
+Adding a drafter to a model whose target is present downloads only the drafter. When a catalog
+drafter gets a new revision, every model using it shows Update.
 
 The same projection publishes a small preparation summary derived directly from the current ICN
-source and assessment snapshots: discovery completion and the discovered-model count (catalog
+source and assessment snapshots: local-model scan completion and the custom-model count (catalog
 models are excluded from it), plus assessment completion,
 settled count, and total count. Assessment totals describe the current target set and may grow when
-authoritative discovery contributes additional targets. This summary is the readiness authority for
+authoritative scanning contributes additional targets. This summary is the readiness authority for
 onboarding and local provider offerings; clients do not recover global readiness by scanning
 individual product rows.
 
 Shared fields contain presentation and canonical `modelId`. Catalog rows directly contain their
-catalog data, acquisition state, and serving state. A discovered row contains one structural state:
+catalog data, acquisition state, and serving state. A custom row contains one structural state:
 `Ready` owns its resolved installation, residency, catalog attribution, and serving state;
-`Unavailable` owns its resolved installation and native failure. An unavailable discovery has no
+`Unavailable` owns its resolved installation and native failure. An unavailable custom model has no
 catalog-attribution fact because its selected artifact is not ready.
 Presentation may include deduplicated HTTPS source links, but never package or bundle structure.
-Where present, serving state is `Assessing`, `Failed`, or `Assessed`. Native catalog/discovery rows
+Where present, serving state is `Assessing`, `Failed`, or `Assessed`. Native catalog and custom-model rows
 already carry a complete desired, effective, or unavailable resolution, so ACN never fabricates an
 intermediate resolving row. `Failed` represents source or serving unavailability, not a failed
 assessment: ICN marks a failed assessment target `Dropped`, and ACN omits that target's row. An
 assessed state contains serving metadata plus capabilities and profile evidence from one atomic ICN
-assessment result. Native catalog, discovery, package-validation, and ready-model state do not
+assessment result. Native catalog, custom-model, package-validation, and ready-model state do not
 carry a parallel capability copy. A fitting catalog assessment alone
-contains ranking scores; discovered and non-fitting states cannot contain them. Provider
+contains ranking scores; custom-model and non-fitting states cannot contain them, and a custom model
+never inherits its parent's scores. Provider
 selectability is derived from these structural facts and is never stored as a second state machine.
 An assessed state also carries the optional speculative method as a direct serving fact; ACN does
 not reconstruct it from private packages.
@@ -81,20 +111,25 @@ Package lists and native occurrence IDs never enter the product. Installation an
 retain their typed native variants, including required and available bytes for insufficient disk
 space; they are not flattened into diagnostic strings.
 
-ACN publishes assessment results only while both catalog and discovery revisions and the local
+ACN publishes assessment results only while both catalog and local-model revisions and the local
 hardware cycle still match the request. A superseded result cannot overwrite a newer source
 snapshot. Derived projections may be materialized for cost, but source revisions and native state
 remain authoritative.
 
 ## Conformance
 
-- Catalog and discovered models share `ModelId` without sharing lifecycle semantics.
-- Every callable external Hugging Face artifact appears once under its `hf:` identity.
-- `Unsupported` assessment outcomes (discovered models only) remain visible but never become
-  offerings; targets whose assessment attempt fails are omitted.
+- Catalog and custom models share `ModelId` without sharing lifecycle semantics.
+- Every callable custom model appears once under its `hf:` or `local:` identity, wherever its files
+  are found.
+- `Unsupported` assessment outcomes (custom models only) never become offerings; for found and
+  imported models they appear only in the unsupported list, with every reason; targets whose
+  assessment attempt fails are omitted.
+- Hidden models appear only in the hidden list, are never assessed, and are never offered.
 - Catalog rows carry their catalog support level unchanged; support and assessment stay separate
   facts in the projection.
-- An externally owned discovery can be selected and loaded but cannot be installed, updated, or
-  removed through catalog commands.
+- Found and imported models can be selected and loaded but cannot be installed, updated, or deleted;
+  only catalog and added models expose managed acquisition.
+- Catalog models never offer a drafter change; every custom model can add, change, or turn off its
+  drafter.
 - Provider offerings contain no fallback profile, capability, ranking, package, or bundle data.
 - Clients never correlate package collections or reconstruct model identity.

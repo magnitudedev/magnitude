@@ -63,9 +63,12 @@ Any change is new work. Old results are unreachable by identity; there is no mig
 
 ## Model assessment
 
-The service derives targets from its current catalog and discovery authorities. A catalog target
-selects `Desired` or `Effective` material; a discovery target uses the current ready material.
-Material is exact: the release catalog's header bundle before download, installed files after.
+The service derives targets from its current catalog and local-model authorities. A catalog target
+selects `Desired` or `Effective` material; a custom-model target uses the current ready material
+with its attached drafter. A candidate target (a Hugging Face repository at a commit, or a local
+path, with a projector and drafter) is assessed on request from headers fetched by range request.
+Material is exact: the release catalog's header bundle before download, installed or fetched
+headers otherwise.
 
 One assessment is header arithmetic on the service's bounded blocking pool:
 
@@ -83,8 +86,9 @@ across several GGUF files is assessed as one package: the engine is given its fi
 reads every shard's header. A speculative bundle's separate draft is interpreted against its
 target from its header exactly as a load binds it: its weights, history and draft workflows join
 the memory charge, and its decode speed is the target's plain decode (no acceptance is modeled). A
-draft with missing, malformed or unsupported semantics is disabled with a distinct diagnostic,
-and automatic or separate-draft selection resolves to plain target decoding before planning.
+draft with missing, malformed or unsupported semantics is reported as `DrafterVerdict::Rejected`
+with its reasons, and automatic or separate-draft selection resolves to plain target decoding
+before planning.
 Its weights, history and workflows then contribute nothing to the memory charge. Target
 interpretation failures still fail admission. A successfully admitted draft of another variant
 than the requested method remains an invalid configuration. Assessment and loading share
@@ -110,9 +114,13 @@ Every assessed profile produces one complete result:
 
 | Result | Meaning |
 | ------ | ------- |
-| `Fits` | Per-domain memory accounting and one decode-speed estimate per requested depth |
-| `DoesNotFit` | Per-domain memory accounting, the limiting domain and its deficit |
-| `Unsupported` | The engine cannot execute a discovered model: unrecognized family, unsupported representation (including tokenizer, template and tensor encoding), a planner refusal on the backend, or a kernel call outside its kernel's domain |
+| `Fits` | Per-domain memory accounting, one decode-speed estimate per requested depth, and the drafter verdict |
+| `DoesNotFit` | Per-domain memory accounting, the limiting domain and its deficit, and the drafter verdict |
+| `Unsupported` | The engine cannot execute a custom model or candidate: every structured reason found (unrecognized family, unsupported weight types with counts, other representation failures including tokenizer, template and tensor encoding, a planner refusal on the backend, or a kernel call outside its kernel's domain) |
+
+Every assessed result also carries the target's shape fingerprint. The structured reasons, drafter
+verdict, and fingerprint are defined by the
+[engine boundary](../model-management/assessment-and-ranking.md#engine-boundary).
 
 A catalog model is never `Unsupported`: an engine `Unsupported` for a catalog target is a release
 defect, settled as `Dropped` with an OpenTelemetry error. A family the engine does not implement
@@ -122,7 +130,7 @@ revisioned assessment snapshot; one target's failure never invalidates siblings.
 
 Every exact target receives one attempt. An operational, malformed-material, timeout, or resolution
 failure creates no cache entry and settles the target as `Dropped`; it is not re-admitted by a
-timer. A dropped discovery target is silent. A dropped reviewed-catalog target emits an
+timer. A dropped custom-model or candidate target is silent. A dropped reviewed-catalog target emits an
 OpenTelemetry error before ACN omits it. A changed artifact, profile, bundle, or environment is
 new work, not a retry.
 
@@ -170,14 +178,15 @@ engine is new work.
 
 ## Automatic assessment pool
 
-The service maintains one pool over the current catalog and discovered-model sources in its one
-environment. Each source slice is `Pending` until its source is read (discovery until its inventory
-snapshot is authoritative), then `Available` with one entry per target. Catalog desired material is
-admitted immediately when not installed; effective material is used when installed. Ready
-discoveries join the same pool without restarting catalog work.
+The service maintains one pool over the current catalog and custom-model sources in its one
+environment. Each source slice is `Pending` until its source is read (custom models until their
+inventory snapshot is authoritative), then `Available` with one entry per target. Catalog desired
+material is admitted immediately when not installed; effective material is used when installed.
+Ready custom models join the same pool without restarting catalog work. Candidate requests share
+the pool's cache and single-flight but are not pool targets.
 
 Reconciliation retains terminal evidence, joins equivalent in-flight work, queues missing work, and
-cancels work no longer referenced by either source slice. Catalog and discovery expose independent
+cancels work no longer referenced by either source slice. Catalog and custom models expose independent
 source revisions. A failed source read is the model inventory's failure, which the catalog reports
 from the same listing; the pool keeps that slice as it is and reads the source again after a short
 delay. Individual target failures are terminal. Concurrency is bounded by hardware parallelism and

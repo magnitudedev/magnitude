@@ -37,9 +37,12 @@ publication, residency and instance supervision, and runs every loaded model in 
 worker process. The engine owns model interpretation, execution, memory accounting and serving
 semantics inside that worker; Seismic, below the engine, is the only device and byte authority.
 
-ICN owns physical inference truth: native models and packages, installation and download
-occurrences, hardware observations, planning, assessment, safety, instance lifecycle, residency
-policy, and inference execution. ICN operations revalidate native preconditions at admission.
+ICN owns physical inference truth: native models and packages, scanning of model locations and
+custom-model identity, Hugging Face access, installation and download occurrences, hardware
+observations, planning, assessment, drafter-candidate enumeration, safety, instance lifecycle,
+residency policy, and inference execution. ICN operations revalidate native preconditions at
+admission. ICN persists no user choice about custom models; it applies the configuration ACN
+delivers.
 
 ICN does not own Magnitude Slots, favorites, ranking preference, provider policy, presentation
 states, or client interaction flows. Native changes may originate from ACN commands, chat
@@ -52,8 +55,9 @@ ACN owns the complete client-facing model contract:
 
 - `ModelCatalog`: the unified local and remote product view. A catalog local row carries one
   `acquisitionState` union covering managed installation, update, post-installation optimization,
-  transfer failure, removal, and residency. A discovered local row instead carries observed discovery truth and no managed
-  acquisition lifecycle. Every variant is a reachable product state; progress and failure payloads
+  transfer failure, removal, and residency. A custom local row carries its origin; only an added
+  model carries a managed acquisition lifecycle, while found and imported rows carry observed
+  truth. Every variant is a reachable product state; progress and failure payloads
   exist only under the states they belong to, and native occurrence identities never appear;
 - `ModelSlots`: durable selection resolved to truthful client-ready Slot states;
 - `LocalInferenceEnvironment`: normalized hardware and memory presentation facts; and
@@ -61,7 +65,10 @@ ACN owns the complete client-facing model contract:
   product identity (`modelId`, `slotId`); ACN resolves the native occurrence.
 
 ACN also owns stable ranking scores, warnings, provider status, favorites, Slot reference
-integrity, and the atomic configuration admitted to agent work. It may project ICN facts into
+integrity, and the atomic configuration admitted to agent work. It persists every custom-model
+choice (declarations, hidden models, attached drafters, user folders, disabled automatic
+locations), resolves location paths, delivers the whole configuration to ICN, and orders drafter
+candidates by measured acceptance. It may project ICN facts into
 application semantics, but it does not become the authority for the native resource.
 
 The public resources remain separate because they have different identities and failure causes.
@@ -104,9 +111,9 @@ ICN transition -> native invalidation -> authoritative ICN read -> ACN projectio
                -> ACN query-name poke -> client query invalidation and reread
 ```
 
-An ICN discovery snapshot explicitly marked as incomplete reconciliation is provisional.
+An ICN local-models snapshot explicitly marked as incomplete reconciliation is provisional.
 Provisional emptiness cannot become stable ACN product truth, but it does not delay service health.
-The automatic assessment snapshot is separately observed; catalog and discovery assessment slices
+The automatic assessment snapshot is separately observed; catalog and custom assessment slices
 remain pending or assessing until their current exact targets settle.
 
 The inference response stream and resource observation have independent lifetimes. Cancelling a
@@ -198,7 +205,8 @@ generation and cannot restart ACN or interrupt ICN-owned transfers.
   reread for proof.
 - Model sync, cancellation, failure acknowledgement, and removal are addressed by canonical
   model ID. ICN exposes model-addressed catalog installation and removal plus
-  `CatalogInstallationOperationId`-addressed occurrence control; raw download and Package
+  `CatalogInstallationOperationId`-addressed occurrence control, and model-addressed downloads for
+  added models and drafters; raw download and Package
   identities remain private inside ICN. The authoritative native observation subsequently updates
   ACN product state.
 - Incomplete ICN startup snapshots are retried to completion and cannot permanently erase installed

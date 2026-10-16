@@ -30,16 +30,23 @@ server setup | remove
 status
 hardware
 catalog status | list | show <model-id> | recommendations [--preference <value>] [--limit <count>]
-catalog pull <model-id> | cancel <model-id> | remove <model-id>
-models status [model-id] | load <model-id> | stop
+catalog search <query> [--all] [--limit <count>]
+catalog inspect <huggingface-url | owner/repo | owner/repo:QUANT>
+catalog pull <model-id | owner/repo[:QUANT]> [--drafter auto|none|<ref>]
+catalog cancel <model-id> | remove <model-id>
+models status [model-id] [--all] | load <model-id> | stop
+models import <path.gguf> [--drafter auto|none|<ref>]
+models drafter <model-id> <ref | auto | none>
+models hide <model-id> | unhide <model-id>
+models folders list | add <path> | remove <path>
 connections list | connect <harness> [--set-model <model-id>] [--install-skill]
 connections sync [harness] | remove <harness>
 docs [topic-id]
 ```
 
-Removed output flags are not retained as aliases. The acquisition command remains `catalog pull`,
-and there is no JSON mode. Model status, load, and stop are human-oriented commands;
-plugins call the SDK over RPC instead.
+Every inference command (`hardware`, `catalog`, `models`) accepts `--json`. Nothing prompts:
+ambiguity resolves the way the desktop's defaults do, and the choice is printed. Removed output flags are not retained as aliases.
+The acquisition command remains `catalog pull`. Plugins call the SDK over RPC instead of the CLI.
 
 ## Domain ownership
 
@@ -49,13 +56,16 @@ plugins call the SDK over RPC instead.
   On Windows they explain that server mode isn't available and change nothing.
 - `status` passively reports owner and runtime readiness; tray and login-startup fields appear only for Desktop. With no owner, it prints startup guidance (for the system service where one is set up) and exits successfully without starting anything.
 - `hardware` reports the local inference topology, current memory use, and current allocation.
-- `catalog` reports catalog assessment progress, reviewed model choices,
-  machine-specific assessment evidence, recommendations, and download operations.
-- `models` reports models present or undergoing local operations and controls runtime residency.
+- `catalog` finds and downloads models: catalog assessment progress, reviewed model choices,
+  machine-specific assessment evidence, recommendations, Hugging Face search and inspection, and
+  download operations.
+- `models` covers what is on this computer: catalog and custom models present or undergoing local
+  operations, imports, drafters, hidden models, model locations, and runtime residency.
 - `connections` reports harness installation and observed configuration integrity, and writes
   harness configuration for the person running the command, from the CLI process.
 
-Catalog output never includes acquisition or residency state. Model-status output never includes
+Catalog output never includes acquisition or residency state, except that `catalog inspect` marks a
+version already on this computer. Model-status output never includes
 catalog ranking or provenance. The focused `models status <model-id>` view is the observation point
 for download and load progress.
 
@@ -75,6 +85,11 @@ Normal output excludes ACN/ICN terminology, assessment and environment IDs, pack
 cache paths, native device indices, source revisions, raw tags, ranking utility, operation IDs,
 retryability flags, and stack traces.
 
+`--json` prints one machine-readable document of the same product facts the text form shows,
+including canonical IDs, structured unsupported reasons with their developer detail, and drafter
+verdicts. It never includes internal ACN/ICN identities, package structure, or prose meant only for
+terminals, and errors stay on stderr with a nonzero exit.
+
 Memory uses hardware-conventional units; storage and transfer use decimal units; context uses
 compact token counts; generation speed uses `tok/s`. Rounded values are presentation only.
 
@@ -85,8 +100,9 @@ existing RPC endpoint for model observation and control. Both connect to an alre
 Desktop or Headless owner without launching an application. `connections connect` and `sync` need
 the running service's models, which they read over loopback, and write configuration themselves. With no owner, service-backed CLI
 commands fail with “No Magnitude service is running. Open the Magnitude desktop app or run
-`magnitude serve`.” Passive `status` reports absence successfully. There is no model-control JSON
-CLI protocol, CLI service starter, or separately published integration-contract package.
+`magnitude serve`.” Passive `status` reports absence successfully. `--json` output is a product
+projection for scripts and agents, not an SDK substitute; there is no CLI service starter or
+separately published integration-contract package.
 
 ## Catalog and recommendation behavior
 
@@ -94,7 +110,7 @@ CLI protocol, CLI service starter, or separately published integration-contract 
 available. When assessment is incomplete and no targets have been reported, it says so without
 inferring a preparation phase or failure reason from the empty count. It does not infer
 completion from catalog rows or recommendation availability and does not wait for assessment to
-finish. Arbitrary-model discovery is outside the catalog-only product and is not presented.
+finish.
 
 `catalog list` displays only assessed catalog configurations that fit the current machine. It shows
 friendly identity, predicted memory, baseline speed, configured context, speculative acceleration,
@@ -108,19 +124,40 @@ private. The command is a client projection over existing catalog and hardware a
 second server recommendation authority. Successful nonempty output ends with the exact local
 documentation command for interpreting the evidence and ranking methodology.
 
-`catalog show` supplies one model's useful curated and machine-specific evidence.
+`catalog show` supplies one model's useful curated and machine-specific evidence and prints the
+`catalog search` command that finds other versions of it. Successful `catalog recommendations`
+output ends with a hint line for adding a model from Hugging Face.
+
+`catalog search` lists supported Hugging Face repositories with uploader, the catalog model each is
+a variant of, and downloads; unsupported results are counted in a footer and `--all` lists them with
+their reason. `catalog inspect` prints the repository step: versions with sizes and the engine's
+verdict, the recommended version, and drafter choices in
+[drafter selection](../model-management/drafter-selection.md) order with their labels. It accepts a
+Hugging Face URL and makes no changes.
 
 No catalog or model observation command waits for assessment or residency to settle. Service health
 is likewise independent of background assessment.
 
 ## Model operations
 
-`catalog pull` converges a catalog model to installed and current. It acknowledges admitted
-download or update work and directs the caller to focused model status. Pull, cancel, and removal
-validate only model-ID syntax before delegating directly to their authoritative mutations.
+`catalog pull` converges a catalog model to installed and current. Given a Hugging Face repository,
+it adds that model pinned to the repository's current commit: with no quant it picks the
+recommended version, with no `--drafter` it uses `auto` (the preselected drafter), and it prints
+what it chose and the model ID to load. A version already on this computer downloads only the
+drafter, and says so. Pull acknowledges admitted download or update work and directs the caller to
+focused model status. Pull, cancel, and removal validate only argument syntax before delegating
+directly to their authoritative mutations.
 
-`models status` lists curated catalog models when they are on the computer or have relevant
-acquisition/removal work. Addressed model commands accept catalog IDs only. One status field applies product priority:
+`models import` adds one GGUF file in place, with the same drafter choice. `models drafter` adds,
+changes, or turns off the drafter of a custom model and is refused for catalog models. `models hide`
+and `unhide` apply to found models. `models folders list` shows the automatic locations and the
+user's folders; `add` and `remove` manage the folders.
+
+`models status` lists catalog models on the computer or with relevant acquisition/removal work and
+every visible custom model, with its source, followed by a footer counting models that can't run and
+hidden models; `--all` lists those with their reasons and lists hidden models marked hidden. The addressed form adds Source, Variant of, Drafter, measured
+acceptance, and the drafter candidates with their labels and verdicts. Addressed model commands
+accept every canonical model ID. One status field applies product priority:
 removal, transfer, failures, load/stop, ready, update availability, then unloaded. An optimizing
 model reports `Optimizing` with its percentage once tuning is measured. The addressed
 form reports installation, transfer or optimization progress, runtime, memory, context, and
@@ -152,4 +189,4 @@ Users launch their external harness themselves.
   interpretations.
 - Agent documentation directs onboarding to the desktop and documents headless model/configuration commands.
 - Tests cover collection, detail, narrow-width, empty, partial, failure, and redirected forms.
-- Model commands reject the removed `--json` option before performing any operation.
+- Every inference command supports `--json`, and no command prompts.

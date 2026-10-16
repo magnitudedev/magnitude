@@ -11,8 +11,11 @@ applies_to:
 # Local serving usage
 
 ACN retains local inference usage observations independently of desktop windows, connections,
-model residency and process restarts. The ledger contains model identity, completion time, native
-token counts and timing evidence; it never retains prompts, generated content or credentials.
+model residency and process restarts. The ledger contains model identity, the attached drafter,
+completion time, native token counts (with drafted and accepted tokens when speculative decoding
+ran) and timing evidence; it never retains prompts, generated content or credentials. Per model and
+drafter pair, these supply the measured acceptance used by
+[drafter selection](../model-management/drafter-selection.md).
 It covers local generation through the public service's Chat Completions, Messages and Responses
 HTTP/SSE routes and local Codex Responses WebSockets. Cloud forwarding, discovery, token counting,
 rejected requests and WebSocket warm-up are excluded.

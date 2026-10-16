@@ -107,7 +107,7 @@ The ICN package owns:
 - exposing one scoped generated client whose admitted streams preserve their response lifetime; and
 - supplying the generated client with the connection established by the managed child lifecycle.
 
-The package owns exact hardware, catalog, discovery, catalog-installation, and instance observation
+The package owns exact hardware, catalog, local-model, download, catalog-installation, and instance observation
 plus the local provider adaptation because those capabilities compose the one generated ICN client.
 It does not own ranking policy, user selection, ACN RPC state, cloud
 provider routing, or client presentation. It does not independently inspect hardware or GGUF files
@@ -128,9 +128,13 @@ Development generation and release CI build it explicitly from immutable catalog
 ordinary TypeScript and Cargo builds perform no catalog network access.
 
 ACN owns the parent scope, application policy, and complete first-party client control plane. It
-supplies ICN's storage roots and supported binary identity and translates native observations into
+supplies ICN's storage roots, supported binary identity and local-models configuration (model
+locations, declarations, hidden models, drafter choices): a snapshot file passed as
+`--local-models-config` at spawn, so the first scan is already correct, and the whole snapshot again
+through the local-models configuration endpoint after every change. That configuration is the only
+source of model locations, the Hugging Face cache included; ICN has no separate cache flag. It translates native observations into
 Magnitude-owned catalog, Slot, Instance, environment, ranking, and provider resources. Hardware,
-catalog, discovery, catalog-installation, assessment, and instance operations remain native ICN
+catalog, local-model, download, catalog-installation, assessment, and instance operations remain native ICN
 authorities. Packages and download occurrences are internal implementation details of those direct
 operations, not management resources exposed to ACN. The generated contract and event stream are
 private to ACN. Only the OpenAI-compatible
@@ -173,8 +177,9 @@ response metadata.
 
 Every operation in the normalized IR is emitted into the callable client automatically. There is
 no allowlist or hand-maintained facade coverage table. At minimum the ICN contract comprises health
-and identity, hardware, catalog, discovery, catalog installation, instances, assessment and load
-planning, Hugging Face repository preview, template application, model properties, resource-event
+and identity, hardware, catalog, local models and their configuration, catalog installation,
+downloads, instances, assessment (including candidates) and load planning, Hugging Face search,
+repository preview, candidate inspection and drafter candidates, template application, model properties, resource-event
 observation, mixed JSON/SSE Chat Completions and Responses, local Anthropic Messages, and
 Anthropic token counting. Generator tests
 prove that the manifest, descriptors, and callable client contain the same operation set.
@@ -207,7 +212,7 @@ branches.
 Launch configuration and model execution configuration are separate.
 
 The launch configuration contains only process-lifetime facts: binary resolution policy, loopback
-binding, model-store and cache roots, optional read-only import/source roots, startup and shutdown
+binding, model-store and cache roots, the initial local-models configuration file, startup and shutdown
 deadlines, output bounds, an optional log file, authentication/instance identity, and compatible
 API/build identity. It must be validated before spawning. When a log file is named, the child's
 output, start and exit are also recorded there as plain text, with request logging limited to
@@ -222,14 +227,20 @@ change applies at the next service start, and it resolves a symbolically linked 
 directory before spawning because ICN refuses a linked root. A relative value, or a path that exists
 but is not a directory, or a directory the service cannot create or write a file in, is logged and the
 default applies, so an unusable folder never stops the service from starting. Changing the root never moves artifacts;
-the previous store remains intact on disk. ICN's managed Hugging Face hub lives beneath the model store, and ICN does not
-implicitly discover or adopt a host user's global Hugging Face cache.
-External caches or directories participate only when they are supplied explicitly as read-only
-import/source roots. ACN resolves the active Hugging Face hub cache from `HF_HUB_CACHE`,
-`HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, or the platform home default and supplies
-that one root explicitly; ICN never discovers another host cache implicitly.
+the previous store remains intact on disk. ICN's managed Hugging Face hub lives beneath the model store.
 
-Opening the native model store automatically starts discovery reconciliation. Discovery and model
+External locations participate only through the local-models configuration ACN supplies; ICN never
+discovers a host location implicitly. The configuration is one whole snapshot: model roots (kind,
+resolved path, enabled), custom-model declarations, hidden model IDs, and drafter attachments. ACN
+resolves each automatic root from its overrides and the owning tool's own configuration: the
+Hugging Face cache from `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, or `XDG_CACHE_HOME`;
+LM Studio from its own settings; the llama.cpp cache from `LLAMA_CACHE`; Ollama from
+`OLLAMA_MODELS`; each falling back to its platform default. User folders come from configuration.
+ACN writes the snapshot to a file and names it at spawn, so the first scan is already correct. After
+every change ACN replaces the whole snapshot through an idempotent `PUT`; ICN reconciles only what
+changed. ICN reads no other configuration source for local models.
+
+Opening the native model store automatically starts local-model reconciliation. Scanning and model
 assessment are background model-domain work: neither delays listener binding, ICN readiness, ACN
 readiness, nor health. Their revisioned snapshots explicitly remain provisional while work is in
 progress, and model-domain failure does not make the otherwise operational ICN unhealthy.
@@ -394,7 +405,7 @@ complete nested job retired, even when the root exits successfully within the gr
 
 ## Model instance lifecycle
 
-The singleton starts with no model instances. Catalog, discovery, assessment, catalog installation,
+The singleton starts with no model instances. Catalog, local models, assessment, catalog installation,
 and deletion remain available in that state. ICN's `ModelInstanceController` owns
 physical instance admission, native workers, backends, exact-instance leases, lifecycle
 publication, and terminal cleanup. ACN owns product slots as durable selection only. A slot is not
@@ -538,6 +549,8 @@ The lifecycle conforms when:
 - constructing `IcnClient` without `IcnProcess` is impossible in the Effect dependency graph;
 - ACN cannot become ready when its ICN binary is absent, incompatible, or unready;
 - launch is model-free and changing the active model never replaces the ICN process;
+- ICN's first local-model scan uses the configuration snapshot named at spawn, and every later
+  configuration change arrives as a whole idempotent snapshot without restarting ICN;
 - ICN readiness never waits for measurement; the assessment pool is `Preparing` until its basis exists;
 - loopback binding has no probe-then-bind race and readiness proves child instance identity;
 - every bootstrap record produced by ICN is accepted by its generated Bun schema, and generated

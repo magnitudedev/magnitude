@@ -16,6 +16,9 @@ assessment with the pure ranking policy. Client-common applies the user's Fast-t
 and memory budget to those scores. ACN does not maintain a separate ranking projection or publish
 server-selected preference tiers, explanations, or a selected portfolio.
 
+Only catalog configurations are rankable, because only they carry intelligence and fidelity
+evidence. Custom models are shown but never ranked, and never inherit a parent's scores.
+
 ## Ranking scores
 
 Every rankable configuration has three normalized scores in `[0, 1]`:
@@ -83,6 +86,7 @@ as its defaults. It prints a finite result and does not render a chooser or keyb
 
 - ACN publishes `LocalModelRankingScores`, never server-selected preference tiers or explanations.
 - Scores belong to one exact catalog model configuration with a terminal `Fits` assessment.
+- Custom models never carry ranking scores and never appear in recommendations.
 - A deprecated catalog model is never a ranked choice. A best-effort model is ranked like any other
   `Fits` configuration and is labeled wherever it is shown.
 - A model with distinct desired and effective installed configurations may temporarily have scores

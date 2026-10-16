@@ -20,13 +20,13 @@ or runtime residency.
 ## Provider offerings
 
 The local provider adapter consumes ACN's local-model product projection. Both an installed catalog
-model and a ready external Hugging Face discovery can become callable. Within the `local` provider
+model and a ready custom model of any origin can become callable. Within the `local` provider
 namespace, `ProviderModelId` is exactly the canonical `ModelId`; ACN creates no provider alias or
 configuration identity.
 
 A callable offering exists only when the exact current model has completed assessment with `Fits`
 and is `Selectable`. It contains that assessment cycle's profile and inspected capabilities.
-Catalog models that are not installed, discoveries that are unavailable or ambiguous, incompatible
+Catalog models that are not installed, custom models that are unavailable or ambiguous, incompatible
 models, insufficient-resource models, and models still being assessed remain product rows but are
 not callable offerings.
 
@@ -39,7 +39,7 @@ Initial and invalidation-driven projection runs in one scoped background worker.
 never gates ACN service readiness.
 
 The local-offering projection consumes shared local-product assessment state and never invokes
-native assessment. Inventory, discovery, assessment, acquisition, and residency changes rebuild
+native assessment. Inventory, local-model, assessment, acquisition, and residency changes rebuild
 the product projection; transfer progress alone cannot make a model callable.
 
 The aggregate provider catalog remains usable when aggregation completes with typed provider or

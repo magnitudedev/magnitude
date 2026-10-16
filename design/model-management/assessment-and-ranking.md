@@ -2,10 +2,12 @@
 applies_to:
   - inference/service/models/**
   - inference/service/server/src/assessment/**
+  - inference/service/contracts/src/models.rs
+  - inference/engine/src/assessment.rs
   - inference/catalog/**
   - packages/icn/src/hardware/**
   - packages/icn/src/models/**
-  - packages/acn/src/local-model-**
+  - packages/acn/src/local-model*
   - packages/acn-protocol/src/schemas/model-state.ts
   - packages/client-common/src/local-models/**
 ---
@@ -21,8 +23,8 @@ Assessment Material is the immutable GGUF header evidence required to assess a m
 installed tensor payloads: each component's exact header, through the aligned tensor-data offset,
 with its component roles and content identities. The header carries the tokenizer, chat templates,
 metadata and tensor directory the engine reads; a companion projector header lets the engine
-establish vision without an authored capability flag. Catalog desired, catalog effective, and
-discovered targets resolve this same input shape. A catalog serving profile's context is the
+establish vision without an authored capability flag. Catalog desired, catalog effective, custom
+model, and candidate targets resolve this same input shape. A catalog serving profile's context is the
 target's supported maximum context, the context the engine serves and assesses; memory fit uses
 `min(context, 100_000)`.
 
@@ -31,13 +33,14 @@ tensor payload. Windows explicitly marks these files sparse before extending the
 filesystem operations fail that assessment rather than consuming model-sized disk space.
 
 The automatic assessment pool assesses catalog desired material when not installed, effective material
-when installed, and only `Ready` discoveries. It publishes a read-only revisioned snapshot with
-independent catalog and discovery source slices. Exact work identity guards publication, so removed
+when installed, and only `Ready` custom models with their attached drafter. It publishes a read-only
+revisioned snapshot with independent catalog and custom source slices. Exact work identity guards publication, so removed
 or superseded models cannot retain stale results. Packages, bundles, and serving configurations do
 not cross the boundary. A failed source read keeps that slice as it is and is retried in the
 background; it is the inventory's failure, which the catalog reports. Each exact target is attempted once; any target failure settles as `Dropped`, is never
-retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; discovered drops are
-silent.
+retried, and is omitted by ACN. Catalog drops emit an OpenTelemetry error; custom-model drops are
+silent. Candidate assessments are requested on demand for a candidate's target, projector, and
+drafter, from headers fetched by range request, and are cached like every assessment.
 
 One assessment reads the target's Assessment Material headers once, in the service process, and
 is arithmetic over them and the assessment environment the service establishes at start (the
@@ -50,7 +53,8 @@ worker, template worker, inventory capability state, or post-download assessment
 immutable tokenizer and template content may share derived preparation within the process without
 becoming a separate capability authority.
 
-`Fits`, `DoesNotFit`, and `Unsupported` (discovered models only) are genuine terminal evidence.
+`Fits`, `DoesNotFit`, and `Unsupported` (custom models and candidates only) are genuine terminal
+evidence.
 Transport or operation failure drops the target rather than fabricating assessment evidence.
 Hardware observations that were not performed are represented as `NotObserved`; zero-valued
 headroom is never fabricated.
@@ -58,7 +62,8 @@ headroom is never fabricated.
 Ranking exists only for reviewed catalog models with `Fits` evidence and the required bounded
 performance sample. Intelligence and fidelity come from authored catalog evidence; speed comes
 from engine assessment, which every fitting model has. Missing evidence yields absent ranking
-scores, never zeros. Discovered models receive no invented intelligence or fidelity score.
+scores, never zeros. Custom models are never ranked and never inherit an intelligence or fidelity
+score from the catalog model they are a variant of.
 
 Provider selection requires `Fits`, current selectability, profile, and capabilities from the same
 assessed state. Package validation establishes only structural artifact validity and presence;
@@ -66,3 +71,46 @@ assessment is the sole published capability authority. Loading resolves the same
 configuration from the installed package; the service verifies the loaded instance's template
 fingerprint and modalities against the host's resolution. Admission plans memory against current
 resources. Cached assessment alone never authorizes admission.
+
+## Engine boundary
+
+`ModelAssessment` is the one contract between the engine (families, weight types, kernels) and the
+product (service, ACN, clients). The engine decides which outcome a file gets; the product asks and
+presents. Adding a weight type or relaxing a family check changes verdicts, never the contract.
+
+| Outcome | Carries |
+|---|---|
+| `Fits` | Profile, memory, performance, and the drafter verdict |
+| `DoesNotFit` | Profile, memory, the limiting resource and deficit, and the drafter verdict |
+| `Unsupported` | Profile, the complete list of `UnsupportedReason`s, and developer detail |
+
+`UnsupportedReason` is a closed, structured set: architecture, weight types (each type with its
+tensor count), rope scaling, unrecognized tensor, unrecognized metadata, tokenizer, chat template,
+kernel domain, backend, and unreadable. The assessment collects every reason, not the first: a
+representation failure does not stop the weight-type check, and a file with two unsupported types
+reports both. Clients own user-facing wording per case; `detail` stays developer text for Details
+and `--json`. Clients render an unknown case generically with its detail, so the engine can add
+cases without a client release.
+
+`DrafterVerdict` is `None`, `Bound` (method and resident memory), or `Rejected` (reasons and
+detail). A drafter that fails to bind is reported, never silently dropped. The engine reports only
+whether a drafter binds; lineage stays a product judgment
+(see [drafter selection](./drafter-selection.md)).
+
+An assessed entry also carries the target's `ModelFingerprint`: architecture, block count, embedding
+length, head and KV-head counts, key length, vocabulary size, expert count, and a digest of the
+tokenizer's token table. The engine also publishes the architecture strings it recognizes, which
+Hugging Face search uses as its prefilter. The product side never parses headers, reads file names
+for quantization, or keeps its own list of supported architectures.
+
+Engine guarantees:
+
+- **Header-only and deterministic.** A verdict reads GGUF headers only, never weights, and is a
+  function of the header bytes, backend, and hardware, so it is cached by header digest.
+- **Resident memory.** Memory is reported as stored after import, including widened types, not as
+  file size.
+- **Catalog targets are never `Unsupported`.** That remains a release defect.
+- **No slow fallback.** A family without kernels is refused with a reason, never run on a fallback.
+
+Shared fixtures of real GGUF headers with expected verdicts are tested on both sides; a change that
+adds support flips its fixture's expected verdict in the same change.
