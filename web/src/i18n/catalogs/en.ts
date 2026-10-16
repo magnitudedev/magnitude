@@ -584,4 +584,5 @@ export const en = {
   fidelity: "Fidelity",
   modelsAssessedCount: "{settled} of {total} assessed",
   memoryUsage: "Memory usage",
+  existingDownloadsPreviousFolder: "Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.",
 } as const
