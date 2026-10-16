@@ -648,4 +648,7 @@ export const es: { [K in keyof typeof en]: string } = {
   korean: "Coreano",
   vietnamese: "Vietnamita",
   indonesian: "Indonesio",
+  noModelsDownloaded: "Todavía no has descargado ningún modelo. Busca uno en Descubrir.",
+  couldNotCheckAvailableModels: "No se pudieron comprobar los modelos disponibles",
+  restartServerToApply: "{reason} Reinicia el servidor de Magnitude para aplicar los cambios.",
 }
