@@ -566,7 +566,7 @@ function DownloadActivity() {
   if (Result.isInitial(models)) return null
   if (Result.isSuccess(models) && active.length === 0) return null
   return <div className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-700">
-    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? "Download activity unavailable" : "Reading download activity…"}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? "Removing files…" : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
+    {!Result.isSuccess(models) ? <p className="mt-3 text-sm text-slate-500">{Result.isFailure(models) ? tr("downloadActivityUnavailable") : tr("readingDownloadActivity")}</p> : <ul className="space-y-5">{active.map(model => <li key={model.modelId}><div className="flex items-center gap-3"><ModelLogo model={model} className="size-6" /><p className="text-sm">{formatLocalModelDisplayName(model)} · {model.acquisitionState._tag === "Removing" ? tr("removingFiles") : model.acquisitionState._tag === "Optimizing" ? "Optimizing" : model.acquisitionState._tag === "Updating" ? "Updating" : "Downloading"}</p></div><DownloadProgress modelName={formatLocalModelDisplayName(model)} acquisition={model.acquisitionState} /></li>)}</ul>}
   </div>
 }
 function Status({ observation }: { observation: ServiceObservation }) {
@@ -582,20 +582,20 @@ function Status({ observation }: { observation: ServiceObservation }) {
       <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
         <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300"><T k="magnitudeService" /></h2>
         <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
-          {ready ? <CheckCircleIcon aria-label="Service ready" weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
-          <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
+          {ready ? <CheckCircleIcon aria-label=tr("serviceReady") weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
+          <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? tr("cleanupAttention") : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
         </div>
       </div>
       {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500"><T k="startingService" /></p>}
       {ready && <DownloadActivity />}
-      {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"}
-        description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : service.message}
+      {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? tr("couldNotConfirmServiceStopped") : tr("serviceCouldNotStart")}
+        description={service._tag === "CleanupFailed" ? tr("backgroundWorkMayRun") : service.message}
         actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}><T k="retryService" /></NoticeAction> : undefined} />}
-      {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
+      {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title=tr("couldNotRetryService") className="mt-3" />}
     </section>
     <MemoryBreakdown />
     {ready && <StatusOverview />}
-    {tray?._tag === "Unavailable" && <ErrorNotice severity="warning" title="The tray icon isn’t available" description="Closing this window keeps Magnitude running. Open it again from your applications menu." />}
+    {tray?._tag === "Unavailable" && <ErrorNotice severity="warning" title=tr("trayIconUnavailable") description=tr("windowKeepsRunning") />}
   </div>
 }
 const compact = new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 })
@@ -610,7 +610,7 @@ function StatusOverview() {
   const client = useAgentClient()
   const session = useSession()
   const navigate = useNavigate()
-  const usage = useAtomValue(client.Models.GetServingUsage({ period: "Today", timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: Option.none() })).result
+  const usage = useAtomValue(client.Models.GetServingUsage({ period: tr("today"), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, model: Option.none() })).result
   const rows = useAtomValue(client.Connections.WatchHarnessConnections({})).result
   const network = useAtomValue(client.Configuration.GetNetworkAccess({})).result
   const today = Result.isSuccess(usage) && usage.value._tag === "Available" ? usage.value : null
@@ -618,16 +618,16 @@ function StatusOverview() {
   const connected = installed?.filter(row => row.inspection._tag === "Connected").length
   const address = Result.isSuccess(network) && network.value.enabled ? Option.getOrElse(network.value.bind, () => "All interfaces") : null
   const loading = <SkeletonLine className="h-4 text-xs" width="80px" />
-  return <section aria-label="Activity" className={`${pageLayout.card} grid grid-cols-1 gap-2 p-3 md:grid-cols-3`}>
-    <StatusTile label="Today" onClick={() => navigate("usage")}
+  return <section aria-label=tr("activity") className={`${pageLayout.card} grid grid-cols-1 gap-2 p-3 md:grid-cols-3`}>
+    <StatusTile label=tr("today") onClick={() => navigate("usage")}
       value={today ? `${compact.format(today.totalTokens)} tokens` : Result.isInitial(usage) ? loading : "Unavailable"}
       detail={today ? `${today.requests.toLocaleString()} ${today.requests === 1 ? "request" : "requests"}` : null} />
-    <StatusTile label="Agents" onClick={() => navigate("connections")}
+    <StatusTile label=tr("agents") onClick={() => navigate("connections")}
       value={connected !== undefined ? `${connected} connected` : Result.isInitial(rows) ? loading : "Unavailable"}
       detail={installed ? `${installed.length} installed` : null} />
     <StatusTile label="Network access" onClick={() => navigate("settings")}
       value={Result.isSuccess(network) ? network.value.enabled ? "On" : "Off" : Result.isInitial(network) ? loading : "Unavailable"}
-      detail={Result.isSuccess(network) ? address ?? "This computer only" : null} />
+      detail={Result.isSuccess(network) ? address ?? tr("thisComputerOnly") : null} />
   </section>
 }
 type UpdateTransfer = (typeof ApplicationUpdateState.Type)["transfer"]
@@ -660,7 +660,7 @@ function ThemeRow() {
   const save = useAtomSet(saveAppearance)
   const saving = useAtomValue(saveAppearance)
   const readError = useAtomValue(appearanceReadError)
-  return <SettingsRow label={t("theme")} alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title="Your theme wasn’t saved" description="Your previous appearance setting is still in use." /> : readError ? <ErrorNotice title="Couldn’t read your saved theme" description="System appearance is being used for this window." /> : undefined)} control={
+  return <SettingsRow label={t("theme")} alert={!saving.waiting && (Result.isFailure(saving) ? <ErrorNotice title=tr("themeNotSaved") description=tr("previousAppearanceInUse") /> : readError ? <ErrorNotice title=tr("couldNotReadTheme") description=tr("systemAppearanceUsed") /> : undefined)} control={
     <div className="inline-flex rounded-md border border-slate-300 p-0.5 dark:border-slate-700" role="group" aria-label={useI18n().t("theme")}>
       {(["system", "light", "dark"] as const).map(value => { const Icon = value === "system" ? MonitorIcon : value === "light" ? SunIcon : MoonIcon
         return <Button key={value} size="sm" variant={appearance === value ? "secondary" : "ghost"} aria-pressed={appearance === value} disabled={saving.waiting} onClick={() => save(value)}><Icon />{t(value)}</Button> })}
@@ -685,8 +685,8 @@ function LaunchAtLoginRow() {
   const enabled = current?._tag === "Enabled" || current?._tag === "RequiresApproval"
   const hint = current?._tag === "Unavailable" ? current.message
     : current?._tag === "RequiresApproval" ? "Allow Magnitude in your system login settings to finish enabling startup."
-    : "Starts in the background with its tray icon."
-  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title="Couldn’t update launch at login" description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title="Couldn’t check launch at login" description="Magnitude can’t confirm whether it will open when you sign in." /> : undefined
+    : tr("startsInBackground")
+  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title=tr("couldNotUpdateLaunch") description="Check Magnitude’s status in your system startup settings." /> : Result.isFailure(state) ? <ErrorNotice title="Couldn’t check launch at login" description="Magnitude can’t confirm whether it will open when you sign in." /> : undefined
   return <SettingsRow label={useI18n().t("launchAtLogin")} hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
     control={current && <Switch aria-label={useI18n().t("launchAtLogin")} checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
 }
