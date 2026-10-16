@@ -136,6 +136,7 @@ describe("i18n catalogs", () => {
       "cpuCoreOptionsSpec", "neuralEngineCoresSpec", "gpuArchitectureSpec",
       "capabilityProfile", "harnessModel", "cacheNotReportedForRequests", "requireApiKey", "cancel", "close",
       "magnitudeCouldNotOpen", "reloadWindowRestart", "quitAndReopen", "savedAppearanceReadError",
+      "on", "off", "request", "allModels", "downloading", "connected", "installed", "stoppingEllipsis",
     ] as const
     for (const [locale, catalog] of catalogs) {
       for (const key of keys) {
