@@ -632,4 +632,7 @@ export const hi = {
   snug: "सघन",
   tight: "बहुत सघन",
   none: "कोई नहीं",
+  capabilityProfile: "{name} की क्षमता प्रोफ़ाइल",
+  harnessModel: "{name} 模型",
+  cacheNotReportedForRequests: "{count} अनुरोधों के लिए रिपोर्ट नहीं किया गया",
 } satisfies typeof en
