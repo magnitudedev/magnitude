@@ -42,7 +42,7 @@ export function HardwarePending({ identifying = false }: { identifying?: boolean
   return <div aria-busy="true" aria-label=tr("detectingHardware") className={`relative ${pageLayout.hardware}`} data-loading-region="">
     <div className={`grid items-center gap-6 ${pageLayout.hardwareGrid}`}>
       <div aria-hidden="true" className={pageLayout.hardwarePhoto}><Skeleton className="aspect-[4/3] w-full rounded-none" /></div>
-      <div className="min-w-0"><p className="text-xs font-medium uppercase tracking-widest text-slate-500">Your machine</p><LoadingStatus title={identifying ? tr("identifyingMachine") : tr("readingHardware")} detail={identifying ? tr("lookingUpMachine") : tr("checkingChip")} />
+      <div className="min-w-0"><p className="text-xs font-medium uppercase tracking-widest text-slate-500">{tr("yourMachine")}</p><LoadingStatus title={identifying ? tr("identifyingMachine") : tr("readingHardware")} detail={identifying ? tr("lookingUpMachine") : tr("checkingChip")} />
         <div aria-hidden="true" className="mt-5 flex flex-wrap gap-x-7 gap-y-4">{[0,1].map(index => <div key={index} className="flex items-center gap-3"><Skeleton className="size-5 shrink-0" /><div><SkeletonLine className={index === 0 ? "h-7 w-24 text-lg" : "h-5 w-24 text-sm"} /><SkeletonLine className="h-4 w-24 text-xs" /></div></div>)}</div>
       </div>
     </div>
@@ -84,8 +84,8 @@ export function ConnectionsSkeleton() {
   return <LoadingRegion label=tr("loadingConnections") className="mt-7 space-y-8"><SkeletonLine className="mb-4 h-5 text-sm" width="180px" /><div className={pageLayout.harnessGrid}>{Array.from({length:8},(_,index) => <article className={pageLayout.harnessCard} key={index}><div className="flex flex-wrap items-center justify-between gap-4"><div className="flex min-w-0 items-center gap-3"><Skeleton className="size-14 shrink-0 rounded-2xl" /><div><SkeletonLine className="h-7 w-32 text-lg" /><SkeletonLine className="mt-1 h-5 w-28 text-sm" /></div></div><Skeleton className="h-8 w-24" /></div></article>)}</div></LoadingRegion>
 }
 export function LoginSkeleton() {
-  return <LoadingRegion label=tr("loadingLoginSettings") className={pageLayout.settingsCard}><div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">Launch at login</h2><p className="mt-2 text-sm text-slate-500">Start Magnitude in the background with its tray icon. The window stays closed.</p></div><Skeleton className="h-8 w-16 shrink-0" /></div></LoadingRegion>
+  return <LoadingRegion label=tr("loadingLoginSettings") className={pageLayout.settingsCard}><div className="flex items-center justify-between gap-6"><div><h2 className="font-heading text-lg">{tr("launchAtLogin")}</h2><p className="mt-2 text-sm text-slate-500">{tr("startMagnitudeBackground")}</p></div><Skeleton className="h-8 w-16 shrink-0" /></div></LoadingRegion>
 }
 export function UpdatesSkeleton() {
-  return <LoadingRegion label=tr("loadingUpdateSettings") className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750"><h3 className="font-medium">Application updates</h3><div className="mt-3 flex h-5 items-center gap-3"><Skeleton className="size-4" /><Skeleton className="h-3 w-40" /></div><SkeletonLine className="mt-3 h-5 text-sm" width="65%" /><Skeleton className="mt-3 h-8 w-32" /></LoadingRegion>
+  return <LoadingRegion label=tr("loadingUpdateSettings") className="mt-5 border-t border-slate-200 pt-5 dark:border-slate-750"><h3 className="font-medium">{tr("applicationUpdates")}</h3><div className="mt-3 flex h-5 items-center gap-3"><Skeleton className="size-4" /><Skeleton className="h-3 w-40" /></div><SkeletonLine className="mt-3 h-5 text-sm" width="65%" /><Skeleton className="mt-3 h-8 w-32" /></LoadingRegion>
 }
