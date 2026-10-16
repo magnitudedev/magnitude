@@ -632,4 +632,7 @@ export const pt = {
   stopRequiringKeyDescription: "Quando o Magnitude reiniciar, qualquer dispositivo que consiga aceder a este computador poderá usar a inferência sem chave. Faça-o apenas numa rede de confiança. Este navegador continuará a precisar da chave para iniciar sessão.",
   changeAddressDescription: "Quando o Magnitude reiniciar, aceitará ligações apenas no endereço escolhido. Este navegador poderá não conseguir voltar a ligar-se.",
   restartDisconnectDescription: "Este navegador será desligado enquanto o Magnitude reinicia e voltará a ligar-se automaticamente.",
+  capabilityProfile: "Perfil de capacidades de {name}",
+  harnessModel: "Modelo de {name}",
+  cacheNotReportedForRequests: "Não reportado para {count} pedidos",
 } satisfies typeof en
