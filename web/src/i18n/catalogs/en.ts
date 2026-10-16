@@ -364,4 +364,8 @@ export const en = {
   local: "Local",
   remote: "Remote",
   automaticDownloadHint: "Download updates in the background when they are available.",
+  startMagnitudeBackground: "Start Magnitude in the background with its tray icon. The window stays closed.",
+  loadingUpdateSettings: "Loading update settings",
+  applicationUpdates: "Application updates",
+  detectingHardwareShort: "Detecting hardware",
 } as const
