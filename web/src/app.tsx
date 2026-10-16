@@ -685,7 +685,7 @@ function LaunchAtLoginRow() {
   const hint = current?._tag === "Unavailable" ? current.message
     : current?._tag === "RequiresApproval" ? tr("startupSettingsEnable")
     : tr("startsInBackground")
-  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title={tr("couldNotUpdateLaunch")} description=tr("startupSettingsCheck") /> : Result.isFailure(state) ? <ErrorNotice title={tr("couldNotCheckLaunch")} description={tr("cannotConfirmSignIn")} /> : undefined
+  const alert = !change.waiting && Result.isFailure(change) ? <ErrorNotice title={tr("couldNotUpdateLaunch")} description={tr("startupSettingsCheck")} /> : Result.isFailure(state) ? <ErrorNotice title={tr("couldNotCheckLaunch")} description={tr("cannotConfirmSignIn")} /> : undefined
   return <SettingsRow label={useI18n().t("launchAtLogin")} hint={Result.isInitial(state) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : hint} alert={alert}
     control={current && <Switch aria-label={useI18n().t("launchAtLogin")} checked={enabled} disabled={current._tag === "Unavailable" || change.waiting} onCheckedChange={checked => set(checked)} />} />
 }
