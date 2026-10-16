@@ -586,4 +586,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   fidelity: "保真度",
   modelsAssessedCount: "已评估 {settled} / {total}",
   memoryUsage: "内存用量",
+  existingDownloadsPreviousFolder: "现有下载仍保留在之前的文件夹中。若要移动它们，请退出 Magnitude，运行此命令，然后重新打开 Magnitude。",
 }
