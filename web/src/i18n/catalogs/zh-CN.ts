@@ -494,4 +494,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   otherDeviceKeyIntro: "其他设备使用网络访问设置中的地址和 API 密钥：",
   turnOnNetworkIntro: "若要从其他设备使用，请在以下位置开启网络访问：",
   secondsWord: "秒",
+  noKeySetDescription: "在运行 Magnitude 的电脑上，打开“设置 → 网络访问”，然后选择“重新生成”来创建密钥。",
 }
