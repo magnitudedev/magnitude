@@ -19,7 +19,7 @@ const hardwareLabelKeys: Record<string, MessageKey> = {
   "Laptop": "laptop", "Gaming laptop": "gamingLaptop", "Gaming tablet": "gamingTablet",
   "Mobile workstation": "mobileWorkstation", "Mini PC": "miniPc", "AI mini PC": "aiMiniPc",
   "Desktop": "desktop", "Workstation": "workstation", "All-in-one": "allInOne",
-  "Server": "server", "Graphics card": "graphicsCard", "Unknown": "unknown", "Unknown processor": "unknownProcessor", "Chip": "chip", "CPU": "cpuLabel", "GPU": "gpuLabel",
+  "Server": "server", "Graphics card": "graphicsCard", "Unknown": "unknown", "Unknown processor": "unknownProcessor", "Computer": "computer", "Laptop / tablet": "laptopTablet", "Chip": "chip", "CPU": "cpuLabel", "GPU": "gpuLabel",
   "Memory bandwidth (spec)": "memoryBandwidthSpec", "CPU core options (spec)": "cpuCoreOptionsSpec", "Neural Engine cores (spec)": "neuralEngineCoresSpec", "GPU cores (spec)": "gpuCoresSpec", "CUDA cores (spec)": "cudaCoresSpec", "GPU compute units (spec)": "gpuComputeUnitsSpec", "CPU cores / processor (spec)": "cpuCoresProcessorSpec", "Xe cores (spec)": "xeCoresSpec", "Stream processors (spec)": "streamProcessorsSpec", "GPU architecture (spec)": "gpuArchitectureSpec",
 }
 const localizeHardwareLabel = (label: string) => hardwareLabelKeys[label] ? tr(hardwareLabelKeys[label]!) : label
