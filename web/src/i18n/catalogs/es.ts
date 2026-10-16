@@ -493,4 +493,5 @@ export const es: { [K in keyof typeof en]: string } = {
   remoteCopyKeyIntro: "Copia la clave desde Acceso a la red en ",
   otherDeviceKeyIntro: "Otros dispositivos usan la dirección y la clave API de Acceso a la red en ",
   turnOnNetworkIntro: "Para utilizarlo desde otro dispositivo, activa el acceso a la red en ",
+  secondsWord: "segundos",
 }
