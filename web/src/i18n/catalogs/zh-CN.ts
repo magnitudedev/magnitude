@@ -584,4 +584,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   speculation: "推测",
   fit: "适配度",
   fidelity: "保真度",
+  modelsAssessedCount: "已评估 {settled} / {total}",
 }
