@@ -577,7 +577,7 @@ function Status({ observation }: { observation: ServiceObservation }) {
   const tray = Option.getOrUndefined(observation.tray)
   const ready=service?._tag === "Ready"
   return <div className={pageLayout.statusStack}>
-    <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
+    <section aria-busy={!snapshot} aria-label={!snapshot ? tr("loadingServiceStatus") : undefined} className={pageLayout.statusHero}>
       <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
         <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300"><T k="magnitudeService" /></h2>
         <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
