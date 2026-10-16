@@ -571,4 +571,10 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   blockedMemoryDescription: "此模型需要 {required}，当前可用 {available}。请退出未使用的应用，或选择较小的模型。",
   memoryPressureDescription: "为了让其他应用保持响应，加载已停止。请退出未使用的应用，或稍后重试。",
   modelStoppedForMemory: "由于电脑内存不足，模型已停止",
+  waitingForMemory: "正在等待内存…",
+  loadingWeights: "正在加载权重…",
+  finalizing: "正在完成…",
+  optimizingEllipsis: "正在优化…",
+  preparingToOptimize: "正在准备优化…",
+  optimizingForDevice: "正在为 {device} 优化…",
 }
