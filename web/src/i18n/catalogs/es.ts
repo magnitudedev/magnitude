@@ -638,4 +638,8 @@ export const es: { [K in keyof typeof en]: string } = {
   reloadWindowRestart: "Recarga esta ventana. Si sigue sin abrirse, reinicia Magnitude.",
   quitAndReopen: "Cierra Magnitude y vuelve a abrirlo.",
   savedAppearanceReadError: "No se pudo leer la apariencia guardada. Se usará la apariencia del sistema.",
+  chineseTraditional: "Chino tradicional",
+  korean: "Coreano",
+  vietnamese: "Vietnamita",
+  indonesian: "Indonesio",
 }
