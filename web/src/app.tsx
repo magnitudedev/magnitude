@@ -74,6 +74,7 @@ const inferenceUrl = (address: string, port: number) => `http://${address}:${por
 const moveModelsCommand = (platform: string, from: string, to: string) => platform === "win32"
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
+const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
 function T({ k }: { k: MessageKey }) { const { t } = useI18n(); return t(k) }
 const tr = (key: MessageKey) => translate(readLanguage(), key)
 function localizeModelText(text: string): string {
@@ -925,7 +926,7 @@ export function App() {
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title={tr("magnitudeNeedsAttention")} description={tr("inferenceUnavailable")} className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}><T k="openStatus" /></NoticeAction>} /></> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{localizedPageName(page, t)}</h1>}<ErrorNotice title={tr("magnitudeNeedsAttention")} description={tr("inferenceUnavailable")} className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}><T k="openStatus" /></NoticeAction>} /></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </AppShell></>
@@ -967,7 +968,7 @@ function QuitFailureDialog() {
     <AlertDialogContent>
       <AlertDialogHeader>
         <AlertDialogTitle><T k="quittingTitle" /></AlertDialogTitle>
-        <AlertDialogDescription>Background processes could not be confirmed stopped. Retry Quit tries to stop background work again. Force Quit closes Magnitude even though some background processes may still be running.</AlertDialogDescription>
+        <AlertDialogDescription>{tr("quitBackgroundProcesses")}</AlertDialogDescription>
       </AlertDialogHeader>
       <AlertDialogFooter>
         <AlertDialogCancel disabled={resolving.waiting} onClick={() => resolve("KeepOpen")}><T k="keepOpen" /></AlertDialogCancel>
@@ -978,6 +979,7 @@ function QuitFailureDialog() {
   </AlertDialog>
 }
 export function AppShell({ page, navigate, platform, children }: { page: ApplicationPage; navigate?: (page: ApplicationPage) => void; platform: string | undefined; children: ReactNode }) {
+  const { t } = useI18n()
   const narrow = useNarrowViewport()
   const [open, setOpen] = useState(false)
   // Only the navigation chrome changes across `md`; the page stays mounted, so resizing keeps its state.
@@ -985,7 +987,7 @@ export function AppShell({ page, navigate, platform, children }: { page: Applica
     {narrow ? <NarrowBar open={open} onOpen={() => setOpen(true)} /> : <DockedSidebar page={page} navigate={navigate} platform={platform} />}
     <main key={page} className="min-w-0 flex-1 overflow-y-auto" inert={narrow && open}>
       <div data-page-content className={narrow ? "mx-auto w-full max-w-6xl px-4 pb-8 pt-5" : `mx-auto w-[calc(100vw-224px)] max-w-[min(100%,72rem)] px-10 pb-9 ${platform === "win32" ? "pt-14" : "pt-9"}`}>
-        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}
+        {page !== "catalog" && page !== "models" && <h1 className={pageLayout.pageTitle}>{localizedPageName(page, t)}</h1>}
         {children}
       </div>
     </main>
@@ -1018,7 +1020,7 @@ function NavigationDrawer({ page, navigate, onClose }: { page: ApplicationPage; 
     <aside aria-label={useI18n().t("navigation")} className="relative flex h-full w-64 max-w-[85vw] flex-col border-r border-slate-200 bg-slate-50 pb-6 pt-4 shadow-xl dark:border-slate-750 dark:bg-slate-925 motion-safe:animate-[slide-in-left_150ms_ease-out]">
       <div className="mb-6 flex h-10 items-center justify-between px-4">
         <span className="flex items-center gap-3 px-3 font-heading text-base font-semibold"><MagnitudeMark className="h-8 w-8 shrink-0" />Magnitude</span>
-        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label="Close navigation" onClick={onClose}><XIcon className="size-5" /></button>
+        <button type="button" autoFocus className="inline-flex size-10 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" aria-label={useI18n().t("closeNavigation")} onClick={onClose}><XIcon className="size-5" /></button>
       </div>
       <Navigation page={page} navigate={navigate} onNavigate={onClose} />
     </aside>
