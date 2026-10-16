@@ -119,7 +119,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
 /** A catalog model's download and the one-time optimization that follows it. */
 const acquiring = (acquisition: CatalogLocalModel["acquisitionState"]) =>
   acquisition._tag === "Installing" || acquisition._tag === "Updating" || acquisition._tag === "Optimizing"
-const minutesRemaining = (seconds: number) => seconds < 60 ? tr("lessThanMinute") : `About ${Math.ceil(seconds / 60)} min`
+const minutesRemaining = (seconds: number) => seconds < 60 ? tr("lessThanMinute") : `${tr("aboutMinutes")} ${Math.ceil(seconds / 60)} ${tr("minutesShort")}`
 /** Tuning's time remaining from its observed rate; units are measured configurations, so they track time. */
 function useTuningEstimate(progress: ModelOptimizationProgress | null): string {
   const baseline = useRef<{ at: number; completed: number } | null>(null)
@@ -705,7 +705,7 @@ function ModelStorageRow() {
       title="Choose a folder for downloaded models" description=tr("modelFolderDescription") confirmLabel=tr("useThisFolder")
       onChoose={path => save({ path: Option.some(path) })} />
     <SettingsRow label={useI18n().t("modelStorage")} alert={!busy && failure ? <ErrorNotice title=tr("modelFolderNotSaved") description={Option.getOrElse(refusal, () => tr("checkFolderWritable"))} /> : Result.isFailure(settings) ? <ErrorNotice title=tr("couldNotReadFolderSetting") description=tr("runningServiceFolderUnchanged") /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title=tr("savedFolderUnavailable") description=tr("defaultFolderInstead") /> : undefined}
-      hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === tr("defaultLabel") && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
+      hint={current ? <span className="block truncate" title={current.path}>{tr("currentPathIs")} <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === tr("defaultLabel") && ` (${tr("defaultLabel").toLowerCase()})`}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
       control={<>
         {(current?.source === tr("configured") || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}><T k="useDefault" /></Button>}
         <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => setChoosing(true)}><FolderOpenIcon /><T k="change" /></Button>
@@ -762,7 +762,7 @@ function NetworkAccessRows() {
   const reachable = current?.enabled ? Option.getOrElse(current.bind, () => current.interfaces[0]?.address) : undefined
   return <>
     {disconnect.dialog}
-    <SettingsRow label={useI18n().t("networkAccess")} hint={current ? <>Let other devices on your network use Magnitude for inference. <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300"><T k="remoteServerGuide" /><ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
+    <SettingsRow label={useI18n().t("networkAccess")} hint={current ? <>{tr("networkInference")} <a href="https://docs.magnitude.dev/remote-server" target="_blank" rel="noreferrer" className="inline-flex items-center gap-0.5 font-medium text-slate-700 hover:underline dark:text-slate-300"><T k="remoteServerGuide" /><ArrowUpRightIcon aria-hidden="true" className="size-3" /></a></> : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="240px" /> : undefined}
       alert={!busy && failure ? <ErrorNotice title="Network settings weren’t saved" description="Your previous saved settings are still in use." /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read network settings" description="The running service’s network settings have not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title=tr("savedAddressInvalid") description=tr("chooseAddressBelow") /> : undefined}
       control={current && <Switch aria-label=tr("networkAccess") checked={current.enabled} disabled={busy} onCheckedChange={checked => checked ? update({ enabled: Option.some(true) }) : disconnect.warn("TurnOffNetworkAccess", () => update({ enabled: Option.some(false) }))} />} />
     {current?.enabled && <>
