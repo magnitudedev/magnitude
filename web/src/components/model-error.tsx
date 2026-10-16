@@ -5,10 +5,13 @@ import { ErrorNotice, type NoticeContent } from "./error-notice"
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip"
 import { WarningCircleIcon } from "@phosphor-icons/react"
 import type { ReactNode } from "react"
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
 
 export const modelLoadNotice = (failure: ModelInstanceFailure): NoticeContent => {
   if ("_tag" in failure) return { title: memoryShortageTitle(failure.shortage), description: describeMemoryShortage(failure.shortage) }
-  return { title: "This model couldn’t start", description: "Try loading it again. If it still won’t start, choose another model." }
+  return { title: tr("modelCouldNotStart"), description: tr("tryLoadAnother") }
 }
 
 export function ModelLoadNotice({ failure, actions }: { failure: ModelInstanceFailure; actions?: ReactNode }) {
@@ -31,39 +34,39 @@ export function ModelLoadFailureIndicator({ failure }: { failure: ModelInstanceF
 
 export const downloadNotice = (failure: ModelAcquisitionFailure): NoticeContent => {
   switch (failure._tag) {
-    case "Interrupted": return { title: "Download interrupted", description: "Try the download again. Saved progress will be reused where possible." }
-    case "InsufficientDiskSpace": return { title: "Not enough disk space", description: `Free up ${formatStorageSize(Math.max(0, failure.requiredBytes - failure.availableBytes))} on the drive where your models are stored, then try again.` }
-    case "SourceUnavailable": return { title: "This download is unavailable", description: "The model source no longer provides the required files. Choose another model." }
-    case "NetworkUnavailable": return { title: "Can’t reach the model source", description: "Check your internet connection, then try the download again." }
-    case "LocalStorageFailure": return { title: "Couldn’t save the model", description: "Check that your model folder is writable and its drive is connected, then try again." }
-    case "CorruptDownload": return { title: "The download couldn’t be verified", description: "Try downloading the model again." }
-    case "Internal": return { title: "The download couldn’t finish", description: "Try the download again." }
+    case "Interrupted": return { title: tr("downloadInterrupted"), description: tr("retryDownloadSaved") }
+    case "InsufficientDiskSpace": return { title: tr("notEnoughDiskSpace"),  description: tr("freeDiskSpace").replace("{size}", formatStorageSize(Math.max(0, failure.requiredBytes - failure.availableBytes))) }
+    case "SourceUnavailable": return { title: tr("downloadUnavailable"), description: tr("sourceNoLongerProvides") }
+    case "NetworkUnavailable": return { title: tr("cannotReachSource"), description: tr("checkInternet") }
+    case "LocalStorageFailure": return { title: tr("couldNotSaveModel"), description: tr("checkModelFolder") }
+    case "CorruptDownload": return { title: tr("downloadNotVerified"), description: tr("retryDownloadAgain") }
+    case "Internal": return { title: tr("downloadCouldNotFinish"), description: "Try the download again." }
   }
 }
 
 export const modelRemovalNotice = (failure: ModelFailure): NoticeContent => {
   switch (failure.code) {
-    case "model_removal_retained_external": return { title: "This model is managed outside Magnitude", description: "Its files are in an external model cache and have not been removed." }
-    case "model_removal_retained_shared": return { title: "These model files are shared", description: "Another model uses these files, so they have not been removed." }
-    default: return { title: "Couldn’t remove the model", description: "The files may still be on disk. Check that the model folder is accessible before trying again." }
+    case "model_removal_retained_external": return { title: tr("modelExternalManaged"), description: tr("externalCacheNotRemoved") }
+    case "model_removal_retained_shared": return { title: tr("modelFilesShared"), description: tr("sharedFilesRetained") }
+    default: return { title: tr("couldNotRemoveModel"), description: tr("filesMayRemain") }
   }
 }
 
 export const modelCommandNotice = (failure: LocalModelCommandFailure): NoticeContent => {
   if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_instance_stopped") return {
-    severity: "info", title: "Loading was stopped", description: "Load the model again when you’re ready.",
+    severity: "info", title: tr("loadingStopped"), description: tr("loadWhenReady"),
   }
   if (failure.operation === "load" && Option.isSome(failure.rejection) && failure.rejection.value.code === "model_does_not_fit") return {
-    title: "This model doesn’t fit this computer", description: "It needs more memory than this computer can provide. Choose a smaller model.",
+    title: tr("modelDoesNotFit"), description: tr("needsMoreMemory"),
   }
   if (Option.isSome(failure.rejection) && failure.rejection.value.code === "memory_shortage") return {
-    title: MEMORY_SHORTAGE_TITLE, description: "Quit apps you aren’t using, or choose a smaller model.",
+    title: MEMORY_SHORTAGE_TITLE, description: tr("quitUnusedApps"),
   }
   switch (failure.operation) {
-    case "load": return { title: "This model couldn’t load", description: "Try loading it again, or choose another model." }
-    case "install": return { title: "The download couldn’t start", description: "Check your connection and available disk space, then try again." }
-    case "cancel": return { title: "Couldn’t cancel the download", description: "The download may still be running. Check its progress before trying again." }
-    case "dismiss": return { title: "Couldn’t dismiss the download error", description: "The previous download error is still available." }
+    case "load": return { title: tr("modelCouldNotLoad"), description: tr("tryLoadOrChoose") }
+    case "install": return { title: tr("downloadCouldNotStart"), description: tr("checkConnectionDisk") }
+    case "cancel": return { title: tr("couldNotCancelDownload"), description: tr("downloadMayStillRun") }
+    case "dismiss": return { title: tr("couldNotDismissError"), description: tr("previousDownloadError") }
     case "remove": return modelRemovalNotice(Option.getOrElse(failure.rejection, () => ({ code: "unknown", message: "", retryable: true })))
   }
 }
