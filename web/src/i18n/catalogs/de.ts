@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** German UI translations; untranslated long-tail messages fall back to English. */
+/** Vollständiger deutscher UI-Katalog; alle Meldungsschlüssel sind explizit übersetzt. */
 export const de = {
   settings: "Einstellungen",
   general: "Allgemein",
