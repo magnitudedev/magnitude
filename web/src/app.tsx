@@ -874,6 +874,9 @@ function LanguageRow() {
         <SelectItem value="en">{t("english")}</SelectItem>
         <SelectItem value="es">{t("spanish")}</SelectItem>
         <SelectItem value="zh-CN">{t("chineseSimplified")}</SelectItem>
+        <SelectItem value="hi">{t("hindi")}</SelectItem>
+        <SelectItem value="ur">{t("urdu")}</SelectItem>
+        <SelectItem value="bn">{t("bengali")}</SelectItem>
       </SelectContent>
     </Select>} />
 }
