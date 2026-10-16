@@ -642,6 +642,8 @@ export const it = {
   off: "Disattivo",
   request: "richiesta",
   appearanceCouldNotBeSaved: "Impossibile salvare l'aspetto in questo browser.",
+  computer: "Computer",
+  laptopTablet: "Portatile / tablet",
   savedAppearanceReadError: "Impossibile leggere l'aspetto salvato. Verrà usato l'aspetto del sistema.",
   chineseTraditional: "Cinese tradizionale",
   korean: "Coreano",
