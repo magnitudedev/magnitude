@@ -488,4 +488,9 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   copyHarnessCommand: "复制 {name} 命令",
   terminal: "你的终端",
   setupPromptInstruction: "复制代理的设置提示词，并将其粘贴到你当前使用的电脑上的该代理或任何编程代理中。",
+  baseUrlLabel: "基础 URL",
+  anthropicAppsHint: "兼容 Anthropic 的应用请改用 /inference/anthropic。",
+  remoteCopyKeyIntro: "请从网络访问设置中复制密钥：",
+  otherDeviceKeyIntro: "其他设备使用网络访问设置中的地址和 API 密钥：",
+  turnOnNetworkIntro: "若要从其他设备使用，请在以下位置开启网络访问：",
 }
