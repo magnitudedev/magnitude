@@ -335,7 +335,6 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   cancelDownload: "取消下载",
   optimizationProgress: "优化进度",
   downloadProgress: "下载进度",
-  modelDownload: "模型下载",
   removingState: "正在移除",
   replacementModelAvailable: "有可替代模型可用",
   requested: "已请求",
