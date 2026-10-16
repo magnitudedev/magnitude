@@ -514,4 +514,10 @@ export const es: { [K in keyof typeof en]: string } = {
   fasterRepliesSmarterAnswers: "Respuestas más rápidas o respuestas más inteligentes. Elige qué es más importante para ti.",
   tokensLabel: "tokens",
   streakLabel: "racha de {count} {days}",
+  modelPreference: "Preferencia del modelo",
+  fastest: "Máxima velocidad",
+  faster: "Más rápido",
+  balanced: "Equilibrado",
+  smarter: "Más inteligente",
+  smartest: "Máxima inteligencia",
 }
