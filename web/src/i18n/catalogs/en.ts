@@ -382,4 +382,5 @@ export const en = {
   restart: "Restart",
   configured: "Configured",
   availableStatus: "Available",
+  minutesShort: "min",
 } as const
