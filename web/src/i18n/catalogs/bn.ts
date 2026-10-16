@@ -632,4 +632,7 @@ export const bn = {
   snug: "কম জায়গার",
   tight: "খুব আঁটসাঁট",
   none: "কোনোটিই নয়",
+  capabilityProfile: "{name}-এর সক্ষমতার প্রোফাইল",
+  harnessModel: "{name} মডেল",
+  cacheNotReportedForRequests: "{count}টি অনুরোধের তথ্য জানানো হয়নি",
 } satisfies typeof en
