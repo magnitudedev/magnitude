@@ -512,4 +512,5 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   more: "多",
   recommendedForMachine: "为你的设备推荐",
   fasterRepliesSmarterAnswers: "更快的回复或更聪明的回答。选择对你更重要的方面。",
+  tokensLabel: "令牌",
 }
