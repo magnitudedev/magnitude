@@ -413,7 +413,6 @@ export const en = {
   cannotReadMemoryUsage: "Magnitude can’t read the model’s memory usage right now.",
   resident: "Resident",
   installedOnMachine: "Installed on your machine",
-  statusUnavailable: "Status unavailable",
   connectionNeedsRepair: "Connection needs repair",
   notConnected: "Not connected",
   refreshConnection: "Refresh connection",
