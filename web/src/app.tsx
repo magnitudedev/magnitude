@@ -230,7 +230,7 @@ function DeprecatedModelControls({ model, replacement, children }: { model: Cata
       {localModelIsInstalled(model) && <RemoveDownloadButton model={model} running={false} disabled={pending} onRemove={() => remove(model.modelId)} />}
     </div>
     {Option.isSome(replacement) && replacementCommand.failures.map(failure => <ErrorNotice key={`replacement-${failure.operation}`} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
-    <ErrorNotice severity="info" title={Option.isSome(replacement) ? tr("replacementModelAvailable") : tr("modelNoLongerSupported")} description={Option.isSome(replacement) ? `Switch to ${formatLocalModelDisplayName(replacement.value)} to continue receiving support.` : tr("chooseAnotherFromCatalog")} className="col-span-full mt-3" />
+    <ErrorNotice severity="info" title={Option.isSome(replacement) ? tr("replacementModelAvailable") : tr("modelNoLongerSupported")} description={Option.isSome(replacement) ? tr("switchToReplacementDescription").replace("{name}", formatLocalModelDisplayName(replacement.value)) : tr("chooseAnotherFromCatalog")} className="col-span-full mt-3" />
     {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
     {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
   </div></TooltipProvider>
@@ -258,7 +258,7 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
 
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
-      {transferring ? null : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
+      {transferring ? null : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />{tr("downloadWithSize").replace("{size}", formatStorageSize(model.storageBytes).replace(/\s/g, ""))}</Button> : <>
         {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon /><T k="connectAgent" /></Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon /><T k="stopModel" /></Button> : loadNotice ? null : <LoadModelButton model={model} pending={pending} onLoad={requestLoad} />)}
         {!onConnectAgent && <RemoveDownloadButton model={model} running={canStop} disabled={pending} onRemove={() => remove(model.modelId)} />}
         {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <ActionTooltip label={tr("newFilesAvailable")} trigger={<Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}><T k="update" /></Button>} />}
@@ -276,8 +276,8 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
     {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
     {loadNotice && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadNotice} actions={model.catalogData.support._tag === "Supported" && loadNotice.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}><T k="loadAgain" /></NoticeAction> : undefined} /></div>}
     {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
-    {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={`Load ${formatLocalModelDisplayName(model)}?`}
-      description={`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}.`} confirmLabel="Load model" onConfirm={() => load(model.modelId)} />}
+    {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={tr("loadConfirmationTitle").replace("{name}", formatLocalModelDisplayName(model))}
+      description={tr("loadConfirmationDescription").replace("{name}", formatLocalModelDisplayName(model)).replace("{replacing}", replacing)} confirmLabel={tr("loadModel")} onConfirm={() => load(model.modelId)} />}
   </div></TooltipProvider>
 }
 /** Removing a download always asks first; a running model is stopped before its files are removed. */
@@ -299,7 +299,7 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware }: {
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
   const statusLabel = acquisition._tag === "Removing" ? tr("removing") : acquisition._tag === "RemoveFailed" ? tr("removalFailed") : residency?._tag === "Ready" ? tr("loaded") : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? tr("downloaded") : residency?._tag === "Failed" ? tr("notLoaded") : residency?._tag === "Requested" ? tr("preparingEllipsis") : residency?._tag === "Loading" ? describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? tr("notDownloaded") : acquisition._tag === "UpdateFailed" ? tr("updateIncomplete") : acquisition._tag === "UpdateAvailable" ? tr("updateAvailable") : acquisition._tag)
-  const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} memory</span></>}</div>
+  const status = (statusLabel || showMemory) && <div className="mt-1 flex flex-wrap items-center gap-x-3 text-sm text-slate-500">{statusLabel && <span className={residency?._tag === "Ready" ? "text-green-600 dark:text-green-400" : ""}>{statusLabel}</span>}{showMemory && model.servingState._tag === "Assessed" && model.servingState.assessment._tag === "Fits" && <><span aria-hidden="true">·</span><span>{formatMemorySize(model.servingState.assessment.memory.totalRequiredBytes)} {tr("memory")}</span></>}</div>
   return <article className={pageLayout.modelCard}>
     <div className={pageLayout.modelRow}>
       <div className="flex min-w-0 items-center gap-4"><ModelLogo model={model} /><div className="min-w-0"><h2 className="flex flex-wrap items-center gap-2 text-lg font-semibold">{formatLocalModelDisplayName(model)}</h2>{status}</div></div>
