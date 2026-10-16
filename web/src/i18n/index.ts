@@ -38,6 +38,17 @@ export function translate(language: Language, key: MessageKey): string {
   return catalogs[language][key] ?? en[key]
 }
 
+const englishMessageKeys = new Map<string, MessageKey>()
+for (const [key, value] of Object.entries(en) as Array<[MessageKey, string]>) {
+  if (!englishMessageKeys.has(value)) englishMessageKeys.set(value, key)
+}
+
+/** Translate exact known UI messages that arrive from service/host layers; preserve unknown diagnostics. */
+export function translateKnownMessage(message: string, language: Language = readLanguage()): string {
+  const key = englishMessageKeys.get(message)
+  return key ? translate(language, key) : message
+}
+
 const changeEvent = "magnitude-language-change"
 
 export function useI18n() {
