@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest"
-import { isLanguage, readLanguage, STORAGE_KEY, translate } from "./index"
+import { isLanguage, readLanguage, STORAGE_KEY, translate, translateKnownMessage } from "./index"
 import { en } from "./catalogs/en"
 import { es } from "./catalogs/es"
 import { zhCN } from "./catalogs/zh-CN"
@@ -15,6 +15,11 @@ describe("i18n catalogs", () => {
     expect(translate("hi", "settings")).toBe("सेटिंग्स")
     expect(translate("ur", "settings")).toBe("ترتیبات")
     expect(translate("bn", "settings")).toBe("সেটিংস")
+  })
+
+  test("translates exact known messages but preserves unknown diagnostics", () => {
+    expect(translateKnownMessage("Couldn’t load the model catalog", "es")).toBe("No se pudo cargar el catálogo de modelos")
+    expect(translateKnownMessage("unrecognized diagnostic from the service", "es")).toBe("unrecognized diagnostic from the service")
   })
 
   test("rejects unknown locale values", () => {
