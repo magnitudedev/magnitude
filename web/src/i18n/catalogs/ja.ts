@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** Japanese UI translations; untranslated long-tail messages fall back to English. */
+/** 完全な日本語 UI カタログ。すべてのメッセージキーを明示的に翻訳しています。 */
 export const ja = {
   settings: "設定",
   general: "一般",
