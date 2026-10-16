@@ -635,4 +635,8 @@ export const de = {
   capabilityProfile: "Fähigkeitsprofil von {name}",
   harnessModel: "{name}-Modell",
   cacheNotReportedForRequests: "Für {count} Anfragen nicht gemeldet",
+  magnitudeCouldNotOpen: "Magnitude konnte nicht geöffnet werden",
+  reloadWindowRestart: "Laden Sie dieses Fenster neu. Wenn es sich weiterhin nicht öffnet, starten Sie Magnitude neu.",
+  quitAndReopen: "Beenden Sie Magnitude und öffnen Sie es erneut.",
+  savedAppearanceReadError: "Das gespeicherte Erscheinungsbild konnte nicht gelesen werden. Das System-Erscheinungsbild wird verwendet.",
 } satisfies typeof en
