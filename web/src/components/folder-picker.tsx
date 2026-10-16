@@ -9,6 +9,10 @@ import { Input } from "./ui/input"
 import { ErrorNotice } from "./error-notice"
 import { SkeletonLine } from "./page-skeletons"
 
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
 /** Chooses a folder on the machine running Magnitude, which may not be the machine showing this window. */
 export function FolderPicker({ open, onOpenChange, initialPath, title, description, confirmLabel, onChoose }: {
   open: boolean
@@ -44,20 +48,20 @@ function FolderBrowser({ initialPath, confirmLabel, onCancel, onChoose }: {
   const go = (next: string) => { setPath(Option.some(next)); setTyped(next) }
   return <>
     <form className="flex gap-2" onSubmit={event => { event.preventDefault(); if (typed.trim()) go(typed.trim()) }}>
-      <Input aria-label="Folder path" value={typed} onChange={event => setTyped(event.target.value)} className="min-w-0 flex-1 font-mono text-xs" />
-      <Button type="submit" variant="outline" size="sm">Go</Button>
+      <Input aria-label={tr("folderPath")} value={typed} onChange={event => setTyped(event.target.value)} className="min-w-0 flex-1 font-mono text-xs" />
+      <Button type="submit" variant="outline" size="sm">{tr("go")}</Button>
     </form>
-    <div className="max-h-72 min-h-40 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-700" aria-label="Folders">
-      {Result.isFailure(listing) ? <ErrorNotice className="m-3" title="Couldn’t open this folder" description="Check that it exists and that Magnitude can read it." />
+    <div className="max-h-72 min-h-40 overflow-y-auto rounded-md border border-slate-200 dark:border-slate-700" aria-label={tr("folders")}>
+      {Result.isFailure(listing) ? <ErrorNotice className="m-3" title={tr("couldNotOpenFolder")} description={tr("checkFolderRead")} />
         : !Result.isSuccess(listing) ? <div className="space-y-2 p-3"><SkeletonLine className="h-5" width="60%" /><SkeletonLine className="h-5" width="45%" /></div>
         : <ul className="divide-y divide-slate-100 dark:divide-slate-800">
-          {Option.isSome(listing.value.parent) && <li><button type="button" className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" onClick={() => go(Option.getOrThrow(listing.value.parent))}><ArrowUpIcon aria-hidden="true" className="size-4 shrink-0 text-slate-500" />Parent folder</button></li>}
+          {Option.isSome(listing.value.parent) && <li><button type="button" className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" onClick={() => go(Option.getOrThrow(listing.value.parent))}><ArrowUpIcon aria-hidden="true" className="size-4 shrink-0 text-slate-500" />{tr("parentFolder")}</button></li>}
           {listing.value.directories.map(entry => <li key={entry.path}><button type="button" className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-slate-100 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:bg-slate-800" onClick={() => go(entry.path)}><FolderIcon aria-hidden="true" className="size-4 shrink-0 text-blue-600 dark:text-blue-400" /><span className="min-w-0 truncate">{entry.name}</span></button></li>)}
-          {listing.value.directories.length === 0 && <li className="px-3 py-6 text-center text-sm text-slate-500">No folders inside</li>}
+          {listing.value.directories.length === 0 && <li className="px-3 py-6 text-center text-sm text-slate-500">{tr("noFoldersInside")}</li>}
         </ul>}
     </div>
     <DialogFooter>
-      <Button variant="outline" onClick={onCancel}>Cancel</Button>
+      <Button variant="outline" onClick={onCancel}>{tr("cancel")}</Button>
       <Button disabled={Option.isNone(current)} onClick={() => { if (Option.isSome(current)) onChoose(current.value) }}>{confirmLabel}</Button>
     </DialogFooter>
   </>
