@@ -635,4 +635,8 @@ export const ur = {
   capabilityProfile: "{name} کی صلاحیتوں کا خاکہ",
   harnessModel: "{name} ماڈل",
   cacheNotReportedForRequests: "{count} درخواستوں کی رپورٹ نہیں",
+  magnitudeCouldNotOpen: "Magnitude نہیں کھل سکا",
+  reloadWindowRestart: "اس ونڈو کو دوبارہ لوڈ کریں۔ اگر پھر بھی نہ کھلے تو Magnitude دوبارہ شروع کریں۔",
+  quitAndReopen: "Magnitude بند کر کے دوبارہ کھولیں۔",
+  savedAppearanceReadError: "محفوظ کردہ ظاہری شکل نہیں پڑھی جا سکی۔ سسٹم کی ظاہری شکل استعمال ہو رہی ہے۔",
 } satisfies typeof en
