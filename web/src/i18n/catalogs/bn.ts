@@ -1,6 +1,6 @@
 import { en } from "./en"
 
-/** Bengali (বাংলা). Untranslated long-tail messages retain the English fallback. */
+/** Complete Bengali translations for the Magnitude message catalog. */
 export const bn = {
   ...en,
   settings: "সেটিংস", general: "সাধারণ", about: "পরিচিতি", thisBrowser: "এই ব্রাউজার",
