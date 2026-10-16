@@ -497,4 +497,9 @@ export const es: { [K in keyof typeof en]: string } = {
   noKeySetDescription: "En el equipo que ejecuta Magnitude, abre Ajustes → Acceso a la red y elige Regenerar para crear una clave.",
   reloadPage: "Después, vuelve a cargar esta página.",
   changeAddress: "Cambiar dirección",
+  go: "Ir",
+  couldNotOpenFolder: "No se pudo abrir esta carpeta",
+  checkFolderRead: "Comprueba que existe y que Magnitude puede leerla.",
+  parentFolder: "Carpeta superior",
+  noFoldersInside: "No hay carpetas dentro",
 }
