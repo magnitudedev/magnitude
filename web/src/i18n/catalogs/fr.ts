@@ -632,4 +632,7 @@ export const fr = {
   vramLabel: "VRAM",
   cpuLabel: "CPU",
   gpuLabel: "GPU",
+  capabilityProfile: "Profil des capacités de {name}",
+  harnessModel: "Modèle de {name}",
+  cacheNotReportedForRequests: "Non signalé pour {count} requêtes",
 } satisfies typeof en
