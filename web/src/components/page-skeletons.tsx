@@ -33,7 +33,7 @@ function LoadingStatus({ title, detail, assessment }: { title: string; detail: s
       <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{detail}</p>
       {assessment && assessment.totalModels > 0 && <>
         <progress aria-label={tr("modelAssessmentsCompleted")} max={assessment.totalModels} value={assessment.settledModels} className="mt-3 block h-1.5 w-full overflow-hidden rounded-full [&::-webkit-progress-bar]:bg-slate-200 dark:[&::-webkit-progress-bar]:bg-slate-700 [&::-webkit-progress-value]:bg-blue-500 [&::-moz-progress-bar]:bg-blue-500" />
-        <p className="mt-2 text-xs tabular-nums text-slate-500 dark:text-slate-400">{assessment.settledModels} of {assessment.totalModels} assessed</p>
+        <p className="mt-2 text-xs tabular-nums text-slate-500 dark:text-slate-400">{tr("modelsAssessedCount").replace("{settled}", String(assessment.settledModels)).replace("{total}", String(assessment.totalModels))}</p>
       </>}
     </div>
   </div>
