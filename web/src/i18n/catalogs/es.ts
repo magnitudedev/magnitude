@@ -488,4 +488,9 @@ export const es: { [K in keyof typeof en]: string } = {
   copyHarnessCommand: "Copiar comando de {name}",
   terminal: "tu terminal",
   setupPromptInstruction: "Copia las instrucciones de configuración de un agente y pégalas en ese agente, o en cualquier agente de programación, en el equipo que estás usando.",
+  baseUrlLabel: "URL base",
+  anthropicAppsHint: "Las aplicaciones compatibles con Anthropic utilizan /inference/anthropic.",
+  remoteCopyKeyIntro: "Copia la clave desde Acceso a la red en ",
+  otherDeviceKeyIntro: "Otros dispositivos usan la dirección y la clave API de Acceso a la red en ",
+  turnOnNetworkIntro: "Para utilizarlo desde otro dispositivo, activa el acceso a la red en ",
 }
