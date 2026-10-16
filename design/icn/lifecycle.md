@@ -235,7 +235,8 @@ resolved path, enabled), custom-model declarations, hidden model IDs, and drafte
 resolves each automatic root from its overrides and the owning tool's own configuration: the
 Hugging Face cache from `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, or `XDG_CACHE_HOME`;
 LM Studio from its own settings; the llama.cpp cache from `LLAMA_CACHE`; Ollama from
-`OLLAMA_MODELS`; each falling back to its platform default. User folders come from configuration.
+`OLLAMA_MODELS`; each falling back to its platform defaults (Ollama on Linux: the user's
+`~/.ollama/models`, then a system service's `/usr/share/ollama/.ollama/models` or `/var/lib/ollama`). User folders come from configuration.
 ACN writes the snapshot to a file and names it at spawn, so the first scan is already correct. After
 every change ACN replaces the whole snapshot through an idempotent `PUT`; ICN reconciles only what
 changed. ICN reads no other configuration source for local models.

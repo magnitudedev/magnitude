@@ -330,11 +330,11 @@ fn rejects_missing_tensors_unknown_metadata_wrong_shapes_and_unbound_roles() {
 
     let mut unbound = target("e2b");
     let mut extra = unbound.tensors[0].clone();
-    extra.name = "blk.20.attn_k.weight".into();
+    extra.name = "blk.20.attn_k.bias".into();
     unbound.tensors.push(extra);
     assert_eq!(
         inspect(&unbound).unwrap_err(),
-        "artifact contains unbound weight roles [\"blk.20.attn_k.weight\"]"
+        "artifact contains unbound weight roles [\"blk.20.attn_k.bias\"]"
     );
 
     let mut pattern = target("e2b");

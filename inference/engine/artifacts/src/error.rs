@@ -4,6 +4,7 @@ use std::{fmt, io, path::PathBuf};
 pub enum Error {
     Io(io::Error),
     Invalid(String),
+    Truncated { offset: u64 },
     AmbiguousProjectors(Vec<PathBuf>),
 }
 
@@ -12,6 +13,7 @@ impl fmt::Display for Error {
         match self {
             Self::Io(error) => write!(f, "artifact source: {error}"),
             Self::Invalid(message) => f.write_str(message),
+            Self::Truncated { offset } => write!(f, "truncated GGUF header at byte {offset}"),
             Self::AmbiguousProjectors(paths) => write!(
                 f,
                 "multiple sibling projector artifacts found: {}",
@@ -30,7 +32,7 @@ impl Error {
     /// as opposed to a source that could not be read.
     pub fn unreadable(&self) -> bool {
         match self {
-            Self::Invalid(_) => true,
+            Self::Invalid(_) | Self::Truncated { .. } => true,
             Self::Io(error) => error.kind() == io::ErrorKind::UnexpectedEof,
             Self::AmbiguousProjectors(_) => false,
         }
@@ -41,7 +43,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::Invalid(_) | Self::AmbiguousProjectors(_) => None,
+            Self::Invalid(_) | Self::Truncated { .. } | Self::AmbiguousProjectors(_) => None,
         }
     }
 }

@@ -2,7 +2,7 @@ import { useState } from "react"
 import { Cause, Option } from "effect"
 import { Result, useAtomSet, useAtomValue } from "@effect-atom/atom-react"
 import { FolderPlusIcon } from "@phosphor-icons/react"
-import { useAgentClient } from "@magnitudedev/client-common"
+import { unreadableModelLocationMessage, useAgentClient } from "@magnitudedev/client-common"
 import type { AutomaticModelLocationKind, ModelLocation, ModelLocationKind } from "@magnitudedev/sdk"
 import { Button } from "./ui/button"
 import { Switch } from "./ui/switch"
@@ -21,7 +21,7 @@ const folderCount = (count: number) => `${count} ${count === 1 ? "folder" : "fol
 
 /** "Hugging Face cache, LM Studio · 1 folder": the automatic locations found and on, then how many folders are added. */
 export const modelLocationsSummary = (locations: readonly ModelLocation[]): string => {
-  const automatic = locations.flatMap(location => location.kind !== "Folder" && location.found && location.enabled ? [locationNames[location.kind]] : [])
+  const automatic = locations.flatMap(location => location.kind !== "Folder" && location.state === "Found" && location.enabled ? [locationNames[location.kind]] : [])
   const folders = locations.filter(location => location.kind === "Folder").length
   const parts = [...(automatic.length > 0 ? [automatic.join(", ")] : []), ...(folders > 0 ? [folderCount(folders)] : [])]
   return parts.length > 0 ? parts.join(" · ") : "Magnitude isn’t looking anywhere else for models"
@@ -32,7 +32,16 @@ const sectionHeading = "font-heading text-sm font-semibold"
 const listClass = "divide-y divide-slate-200 rounded-lg border border-slate-200 dark:divide-slate-750 dark:border-slate-750"
 const rowClass = "flex items-center gap-3 px-3 py-2"
 
-/** Manage…: the automatic locations found here with an on/off switch, the ones not found tucked away, then your folders. */
+const locationPath = (location: ModelLocation) =>
+  <span className={pathText} title={location.path}>{location.state === "Found" ? location.path : `${location.state === "Unreadable" ? "Can’t read" : "Not found"} · ${location.path}`}</span>
+
+const unreadableHint = (location: ModelLocation) =>
+  location.state === "Unreadable" && <span className="mt-0.5 block text-xs text-orange-700 dark:text-orange-300">{unreadableModelLocationMessage(location.kind)}</span>
+
+/**
+ * Manage…: the automatic locations here with an on/off switch, including ones Magnitude can't read
+ * with what to do about it, the ones not found tucked away, then your folders.
+ */
 export function ModelLocationsManager({ locations, busy, notice, onToggle, onRemove, onAdd }: {
   locations: readonly ModelLocation[]
   busy: boolean
@@ -42,8 +51,8 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
   onAdd: () => void
 }) {
   const automatic = locations.flatMap(location => location.kind === "Folder" ? [] : [{ ...location, kind: location.kind }])
-  const found = automatic.filter(location => location.found)
-  const missing = automatic.filter(location => !location.found)
+  const found = automatic.filter(location => location.state !== "NotFound")
+  const missing = automatic.filter(location => location.state === "NotFound")
   const folders = locations.filter(location => location.kind === "Folder")
   return <div className="space-y-4">
     {notice && <ErrorNotice {...notice} />}
@@ -55,7 +64,7 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
           {found.map(location => {
             const name = locationNames[location.kind]
             return <li key={location.kind} className={rowClass}>
-              <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{name}</span><span className={pathText} title={location.path}>{location.path}</span></span>
+              <span className="min-w-0 flex-1"><span className="block text-sm font-medium">{name}</span>{locationPath(location)}{unreadableHint(location)}</span>
               <Switch aria-label={`Look for models in ${name}`} checked={location.enabled} disabled={busy} onCheckedChange={checked => onToggle(location.kind, checked)} />
             </li>
           })}
@@ -77,7 +86,7 @@ export function ModelLocationsManager({ locations, busy, notice, onToggle, onRem
         : "Magnitude watches these folders, so files added or deleted later appear or disappear."}</p>
       {folders.length > 0 && <ul className={listClass}>
         {folders.map(folder => <li key={folder.path} className={rowClass}>
-          <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{folderName(folder.path)}</span><span className={pathText} title={folder.path}>{folder.found ? folder.path : `Not found · ${folder.path}`}</span></span>
+          <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{folderName(folder.path)}</span>{locationPath(folder)}{unreadableHint(folder)}</span>
           <Button size="sm" variant="ghost" disabled={busy} aria-label={`Remove ${folder.path}`} onClick={() => onRemove(folder.path)}>Remove</Button>
         </li>)}
       </ul>}

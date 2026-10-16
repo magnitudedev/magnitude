@@ -398,8 +398,8 @@ export const makeInspection = (overrides: Partial<CandidateInspection> = {}): Ca
 })
 
 export const makeLocations = (): readonly ModelLocation[] => [
-  { kind: "HuggingFaceCache", path: "/Users/test/.cache/huggingface/hub", enabled: true, automatic: true, found: true },
-  { kind: "LmStudio", path: "/Users/test/.lmstudio/models", enabled: true, automatic: true, found: false },
-  { kind: "Ollama", path: "/Users/test/.ollama/models", enabled: false, automatic: true, found: true },
-  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, found: true },
+  { kind: "HuggingFaceCache", path: "/Users/test/.cache/huggingface/hub", enabled: true, automatic: true, state: "Found" },
+  { kind: "LmStudio", path: "/Users/test/.lmstudio/models", enabled: true, automatic: true, state: "NotFound" },
+  { kind: "Ollama", path: "/Users/test/.ollama/models", enabled: false, automatic: true, state: "Found" },
+  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, state: "Found" },
 ]

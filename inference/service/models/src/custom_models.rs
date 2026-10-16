@@ -1485,6 +1485,104 @@ mod tests {
         ));
     }
 
+    /// The layout current `huggingface_hub` writes: the repository blob, named by the file's Hub
+    /// hash, links into `<hub>/blobs/<xx>/<store hash>`, a store every repository shares.
+    #[cfg(unix)]
+    fn publish_shared_hf_cache(
+        hub: &Path,
+        repository: &str,
+        commit: &str,
+        files: &[(&str, Vec<u8>)],
+    ) -> PathBuf {
+        use std::os::unix::fs::symlink;
+
+        let repository_root = hub.join(hf_repo_dir(repository));
+        let snapshot = repository_root.join("snapshots").join(commit);
+        let blobs = repository_root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        for (name, bytes) in files {
+            let hub_hash = sha256(bytes);
+            let store_hash = sha256(hub_hash.as_bytes());
+            let shard = hub.join("blobs").join(&store_hash[..2]);
+            fs::create_dir_all(&shard).unwrap();
+            fs::write(shard.join(&store_hash), bytes).unwrap();
+            symlink(
+                format!("../../blobs/{}/{store_hash}", &store_hash[..2]),
+                blobs.join(&hub_hash),
+            )
+            .unwrap();
+            let link = snapshot.join(name);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(format!("../../blobs/{hub_hash}"), &link).unwrap();
+        }
+        fs::create_dir_all(repository_root.join("refs")).unwrap();
+        fs::write(repository_root.join("refs/main"), commit).unwrap();
+        snapshot
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_blob_hugging_face_caches_are_found_read_only_with_their_hub_identity() {
+        let fixture = Fixture::new().await;
+        let hub = fixture.root.join("hf/hub");
+        let bytes = model_bytes("shared");
+        let snapshot = publish_shared_hf_cache(
+            &hub,
+            "owner/Shared-GGUF",
+            &"b".repeat(40),
+            &[("Shared-Q4_K_M.gguf", bytes.clone())],
+        );
+        publish_hf_cache(
+            &hub,
+            "owner/Classic-GGUF",
+            &"c".repeat(40),
+            &[("Classic-Q4_K_M.gguf", model_bytes("classic"))],
+        );
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::HuggingFaceCache, &hub)]))
+            .await;
+
+        assert_eq!(
+            ids(&listed.models),
+            [
+                "hf:owner/Classic-GGUF/Classic-Q4_K_M.gguf",
+                "hf:owner/Shared-GGUF/Shared-Q4_K_M.gguf"
+            ]
+        );
+        let shared = listed
+            .models
+            .iter()
+            .find(|model| model.model_id.as_str() == "hf:owner/Shared-GGUF/Shared-Q4_K_M.gguf")
+            .unwrap();
+        assert!(matches!(shared.state, CustomModelState::Ready { .. }));
+        assert_eq!(shared.files[0].path, snapshot.join("Shared-Q4_K_M.gguf"));
+
+        let inventory = fixture.inventory();
+        let model = inventory
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|model| matches!(
+                &model.source,
+                ModelSource::HuggingFace { repository, .. } if repository == "owner/Shared-GGUF"
+            ))
+            .expect("inventory publishes the shared-blob snapshot");
+        assert_eq!(
+            model.location.components()[0].content,
+            ContentIdentity::Sha256 {
+                value: sha256(&bytes)
+            },
+            "the repository blob's name, not the shared store's, identifies the content"
+        );
+        let resolved = inventory.resolve_ready(&model.id).await.unwrap();
+        assert_eq!(resolved.components[0].path, snapshot.join("Shared-Q4_K_M.gguf"));
+        assert!(!inventory.plan_delete(&model.id).await.unwrap().supported);
+        assert!(inventory.delete(&model.id).await.is_err());
+        assert!(snapshot.join("Shared-Q4_K_M.gguf").is_file());
+    }
+
     #[tokio::test]
     async fn lm_studio_publisher_layout_gives_the_hub_identity_and_pairs_its_projector() {
         let fixture = Fixture::new().await;
@@ -1594,7 +1692,7 @@ mod tests {
         model: &str,
         tag: &str,
         layers: &[(&str, &[u8])],
-    ) {
+    ) -> Vec<u8> {
         let blobs = root.join("blobs");
         fs::create_dir_all(&blobs).unwrap();
         let layers = layers
@@ -1616,12 +1714,69 @@ mod tests {
             .join(model)
             .join(tag);
         fs::create_dir_all(manifest.parent().unwrap()).unwrap();
-        fs::write(
-            manifest,
+        let document =
             serde_json::to_vec(&serde_json::json!({ "schemaVersion": 2, "layers": layers }))
-                .unwrap(),
-        )
-        .unwrap();
+                .unwrap();
+        fs::write(manifest, &document).unwrap();
+        document
+    }
+
+    /// Ollama's newer `manifests-v2` entry: a symlink to the manifest stored as a blob.
+    #[cfg(unix)]
+    fn write_ollama_v2(root: &Path, registry: &str, path: &str, document: &[u8]) {
+        let blob = format!("sha256-{}", sha256(document));
+        fs::write(root.join("blobs").join(&blob), document).unwrap();
+        let manifest = root.join("manifests-v2").join(registry).join(path);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(Path::new("../../../../blobs").join(blob), manifest).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ollama_manifests_v2_are_read_and_a_pull_in_both_trees_is_one_model() {
+        let fixture = Fixture::new().await;
+        let ollama = fixture.root.join("ollama");
+        let qwen = model_bytes("qwen library");
+        let document = write_ollama(
+            &ollama,
+            "registry.ollama.ai",
+            "library",
+            "qwen3.5",
+            "0.8b",
+            &[("application/vnd.ollama.image.model", &qwen)],
+        );
+        write_ollama_v2(&ollama, "ollama.com", "library/qwen3.5/0.8b", &document);
+        let pulled = model_bytes("hub pull v2");
+        let hub_document = write_ollama(
+            &ollama,
+            "hf.co",
+            "unsloth",
+            "Qwen3.5-0.8B-GGUF",
+            "Q4_K_M",
+            &[("application/vnd.ollama.image.model", &pulled)],
+        );
+        fs::remove_dir_all(ollama.join("manifests/hf.co")).unwrap();
+        write_ollama_v2(
+            &ollama,
+            "hf.co",
+            "unsloth/Qwen3.5-0.8B-GGUF/Q4_K_M",
+            &hub_document,
+        );
+
+        let listed = fixture
+            .apply(roots(vec![root(ModelRootKind::Ollama, &ollama)]))
+            .await;
+
+        let mut names = listed
+            .models
+            .iter()
+            .map(|model| model.display_name.as_str())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", "qwen3.5:0.8b"]
+        );
     }
 
     #[tokio::test]
@@ -2052,6 +2207,52 @@ mod tests {
             file.exists(),
             "forgetting an imported model never touches its file"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_imported_symlink_is_served_through_its_link_wherever_it_points() {
+        let fixture = Fixture::new().await;
+        let hub = fixture.root.join("hf/hub");
+        let snapshot = publish_shared_hf_cache(
+            &hub,
+            "owner/Linked-GGUF",
+            &"d".repeat(40),
+            &[("Linked-Q4_K_M.gguf", model_bytes("linked"))],
+        );
+        let link = fixture.root.join("Downloads/linked.gguf");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(snapshot.join("Linked-Q4_K_M.gguf"), &link).unwrap();
+        let id = local_id(&link);
+
+        let listed = fixture
+            .apply(LocalModelsConfiguration {
+                declarations: vec![CustomModelDeclaration {
+                    model_id: id.clone(),
+                    origin: CustomModelDeclarationOrigin::Imported { path: link.clone() },
+                    target: vec![link.to_string_lossy().into_owned()],
+                    projector: None,
+                }],
+                ..LocalModelsConfiguration::default()
+            })
+            .await;
+
+        assert_eq!(ids(&listed.models), [id.to_string()]);
+        assert!(matches!(listed.models[0].state, CustomModelState::Ready { .. }));
+        assert_eq!(listed.models[0].files[0].path, link);
+        let inventory = fixture.inventory();
+        let model = inventory
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|model| matches!(
+                model.location,
+                ModelLocation::External { origin: ExternalOrigin::Imported, .. }
+            ))
+            .expect("the imported link is published");
+        let resolved = inventory.resolve_ready(&model.id).await.unwrap();
+        assert_eq!(resolved.components[0].path, link);
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ import { Context, Effect, Layer } from "effect"
 import type { ModelLocation } from "@magnitudedev/acn-protocol"
 import type { CustomModelsConfig } from "@magnitudedev/storage"
 import {
-  directoryExists,
+  directoryState,
   hostDiscoveryEnvironment,
   resolveAutomaticLocations,
   type DiscoveryEnvironment,
@@ -33,11 +33,11 @@ export const makeModelLocations = (
         path: location.path,
         enabled: !config.disabledLocations.includes(location.kind),
         automatic: true,
-        found: location.found,
+        state: location.state,
       }))
-      const folders = yield* Effect.forEach(config.folders, (path) => directoryExists(path).pipe(
+      const folders = yield* Effect.forEach(config.folders, (path) => directoryState(path).pipe(
         provide,
-        Effect.map((found): ModelLocation => ({ kind: "Folder", path, enabled: true, automatic: false, found })),
+        Effect.map((state): ModelLocation => ({ kind: "Folder", path, enabled: true, automatic: false, state })),
       ))
       return [...automatic, ...folders]
     }),

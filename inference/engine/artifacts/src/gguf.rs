@@ -322,22 +322,33 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
 }
 
+/// Reads a header up to `end`: the source's end, or the header limit when `bounded` because the
+/// source extends past it. Running out of a source is truncation; running past the limit is an
+/// oversized header.
 struct Reader<'a, R> {
     source: &'a mut R,
     offset: u64,
     end: u64,
+    bounded: bool,
     order: ByteOrder,
 }
 
 impl<R: Read> Reader<'_, R> {
     fn check(&self, size: u64) -> Result<(), Error> {
-        if size > self.end.saturating_sub(self.offset) {
-            Err(invalid(format!(
-                "truncated or oversized GGUF header at byte {}",
-                self.offset
-            )))
-        } else {
+        if size <= self.end.saturating_sub(self.offset) {
             Ok(())
+        } else {
+            Err(self.beyond_end())
+        }
+    }
+
+    fn beyond_end(&self) -> Error {
+        if self.bounded {
+            invalid(format!("oversized GGUF header at byte {}", self.offset))
+        } else {
+            Error::Truncated {
+                offset: self.offset,
+            }
         }
     }
 
@@ -652,6 +663,7 @@ fn read_directory_with_payload<R: Read + Seek>(
         source,
         offset: 0,
         end: size.min(header_limit),
+        bounded: size > header_limit,
         order: ByteOrder::Little,
     };
     if &reader.take::<4>()? != b"GGUF" {
@@ -674,7 +686,7 @@ fn read_directory_with_payload<R: Read + Seek>(
         .checked_add(metadata_count)
         .is_none_or(|count| count > (reader.end - reader.offset) / 12)
     {
-        return Err(invalid("GGUF entry counts exceed header bounds"));
+        return Err(reader.beyond_end());
     }
 
     let mut metadata = Vec::new();

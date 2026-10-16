@@ -324,6 +324,23 @@ impl StubFile {
         }
     }
 
+    /// The same file with `tensor` stored under a tensor type id the engine doesn't know, as
+    /// files of since-removed ggml types (`Q4_0_4_4` is 31) are.
+    fn with_tensor_type(mut self, tensor: &str, type_id: u32) -> Self {
+        let mut name = (tensor.len() as u64).to_le_bytes().to_vec();
+        name.extend(tensor.as_bytes());
+        let start = self
+            .header
+            .windows(name.len())
+            .position(|window| window == name)
+            .expect("tensor in header")
+            + name.len();
+        let rank = u32::from_le_bytes(self.header[start..start + 4].try_into().unwrap()) as usize;
+        let at = start + 4 + rank * 8;
+        self.header[at..at + 4].copy_from_slice(&type_id.to_le_bytes());
+        self
+    }
+
     fn sha256(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(&self.header);
@@ -582,6 +599,7 @@ const THIRD_PARTY: &str = "thirdparty/Llama-DFlash-GGUF";
 const SPECULATIVE: &str = "community/Llama-Speculative-GGUF";
 const REJECTED: &str = "community/Llama-Rejected-GGUF";
 const PLAIN: &str = "community/Llama-Plain-GGUF";
+const LEGACY: &str = "community/Llama-Legacy-GGUF";
 
 fn repository(seed: char, files: Vec<StubFile>, base_models: &[&str]) -> StubRepository {
     StubRepository {
@@ -673,6 +691,17 @@ fn hub() -> StubHub {
     repositories.insert(
         PLAIN.to_owned(),
         repository('3', vec![StubFile::new("llama-Q8_0.gguf", &q8)], &["community/Llama-Finetune"]),
+    );
+    repositories.insert(
+        LEGACY.to_owned(),
+        repository(
+            '4',
+            vec![
+                StubFile::new("llama-Q4_0_4_4.gguf", &q8).with_tensor_type("blk.0.ffn_up.weight", 31),
+                StubFile::new("llama-Q8_0.gguf", &q8),
+            ],
+            &[],
+        ),
     );
     repositories.insert(
         THIRD_PARTY.to_owned(),
@@ -948,6 +977,68 @@ async fn a_local_file_is_identified_by_its_header_digest_unless_a_listed_model_h
     let version = &inspection.versions[0];
     assert_eq!(version.model_id, found);
     assert_eq!(version.on_this_computer, Some(found));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_with_an_unknown_tensor_type_is_an_unreadable_version_not_a_failed_inspection() {
+    let fixture = fixture(Vec::new()).await;
+    let inspection = fixture
+        .candidates
+        .inspect(CandidateInspectionRequest::HuggingFace {
+            repository: HuggingFaceRepositoryId::new(LEGACY.to_owned()).unwrap(),
+            revision: "main".to_owned(),
+        })
+        .await
+        .expect("one unreadable file never fails the repository");
+
+    assert_eq!(inspection.versions.len(), 2);
+    assert_eq!(inspection.unsupported_architecture, None);
+    let legacy = version(&inspection, "llama-Q4_0_4_4.gguf");
+    let Some(ModelAssessment::Unsupported {
+        reasons, detail, ..
+    }) = &legacy.assessment
+    else {
+        panic!("the legacy file is unsupported: {:?}", legacy.assessment);
+    };
+    assert_eq!(reasons, &[UnsupportedReason::Unreadable]);
+    assert!(detail.contains("unknown GGUF tensor type 31"), "{detail}");
+    assert_eq!(
+        legacy.model_id.as_str(),
+        format!("hf:{LEGACY}/llama-Q4_0_4_4.gguf")
+    );
+    assert!(matches!(
+        version(&inspection, "llama-Q8_0.gguf").assessment,
+        Some(ModelAssessment::Fits { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_symlinked_local_file_is_inspected_through_its_link_under_its_own_name() {
+    let folder = tempfile::tempdir().expect("model folder");
+    let (header, _) = llama(7, Encoding::Q8_0).bytes();
+    let blob = folder.path().join("blobs/0123abcd");
+    std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+    std::fs::write(&blob, header).unwrap();
+    let snapshot = folder.path().join("snapshots/commit");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    let link = snapshot.join("model-Q8_0.gguf");
+    std::os::unix::fs::symlink("../../blobs/0123abcd", &link).unwrap();
+    let digest = magnitude_service_models::candidate_files::local_header_digest(&blob).unwrap();
+    let fixture = fixture(Vec::new()).await;
+
+    for request in [link.clone(), snapshot.clone()] {
+        let inspection = fixture
+            .candidates
+            .inspect(CandidateInspectionRequest::Local { path: request })
+            .await
+            .expect("a symlinked file inspects like the file it links to");
+        assert_eq!(inspection.versions.len(), 1);
+        let version = &inspection.versions[0];
+        assert_eq!(version.files[0].path, "model-Q8_0.gguf");
+        assert_eq!(version.model_id.as_str(), format!("local:{digest}"));
+        assert!(version.assessment.is_some());
+    }
 }
 
 fn custom_model(model_id: ModelId, size_bytes: u64) -> CustomModel {

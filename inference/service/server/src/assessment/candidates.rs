@@ -85,13 +85,15 @@ struct DrafterTarget {
     catalog: Option<ModelId>,
 }
 
-/// One classified complete GGUF of a candidate.
+/// One classified complete GGUF of a candidate. A file whose header is invalid stays a target
+/// version with `unreadable` naming why, so the rest of its repository is still inspected.
 struct ClassifiedGroup {
     group: GgufGroup,
     role: CandidateFileRole,
     header_digest: String,
     base_repositories: BTreeSet<String>,
     quantization: Option<String>,
+    unreadable: Option<String>,
 }
 
 /// What the release headers say about each catalog model, for matching models without lineage.
@@ -612,20 +614,29 @@ impl ManagedModelCandidates {
             return Ok(classified);
         }
         // Read a likely model file whole: a projector shares no tokenizer. Names only order the
-        // requests; headers decide every role.
-        let probe = uncached
-            .iter()
-            .position(|group| !path_string(&group.primary().path).to_lowercase().contains("mmproj"))
-            .unwrap_or(0);
-        let probe = uncached.remove(probe);
-        let probe_file = snapshot_file(snapshot, &probe.primary().path)?;
-        let sibling = self
-            .models()
-            .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, probe_file, None)
-            .await?;
-        classified.push(self.classify_hugging_face_group(snapshot, probe, None).await?);
+        // requests; headers decide every role. A probe whose header is invalid can't share its
+        // tokenizer, so the next file is read whole instead.
+        let mut sibling = None;
+        while sibling.is_none() && !uncached.is_empty() {
+            let probe = uncached
+                .iter()
+                .position(|group| !path_string(&group.primary().path).to_lowercase().contains("mmproj"))
+                .unwrap_or(0);
+            let probe = uncached.remove(probe);
+            let probe_file = snapshot_file(snapshot, &probe.primary().path)?;
+            let group = self.classify_hugging_face_group(snapshot, probe, None).await?;
+            if group.unreadable.is_none() {
+                sibling = Some(
+                    self.models()
+                        .hugging_face_gguf_header(&snapshot.repository, &snapshot.commit, probe_file, None)
+                        .await?,
+                );
+            }
+            classified.push(group);
+        }
+        let sibling = sibling.as_ref().map(|header| header.bytes.as_slice());
         let rest = futures_util::stream::iter(uncached.into_iter().map(|group| {
-            self.classify_hugging_face_group(snapshot, group, Some(&sibling.bytes))
+            self.classify_hugging_face_group(snapshot, group, sibling)
         }))
         .buffered(HEADER_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -649,7 +660,7 @@ impl ManagedModelCandidates {
         sibling: Option<&[u8]>,
     ) -> Result<ClassifiedGroup, InventoryError> {
         let file = snapshot_file(snapshot, &group.primary().path)?;
-        let (header_digest, classification) = self
+        match self
             .models()
             .classify_hugging_face_gguf(
                 &snapshot.repository,
@@ -658,19 +669,29 @@ impl ManagedModelCandidates {
                 &self.architectures,
                 sibling,
             )
-            .await?;
-        Ok(classified_group(group, header_digest, classification))
+            .await
+        {
+            Ok((header_digest, classification)) => {
+                Ok(classified_group(group, header_digest, classification))
+            }
+            Err(InventoryError::Integrity(detail)) => Ok(unreadable_group(group, detail)),
+            Err(error) => Err(error),
+        }
     }
 
-    /// A version's verdict, when its architecture is one the engine runs. A failure to read its
-    /// material leaves the version without a verdict rather than failing the inspection.
+    /// A version's verdict, when its header is readable and its architecture is one the engine
+    /// runs; an invalid header is `Unreadable`. A failure to read its material leaves the version
+    /// without a verdict rather than failing the inspection.
     async fn version_assessment(
         &self,
-        recognized: bool,
+        group: &ClassifiedGroup,
         identity: Option<String>,
         material: impl std::future::Future<Output = Result<TargetMaterial, InventoryError>>,
     ) -> Option<CachedModelAssessment> {
-        if !recognized {
+        if let Some(detail) = &group.unreadable {
+            return Some(super::assessor::unreadable_assessment(0, detail.clone()));
+        }
+        if !self.recognized(group) {
             return None;
         }
         if let Some(cached) = identity
@@ -724,7 +745,7 @@ impl ManagedModelCandidates {
         let mut pending = Vec::new();
         for group in &targets {
             pending.push(self.version_assessment(
-                self.recognized(group),
+                group,
                 self.cached_hugging_face_identity(&snapshot, &group.group, projector_path.as_deref()),
                 self.hugging_face_target(
                     &snapshot,
@@ -827,6 +848,12 @@ impl ManagedModelCandidates {
             })
             .collect::<Vec<_>>();
         if selected.is_some() && targets.is_empty() {
+            if let Err(error) = local_directory(&path) {
+                return Err(InventoryError::InvalidRequest(format!(
+                    "{} can't be read as a GGUF model: {error}",
+                    path.display()
+                )));
+            }
             return Err(InventoryError::InvalidRequest(format!(
                 "{} is not a model the engine could run on its own (it is a projector, a drafter or an incomplete split file)",
                 path.display()
@@ -842,14 +869,10 @@ impl ManagedModelCandidates {
                 projector_path.clone(),
             );
             let unreadable = unreadable_local_group(&root, &group.group);
-            let recognized = self.recognized(group);
             pending.push(async move {
                 match unreadable {
                     Some(assessment) => Some(assessment),
-                    None => {
-                        self.version_assessment(recognized, None, async { material })
-                            .await
-                    }
+                    None => self.version_assessment(group, None, async { material }).await,
                 }
             });
         }
@@ -918,11 +941,15 @@ impl ManagedModelCandidates {
         &self,
         targets: &[&ClassifiedGroup],
     ) -> Option<Vec<magnitude_service_contracts::models::UnsupportedReason>> {
-        if targets.is_empty() || targets.iter().any(|group| self.recognized(group)) {
+        let readable = targets
+            .iter()
+            .filter(|group| group.unreadable.is_none())
+            .collect::<Vec<_>>();
+        if readable.is_empty() || readable.iter().any(|group| self.recognized(group)) {
             return None;
         }
         Some(
-            targets
+            readable
                 .iter()
                 .filter_map(|group| match &group.role {
                     CandidateFileRole::Target { architecture } => {
@@ -2028,6 +2055,20 @@ fn classified_group(
         quantization: classification.quantization,
         header_digest,
         group,
+        unreadable: None,
+    }
+}
+
+/// A file whose header is invalid, such as one with a tensor type the engine doesn't know: a
+/// version of its repository that can't be read, never a reason to fail the inspection.
+fn unreadable_group(group: GgufGroup, detail: String) -> ClassifiedGroup {
+    ClassifiedGroup {
+        role: CandidateFileRole::Target { architecture: None },
+        header_digest: String::new(),
+        base_repositories: BTreeSet::new(),
+        quantization: None,
+        group,
+        unreadable: Some(detail),
     }
 }
 
@@ -2048,11 +2089,14 @@ fn classify_local(
                 quantization: inspection.quantization,
                 header_digest: local_header_digest(&path).ok()?,
                 group,
+                unreadable: None,
             })
         })
         .collect()
 }
 
+/// GGUF files under `root`, named by the paths the user sees: a symlinked file (a Hugging Face
+/// cache snapshot entry, or any link) is listed under its own name and read through the link.
 fn scan_ggufs(root: &Path, depth: usize) -> Vec<CandidateGguf> {
     let mut found = Vec::new();
     let mut pending = vec![(root.to_path_buf(), 0_usize)];
@@ -2077,9 +2121,11 @@ fn scan_ggufs(root: &Path, depth: usize) -> Vec<CandidateGguf> {
             let path = entry.path();
             if file_type.is_dir() && level + 1 < depth {
                 pending.push((path, level + 1));
-            } else if file_type.is_file()
+            } else if (file_type.is_file() || file_type.is_symlink())
                 && name.to_ascii_lowercase().ends_with(".gguf")
-                && let (Ok(relative), Ok(metadata)) = (path.strip_prefix(root), entry.metadata())
+                && let Ok(metadata) = std::fs::metadata(&path)
+                && metadata.is_file()
+                && let Ok(relative) = path.strip_prefix(root)
             {
                 found.push(CandidateGguf {
                     path: relative.to_path_buf(),

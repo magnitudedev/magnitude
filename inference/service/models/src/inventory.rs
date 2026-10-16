@@ -27,7 +27,7 @@ use crate::gguf;
 use crate::hugging_face::HubCredential;
 use crate::identity::{content_id, fingerprint, inventory_entry_id};
 use crate::package_service::PrimaryEvidence;
-use crate::snapshot_blobs::RepositoryBlobs;
+use crate::snapshot_blobs::{RepositoryBlob, RepositoryBlobs};
 use crate::store_fs::ensure_store_layout;
 
 const MAX_SCAN_ENTRIES: usize = 100_000;
@@ -1461,6 +1461,8 @@ fn append_discovered_groups(
     Ok(())
 }
 
+/// Snapshot entries may link anywhere inside the hub: current `huggingface_hub` keeps the bytes in
+/// a blob store every repository shares.
 pub(crate) fn scan_hf_cache(
     cache: &Path,
     declared: &DeclaredProjectors,
@@ -1493,7 +1495,7 @@ pub(crate) fn scan_hf_cache(
             let snapshot = snapshot_entry.path();
             let groups = discover_groups(
                 &snapshot,
-                &repo_root,
+                cache,
                 inspections,
                 &declared.for_snapshot(&repository, &commit, &snapshot),
             )?;
@@ -2195,10 +2197,7 @@ fn content_identity_for_file(
 ) -> ContentIdentity {
     let blob = blobs.and_then(|blobs| blobs.resolve(path).ok().flatten());
     let in_blob_store = blob.is_some();
-    let name = blob
-        .as_deref()
-        .and_then(Path::file_name)
-        .and_then(|value| value.to_str());
+    let name = blob.as_ref().and_then(RepositoryBlob::name);
     if in_blob_store
         && let Some(value) = name.and_then(|value| value.strip_prefix("lfs-sha256-"))
         && value.len() == 64

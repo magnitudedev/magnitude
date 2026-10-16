@@ -1,7 +1,9 @@
 //! Gemma 4 artifact recognition and family-specific numerical interpretation.
 //!
 //! This adapter recognizes `gemma4` GGUF metadata and binds every stored
-//! tensor to the family-neutral decoder contract. Everything that varies
+//! tensor to the family-neutral decoder contract, except the key/value
+//! weights a converter may keep in layers that reuse an earlier layer's
+//! history, which are checked and never imported. Everything that varies
 //! between Gemma 4 models is read from metadata and tensor shapes: the
 //! window/full layer pattern, per-layer head widths and key/value heads,
 //! per-layer feed-forward widths, layers that reuse an earlier layer's
@@ -356,6 +358,17 @@ pub fn inspect_components(
             Some(source)
         };
         let attention = attention(&mut b, &shape, &p, geometry, kv_heads[index], key_value)?;
+        if key_value.is_some() {
+            // Converted checkpoints may keep a sharing layer's own key and
+            // value projections and key norm. The layer never computes keys
+            // or values (it reads its source's history), so they are checked
+            // and never imported. An assistant has no such excuse: its
+            // layers read the target's history and must store no keys.
+            let kv_rows = product(&[kv_heads[index], geometry.width])?;
+            b.bind_unused(&format!("{p}attn_k.weight"), &[kv_rows, shape.hidden])?;
+            b.bind_unused(&format!("{p}attn_v.weight"), &[kv_rows, shape.hidden])?;
+            b.bind_unused(&format!("{p}attn_k_norm.weight"), &[geometry.width])?;
+        }
         let (input, op) = if b.contains(&format!("{p}ffn_gate_inp.weight")) {
             let experts = experts.as_ref().ok_or_else(|| {
                 invalid(format!(

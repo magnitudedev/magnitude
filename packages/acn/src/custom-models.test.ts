@@ -49,8 +49,8 @@ describe("local-models configuration snapshot", () => {
     const configuration = localModelsConfiguration(
       sampleConfig(),
       [
-        { kind: "HuggingFaceCache", path: "/hf/hub", found: true },
-        { kind: "Ollama", path: "/ollama", found: false },
+        { kind: "HuggingFaceCache", path: "/hf/hub", state: "Found" },
+        { kind: "Ollama", path: "/ollama", state: "NotFound" },
       ],
       (reference) => reference._tag === "HuggingFace" ? Option.some({ _tag: "DFlash" }) : Option.none(),
     )

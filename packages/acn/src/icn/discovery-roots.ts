@@ -1,8 +1,9 @@
 import { FileSystem } from "@effect/platform"
-import { Effect, Option, Schema } from "effect"
+import type { PlatformError } from "@effect/platform/Error"
+import { Effect, Either, Option, Schema } from "effect"
 import { homedir } from "node:os"
 import { posix, win32 } from "node:path"
-import type { AutomaticModelLocationKind } from "@magnitudedev/acn-protocol"
+import type { AutomaticModelLocationKind, ModelLocationState } from "@magnitudedev/acn-protocol"
 
 /** The host facts automatic model locations depend on; injected so every platform's rules are testable. */
 export interface DiscoveryEnvironment {
@@ -23,11 +24,11 @@ export interface AutomaticLocationCandidates {
   readonly candidates: readonly [string, ...string[]]
 }
 
-/** The directory Magnitude scans for one automatic location, and whether it exists. */
+/** The directory Magnitude scans for one automatic location, and whether it exists and can be read. */
 export interface ResolvedAutomaticLocation {
   readonly kind: AutomaticModelLocationKind
   readonly path: string
-  readonly found: boolean
+  readonly state: ModelLocationState
 }
 
 const pathFor = (platform: NodeJS.Platform) => platform === "win32" ? win32 : posix
@@ -100,13 +101,17 @@ export const llamaCppCandidates = (environment: DiscoveryEnvironment): readonly 
   return [expandPath(environment, root)]
 }
 
-/** `OLLAMA_MODELS`, then `~/.ollama/models`; a Linux service install keeps its models under `/usr/share/ollama`. */
+/**
+ * `OLLAMA_MODELS`, then `~/.ollama/models`. On Linux a system service keeps its models under the
+ * `ollama` user's home, `/usr/share/ollama/.ollama/models` (the official install script), or directly
+ * in `/var/lib/ollama` (distribution packages such as Arch's, which set `OLLAMA_MODELS` there).
+ */
 export const ollamaCandidates = (environment: DiscoveryEnvironment): readonly [string, ...string[]] => {
   const path = pathFor(environment.platform)
   const override = configured(environment.env.OLLAMA_MODELS)
   if (Option.isSome(override)) return [expandPath(environment, override.value)]
   const user = path.join(environment.home, ".ollama", "models")
-  return environment.platform === "linux" ? [user, "/usr/share/ollama/.ollama/models"] : [user]
+  return environment.platform === "linux" ? [user, "/usr/share/ollama/.ollama/models", "/var/lib/ollama"] : [user]
 }
 
 export const automaticLocationCandidates = (
@@ -148,20 +153,31 @@ export const readLmStudioSettings = (environment: DiscoveryEnvironment) => Effec
   return { homePointer, downloadsFolder }
 })
 
-const isDirectory = (fs: FileSystem.FileSystem, path: string) =>
-  fs.stat(path).pipe(Effect.map((info) => info.type === "Directory"), Effect.orElseSucceed(() => false))
+const isPermissionDenied = (error: PlatformError) => error._tag === "SystemError" && error.reason === "PermissionDenied"
 
-/** The first existing candidate of each automatic location, or its first candidate when none exists yet. */
-export const resolveAutomaticLocations = (environment: DiscoveryEnvironment) => Effect.gen(function* () {
+/**
+ * `Found` for a directory Magnitude can list, `Unreadable` when the directory or a folder above it
+ * denies Magnitude permission, and `NotFound` otherwise.
+ */
+export const directoryState = (path: string): Effect.Effect<ModelLocationState, never, FileSystem.FileSystem> => Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
+  const stat = yield* fs.stat(path).pipe(Effect.either)
+  if (Either.isLeft(stat)) return isPermissionDenied(stat.left) ? "Unreadable" : "NotFound"
+  if (stat.right.type !== "Directory") return "NotFound"
+  const listing = yield* fs.readDirectory(path).pipe(Effect.either)
+  return Either.isRight(listing) || !isPermissionDenied(listing.left) ? "Found" : "Unreadable"
+})
+
+/** Each automatic location's first found candidate, else its first unreadable one, else its first candidate. */
+export const resolveAutomaticLocations = (environment: DiscoveryEnvironment) => Effect.gen(function* () {
   const lmStudio = yield* readLmStudioSettings(environment)
   return yield* Effect.forEach(automaticLocationCandidates(environment, lmStudio), ({ kind, candidates }) =>
     Effect.gen(function* () {
-      for (const candidate of candidates) {
-        if (yield* isDirectory(fs, candidate)) return { kind, path: candidate, found: true } satisfies ResolvedAutomaticLocation
-      }
-      return { kind, path: candidates[0], found: false } satisfies ResolvedAutomaticLocation
+      const states = yield* Effect.forEach(candidates, (path) =>
+        Effect.map(directoryState(path), (state): ResolvedAutomaticLocation => ({ kind, path, state })))
+      const fallback: ResolvedAutomaticLocation = { kind, path: candidates[0], state: "NotFound" }
+      return states.find(({ state }) => state === "Found")
+        ?? states.find(({ state }) => state === "Unreadable")
+        ?? fallback
     }))
 })
-
-export const directoryExists = (path: string) => Effect.flatMap(FileSystem.FileSystem, (fs) => isDirectory(fs, path))

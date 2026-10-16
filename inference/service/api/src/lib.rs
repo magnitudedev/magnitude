@@ -878,6 +878,9 @@ async fn hardware(State(state): State<AppState>) -> Result<Json<HardwareSnapshot
     responses(
         (status = 200, description = "Live Hugging Face GGUF model search", body = HuggingFaceModelSearchResults),
         (status = 400, description = "Invalid search request", body = ErrorResponse),
+        (status = 404, description = "Repository or revision not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Hugging Face search failed", body = ErrorResponse)
     )
 )]
@@ -902,6 +905,9 @@ async fn search_hugging_face_models(
     responses(
         (status = 200, description = "Immutable snapshot of the requested live Hugging Face repository", body = HuggingFaceRepositorySnapshot),
         (status = 400, description = "Invalid repository request", body = ErrorResponse),
+        (status = 404, description = "Repository or revision not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Hugging Face resolution failed", body = ErrorResponse)
     )
 )]
@@ -1254,6 +1260,8 @@ async fn prune_local_drafters(State(state): State<AppState>) -> Result<Json<Draf
         (status = 200, description = "Every version of the candidate with the engine's verdict", body = CandidateInspection),
         (status = 400, description = "Invalid candidate", body = ErrorResponse),
         (status = 404, description = "Repository, revision or file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Inspection failed", body = ErrorResponse)
     )
 )]
@@ -1275,6 +1283,8 @@ async fn inspect_model_candidate(
         (status = 200, description = "Drafter candidates for the target, in category order", body = DrafterCandidatesResponse),
         (status = 400, description = "Invalid target", body = ErrorResponse),
         (status = 404, description = "Target not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Enumeration failed", body = ErrorResponse)
     )
 )]
@@ -1296,6 +1306,8 @@ async fn drafter_candidates(
         (status = 200, description = "The exact bundle a download of the candidate fetches; a candidate whose target is local yields its drafter alone", body = ServableModelBundle),
         (status = 400, description = "Invalid candidate", body = ErrorResponse),
         (status = 404, description = "Candidate file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Bundle construction failed", body = ErrorResponse)
     )
 )]
@@ -1317,6 +1329,8 @@ async fn candidate_bundle(
         (status = 200, description = "The engine's header-only verdict for the candidate", body = ModelAssessment),
         (status = 400, description = "Invalid candidate", body = ErrorResponse),
         (status = 404, description = "Candidate file not found", body = ErrorResponse),
+        (status = 409, description = "The operation conflicts with the model's current state", body = ErrorResponse),
+        (status = 422, description = "The repository's metadata or a file's header is invalid", body = ErrorResponse),
         (status = 500, description = "Assessment failed", body = ErrorResponse)
     )
 )]
@@ -1455,7 +1469,7 @@ async fn standard_models(
         .snapshot()
         .await
         .map_err(ApiError::from_inventory)?;
-    let assessed_capabilities = assessed_capabilities(&assessment_snapshot);
+    let offered_capabilities = offered_capabilities(&assessment_snapshot);
     let catalog_models = catalog.models.into_iter().filter_map(|model| {
         let CatalogModelState::Installed { effective, .. } = model.local_state else {
             return None;
@@ -1463,7 +1477,7 @@ async fn standard_models(
         let EffectiveModel::Ready { model: target } = effective else {
             return None;
         };
-        let capabilities = assessed_capabilities.get(&ModelAssessmentSubject::Catalog {
+        let capabilities = offered_capabilities.get(&ModelAssessmentSubject::Catalog {
             model_id: model.id.clone(),
             selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
         })?;
@@ -1482,7 +1496,7 @@ async fn standard_models(
         let CustomModelState::Ready { model: target, .. } = &model.state else {
             return None;
         };
-        let capabilities = assessed_capabilities.get(&ModelAssessmentSubject::Custom {
+        let capabilities = offered_capabilities.get(&ModelAssessmentSubject::Custom {
             model_id: model.model_id.clone(),
         })?;
         let (owned_by, description) = custom_model_source(&model);
@@ -1532,7 +1546,9 @@ fn custom_model_source(model: &CustomModel) -> (&'static str, String) {
     }
 }
 
-fn assessed_capabilities(
+/// The capabilities of every offered model: one whose assessment is `Fits`. A model that does not
+/// fit or that the engine cannot run is never offered for inference.
+fn offered_capabilities(
     snapshot: &ModelAssessmentsSnapshot,
 ) -> BTreeMap<ModelAssessmentSubject, ModelCapabilities> {
     [&snapshot.catalog, &snapshot.custom]
@@ -1543,10 +1559,16 @@ fn assessed_capabilities(
         })
         .flatten()
         .filter_map(|entry| match &entry.state {
-            ModelAssessmentEntryState::Assessed { capabilities, .. } => {
+            ModelAssessmentEntryState::Assessed {
+                capabilities,
+                profiles,
+                ..
+            } if matches!(profiles.first(), Some(ModelAssessment::Fits { .. })) => {
                 Some((entry.subject.clone(), capabilities.clone()))
             }
-            ModelAssessmentEntryState::Assessing | ModelAssessmentEntryState::Dropped => None,
+            ModelAssessmentEntryState::Assessed { .. }
+            | ModelAssessmentEntryState::Assessing
+            | ModelAssessmentEntryState::Dropped => None,
         })
         .collect()
 }
@@ -2479,6 +2501,27 @@ mod tests {
     }
 
     #[test]
+    fn exported_candidate_operations_declare_every_inventory_error_status() {
+        let value = serde_json::to_value(openapi().unwrap()).unwrap();
+        for path in [
+            "/api/v1/sources/hugging-face/search",
+            "/api/v1/sources/hugging-face/resolve",
+            "/api/v1/candidates/inspect",
+            "/api/v1/candidates/drafters",
+            "/api/v1/candidates/bundle",
+            "/api/v1/model-assessments/candidates",
+        ] {
+            let responses = &value["paths"][path]["post"]["responses"];
+            for status in ["400", "404", "409", "422", "500"] {
+                assert!(
+                    responses[status].is_object(),
+                    "post {path} must declare inventory error status {status}: an undeclared one reaches clients as an invalid response, not the service's message",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exported_model_admission_operations_declare_every_inventory_error_status() {
         let value = serde_json::to_value(openapi().unwrap()).unwrap();
         let statuses = ["400", "404", "409", "422", "500"];
@@ -3322,40 +3365,83 @@ mod tests {
         assert_eq!(body["state"]["acknowledged"], true);
     }
 
-    #[tokio::test]
-    async fn standard_models_list_assessed_custom_models_with_their_source() {
-        let custom = ModelAssessmentSubject::Custom {
-            model_id: local_model_id(),
-        };
-        let assessments = Arc::new(StubModelAssessments(ModelAssessmentsSnapshot {
+    fn does_not_fit_assessment() -> ModelAssessment {
+        ModelAssessment::DoesNotFit {
+            profile: ServingProfile {
+                context_length: 8192,
+            },
+            assessment_id: magnitude_service_contracts::models::ModelAssessmentId(
+                "assessment".to_owned(),
+            ),
+            memory: Vec::new(),
+            limiting_resource: "gpu".to_owned(),
+            deficit_bytes: 1,
+            drafter: DrafterVerdict::None,
+        }
+    }
+
+    fn unsupported_assessment() -> ModelAssessment {
+        ModelAssessment::Unsupported {
+            profile: ServingProfile {
+                context_length: 8192,
+            },
+            reasons: Vec::new(),
+            detail: "unknown GGUF tensor type 31".to_owned(),
+        }
+    }
+
+    fn assessed_entry(
+        subject: ModelAssessmentSubject,
+        assessment: ModelAssessment,
+    ) -> magnitude_service_contracts::models::ModelAssessmentEntry {
+        magnitude_service_contracts::models::ModelAssessmentEntry {
+            subject,
+            state: ModelAssessmentEntryState::Assessed {
+                capabilities: ModelCapabilities {
+                    vision: false,
+                    tools: true,
+                    structured_output: false,
+                    reasoning: magnitude_service_contracts::models::ModelReasoningCapabilities {
+                        supported: false,
+                        efforts: Vec::new(),
+                        default_effort: None,
+                    },
+                },
+                template_fingerprint: "template".to_owned(),
+                fingerprint: None,
+                profiles: vec![assessment],
+            },
+        }
+    }
+
+    fn assessments_snapshot(
+        catalog: Vec<magnitude_service_contracts::models::ModelAssessmentEntry>,
+        custom: Vec<magnitude_service_contracts::models::ModelAssessmentEntry>,
+    ) -> ModelAssessmentsSnapshot {
+        ModelAssessmentsSnapshot {
             revision: 1,
             environment_id: magnitude_service_contracts::models::AssessmentEnvironmentId(
                 "environment".to_owned(),
             ),
-            catalog: ModelAssessmentDomainSnapshot::Pending { source_revision: 0 },
+            catalog: ModelAssessmentDomainSnapshot::Available {
+                source_revision: 3,
+                entries: catalog,
+            },
             custom: ModelAssessmentDomainSnapshot::Available {
                 source_revision: 4,
-                entries: vec![magnitude_service_contracts::models::ModelAssessmentEntry {
-                    subject: custom,
-                    state: ModelAssessmentEntryState::Assessed {
-                        capabilities: ModelCapabilities {
-                            vision: false,
-                            tools: true,
-                            structured_output: false,
-                            reasoning:
-                                magnitude_service_contracts::models::ModelReasoningCapabilities {
-                                    supported: false,
-                                    efforts: Vec::new(),
-                                    default_effort: None,
-                                },
-                        },
-                        template_fingerprint: "template".to_owned(),
-                        fingerprint: None,
-                        profiles: vec![fits_assessment()],
-                    },
-                }],
+                entries: custom,
             },
-        }));
+        }
+    }
+
+    async fn standard_models_with_custom_assessment(assessment: ModelAssessment) -> Value {
+        let custom = ModelAssessmentSubject::Custom {
+            model_id: local_model_id(),
+        };
+        let assessments = Arc::new(StubModelAssessments(assessments_snapshot(
+            Vec::new(),
+            vec![assessed_entry(custom, assessment)],
+        )));
         let state = local_models_state(StubLocalModels::new()).with_model_assessments(assessments);
         let (status, body) = send(
             test_app(state),
@@ -3363,11 +3449,63 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    #[tokio::test]
+    async fn standard_models_list_fitting_custom_models_with_their_source() {
+        let body = standard_models_with_custom_assessment(fits_assessment()).await;
         assert_eq!(body["data"][0]["id"], local_model_id().to_string());
         assert_eq!(body["data"][0]["owned_by"], "ollama");
         assert_eq!(body["data"][0]["name"], "Fine Tune");
         assert_eq!(body["data"][0]["description"], "Found in Ollama");
         assert_eq!(body["data"][0]["context_length"], 8192);
+    }
+
+    #[tokio::test]
+    async fn standard_models_omit_custom_models_that_are_not_offered() {
+        for assessment in [unsupported_assessment(), does_not_fit_assessment()] {
+            let body = standard_models_with_custom_assessment(assessment).await;
+            assert_eq!(body["data"], json!([]));
+        }
+    }
+
+    #[test]
+    fn only_fitting_models_are_offered() {
+        let catalog_fits = ModelAssessmentSubject::Catalog {
+            model_id: "qwen3.6-35b-a3b:gguf:q4".parse().unwrap(),
+            selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
+        };
+        let catalog_too_large = ModelAssessmentSubject::Catalog {
+            model_id: "qwen3.6-27b:gguf:q4".parse().unwrap(),
+            selection: magnitude_service_contracts::models::CatalogModelSelection::Effective,
+        };
+        let custom_fits = ModelAssessmentSubject::Custom {
+            model_id: "hf:owner/repo/fits.gguf".parse().unwrap(),
+        };
+        let custom_unsupported = ModelAssessmentSubject::Custom {
+            model_id: "hf:owner/repo/unsupported.gguf".parse().unwrap(),
+        };
+        let snapshot = assessments_snapshot(
+            vec![
+                assessed_entry(catalog_fits.clone(), fits_assessment()),
+                assessed_entry(catalog_too_large, does_not_fit_assessment()),
+            ],
+            vec![
+                assessed_entry(custom_fits.clone(), fits_assessment()),
+                assessed_entry(custom_unsupported, unsupported_assessment()),
+            ],
+        );
+        assert_eq!(
+            offered_capabilities(&snapshot)
+                .into_keys()
+                .collect::<Vec<_>>(),
+            {
+                let mut expected = vec![catalog_fits, custom_fits];
+                expected.sort();
+                expected
+            }
+        );
     }
 
     #[test]

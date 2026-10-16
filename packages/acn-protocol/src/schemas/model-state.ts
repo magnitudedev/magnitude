@@ -873,13 +873,17 @@ export type ModelLocationKind = typeof ModelLocationKindSchema.Type
 export const AutomaticModelLocationKindSchema = Schema.Literal("HuggingFaceCache", "LmStudio", "LlamaCpp", "Ollama")
 export type AutomaticModelLocationKind = typeof AutomaticModelLocationKindSchema.Type
 
+/** Whether a location's directory exists and Magnitude has permission to read it. */
+export const ModelLocationStateSchema = Schema.Literal("Found", "NotFound", "Unreadable")
+export type ModelLocationState = typeof ModelLocationStateSchema.Type
+
 /** A directory scanned for GGUFs: an automatic location Magnitude resolved, or a user folder. */
 export const ModelLocationSchema = Schema.Struct({
   kind: ModelLocationKindSchema,
   path: NonEmptyString,
   enabled: Schema.Boolean,
   automatic: Schema.Boolean,
-  found: Schema.Boolean,
+  state: ModelLocationStateSchema,
 }).pipe(Schema.filter((location) => location.automatic === (location.kind !== "Folder"),
   { message: () => "only user folders are not automatic locations" }))
 export type ModelLocation = typeof ModelLocationSchema.Type

@@ -10,7 +10,9 @@ import {
   type ModelId,
   type ModelLocation,
   type ModelLocationKind,
+  type ModelLocationState,
 } from "@magnitudedev/sdk"
+import { unreadableModelLocationMessage } from "@magnitudedev/client-common"
 import { Effect, Option, Schema } from "effect"
 import { resolveDrafterChoice } from "./hugging-face-runtime"
 import { withClient, type CliModelsClient } from "./inference-client"
@@ -140,8 +142,18 @@ const LOCATION_NAMES: Record<ModelLocationKind, string> = {
   Folder: "Folder",
 }
 
+const LOCATION_STATES: Record<ModelLocationState, string> = {
+  Found: "Scanning",
+  NotFound: "Not found",
+  Unreadable: "Can't read",
+}
+
 const locationStatus = (location: ModelLocation): string =>
-  !location.enabled ? "Off" : location.found ? "Scanning" : "Not found"
+  location.enabled ? LOCATION_STATES[location.state] : "Off"
+
+const unreadableNotes = (locations: readonly ModelLocation[]): readonly string[] =>
+  locations.filter(({ enabled, state }) => enabled && state === "Unreadable")
+    .flatMap(({ kind, path }) => ["", `Can't read ${path}. ${unreadableModelLocationMessage(kind)}`])
 
 export const renderModelLocations = (locations: readonly ModelLocation[]): string => {
   const automatic = locations.filter(({ automatic }) => automatic)
@@ -155,6 +167,7 @@ export const renderModelLocations = (locations: readonly ModelLocation[]): strin
       { heading: "STATUS", value: locationStatus },
       { heading: "PATH", value: ({ path }) => path },
     ]).trimEnd(),
+    ...unreadableNotes(automatic),
     "",
     "Your folders",
     "",
@@ -162,6 +175,7 @@ export const renderModelLocations = (locations: readonly ModelLocation[]): strin
       { heading: "PATH", value: ({ path }) => path },
       { heading: "STATUS", value: locationStatus },
     ]).trimEnd(),
+    ...unreadableNotes(folders),
   ].join("\n"))
 }
 

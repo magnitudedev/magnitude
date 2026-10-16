@@ -51,6 +51,16 @@ impl<'a> Tensors<'a> {
         self.bind_transformed(name, shape, Vec::new())
     }
 
+    /// Accepts `name`, when stored, as a weight the model never reads: its
+    /// stored shape must be `shape`, it counts as bound, and no descriptor
+    /// names it, so it is never planned or imported.
+    pub fn bind_unused(&mut self, name: &str, shape: &[u64]) -> Result<(), HeaderError> {
+        if self.contains(name) {
+            self.bind(name, shape)?;
+        }
+        Ok(())
+    }
+
     /// Binds `name`, stored exactly as `stored`, through exact import
     /// `transforms`; the descriptor's shape is the one they produce.
     pub fn bind_transformed(

@@ -52,7 +52,11 @@ the file's content identity, so a repository is read once. Quantizations of one 
 tokenizer that is nearly all of a header, so after one header is read whole, each sibling is read
 as its own prefix, three verification windows inside the tokenizer compared byte for byte with the
 first header's, and its own remainder; any mismatch, or a result that does not parse, reads that
-header whole. Each version also reports the bytes adding it downloads before any drafter: its
+header whole. A header read stops growing as soon as the bytes in hand prove the header invalid
+(such as a tensor type the engine doesn't know); only a prefix that ends before its header reads
+on. A file whose header is invalid is a version assessed `Unsupported` with the `Unreadable`
+reason and the parser's detail; it never fails the repository's inspection, and an inspection
+failure is never reported as a network failure unless the inference service was unreachable. Each version also reports the bytes adding it downloads before any drafter: its
 files and the repository's projector, or nothing when it is already on this computer or is a local
 file used in place. Each version carries its canonical model ID,
 so clients never form identities: a repository file's `hf:` ID, and for a path the ID of the custom
@@ -229,15 +233,19 @@ ICN scans a list of model roots that ACN resolves and supplies (see
 
 | Location | Layout and identity |
 |---|---|
-| Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID |
+| Hugging Face cache | Hub cache layout; repository and selector give the `hf:` ID. A snapshot entry links to `<repository>/blobs/<hash>`, whose name is the file's Hub content hash; classic caches keep the bytes there, while current `huggingface_hub` makes that entry a link into a store every repository of the hub shares (`<hub>/blobs/<xx>/<hash>`, named by another hash). Both layouts are read, following link chains only within the hub; the repository blob's name is the content identity, and the cache stays read-only |
 | LM Studio | Publisher/repository layout gives the `hf:` ID |
 | llama.cpp cache | `manifest=<owner>=<repository>=<tag>.json` names each flat `<owner>_<repository>_<file>` and its projector; a name without a manifest parses only when its repository segment ends in `GGUF`; others are `local:` |
-| Ollama | Manifests name each model and its GGUF blob, whose `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
+| Ollama | Manifests name each model and its GGUF blob; both `manifests/` and newer releases' `manifests-v2/` (whose entries may be symlinks to the manifest stored as a blob, followed only within the root, and which name Ollama's registry `ollama.com` rather than `registry.ollama.ai`) are read, and a model in both is one model, named as Ollama names it (`qwen3.5:0.8b`). A GGUF blob's `sha256-<hex>` name is its content identity; `hf.co/…` pulls take the `hf:` ID of the repository file with the same SHA-256 (resolved once from the repository's file list and cached, matches and misses alike), so the same bytes have one ID whichever locations are enabled; until resolved, and for library models, the ID is `local:` |
 | User folders | Any GGUFs beneath the folder; `local:` |
 
 Each automatic location is resolved from its environment override and the owning tool's own
 configuration before its platform default, and remains configured while absent, so a location
-created later is observed. The user may turn off an automatic location and add or remove folders;
+created later is observed. A location with several platform defaults resolves to the first one
+Magnitude can read, else the first one that exists but denies Magnitude permission, else the first.
+Each location reports one state: found, not found, or can't read (it exists, but the directory or a
+folder above it denies Magnitude permission, such as a system Ollama service's folder owned by the
+`ollama` user). The user may turn off an automatic location and add or remove folders;
 the change reaches ICN as a new configuration and reconciles only the affected roots. Imported files
 are scanned at their declared paths. ICN watches every enabled root, so models appear and disappear
 without a restart; a watch event triggers scoped reconciliation of that root, never a global scan.
@@ -270,7 +278,9 @@ model; its files remain externally owned.
 
 A complete GGUF group whose header cannot be read, or whose file is shorter than the tensor data its
 header declares, is published as an unsupported local model with the `Unreadable` reason and its
-location; a local candidate inspected before adding gets the same verdict; it receives no callable identity and is never offered.
+location; a local candidate inspected before adding gets the same verdict; a symlinked file is
+read through its link and named by the path the user sees, and an imported file is served through
+its declared path wherever its link points; it receives no callable identity and is never offered.
 Every readable group is published as a custom model and assessed, so the engine decides support:
 ACN lists a found or imported custom model whose assessment is `Unsupported` among the unsupported
 local models with the assessment's reasons, never as an offering; an added one keeps its row so it
@@ -427,6 +437,8 @@ ready outcome. The filesystem observation remains authoritative.
 Deletion plans derive exclusively from current managed files and the addressed package or bundle.
 ICN validates containment, scans every repository snapshot, removes only the addressed package's
 entries, and removes a blob only when no remaining snapshot entry references its proven content identity.
+A managed entry whose blob links into a store shared beyond its repository is refused as unsafe
+rather than deleted.
 Bytes reclaimed are measured from blobs actually removed. Inventory cannot recreate deleted links
 from catalog declarations or retained blobs.
 

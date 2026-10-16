@@ -37,7 +37,7 @@ describe("custom model reconciliation", () => {
         Layer.succeed(CustomModels, custom),
         Layer.succeed(ModelLocations, {
           environment: { platform: "linux", env: {}, home: "/h" },
-          resolve: Effect.succeed([{ kind: "HuggingFaceCache" as const, path: "/h/.cache/huggingface/hub", found: true }]),
+          resolve: Effect.succeed([{ kind: "HuggingFaceCache" as const, path: "/h/.cache/huggingface/hub", state: "Found" as const }]),
           list: () => Effect.succeed([]),
         }),
         DrafterMethodsLive,

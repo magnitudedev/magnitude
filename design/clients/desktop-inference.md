@@ -268,7 +268,8 @@ Launch at login (switch), Model storage, Model locations, and Automatic updates 
 About row with the application version, update status, and the single update action for the current
 state. Model locations is one row summarizing what is scanned (the found, enabled locations and the
 folder count) with a Manage action; Manage opens a modal listing found automatic locations with a
-switch and their path, not-found locations folded away, and the user's folders with Add folder… and
+switch and their path, locations Magnitude can't read with the same switch, "Can't read" before their
+path, and what to do about it, not-found locations folded away, and the user's folders with Add folder… and
 Remove. The version is the running service's, from its health.
 Folders are chosen with the app's own folder picker; a folder is watched, so files added or deleted
 later appear or disappear.

@@ -425,6 +425,22 @@ fn removed_or_unknown_encoding_ids_are_invalid() {
     }
 }
 
+#[test]
+fn a_header_cut_short_is_truncated_and_one_past_the_limit_is_invalid() {
+    let bytes = container(false, &[("weight", vec![32], 0, 0)], &[]);
+    for end in [6, 20, 50] {
+        let error = gguf::read_directory(
+            &mut Cursor::new(bytes[..end].to_vec()),
+            gguf::DEFAULT_HEADER_LIMIT,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Truncated { .. }), "{end}: {error}");
+        assert!(error.unreadable());
+    }
+    let error = gguf::read_directory(&mut Cursor::new(bytes.clone()), 40).unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)), "{error}");
+}
+
 fn u16_value(value: u16) -> Vec<u8> {
     value.to_le_bytes().to_vec()
 }

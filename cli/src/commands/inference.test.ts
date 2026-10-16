@@ -742,6 +742,18 @@ describe("model locations", () => {
     ].join("\n"))
     expect(renderModelLocations(makeLocations().slice(0, 1))).toContain("No folders added. Add one: magnitude models folders add <path>")
   })
+
+  it("says which locations it can't read and how to grant access", () => {
+    const rendered = renderModelLocations([
+      { kind: "Ollama", path: "/usr/share/ollama/.ollama/models", enabled: true, automatic: true, state: "Unreadable" },
+      { kind: "Folder", path: "/srv/models", enabled: true, automatic: false, state: "Unreadable" },
+    ])
+    expect(rendered).toContain("Ollama    Can't read  /usr/share/ollama/.ollama/models")
+    expect(rendered).toContain("Can't read /usr/share/ollama/.ollama/models. Magnitude doesn’t have permission to read this folder. A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read.")
+    expect(rendered).toContain("/srv/models  Can't read")
+    expect(rendered).toContain("Can't read /srv/models. Magnitude doesn’t have permission to read this folder. Give your account read access to it.")
+    expect(renderModelLocations([{ kind: "Ollama", path: "/o", enabled: false, automatic: true, state: "Unreadable" }])).not.toContain("permission")
+  })
 })
 
 const encode = <A>(document: { readonly encode: (value: A) => Effect.Effect<unknown, unknown> }, value: A) =>

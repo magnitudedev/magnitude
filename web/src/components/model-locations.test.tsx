@@ -8,10 +8,10 @@ import { candidateErrorNotice, modelLocationErrorNotice } from "./candidate-erro
 import { DirectoryNotFound, InvalidModelReference, ModelSourceUnavailable } from "@magnitudedev/sdk"
 
 const locations: ModelLocation[] = [
-  { kind: "HuggingFaceCache", path: "/Users/me/.cache/huggingface/hub", enabled: true, automatic: true, found: true },
-  { kind: "LmStudio", path: "/Users/me/.lmstudio/models", enabled: false, automatic: true, found: true },
-  { kind: "Ollama", path: "/Users/me/.ollama/models", enabled: true, automatic: true, found: false },
-  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, found: true },
+  { kind: "HuggingFaceCache", path: "/Users/me/.cache/huggingface/hub", enabled: true, automatic: true, state: "Found" },
+  { kind: "LmStudio", path: "/Users/me/.lmstudio/models", enabled: false, automatic: true, state: "Found" },
+  { kind: "Ollama", path: "/Users/me/.ollama/models", enabled: true, automatic: true, state: "NotFound" },
+  { kind: "Folder", path: "/Volumes/External/models", enabled: true, automatic: false, state: "Found" },
 ]
 
 describe("model locations", () => {
@@ -37,6 +37,21 @@ describe("model locations", () => {
     expect(html.indexOf("Your folders")).toBeLessThan(html.indexOf("Add folder…"))
     expect(html.indexOf("Add folder…")).toBeLessThan(html.indexOf("Remove /Volumes"))
     expect(html.indexOf("Not found on this computer")).toBeLessThan(html.indexOf("Your folders"))
+  })
+  it("keeps locations it can't read in view with what to do, and leaves them out of the summary", () => {
+    const unreadable: ModelLocation[] = [
+      locations[0]!,
+      { kind: "Ollama", path: "/usr/share/ollama/.ollama/models", enabled: true, automatic: true, state: "Unreadable" },
+      { kind: "Folder", path: "/srv/models", enabled: true, automatic: false, state: "Unreadable" },
+    ]
+    const html = manager(unreadable)
+    expect(modelLocationsSummary(unreadable)).toBe("Hugging Face cache · 1 folder")
+    expect(html).toContain('aria-label="Look for models in Ollama"')
+    expect(html).toContain("Can’t read · /usr/share/ollama/.ollama/models")
+    expect(html).toContain("A system Ollama service keeps its models in a folder that belongs to the ollama user: give your account read access to it, or set OLLAMA_MODELS to a folder you can read.")
+    expect(html).toContain("Can’t read · /srv/models")
+    expect(html).toContain("Give your account read access to it.")
+    expect(html).not.toContain("Not found on this computer")
   })
   it("explains a first folder before any exist", () => {
     expect(manager(locations.slice(0, 1))).toContain("Add a folder of GGUF files no other app manages")

@@ -184,16 +184,34 @@ const remoteMessage = (cause: GeneratedClientError<unknown>): string => {
   return "The inference service could not read this model."
 }
 
-/** A rejected reference is the caller's to fix; anything else may clear on retry. */
-const candidateFailure = (reference: string) => (cause: GeneratedClientError<unknown>): ModelCandidateError =>
-  cause._tag === "GeneratedClientRemoteError" && (cause.status === 400 || cause.status === 404)
-    ? new InvalidModelReference({ reference, message: remoteMessage(cause) })
-    : new ModelSourceUnavailable({
-        message: cause._tag === "GeneratedClientRemoteError"
-          ? remoteMessage(cause)
-          : "Magnitude couldn't reach Hugging Face or the file. Check your connection and try again.",
-        retryable: cause._tag !== "GeneratedClientRemoteError" || cause.status === 409 || cause.status >= 500,
+/**
+ * A rejected reference is the caller's to fix. The inference service reports Hugging Face and
+ * file failures in its own message; only a connection that never reached it is a reachability
+ * failure, and a response that doesn't match the contract is never presented as one.
+ */
+const candidateFailure = (reference: string) => (cause: GeneratedClientError<unknown>): ModelCandidateError => {
+  switch (cause._tag) {
+    case "GeneratedClientRemoteError":
+      return cause.status === 400 || cause.status === 404
+        ? new InvalidModelReference({ reference, message: remoteMessage(cause) })
+        : new ModelSourceUnavailable({
+            message: remoteMessage(cause),
+            retryable: cause.status === 409 || cause.status >= 500,
+          })
+    case "GeneratedClientTransportError":
+    case "GeneratedClientIncompleteStreamError":
+      return new ModelSourceUnavailable({
+        message: "Magnitude couldn't reach its inference service. Try again in a moment.",
+        retryable: true,
       })
+    case "GeneratedClientInputError":
+    case "GeneratedClientInvalidResponseError":
+      return new ModelSourceUnavailable({
+        message: "The inference service could not read this model.",
+        retryable: false,
+      })
+  }
+}
 
 const notFound = (modelId: ModelId) => new LocalModelMutationFailed({
   code: "custom_model_not_found",

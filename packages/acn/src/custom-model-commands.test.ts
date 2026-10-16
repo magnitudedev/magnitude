@@ -99,6 +99,7 @@ interface Recorded {
 const harness = (options: {
   readonly config?: ReturnType<typeof customModelsConfig>
   readonly inspect?: ReturnType<typeof inspection>
+  readonly inspectFailure?: unknown
   readonly drafters?: readonly NativeDrafterCandidate[]
   readonly downloads?: readonly ModelDownload[]
   readonly customModels?: ReturnType<typeof nativeCustomModel>[]
@@ -128,7 +129,9 @@ const harness = (options: {
       }],
     }) as never,
     resolveRepository: () => Effect.die("unused"),
-    inspect: () => Effect.succeed(options.inspect ?? inspection()),
+    inspect: () => options.inspectFailure === undefined
+      ? Effect.succeed(options.inspect ?? inspection())
+      : Effect.fail(options.inspectFailure as never),
     drafters: (request) => Effect.sync(() => {
       recorded.drafterRequests.push(request)
       return options.drafters ?? [nativeCandidate()]
@@ -224,6 +227,33 @@ describe("finding models", () => {
       "hf:owner/model-GGUF/model-Q2_K.gguf",
     ])
     expect(result.versions[1]?.assessment.pipe(Option.map(({ _tag }) => _tag))).toEqual(Option.some("Unsupported"))
+  })
+
+  it("reports the inference service's own message, and never a contract failure as unreachable", async () => {
+    const integrity = harness({
+      inspectFailure: {
+        _tag: "GeneratedClientRemoteError",
+        status: 422,
+        body: { error: { code: "integrity_failed", message: "unknown GGUF tensor type 31" } },
+      },
+    })
+    const rejected = await integrity.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    expect(rejected._tag === "Left" && rejected.left).toMatchObject({
+      _tag: "ModelSourceUnavailable",
+      message: "unknown GGUF tensor type 31",
+      retryable: false,
+    })
+
+    const invalid = harness({
+      inspectFailure: { _tag: "GeneratedClientInvalidResponseError", status: 418, message: "undeclared status" },
+    })
+    const unreadable = await invalid.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    expect(unreadable._tag === "Left" && unreadable.left._tag).toBe("ModelSourceUnavailable")
+    expect(unreadable._tag === "Left" && unreadable.left.message).not.toMatch(/reach|connection/i)
+
+    const transport = harness({ inspectFailure: { _tag: "GeneratedClientTransportError", cause: new Error("refused") } })
+    const unreachable = await transport.run((commands) => commands.inspectCandidate("owner/model-GGUF").pipe(Effect.either))
+    expect(unreachable._tag === "Left" && unreachable.left).toMatchObject({ _tag: "ModelSourceUnavailable", retryable: true })
   })
 
   it("refuses a version the repository does not have", async () => {
@@ -503,8 +533,8 @@ describe("model locations", () => {
     expect(result.notDirectory._tag === "Left" && result.notDirectory.left._tag).toBe("PathNotDirectory")
     expect(result.afterAdd.folders).toEqual([folder])
     expect(result.afterAdd.disabledLocations).toEqual(["Ollama"])
-    expect(result.locations.find(({ kind }) => kind === "Ollama")).toMatchObject({ enabled: false, automatic: true, found: false })
-    expect(result.locations.find(({ kind }) => kind === "Folder")).toEqual({ kind: "Folder", path: folder, enabled: true, automatic: false, found: true })
+    expect(result.locations.find(({ kind }) => kind === "Ollama")).toMatchObject({ enabled: false, automatic: true, state: "NotFound" })
+    expect(result.locations.find(({ kind }) => kind === "Folder")).toEqual({ kind: "Folder", path: folder, enabled: true, automatic: false, state: "Found" })
     expect(result.afterRemove.folders).toEqual([])
   })
 })

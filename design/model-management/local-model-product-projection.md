@@ -25,7 +25,8 @@ ICN exposes two explicit model resources:
 Hugging Face search, candidate inspection, drafter candidates, and non-catalog downloads are
 separate ICN resources. There is no combined native management model list and no package, bundle,
 or raw-download identity at the ICN–ACN boundary. The OpenAI-compatible `/v1/models` endpoint is
-inference advertisement, not management state.
+inference advertisement, not management state: it lists only ready models whose current assessment
+is `Fits`, so models that do not fit or that the engine cannot run are never advertised.
 
 Each row already carries a valid canonical `ModelId`. Catalog rows exist without local material and
 have `NotInstalled` or `Installed` local state. Custom-model rows exist because material was

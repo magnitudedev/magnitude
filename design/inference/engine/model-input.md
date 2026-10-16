@@ -42,6 +42,17 @@ Every prompt token is one input row, in order, except each image's placeholder t
 adapter expands to its span's rows; the input's layout alone therefore maps a prompt position to its
 row.
 
+A family binds every stored tensor of the components it interprets by exact name and shape; a
+stored tensor no role binds, or one stored in a shape its role does not read, is an unrecognized
+tensor. A family may accept a stored tensor its model provably never reads: it checks the tensor's
+exact geometry, and no weight descriptor names it, so planning never imports, places or charges it.
+Gemma 4 layers that reuse an earlier layer's history are the case: converters that keep the
+checkpoint's key and value projections and key norm for those layers store `attn_k`, `attn_v` and
+`attn_k_norm` there, which the layers never compute (llama.cpp loads them as optional for layers
+without their own history and never reads them), so such a file interprets to the same definition as
+one without them. The header weight-encoding check stays independent of interpretation and still
+counts such a tensor's stored type.
+
 An input row's token also names the rows it reads of a gathered table, by the table's row rule. A
 token table's row is the token. An n-gram table's rows hash the token with its predecessors: order
 `n` mixes the last `n` tokens (exact 64-bit products, XOR-combined) into each of its heads' row

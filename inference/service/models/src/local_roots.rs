@@ -19,13 +19,15 @@ use crate::cache::{ModelCache, ModelIndexKind};
 use crate::identity::{content_id, inventory_entry_id};
 use crate::inventory::{
     ArtifactCandidate, DeclaredProjectors, DiscoveryCandidate, ModelGroup, canonical_or_self,
-    components_for_group, discover_groups, io_error, modified_seconds, now, primary_path,
-    read_dir_sorted, scan_hf_cache,
+    components_for_group, discover_groups, modified_seconds, now, primary_path, read_dir_sorted,
+    scan_hf_cache,
 };
 
 const OLLAMA_MODEL_MEDIA_TYPE: &str = "application/vnd.ollama.image.model";
 const OLLAMA_PROJECTOR_MEDIA_TYPE: &str = "application/vnd.ollama.image.projector";
 const OLLAMA_REGISTRY: &str = "registry.ollama.ai";
+const OLLAMA_REGISTRY_HOST: &str = "ollama.com";
+const OLLAMA_MANIFEST_TREES: [&str; 2] = ["manifests", "manifests-v2"];
 const MAX_OLLAMA_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_LLAMA_CPP_MANIFEST_BYTES: u64 = 1024 * 1024;
 
@@ -283,48 +285,74 @@ struct OllamaLayer {
     size: u64,
 }
 
-/// One Ollama manifest: its registry path and its parsed layers.
+/// One Ollama model: its registry path, the name Ollama shows for it, and its parsed manifest.
 struct OllamaPull {
     registry: String,
     namespace: String,
     model: String,
-    tag: String,
+    name: String,
     manifest: OllamaManifest,
 }
 
-/// Every manifest under an Ollama root, in `manifests/<registry>/<namespace>/<model>/<tag>`.
+/// Every model under an Ollama root. Ollama writes each pull's manifest to
+/// `manifests/<registry>/<namespace>/<model>/<tag>`, and newer releases also to
+/// `manifests-v2/<registry>/<namespace>/<model>/<tag>`, often as a symlink to the manifest stored as
+/// a blob, naming Ollama's own registry `ollama.com` rather than `registry.ollama.ai`. A manifest is
+/// read only when it resolves inside the root. The same model in both trees is one pull, the
+/// manifest whose blobs are all present when only one is complete.
 fn ollama_pulls(root: &Path) -> Result<Vec<OllamaPull>, InventoryError> {
-    let manifests = root.join("manifests");
-    let mut pulls = Vec::new();
-    for registry in read_dir_sorted(&manifests)? {
-        let registry_name = registry.file_name().to_string_lossy().into_owned();
-        for namespace in read_dir_sorted(&registry.path())? {
-            let namespace_name = namespace.file_name().to_string_lossy().into_owned();
-            for model in read_dir_sorted(&namespace.path())? {
-                let model_name = model.file_name().to_string_lossy().into_owned();
-                for tag in read_dir_sorted(&model.path())? {
-                    if !tag.file_type().map_err(io_error)?.is_file() {
-                        continue;
+    let contained = canonical_or_self(root);
+    let mut pulls = BTreeMap::<String, OllamaPull>::new();
+    for tree in OLLAMA_MANIFEST_TREES {
+        for registry in read_dir_sorted(&root.join(tree))? {
+            let registry_name = ollama_registry(&registry.file_name().to_string_lossy());
+            for namespace in read_dir_sorted(&registry.path())? {
+                let namespace_name = namespace.file_name().to_string_lossy().into_owned();
+                for model in read_dir_sorted(&namespace.path())? {
+                    let model_name = model.file_name().to_string_lossy().into_owned();
+                    for tag in read_dir_sorted(&model.path())? {
+                        let Some(manifest) = fs::canonicalize(tag.path())
+                            .ok()
+                            .filter(|path| path.starts_with(&contained))
+                            .and_then(|path| read_bounded_json(&path, MAX_OLLAMA_MANIFEST_BYTES))
+                            .and_then(|document| {
+                                serde_json::from_value::<OllamaManifest>(document).ok()
+                            })
+                        else {
+                            continue;
+                        };
+                        let tag_name = tag.file_name().to_string_lossy().into_owned();
+                        let name =
+                            ollama_name(&registry_name, &namespace_name, &model_name, &tag_name);
+                        let pull = OllamaPull {
+                            registry: registry_name.clone(),
+                            namespace: namespace_name.clone(),
+                            model: model_name.clone(),
+                            name: name.clone(),
+                            manifest,
+                        };
+                        let keep_existing = pulls.get(&name).is_some_and(|existing| {
+                            ollama_components(root, &existing.manifest).is_some()
+                                || ollama_components(root, &pull.manifest).is_none()
+                        });
+                        if !keep_existing {
+                            pulls.insert(name, pull);
+                        }
                     }
-                    let Some(manifest) = read_bounded_json(&tag.path(), MAX_OLLAMA_MANIFEST_BYTES)
-                        .and_then(|document| {
-                            serde_json::from_value::<OllamaManifest>(document).ok()
-                        })
-                    else {
-                        continue;
-                    };
-                    pulls.push(OllamaPull {
-                        registry: registry_name.clone(),
-                        namespace: namespace_name.clone(),
-                        model: model_name.clone(),
-                        tag: tag.file_name().to_string_lossy().into_owned(),
-                        manifest,
-                    });
                 }
             }
         }
     }
-    Ok(pulls)
+    Ok(pulls.into_values().collect())
+}
+
+/// Ollama's own registry under the name its older manifests use.
+fn ollama_registry(name: &str) -> String {
+    if name == OLLAMA_REGISTRY_HOST {
+        OLLAMA_REGISTRY.to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 impl OllamaPull {
@@ -414,7 +442,6 @@ fn scan_ollama(
     output: &mut Vec<DiscoveryCandidate>,
 ) -> Result<(), InventoryError> {
     for pull in ollama_pulls(root)? {
-        let name = ollama_name(&pull.registry, &pull.namespace, &pull.model, &pull.tag);
         let hub = pull.hub_repository().and_then(|repository| {
             let file = read_ollama_hub_file(cache, &repository, pull.model_sha256()?)?.file?;
             hub_file(repository, file)
@@ -423,7 +450,10 @@ fn scan_ollama(
             push_external(
                 root,
                 "ollama",
-                ExternalOrigin::Ollama { name, hub },
+                ExternalOrigin::Ollama {
+                    name: pull.name,
+                    hub,
+                },
                 LocalDeclaration::Discovery,
                 components,
                 output,
@@ -593,4 +623,228 @@ fn read_bounded_json(path: &Path, limit: u64) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use sha2::{Digest, Sha256};
+
+    use super::*;
+
+    fn sha256(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    fn manifest_path(root: &Path, tree: &str, registry: &str, path: &str) -> PathBuf {
+        let manifest = root.join(tree).join(registry).join(path);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        manifest
+    }
+
+    /// Writes the model blob and returns the manifest naming it.
+    fn manifest(root: &Path, model: &[u8], stored_size: usize) -> Vec<u8> {
+        let blobs = root.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        let digest = sha256(model);
+        fs::write(
+            blobs.join(format!("sha256-{digest}")),
+            &model[..stored_size],
+        )
+        .unwrap();
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "layers": [{
+                "mediaType": OLLAMA_MODEL_MEDIA_TYPE,
+                "digest": format!("sha256:{digest}"),
+                "size": model.len(),
+            }],
+        }))
+        .unwrap()
+    }
+
+    /// `manifests/<registry>/<path>` as a regular file, as every Ollama release writes it.
+    fn write_v1(root: &Path, registry: &str, path: &str, model: &[u8]) {
+        let document = manifest(root, model, model.len());
+        fs::write(manifest_path(root, "manifests", registry, path), document).unwrap();
+    }
+
+    /// `manifests-v2/<registry>/<path>` as a symlink to the manifest stored as a blob.
+    fn write_v2(root: &Path, registry: &str, path: &str, document: &[u8]) {
+        let blob = format!("sha256-{}", sha256(document));
+        fs::write(root.join("blobs").join(&blob), document).unwrap();
+        symlink(
+            Path::new("../../../../blobs").join(blob),
+            manifest_path(root, "manifests-v2", registry, path),
+        )
+        .unwrap();
+    }
+
+    fn names(root: &Path) -> Vec<String> {
+        ollama_pulls(root)
+            .unwrap()
+            .into_iter()
+            .map(|pull| pull.name)
+            .collect()
+    }
+
+    #[test]
+    fn ollama_reads_symlinked_v2_manifests_and_names_ollama_com_as_its_registry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let qwen = manifest(root, b"qwen weights", 12);
+        write_v2(root, "ollama.com", "library/qwen3.5/0.8b", &qwen);
+        let shared = manifest(root, b"shared namespace", 16);
+        write_v2(root, "ollama.com", "someone/tool/latest", &shared);
+        let hub = manifest(root, b"hub weights", 11);
+        write_v2(root, "hf.co", "unsloth/Qwen3.5-0.8B-GGUF/Q4_K_M", &hub);
+
+        assert_eq!(
+            names(root),
+            [
+                "hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M",
+                "qwen3.5:0.8b",
+                "someone/tool:latest",
+            ]
+        );
+        let pulls = ollama_pulls(root).unwrap();
+        assert!(
+            pulls
+                .iter()
+                .all(|pull| ollama_components(root, &pull.manifest).is_some())
+        );
+        assert_eq!(
+            pulls[0].hub_repository().as_deref(),
+            Some("unsloth/Qwen3.5-0.8B-GGUF")
+        );
+    }
+
+    #[test]
+    fn ollama_lists_a_pull_in_both_manifest_trees_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        write_v1(
+            root,
+            "registry.ollama.ai",
+            "library/qwen3.5/0.8b",
+            b"qwen weights",
+        );
+        let qwen = manifest(root, b"qwen weights", 12);
+        write_v2(root, "ollama.com", "library/qwen3.5/0.8b", &qwen);
+        write_v1(
+            root,
+            "hf.co",
+            "unsloth/Qwen3.5-0.8B-GGUF/Q4_K_M",
+            b"hub weights",
+        );
+        let hub = manifest(root, b"hub weights", 11);
+        write_v2(root, "hf.co", "unsloth/Qwen3.5-0.8B-GGUF/Q4_K_M", &hub);
+
+        assert_eq!(
+            names(root),
+            ["hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", "qwen3.5:0.8b"]
+        );
+        let unresolved = unresolved_ollama_hub_pulls(
+            &[ModelRoot {
+                kind: ModelRootKind::Ollama,
+                path: root.to_path_buf(),
+                enabled: true,
+            }],
+            &ModelCache::new(&temporary.path().join("cache")),
+        );
+        assert_eq!(
+            unresolved,
+            [(
+                "unsloth/Qwen3.5-0.8B-GGUF".to_owned(),
+                sha256(b"hub weights")
+            )]
+        );
+    }
+
+    #[test]
+    fn ollama_prefers_the_manifest_whose_blobs_are_complete() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let stale = manifest(root, b"stale weights", 5);
+        fs::write(
+            manifest_path(
+                root,
+                "manifests",
+                "registry.ollama.ai",
+                "library/qwen3.5/0.8b",
+            ),
+            stale,
+        )
+        .unwrap();
+        let complete = manifest(root, b"complete weights", 16);
+        write_v2(root, "ollama.com", "library/qwen3.5/0.8b", &complete);
+
+        let pulls = ollama_pulls(root).unwrap();
+        assert_eq!(pulls.len(), 1);
+        assert_eq!(
+            pulls[0].model_sha256(),
+            Some(sha256(b"complete weights").as_str())
+        );
+    }
+
+    #[test]
+    fn ollama_ignores_a_v2_manifest_resolving_outside_the_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("ollama");
+        let outside = temporary.path().join("outside.json");
+        fs::write(&outside, manifest(&root, b"elsewhere", 9)).unwrap();
+        symlink(
+            &outside,
+            manifest_path(&root, "manifests-v2", "ollama.com", "library/escape/latest"),
+        )
+        .unwrap();
+
+        assert!(names(&root).is_empty());
+    }
+
+    #[test]
+    fn ollama_scans_a_distribution_service_root() {
+        // Arch's package sets OLLAMA_MODELS=/var/lib/ollama: both trees sit directly in the root,
+        // beside the service user's `.ollama` and Ollama's `metadata`.
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        fs::create_dir_all(root.join(".ollama/cache")).unwrap();
+        fs::create_dir_all(root.join("metadata")).unwrap();
+        fs::write(root.join("metadata/sha256-0.json"), b"{}").unwrap();
+        write_v1(
+            root,
+            "registry.ollama.ai",
+            "library/llama3.2/1b",
+            b"llama weights",
+        );
+        let llama = manifest(root, b"llama weights", 13);
+        write_v2(root, "ollama.com", "library/llama3.2/1b", &llama);
+        write_v1(
+            root,
+            "hf.co",
+            "unsloth/Qwen3.5-0.8B-GGUF/Q4_K_M",
+            b"hub weights",
+        );
+
+        let cache = ModelCache::new(&temporary.path().join("cache"));
+        let mut output = Vec::new();
+        scan_ollama(root, &cache, &mut output).unwrap();
+        let names = output
+            .iter()
+            .filter_map(
+                |DiscoveryCandidate::Artifact(artifact)| match &artifact.location {
+                    ModelLocation::External {
+                        origin: ExternalOrigin::Ollama { name, .. },
+                        ..
+                    } => Some(name.clone()),
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["hf.co/unsloth/Qwen3.5-0.8B-GGUF:Q4_K_M", "llama3.2:1b"]
+        );
+    }
 }

@@ -1522,47 +1522,77 @@ pub(crate) async fn read_header(
             bytes.extend_from_slice(&range);
         }
         let (returned, inspected) = tokio::task::spawn_blocking(move || {
-            let inspected = header_length(&bytes);
+            let inspected = header_prefix(&bytes);
             (bytes, inspected)
         })
         .await
         .map_err(|error| InventoryError::Internal(error.to_string()))?;
         bytes = returned;
-        match inspected {
-            Ok(header_length) if header_length <= bytes.len() => {
+        match inspected? {
+            HeaderPrefix::Complete(header_length) if header_length <= bytes.len() => {
                 bytes.truncate(header_length);
                 return Ok(bytes);
             }
-            Ok(header_length) if header_length <= MAX_HEADER_BYTES.min(logical_length) => {
+            HeaderPrefix::Complete(header_length)
+                if header_length <= MAX_HEADER_BYTES.min(logical_length) =>
+            {
                 target_length = header_length;
             }
-            Ok(_) => {
-                return Err(InventoryError::Integrity(
-                    "GGUF header extends beyond its size bound".to_owned(),
-                ));
-            }
-            Err(_) if bytes.len() < MAX_HEADER_BYTES && bytes.len() < logical_length => {
+            HeaderPrefix::Truncated
+                if bytes.len() < MAX_HEADER_BYTES && bytes.len() < logical_length =>
+            {
                 target_length = bytes
                     .len()
                     .saturating_mul(4)
                     .min(MAX_HEADER_BYTES)
                     .min(logical_length);
             }
-            Err(error) => return Err(error),
+            HeaderPrefix::Complete(_) | HeaderPrefix::Truncated => {
+                return Err(InventoryError::Integrity(
+                    "GGUF header extends beyond its size bound".to_owned(),
+                ));
+            }
         }
     }
+}
+
+/// What a GGUF prefix says about its header.
+pub(crate) enum HeaderPrefix {
+    Complete(usize),
+    Truncated,
+}
+
+/// The aligned tensor-data offset of a GGUF prefix, `Truncated` when the prefix ends before the
+/// header does, or an integrity error when the header itself is invalid: reading further can't
+/// change that verdict.
+pub(crate) fn header_prefix(prefix: &[u8]) -> Result<HeaderPrefix, InventoryError> {
+    let temporary =
+        tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
+    fs::write(temporary.path(), prefix).map_err(|error| InventoryError::Io(error.to_string()))?;
+    let directory = match magnitude_artifacts::gguf::inspect_header(temporary.path()) {
+        Ok(directory) => directory,
+        Err(magnitude_artifacts::Error::Truncated { .. }) => return Ok(HeaderPrefix::Truncated),
+        Err(magnitude_artifacts::Error::Io(error))
+            if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+        {
+            return Ok(HeaderPrefix::Truncated);
+        }
+        Err(error) => return Err(InventoryError::Integrity(error.to_string())),
+    };
+    usize::try_from(directory.data_offset)
+        .map(HeaderPrefix::Complete)
+        .map_err(|_| InventoryError::Integrity("GGUF header is too large".to_owned()))
 }
 
 /// The aligned tensor-data offset of a GGUF prefix, or an error when the prefix is too short to
 /// hold the whole header.
 pub(crate) fn header_length(prefix: &[u8]) -> Result<usize, InventoryError> {
-    let temporary =
-        tempfile::NamedTempFile::new().map_err(|error| InventoryError::Io(error.to_string()))?;
-    fs::write(temporary.path(), prefix).map_err(|error| InventoryError::Io(error.to_string()))?;
-    let directory = magnitude_artifacts::gguf::inspect_header(temporary.path())
-        .map_err(|error| InventoryError::Integrity(error.to_string()))?;
-    usize::try_from(directory.data_offset)
-        .map_err(|_| InventoryError::Integrity("GGUF header is too large".to_owned()))
+    match header_prefix(prefix)? {
+        HeaderPrefix::Complete(length) => Ok(length),
+        HeaderPrefix::Truncated => Err(InventoryError::Integrity(
+            "the GGUF prefix ends before its header".to_owned(),
+        )),
+    }
 }
 
 fn valid_content_range(
@@ -2545,6 +2575,52 @@ mod tests {
         .unwrap();
         assert_eq!(hinted, header);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3, "the hint covers the header");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_header_stops_the_read_once_its_entries_are_in_hand() {
+        let description = "x".repeat(3 * 1024 * 1024);
+        let mut file = crate::test_gguf::gguf_bytes(
+            &[
+                ("general.architecture", crate::test_gguf::Meta::Str("llama")),
+                ("general.description", crate::test_gguf::Meta::Str(&description)),
+            ],
+            &["token_embd.weight"],
+        );
+        let mut name = ("token_embd.weight".len() as u64).to_le_bytes().to_vec();
+        name.extend(b"token_embd.weight");
+        let type_at = file
+            .windows(name.len())
+            .position(|window| window == name)
+            .unwrap()
+            + name.len()
+            + 4
+            + 8;
+        file[type_at..type_at + 4].copy_from_slice(&31_u32.to_le_bytes());
+        file.resize(file.len() + 64 * 1024 * 1024, 0);
+        let size = u64::try_from(file.len()).unwrap();
+        let (endpoint, requests, _) = serve_ranges(vec![("model-Q4_0_4_4.gguf", file)]);
+        let error = fetch_header(
+            &reqwest::Client::new(),
+            &endpoint,
+            "owner/repo",
+            &"a".repeat(40),
+            Path::new("model-Q4_0_4_4.gguf"),
+            size,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&error, InventoryError::Integrity(detail) if detail == "unknown GGUF tensor type 31"),
+            "{error:?}"
+        );
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a truncated probe reads on; an invalid header ends the read"
+        );
     }
 
     async fn stub_store(endpoint: String) -> (tempfile::TempDir, Arc<ManagedModelStore>) {
