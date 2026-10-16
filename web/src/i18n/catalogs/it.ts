@@ -632,4 +632,7 @@ export const it = {
   stopRequiringKeyDescription: "Al riavvio di Magnitude, qualsiasi dispositivo che raggiunge questo computer potrà usare l'inferenza senza chiave. Fallo solo su una rete fidata. Questo browser avrà comunque bisogno della chiave per accedere.",
   changeAddressDescription: "Al riavvio, Magnitude accetterà connessioni solo all'indirizzo scelto. Questo browser potrebbe non riuscire a riconnettersi.",
   restartDisconnectDescription: "Questo browser verrà disconnesso durante il riavvio di Magnitude e si riconnetterà automaticamente.",
+  capabilityProfile: "Profilo delle capacità di {name}",
+  harnessModel: "Modello di {name}",
+  cacheNotReportedForRequests: "Non riportato per {count} richieste",
 } satisfies typeof en
