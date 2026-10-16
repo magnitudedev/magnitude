@@ -599,4 +599,5 @@ export const en = {
   allInOne: "All-in-one",
   server: "Server",
   graphicsCard: "Graphics card",
+  piExtension: "Pi extension",
 } as const
