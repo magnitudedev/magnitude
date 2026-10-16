@@ -497,4 +497,9 @@ export const zhCN: { [K in keyof typeof en]: string } = {
   noKeySetDescription: "在运行 Magnitude 的电脑上，打开“设置 → 网络访问”，然后选择“重新生成”来创建密钥。",
   reloadPage: "然后重新加载此页面。",
   changeAddress: "更改地址",
+  go: "前往",
+  couldNotOpenFolder: "无法打开此文件夹",
+  checkFolderRead: "请确认文件夹存在且 Magnitude 可以读取。",
+  parentFolder: "上级文件夹",
+  noFoldersInside: "此文件夹中没有子文件夹",
 }
