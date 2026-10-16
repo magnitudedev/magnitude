@@ -1,5 +1,8 @@
 import { describe, expect, test } from "vitest"
 import { isLanguage, readLanguage, STORAGE_KEY, translate } from "./index"
+import { en } from "./catalogs/en"
+import { es } from "./catalogs/es"
+import { zhCN } from "./catalogs/zh-CN"
 
 describe("i18n catalogs", () => {
   test("supports English, Spanish and Simplified Chinese", () => {
@@ -25,11 +28,13 @@ describe("i18n catalogs", () => {
     expect(readLanguage({ getItem: () => { throw new Error("storage blocked") } })).toBe("en")
   })
 
-  test("catalogs share the same message keys", () => {
-    for (const key of ["settings", "general", "about", "thisBrowser", "language", "languageHint", "english", "spanish", "chineseSimplified", "discover", "catalog", "myModels", "connections", "usage", "status", "theme", "launchAtLogin", "modelStorage", "networkAccess", "automaticUpdates", "system", "light", "dark", "openNavigation", "closeNavigation", "navigation", "expandSidebar", "collapseSidebar", "signOut", "address", "apiKey", "reachableAt", "regenerate", "requireApiKey", "allInterfaces", "keepMagnitudeOpen", "forceQuit", "retryQuit"] as const) {
-      expect(translate("en", key)).toBeTruthy()
-      expect(translate("es", key)).toBeTruthy()
-      expect(translate("zh-CN", key)).toBeTruthy()
+  test("catalogs share the same message keys and every locale has a translation", () => {
+    expect(Object.keys(es).sort()).toEqual(Object.keys(en).sort())
+    expect(Object.keys(zhCN).sort()).toEqual(Object.keys(en).sort())
+    for (const key of Object.keys(en) as Array<keyof typeof en>) {
+      expect(en[key], `English: ${key}`).toBeTruthy()
+      expect(es[key], `Spanish: ${key}`).toBeTruthy()
+      expect(zhCN[key], `Chinese: ${key}`).toBeTruthy()
     }
   })
 })
