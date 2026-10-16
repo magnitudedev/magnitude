@@ -43,6 +43,10 @@ const changeEvent = "magnitude-language-change"
 export function useI18n() {
   const [language, setLanguageState] = useState<Language>(() => readLanguage())
   useEffect(() => {
+    document.documentElement.lang = language
+    document.documentElement.dir = language === "ur" ? "rtl" : "ltr"
+  }, [language])
+  useEffect(() => {
     const sync = () => setLanguageState(readLanguage())
     window.addEventListener("storage", sync)
     window.addEventListener(changeEvent, sync)
