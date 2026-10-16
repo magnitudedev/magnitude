@@ -6,7 +6,7 @@ import { pageLayout } from "./components/page-layout"
 import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
-import { useI18n, isLanguage } from "./i18n"
+import { useI18n, isLanguage, type MessageKey } from "./i18n"
 import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
 import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
@@ -75,6 +75,7 @@ const moveModelsCommand = (platform: string, from: string, to: string) => platfo
   ? `robocopy "${from}" "${to}" /E /MOVE`
   : `mv "${from}/"* "${to}/"`
 const pageNames: Record<ApplicationPage, string> = { discover: "Discover", catalog: "Catalog", models: "My Models", connections: "Connections", usage: "Usage", status: "Status", settings: "Settings" }
+function T({ k }: { k: MessageKey }) { const { t } = useI18n(); return t(k) }
 function localizedPageName(page: ApplicationPage, t: (key: import("./i18n").MessageKey) => string) {
   const keys = { discover: "discover", catalog: "catalog", models: "myModels", connections: "connections", usage: "usage", status: "status", settings: "settings" } as const
   return t(keys[page])
@@ -88,19 +89,19 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
       <div className={radar ? "space-y-5" : "contents"}>
       <div className="min-w-0 space-y-5">
         <dl className="flex flex-wrap gap-x-8 gap-y-3">
-          <div><dt className="text-xs text-slate-500">License</dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
-          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500">Context window</dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
+          <div><dt className="text-xs text-slate-500"><T k="license" /></dt><dd className="mt-1">{Option.getOrElse(model.presentation.license, () => "Not specified")}</dd></div>
+          {serving._tag === "Assessed" && <div><dt className="text-xs text-slate-500"><T k="contextWindow" /></dt><dd className="mt-1">{serving.assessment.profile.contextLength.toLocaleString()} tokens</dd></div>}
           {serving._tag === "Assessed" && serving.capabilities.vision && <div className="self-end"><TooltipProvider><ActionTooltip label="Supports vision" trigger={<button type="button" aria-label="Supports vision" className="rounded p-1 text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:hover:text-slate-200"><EyeIcon aria-hidden="true" className="size-4" /></button>} /></TooltipProvider></div>}
         </dl>
-        {model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500">Sources</p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
+        {model.presentation.sourceUrls.length > 0 && <div><p className="mb-2 text-xs text-slate-500"><T k="sources" /></p><div className="flex flex-wrap gap-x-4 gap-y-2">{model.presentation.sourceUrls.map(url => {
           const source = new URL(url)
           const label = source.hostname === "huggingface.co" ? `Hugging Face · ${source.pathname.split("/")[1]}` : source.hostname.replace(/^www\./, "")
           return <a className="inline-flex items-center gap-1 text-sm text-slate-600 hover:underline dark:text-slate-300" key={url} href={url} title={url} target="_blank" rel="noreferrer">{label}<ArrowUpRightIcon aria-hidden="true" className="size-3.5" /></a>
         })}</div></div>}
       </div>
-      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500">Assessment</p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
+      {serving._tag === "Failed" && <div className="min-w-0"><p className="mb-1 text-xs text-slate-500"><T k="assessment" /></p><p className="break-words text-slate-600 dark:text-slate-300">{serving.failure.message}</p></div>}
       {serving._tag === "Assessed" && serving.assessment._tag === "Fits" && <div className="min-w-0">
-        <p className="mb-1 flex items-center gap-1.5 font-medium">Estimated speed on your machine<SpeedInfo /></p>
+        <p className="mb-1 flex items-center gap-1.5 font-medium"><T k="estimatedSpeed" /><SpeedInfo /></p>
         <p className="text-sm tabular-nums">{performanceRangeSpeedLabel(serving.assessment.performance, serving.assessment.profile.contextLength)}</p>
         <p className="mt-1 text-xs text-slate-500">{localModelSpeedNote}</p>
       </div>}
@@ -110,7 +111,7 @@ function ModelDetails({ model, radar = false, open, contentId, compact = false }
   )
   if (open !== undefined) return open ? <div id={contentId}>{content}</div> : null
   return <details className="group mt-4 text-sm">
-    <summary className="flex cursor-pointer list-none items-center justify-end gap-1 rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 [&::-webkit-details-marker]:hidden">Model details<CaretDownIcon aria-hidden="true" className="size-4 group-open:rotate-180" /></summary>
+    <summary className="flex cursor-pointer list-none items-center justify-end gap-1 rounded py-1 text-slate-600 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-300 [&::-webkit-details-marker]:hidden"><T k="modelDetails" /><CaretDownIcon aria-hidden="true" className="size-4 group-open:rotate-180" /></summary>
     {content}
   </details>
 }
@@ -160,7 +161,7 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false, l
     const downloading = progress.stage === "downloading"
     const rate = downloading ? Option.getOrNull(progress.bytesPerSecond) : null
     heading = stages[progress.stage]
-    title = downloading ? <><span className="shrink-0">Downloading</span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{heading}</span>
+    title = downloading ? <><span className="shrink-0"><T k="downloading" /></span><span className="min-w-0 flex-1 truncate" title={modelName}>{modelName}</span></> : <span className="min-w-0 flex-1 truncate">{heading}</span>
     detail = `${formatStorageSize(progress.completedBytes)} / ${progress.totalBytes > 0 ? formatStorageSize(progress.totalBytes) : "Unknown total"}`
     percent = progress.totalBytes > 0 ? progress.completedBytes / progress.totalBytes * 100 : null
     downloadWidth = percent ?? 100
@@ -202,7 +203,7 @@ function DownloadProgress({ acquisition, modelName, onCancel, pending = false, l
     </h3>
     {progressBar}
     <div className="mt-3 flex items-baseline justify-between gap-3 text-sm tabular-nums text-slate-600 dark:text-slate-300"><span className="min-w-0 truncate">{detail}</span><span>{percentText}</span></div>
-    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div className="min-w-0"><dt className="text-xs text-slate-500 dark:text-slate-400">{stat.label}</dt><dd className="mt-1 truncate font-medium tabular-nums text-slate-800 dark:text-slate-200" title={stat.value}>{stat.value}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400">Time remaining</dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{remaining}</dd></div></dl>
+    <dl className="mt-6 grid grid-cols-2 gap-4 text-sm"><div className="min-w-0"><dt className="text-xs text-slate-500 dark:text-slate-400">{stat.label}</dt><dd className="mt-1 truncate font-medium tabular-nums text-slate-800 dark:text-slate-200" title={stat.value}>{stat.value}</dd></div><div className="text-right"><dt className="text-xs text-slate-500 dark:text-slate-400"><T k="timeRemaining" /></dt><dd className="mt-1 font-medium tabular-nums text-slate-800 dark:text-slate-200">{remaining}</dd></div></dl>
     {onCancel && <div className="mt-7 flex justify-center">{cancelButton("")}</div>}
   </div>
 }
@@ -258,9 +259,9 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
   return <TooltipProvider><div className="contents">
     <div className="flex flex-wrap items-center justify-end gap-2">{children}
       {transferring ? null : !installed ? downloadFailure ? null : <Button disabled={pending || model.catalogData.support._tag !== "Supported" || model.servingState._tag !== "Assessed" || model.servingState.assessment._tag !== "Fits"} onClick={() => { install(model.modelId) }}><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <>
-        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon />Connect Agent</Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button> : loadNotice ? null : <LoadModelButton model={model} pending={pending} onLoad={requestLoad} />)}
+        {model.catalogData.support._tag === "Supported" && (onConnectAgent ? <Button className="min-w-28" disabled={pending} onClick={onConnectAgent}><PlugIcon /><T k="connectAgent" /></Button> : canStop ? <Button className="min-w-28" variant="outline" disabled={stopping.pending} onClick={() => stop()}><SquareIcon /><T k="stopModel" /></Button> : loadNotice ? null : <LoadModelButton model={model} pending={pending} onLoad={requestLoad} />)}
         {!onConnectAgent && <RemoveDownloadButton model={model} running={canStop} disabled={pending} onRemove={() => remove(model.modelId)} />}
-        {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <ActionTooltip label="New files are available for this model, usually an updated drafter for faster responses." trigger={<Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}>Update</Button>} />}
+        {model.catalogData.support._tag === "Supported" && acquisition._tag === "UpdateAvailable" && <ActionTooltip label="New files are available for this model, usually an updated drafter for faster responses." trigger={<Button variant="outline" disabled={pending} onClick={() => install(model.modelId)}><T k="update" /></Button>} />}
       </>}
 
     </div>
@@ -269,11 +270,11 @@ function ModelControls({ model, replacing, children, onConnectAgent, inlineLoadF
     {stoppedForMemory && !command.pendingOperations.includes("load") && <ErrorNotice severity="warning" title={MODEL_STOPPED_FOR_MEMORY_MESSAGE} description="It was stopped to keep your other apps running. Quit apps you aren’t using before loading it again." className="col-span-full mt-3" />}
     {model.catalogData.support._tag === "Disabled" && <ErrorNotice severity="warning" title="This model is unavailable" description="Choose another model from Catalog." className="col-span-full mt-3" />}
     {downloadFailure && <ErrorNotice {...downloadNotice(downloadFailure)} className="col-span-full mt-3" actions={<>
-      {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}>Retry download</NoticeAction>}
-      <NoticeAction disabled={pending} onClick={() => dismiss(model.modelId)}>Dismiss</NoticeAction>
+      {canDownload && <NoticeAction disabled={pending} onClick={() => install(model.modelId)}><T k="retryDownload" /></NoticeAction>}
+      <NoticeAction disabled={pending} onClick={() => dismiss(model.modelId)}><T k="dismiss" /></NoticeAction>
     </>} />}
     {acquisition._tag === "RemoveFailed" && <ErrorNotice {...modelRemovalNotice(acquisition.failure)} className="col-span-full mt-3" />}
-    {loadNotice && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadNotice} actions={model.catalogData.support._tag === "Supported" && loadNotice.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}>Load again</NoticeAction> : undefined} /></div>}
+    {loadNotice && <div className="col-span-full mt-3"><ModelLoadNotice failure={loadNotice} actions={model.catalogData.support._tag === "Supported" && loadNotice.retryable && !onConnectAgent ? <NoticeAction disabled={pending} onClick={requestLoad}><T k="loadAgain" /></NoticeAction> : undefined} /></div>}
     {command.failures.map(failure => <ErrorNotice key={failure.operation} {...modelCommandNotice(failure)} className="col-span-full mt-3" />)}
     {replacing && <ConfirmDialog open={confirmingLoad} onOpenChange={setConfirmingLoad} title={`Load ${formatLocalModelDisplayName(model)}?`}
       description={`Loading ${formatLocalModelDisplayName(model)} will stop ${replacing}.`} confirmLabel="Load model" onConfirm={() => load(model.modelId)} />}
@@ -294,7 +295,7 @@ function ModelCard({ model, models, showMemory = false, replacing, hardware }: {
   const [detailsOpen, setDetailsOpen] = useState(false)
   const detailsId = useId()
   const deprecation = localModelDeprecation(model)
-  const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}>Details<CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
+  const detailsToggle = <Button variant="ghost" aria-expanded={detailsOpen} aria-controls={detailsId} onClick={() => setDetailsOpen(value => !value)}><T k="details" /><CaretDownIcon aria-hidden="true" className={`size-4 ${detailsOpen ? "rotate-180" : ""}`} /></Button>
   const acquisition = model.acquisitionState
   const residency = "residencyState" in acquisition ? acquisition.residencyState : undefined
   const statusLabel = acquisition._tag === "Removing" ? "Removing…" : acquisition._tag === "RemoveFailed" ? "Removal failed" : residency?._tag === "Ready" ? "Loaded" : residency?._tag === "Unloaded" || residency?._tag === "Stopped" ? "Downloaded" : residency?._tag === "Failed" ? "Not loaded" : residency?._tag === "Requested" ? "Preparing…" : residency?._tag === "Loading" ? describeModelLoadStage(residency.stage, residency.plannedAllocation, hardware) : residency?._tag ?? (acquisition._tag === "NotInstalled" ? "" : acquisition._tag === "InstallFailed" ? "Not downloaded" : acquisition._tag === "UpdateFailed" ? "Update incomplete" : acquisition._tag === "UpdateAvailable" ? "Update available" : acquisition._tag)
@@ -322,8 +323,8 @@ function SelectedRecommendation({ model, active }: { model: CatalogLocalModel; a
     <div className={transferring ? "invisible" : undefined} inert={transferring} aria-hidden={transferring}>
     <div className={pageLayout.recommendationToolbar}>
     <div className="flex items-center gap-1" aria-label="Model information">
-      <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}>Profile</Button>
-      <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}>Details</Button>
+      <Button variant={view === "profile" ? "secondary" : "ghost"} aria-pressed={view === "profile"} onClick={() => setView("profile")}><T k="profile" /></Button>
+      <Button variant={view === "details" ? "secondary" : "ghost"} aria-pressed={view === "details"} onClick={() => setView("details")}><T k="details" /></Button>
     </div>
       {transferring ? <Button disabled><DownloadSimpleIcon />Download ({formatStorageSize(model.storageBytes).replace(/\s/g, "")})</Button> : <ModelControls model={model} inlineLoadFailure={false} onConnectAgent={() => connectAgent()} {...(Option.isSome(active) && active.value.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.value.model) } : {})} />}
     </div>
@@ -435,7 +436,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
             <SelectContent>{[<SelectItem key="any" value={null}><LabOption lab={null} /></SelectItem>, ...labOptions.map(option => <SelectItem key={option.name} value={option}><LabOption lab={option} /></SelectItem>)]}</SelectContent>
           </Select>
           <Select items={sortOptions} value={sort} onValueChange={value => { if (value !== null) setSort(value) }}>
-            <SelectTrigger aria-label="Sort models"><span className="text-slate-500">Sort:</span><SelectValue /></SelectTrigger>
+            <SelectTrigger aria-label="Sort models"><span className="text-slate-500"><T k="sort" /></span><SelectValue /></SelectTrigger>
             <SelectContent>{sortOptions.map(option => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
           </Select>
         </div>
@@ -453,7 +454,7 @@ function Models({ page }: { page: "discover" | "catalog" | "models" }) {
     <div className="grid items-start gap-5">{visible.map(model => <ModelCard key={model.modelId} model={model} models={models} showMemory={installedOnly} hardware={Result.value(hardware)} {...(active && active.model.modelId !== model.modelId ? { replacing: formatLocalModelDisplayName(active.model) } : {})} />)}</div>
     {visible.length === 0 && <p className="py-8 text-slate-500">{search.trim() || filter !== "all" || lab !== null ? "No models match your search or filter." : installedOnly ? "No models downloaded yet. Find one in Discover." : "No models match this filter."}</p>}
     </>}
-    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500">No fitting recommendations right now. Explore Catalog for memory and speed details.</p>}
+    {discover && ranked.length === 0 && !recommendationsPending && Result.isSuccess(hardware) && <p className="py-8 text-slate-500"><T k="noRecommendations" /></p>}
   </>
 }
 function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; selectedModel: Option.Option<ProviderModelId> }) {
@@ -481,7 +482,7 @@ function Connections({ serviceReady, selectedModel }: { serviceReady: boolean; s
   const defaultModel = commandModels.find(model => model.id === active)?.id ?? commandModels[0]?.id
   return <>
     {!serviceReady && <p className="mt-5 text-sm text-slate-500">{desktop ? "Configuration checks are available. Start the service from Status before connecting a harness." : "Start the service from Status before setting up an agent."}</p>}
-    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}>Discover models</NoticeAction>} />}
+    {serviceReady && !canConnect && !Result.isInitial(models) && <ErrorNotice severity={Result.isFailure(models) ? "error" : "info"} title={Result.isFailure(models) ? "Couldn’t check available models" : "Download a model to connect an agent"} description={Result.isFailure(models) ? "Check the service on Status." : "Choose a compatible model. It doesn’t need to be loaded."} className="mt-5" actions={!Result.isFailure(models) && <NoticeAction onClick={() => navigate("discover")}><T k="discoverModels" /></NoticeAction>} />}
     {desktop
       ? <DesktopHarnessConnections canConnect={canConnect} models={commandModels} defaultModel={defaultModel} platform={platform} selectedModel={selectedModel} />
       : Option.isSome(apiOrigin) && <HarnessSetupList defaultModel={defaultModel} origin={apiOrigin.value} remote={remote} platform={viewerPlatform()} />}
@@ -535,7 +536,7 @@ function ModelStatus() {
   const presentation = Result.isSuccess(models) ? modelTrayPresentation(models.value) : null
   const active = Result.isSuccess(models) ? Option.getOrUndefined(activeLocalModel(models.value)) : undefined
   if (Result.isInitial(models)) return <LoadingRegion label="Loading model status" className="mt-5"><div className="flex h-12 items-center gap-3"><SkeletonLine className="h-6 w-64" /></div></LoadingRegion>
-  if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400">No model is loaded yet. It will load automatically on the first request.</p></div>
+  if (Result.isSuccess(models) && !active) return <div className="mt-5 flex min-h-12 items-center"><p className="m-0 text-base text-slate-500 dark:text-slate-400"><T k="noModelLoaded" /></p></div>
   return <div className="mt-5">
     <div className="flex min-h-12 items-center justify-between gap-5">
       <div className="flex min-w-0 items-center gap-3">
@@ -545,7 +546,7 @@ function ModelStatus() {
           {active && <><span aria-hidden="true" className="text-slate-400 dark:text-slate-500">·</span><span className={`shrink-0 text-xs ${active.residency._tag === "Ready" ? "text-green-700 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>{modelStatusText(active.residency, Result.isSuccess(hardware) ? Option.some(hardware.value) : Option.none())}</span></>}
         </div>
       </div>
-      {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon />Stop model</Button>}
+      {presentation?.canStop && <Button variant="outline" className="hover:border-red-300 hover:text-red-600 dark:hover:border-red-800 dark:hover:text-red-400" disabled={stopping.pending} onClick={() => stop()}><SquareIcon /><T k="stopModel" /></Button>}
     </div>
     {active && Option.match(loadFraction(active.residency), {
       onNone: () => null,
@@ -578,17 +579,17 @@ function Status({ observation }: { observation: ServiceObservation }) {
   return <div className={pageLayout.statusStack}>
     <section aria-busy={!snapshot} aria-label={!snapshot ? "Loading service status" : undefined} className={pageLayout.statusHero}>
       <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4 dark:border-slate-700">
-        <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300">Magnitude service</h2>
+        <h2 className="m-0 text-base font-medium text-slate-600 dark:text-slate-300"><T k="magnitudeService" /></h2>
         <div className={`flex h-8 items-center gap-2 rounded-full px-3 text-sm font-medium ${ready ? "bg-green-200/20 text-green-700 dark:bg-green-800/20 dark:text-green-400" : "text-slate-500 dark:text-slate-400"}`}>
           {ready ? <CheckCircleIcon aria-label="Service ready" weight="fill" className="size-5 shrink-0" /> : <PulseIcon className="size-4 shrink-0" />}
           <span>{!snapshot ? <SkeletonLine className="h-4 w-16 text-xs" /> : ready ? "Ready" : service?._tag === "CleanupFailed" ? "Cleanup needs attention" : service?._tag === "Failed" ? "Unavailable" : "Starting"}</span>
         </div>
       </div>
-      {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500">Starting the service…</p>}
+      {ready ? <ModelStatus /> : !snapshot ? <SkeletonLine className="mt-5 h-12 w-64" /> : service?._tag === "Failed" || service?._tag === "CleanupFailed" ? null : <p className="mt-5 text-sm text-slate-500"><T k="startingService" /></p>}
       {ready && <DownloadActivity />}
       {service && "message" in service && <ErrorNotice className="mt-5" title={service._tag === "CleanupFailed" ? "Couldn’t confirm the service has stopped" : "The service couldn’t start"}
         description={service._tag === "CleanupFailed" ? "Some background work may still be running. Quit Magnitude to retry cleanup." : service.message}
-        actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}>Retry service</NoticeAction> : undefined} />}
+        actions={service._tag === "Failed" && observation.canRetry ? <NoticeAction disabled={retrying.waiting} onClick={() => retry()}><T k="retryService" /></NoticeAction> : undefined} />}
       {Result.isFailure(retrying) && !retrying.waiting && service?._tag !== "Failed" && service?._tag !== "Ready" && <ErrorNotice title="Couldn’t retry the service" className="mt-3" />}
     </section>
     <MemoryBreakdown />
@@ -705,8 +706,8 @@ function ModelStorageRow() {
     <SettingsRow label={useI18n().t("modelStorage")} alert={!busy && failure ? <ErrorNotice title="The model folder wasn’t saved" description={Option.getOrElse(refusal, () => "Check that the folder is available and writable, then try again.")} /> : Result.isFailure(settings) ? <ErrorNotice title="Couldn’t read the model folder setting" description="The folder used by the running service has not been changed." /> : current && Option.isSome(current.warning) ? <ErrorNotice severity="warning" title="The saved model folder can’t be used" description="Magnitude is using the default folder instead. Choose a folder the Magnitude service can write to." /> : undefined}
       hint={current ? <span className="block truncate" title={current.path}>Current path is <span className="text-slate-700 dark:text-slate-300" data-testid="model-storage-path">{current.path}</span>{current.source === "Default" && " (default)"}</span>  : Result.isInitial(settings) ? <SkeletonLine className="h-4 text-xs" width="220px" /> : undefined}
       control={<>
-        {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}>Use default</Button>}
-        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => setChoosing(true)}><FolderOpenIcon />Change…</Button>
+        {(current?.source === "Configured" || (current && Option.isSome(current.warning))) && <Button size="sm" variant="ghost" disabled={busy} onClick={() => save({ path: Option.none() })}><T k="useDefault" /></Button>}
+        <Button size="sm" variant="outline" disabled={!current || busy} onClick={() => setChoosing(true)}><FolderOpenIcon /><T k="change" /></Button>
       </>} />
   </>
 }
@@ -735,9 +736,9 @@ function RestartRequiredToast() {
     <ErrorNotice severity={Result.isFailure(relaunching) && !relaunching.waiting ? "error" : "info"}
       title={Result.isFailure(relaunching) && !relaunching.waiting ? "Magnitude couldn’t restart" : "Restart to apply your changes"}
       description={supports("RestartService") ? reason : `${reason} Restart the Magnitude server to apply them.`}
-      actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}>Restart Magnitude</NoticeAction> : undefined}>
+      actions={supports("RestartService") ? <NoticeAction disabled={relaunching.waiting} onClick={() => relaunch()}><T k="restartMagnitude" /></NoticeAction> : undefined}>
       {storagePending && storageValue && <details className="mt-2 text-xs text-slate-600 dark:text-slate-400">
-        <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500">Moving existing models</summary>
+        <summary className="w-fit cursor-pointer rounded py-0.5 hover:underline focus-visible:outline-2 focus-visible:outline-blue-500"><T k="movingModels" /></summary>
         <p className="my-2">Existing downloads stay in the previous folder. To move them, quit Magnitude, run this command, then open Magnitude again.</p>
         <CopyCommand command={moveModelsCommand(platform, storageValue.active, storageValue.path)} label="Copy move command" />
       </details>}
@@ -768,7 +769,7 @@ function NetworkAccessRows() {
         control={<Select items={[{ value: ALL_INTERFACES, label: "All interfaces" }, ...current.interfaces.map(entry => ({ value: entry.address, label: `${entry.address} (${entry.kind === "tailscale" ? "Tailscale" : entry.name})` }))]}
           value={Option.getOrElse(current.bind, () => ALL_INTERFACES)} onValueChange={value => value === ALL_INTERFACES || value === null ? update({ bind: Option.some<NetworkBind>({ _tag: "AllInterfaces" }) }) : disconnect.warn("ChangeAddress", () => update({ bind: Option.some<NetworkBind>({ _tag: "Address", address: String(value) }) }))}>
           <SelectTrigger aria-label="Network address" className="min-w-56"><SelectValue /></SelectTrigger>
-          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}>All interfaces</SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
+          <SelectContent>{[<SelectItem key={ALL_INTERFACES} value={ALL_INTERFACES}><T k="allInterfacesLabel" /></SelectItem>, ...current.interfaces.map(entry => <SelectItem key={entry.address} value={entry.address}>{entry.address} ({entry.kind === "tailscale" ? "Tailscale" : entry.name})</SelectItem>)]}</SelectContent>
         </Select>} />
       <SettingsRow nested label="API key" hint={current.requireApiKey ? "Other devices must send this key as a Bearer token." : "Other devices can connect without a key. Only do this on a network you trust."}
         control={<><Button size="sm" variant="ghost" disabled={busy} onClick={() => disconnect.warn("RegenerateKey", () => regenerate({}))}>Regenerate</Button><span className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-400"><span aria-hidden="true">Require</span><Switch aria-label="Require API key" checked={current.requireApiKey} disabled={busy} onCheckedChange={checked => checked ? update({ requireApiKey: Option.some(true) }) : disconnect.warn("StopRequiringKey", () => update({ requireApiKey: Option.some(false) }))} /></span></>}>
@@ -836,9 +837,9 @@ function AboutRow() {
   const hasFailure = Boolean(actionFailure || checkFailed || current?._tag === "Failed" || current?._tag === "InstallationFailed")
   const busy = pending || checking.waiting || snapshot?.check._tag === "Checking"
   const actions = <>
-    {installable ? <><NoticeAction disabled={busy} onClick={() => restart()}>Retry update</NoticeAction><NoticeAction disabled={busy} onClick={() => discard()}>Discard download</NoticeAction></>
-      : current?._tag === "Available" ? <NoticeAction disabled={busy} onClick={() => download()}>Download update</NoticeAction>
-      : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}>Check for updates</NoticeAction> : null}
+    {installable ? <><NoticeAction disabled={busy} onClick={() => restart()}><T k="retryUpdate" /></NoticeAction><NoticeAction disabled={busy} onClick={() => discard()}><T k="discardDownload" /></NoticeAction></>
+      : current?._tag === "Available" ? <NoticeAction disabled={busy} onClick={() => download()}><T k="downloadUpdate" /></NoticeAction>
+      : current && !["Unavailable", "Closed"].includes(current._tag) ? <NoticeAction disabled={busy} onClick={() => check()}><T k="checkUpdates" /></NoticeAction> : null}
   </>
   return <>{disconnect.dialog}<SettingsRow label={version} hint={Result.isInitial(observation) ? <SkeletonLine className="h-4 text-xs" width="160px" /> : message}
     alert={hasFailure && !busy ? <ErrorNotice
@@ -847,10 +848,10 @@ function AboutRow() {
         : snapshot?.check._tag === "Failed" ? snapshot.check.message
         : current?._tag === "Failed" ? current.message : "Check your connection before trying again."}
       actions={actions} /> : undefined}
-    control={hasFailure ? busy ? <span className="text-xs text-slate-500">Working…</span> : null : <>
-      {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}>Discard download</Button>}
-      {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}>Restart to update</Button>
-        : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}>Download update</Button>
+    control={hasFailure ? busy ? <span className="text-xs text-slate-500"><T k="working" /></span> : null : <>
+      {installable && <Button size="sm" variant="ghost" disabled={pending} onClick={() => discard()}><T k="discardDownload" /></Button>}
+      {installable ? <Button size="sm" disabled={pending} onClick={() => restart()}><T k="restartToUpdate" /></Button>
+        : current?._tag === "Available" ? <Button size="sm" disabled={pending} onClick={() => download()}><T k="downloadUpdate" /></Button>
         : current && !["Unavailable", "Closed"].includes(current._tag) ? <Button size="sm" variant="outline" disabled={busy} onClick={() => check()}>{busy ? "Checking…" : "Check for updates"}</Button>
         : null}
     </>} /></>
@@ -904,7 +905,7 @@ export function App() {
       : page === "usage" ? <ServingUsage />
       : page === "settings" ? <SettingsPage />
       : page === "connections" ? <Connections serviceReady={service?._tag === "Ready"} selectedModel={Option.none()} />
-      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}>Open Status</NoticeAction>} /></> : <ModelsSkeleton page={page} />)
+      : service?._tag !== "Ready" ? (service?._tag === "Failed" || service?._tag === "CleanupFailed" || Result.isFailure(observation.service) ? <>{page !== "discover" && <h1 className={pageLayout.pageTitle}>{pageNames[page]}</h1>}<ErrorNotice title="Magnitude needs your attention" description="The inference service is unavailable." className="mt-8" actions={<NoticeAction onClick={() => navigate("status")}><T k="openStatus" /></NoticeAction>} /></> : <ModelsSkeleton page={page} />)
       : page === "discover" || page === "catalog" || page === "models" ? <Models page={page} />
       : null}
   </AppShell></>
@@ -922,7 +923,7 @@ function CannotReachMagnitude() {
   const reconnecting = useAtomValue(reconnectAction)
   return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"
     description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
-    actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}>Reconnect</NoticeAction>} />
+    actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}><T k="reconnect" /></NoticeAction>} />
 }
 /** Messages raised by Electron main while this window exists, such as a link that couldn't open. */
 function HostNotices() {
@@ -932,7 +933,7 @@ function HostNotices() {
   if (notices.length === 0) return null
   return <div className="fixed bottom-4 left-4 z-50 flex w-96 max-w-[calc(100vw-2rem)] flex-col gap-2">
     {notices.map((notice, index) => <div key={index} className="rounded-lg bg-white shadow-md dark:bg-slate-850">
-      <ErrorNotice title={notice.title} description={notice.description} actions={<NoticeAction onClick={() => dismiss(notice)}>Dismiss</NoticeAction>} />
+      <ErrorNotice title={notice.title} description={notice.description} actions={<NoticeAction onClick={() => dismiss(notice)}><T k="dismiss" /></NoticeAction>} />
     </div>)}
   </div>
 }
