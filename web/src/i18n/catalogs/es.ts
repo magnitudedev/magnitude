@@ -384,4 +384,5 @@ export const es: { [K in keyof typeof en]: string } = {
   restart: "Reiniciar",
   configured: "Configurado",
   availableStatus: "Disponible",
+  minutesShort: "min",
 }
