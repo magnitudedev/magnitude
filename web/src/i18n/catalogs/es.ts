@@ -300,4 +300,6 @@ export const es: { [K in keyof typeof en]: string } = {
   cantReachMagnitude: "No se puede conectar con Magnitude",
   signedInFromAnotherDevice: "Se ha iniciado sesión desde otro dispositivo",
   couldNotSignOutTitle: "No se pudo cerrar la sesión",
+  downloading: "Descargando",
+  aboutMinutes: "Aproximadamente",
 }
