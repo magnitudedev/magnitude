@@ -897,6 +897,9 @@ function LanguageRow() {
         <SelectItem value="fr">Français</SelectItem>
         <SelectItem value="de">Deutsch</SelectItem>
         <SelectItem value="ja">日本語</SelectItem>
+        <SelectItem value="pt">Português</SelectItem>
+        <SelectItem value="it">Italiano</SelectItem>
+        <SelectItem value="uk">Українська</SelectItem>
       </SelectContent>
     </Select>} />
 }
