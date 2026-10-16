@@ -649,4 +649,7 @@ export const ja = {
   korean: "韓国語",
   vietnamese: "ベトナム語",
   indonesian: "インドネシア語",
+  noModelsDownloaded: "モデルはまだダウンロードされていません。「見つける」でモデルを探してください。",
+  couldNotCheckAvailableModels: "利用可能なモデルを確認できませんでした",
+  restartServerToApply: "{reason} 変更を適用するには Magnitude サーバーを再起動してください。",
 } satisfies typeof en
