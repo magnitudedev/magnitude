@@ -1,8 +1,5 @@
-import { en } from "./en"
-
 /** Complete Bengali translations for the Magnitude message catalog. */
 export const bn = {
-  ...en,
   settings: "সেটিংস", general: "সাধারণ", about: "পরিচিতি", thisBrowser: "এই ব্রাউজার",
   language: "ভাষা", languageHint: "এই ব্রাউজার বা ডেস্কটপ অ্যাপে Magnitude-এর ভাষা বেছে নিন।",
   english: "ইংরেজি", spanish: "স্প্যানিশ", chineseSimplified: "সরলীকৃত চীনা",
@@ -633,4 +630,4 @@ export const bn = {
   snug: "কম জায়গার",
   tight: "খুব আঁটসাঁট",
   none: "কোনোটিই নয়",
-} satisfies Partial<typeof en>
+} satisfies typeof en
