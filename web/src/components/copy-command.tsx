@@ -5,6 +5,10 @@ import { useMemo, useRef, useState } from "react"
 import { CopyIcon, CheckIcon } from "@phosphor-icons/react"
 import { writeClipboardText } from "../lib/clipboard"
 
+import { readLanguage, translate } from "../i18n"
+
+const tr = (key: Parameters<typeof translate>[1]) => translate(readLanguage(), key)
+
 /** A command shown inline; the whole control copies it and highlights on hover. */
 export function CopyCommand({ command, label, multiline = false }: { command: string; label: string; multiline?: boolean }) {
   const [copied, setCopied] = useState(false)
@@ -25,7 +29,7 @@ export function CopyCommand({ command, label, multiline = false }: { command: st
       <code className={`min-w-0 flex-1 text-xs text-slate-800 dark:text-slate-200 ${multiline ? "whitespace-pre-wrap leading-5 [overflow-wrap:anywhere]" : "truncate"}`}>{command}</code>
       {copied ? <CheckIcon aria-hidden="true" className="size-4 shrink-0 text-green-500" /> : <CopyIcon aria-hidden="true" className="size-4 shrink-0" />}
     </button>
-    {copied && <span role="status" className="sr-only">Command copied</span>}
-    {failed && <ErrorNotice title="Couldn’t copy to the clipboard" className="mt-2" actions={<NoticeAction onClick={copy}>Copy again</NoticeAction>} />}
+    {copied && <span role="status" className="sr-only">{tr("commandCopied")}</span>}
+    {failed && <ErrorNotice title={tr("couldNotCopyClipboard")} className="mt-2" actions={<NoticeAction onClick={copy}>{tr("copyAgain")}</NoticeAction>} />}
   </div>
 }
