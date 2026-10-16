@@ -19,9 +19,29 @@ const hardwareLabelKeys: Record<string, MessageKey> = {
   "Laptop": "laptop", "Gaming laptop": "gamingLaptop", "Gaming tablet": "gamingTablet",
   "Mobile workstation": "mobileWorkstation", "Mini PC": "miniPc", "AI mini PC": "aiMiniPc",
   "Desktop": "desktop", "Workstation": "workstation", "All-in-one": "allInOne",
-  "Server": "server", "Graphics card": "graphicsCard", "Unknown": "unknown",
+  "Server": "server", "Graphics card": "graphicsCard", "Unknown": "unknown", "Unknown processor": "unknownProcessor", "Chip": "chip", "CPU": "cpuLabel", "GPU": "gpuLabel",
+  "Memory bandwidth (spec)": "memoryBandwidthSpec", "CPU core options (spec)": "cpuCoreOptionsSpec", "Neural Engine cores (spec)": "neuralEngineCoresSpec", "GPU cores (spec)": "gpuCoresSpec", "CUDA cores (spec)": "cudaCoresSpec", "GPU compute units (spec)": "gpuComputeUnitsSpec", "CPU cores / processor (spec)": "cpuCoresProcessorSpec", "Xe cores (spec)": "xeCoresSpec", "Stream processors (spec)": "streamProcessorsSpec", "GPU architecture (spec)": "gpuArchitectureSpec",
 }
 const localizeHardwareLabel = (label: string) => hardwareLabelKeys[label] ? tr(hardwareLabelKeys[label]!) : label
+function localizeHardwareDetail(detail: string): string {
+  const normalized = detail.replace(/ \(spec\)/g, "")
+  const exact: Record<string, MessageKey> = {
+    "Shares unified memory": "sharesUnifiedMemory",
+    "Shares system RAM": "sharesSystemRam",
+    "Local acceleration": "localAcceleration",
+  }
+  if (exact[normalized]) return tr(exact[normalized]!)
+  if (normalized.endsWith(" VRAM")) return normalized.replace(/ VRAM$/, ` ${tr("vramLabel")}`)
+  if (normalized.endsWith(" acceleration")) return normalized.replace(/ acceleration$/, ` ${tr("acceleration")}`)
+  for (const [label, key] of Object.entries(hardwareLabelKeys)) {
+    const shortLabel = label.replace(/ \(spec\)/g, "")
+    if (normalized === shortLabel) return tr(key)
+    if (normalized.endsWith(` ${shortLabel}`)) {
+      return normalized.slice(0, -shortLabel.length) + tr(key)
+    }
+  }
+  return normalized
+}
 
 /** An estimated speed's small slate info icon, explaining what the estimate leaves out. */
 export function SpeedInfo() {
@@ -90,7 +110,7 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
       {Option.isSome(presentation.photo) && <div className="w-full max-w-[260px]"><HardwarePhotograph photo={presentation.photo.value} /></div>}
       <div className="min-w-0">
         <p className="text-xs font-medium uppercase tracking-widest text-slate-500 dark:text-slate-400">{localizeHardwareLabel(presentation.category)}{presentation.cpuInference ? ` · ${tr("cpuInference")}` : ""}</p>
-        <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => tr("yourComputer")) : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => "Your computer")}</h2>
+        <h2 title={Option.isNone(presentation.deviceId) ? Option.getOrElse(presentation.name, () => tr("yourComputer")) : undefined} className={`mt-2 font-heading text-xl ${Option.isSome(presentation.deviceId) ? "break-words" : "truncate"}`}>{Option.getOrElse(presentation.name, () => tr("yourComputer"))}</h2>
         <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(min(100%,220px),1fr))] gap-x-6 gap-y-4">
           {presentation.groups.map(group => {
             const Icon = group.label === "Memory" ? MemoryIcon : group.label.startsWith("GPU") ? CircuitryIcon : CpuIcon
@@ -100,8 +120,8 @@ export function HardwareSummary({ identity, value }: { identity: MachineIdentity
                 <p className="m-0 text-xs font-medium leading-tight text-slate-500 dark:text-slate-400">{group.label === "Memory" ? tr("memory") : localizeHardwareLabel(group.label)}</p>
               </div>
               <div className="min-w-0">
-                <p title={group.truncateName ? group.name : undefined} className={`mb-0 mt-1 text-sm font-semibold leading-snug ${group.truncateName ? "truncate" : "break-words"}`}>{group.name}</p>
-                <div className="mt-1 flex flex-col gap-0.5">{group.details.map(detail => <p key={detail} className="m-0 text-xs leading-snug text-slate-500 dark:text-slate-400">{detail.replace(/ \(spec\)/g, "")}</p>)}</div>
+                <p title={group.truncateName ? group.name : undefined} className={`mb-0 mt-1 text-sm font-semibold leading-snug ${group.truncateName ? "truncate" : "break-words"}`}>{localizeHardwareLabel(group.name)}</p>
+                <div className="mt-1 flex flex-col gap-0.5">{group.details.map(detail => <p key={detail} className="m-0 text-xs leading-snug text-slate-500 dark:text-slate-400">{localizeHardwareDetail(detail)}</p>)}</div>
               </div>
             </div>
           })}
