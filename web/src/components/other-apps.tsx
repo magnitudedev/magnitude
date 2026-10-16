@@ -45,7 +45,7 @@ export function OtherApps({ origin, model, platform, remote = false, networkAcce
         </div>
         {showExample && <div id="other-apps-example" className="mt-3"><CopyCommand multiline command={exampleRequest(baseUrl, model ?? "MODEL_ID", platform, remote)} label={tr("copyExampleRequest")} /></div>}
       </div>
-      <p className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750">{remote ? "tr("remoteCopyKeyIntro") : networkAccess ? "tr("otherDeviceKeyIntro") : "tr("turnOnNetworkIntro")}<button type="button" onClick={onOpenSettings} className={`${inlineLink} cursor-pointer`}>{tr("settings")}</button>.</p>
+      <p className="mt-4 border-t border-slate-200 pt-4 text-sm text-slate-500 dark:border-slate-750">{remote ? tr("remoteCopyKeyIntro") : networkAccess ? tr("otherDeviceKeyIntro") : tr("turnOnNetworkIntro")}<button type="button" onClick={onOpenSettings} className={`${inlineLink} cursor-pointer`}>{tr("settings")}</button>.</p>
     </article>
   </section>
 }
