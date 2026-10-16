@@ -862,7 +862,7 @@ function SignOutRow() {
   const action = useMemo(() => Atom.fn((_: void) => signOut(origin)), [origin])
   const run = useAtomSet(action)
   const signingOut = useAtomValue(action)
-  return <SettingsRow label="Signed in from another device" hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
+  return <SettingsRow label=tr("signedInFromAnotherDevice") hint={`This browser controls Magnitude at ${new URL(origin).host}.`}
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title=tr("couldNotSignOut") description=tr("checkDeviceReach") /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>{useI18n().t("signOut")}</Button>} />
 }
@@ -913,8 +913,8 @@ export function App() {
 }
 /** Shown while a browser's own retries run after its connection drops, as it does when Magnitude restarts. */
 function ReconnectingToMagnitude() {
-  return <ErrorNotice className="mt-8" severity="info" title="Reconnecting to Magnitude…"
-    description="The connection to the Magnitude service was interrupted, as it is when Magnitude restarts." />
+  return <ErrorNotice className="mt-8" severity="info" title=tr("reconnectingMagnitude")
+    description=tr("serviceRestartInterrupted") />
 }
 /** A browser cannot restart the service; it keeps retrying in the background, and Reconnect tries at once. */
 function CannotReachMagnitude() {
@@ -922,7 +922,7 @@ function CannotReachMagnitude() {
   const reconnectAction = useMemo(() => Atom.fn((_: void) => attempt), [attempt])
   const reconnect = useAtomSet(reconnectAction)
   const reconnecting = useAtomValue(reconnectAction)
-  return <ErrorNotice className="mt-8" title="Can’t reach Magnitude"
+  return <ErrorNotice className="mt-8" title=tr("cantReachMagnitude")
     description="This page can’t connect to the Magnitude service and keeps trying. Check that Magnitude is running on that computer and that this device can reach it."
     actions={<NoticeAction disabled={reconnecting.waiting} onClick={() => reconnect()}><T k="reconnect" /></NoticeAction>} />
 }
