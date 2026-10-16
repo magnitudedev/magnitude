@@ -2,12 +2,15 @@ import { useCallback, useEffect, useState } from "react"
 import { en } from "./catalogs/en"
 import { es } from "./catalogs/es"
 import { zhCN } from "./catalogs/zh-CN"
+import { hi } from "./catalogs/hi"
+import { ur } from "./catalogs/ur"
+import { bn } from "./catalogs/bn"
 
-export const LANGUAGES = ["en", "es", "zh-CN"] as const
+export const LANGUAGES = ["en", "es", "zh-CN", "hi", "ur", "bn"] as const
 export type Language = typeof LANGUAGES[number]
 export type MessageKey = keyof typeof en
 export const STORAGE_KEY = "magnitude.language"
-const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN }
+const catalogs: Record<Language, Record<MessageKey, string>> = { en, es, "zh-CN": zhCN, hi, ur, bn }
 
 export function isLanguage(value: unknown): value is Language {
   return typeof value === "string" && (LANGUAGES as readonly string[]).includes(value)
