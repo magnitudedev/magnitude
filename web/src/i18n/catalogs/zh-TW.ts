@@ -645,5 +645,7 @@ export const zhTW: { [K in keyof typeof en]: string } = {
   off: "關閉",
   request: "請求",
   appearanceCouldNotBeSaved: "無法在此瀏覽器中儲存外觀設定。",
+  computer: "電腦",
+  laptopTablet: "筆記型電腦／平板電腦",
   savedAppearanceReadError: "无法读取已儲存的外观設置。将使用系統外观。",
 }
