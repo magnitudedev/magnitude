@@ -48,7 +48,7 @@ describe("summarizeInferenceHardware", () => {
   const snapshot = (fields: Partial<InferenceSchema.HardwareSnapshot>): InferenceSchema.HardwareSnapshot => ({
     architecture: "x86_64", captured_at: 1, cpu_model: Option.some("AMD EPYC 7V13 64-Core Processor"), enabled_backends: ["cpu", "cuda", "vulkan"],
     logical_cores: 12, memory_domains: [], native_build: "test", physical_cores: Option.some(6), platform: "windows",
-    system_memory: { abort_reserve_bytes: 0, allocation_capacity_bytes: 0, allocation_headroom_bytes: 0, assess_reserve_bytes: 0, physical_available_bytes: 0, physical_capacity_bytes: 118111600640 },
+    system_memory: { abort_reserve_bytes: 0, allocation_capacity_bytes: 0, allocation_headroom_bytes: 0, physical_available_bytes: 0, physical_capacity_bytes: 118111600640 },
     system_product_name: Option.none(), topology_fingerprint: "f", backend_diagnostics: Option.none(), ...fields,
   })
   const cudaCard = domain({ id: "gpu-1", kind: "physical_device", total_capacity_bytes: 8589934592, devices: [
@@ -60,6 +60,17 @@ describe("summarizeInferenceHardware", () => {
     const summary = summarizeInferenceHardware(Option.some({ _tag: "Cuda", hardwareLabel: "NVIDIA A10-8Q" }), snapshot({ memory_domains: [cudaCard] }))
     expect(summary).toEqual({ backend: "cuda", gpuName: Option.some("NVIDIA A10-8Q"), gpuKind: Option.some("discrete"), gpuMemoryBytes: Option.some(8589934592), gpuCount: 1,
       gpuUnusedReason: Option.none(), cpuModel: Option.some("AMD EPYC 7V13 64-Core Processor"), cpuCores: Option.some(6), memoryBytes: 118111600640 })
+  })
+  it("prefers the exact active hardware label when multiple GPUs share a backend", () => {
+    const larger = domain({ id: "gpu-large", kind: "physical_device", total_capacity_bytes: 16_000_000_000, devices: [
+      device({ id: "cuda:0", backend: "cuda", name: "NVIDIA RTX 4090", kind: "gpu", memory_limit: Option.some({ kind: "recommended_working_set", total_bytes: 16_000_000_000, stable_bytes: 15_000_000_000, current_free_bytes: Option.none() }) }),
+    ] })
+    const active = domain({ id: "gpu-active", kind: "physical_device", total_capacity_bytes: 4_000_000_000, devices: [
+      device({ id: "cuda:1", backend: "cuda", name: "NVIDIA GeForce RTX 3050 Laptop GPU", kind: "gpu", memory_limit: Option.some({ kind: "recommended_working_set", total_bytes: 4_000_000_000, stable_bytes: 3_500_000_000, current_free_bytes: Option.none() }) }),
+    ] })
+    const summary = summarizeInferenceHardware(Option.some({ _tag: "Cuda", hardwareLabel: "NVIDIA GeForce RTX 3050 Laptop GPU" }), snapshot({ memory_domains: [larger, active] }))
+    expect([summary.backend, Option.getOrNull(summary.gpuName), Option.getOrNull(summary.gpuMemoryBytes)])
+      .toEqual(["cuda", "NVIDIA GeForce RTX 3050 Laptop GPU", 4_000_000_000])
   })
   it("explains an unused GPU from its own reason, then the backend diagnostic, then the selection policy", () => {
     const unavailable = domain({ id: "gpu-1", kind: "physical_device", total_capacity_bytes: 8589934592, devices: [
