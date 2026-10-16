@@ -6,6 +6,7 @@ import { pageLayout } from "./components/page-layout"
 import { RecommendationPreference } from "./components/model-preference-slider"
 import { ServingUsage } from "./components/serving-usage"
 import { setAppearancePreference, useAppearancePreference } from "./stores/appearance-store"
+import { useI18n, isLanguage } from "./i18n"
 import { ActionTooltip, TooltipProvider } from "./components/ui/tooltip"
 import { Button } from "./components/ui/button"
 import { Switch } from "./components/ui/switch"
@@ -858,16 +859,29 @@ function SignOutRow() {
     alert={Result.isFailure(signingOut) && !signingOut.waiting ? <ErrorNotice title="Couldn’t sign out" description="Check that this device can still reach Magnitude, then try again." /> : undefined}
     control={<Button size="sm" variant="outline" disabled={signingOut.waiting} onClick={() => run()}>Sign out</Button>} />
 }
+function LanguageRow() {
+  const { language, setLanguage, t } = useI18n()
+  return <SettingsRow label={t("language")} hint={t("languageHint")}
+    control={<Select value={language} onValueChange={value => { if (isLanguage(value)) setLanguage(value) }}>
+      <SelectTrigger className="w-48" aria-label={t("language")}><SelectValue /></SelectTrigger>
+      <SelectContent>
+        <SelectItem value="en">{t("english")}</SelectItem>
+        <SelectItem value="es">{t("spanish")}</SelectItem>
+        <SelectItem value="zh-CN">{t("chineseSimplified")}</SelectItem>
+      </SelectContent>
+    </Select>} />
+}
 function SettingsPage() {
   // A fresh mount observes hand edits; writes refresh in their own Effect actions.
   const client = useAgentClient()
   const { remote } = useRemoteAccess()
   const { storagePending, networkPending } = useRestartPending()
+  const { t } = useI18n()
   useAtomMount(useMemo(() => Atom.make(Effect.all([Atom.refresh(client.Configuration.GetModelStorage({})), Atom.refresh(client.Configuration.GetNetworkAccess({}))], { discard: true })), [client]))
   return <>
-    <SettingsGroup label="General"><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
-    <SettingsGroup label="About"><AboutRow /></SettingsGroup>
-    {remote && <SettingsGroup label="This browser"><SignOutRow /></SettingsGroup>}
+    <SettingsGroup label={t("general")}><LanguageRow /><ThemeRow /><LaunchAtLoginRow /><ModelStorageRow /><NetworkAccessRows /><AutomaticUpdatesRow /></SettingsGroup>
+    <SettingsGroup label={t("about")}><AboutRow /></SettingsGroup>
+    {remote && <SettingsGroup label={t("thisBrowser")}><SignOutRow /></SettingsGroup>}
     {(storagePending || networkPending) && <div aria-hidden="true" className="h-44" />}
   </>
 }
