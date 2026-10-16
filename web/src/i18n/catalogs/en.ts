@@ -616,4 +616,7 @@ export const en = {
   vramLabel: "VRAM",
   acceleration: "acceleration",
   unknownProcessor: "Unknown processor",
+  chip: "Chip",
+  cpuLabel: "CPU",
+  gpuLabel: "GPU",
 } as const
