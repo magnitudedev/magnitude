@@ -366,4 +366,8 @@ export const es: { [K in keyof typeof en]: string } = {
   local: "Local",
   remote: "Remoto",
   automaticDownloadHint: "Descargar actualizaciones en segundo plano cuando estén disponibles.",
+  startMagnitudeBackground: "Inicia Magnitude en segundo plano con su icono en la bandeja. La ventana permanecerá cerrada.",
+  loadingUpdateSettings: "Cargando ajustes de actualización",
+  applicationUpdates: "Actualizaciones de la aplicación",
+  detectingHardwareShort: "Detectando hardware",
 }
