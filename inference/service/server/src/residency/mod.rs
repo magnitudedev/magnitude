@@ -1085,7 +1085,7 @@ impl<D: ModelResidencyDriver> ModelResidency<D> {
                     model_id: loading.instance.model_id,
                     lifecycle: ModelInstanceLifecycle::Ready {
                         allocation: prepared.allocation.clone(),
-                        device: prepared.device.clone(),
+                        device: Some(prepared.device.clone()),
                     },
                 };
                 let mut ready = ReadyResidency {

@@ -656,7 +656,8 @@ pub enum ModelInstanceLifecycle {
     Ready {
         allocation: ModelInstanceAllocation,
         /// Device and backend confirmed by the inference worker after opening the model.
-        device: ModelLoadDevice,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device: Option<ModelLoadDevice>,
     },
     #[serde(rename_all = "camelCase")]
     Stopping {
