@@ -94,6 +94,7 @@ export const ActiveModelDeviceSchema = Schema.Struct({
   instanceId: NonEmptyString,
   modelId: NonEmptyString,
   deviceId: NonEmptyString,
+  deviceName: Schema.optional(NonEmptyString),
   backend: Schema.Literal("cpu", "metal", "cuda", "vulkan"),
 })
 export type ActiveModelDevice = typeof ActiveModelDeviceSchema.Type

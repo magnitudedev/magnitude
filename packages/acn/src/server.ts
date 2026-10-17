@@ -845,8 +845,10 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
       )
       const applicationContext = Context.merge(serviceContext, handlers)
       const observedInstances = Context.get(applicationContext, IcnInstances)
+      const observedHardware = Context.get(applicationContext, IcnHardware)
       readActiveModelDevices = () => Effect.gen(function* () {
         const snapshot = yield* observedInstances.get
+        const hardwareSnapshot = yield* observedHardware.get
         const active: ActiveModelDevice[] = []
         for (const instance of snapshot.instances) {
           if (instance.lifecycle._tag !== "Ready") continue
@@ -859,11 +861,18 @@ export const launchAcnServer = (options: AcnServerOptions, owner: AcnOwnerContro
           const device = lifecycle.device
           if (typeof device?.id !== "string"
             || !["cpu", "metal", "cuda", "vulkan"].includes(String(device.backend))) continue
+          const hardwareDevice = hardwareSnapshot.state.memory_domains
+            .flatMap(domain => domain.devices)
+            .find(candidate => candidate.id === device.id)
+          const deviceName = hardwareDevice === undefined
+            ? undefined
+            : [hardwareDevice.name, hardwareDevice.description].find(value => value.trim().length > 0)
           active.push({
             instanceId: instance.id,
             modelId: instance.modelId,
             deviceId: device.id,
             backend: device.backend as ActiveModelDevice["backend"],
+            ...(deviceName === undefined ? {} : { deviceName }),
           })
         }
         return active
