@@ -1266,6 +1266,7 @@ fn certify_head_family(
                     [GraphConstant::identity_value(class.entry_rows)?],
                 );
             }
+            family.include_plan(layout.plan_heap())?;
             layouts.insert(class, layout.clone());
         }
     }

@@ -197,6 +197,7 @@ fn print_breakdown(
             "host_table_bytes": charge.host_table_bytes,
             "sealed_graph_host_bytes": bounds.sealed_graph_host_bytes.at_most,
             "bound_graph_host_bytes": bounds.bound_graph_host_bytes,
+            "drafter_graph_host_bytes": bounds.drafter_graph_host_bytes,
             "host_runtime_bytes": host.runtime,
             "host_vocabulary_bytes": host.vocabulary,
             "host_program_bytes": host.programs,

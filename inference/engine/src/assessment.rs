@@ -286,11 +286,13 @@ pub fn assess_model(
 /// Prepare one package from its headers on the selected execution
 /// configuration: admission (every header refusal at once), the target's
 /// plain plan and its decode demand and checked memory charge, then the
-/// drafter's plan when one is admitted. A drafter is `Bound` with the
-/// serving bytes its plan adds to the plain plan's
-/// ([`magnitude_executor::AssessmentMemoryCharge::serving_bytes`], the
-/// device's allocation domain at the fit depth: the drafter's weights, state
-/// and prepared resources), and the drafted plan is the one assessed.
+/// drafter's plan when one is admitted. A drafter is `Bound` with what its
+/// plan adds to the plain plan's memory at the fit depth: its weights, state
+/// and prepared resources on the device
+/// ([`magnitude_executor::AssessmentMemoryCharge::serving_bytes`]) and the
+/// host memory of its kernels and graphs
+/// ([`magnitude_executor::AssessmentMemoryCharge::host_bytes`]); the drafted
+/// plan is the one assessed.
 pub fn prepare_model_assessment(
     package: &ModelPackagePaths,
     setup: &AssessmentSetup,
@@ -348,10 +350,14 @@ pub fn prepare_model_assessment(
     };
     let (drafter, draft, execution) = match drafted {
         Ok((method, draft, execution)) => {
-            let memory_bytes = execution
-                .memory_charge()
-                .serving_bytes
-                .saturating_sub(plain_execution.memory_charge().serving_bytes);
+            let held = |charge: &magnitude_executor::AssessmentMemoryCharge| {
+                charge
+                    .host_bytes()
+                    .map(|host| charge.serving_bytes.saturating_add(host))
+                    .map_err(ModelAssessmentError::Planning)
+            };
+            let memory_bytes = held(execution.memory_charge())?
+                .saturating_sub(held(plain_execution.memory_charge())?);
             (
                 DrafterVerdict::Bound {
                     method,

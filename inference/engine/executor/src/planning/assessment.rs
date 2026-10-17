@@ -65,6 +65,9 @@ pub struct AssessmentMemoryBounds {
     /// (`PlannedSealedGraphs::bound`): system RAM, held from the binding of
     /// the resident weights on, after the import.
     pub bound_graph_host_bytes: u64,
+    /// Host heap of the drafter's graphs
+    /// (`AssessmentGraphResourceBounds::drafter_graph_host_bytes`).
+    pub drafter_graph_host_bytes: u64,
     pub host_process: HostProcessBytes,
     pub device_process: DeviceProcessBytes,
 }
@@ -358,6 +361,11 @@ pub struct AssessmentGraphResourceBounds {
     /// stores them, exact from the classes the load prepares. Host memory,
     /// not part of `total_bytes`.
     pub sealed_state_graphs: seismic::HostHeap,
+    /// The host heap of the drafter's graphs (a head's, a shared head's or
+    /// a separate draft's): each class's sealed plan and the family's one
+    /// copy of each constant value, exact from the classes the load
+    /// prepares. Host memory, not part of `total_bytes`.
+    pub drafter_graph_host_bytes: u64,
 }
 
 impl AssessmentGraphResourceBounds {
@@ -404,104 +412,108 @@ impl AssessmentGraphResourceBounds {
             1,
             slots.readout,
         )?;
-        let (head, head_constant_bytes) = match (plan.head(), plan.draft(), state.head_state()) {
-            // A head reading target history keeps no state of its own.
-            (None, None, None) if plan.shared_head().is_some() => {
-                let shared = plan
-                    .shared_head()
-                    .ok_or("a shared head program is absent")?;
-                let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
-                    definition, state, shared,
-                )?;
-                let head_graph =
-                    crate::programs::native_shared_head::checked_shared_head_family_storage(
+        let (head, head_constant_bytes, drafter_graph_host_bytes) =
+            match (plan.head(), plan.draft(), state.head_state()) {
+                // A head reading target history keeps no state of its own.
+                (None, None, None) if plan.shared_head().is_some() => {
+                    let shared = plan
+                        .shared_head()
+                        .ok_or("a shared head program is absent")?;
+                    let geometry = crate::programs::native_shared_head::SharedHeadGeometry::new(
+                        definition, state, shared,
+                    )?;
+                    let head_graph =
+                        crate::programs::native_shared_head::checked_shared_head_family_storage(
+                            backend,
+                            load,
+                            &geometry,
+                            crate::programs::native_shared_head::shared_head_graph_classes(
+                                limits,
+                                method.draft_rows(),
+                            )?,
+                        )?;
+                    (
+                        Some(NativeGraphCharge::from_checked(
+                            head_graph.storage,
+                            1,
+                            slots.head,
+                        )?),
+                        head_graph.binding_constant_bytes,
+                        head_graph.host_heap.bytes,
+                    )
+                }
+                (None, Some(draft_plan), Some(head_state)) => {
+                    let draft = definition
+                        .draft
+                        .as_ref()
+                        .ok_or("a draft program without a draft")?;
+                    let geometry =
+                        crate::programs::native_draft::DraftGeometry::new(definition, head_state)?;
+                    let draft_graph = crate::programs::native_draft::checked_draft_family_storage(
                         backend,
                         load,
+                        draft_plan,
                         &geometry,
-                        crate::programs::native_shared_head::shared_head_graph_classes(
+                        crate::programs::native_draft::draft_graph_classes(
                             limits,
+                            method.draft_rows(),
+                            &method.block_widths(),
+                            draft,
+                        )?,
+                    )?;
+                    (
+                        Some(NativeGraphCharge::from_checked(
+                            draft_graph.storage,
+                            1,
+                            slots.head,
+                        )?),
+                        draft_graph.binding_constant_bytes,
+                        draft_graph.host_heap.bytes,
+                    )
+                }
+                (Some(head), None, Some(head_state)) => {
+                    let binding = *head.blocks().first().ok_or("head program has no block")?;
+                    let head = definition
+                        .head
+                        .as_ref()
+                        .ok_or("head graph requires a draft head")?;
+                    let head_block = crate::operators::CausalHeadBlock::of(
+                        head,
+                        head.blocks
+                            .first()
+                            .ok_or("head graph requires a draft head block")?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let history = head_state.sole_history()?;
+                    let history_rows =
+                        u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
+                    let head_graph = crate::programs::native_head::checked_head_family_storage(
+                        backend,
+                        load,
+                        &definition.decoder,
+                        head_block,
+                        binding,
+                        crate::programs::native_head::head_graph_classes(
+                            limits,
+                            history_rows,
+                            history.slab_rows,
+                            head_state.span_limit(),
                             method.draft_rows(),
                         )?,
                     )?;
-                (
-                    Some(NativeGraphCharge::from_checked(
-                        head_graph.storage,
-                        1,
-                        slots.head,
-                    )?),
-                    head_graph.binding_constant_bytes,
-                )
-            }
-            (None, Some(draft_plan), Some(head_state)) => {
-                let draft = definition
-                    .draft
-                    .as_ref()
-                    .ok_or("a draft program without a draft")?;
-                let geometry =
-                    crate::programs::native_draft::DraftGeometry::new(definition, head_state)?;
-                let draft_graph = crate::programs::native_draft::checked_draft_family_storage(
-                    backend,
-                    load,
-                    draft_plan,
-                    &geometry,
-                    crate::programs::native_draft::draft_graph_classes(
-                        limits,
-                        method.draft_rows(),
-                        &method.block_widths(),
-                        draft,
-                    )?,
-                )?;
-                (
-                    Some(NativeGraphCharge::from_checked(
-                        draft_graph.storage,
-                        1,
-                        slots.head,
-                    )?),
-                    draft_graph.binding_constant_bytes,
-                )
-            }
-            (Some(head), None, Some(head_state)) => {
-                let binding = *head.blocks().first().ok_or("head program has no block")?;
-                let head = definition
-                    .head
-                    .as_ref()
-                    .ok_or("head graph requires a draft head")?;
-                let head_block = crate::operators::CausalHeadBlock::of(
-                    head,
-                    head.blocks
-                        .first()
-                        .ok_or("head graph requires a draft head block")?,
-                )
-                .map_err(|error| error.to_string())?;
-                let history = head_state.sole_history()?;
-                let history_rows =
-                    u64::try_from(history.rows).map_err(|_| "head history rows exceed u64")?;
-                let head_graph = crate::programs::native_head::checked_head_family_storage(
-                    backend,
-                    load,
-                    &definition.decoder,
-                    head_block,
-                    binding,
-                    crate::programs::native_head::head_graph_classes(
-                        limits,
-                        history_rows,
-                        history.slab_rows,
-                        head_state.span_limit(),
-                        method.draft_rows(),
-                    )?,
-                )?;
-                (
-                    Some(NativeGraphCharge::from_checked(
-                        head_graph.storage,
-                        1,
-                        slots.head,
-                    )?),
-                    head_graph.binding_constant_bytes,
-                )
-            }
-            (None, None, None) => (None, 0),
-            _ => return Err("drafter program and state disagree".into()),
-        };
+                    (
+                        Some(NativeGraphCharge::from_checked(
+                            head_graph.storage,
+                            1,
+                            slots.head,
+                        )?),
+                        head_graph.binding_constant_bytes,
+                        head_graph.host_heap.bytes,
+                    )
+                }
+                (None, None, None) => (None, 0, 0),
+                _ => return Err("drafter program and state disagree".into()),
+            };
         let (vision, vision_constant_bytes) = match (plan.vision(), definition.vision.as_ref()) {
             (Some(vision_plan), Some(vision_definition)) => {
                 let patch_rows = crate::programs::native_vision::image_patch_classes(
@@ -571,6 +583,7 @@ impl AssessmentGraphResourceBounds {
             recorded_graph_bytes: seismic::recorded_graph_device_bytes(backend),
             sealed_target_graphs,
             sealed_state_graphs,
+            drafter_graph_host_bytes,
         })
     }
 }
@@ -643,6 +656,7 @@ impl AssessmentHeaderBounds {
                     .ok_or("assessment sealed graph bytes overflow")?,
             },
             bound_graph_host_bytes: graph.sealed_target_graphs.bound.bytes,
+            drafter_graph_host_bytes: graph.drafter_graph_host_bytes,
             host_process,
             device_process,
         })
@@ -782,12 +796,13 @@ impl AssessmentMemoryTerms {
 impl AssessmentMemoryCharge {
     /// Everything the load holds in system RAM outside its device
     /// allocations: the host tables, the target graphs' sealed plans (the
-    /// most a load seals) and static bindings, and the worker's own host
-    /// bytes. All are held together from the binding of the weights on.
+    /// most a load seals) and static bindings, the drafter's graphs, and the
+    /// worker's own host bytes. All are held together from the binding of the weights on.
     pub fn host_bytes(&self) -> Result<u64, String> {
         self.host_table_bytes
             .checked_add(self.bounds.sealed_graph_host_bytes.at_most)
             .and_then(|bytes| bytes.checked_add(self.bounds.bound_graph_host_bytes))
+            .and_then(|bytes| bytes.checked_add(self.bounds.drafter_graph_host_bytes))
             .and_then(|bytes| bytes.checked_add(self.bounds.host_process.bytes().ok()?))
             .ok_or_else(|| "host charge overflows".to_owned())
     }
@@ -1339,6 +1354,9 @@ mod tests {
                 binding.projection,
                 crate::ReadoutHead::Qualified { .. }
             ));
+            // The head's packed readers bind the unplaced target
+            // projection, and the assessment lists their kernels over it.
+            HostProcessBytes::derive(&definition, &load, &plan, limits, backend).unwrap();
             let classes = crate::programs::native_head::head_graph_classes(
                 limits,
                 head_history.rows as u64,
@@ -2329,6 +2347,54 @@ mod tests {
         assert!(family.workspace > 0 && family.output > 0 && family.upload > 0);
     }
 
+    /// A load whose readout selected planes stores its packed output
+    /// projection unplaced, and its packed readers still bind it: the
+    /// assessment's kernel listing over the finalized plan resolves it.
+    #[test]
+    fn kernels_of_a_finalized_target_readout_resolve_the_unplaced_projection() {
+        let definition = crate::planning::tests::fixture_definition();
+        let mut manifest = crate::planning::tests::fixture_manifest(&definition);
+        let output = manifest
+            .target
+            .tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == definition.decoder.exit.output.name)
+            .unwrap();
+        output.encoding = magnitude_artifacts::gguf::Encoding::Q8_0;
+        output.nbytes = output.shape.iter().product::<u64>() / 32 * 34;
+        let backend = BackendName::Metal;
+        let load = ModelLoadPlan::derive(
+            &manifest,
+            &definition,
+            ComponentSelection {
+                head: false,
+                vision: false,
+            },
+            crate::planning::resident_layout(crate::ExecutionPath::Native, backend),
+        )
+        .unwrap()
+        .with_readout_candidates(&definition)
+        .unwrap()
+        .finalize_readout(&[crate::ReadoutClassChoice {
+            scope: magnitude_family_contracts::WeightScope::Target,
+            norm_scope: magnitude_family_contracts::WeightScope::Target,
+            prepared: false,
+            rows: vec![1],
+        }])
+        .unwrap();
+        assert!(
+            !load.weights().any(|placed| placed.role
+                == magnitude_family_contracts::WeightRole {
+                    scope: magnitude_family_contracts::WeightScope::Target,
+                    kind: magnitude_family_contracts::WeightKind::Output,
+                }),
+            "the selected scope's packed projection is not placed"
+        );
+        let plan = load.program_plan(&definition, KvCodec::Dense).unwrap();
+        HostProcessBytes::derive(&definition, &load, &plan, fixture_limits(false), backend)
+            .unwrap();
+    }
+
     fn fixture_limits(lookahead: bool) -> crate::ResourceLimits {
         crate::ResourceLimits {
             max_launch_rows: 2,
@@ -2466,9 +2532,7 @@ mod tests {
         assert_eq!(bounds.device_process, device_process);
         assert_eq!(
             bounds.prepared_resource_bytes,
-            header.prepared_program_bytes
-                + graph.total_bytes
-                + device_process.bytes().unwrap()
+            header.prepared_program_bytes + graph.total_bytes + device_process.bytes().unwrap()
         );
         assert_eq!(
             bounds.startup_additional_bytes,
@@ -2542,6 +2606,7 @@ mod tests {
                     at_least: 0,
                 },
                 bound_graph_host_bytes: 0,
+                drafter_graph_host_bytes: 0,
                 host_process: NO_HOST_PROCESS,
                 device_process: NO_DEVICE_PROCESS,
             },
@@ -2577,6 +2642,7 @@ mod tests {
                 at_least: 0,
             },
             bound_graph_host_bytes: 0,
+            drafter_graph_host_bytes: 0,
             host_process: NO_HOST_PROCESS,
             device_process: NO_DEVICE_PROCESS,
         };

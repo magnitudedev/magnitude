@@ -443,6 +443,7 @@ pub(crate) fn distinct_storage_bytes<'a>(
 pub(crate) struct CheckedGraphFamilyResources {
     storage: Option<NativeGraphStorageBytes>,
     constants: Vec<GraphConstant>,
+    plans: HostHeap,
 }
 
 impl CheckedGraphFamilyResources {
@@ -450,7 +451,18 @@ impl CheckedGraphFamilyResources {
         Self {
             storage: None,
             constants: Vec::new(),
+            plans: HostHeap::default(),
         }
+    }
+
+    /// Count the host heap of one sealed plan of the family
+    /// (`NativeGraphMetadata::plan_heap` or `NativeGraphLayout::plan_heap`).
+    pub(crate) fn include_plan(&mut self, heap: HostHeap) -> Result<(), String> {
+        self.plans = self
+            .plans
+            .plus(heap)
+            .ok_or("checked graph plan heap overflows")?;
+        Ok(())
     }
 
     pub(crate) fn include(
@@ -491,15 +503,22 @@ impl CheckedGraphFamilyResources {
 
     pub(crate) fn finish(self) -> Result<CheckedGraphResources, String> {
         Ok(CheckedGraphResources {
+            host_heap: self
+                .plans
+                .plus(self.constant_heap()?)
+                .ok_or("checked graph host heap overflows")?,
             storage: self.storage.ok_or("checked graph family has no class")?,
             binding_constant_bytes: distinct_storage_bytes(self.constants.iter())?,
         })
     }
 }
 
+/// A checked family's device storage and constants, and the host heap of
+/// its sealed plans and its one copy of each constant value.
 pub(crate) struct CheckedGraphResources {
     pub(crate) storage: NativeGraphStorageBytes,
     pub(crate) binding_constant_bytes: u64,
+    pub(crate) host_heap: HostHeap,
 }
 
 /// The constant values of one graph family, each held once: the family's

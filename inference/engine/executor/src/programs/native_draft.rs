@@ -578,6 +578,7 @@ pub(crate) fn checked_draft_family_storage(
                 "separate draft graph must retain every artifact vocabulary row"
             );
         }
+        family.include_plan(parts.plan.plan_heap())?;
         let storage = GraphDraft::seal(parts.plan).map_err(|error| error.context(context()))?;
         family.include(storage, parts.constants);
     }

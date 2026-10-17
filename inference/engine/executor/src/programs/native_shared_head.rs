@@ -832,6 +832,7 @@ pub(crate) fn checked_shared_head_family_storage(
             backend,
         )
         .map_err(|error| error.context(context()))?;
+        family.include_plan(parts.plan.plan_heap())?;
         let storage = GraphDraft::seal(parts.plan).map_err(|error| error.context(context()))?;
         family.include(storage, parts.constants);
     }

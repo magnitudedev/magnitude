@@ -204,7 +204,8 @@ preparation of the programs to the end of serving, so it is charged once beside 
 load and serving phases. Two kinds of term make it up:
 
 - Exact from the plan: the host tables' row caches, the most host heap the target and state copy
-  graphs' sealed plans hold, and the target graphs' static bindings.
+  graphs' sealed plans hold, the target graphs' static bindings, and the drafter's graphs (a head's,
+  shared head's or separate draft's sealed plans and constant values).
 - The worker's own memory, which no structure of the plan describes: its runtime (process, Seismic's
   catalog, the opened device), the model's vocabulary (the artifact's token tables, the scheduler's
   tokenizer and the grammar vocabulary), its prepared programs (checked entries, prepared
