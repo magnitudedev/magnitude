@@ -34,7 +34,7 @@ struct Options {
 }
 
 const USAGE: &str = "magnitude-assess --device auto|metal|cuda|vulkan|cpu \
-     [--depths 25000,50000,75000] [--breakdown] TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...";
+     [--depths 25000,50000,75000] [--breakdown] [--method auto|plain] TARGET.gguf[,[PROJECTOR.gguf][,DRAFT.gguf]]...";
 
 fn value(flag: &str, args: &mut impl Iterator<Item = String>) -> Result<String, String> {
     args.next()
@@ -45,6 +45,7 @@ fn parse() -> Result<Options, String> {
     let mut device = None;
     let mut depths = STANDARD_DEPTHS.to_vec();
     let mut breakdown = false;
+    let mut method = ModelMethod::Auto;
     let mut models = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -67,6 +68,13 @@ fn parse() -> Result<Options, String> {
                     .collect::<Result<_, _>>()?
             }
             "--breakdown" => breakdown = true,
+            "--method" => {
+                method = match value(&argument, &mut args)?.as_str() {
+                    "auto" => ModelMethod::Auto,
+                    "plain" => ModelMethod::Plain,
+                    other => return Err(format!("--method takes auto or plain, not {other}")),
+                }
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -91,6 +99,9 @@ fn parse() -> Result<Options, String> {
     }
     if models.is_empty() {
         return Err(format!("no model given\n{USAGE}"));
+    }
+    for model in &mut models {
+        model.method = method;
     }
     Ok(Options {
         device: device.ok_or("--device is required")?,

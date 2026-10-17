@@ -228,7 +228,8 @@ raises them here, never a margin elsewhere.
 | Backend | Runtime | Per vocabulary entry | Per kernel | Vision | Measured on |
 |---|---|---|---|---|---|
 | Metal | 175 MB | 1,800 B | 5.7 MB | 210 MB | M4 Max, macOS 15.5: MiniCPM5 1B, Qwen3.5 0.8B, 2B and 4B, LFM2.5 1.2B, Gemma 4 E2B QAT (with its drafter and projector) and Q4_K_M (`bugs/26-10-17/unplanned-host-heap-in-memory-verdict.md`) |
-| CPU, Vulkan, CUDA | Metal's | Metal's | Metal's | Metal's | Not yet measured: the vocabulary and program structures are the engine's own and the same on every backend, the runtimes are not |
+| CPU | 205 MB | 1,400 B | 5.3 MB | Metal's | The same machine's CPU backend: MiniCPM5 1B, Qwen3.5 0.8B and 2B, LFM2.5 1.2B, Gemma 4 E2B, each twice; Linux CPU workers hold the same |
+| Vulkan, CUDA | Metal's | Metal's | Metal's | Metal's | Not measured: held in host RAM beside a dedicated device |
 
 A dedicated device also loses memory to the worker outside every charged allocation. Assessment
 charges it in the allocation domain with the prepared resources. It has three parts:
@@ -241,14 +242,15 @@ charges it in the allocation domain with the prepared resources. It has three pa
   inventory.
 - The free space of the blocks the allocations are carved from (`unallocated`). It varies with the
   order of allocations rather than with any count the plan fixes. Later allocations fill it, but a load
-  holds some at every moment, the fit depth included, so it is charged as the most measured.
+  holds some at every moment, the fit depth included. On CUDA it never exceeded the allocator's block
+  cap, which is charged; on Vulkan, whose upload storage has blocks of its own, the most measured is.
 
 A unified device's kernels and runtime are in its worker's host bytes.
 
 | Backend | Context | Per kernel | Block free space | Measured on |
 |---|---|---|---|---|
-| CUDA | In the usable capacity | None measured | 0.89 GB | A10G, L40S (Linux) |
-| Vulkan | 67 MB | 3.5 MB | 1.151 GB | Radeon PRO V710 (Linux) |
+| CUDA | In the usable capacity | None measured | One block cap (1 GiB) | A10G, L40S (Linux), A10 (Windows); measured 0.28–1.04 GB |
+| Vulkan | 74 MB | 7.5 MB | 1.151 GB | Radeon PRO V710 (Linux, Windows) |
 | Metal, CPU | In the host bytes | In the host bytes | None | |
 
 The device costs are measured as the host costs are. `inference/scripts/device-memory-costs.py`

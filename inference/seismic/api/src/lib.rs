@@ -171,6 +171,9 @@ pub use seismic_native_cpu as cpu;
 pub use seismic_runtime::api::HostRegion;
 pub use seismic_runtime::api::{CallError, OutputError, TensorError, WorkflowError};
 pub use seismic_runtime::native::recorded_graph_device_bytes;
+/// The largest block a dedicated device's allocator takes from its driver
+/// for an ordinary allocation (blocks grow from 64 MiB to it).
+pub use seismic_compiler::blocks::BLOCK_CAP_BYTES as DEVICE_BLOCK_CAP_BYTES;
 mod slab;
 pub use seismic_runtime::devices::{
     Availability, CapacityBasis, DISPLACEMENT_HISTORY, DeviceId, DeviceInfo, DeviceKind, DeviceMeasurements,

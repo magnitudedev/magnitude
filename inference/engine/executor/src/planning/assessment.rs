@@ -97,23 +97,27 @@ struct DeviceProcessCosts {
 }
 
 impl DeviceProcessCosts {
-    /// Measured by `inference/scripts/device-memory-costs.py` on an A10G and
-    /// an L40S (CUDA, Linux) and a Radeon PRO V710 (Vulkan, Linux), loading
-    /// Qwen3.5 2B and 4B (with and without DFlash), Gemma 4 E2B (with and
-    /// without its projector) and a 26B or 27B model each.
+    /// Measured by `inference/scripts/device-memory-costs.py` (Linux) and its
+    /// Windows equivalent on an A10G, an L40S and an A10 (CUDA) and a Radeon
+    /// PRO V710 (Vulkan, Linux and Windows).
     ///
     /// CUDA: what the device lost beyond what the engine holds (`held`) is
-    /// the process's context, within 20 MB on both cards, and the usable
-    /// capacity already excludes the context (measured on the device at
-    /// discovery), so it is not charged again; kernel modules showed no
-    /// device cost. Vulkan: the device's creation (67 MB) takes from the
-    /// heap or budget that is the capacity, and the driver objects beyond
-    /// the charge grow with the kernels (3.5 MB each at most). On both, the
-    /// block allocator held free space at load end (0.47–0.89 GB on CUDA,
-    /// 0.55–1.15 GB on Vulkan), whatever the model; a load holds that space
-    /// at any moment, the fit depth included, and the cost is the most
-    /// measured. Metal and the CPU are unified: their kernels and runtime
-    /// are measured in the worker's host bytes.
+    /// the process's context (within 20 MB), and the usable capacity
+    /// already excludes it: measured on the device at discovery, and under
+    /// WDDM the free figure read after the context exists, which also
+    /// excludes WDDM's own share. It is not charged again. Kernel modules
+    /// showed no device cost. Vulkan: the device's creation (67–74 MB)
+    /// takes from the heap or budget that is the capacity, and the driver
+    /// objects beyond the charge grow with the kernels (at most 7.5 MB each
+    /// on Windows, 3.5 MB on Linux).
+    ///
+    /// The block allocator holds free space beside the charge at every
+    /// moment, the fit depth included; it depends on the order of
+    /// allocations, not on a count the plan fixes. On CUDA it never exceeded
+    /// one block cap (0.28–1.04 GB measured), which is its cost. On Vulkan,
+    /// whose upload storage has blocks of its own, it reached 1.151 GB on
+    /// both systems, the most measured. Metal and the CPU are unified: their
+    /// kernels and runtime are measured in the worker's host bytes.
     fn of(backend: BackendName) -> Self {
         match backend {
             BackendName::Metal | BackendName::Cpu => Self {
@@ -135,9 +139,9 @@ impl DeviceProcessCosts {
     }
 }
 
-const CUDA_BLOCK_SLACK: u64 = 890_000_000;
-const VULKAN_CONTEXT: u64 = 67_000_000;
-const VULKAN_PER_KERNEL: u64 = 3_500_000;
+const CUDA_BLOCK_SLACK: u64 = seismic::DEVICE_BLOCK_CAP_BYTES;
+const VULKAN_CONTEXT: u64 = 74_000_000;
+const VULKAN_PER_KERNEL: u64 = 7_500_000;
 const VULKAN_BLOCK_SLACK: u64 = 1_151_000_000;
 
 impl DeviceProcessBytes {
@@ -195,26 +199,39 @@ struct HostProcessCosts {
 }
 
 impl HostProcessCosts {
-    /// Metal is measured on an M4 Max (macOS 15.5) from loads of MiniCPM5
-    /// 1B, Qwen3.5 0.8B, 2B and 4B, LFM2.5 1.2B and Gemma 4 E2B: the
-    /// process footprint at load end less everything the plan holds then is
-    /// the worker's own memory, and these are the least-overestimating costs
-    /// under which no measured load exceeds its plan. The vision cost is
-    /// what Qwen3.5 2B's and Gemma 4 E2B's workers held after their first
-    /// image beyond everything else their plans hold, the two within 2 %. The other backends are not yet measured and
-    /// take Metal's costs: the vocabulary's and the prepared programs'
-    /// structures are the engine's own and the same on every backend, the
-    /// runtimes are not.
+    /// Each backend's costs are measured from its loads: the process
+    /// footprint at load end less everything the plan holds then is the
+    /// worker's own memory, and the costs are the least-overestimating ones
+    /// under which no measured load exceeds its plan.
+    ///
+    /// Metal: an M4 Max (macOS 15.5), from MiniCPM5 1B, Qwen3.5 0.8B, 2B and
+    /// 4B, LFM2.5 1.2B and Gemma 4 E2B. Its vision cost is what Qwen3.5 2B's
+    /// and Gemma 4 E2B's workers held after their first image beyond
+    /// everything else their plans hold, the two within 2 %.
+    ///
+    /// CPU: the same machine's CPU backend, from MiniCPM5 1B, Qwen3.5 0.8B
+    /// and 2B, LFM2.5 1.2B and Gemma 4 E2B, each loaded twice (identical
+    /// loads differ by up to 0.16 GB). Linux CPU workers held the same at
+    /// load end (LFM2.5 1.2B: 1.30 GB on both). Its vision is not measured
+    /// and takes Metal's.
+    ///
+    /// CUDA and Vulkan hold their workers' host bytes in host RAM beside
+    /// a dedicated device, not measured there; they take Metal's.
     fn of(backend: BackendName) -> Self {
+        let metal = Self {
+            runtime: METAL_RUNTIME,
+            per_token: METAL_PER_TOKEN,
+            per_kernel: METAL_PER_KERNEL,
+            vision: METAL_VISION,
+        };
         match backend {
-            BackendName::Metal | BackendName::Cpu | BackendName::Vulkan | BackendName::Cuda => {
-                Self {
-                    runtime: METAL_RUNTIME,
-                    per_token: METAL_PER_TOKEN,
-                    per_kernel: METAL_PER_KERNEL,
-                    vision: METAL_VISION,
-                }
-            }
+            BackendName::Metal | BackendName::Vulkan | BackendName::Cuda => metal,
+            BackendName::Cpu => Self {
+                runtime: CPU_RUNTIME,
+                per_token: CPU_PER_TOKEN,
+                per_kernel: CPU_PER_KERNEL,
+                ..metal
+            },
         }
     }
 }
@@ -223,6 +240,9 @@ const METAL_RUNTIME: u64 = 175_000_000;
 const METAL_PER_TOKEN: u64 = 1_800;
 const METAL_PER_KERNEL: u64 = 5_700_000;
 const METAL_VISION: u64 = 210_000_000;
+const CPU_RUNTIME: u64 = 205_000_000;
+const CPU_PER_TOKEN: u64 = 1_400;
+const CPU_PER_KERNEL: u64 = 5_300_000;
 
 impl HostProcessBytes {
     /// The worker's unplanned host bytes for a load of `programs` (the
