@@ -284,7 +284,7 @@ export function ChatPage() {
     </div>
   }
 
-  return <div className="flex min-h-[calc(100vh-8rem)] min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
+  return <div className="flex h-[calc(100dvh-8rem)] min-h-[24rem] min-w-0 overflow-hidden rounded-xl border border-slate-200 bg-white dark:border-slate-750 dark:bg-slate-925">
     <aside className="hidden w-64 shrink-0 flex-col border-r border-slate-200 bg-slate-50 p-3 dark:border-slate-750 dark:bg-slate-900 sm:flex">
       <Button onClick={createConversation} className="mb-3 justify-start gap-2"><PlusIcon className="size-4" />New chat</Button>
       <div className="min-h-0 flex-1 space-y-1 overflow-y-auto" aria-label="Conversation history">
