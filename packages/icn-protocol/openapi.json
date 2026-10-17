@@ -3346,6 +3346,7 @@
               "installation",
               "updateState",
               "missingComponents",
+              "storedComponents",
               "drafterWithheld",
               "_tag"
             ],
@@ -3365,6 +3366,12 @@
                   "$ref": "#/components/schemas/CatalogMissingComponent"
                 }
               },
+              "storedComponents": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CatalogComponent"
+                }
+              },
               "drafterWithheld": {
                 "type": "boolean"
               },
@@ -3377,7 +3384,7 @@
             }
           }
         ],
-        "description": "A catalog model's state here. `drafter_withheld`: it serves without its catalog drafter, which\nit fits only without, so it loads rather than being refused."
+        "description": "A catalog model's state here. `drafter_withheld`: it serves without its catalog drafter, which\nit fits only without, so it loads rather than being refused. `stored_components`: the parts\nMagnitude stores for a model whose weights are only in another app's location (its projector\npackage and drafter), which Remove deletes while the found weights stay and keep serving."
       },
       "CatalogModelUpdate": {
         "oneOf": [

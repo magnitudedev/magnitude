@@ -3689,7 +3689,48 @@ mod tests {
             },
             method: SpeculativeMethod::DFlash,
         };
-        let catalog = vec![definition];
+        // Another variant of the same repository shares the projector and the drafter but isn't
+        // installed, so it never keeps them from being removed with this model.
+        let mut other_target = target.clone();
+        let weights_id = other_target
+            .files
+            .iter()
+            .find(|file| file.role == ModelFileRole::Weights)
+            .map(|file| file.id.clone())
+            .unwrap();
+        let other_weights = magnitude_service_contracts::models::ModelFileId(format!("file_{}", "d".repeat(64)));
+        for file in &mut other_target.files {
+            if file.id == weights_id {
+                file.id = other_weights.clone();
+                file.sha256 = "d".repeat(64);
+                file.path = PathBuf::from("Model-Q6_K.gguf");
+            }
+        }
+        for relationship in &mut other_target.relationships {
+            if let magnitude_service_contracts::models::ModelFileRelationship::ProjectorFor {
+                weights_file_id,
+                ..
+            } = relationship
+            {
+                *weights_file_id = other_weights.clone();
+            }
+        }
+        other_target.files.sort_by(|left, right| left.path.cmp(&right.path));
+        other_target.id = crate::package_service::canonical_package_id(
+            &other_target.files,
+            &other_target.relationships,
+        );
+        let mut other = definition.clone();
+        other.variant_id =
+            magnitude_service_contracts::models::CatalogVariantId::new("gguf:q6").unwrap();
+        other.configuration.bundle = ServableModelBundle::SpeculativeDecoding {
+            target: other_target,
+            draft_source: SpeculativeDraftSource::Separate {
+                draft: draft.clone(),
+            },
+            method: SpeculativeMethod::DFlash,
+        };
+        let catalog = vec![definition, other];
         let model_id = catalog_id(&catalog[0]);
         let (endpoint, requests) = serve_files(vec![
             (
@@ -3717,7 +3758,17 @@ mod tests {
             Arc::new(StoreRemover(fixture.resolver.inventory.clone())),
             Arc::new(NoOptimizer),
         );
-        let state = || fixture.resolver.catalog_snapshot().unwrap().models[0].local_state.clone();
+        let state = || {
+            fixture
+                .resolver
+                .catalog_snapshot()
+                .unwrap()
+                .models
+                .into_iter()
+                .find(|model| model.id == model_id)
+                .unwrap()
+                .local_state
+        };
         let missing = |state: &CatalogModelState| match state {
             CatalogModelState::Installed {
                 update_state,
@@ -3817,6 +3868,30 @@ mod tests {
             (projector.len() + drafter.len()) as u64
         );
 
+        let CatalogModelState::Installed {
+            installation,
+            stored_components,
+            ..
+        } = state()
+        else {
+            panic!("installed");
+        };
+        assert!(
+            matches!(
+                installation,
+                magnitude_service_contracts::models::ModelInstallation::Resolved {
+                    ownership: magnitude_service_contracts::models::ModelInstallationOwnership::External,
+                    ..
+                }
+            ),
+            "the model's weights are only in the Hugging Face cache"
+        );
+        assert_eq!(
+            stored_components,
+            vec![CatalogComponent::Projector, CatalogComponent::Drafter],
+            "Magnitude's own parts, which Remove deletes"
+        );
+
         // Removal removes Magnitude's projector and drafter; the found weights stay and still serve.
         let removed = installations.remove(&model_id).await.unwrap();
         assert!(matches!(removed, CatalogInstallationRemoval::Removed { .. }), "{removed:?}");
@@ -3824,6 +3899,17 @@ mod tests {
         assert!(stored_files(&fixture.store).is_empty());
         assert_eq!(fs::read(snapshot.join("Model-Q4_K_M.gguf")).unwrap(), weights);
         assert_eq!(missing(&state()).len(), 2);
+        assert!(matches!(
+            state(),
+            CatalogModelState::Installed { stored_components, .. } if stored_components.is_empty()
+        ));
+        assert!(
+            matches!(
+                installations.remove(&model_id).await.unwrap(),
+                CatalogInstallationRemoval::Retained { .. }
+            ),
+            "with nothing of Magnitude's left, the found model is hidden instead"
+        );
 
         // With the projector stored again, the found weights disappearing leave the model not
         // installed, and its full download takes the stored projector instead of fetching it.

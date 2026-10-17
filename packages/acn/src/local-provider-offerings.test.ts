@@ -98,6 +98,7 @@ const assessed = (modelId: string, source: "Catalog" | "Discovered"): LocalModel
     acquisitionState: { _tag: "Installed", installation, residencyState: { _tag: "Unloaded" } },
     servingState: { ...servingState, rankingScores: Option.none() },
     missingComponents: [],
+    storedComponents: [],
     drafterWithheld: false,
   })
 }

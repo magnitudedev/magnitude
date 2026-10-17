@@ -158,6 +158,7 @@ const makeCatalogOnlyModel = (
   },
   acquisitionState: { _tag: "NotInstalled" },
   missingComponents: [],
+  storedComponents: [],
   drafterWithheld: false,
   servingState: {
     _tag: "Assessed",

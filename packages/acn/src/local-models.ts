@@ -360,6 +360,7 @@ const catalogModel = (
     acquisitionState,
     servingState: catalogModelServingState(ready, assessment, rankingScores, unavailableFailure),
     missingComponents: source.localState._tag === "Installed" ? source.localState.missingComponents : [],
+    storedComponents: source.localState._tag === "Installed" ? source.localState.storedComponents : [],
     drafterWithheld: source.localState._tag === "Installed" && source.localState.drafterWithheld,
   })
 }

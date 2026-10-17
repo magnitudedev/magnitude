@@ -56,6 +56,19 @@ describe("removing by origin", () => {
     expect(renderToStaticMarkup(<ModelRemoveAction model={found} running={false} disabled={false} onRemove={() => {}} />)).toBe("")
     expect(removalKind({ ...found, acquisitionState: { ...found.acquisitionState, installation: { ...found.acquisitionState.installation, ownership: "Mixed" as const } } })).toBe("delete")
   })
+  it("removes only the parts Magnitude stores for a found catalog model, and still offers Hide", () => {
+    const external = catalogModel()
+    const found = { ...external, storedComponents: ["Projector", "Drafter"] as const, acquisitionState: { _tag: "Installed" as const, installation: { _tag: "Resolved" as const, installedBytes: 1, primaryPath: "/Users/me/.cache/huggingface/hub/qwen.gguf", ownership: "External" as const }, residencyState: { _tag: "Unloaded" as const } } }
+    expect(removalKind(found)).toBe("parts")
+    const html = render(found)
+    expect(html).toContain('aria-label="Hide Qwen3.6 35B-A3B (Q4) from Magnitude"')
+    expect(html).toContain('aria-label="Remove the files Magnitude downloaded for Qwen3.6 35B-A3B (Q4)"')
+    expect(removalConfirmation(found, false)).toEqual({
+      title: "Remove the image input and drafter Magnitude downloaded for Qwen3.6 35B-A3B (Q4)?",
+      description: "The model file is in another app's location, which Magnitude never deletes, so the model stays in My Models and runs from there. Hide it to stop listing it.",
+      confirmLabel: "Remove",
+    })
+  })
   it("says removing an added model with the same bytes elsewhere deletes only Magnitude's copy and keeps it listed", () => {
     const addedModel = customModel(added)
     const alsoFound = customModel(added, { acquisitionState: { _tag: "Installed", installation: { _tag: "Resolved", installedBytes: 23_000_000_000, primaryPath: "/models/qwen.gguf", ownership: "Mixed" }, residencyState: { _tag: "Unloaded" } } })

@@ -19,7 +19,8 @@ use magnitude_service_contracts::models::{
 
 use crate::catalog_installations::ManagedCatalogInstallations;
 use crate::inventory::{
-    InstalledPackagesObserver, catalog_packages, catalog_projector_package, catalog_target,
+    InstalledPackagesObserver, catalog_packages, catalog_projector_package, catalog_store_packages,
+    catalog_target,
 };
 use crate::model_domains::{ModelDomainResolver, domain_changes};
 use crate::model_projection::{
@@ -261,10 +262,13 @@ impl ModelDomainResolver {
                 },
             );
         let mut occurrence_origins = occurrence_origins;
-        for (composed, weights, projector) in self.inventory.composed_catalog_targets(&records) {
-            let origins = occurrence_origins.entry(composed.package.id).or_default();
-            origins.include(weights.installed.origin);
-            origins.include(projector.installed.origin);
+        // A composed target's weights are its found copy's; Magnitude's projector beside them doesn't
+        // make Magnitude own the model (see `installation`).
+        for (composed, weights, _) in self.inventory.composed_catalog_targets(&records) {
+            occurrence_origins
+                .entry(composed.package.id)
+                .or_default()
+                .include(weights.installed.origin);
         }
         Ok(CatalogModelsResponse {
             revision: self.revision()?,
@@ -366,7 +370,8 @@ impl ModelDomainResolver {
             .iter()
             .filter(|entry| {
                 attributed(entry)
-                    || catalog_packages(definition).any(|(package, _)| package.id == entry.package.id)
+                    || catalog_store_packages(definition)
+                        .any(|(package, _)| package.id == entry.package.id)
                     || affiliations.iter().any(|affiliation| {
                         affiliation.model_id == definition.model_id
                             && affiliation.variant_id == definition.variant_id
@@ -394,17 +399,35 @@ impl ModelDomainResolver {
             })
             .map(|record| record.installed.package.id.clone())
             .collect::<BTreeSet<_>>();
+        // A package is shared only with another catalog model that is installed: one whose target
+        // is here and whose bundle (projector package included) or affiliations hold the package.
+        // Variants that share a drafter or projector but aren't installed never keep it.
+        let installed_elsewhere = self
+            .catalog
+            .models
+            .iter()
+            .filter(|candidate| catalog_id(candidate) != *id)
+            .filter(|candidate| {
+                installed.packages.iter().any(|entry| {
+                    entry.package.id == catalog_target(candidate).id
+                        || matches!(
+                            &entry.catalog_attribution,
+                            InstalledCatalogAttribution::Attributed { model_id, variant_id }
+                                if model_id == &candidate.model_id && variant_id == &candidate.variant_id
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
         let shared_ids = ids
             .iter()
             .filter(|package_id| {
-                affiliations.iter().any(|affiliation| {
-                    affiliation.package_id == **package_id
-                        && (affiliation.model_id != definition.model_id
-                            || affiliation.variant_id != definition.variant_id)
-                }) || self.catalog.models.iter().any(|candidate| {
-                    catalog_id(candidate) != *id
-                        && catalog_packages(candidate)
-                            .any(|(package, _)| package.id == **package_id)
+                installed_elsewhere.iter().any(|candidate| {
+                    catalog_store_packages(candidate).any(|(package, _)| package.id == **package_id)
+                        || affiliations.iter().any(|affiliation| {
+                            affiliation.package_id == **package_id
+                                && affiliation.model_id == candidate.model_id
+                                && affiliation.variant_id == candidate.variant_id
+                        })
                 })
             })
             .cloned()
@@ -668,25 +691,62 @@ fn catalog_model(
                 selected_target,
                 effective,
                 ..
-            } => CatalogModelState::Installed {
-                effective,
-                installation: installation(
+            } => {
+                let installation = installation(
                     &resolution.installed_packages,
                     selected_target,
                     occurrence_origins,
-                ),
-                update_state: if resolution.required_download_bytes == 0 {
-                    CatalogModelUpdate::Current
-                } else {
-                    CatalogModelUpdate::Available {
-                        required_download_bytes: resolution.required_download_bytes,
-                    }
-                },
-                missing_components: resolution.missing_components,
-                drafter_withheld: resolution.drafter_withheld,
-            },
+                );
+                let stored_components = stored_components(definition, &installation, present);
+                CatalogModelState::Installed {
+                    effective,
+                    installation,
+                    stored_components,
+                    update_state: if resolution.required_download_bytes == 0 {
+                        CatalogModelUpdate::Current
+                    } else {
+                        CatalogModelUpdate::Available {
+                            required_download_bytes: resolution.required_download_bytes,
+                        }
+                    },
+                    missing_components: resolution.missing_components,
+                    drafter_withheld: resolution.drafter_withheld,
+                }
+            }
         },
     }
+}
+
+/// The components Magnitude stores for a model whose weights are only in another app's location:
+/// its target's projector package and its drafter, each when Magnitude's store holds it.
+fn stored_components(
+    definition: &RecommendableModel,
+    installation: &ModelInstallation,
+    present: &BTreeMap<ModelPackageId, &InstalledModelPackage>,
+) -> Vec<CatalogComponent> {
+    let external = matches!(
+        installation,
+        ModelInstallation::Resolved { ownership: ModelInstallationOwnership::External, .. }
+            | ModelInstallation::Unresolved { ownership: ModelInstallationOwnership::External, .. }
+    );
+    if !external {
+        return Vec::new();
+    }
+    let stored = |package: Option<ModelPackage>| {
+        package.is_some_and(|package| {
+            present
+                .get(&package.id)
+                .is_some_and(|entry| entry.origin == ModelPackageInstallationOrigin::Magnitude)
+        })
+    };
+    [
+        (CatalogComponent::Projector, catalog_projector_package(catalog_target(definition))),
+        (CatalogComponent::Drafter, catalog_draft(definition).cloned()),
+    ]
+    .into_iter()
+    .filter(|(_, package)| stored(package.clone()))
+    .map(|(component, _)| component)
+    .collect()
 }
 
 /// `required_download_bytes` is the update: what a newer catalog revision needs fetched.

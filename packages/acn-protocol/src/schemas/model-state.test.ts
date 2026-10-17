@@ -40,6 +40,7 @@ const catalogModel = {
   },
   acquisitionState: { _tag: "NotInstalled" },
   missingComponents: [],
+  storedComponents: [],
   drafterWithheld: false,
   servingState: {
     _tag: "Failed",

@@ -169,6 +169,44 @@ describe("model mutations accept hf: and local: IDs", () => {
     expect(json).toEqual({ modelId })
   })
 
+  it("catalog remove of a found catalog model deletes only the parts Magnitude stores, and points to Hide without any", async () => {
+    const weightsPath = "/home/ada/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/c/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+    const found = (storedComponents: readonly ("Projector" | "Drafter")[]) => makeInstalledCatalogModel({
+      acquisitionState: {
+        _tag: "Installed",
+        installation: { _tag: "Resolved", installedBytes: 1, primaryPath: weightsPath, ownership: "External" },
+        residencyState: { _tag: "Unloaded" },
+      },
+      storedComponents,
+    })
+    const withParts = found(["Projector", "Drafter"])
+    const { text, json, models } = await runBoth({
+      getCatalog: succeed(catalogState([withParts])),
+      removeLocalModel: succeed(),
+    }, (options) => removeModel(withParts.modelId, options))
+    expect(models.removeLocalModel).toHaveBeenCalledWith({ modelId: withParts.modelId })
+    expect(text).toBe([
+      `Removed the image input and drafter Magnitude downloaded for ${withParts.modelId}.`,
+      `It still runs from ${weightsPath}, which Magnitude never deletes.`,
+      `To stop listing it: magnitude models hide ${withParts.modelId}`,
+      "",
+    ].join("\n"))
+    expect(json).toEqual({ modelId: withParts.modelId })
+
+    // With nothing of Magnitude's, the service refuses and points to Hide, which this model takes.
+    const message = `${withParts.modelId} uses files in your Hugging Face cache (${weightsPath}), which Magnitude never deletes. `
+      + `Hide it with \`magnitude models hide ${withParts.modelId}\`, or delete it with the Hugging Face CLI (\`hf cache delete\`).`
+    const { client } = fakeService({
+      getCatalog: succeed(catalogState([found([])])),
+      removeLocalModel: () => Effect.fail({ _tag: "LocalModelMutationFailed", code: "model_removal_retained_external", message, retryable: false }),
+    })
+    const refused = await capture(removeModel(withParts.modelId), client)
+    expect(refused.stdout).toBe("")
+    expect(refused.stderr).toContain(`magnitude models hide ${withParts.modelId}`)
+    expect(refused.stderr).not.toContain("catalog remove")
+    expect(refused.exitCode).toBe(1)
+  })
+
   it("models hide fails with the service's error for an ID that isn't on this computer", async () => {
     const message = `${IMPORTED_MODEL_ID} is not a model on this computer.`
     const { client } = fakeService({

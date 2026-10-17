@@ -436,6 +436,7 @@ export const CatalogModelState = S.Union(
       missingComponents: S.Array(
         S.suspend((): S.Schema<CatalogMissingComponent, CatalogMissingComponentEncoded> => CatalogMissingComponent),
       ),
+      storedComponents: S.Array(S.suspend((): S.Schema<CatalogComponent, CatalogComponentEncoded> => CatalogComponent)),
       updateState: S.suspend((): S.Schema<CatalogModelUpdate, CatalogModelUpdateEncoded> => CatalogModelUpdate),
     }),
     S.Record({ key: S.String, value: JsonValue }),

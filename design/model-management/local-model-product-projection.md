@@ -126,9 +126,12 @@ unresolved installation and does not fabricate one.
 Ownership is of the model's own weights: where the selected target's copies are. `Magnitude` is a
 copy only in Magnitude's store, `External` weights found only in another location, and `Mixed` both.
 A catalog drafter or projector in Magnitude's store beside external weights leaves the installation
-`External`. Remove deletes only Magnitude's copy of the weights, so an `External` catalog model is
-hidden instead (Hide, `magnitude models hide`), and a `Mixed` one is removed and stays listed from its
-external copy.
+`External`; those parts are listed as `storedComponents`. Remove deletes only what Magnitude stores:
+for a `Mixed` model its copy of the weights (it stays listed from its external copy), for an
+`External` model with stored components only those components (it keeps running from the found
+file), and an `External` model with none is hidden instead (Hide, `magnitude models hide`). The
+removal gate checks for stored components, not ownership alone, so Remove's guidance points to Hide
+only when Remove has nothing to delete, and Hide applies to every `External` model.
 An installation's optimization projects as `Optimizing`, an installed-family state that carries
 residency and optimization progress (stage, completed and total units, and the device once known).
 Installing or Updating moves to `Optimizing` and then to `Installed`; cancellation, a load, or a

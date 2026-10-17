@@ -1224,7 +1224,9 @@ pub struct CatalogMissingComponent {
 }
 
 /// A catalog model's state here. `drafter_withheld`: it serves without its catalog drafter, which
-/// it fits only without, so it loads rather than being refused.
+/// it fits only without, so it loads rather than being refused. `stored_components`: the parts
+/// Magnitude stores for a model whose weights are only in another app's location (its projector
+/// package and drafter), which Remove deletes while the found weights stay and keep serving.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "_tag", rename_all = "PascalCase", deny_unknown_fields)]
@@ -1236,6 +1238,7 @@ pub enum CatalogModelState {
         installation: ModelInstallation,
         update_state: CatalogModelUpdate,
         missing_components: Vec<CatalogMissingComponent>,
+        stored_components: Vec<CatalogComponent>,
         drafter_withheld: bool,
     },
 }

@@ -822,7 +822,7 @@ export const CustomModelCommandsLive: Layer.Layer<
     Option.getOrElse(Option.flatMap(Option.fromNullable(catalogModels.find(({ id }) => id === modelId)), ({ source }) => source.aliases), () => [])
       .flatMap((alias) => Option.toArray(Schema.decodeUnknownOption(CustomFormModelIdSchema)(alias)))))
 
-  /** A catalog model whose files are all in an external location is a found copy: hidden, never deleted. */
+  /** A catalog model whose weights are all in an external location is a found copy: hidden, never deleted. */
   const externalCatalogFiles = (modelId: CatalogFormModelId) => Effect.gen(function* () {
     const state = yield* localModels.state
     const model = [...state.models, ...state.hidden].find((candidate) => candidate.modelId === modelId)

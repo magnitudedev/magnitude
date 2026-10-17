@@ -22,6 +22,8 @@ import {
   ModelIdSchema,
   UnsupportedLocalModelSchema,
   localModelDeprecation,
+  installedAcquisition,
+  type CatalogComponent,
   type CatalogMissingComponent,
   type CustomLocalModel,
   type DrafterCandidate,
@@ -89,7 +91,32 @@ export const cancelDownload = (modelInput: string, options: JsonOption = {}) => 
 )
 
 /** What removing a model did, which follows who owns its files. */
-export const renderRemoval = (modelId: ModelId, origin: Option.Option<CustomLocalModel["origin"]>): string => {
+/** The parts Magnitude stores for a catalog model whose weights are found elsewhere, and where those weights are. */
+export interface StoredCatalogParts {
+  readonly components: readonly CatalogComponent[]
+  readonly weightsPath: string
+}
+
+/** A catalog model's stored parts when its weights are only in another app's location: what Remove deletes. */
+export const storedCatalogParts = (model: LocalModel): Option.Option<StoredCatalogParts> => {
+  if (model._tag !== "Catalog" || model.storedComponents.length === 0) return Option.none()
+  const installation = installedAcquisition(model.acquisitionState)?.installation
+  return installation?._tag === "Resolved"
+    ? Option.some({ components: model.storedComponents, weightsPath: installation.primaryPath })
+    : Option.none()
+}
+
+export const renderRemoval = (
+  modelId: ModelId,
+  origin: Option.Option<CustomLocalModel["origin"]>,
+  parts: Option.Option<StoredCatalogParts> = Option.none(),
+): string => {
+  if (Option.isSome(parts)) {
+    const names = parts.value.components.map((component) => catalogComponentName(component).toLowerCase()).join(" and ")
+    return `Removed the ${names} Magnitude downloaded for ${modelId}.\n`
+      + `It still runs from ${parts.value.weightsPath}, which Magnitude never deletes.\n`
+      + `To stop listing it: magnitude models hide ${modelId}\n`
+  }
   if (Schema.is(CatalogFormModelIdSchema)(modelId)) {
     return `Removed ${modelId} from this computer.\nThe model remains available in the catalog.\n`
   }
@@ -102,14 +129,13 @@ export const renderRemoval = (modelId: ModelId, origin: Option.Option<CustomLoca
 
 export const removeModel = (modelInput: string, options: JsonOption = {}) => commandEffect({
   effect: decodeModelId(modelInput).pipe(Effect.flatMap((modelId) => withClient((client) => Effect.gen(function* () {
-    const origin = Option.flatMap(
-      Option.fromNullable(addressableModels(yield* readCatalog(client)).find((model) => model.modelId === modelId)),
-      (model) => model._tag === "Custom" ? Option.some(model.origin) : Option.none(),
-    )
+    const model = Option.fromNullable(addressableModels(yield* readCatalog(client)).find((candidate) => candidate.modelId === modelId))
+    const origin = Option.flatMap(model, (found) => found._tag === "Custom" ? Option.some(found.origin) : Option.none())
+    const parts = Option.flatMap(model, storedCatalogParts)
     yield* client.models.removeLocalModel({ modelId })
-    return { modelId, origin }
+    return { modelId, origin, parts }
   })))),
-  render: ({ modelId, origin }) => renderRemoval(modelId, origin),
+  render: ({ modelId, origin, parts }) => renderRemoval(modelId, origin, parts),
   json: asJson(options, jsonDocument(ModelIdJsonSchema, ({ modelId }: { readonly modelId: ModelId }) => ({ modelId }))),
 })
 

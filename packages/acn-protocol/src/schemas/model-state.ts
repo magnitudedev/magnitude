@@ -1066,7 +1066,9 @@ export type CatalogMissingComponent = typeof CatalogMissingComponentSchema.Type
 
 /**
  * A catalog model on this computer. `drafterWithheld`: it runs without its catalog drafter, because it fits this
- * computer only without it, so it loads rather than being refused.
+ * computer only without it, so it loads rather than being refused. `storedComponents`: the parts Magnitude stores
+ * for a model whose weights are only in another app's location (its projector and drafter); Remove deletes these
+ * and the model keeps running from the found file, and with none of them Remove is Hide.
  */
 export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   ...LocalModelFields,
@@ -1076,6 +1078,7 @@ export const CatalogLocalModelSchema = Schema.TaggedStruct("Catalog", {
   storageBytes: NonNegativeSafeInteger,
   acquisitionState: LocalModelAcquisitionStateSchema,
   missingComponents: Schema.Array(CatalogMissingComponentSchema),
+  storedComponents: Schema.Array(CatalogComponentSchema),
   drafterWithheld: Schema.Boolean,
 })
 export type CatalogLocalModel = typeof CatalogLocalModelSchema.Type

@@ -149,12 +149,15 @@ export const ModelCommandsLive: Layer.Layer<
             Effect.tap(() => installations.refresh.pipe(Effect.ignore)), Effect.as({}),
           )),
     )
-  // Remove never deletes files Magnitude doesn't own; a catalog model found only elsewhere is hidden instead.
-  const catalogRemove = (modelId: CatalogFormModelId) => custom.externalCatalogFiles(modelId).pipe(
-    Effect.flatMap(Option.match({
-      onSome: (files) => Effect.fail(externalCatalogRemovalRefusal(modelId, files)),
-      onNone: () => stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId))),
-    })),
+  /** Whether Magnitude stores parts (a projector or drafter) of a catalog model whose weights are found elsewhere. */
+  const storesComponents = (modelId: CatalogFormModelId) => localModels.state.pipe(Effect.map(({ models, hidden }) =>
+    [...models, ...hidden].some((model) => model._tag === "Catalog" && model.modelId === modelId && model.storedComponents.length > 0)))
+  // Remove never deletes files Magnitude doesn't own. A catalog model whose weights are found elsewhere loses only
+  // the parts Magnitude stores for it and keeps running from the found file; with none, it is hidden instead.
+  const catalogRemove = (modelId: CatalogFormModelId) => Effect.all([custom.externalCatalogFiles(modelId), storesComponents(modelId)]).pipe(
+    Effect.flatMap(([external, stored]) => Option.isSome(external) && !stored
+      ? Effect.fail(externalCatalogRemovalRefusal(modelId, external.value))
+      : stopModel(modelId).pipe(Effect.zipRight(removals.remove(modelId)))),
   )
   return ModelCommands.of({
     sync: (modelId) => byForm(modelId, catalogSync.sync, custom.sync),

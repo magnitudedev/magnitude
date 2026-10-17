@@ -8,7 +8,7 @@ import { LocalModels } from "./local-models"
 const UPGRADED_ALIAS = "hf:unsloth/Qwen3.5-4B-MTP-GGUF/Qwen3.5-4B-UD-Q4_K_XL.gguf"
 const localModels = {
   state: Effect.succeed({
-    models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] } }],
+    models: [{ _tag: "Catalog", modelId: "model-a:gguf:test", catalogData: { aliases: [UPGRADED_ALIAS] }, storedComponents: [] }],
     unsupported: [],
     hidden: [],
   }),
@@ -176,6 +176,66 @@ it("stops a running model before removing it, and removes an idle model without 
     + "(/home/ada/.cache/huggingface/hub/models--o--r/snapshots/c/m.gguf), which Magnitude never deletes. "
     + "Hide it with `magnitude models hide model-c:gguf:test`, or delete it with the Hugging Face CLI (`hf cache rm`).")
   expect(customCalls).toContain("custom remove hf:owner/repo/model-Q4_K_M.gguf")
+})
+
+it("removes only the parts Magnitude stores for a catalog model whose weights are found elsewhere, and hides one without any", async () => {
+  const { IcnClient, IcnInstances, IcnCatalog, IcnCatalogInstallations, IcnLocalModels } = await import("@magnitudedev/icn")
+  const { ModelIdSchema } = await import("@magnitudedev/acn-protocol")
+  const { ModelCommands, ModelCommandsLive } = await import("./model-commands")
+  const { ModelSlotController } = await import("./model-slot-controller")
+  const { LocalModelRemovalsLive } = await import("./local-model-removals")
+  const calls: string[] = []
+  const cachePath = "/home/ada/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B-MTP-GGUF/snapshots/c/Qwen3.5-4B-UD-Q4_K_XL.gguf"
+  const external = (storedComponents: readonly string[]) => ({
+    _tag: "Catalog",
+    modelId: "qwen3.5-4b:gguf:q4",
+    catalogData: { aliases: [] },
+    acquisitionState: {
+      _tag: "Installed",
+      installation: { _tag: "Resolved", installedBytes: 1, primaryPath: cachePath, ownership: "External" },
+      residencyState: { _tag: "Unloaded" },
+    },
+    missingComponents: [],
+    storedComponents,
+  })
+  const remove = (storedComponents: readonly string[], removal: unknown) => Effect.gen(function* () {
+    const commands = yield* ModelCommands
+    return yield* commands.remove(Schema.decodeUnknownSync(ModelIdSchema)("qwen3.5-4b:gguf:q4"))
+  }).pipe(
+    Effect.provide(ModelCommandsLive.pipe(Layer.provide(CatalogModelSyncLive), Layer.provide(LocalModelRemovalsLive))),
+    Effect.provideService(CustomModelCommands, {
+      ...customCommands,
+      externalCatalogFiles: () => Effect.succeed(Option.some({ path: cachePath, location: Option.some("HuggingFaceCache") })),
+    } as unknown as CustomModelCommandsApi),
+    Effect.provideService(LocalModels, { state: Effect.succeed({ models: [external(storedComponents)], hidden: [] }) } as never),
+    Effect.provideService(IcnInstances, { get: Effect.succeed({ revision: 1, instances: [] }) } as never),
+    Effect.provideService(IcnClient, { catalog: {
+      removeCatalogModelInstallation: ({ path }: { path: { model_id: string } }) => Effect.sync(() => {
+        calls.push(`remove ${path.model_id}`)
+        return removal
+      }),
+    } } as never),
+    Effect.provideService(IcnCatalog, { refresh: Effect.void } as never),
+    Effect.provideService(IcnCatalogInstallations, {} as never),
+    Effect.provideService(IcnLocalModels, { pruneDrafters: Effect.void } as never),
+    Effect.provideService(ModelSlotController, {} as never),
+  )
+
+  // The projector and drafter Magnitude stores are removed; ICN keeps the found weights.
+  expect(await Effect.runPromise(remove(["Projector", "Drafter"], { _tag: "Removed", reclaimedBytes: 2 }))).toEqual({})
+  expect(calls).toEqual(["remove qwen3.5-4b:gguf:q4"])
+
+  // With nothing of Magnitude's, Remove never reaches ICN and points to Hide, which applies to this model.
+  const hidden = await Effect.runPromise(remove([], { _tag: "Removed", reclaimedBytes: 0 }).pipe(Effect.flip))
+  expect(hidden._tag === "LocalModelMutationFailed" && hidden.code).toBe("model_removal_retained_external")
+  expect(hidden.message).toContain("magnitude models hide qwen3.5-4b:gguf:q4")
+  expect(hidden.message).not.toContain("catalog remove")
+  expect(calls).toHaveLength(1)
+
+  // Parts another model still uses stay; ICN retains them and the guidance is Hide, never Remove again.
+  const retained = await Effect.runPromise(remove(["Drafter"], { _tag: "Retained", reason: "ExternalOwnership" }).pipe(Effect.flip))
+  expect(retained.message).toContain("magnitude models hide qwen3.5-4b:gguf:q4")
+  expect(retained.message).not.toContain("catalog remove")
 })
 
 it("reports whether a catalog sync installs, updates, or finds the model current", async () => {

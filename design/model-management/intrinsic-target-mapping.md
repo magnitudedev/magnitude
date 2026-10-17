@@ -47,7 +47,8 @@ are, and resolves it for serving to the found weights plus the stored projector.
 projector (`install_catalog_component`) downloads and stores only the projector, and installing the
 catalog model fetches only the missing projector and drafter. Removal deletes only Magnitude's
 projector package and drafter and leaves the found file; a model with nothing of Magnitude's is
-retained as externally owned and is hidden instead. When the found weights disappear, the composed
+retained as externally owned and is hidden instead. A projector or drafter that other variants of
+the same repository also list is kept only for another catalog model that is installed. When the found weights disappear, the composed
 target goes with them and the model is not installed; its full download then fetches the target and
 reuses the stored projector. A hidden copy composes nothing: installing the catalog model then makes
 Magnitude's own copy of its bytes. External attributions are derived on every reconciliation and are
