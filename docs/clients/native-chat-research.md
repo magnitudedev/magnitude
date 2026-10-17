@@ -22,7 +22,7 @@ The working branch includes:
 - An optional additional loopback listener on `127.0.0.1:10101` that opens Chat directly; the canonical service/API remains on `127.0.0.1:10100`.
 - Documentation for local privacy and troubleshooting.
 
-**Validation limitation:** changes were authored through the GitHub integration. This environment has not run the local typecheck, tests, web build, or a real inference smoke test. The PR remains a draft and must not be described as validated.
+**Validation status (2026-10-17):** the fork's GitHub Actions run #10 passed dependency installation, `client-common`/web/ACN typechecks, web tests, and production build on head `bdcd27756ff80edd0f1163303cfa1fad016bc031`. Separate local smoke evidence recorded for this branch confirms MiniCPM5 Q4 returned visible non-streaming content and a real SSE stream reconstructed the expected response. These checks validate compilation, unit tests, and the API protocol—not browser-level UI behavior. Browser E2E, cancellation, history lifecycle, occupied-port behavior, cross-model compatibility, and real Open WebUI embedding remain unverified.
 
 ### B. Embed Open WebUI in a Chat page
 
@@ -111,7 +111,24 @@ The architectural goal remains to separate conversation UI from administration, 
 
 The working branch now includes an opt-in Open WebUI view within the Chat page. It accepts only loopback HTTP(S) URLs (`localhost`, `127.0.0.1`, or `[::1]`), rejects URL credentials and non-web protocols, strips URL fragments, and persists the selected URL in browser local storage. A native Chat route remains available as a fallback. The URL validation helper has unit tests for accepted loopback URLs, remote-host rejection, credentials, malformed URLs, non-web schemes, and fragment removal.
 
-These changes are authored but not yet executed through the web typecheck, test suite, or build in this environment. The iframe cannot reliably inspect a cross-origin child page's HTTP headers or authentication state, so server policy and real browser behavior remain manual integration checks. Do not claim that Open WebUI embedding or inference has passed until CI and end-to-end checks are green.
+The fork's CI typechecks, tests, and production build now pass, including unit tests for Open WebUI URL validation. That does not establish that an actual Open WebUI instance can be embedded or authenticate successfully. The iframe cannot reliably inspect a cross-origin child's HTTP headers or authentication state, so server policy and real browser behavior remain manual integration checks. Do not claim Open WebUI embedding or inference has passed until the real-instance end-to-end checks are green.
 
 
 The implementation guide for connecting an existing Open WebUI instance to Magnitude is available at [`docs/clients/open-webui.mdx`](https://github.com/robertosantosx2/magnitude/blob/feat/native-chat-section/docs/clients/open-webui.mdx). It explains the host-versus-container address distinction, API key/network-access requirements, embedding policy, and end-to-end acceptance checklist.
+
+
+## Validation ledger (2026-10-17)
+
+| Check | Result | Evidence / limitation |
+|---|---|---|
+| Fork CI: dependency install, three typechecks, web tests, production build | Pass | [Run #10](https://github.com/robertosantosx2/magnitude/actions/runs/39023175172), current PR head at time of run |
+| SSE parser unit tests and Open WebUI URL validation tests | Pass | Included in the successful web test step |
+| Real non-streaming API request | Pass for MiniCPM5 Q4 | Returned visible assistant content with `reasoning_effort: "none"` |
+| Real SSE API request | Pass for MiniCPM5 Q4 | Incremental chunks reconstructed expected text and ended with `[DONE]` |
+| Native Chat browser UI, Stop, localStorage lifecycle | Pending | Requires running the actual web app in a browser; API smoke alone is insufficient |
+| Port 10101 occupied while 10100 remains healthy | Pending | Requires runtime conflict test |
+| Cross-model/backend support for `reasoning_effort: "none"` | Pending | Only MiniCPM5 Q4 was confirmed |
+| Open WebUI iframe, CSP, cookies/session, API and streaming | Pending | URL validation tests do not prove a real embedded session |
+| Upstream maintainer review and upstream CI | Pending | Fork CI does not substitute for upstream checks |
+
+The PR should remain a draft until the pending runtime acceptance checks are completed. The standalone page previously available on port 10101 is not evidence that this PR's Native Chat component works in-browser.
