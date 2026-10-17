@@ -31,6 +31,8 @@ jobs:
         run: bun run --cwd packages/client-common typecheck
       - name: Typecheck web
         run: bun run --cwd web typecheck
+      - name: Typecheck ACN server
+        run: bun run --cwd packages/acn typecheck
       - name: Run web tests
         run: bun run --cwd web test
       - name: Build web
